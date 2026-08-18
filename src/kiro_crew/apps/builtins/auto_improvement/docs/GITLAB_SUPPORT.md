@@ -199,7 +199,7 @@ and `host` move **only** through `setup-clone` (same allowlist philosophy as
 * `app.json`: description "GitHub *or GitLab* repository", tags add `"gitlab"`,
   `dependencies.commands` add `"glab"`, permissions unchanged
   (`/api/source/pull-request` is the provider-neutral reader);
-* `README.md` / `docs/MANUAL.md`: document the GitLab connect flow
+* `README.md` / `MANUAL.md`: document the GitLab connect flow
   (`https://gitlab.com/<group>/<project>` or a self-managed host listed in
   `dashboard.gitlab_hosts`), `glab auth` requirement, MR vocabulary;
   `PORT_PLAN.md` gains a "GitLab port" addendum; this doc is the reference.

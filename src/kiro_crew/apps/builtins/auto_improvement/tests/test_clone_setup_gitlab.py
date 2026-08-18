@@ -14,6 +14,8 @@ flow into CloneSpec / remote validation.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
 from kiro_crew.apps.builtins.issue_radar.backend import gitlab_client
 
@@ -177,7 +179,7 @@ class TestResolveOriginUrlGitLab:
     def test_setup_result_carries_provider_and_host(self, monkeypatch) -> None:
         monkeypatch.setattr(clone_setup, "_host_is_blocked", lambda _h: False)
         spec = _valid("https://gitlab.com/group/sub/project")
-        result = clone_setup._ok(spec, "/tmp/nowhere", reused=True)
+        result = clone_setup._ok(spec, Path("/tmp/nowhere"), reused=True)
         assert result["provider"] == "gitlab"
         assert result["host"] == "gitlab.com"
         assert result["display"] == "group/sub/project"

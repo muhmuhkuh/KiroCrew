@@ -121,11 +121,14 @@ class TestDraftHappyPath:
         recipe = _recipe(tmp_path, host=host)
         out = recipe.draft(summary="perf: faster", description="body", diff="d", fingerprint="cafe")
         assert out == f"https://{host}/group/proj/-/merge_requests/99"
-        assert "--draft" in seen["cmd"] and "--source-branch" in seen["cmd"]
-        assert "--target-branch" in seen["cmd"] and "main" in seen["cmd"]
+        cmd = seen["cmd"]
+        assert isinstance(cmd, list)
+        assert "--draft" in cmd and "--source-branch" in cmd
+        assert "--target-branch" in cmd and "main" in cmd
         # The resolved host is pinned in the child env — never a glab-config default.
         env = seen["env"]
-        assert env is not None and env["GITLAB_HOST"] == host
+        assert isinstance(env, dict)
+        assert env["GITLAB_HOST"] == host
         # GITLAB_TOKEN is host-unbound: withheld for a self-managed instance.
         assert "GITLAB_TOKEN" not in env
 
@@ -147,8 +150,10 @@ class TestDraftHappyPath:
         recipe = _recipe(tmp_path, host="gitlab.com")
         out = recipe.draft(summary="fix: x", description="body", diff="d", fingerprint="beef")
         assert out == "https://gitlab.com/g/p/-/merge_requests/9"
-        assert seen["env"]["GITLAB_HOST"] == "gitlab.com"
-        assert seen["env"].get("GITLAB_TOKEN") == "supersecret"
+        env = seen["env"]
+        assert isinstance(env, dict)
+        assert env["GITLAB_HOST"] == "gitlab.com"
+        assert env.get("GITLAB_TOKEN") == "supersecret"
 
 
 class TestCliEnv:

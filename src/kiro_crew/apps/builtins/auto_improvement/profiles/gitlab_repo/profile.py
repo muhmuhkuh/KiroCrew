@@ -9,6 +9,8 @@ field is ⑤, the PR/MR recipe. So the GitLab profile is a thin subclass that pi
 
 from __future__ import annotations
 
+from typing import cast
+
 from ..github_repo.profile import GitHubRepoProfile
 from ..github_repo.profile import build_profile as _build_github_profile
 from .pr_recipe import GitLabPRRecipe
@@ -28,4 +30,7 @@ class GitLabRepoProfile(GitHubRepoProfile):
 
 def build_profile(config: dict) -> GitLabRepoProfile:
     """Assemble a :class:`GitLabRepoProfile` from the app's on-disk config."""
-    return _build_github_profile(config or {}, profile_cls=GitLabRepoProfile)
+    profile = _build_github_profile(config or {}, profile_cls=GitLabRepoProfile)
+    # The assembler is annotated with its default class; at runtime it returns an
+    # instance of ``profile_cls``, hence the cast.
+    return cast(GitLabRepoProfile, profile)

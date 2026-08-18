@@ -502,8 +502,10 @@ class TestGitLabPublish:
         monkeypatch.setenv("GITLAB_TOKEN", "tok")
         proc = W._gitlab_ready("https://gitlab.com/g/p/-/merge_requests/5")
         assert proc.returncode == 0
-        assert seen["env"]["GITLAB_HOST"] == "gitlab.com"
-        assert seen["env"]["GITLAB_TOKEN"] == "tok"
+        env = seen["env"]
+        assert isinstance(env, dict)
+        assert env["GITLAB_HOST"] == "gitlab.com"
+        assert env["GITLAB_TOKEN"] == "tok"
 
     def test_gitlab_ready_withholds_token_for_self_managed(
         self, monkeypatch: pytest.MonkeyPatch
@@ -520,8 +522,10 @@ class TestGitLabPublish:
         monkeypatch.setenv("GITLAB_TOKEN", "tok")
         proc = W._gitlab_ready("https://gitlab.example.test/g/p/-/merge_requests/5")
         assert proc.returncode == 0
-        assert seen["env"]["GITLAB_HOST"] == "gitlab.example.test"
-        assert "GITLAB_TOKEN" not in seen["env"]
+        env = seen["env"]
+        assert isinstance(env, dict)
+        assert env["GITLAB_HOST"] == "gitlab.example.test"
+        assert "GITLAB_TOKEN" not in env
 
     def test_a_glab_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import subprocess as sp
@@ -544,11 +548,12 @@ class TestGitLabPublish:
 
         monkeypatch.setattr(W, "auto_publish_enabled", lambda: True)
         seen: list[tuple] = []
-        monkeypatch.setattr(
-            W,
-            "_gh",
-            lambda *a, **k: (seen.append(a) or sp.CompletedProcess([], 0, "", "")),
-        )
+
+        def _fake_gh(*a, **k):  # noqa: ANN002, ANN003
+            seen.append(a)
+            return sp.CompletedProcess([], 0, "", "")
+
+        monkeypatch.setattr(W, "_gh", _fake_gh)
         ok, _ = W.publish_if_authorized("https://github.com/o/r/pull/7", _green())
         assert ok is True
         assert seen == [("pr", "ready", "https://github.com/o/r/pull/7")]
