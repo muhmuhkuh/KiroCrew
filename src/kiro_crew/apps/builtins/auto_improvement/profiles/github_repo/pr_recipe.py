@@ -67,6 +67,8 @@ _PR_URL_RE = re.compile(r"https://(?:www\.)?github\.com/[^\s/]+/[^\s/]+/pull/(\d
 #: Push/network operations are bounded so a hung remote cannot wedge a run.
 _PUSH_TIMEOUT_S = 120.0
 _GH_TIMEOUT_S = 120.0
+#: Bounds a provider-CLI spawn (gh/glab) so a hung remote cannot wedge a run.
+_CLI_TIMEOUT_S = 120.0
 
 
 def _strip_leading_h1(text: str) -> str:
@@ -181,7 +183,20 @@ def _prefer_authenticated_remote(url: str) -> str:
 
 
 class GitHubPRRecipe:
-    """Draft a GitHub PR from a push-disabled clone. Never publishes, never merges."""
+    """Draft a GitHub PR from a push-disabled clone. Never publishes, never merges.
+
+    This is also the shared host-agnostic base for the repo-PR seam: every
+    "draft a reviewable change" step that is identical for GitHub and GitLab
+    (push the one generated branch, fail-closed credential scan, prose
+    redaction, queue degradation) lives here. Subclasses (see
+    ``..gitlab_repo.pr_recipe``) override only the CLI command, the URL
+    extraction, the auth transport and the namespace.
+    """
+
+    #: The provider CLI this recipe drives (``gh`` / ``glab``).
+    cli_name = "gh"
+    #: Namespace label prefix — ``github``, overridden by subclasses (``gitlab``).
+    provider_name = "github"
 
     def __init__(
         self,
@@ -191,14 +206,18 @@ class GitHubPRRecipe:
         pr_queue_dir: Path,
         base_ref: str | None = None,
         fetch_url: str | None = None,
+        host: str | None = None,
     ) -> None:
         #: Display/metadata only — the spine never parses it. For GitHub the
         #: meaningful "namespace" is the authenticated account that owns the PR.
-        self.namespace = f"github/{user}" if user else "github"
+        self.namespace = f"{self.provider_name}/{user}" if user else self.provider_name
         self.user = user
         self.clone_path = Path(clone_path)
         self.pr_queue_dir = Path(pr_queue_dir)
         self.base_ref = base_ref
+        #: The code-host hostname (github.com, or the GitLab instance for the
+        #: GitLab subclass). Used to pin the provider CLI to a specific host.
+        self.host = host or ("github.com" if self.provider_name == "github" else None)
         #: ``gh`` wants a plain branch name for ``--base``; strip the remote prefix.
         self.base_branch = (
             base_ref.split("/", 1)[1] if base_ref and base_ref.startswith("origin/") else base_ref
@@ -239,7 +258,38 @@ class GitHubPRRecipe:
         # do this) cannot be pushed from — degrade to the queue.
         if proc.returncode != 0 or not url or "DISABLED" in url.upper():
             return None
+        return self._prefer_authenticated_fetch_url(url)
+
+    # ── subclass hooks (the host-specific half of the seam) ───────────────────
+
+    def _prefer_authenticated_fetch_url(self, url: str) -> str:
+        """Rewrite the fetch-url transport when the provider CLI prefers SSH.
+
+        GitHub rewrites https→ssh when ``gh`` is configured for SSH. The GitLab
+        subclass returns the URL unchanged (HTTPS via the git credential
+        helper; see ``..gitlab_repo.pr_recipe``).
+        """
         return _prefer_authenticated_remote(url)
+
+    def _cli_env(self) -> dict[str, str] | None:
+        """Extra environment for the provider CLI, or ``None`` to inherit.
+
+        GitHub inherits the gateway environment unchanged (the ``gh`` CLI owns
+        its own auth/config). The GitLab subclass pins ``GITLAB_HOST`` and
+        withholds ``GITLAB_TOKEN`` for self-managed instances.
+        """
+        return None
+
+    def _build_draft_argv(self, *, summary: str, body_path: Path, branch: str) -> list[str]:
+        """The provider CLI argv that opens the DRAFT PR/MR."""
+        cmd = ["gh", *DRAFT_CMD, "--title", summary, "--body-file", str(body_path), "--head", branch]
+        if self.base_branch:
+            cmd += ["--base", self.base_branch]
+        return cmd
+
+    def _extract_url(self, stdout: str) -> str | None:
+        """Pull the first real PR/MR URL out of the provider CLI's stdout."""
+        return extract_pr_url(stdout)
 
     def branch_name(self, *, kind: str, fingerprint: str) -> str:
         """Generated, app-namespaced branch for this fix. Never a human's branch."""
@@ -443,8 +493,8 @@ class GitHubPRRecipe:
             return f"QUEUED:{fingerprint}"
         body_path.write_text(f"# {summary}\n\n{description}\n")
 
-        if shutil.which("gh") is None:
-            logger.info("gh CLI not on PATH — PR queued at %s", body_path)
+        if shutil.which(self.cli_name) is None:
+            logger.info("%s CLI not on PATH — PR queued at %s", self.cli_name, body_path)
             return f"QUEUED:{fingerprint}"
 
         # A PR compares two refs that both exist on the remote, so the fix must be
@@ -456,35 +506,30 @@ class GitHubPRRecipe:
             logger.warning("PR draft degraded to queue for %s: %s", fingerprint, note)
             return f"QUEUED:{fingerprint}"
 
-        cmd = [
-            "gh",
-            *DRAFT_CMD,
-            "--title",
-            summary,
-            "--body-file",
-            str(body_path),
-            "--head",
-            branch,
-        ]
-        if self.base_branch:
-            cmd += ["--base", self.base_branch]
+        cmd = self._build_draft_argv(summary=summary, body_path=body_path, branch=branch)
         try:
             proc = subprocess.run(
                 cmd,
                 cwd=str(self.clone_path),
                 capture_output=True,
                 text=True,
-                timeout=_GH_TIMEOUT_S,
+                timeout=_CLI_TIMEOUT_S,
+                env=self._cli_env(),
             )
         except (FileNotFoundError, subprocess.SubprocessError) as exc:
-            logger.warning("gh pr create failed to launch for %s: %s", fingerprint, exc)
+            logger.warning(
+                "%s create failed to launch for %s: %s", self.cli_name, fingerprint, exc
+            )
             return f"QUEUED:{fingerprint}"
         if proc.returncode != 0:
             logger.warning(
-                "gh pr create failed for %s: %s", fingerprint, (proc.stderr or "").strip()[:200]
+                "%s create failed for %s: %s",
+                self.cli_name,
+                fingerprint,
+                (proc.stderr or "").strip()[:200],
             )
             return f"QUEUED:{fingerprint}"
-        return extract_pr_url(proc.stdout or "") or f"QUEUED:{fingerprint}"
+        return self._extract_url(proc.stdout or "") or f"QUEUED:{fingerprint}"
 
 
 def _kind_of(summary: str) -> str:

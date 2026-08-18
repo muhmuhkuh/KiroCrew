@@ -442,3 +442,113 @@ class TestAutoPublishIsActuallyReachable:
 
         src = inspect.getsource(pr_watchers.PRWatcherRegistry.reconcile_failing_prs)
         assert "publish_if_authorized(" in src, "autoPublish is a dead switch again"
+
+
+class TestGitLabPublish:
+    """`publish_if_authorized` must mark a GitLab MR ready via glab — and nothing else."""
+
+    def test_gitlab_mr_goes_through_glab_mr_update_ready(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as sp
+
+        monkeypatch.setattr(W, "auto_publish_enabled", lambda: True)
+        seen: list[tuple] = []
+
+        def _fake_glab(*args: str, **_kw: object) -> sp.CompletedProcess:
+            seen.append(args)
+            return sp.CompletedProcess(args=list(args), returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(W, "_gitlab_ready", _fake_glab)
+        ok, _ = W.publish_if_authorized(
+            "https://gitlab.com/group/sub/project/-/merge_requests/9", _green()
+        )
+        assert ok is True
+        assert seen == [("https://gitlab.com/group/sub/project/-/merge_requests/9",)]
+
+    def test_gitlab_publish_is_ready_only_never_merge(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as sp
+
+        monkeypatch.setattr(W, "auto_publish_enabled", lambda: True)
+        seen: list[list[str]] = []
+
+        def _fake_run(cmd, **kw):  # noqa: ANN001
+            seen.append(list(cmd))
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(W.subprocess, "run", _fake_run)
+        monkeypatch.setenv("GITLAB_TOKEN", "tok")
+        ok, _ = W.publish_if_authorized(
+            "https://gitlab.com/group/sub/project/-/merge_requests/9", _green()
+        )
+        assert ok is True
+        assert seen and seen[0][:2] == ["glab", "mr"]
+        assert "--ready" in seen[0]
+        assert "--draft" not in seen[0]
+        assert not any("merge" in a for call in seen for a in call if a != "mr")
+
+    def test_gitlab_ready_pins_the_host_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import subprocess as sp
+
+        seen: dict[str, object] = {}
+
+        def _fake_run(cmd, **kw):  # noqa: ANN001
+            seen["env"] = kw.get("env")
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(W.subprocess, "run", _fake_run)
+        monkeypatch.setenv("GITLAB_TOKEN", "tok")
+        proc = W._gitlab_ready("https://gitlab.com/g/p/-/merge_requests/5")
+        assert proc.returncode == 0
+        assert seen["env"]["GITLAB_HOST"] == "gitlab.com"
+        assert seen["env"]["GITLAB_TOKEN"] == "tok"
+
+    def test_gitlab_ready_withholds_token_for_self_managed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess as sp
+
+        seen: dict[str, object] = {}
+
+        def _fake_run(cmd, **kw):  # noqa: ANN001
+            seen["env"] = kw.get("env")
+            return sp.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(W.subprocess, "run", _fake_run)
+        monkeypatch.setenv("GITLAB_TOKEN", "tok")
+        proc = W._gitlab_ready("https://gitlab.example.test/g/p/-/merge_requests/5")
+        assert proc.returncode == 0
+        assert seen["env"]["GITLAB_HOST"] == "gitlab.example.test"
+        assert "GITLAB_TOKEN" not in seen["env"]
+
+    def test_a_glab_failure_is_reported_not_raised(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import subprocess as sp
+
+        monkeypatch.setattr(W, "auto_publish_enabled", lambda: True)
+        monkeypatch.setattr(
+            W,
+            "_gitlab_ready",
+            lambda *a, **k: sp.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="no auth"
+            ),
+        )
+        ok, reason = W.publish_if_authorized(
+            "https://gitlab.com/g/p/-/merge_requests/7", _green()
+        )
+        assert ok is False and "glab mr update --ready failed" in reason
+
+    def test_github_prs_still_go_through_gh(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import subprocess as sp
+
+        monkeypatch.setattr(W, "auto_publish_enabled", lambda: True)
+        seen: list[tuple] = []
+        monkeypatch.setattr(
+            W,
+            "_gh",
+            lambda *a, **k: (seen.append(a) or sp.CompletedProcess([], 0, "", "")),
+        )
+        ok, _ = W.publish_if_authorized("https://github.com/o/r/pull/7", _green())
+        assert ok is True
+        assert seen == [("pr", "ready", "https://github.com/o/r/pull/7")]

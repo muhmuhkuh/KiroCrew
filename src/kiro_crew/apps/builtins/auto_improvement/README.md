@@ -1,6 +1,6 @@
 # Auto-Improvement
 
-Measures a GitHub repository before it changes it.
+Measures a GitHub or GitLab repository before it changes it.
 
 Most "AI improves your code" loops optimize whatever their metric happens to
 report, which means a noisy or wrong metric produces confident nonsense. This app
@@ -35,7 +35,7 @@ blocks the run.
 | D · Measure | serial pinned interleaved A/B, median not mean | deterministic |
 | D' · Bug gate | RED×2 on base → GREEN on fix → whole suite stays green | deterministic |
 | E · Keep or revert | accept only if the win clears the noise band | deterministic |
-| F · Draft PR | second independent reproduce, then `gh pr create --draft` | deterministic |
+| F · Draft PR/MR | second independent reproduce, then `gh pr create --draft` / `glab mr create --draft` | deterministic |
 
 Every phase that decides anything is deterministic Python. The agent proposes; it
 never grades its own work.
@@ -70,7 +70,7 @@ not fill the chat surface with agent cards.
 ## Requirements
 
 - `git` and an authenticated `gh` CLI on the gateway host
-- A GitHub repository you can open pull requests against
+- A GitHub or GitLab repository you can open pull/merge requests against
 
 ## Layout
 
@@ -83,6 +83,7 @@ backend/
 spine/              the target-agnostic engine (driver, gate, measurer, keeper…)
 profiles/
   github_repo/      the GitHub target profile (PR recipe lives here)
+  gitlab_repo/      the GitLab target profile (MR recipe lives here)
 skills/             ai-discover, metric-design
 agents/             discovery, pr-author
 docs/MANUAL.md      user manual — how to run it, read findings, and configure it

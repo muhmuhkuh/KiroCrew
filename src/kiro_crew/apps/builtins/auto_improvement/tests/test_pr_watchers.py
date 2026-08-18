@@ -845,3 +845,31 @@ class TestWorkItems:
 
     def test_clean_status_has_no_work_items(self) -> None:
         assert pr_watchers._work_items(_status(failing=[])) == []
+
+
+class TestNudgePromptGitLab:
+    """A watched GitLab MR must be taught glab verbs and glab's own limits."""
+
+    @staticmethod
+    def _prompt(pr: str) -> str:
+        st = pr_watchers.WatcherState(fp="fp", pr=pr)
+        return pr_watchers.build_nudge_prompt(st, "/tmp/clone", _status())
+
+    def test_gitlab_mr_uses_glab_verbs(self) -> None:
+        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
+        assert "glab mr view" in prompt
+        assert "glab ci status" in prompt
+        assert "gh pr view" not in prompt
+
+    def test_gitlab_limits_forbid_merging_and_ready(self) -> None:
+        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
+        low = prompt.lower()
+        assert "glab mr merge" in low
+        assert "glab mr update --ready" in low
+        assert "never push" in low
+        assert "gh pr ready" not in low
+
+    def test_github_prompt_still_uses_gh(self) -> None:
+        prompt = self._prompt("https://github.com/owner/repo/pull/7")
+        assert "gh pr view" in prompt
+        assert "glab mr view" not in prompt
