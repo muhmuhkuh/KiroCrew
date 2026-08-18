@@ -165,6 +165,7 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "agent",
         "model",
         "reasoning_effort",
+        "ponytail",
         "mode",
         "workspace",
         "project",

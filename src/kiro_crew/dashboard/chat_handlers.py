@@ -81,6 +81,7 @@ from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_no
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
 from kiro_crew.history import carry_provenance, is_incognito_transcript
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.ponytail import PONYTAIL_OVERRIDE_VALUES
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
 from kiro_crew.safety_override import safety_override
@@ -3564,6 +3565,38 @@ async def api_chat_slot_reload(request: web.Request) -> web.Response:
     schedule_eager_spawn(state, slot, allow_resume=True)
     state.push_slots_update()
     return web.json_response({"ok": True})
+
+
+async def api_chat_slot_ponytail(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/ponytail — set a chat Ponytail override.
+
+    ``""`` clears the per-chat override and resumes the live global default.
+    The prompt layer reads this value on the next turn; changing it never
+    interrupts or rewrites the currently running turn.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found"}, status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    ponytail = body.get("ponytail", "")
+    if not isinstance(ponytail, str) or ponytail not in PONYTAIL_OVERRIDE_VALUES:
+        return web.json_response(
+            {"error": f"ponytail must be one of: {', '.join(sorted(PONYTAIL_OVERRIDE_VALUES))}"},
+            status=400,
+        )
+    if slot.ponytail == ponytail:
+        return web.json_response({"ok": True, "ponytail": ponytail})
+    slot.ponytail = ponytail
+    logger.info("Slot %s Ponytail override switched to %r", name, ponytail or "global default")
+    state.push_slots_update()
+    return web.json_response({"ok": True, "ponytail": ponytail})
 
 
 async def api_chat_slot_workspace(request: web.Request) -> web.Response:

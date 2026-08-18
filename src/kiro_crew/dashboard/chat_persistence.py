@@ -38,6 +38,7 @@ from kiro_crew.history import (
     update_metadata_off_loop,
 )
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.ponytail import PONYTAIL_OVERRIDE_VALUES
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import ARTIFACT_SLUG_RE
 
@@ -189,6 +190,15 @@ def _validate_reasoning_effort(raw: object) -> str:
         return raw
     if raw:
         logger.warning("Discarding invalid persisted reasoning_effort: %r", raw)
+    return ""
+
+
+def _validate_ponytail(raw: object) -> str:
+    """Return a valid persisted slot override, or the inheritance sentinel."""
+    if isinstance(raw, str) and raw in PONYTAIL_OVERRIDE_VALUES:
+        return raw
+    if raw:
+        logger.warning("Discarding invalid persisted ponytail mode: %r", raw)
     return ""
 
 
@@ -560,6 +570,8 @@ def _rehydrate_slot_from_history(
                 logger.debug("Failed to resolve model for rehydrated slot %s", slot_name, exc_info=True)
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+        if meta.get("ponytail") is not None:
+            slot.ponytail = _validate_ponytail(meta["ponytail"])
         if meta.get("workspace"):
             slot.workspace = meta["workspace"]
         if meta.get("project"):
@@ -927,6 +939,8 @@ def _restore_recent_sessions_steps(
                 )
         if meta.get("reasoning_effort"):
             slot.reasoning_effort = _validate_reasoning_effort(meta["reasoning_effort"])
+        if meta.get("ponytail") is not None:
+            slot.ponytail = _validate_ponytail(meta["ponytail"])
         if meta.get("workspace"):
             slot.workspace = meta["workspace"]
         if meta.get("project"):
@@ -1810,6 +1824,8 @@ def _save_slot_to_history(
             meta_line["model"] = slot.model
             if slot.reasoning_effort:
                 meta_line["reasoning_effort"] = slot.reasoning_effort
+            if slot.ponytail:
+                meta_line["ponytail"] = slot.ponytail
             if slot.mode:
                 meta_line["mode"] = slot.mode
             if slot.workspace and slot.workspace != "default":

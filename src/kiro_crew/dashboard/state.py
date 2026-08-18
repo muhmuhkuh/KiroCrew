@@ -1349,6 +1349,7 @@ class _ChatSlot:
         "agent",
         "model",
         "reasoning_effort",
+        "ponytail",
         "mode",
         "workspace",
         "project",
@@ -1486,6 +1487,10 @@ class _ChatSlot:
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
+        # "" = inherit the live global default; otherwise one of off/lite/full/ultra.
+        # The context builder resolves this on every turn, so a global change applies
+        # to the next turn without restarting the gateway.
+        self.ponytail: str = ""
         # "" = default chat, "orchestrator" = orchestrated chat
         self.mode = mode
         self.workspace = workspace
@@ -2785,6 +2790,7 @@ class _ChatSlot:
             "agent": self.agent,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "ponytail": self.ponytail,
             "mode": self.mode,
             # Forward-compat alias of `mode` for the frontend's surface
             # registry. Today every slot's surface is identical to its mode

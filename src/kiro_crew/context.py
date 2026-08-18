@@ -31,6 +31,7 @@ from kiro_crew.hooks import (
 from kiro_crew.learn import LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.metrics.provider import get_recorder
+from kiro_crew.ponytail import PONYTAIL_DEFAULT, render_ponytail_mode, resolve_ponytail
 from kiro_crew.security import (
     audit_injection_dropped,
     contains_injection,

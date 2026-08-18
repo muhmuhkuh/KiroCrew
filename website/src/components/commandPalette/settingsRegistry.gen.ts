@@ -156,6 +156,14 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "occurrence": 1
   },
   {
+    "id": "chat.default-ponytail-mode",
+    "label": "Default Ponytail mode",
+    "description": "Choose the coding-style default for new chats. Each chat can override it in the header.",
+    "tab": "chat",
+    "type": "select",
+    "occurrence": 1
+  },
+  {
     "id": "chat.default-reasoning-effort",
     "label": "Default Reasoning Effort",
     "labelKey": "pages.settings.chatPanel.default_reasoning_effort",

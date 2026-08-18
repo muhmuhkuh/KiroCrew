@@ -4837,7 +4837,19 @@
           "pin_this_chat_to_the_top": "এই চ্যাট উপরে পিন করো",
           "remove_pin_from_this_chat": "এই চ্যাট থেকে পিন সরাও",
           "start_a_fresh_chat": "নতুন একটি চ্যাট শুরু করো",
-          "unpin_current_session": "বর্তমান সেশনের পিন সরাও"
+          "unpin_current_session": "বর্তমান সেশনের পিন সরাও",
+          "disable_ponytail": "Disable Ponytail",
+          "disable_ponytail_description": "Turn Ponytail off for this chat on the next turn.",
+          "enable_ponytail": "Enable Ponytail",
+          "enable_ponytail_description": "Use the full Ponytail mode for this chat on the next turn.",
+          "set_ponytail_full": "Set Ponytail: Full",
+          "set_ponytail_full_description": "Use the complete minimal-change ladder in this chat.",
+          "set_ponytail_lite": "Set Ponytail: Lite",
+          "set_ponytail_lite_description": "Keep coding changes lean in this chat.",
+          "set_ponytail_ultra": "Set Ponytail: Ultra",
+          "set_ponytail_ultra_description": "Challenge speculative work in this chat.",
+          "use_global_ponytail_default": "Use global Ponytail default",
+          "use_global_ponytail_default_description": "Clear this chat’s override and follow Settings → Chat."
         },
         "allAggregator": {
           "all": "সব"
@@ -5971,6 +5983,22 @@
       "smarter": "আরও বুদ্ধিমান",
       "use_configured_default": "কনফিগার করা ডিফল্ট ব্যবহার করুন",
       "use_model_default": "মডেলের ডিফল্ট ব্যবহার করুন"
+    },
+    "ponytailModeDropdown": {
+      "active_mode": "Active Ponytail: {{mode}}",
+      "change_mode": "Change Ponytail mode",
+      "chat_override": "This chat has its own override",
+      "full": "Full",
+      "full_description": "Use the complete minimal-change ladder.",
+      "lite": "Lite",
+      "lite_description": "Keep changes lean and mention simpler alternatives.",
+      "off": "Off",
+      "off_description": "Do not inject Ponytail coding guidance.",
+      "ponytail": "Ponytail",
+      "ultra": "Ultra",
+      "ultra_description": "Challenge speculative work and prefer deletion.",
+      "use_global_default": "Use global default",
+      "using_global_default": "Using global default: {{mode}}"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "টিম-নির্দিষ্ট অ্যাপ খুঁজে পেতে প্রতিষ্ঠানের একটি রেজিস্ট্রি যোগ করুন",
@@ -10521,7 +10549,11 @@
         "which_model_new_sessions_start_with_pick_a_model": "কোনো এজেন্ট নিজের মডেল না বাঁধলে নতুন সেশন কোন মডেল দিয়ে শুরু হবে। প্রতিটি এজেন্টের জন্য মডেল ঠিক করতে এজেন্ট সক্ষমতা → এজেন্ট-এ যাও, বা কোনো নির্দিষ্ট সেশনে তা বদলাতে সেই সেশনের ভিতরে একটি মডেল বেছে নাও।",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "প্যারেন্ট সেশনে সাবএজেন্টের সমাপ্তি ইভেন্ট ইনজেক্ট করার সময় তার স্ট্রিমের কোন অংশ রাখা হবে। Head শুরুর অংশ রাখে (ডিফল্ট, পুরোনো আচরণের সঙ্গে মেলে)। Tail চূড়ান্ত সারসংক্ষেপ রাখে। Both দুই প্রান্ত থেকেই একটি অংশ রাখে এবং মাঝে একটি মার্কার বসায়।",
         "widget_density": "উইজেট ঘনত্ব",
-        "your_role": "আপনার ভূমিকা"
+        "your_role": "আপনার ভূমিকা",
+        "default_ponytail_mode": "Default Ponytail mode",
+        "default_ponytail_mode_description": "Choose the coding-style default for new chats. Each chat can override it in the header.",
+        "default_ponytail_mode_hint": "Applies on the next turn without restarting the gateway. Safety rules and explicit requests always take precedence.",
+        "failed_to_save_default_ponytail": "Failed to save the default Ponytail mode"
       },
       "computerUsePanel": {
         "accessibility": "সহজগম্যতা",

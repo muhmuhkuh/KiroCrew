@@ -4655,6 +4655,7 @@ async def _run_chat(
                 memory_store=memory_store,
                 compressed_history=compressed,
                 mode=slot.mode,
+                ponytail_mode=slot.ponytail,
                 blocks_reads=slot.blocks_reads,
                 provider_type=cfg.agent.provider,
                 runtime_source="dashboard",

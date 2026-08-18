@@ -8,6 +8,7 @@ import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effor
 import { isMac } from '../../utils/platform'
 import { capRoleOther, clampRoleOther } from '../../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../../lib/profileOptions'
+import { PONYTAIL_MODES, normalizePonytail, type PonytailMode } from '../../lib/ponytail'
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -65,6 +66,17 @@ const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
 
 type VerbosityLevel = 'default' | 'concise' | 'ultra'
 const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra']
+
+function ponytailLabels(): string[] {
+  return PONYTAIL_MODES.map(mode => {
+    switch (mode) {
+      case 'off': return i18nT('components.ponytailModeDropdown.off')
+      case 'lite': return i18nT('components.ponytailModeDropdown.lite')
+      case 'full': return i18nT('components.ponytailModeDropdown.full')
+      case 'ultra': return i18nT('components.ponytailModeDropdown.ultra')
+    }
+  })
+}
 
 /**
  * Narrow a persisted `dashboard.verbosity` to a level this Select can render.
@@ -157,6 +169,7 @@ export function ChatPanel() {
       role_models?: { background?: string; subagent?: string }
       role_efforts?: { background?: string; subagent?: string }
       reasoning_effort?: string
+      ponytail?: string
       soft_stop_budget_secs?: number
       completion_keep?: CompletionKeepMode
       completion_keep_chars?: number
@@ -296,6 +309,13 @@ export function ChatPanel() {
     onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_reasoning_effort')),
   })
 
+  const defaultPonytail = normalizePonytail(mcCfg?.agent?.ponytail)
+  const defaultPonytailMut = useMutation({
+    mutationFn: (v: PonytailMode) => api.patchConfig('agent.ponytail', v),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_ponytail')),
+  })
+
   // ── Per-role model defaults (agent.role_models) ──
   // Same picker as the chat default above; "auto" (or unset) means "inherit the
   // chat default". Lets an operator run background (lite / heartbeat) or
@@ -403,6 +423,16 @@ export function ChatPanel() {
             optionLabels={effortLabels}
             onChange={v => defaultEffortMut.mutate(v)}
             disabled={!mcQ.isSuccess || !effortSupported}
+          />
+          <SettingsSelect
+            label={i18nT('pages.settings.chatPanel.default_ponytail_mode')}
+            description={i18nT('pages.settings.chatPanel.default_ponytail_mode_description')}
+            hint={i18nT('pages.settings.chatPanel.default_ponytail_mode_hint')}
+            value={defaultPonytail}
+            options={[...PONYTAIL_MODES]}
+            optionLabels={ponytailLabels()}
+            onChange={v => defaultPonytailMut.mutate(v as PonytailMode)}
+            disabled={!mcQ.isSuccess}
           />
         </SettingsCard>
 

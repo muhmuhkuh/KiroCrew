@@ -4910,7 +4910,19 @@
           "pin_this_chat_to_the_top": "Épingler ce chat en haut de la liste",
           "remove_pin_from_this_chat": "Retirer l’épingle de ce chat",
           "start_a_fresh_chat": "Démarrer un nouveau chat",
-          "unpin_current_session": "Désépingler la session actuelle"
+          "unpin_current_session": "Désépingler la session actuelle",
+          "disable_ponytail": "Disable Ponytail",
+          "disable_ponytail_description": "Turn Ponytail off for this chat on the next turn.",
+          "enable_ponytail": "Enable Ponytail",
+          "enable_ponytail_description": "Use the full Ponytail mode for this chat on the next turn.",
+          "set_ponytail_full": "Set Ponytail: Full",
+          "set_ponytail_full_description": "Use the complete minimal-change ladder in this chat.",
+          "set_ponytail_lite": "Set Ponytail: Lite",
+          "set_ponytail_lite_description": "Keep coding changes lean in this chat.",
+          "set_ponytail_ultra": "Set Ponytail: Ultra",
+          "set_ponytail_ultra_description": "Challenge speculative work in this chat.",
+          "use_global_ponytail_default": "Use global Ponytail default",
+          "use_global_ponytail_default_description": "Clear this chat’s override and follow Settings → Chat."
         },
         "allAggregator": {
           "all": "Tout"
@@ -6058,6 +6070,22 @@
       "smarter": "Plus intelligent",
       "use_configured_default": "Utiliser la valeur par défaut configurée",
       "use_model_default": "Utiliser la valeur par défaut du modèle"
+    },
+    "ponytailModeDropdown": {
+      "active_mode": "Active Ponytail: {{mode}}",
+      "change_mode": "Change Ponytail mode",
+      "chat_override": "This chat has its own override",
+      "full": "Full",
+      "full_description": "Use the complete minimal-change ladder.",
+      "lite": "Lite",
+      "lite_description": "Keep changes lean and mention simpler alternatives.",
+      "off": "Off",
+      "off_description": "Do not inject Ponytail coding guidance.",
+      "ponytail": "Ponytail",
+      "ultra": "Ultra",
+      "ultra_description": "Challenge speculative work and prefer deletion.",
+      "use_global_default": "Use global default",
+      "using_global_default": "Using global default: {{mode}}"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Ajoutez un registre d'organisation pour découvrir les applications propres à votre équipe",
@@ -10642,7 +10670,11 @@
         "which_model_new_sessions_start_with_pick_a_model": "Le modèle avec lequel démarrent les nouvelles sessions quand leur agent n’en fixe aucun. Définis un modèle pour chaque agent dans Capacités de l’agent → Agents, ou choisis-en un dans une session pour le remplacer localement.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Quelle partie du flux d'un sous-agent conserver lors de l'injection de son événement de fin dans la session parente. Début conserve le commencement (par défaut, correspond au comportement historique). Fin conserve le résumé final. Les deux conserve une tranche à chaque extrémité, avec un marqueur entre elles.",
         "widget_density": "Densité des widgets",
-        "your_role": "Votre rôle"
+        "your_role": "Votre rôle",
+        "default_ponytail_mode": "Default Ponytail mode",
+        "default_ponytail_mode_description": "Choose the coding-style default for new chats. Each chat can override it in the header.",
+        "default_ponytail_mode_hint": "Applies on the next turn without restarting the gateway. Safety rules and explicit requests always take precedence.",
+        "failed_to_save_default_ponytail": "Failed to save the default Ponytail mode"
       },
       "computerUsePanel": {
         "accessibility": "Accessibilité",

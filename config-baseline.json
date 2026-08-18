@@ -20,6 +20,7 @@
         "role_models": {},
         "role_efforts": {},
         "reasoning_effort": "",
+        "ponytail": "full",
         "provider": "acp",
         "default_agent": "",
         "sandbox": "off",
@@ -185,6 +186,25 @@
         "max"
       ],
       "defaultValue": ""
+    },
+    {
+      "path": "agent.ponytail",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Ponytail Mode",
+      "help": "Default coding-style mode: off, lite, full, or ultra. A per-chat override wins for that chat; safety and explicit user instructions always take precedence.",
+      "hasChildren": false,
+      "enumValues": [
+        "off",
+        "lite",
+        "full",
+        "ultra"
+      ],
+      "defaultValue": "full"
     },
     {
       "path": "agent.provider",

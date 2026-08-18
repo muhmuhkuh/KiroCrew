@@ -43,6 +43,7 @@ from kiro_crew.dashboard.token_auth import MAX_SESSION_TTL_SECS, generate_token,
 from kiro_crew.effort import EFFORT_LEVELS
 from kiro_crew.executors import discovery_executor
 from kiro_crew.metrics import provider as _metrics_provider
+from kiro_crew.ponytail import PONYTAIL_LEVELS
 from kiro_crew.security_posture import build_posture_snapshot_async, posture_counts_async
 from kiro_crew.transcribe import BREW_PATH_DIRS, ensure_ffmpeg_in_path, find_brew, is_available
 
@@ -1619,6 +1620,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
         "validate_fn": _validate_role_model,
     },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
+    "agent.ponytail": {"type": "enum", "values": list(PONYTAIL_LEVELS)},
     # Per-role reasoning effort, paired with role_models. Same enum as the chat
     # default; "" = inherit. Applies only on reasoning-capable models.
     "agent.role_efforts.background": {"type": "enum", "values": ["", *EFFORT_LEVELS]},

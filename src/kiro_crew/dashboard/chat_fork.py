@@ -212,6 +212,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     )
     new_slot.forked_from = effective_session_key(slot)
     new_slot.reasoning_effort = slot.reasoning_effort
+    new_slot.ponytail = slot.ponytail
     # Inherit project folder so the fork appears next to its parent in the sidebar.
     new_slot.folder_id = slot.folder_id
     parent_title = slot.title if slot._titled else "Untitled"

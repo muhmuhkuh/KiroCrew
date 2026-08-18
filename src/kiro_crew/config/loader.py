@@ -115,6 +115,7 @@ from kiro_crew.instances.constants import (
     RECOVER_BACKOFF_MAX_CEILING_SECS as _RECOVER_BACKOFF_CEILING,
 )
 from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
+from kiro_crew.ponytail import PONYTAIL_DEFAULT, PONYTAIL_LEVELS, normalize_ponytail
 
 logger = logging.getLogger(__name__)
 
@@ -1241,6 +1242,16 @@ class AgentConfig:
             enum=["", *EFFORT_LEVELS],
         ),
     )
+    ponytail: str = field(
+        default=PONYTAIL_DEFAULT,
+        metadata=_meta(
+            "Ponytail Mode",
+            "Default coding-style mode: off, lite, full, or ultra. A per-chat "
+            "override wins for that chat; safety and explicit user instructions "
+            "always take precedence.",
+            enum=list(PONYTAIL_LEVELS),
+        ),
+    )
     provider: str = field(
         default="acp",
         metadata=_meta("Provider", "LLM provider backend (KiroACP / kiro-cli).", enum=["acp"]),
@@ -1700,6 +1711,7 @@ class AgentConfig:
         # feeds coerced input.
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
+        self.ponytail = normalize_ponytail(self.ponytail)
 
     def resolve_model(self, role: str) -> str:
         """Effective model id for a task ``role`` — INDEPENDENT of the chat model.
@@ -6027,6 +6039,9 @@ class KiroCrewConfig:
                 role_models=coerce_role_models(agent_data.get("role_models")),
                 role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
                 reasoning_effort=agent_data.get("reasoning_effort", ""),
+                ponytail=normalize_ponytail(
+                    agent_data.get("ponytail", PONYTAIL_DEFAULT)
+                ),
                 provider=agent_data.get("provider", "acp"),
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),

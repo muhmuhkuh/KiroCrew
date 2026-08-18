@@ -4764,7 +4764,19 @@
           "pin_this_chat_to_the_top": "이 채팅을 맨 위에 고정",
           "remove_pin_from_this_chat": "이 채팅의 고정 해제",
           "start_a_fresh_chat": "새 채팅 시작",
-          "unpin_current_session": "현재 세션 고정 해제"
+          "unpin_current_session": "현재 세션 고정 해제",
+          "disable_ponytail": "Disable Ponytail",
+          "disable_ponytail_description": "Turn Ponytail off for this chat on the next turn.",
+          "enable_ponytail": "Enable Ponytail",
+          "enable_ponytail_description": "Use the full Ponytail mode for this chat on the next turn.",
+          "set_ponytail_full": "Set Ponytail: Full",
+          "set_ponytail_full_description": "Use the complete minimal-change ladder in this chat.",
+          "set_ponytail_lite": "Set Ponytail: Lite",
+          "set_ponytail_lite_description": "Keep coding changes lean in this chat.",
+          "set_ponytail_ultra": "Set Ponytail: Ultra",
+          "set_ponytail_ultra_description": "Challenge speculative work in this chat.",
+          "use_global_ponytail_default": "Use global Ponytail default",
+          "use_global_ponytail_default_description": "Clear this chat’s override and follow Settings → Chat."
         },
         "allAggregator": {
           "all": "전체"
@@ -5884,6 +5896,22 @@
       "smarter": "똑똑하게",
       "use_configured_default": "설정된 기본값 사용",
       "use_model_default": "모델 기본값 사용"
+    },
+    "ponytailModeDropdown": {
+      "active_mode": "Active Ponytail: {{mode}}",
+      "change_mode": "Change Ponytail mode",
+      "chat_override": "This chat has its own override",
+      "full": "Full",
+      "full_description": "Use the complete minimal-change ladder.",
+      "lite": "Lite",
+      "lite_description": "Keep changes lean and mention simpler alternatives.",
+      "off": "Off",
+      "off_description": "Do not inject Ponytail coding guidance.",
+      "ponytail": "Ponytail",
+      "ultra": "Ultra",
+      "ultra_description": "Challenge speculative work and prefer deletion.",
+      "use_global_default": "Use global default",
+      "using_global_default": "Using global default: {{mode}}"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "조직 레지스트리를 추가하여 팀 전용 앱을 찾아보세요",
@@ -10399,7 +10427,11 @@
         "which_model_new_sessions_start_with_pick_a_model": "에이전트가 모델을 고정하지 않았을 때 새 세션이 시작할 모델입니다. 에이전트 기능 → 에이전트에서 에이전트별로 모델을 설정하거나, 세션 안에서 모델을 선택해 재정의하세요.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "서브에이전트의 완료 이벤트를 상위 세션에 삽입할 때 스트림의 어느 부분을 유지할지 결정합니다. ‘앞부분’은 스트림 시작을 유지합니다(기본값, 기존 동작과 동일). ‘끝부분’은 최종 요약을 유지합니다. ‘양쪽’은 양 끝에서 일부를 유지하고 그 사이에 표시를 넣습니다.",
         "widget_density": "위젯 밀도",
-        "your_role": "사용자 역할"
+        "your_role": "사용자 역할",
+        "default_ponytail_mode": "Default Ponytail mode",
+        "default_ponytail_mode_description": "Choose the coding-style default for new chats. Each chat can override it in the header.",
+        "default_ponytail_mode_hint": "Applies on the next turn without restarting the gateway. Safety rules and explicit requests always take precedence.",
+        "failed_to_save_default_ponytail": "Failed to save the default Ponytail mode"
       },
       "computerUsePanel": {
         "accessibility": "손쉬운 사용",

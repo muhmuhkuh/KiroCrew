@@ -4983,7 +4983,19 @@
           "pin_this_chat_to_the_top": "Закрепить этот чат наверху",
           "remove_pin_from_this_chat": "Снять закрепление с этого чата",
           "start_a_fresh_chat": "Начать новый чат",
-          "unpin_current_session": "Открепить текущую сессию"
+          "unpin_current_session": "Открепить текущую сессию",
+          "disable_ponytail": "Disable Ponytail",
+          "disable_ponytail_description": "Turn Ponytail off for this chat on the next turn.",
+          "enable_ponytail": "Enable Ponytail",
+          "enable_ponytail_description": "Use the full Ponytail mode for this chat on the next turn.",
+          "set_ponytail_full": "Set Ponytail: Full",
+          "set_ponytail_full_description": "Use the complete minimal-change ladder in this chat.",
+          "set_ponytail_lite": "Set Ponytail: Lite",
+          "set_ponytail_lite_description": "Keep coding changes lean in this chat.",
+          "set_ponytail_ultra": "Set Ponytail: Ultra",
+          "set_ponytail_ultra_description": "Challenge speculative work in this chat.",
+          "use_global_ponytail_default": "Use global Ponytail default",
+          "use_global_ponytail_default_description": "Clear this chat’s override and follow Settings → Chat."
         },
         "allAggregator": {
           "all": "Все"
@@ -6145,6 +6157,22 @@
       "smarter": "Умнее",
       "use_configured_default": "Использовать заданное по умолчанию",
       "use_model_default": "Использовать значение модели по умолчанию"
+    },
+    "ponytailModeDropdown": {
+      "active_mode": "Active Ponytail: {{mode}}",
+      "change_mode": "Change Ponytail mode",
+      "chat_override": "This chat has its own override",
+      "full": "Full",
+      "full_description": "Use the complete minimal-change ladder.",
+      "lite": "Lite",
+      "lite_description": "Keep changes lean and mention simpler alternatives.",
+      "off": "Off",
+      "off_description": "Do not inject Ponytail coding guidance.",
+      "ponytail": "Ponytail",
+      "ultra": "Ultra",
+      "ultra_description": "Challenge speculative work and prefer deletion.",
+      "use_global_default": "Use global default",
+      "using_global_default": "Using global default: {{mode}}"
     },
     "registryManager": {
       "add_an_org_registry_to_discover_team_specific_ap": "Добавьте реестр организации, чтобы находить приложения вашей команды",
@@ -10763,7 +10791,11 @@
         "which_model_new_sessions_start_with_pick_a_model": "С какой моделью начинаются новые сессии, если их агент не закрепил свою. Задай модель для каждого агента в «Возможности агента → Агенты» или выбери модель внутри сессии, чтобы переопределить её там.",
         "which_part_of_a_subagent_s_stream_to_keep_when_i": "Какую часть потока субагента сохранять при вставке события завершения в родительскую сессию. «Начало» сохраняет начало (по умолчанию, как в прежнем поведении). «Хвост» сохраняет итоговую сводку. «Оба» сохраняет по фрагменту с каждого конца с маркером между ними.",
         "widget_density": "Плотность виджетов",
-        "your_role": "Ваша роль"
+        "your_role": "Ваша роль",
+        "default_ponytail_mode": "Default Ponytail mode",
+        "default_ponytail_mode_description": "Choose the coding-style default for new chats. Each chat can override it in the header.",
+        "default_ponytail_mode_hint": "Applies on the next turn without restarting the gateway. Safety rules and explicit requests always take precedence.",
+        "failed_to_save_default_ponytail": "Failed to save the default Ponytail mode"
       },
       "computerUsePanel": {
         "accessibility": "Универсальный доступ",

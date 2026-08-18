@@ -99,6 +99,7 @@ import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutSto
 import { modelSupportsEffort } from '../lib/effort'
 import { isEmbeddedPane } from '../lib/embedded'
 import { displayModel, pinIsWithheld } from '../lib/model'
+import { normalizePonytail } from '../lib/ponytail'
 import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
@@ -109,6 +110,7 @@ import type { FollowupItem } from '../store/chatSlice'
 // the selector would make it a new reference on every store update.
 const EMPTY_FOLLOWUPS: Record<string, { items: FollowupItem[]; ts: number }> = {}
 import ReasoningEffortDropdown from '../components/ReasoningEffortDropdown'
+import PonytailModeDropdown from '../components/PonytailModeDropdown'
 import FlyingQuote from '../components/FlyingQuote'
 import { useMessageSearch } from '../hooks/useMessageSearch'
 import SearchHighlightContext, { MessageSearchScope } from '../hooks/SearchHighlightContext'
@@ -789,6 +791,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // sidebar's does instead of accepting a second click.
   const creatingSlot = useAppSelector(s => s.chat.creatingSlot)
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
+  const { data: ponytailConfig } = useQuery<{ agent?: { ponytail?: unknown } }>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => typeof api.kirocrewConfig === 'function'
+      ? api.kirocrewConfig() as Promise<{ agent?: { ponytail?: unknown } }>
+      : Promise.resolve({}),
+    staleTime: 30_000,
+  })
+  const globalPonytail = normalizePonytail(ponytailConfig?.agent?.ponytail)
   // tool_call_ids in THIS slot that have a live MCP App render payload. Passed
   // to TurnBlock so app-bearing rows (which mount an interactive iframe) never
   // fold into a collapsible pane — collapsing hides the app, and re-expanding
@@ -6376,6 +6386,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 </div>
               )}
                 </div>
+              {activeSlot && (
+                <PonytailModeDropdown
+                  slot={activeSlot}
+                  override={currentSlot?.ponytail}
+                  globalDefault={globalPonytail}
+                />
+              )}
               {effectiveMode === 'orchestrator' && <span className="pointer-events-auto"><InfoTip text={i18nT('pages.chatPage.autopilot_plans_before_executing_each_stage_need')} /></span>}
               <InboundLinkChip slotKey={activeSlot} />
               {/* Trailing controls grouped under a single ml-auto so multiple

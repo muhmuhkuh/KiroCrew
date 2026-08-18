@@ -5132,12 +5132,22 @@ class SubagentManager:
         # Context scope this run was spawned with. Passed even when every group
         # is on, so build_message applies one code path for sub-agents.
         _groups = _context_groups_of(info)
+        # Ponytail follows project-scoped subagents, which are the explicit
+        # coding/editing lane. A caller that withholds project context (the
+        # deterministic contract for pure research or external-data work) gets
+        # no Ponytail policy rather than a task-text heuristic.
+        ponytail_mode = ""
+        if info.include_project and self._ctx_builder:
+            ponytail_mode = self._ctx_builder.ponytail_mode_for_session(
+                info.parent_session_key
+            )
         # Off-loop: build_message embeds the episodic query (blocking urllib).
         full_message, _ = await run_in_embed_pool(
             self._ctx_builder.build_message,
             message,
             is_new,
             session_key,
+            ponytail_mode=ponytail_mode,
             provider_type=self._provider_label_of(client),
             model_window=_sub_window,
             context_groups=_groups,
