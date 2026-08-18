@@ -6253,6 +6253,8 @@
       "unpin": "Désépingler"
     },
     "sessionColorSwatches": {
+      "custom_color": "Couleur personnalisée",
+      "hex_color_code": "Code couleur hexadécimal",
       "no_color": "Aucune couleur"
     },
     "sessionGridView": {
@@ -7876,11 +7878,15 @@
       "recoveryCard": {
         "backend_error_continuing": "erreur de backend · reprise envoyée automatiquement",
         "cancelled_continuing": "appel d’outil bloqué annulé · reprise envoyée automatiquement",
+        "continued_by_a_hook": "Reprise par un hook",
         "continued_by_you": "Reprise à votre demande",
         "empty_output_continuing": "l’agent n’a renvoyé aucune sortie · reprise envoyée automatiquement",
+        "hook_loop_halted": "Boucle de hook arrêtée",
+        "hook_requested_continuing": "demandé par un hook · poursuite",
         "n_patterns": "{{count}} motifs",
         "n_tool_calls_blocked": "{{count}} appels d'outil bloqués",
         "no_response_returned": "Aucune réponse",
+        "nudge_cap_reached": "limite de relances atteinte",
         "recovered_continuing": "reprise envoyée automatiquement",
         "resuming_the_interrupted_turn": "reprise du tour interrompu",
         "safety_policy_continuing": "la politique de sécurité a bloqué l’appel · reprise envoyée automatiquement",
@@ -8099,6 +8105,10 @@
         "unpin": "Désépingler",
         "jump_to_message": "Aller au message"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "Charger les messages précédents",
+        "error_retry": "Impossible de charger les messages précédents — réessayer"
+      },
       "sessionSummary": {
         "empty_body": "Le résumé est écrit à la fin d'un tour. Envoyez un message pour en obtenir un pour cette session.",
         "empty_generate_body": "Cette session n'a pas encore été résumée.",
@@ -8261,6 +8271,7 @@
       "collapse_folder_name": "Réduire le dossier {{name}}",
       "collapse_group_results": "Réduire les résultats de {{group}}",
       "collapse_hidden_folders": "Réduire les dossiers masqués",
+      "collapse_source_links": "Afficher moins",
       "column_filter": "Filtre de colonne",
       "column_name_optional": "Nom de la colonne (optionnel)",
       "connected_to": "Connecté à {{label}}",
@@ -8397,6 +8408,7 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "Plus récentes",
       "sort_oldest": "Plus anciennes",
+      "source_links_expand_failed": "Impossible de charger le reste. Cliquez pour réessayer.",
       "started_in_channel": "Cette conversation a commencé dans {{channel}}.",
       "started_in_direct_message": "Cette conversation a commencé dans un message privé.",
       "stop_filtering_by_tag": "Arrêter de filtrer par {{name}}",

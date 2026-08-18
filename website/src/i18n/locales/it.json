@@ -6253,6 +6253,8 @@
       "unpin": "Non fissare"
     },
     "sessionColorSwatches": {
+      "custom_color": "Colore personalizzato",
+      "hex_color_code": "Codice colore esadecimale",
       "no_color": "Nessun colore"
     },
     "sessionGridView": {
@@ -7876,11 +7878,15 @@
       "recoveryCard": {
         "backend_error_continuing": "errore del backend · continuazione inviata automaticamente",
         "cancelled_continuing": "chiamata dello strumento bloccata annullata · continuazione inviata automaticamente",
+        "continued_by_a_hook": "Ripreso da un hook",
         "continued_by_you": "Ripreso su tua richiesta",
         "empty_output_continuing": "l’agente non ha restituito alcun output · continuazione inviata automaticamente",
+        "hook_loop_halted": "Ciclo di hook interrotto",
+        "hook_requested_continuing": "richiesto da un hook · continua",
         "n_patterns": "{{count}} pattern",
         "n_tool_calls_blocked": "{{count}} chiamate agli strumenti bloccate",
         "no_response_returned": "Nessuna risposta",
+        "nudge_cap_reached": "limite di nudge raggiunto",
         "recovered_continuing": "continuazione inviata automaticamente",
         "resuming_the_interrupted_turn": "ripresa del turno interrotto",
         "safety_policy_continuing": "la policy di sicurezza ha bloccato la chiamata · continuazione inviata automaticamente",
@@ -8099,6 +8105,10 @@
         "unpin": "Rimuovi",
         "jump_to_message": "Vai al messaggio"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "Carica i messaggi precedenti",
+        "error_retry": "Impossibile caricare i messaggi precedenti — riprova"
+      },
       "sessionSummary": {
         "empty_body": "Il riepilogo viene scritto quando un turno finisce. Invia un messaggio per ottenerne uno per questa sessione.",
         "empty_generate_body": "Questa sessione non è ancora stata riassunta.",
@@ -8261,6 +8271,7 @@
       "collapse_folder_name": "Comprimi la cartella {{name}}",
       "collapse_group_results": "Comprimi i risultati di {{group}}",
       "collapse_hidden_folders": "Comprimi le cartelle nascoste",
+      "collapse_source_links": "Mostra meno",
       "column_filter": "Filtro colonna",
       "column_name_optional": "Nome colonna (facoltativo)",
       "connected_to": "Connesso a {{label}}",
@@ -8397,6 +8408,7 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "Più recenti",
       "sort_oldest": "Più vecchie",
+      "source_links_expand_failed": "Impossibile caricare il resto. Fai clic per riprovare.",
       "started_in_channel": "Questa conversazione è iniziata in {{channel}}.",
       "started_in_direct_message": "Questa conversazione è iniziata in un messaggio diretto.",
       "stop_filtering_by_tag": "Non filtrare più per {{name}}",

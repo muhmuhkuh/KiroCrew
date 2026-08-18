@@ -1512,11 +1512,6 @@ class ContextBuilder:
         self.lessons = lessons or LessonStore()
         self.conversation_log = conversation_log
         self.channel_history = channel_history
-        # The resolved mode is remembered per live session so a subagent spawned
-        # during a parent turn can inherit that parent's per-chat override without
-        # reading dashboard state from an MCP process.
-        self._ponytail_modes: dict[str, str] = {}
-        self._ponytail_modes_lock = threading.Lock()
         if bot_name:
             self._bot_name = bot_name
         else:
@@ -1528,24 +1523,6 @@ class ContextBuilder:
     def _substitute_bot_name(self, prompt: str) -> str:
         """Replace {bot_name} placeholder in prompt text."""
         return prompt.replace("{bot_name}", self._bot_name)
-
-    def remember_ponytail_mode(self, session_key: str, mode: str) -> None:
-        """Remember the last resolved mode for parent-to-subagent inheritance."""
-        if not session_key:
-            return
-        with self._ponytail_modes_lock:
-            self._ponytail_modes[session_key] = mode
-
-    def ponytail_mode_for_session(self, session_key: str) -> str:
-        """Return a parent's resolved mode, falling back to the live config."""
-        with self._ponytail_modes_lock:
-            mode = self._ponytail_modes.get(session_key)
-        if mode:
-            return mode
-        try:
-            return resolve_ponytail(default=KiroCrewConfig.load().agent.ponytail)
-        except Exception:
-            return PONYTAIL_DEFAULT
 
     @staticmethod
     def _resolve_prompt_templates(prompt: str, session_key: str) -> str:
@@ -2204,7 +2181,6 @@ class ContextBuilder:
         user_display_name: str | None = None,
         compressed_history: str | None = None,
         mode: str = "",
-        ponytail_mode: str = "",
         blocks_reads: bool = False,
         action_context: str | None = None,
         thread_parent_text: str | None = None,
@@ -2246,25 +2222,9 @@ class ContextBuilder:
             (full_message, hook_result) — hook_result may be a reply/modify/inject.
         """
         is_custom = agent and agent != "kirocrew"
-        try:
-            cfg = KiroCrewConfig.load()
-            resolved_ponytail = resolve_ponytail(
-                ponytail_mode, default=getattr(cfg.agent, "ponytail", PONYTAIL_DEFAULT)
-            )
-        except Exception:
-            resolved_ponytail = PONYTAIL_DEFAULT
-        if session_key:
-            self.remember_ponytail_mode(session_key, resolved_ponytail)
         hook_result = self.hooks.on_message(text)
 
         parts: list[str] = []
-        # A session key is the trust boundary for live prompt assembly. Keeping
-        # keyless helper calls unchanged preserves their standalone contract and
-        # avoids injecting a global mode into formatting-only tests/utilities.
-        if not is_custom and (session_key or ponytail_mode):
-            ponytail_block = render_ponytail_mode(resolved_ponytail)
-            if ponytail_block:
-                parts.append(ponytail_block)
         # Set together with the user's text part when user_text_range is given.
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None

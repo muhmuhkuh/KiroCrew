@@ -6079,6 +6079,8 @@
       "unpin": "取消置顶"
     },
     "sessionColorSwatches": {
+      "custom_color": "自定义颜色",
+      "hex_color_code": "十六进制颜色代码",
       "no_color": "无颜色"
     },
     "sessionGridView": {
@@ -7674,11 +7676,15 @@
       "recoveryCard": {
         "backend_error_continuing": "后端错误 · 已自动发送续接指令",
         "cancelled_continuing": "已取消停滞的工具调用 · 已自动发送续接指令",
+        "continued_by_a_hook": "由 hook 继续",
         "continued_by_you": "按你的要求继续",
         "empty_output_continuing": "代理未返回任何输出 · 已自动发送续接指令",
+        "hook_loop_halted": "Hook 循环已停止",
+        "hook_requested_continuing": "hook 请求 · 继续中",
         "n_patterns": "{{count}} 条规则",
         "n_tool_calls_blocked": "{{count}} 个工具调用被阻止",
         "no_response_returned": "未返回响应",
+        "nudge_cap_reached": "已达到 nudge 上限",
         "recovered_continuing": "已自动发送续接指令",
         "resuming_the_interrupted_turn": "正在从中断处继续",
         "safety_policy_continuing": "安全策略阻止了调用 · 已自动发送续接指令",
@@ -7895,6 +7901,10 @@
         "unpin": "取消置顶",
         "jump_to_message": "跳转到消息"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "加载更早的消息",
+        "error_retry": "无法加载更早的消息 — 重试"
+      },
       "sessionSummary": {
         "empty_body": "摘要在一轮对话结束时生成。发送一条消息即可为此会话生成摘要。",
         "empty_generate_body": "此会话尚未生成摘要。",
@@ -8053,6 +8063,7 @@
       "collapse_folder_name": "折叠文件夹 {{name}}",
       "collapse_group_results": "折叠 {{group}} 的结果",
       "collapse_hidden_folders": "折叠隐藏文件夹",
+      "collapse_source_links": "收起",
       "column_filter": "列筛选",
       "column_name_optional": "列名称（可选）",
       "connected_to": "已连接到 {{label}}",
@@ -8179,6 +8190,7 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "最新",
       "sort_oldest": "最早",
+      "source_links_expand_failed": "无法加载其余项，点击重试。",
       "started_in_channel": "此对话开始于 {{channel}}。",
       "started_in_direct_message": "此对话开始于私信。",
       "stop_filtering_by_tag": "取消按 {{name}} 筛选",

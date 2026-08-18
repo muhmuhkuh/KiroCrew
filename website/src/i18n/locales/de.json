@@ -6166,6 +6166,8 @@
       "unpin": "Entpinnen"
     },
     "sessionColorSwatches": {
+      "custom_color": "Benutzerdefinierte Farbe",
+      "hex_color_code": "Hex-Farbcode",
       "no_color": "Keine Farbe"
     },
     "sessionGridView": {
@@ -7775,11 +7777,15 @@
       "recoveryCard": {
         "backend_error_continuing": "Backend-Fehler · Fortsetzung automatisch gesendet",
         "cancelled_continuing": "Festgefahrener Tool-Aufruf abgebrochen · Fortsetzung automatisch gesendet",
+        "continued_by_a_hook": "Von einem Hook fortgesetzt",
         "continued_by_you": "Auf Ihre Anfrage fortgesetzt",
         "empty_output_continuing": "Agent hat keine Ausgabe zurückgegeben · Fortsetzung automatisch gesendet",
+        "hook_loop_halted": "Hook-Schleife angehalten",
+        "hook_requested_continuing": "Von einem Hook angefordert · wird fortgesetzt",
         "n_patterns": "{{count}} Muster",
         "n_tool_calls_blocked": "{{count}} Werkzeugaufrufe blockiert",
         "no_response_returned": "Keine Antwort",
+        "nudge_cap_reached": "Nudge-Limit erreicht",
         "recovered_continuing": "Fortsetzung automatisch gesendet",
         "resuming_the_interrupted_turn": "unterbrochener Durchlauf wird fortgesetzt",
         "safety_policy_continuing": "Sicherheitsrichtlinie hat den Aufruf blockiert · Fortsetzung automatisch gesendet",
@@ -7997,6 +8003,10 @@
         "unpin": "Loslösen",
         "jump_to_message": "Zur Nachricht springen"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "Frühere Nachrichten laden",
+        "error_retry": "Frühere Nachrichten konnten nicht geladen werden — erneut versuchen"
+      },
       "sessionSummary": {
         "empty_body": "Die Zusammenfassung entsteht am Ende eines Zugs. Sende eine Nachricht, um eine für diese Sitzung zu erhalten.",
         "empty_generate_body": "Diese Sitzung wurde noch nicht zusammengefasst.",
@@ -8157,6 +8167,7 @@
       "collapse_folder_name": "Ordner {{name}} einklappen",
       "collapse_group_results": "Ergebnisse für {{group}} einklappen",
       "collapse_hidden_folders": "Ausgeblendete Ordner einklappen",
+      "collapse_source_links": "Weniger anzeigen",
       "column_filter": "Spaltenfilter",
       "column_name_optional": "Spaltenname (optional)",
       "connected_to": "Verbunden mit {{label}}",
@@ -8288,6 +8299,7 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "Neueste",
       "sort_oldest": "Älteste",
+      "source_links_expand_failed": "Der Rest konnte nicht geladen werden. Zum Wiederholen klicken.",
       "started_in_channel": "Diese Unterhaltung begann in {{channel}}.",
       "started_in_direct_message": "Diese Unterhaltung begann in einer Direktnachricht.",
       "stop_filtering_by_tag": "Nicht mehr nach {{name}} filtern",

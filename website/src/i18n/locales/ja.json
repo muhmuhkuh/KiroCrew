@@ -6079,6 +6079,8 @@
       "unpin": "ピン留め解除"
     },
     "sessionColorSwatches": {
+      "custom_color": "カスタムカラー",
+      "hex_color_code": "16進カラーコード",
       "no_color": "色なし"
     },
     "sessionGridView": {
@@ -7674,11 +7676,15 @@
       "recoveryCard": {
         "backend_error_continuing": "バックエンドエラー・継続を自動送信しました",
         "cancelled_continuing": "停止したツール呼び出しをキャンセルしました・継続を自動送信しました",
+        "continued_by_a_hook": "フックにより続行しました",
         "continued_by_you": "リクエストにより続行しました",
         "empty_output_continuing": "エージェントから出力がありませんでした・継続を自動送信しました",
+        "hook_loop_halted": "フックループを停止しました",
+        "hook_requested_continuing": "フックのリクエスト · 続行中",
         "n_patterns": "パターン {{count}} 件",
         "n_tool_calls_blocked": "ブロックされたツール呼び出し {{count}} 件",
         "no_response_returned": "応答がありませんでした",
+        "nudge_cap_reached": "ナッジ上限に到達",
         "recovered_continuing": "継続を自動送信しました",
         "resuming_the_interrupted_turn": "中断したターンを再開中",
         "safety_policy_continuing": "安全ポリシーにより呼び出しがブロックされました・継続を自動送信しました",
@@ -7894,6 +7900,10 @@
         "copy_link": "メッセージへのリンクをコピー",
         "unpin": "ピン留めを解除",
         "jump_to_message": "メッセージに移動"
+      },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "以前のメッセージを読み込む",
+        "error_retry": "以前のメッセージを読み込めませんでした — 再試行"
       },
       "sessionSummary": {
         "empty_body": "サマリーはターンの終了時に作成されます。このセッションのサマリーを得るにはメッセージを送信してください。",
@@ -8205,7 +8215,9 @@
       "crew_mode": "Crew Mode — トピックごとに並列のサブセッションで実行",
       "new_crew_chat": "新しい Crew Mode チャット",
       "autopilot_desc": "1 つの作業を段階的に — まず計画を示し、承認後に段階ごとに実行します。",
-      "crew_desc": "複数の作業を同時に — トピックごとに別のサブセッションで進み、終わり次第返答します。"
+      "crew_desc": "複数の作業を同時に — トピックごとに別のサブセッションで進み、終わり次第返答します。",
+      "collapse_source_links": "表示を減らす",
+      "source_links_expand_failed": "残りを読み込めませんでした。クリックして再試行してください。"
     },
     "connectionsPage": {
       "access": "アクセス",

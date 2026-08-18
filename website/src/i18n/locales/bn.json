@@ -6166,6 +6166,8 @@
       "unpin": "পিন সরাও"
     },
     "sessionColorSwatches": {
+      "custom_color": "কাস্টম রং",
+      "hex_color_code": "হেক্স রঙের কোড",
       "no_color": "কোনো রঙ নেই"
     },
     "sessionGridView": {
@@ -7775,11 +7777,15 @@
       "recoveryCard": {
         "backend_error_continuing": "ব্যাকএন্ড ত্রুটি · চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
         "cancelled_continuing": "স্থবির টুল কল বাতিল করা হয়েছে · চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
+        "continued_by_a_hook": "হুক দ্বারা চালানো হয়েছে",
         "continued_by_you": "আপনার অনুরোধে চালানো হয়েছে",
         "empty_output_continuing": "এজেন্ট কোনো আউটপুট দেয়নি · চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
+        "hook_loop_halted": "হুক লুপ থামানো হয়েছে",
+        "hook_requested_continuing": "হুক অনুরোধ করেছে · চলছে",
         "n_patterns": "{{count}}টি প্যাটার্ন",
         "n_tool_calls_blocked": "{{count}}টি টুল কল ব্লক করা হয়েছে",
         "no_response_returned": "কোনো প্রতিক্রিয়া পাওয়া যায়নি",
+        "nudge_cap_reached": "নাজ সীমা পৌঁছেছে",
         "recovered_continuing": "চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
         "resuming_the_interrupted_turn": "বিঘ্নিত পালা আবার শুরু হচ্ছে",
         "safety_policy_continuing": "নিরাপত্তা নীতি কলটি ব্লক করেছে · চালিয়ে যাওয়ার অনুরোধ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে",
@@ -7997,6 +8003,10 @@
         "unpin": "আনপিন",
         "jump_to_message": "বার্তায় যান"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "আগের বার্তা লোড করুন",
+        "error_retry": "আগের বার্তা লোড করা যায়নি — আবার চেষ্টা করুন"
+      },
       "sessionSummary": {
         "empty_body": "একটি টার্ন শেষ হলে সারসংক্ষেপ লেখা হয়। এই সেশনের জন্য একটি পেতে একটি মেসেজ পাঠান।",
         "empty_generate_body": "এই সেশনের সারসংক্ষেপ এখনও তৈরি হয়নি।",
@@ -8157,6 +8167,7 @@
       "collapse_folder_name": "{{name}} ফোল্ডার সংকুচিত করো",
       "collapse_group_results": "{{group}} ফলাফল সংকুচিত করো",
       "collapse_hidden_folders": "লুকানো ফোল্ডার সংকুচিত করো",
+      "collapse_source_links": "কম দেখাও",
       "column_filter": "কলাম ফিল্টার",
       "column_name_optional": "কলামের নাম (ঐচ্ছিক)",
       "connected_to": "{{label}}-এ সংযুক্ত",
@@ -8288,6 +8299,7 @@
       "sort_name_desc": "Z → A",
       "sort_newest": "সবচেয়ে নতুন",
       "sort_oldest": "সবচেয়ে পুরোনো",
+      "source_links_expand_failed": "বাকিগুলো লোড করা যায়নি। আবার চেষ্টা করতে ক্লিক করুন।",
       "started_in_channel": "এই কথোপকথন {{channel}}-এ শুরু হয়েছিল।",
       "started_in_direct_message": "এই কথোপকথন একটি সরাসরি মেসেজে শুরু হয়েছিল।",
       "stop_filtering_by_tag": "{{name}} দিয়ে ফিল্টার করা বন্ধ করুন",

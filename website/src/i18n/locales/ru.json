@@ -6340,6 +6340,8 @@
       "unpin": "Открепить"
     },
     "sessionColorSwatches": {
+      "custom_color": "Пользовательский цвет",
+      "hex_color_code": "Шестнадцатеричный код цвета",
       "no_color": "Без цвета"
     },
     "sessionGridView": {
@@ -7977,11 +7979,15 @@
       "recoveryCard": {
         "backend_error_continuing": "ошибка бэкенда · продолжение отправлено автоматически",
         "cancelled_continuing": "зависший вызов инструмента отменён · продолжение отправлено автоматически",
+        "continued_by_a_hook": "Продолжено хуком",
         "continued_by_you": "Продолжено по вашему запросу",
         "empty_output_continuing": "агент не вернул результат · продолжение отправлено автоматически",
+        "hook_loop_halted": "Цикл хука остановлен",
+        "hook_requested_continuing": "хук запросил · продолжение",
         "n_patterns": "шаблонов: {{count}}",
         "n_tool_calls_blocked": "Заблокировано вызовов инструментов: {{count}}",
         "no_response_returned": "Ответ не получен",
+        "nudge_cap_reached": "достигнут лимит подталкиваний",
         "recovered_continuing": "продолжение отправлено автоматически",
         "resuming_the_interrupted_turn": "продолжаем прерванный ход",
         "safety_policy_continuing": "политика безопасности заблокировала вызов · продолжение отправлено автоматически",
@@ -8201,6 +8207,10 @@
         "unpin": "Открепить",
         "jump_to_message": "Перейти к сообщению"
       },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "Загрузить предыдущие сообщения",
+        "error_retry": "Не удалось загрузить предыдущие сообщения — повторить"
+      },
       "sessionSummary": {
         "empty_body": "Сводка создаётся по завершении хода. Отправьте сообщение, чтобы получить её для этой сессии.",
         "empty_generate_body": "Сводка для этой сессии ещё не составлена.",
@@ -8365,6 +8375,7 @@
       "collapse_folder_name": "Свернуть папку «{{name}}»",
       "collapse_group_results": "Свернуть результаты «{{group}}»",
       "collapse_hidden_folders": "Свернуть скрытые папки",
+      "collapse_source_links": "Показать меньше",
       "column_filter": "Фильтр столбца",
       "column_name_optional": "Название столбца (необязательно)",
       "connected_to": "Подключено к {{label}}",
@@ -8506,6 +8517,7 @@
       "sort_name_desc": "Я → А",
       "sort_newest": "Сначала новые",
       "sort_oldest": "Сначала старые",
+      "source_links_expand_failed": "Не удалось загрузить остальное. Нажмите, чтобы повторить.",
       "started_in_channel": "Этот диалог начался в {{channel}}.",
       "started_in_direct_message": "Этот диалог начался в личном сообщении.",
       "stop_filtering_by_tag": "Не фильтровать по тегу {{name}}",

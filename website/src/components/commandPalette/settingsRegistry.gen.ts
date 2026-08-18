@@ -158,7 +158,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
   {
     "id": "chat.default-ponytail-mode",
     "label": "Default Ponytail mode",
-    "labelKey": "pages.settings.chatPanel.default_ponytail_mode",
     "description": "Choose the coding-style default for new chats. Each chat can override it in the header.",
     "tab": "chat",
     "type": "select",

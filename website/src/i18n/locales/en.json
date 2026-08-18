@@ -4250,6 +4250,8 @@
       "tags": "Tags…"
     },
     "sessionColorSwatches": {
+      "custom_color": "Custom color",
+      "hex_color_code": "Hex color code",
       "no_color": "No color"
     },
     "sessionGridView": {
@@ -5257,11 +5259,15 @@
       "recoveryCard": {
         "backend_error_continuing": "backend error · continuation sent automatically",
         "cancelled_continuing": "stalled tool call cancelled · continuation sent automatically",
+        "continued_by_a_hook": "Continued by a hook",
         "continued_by_you": "Continued at your request",
         "empty_output_continuing": "agent returned no output · continuation sent automatically",
+        "hook_loop_halted": "Hook loop halted",
+        "hook_requested_continuing": "requested by a hook · continuing",
         "n_patterns": "{{count}} patterns",
         "n_tool_calls_blocked": "{{count}} tool calls blocked",
         "no_response_returned": "No response returned",
+        "nudge_cap_reached": "nudge cap reached",
         "recovered_continuing": "continuation sent automatically",
         "resuming_the_interrupted_turn": "resuming the interrupted turn",
         "safety_policy_continuing": "safety policy blocked the call · continuation sent automatically",
@@ -5394,6 +5400,10 @@
         "copy_link": "Copy link to message",
         "unpin": "Unpin",
         "jump_to_message": "Jump to message"
+      },
+      "earlierMessagesBar": {
+        "load_earlier_messages": "Load earlier messages",
+        "error_retry": "Couldn't load earlier messages — retry"
       }
     },
     "chatPage": {
