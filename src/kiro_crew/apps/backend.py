@@ -28,14 +28,17 @@ from kiro_crew.apps.execution import (
     shipped_builtin_app_root,
     shipped_builtin_module_path,
 )
+from kiro_crew.apps.interpreter import resolve_app_python, venv_python_path
 from kiro_crew.apps.manager import app_dir, get_app_manifest, list_apps
 from kiro_crew.apps.registry import minimal_env
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 from kiro_crew.sandbox import (
-    build_resource_limit_preexec,
+    RLIMIT_PROFILE_BUILD,
+    RLIMIT_PROFILE_TOOL,
     cgroup_scope_argv,
-    resource_limit_preexec,
+    popen_limited,
+    run_limited,
     wrap_argv,
 )
 from kiro_crew.sel import sel
@@ -691,25 +694,31 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         _env = minimal_env()  # don't leak secrets to pip/venv subprocesses
         try:
             if not venv_dir.exists():
+                # sys.executable, never a bare "python3": the bare name relies on
+                # PATH (absent on some hosts, a Store stub on Windows) — the same
+                # policy every app spawn path applies via apps/interpreter.
                 venv_cmd, _ = wrap_argv(
-                    ["python3", "-m", "venv", str(venv_dir)], mode="standard"
+                    [sys.executable, "-m", "venv", str(venv_dir)], mode="standard"
                 )
                 venv_cmd = cgroup_scope_argv(venv_cmd)  # cgroup DoS ceiling
-                subprocess.run(
+                run_limited(
                     venv_cmd,
                     check=True, capture_output=True, timeout=60, env=_env,
-                    preexec_fn=resource_limit_preexec(),
                 )
-            pip_bin = str(venv_dir / "bin" / "pip")
+            # Invoke pip through the venv's own interpreter: `.venv/bin/pip` is
+            # POSIX-only (Windows venvs ship Scripts\), and `<venv python> -m pip`
+            # is the layout-independent spelling. Without it a Windows venv is
+            # created but never provisioned — and would then be preferred by the
+            # venv-first interpreter policy while holding none of the app's deps.
+            venv_python = str(venv_python_path(root))
             pip_cmd, _ = wrap_argv(
-                [pip_bin, "install", "--quiet", "--disable-pip-version-check",
-                 "-r", str(req_file)], mode="standard"
+                [venv_python, "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "-r", str(req_file)], mode="standard"
             )
             pip_cmd = cgroup_scope_argv(pip_cmd)  # cgroup DoS ceiling
-            subprocess.run(
+            run_limited(
                 pip_cmd,
                 capture_output=True, timeout=60, env=_env,
-                preexec_fn=resource_limit_preexec(),
             )
         except Exception as exc:
             logger.warning("Failed to install deps for app %s: %s", app_name, exc)
@@ -814,10 +823,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                     sandboxed_npm = cgroup_scope_argv(
                         sandboxed_npm
                     )  # cgroup DoS ceiling
-                    subprocess.run(
+                    run_limited(
                         sandboxed_npm,
                         cwd=str(root), env=env, capture_output=True, timeout=120,
-                        preexec_fn=resource_limit_preexec(),
                     )
                 except Exception as exc:
                     logger.warning("Failed to install npm deps for app %s: %s", app_name, exc)
@@ -869,13 +877,13 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
     elif backend_type == "asgi" or (
         not backend_type and _is_asgi_entry(entry)
     ):
-        venv_python = str(root / ".venv" / "bin" / "python3")
-        # Fall back to the gateway's own interpreter (sys.executable) rather than a bare
-        # "python3": a bare name relies on PATH, which isn't guaranteed (e.g. some
-        # build environments ship only a versioned interpreter, so execvp("python3") raises
-        # FileNotFoundError and the backend dies immediately). Matches the module-style
-        # branch above.
-        python_bin = venv_python if (root / ".venv" / "bin" / "python3").is_file() else sys.executable
+        # Prefer the app's venv interpreter, else the gateway's own (sys.executable) —
+        # never a bare "python3": a bare name relies on PATH, which isn't guaranteed
+        # (e.g. some build environments ship only a versioned interpreter, so
+        # execvp("python3") raises FileNotFoundError and the backend dies immediately).
+        # One policy shared with the stdio MCP registration path — see
+        # kiro_crew.apps.interpreter.
+        python_bin = resolve_app_python(root)
         # Derive the module path for uvicorn (e.g. backend.app:app)
         rel = entry.relative_to(root)
         parts = list(rel.parts)
@@ -895,10 +903,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
 
     # --- Plain Python backend (default) ---
     else:
-        venv_python = str(root / ".venv" / "bin" / "python3")
-        # See the ASGI branch: prefer the venv python, else the gateway's own interpreter
-        # (sys.executable) — a bare "python3" relies on PATH and isn't always present.
-        python_bin = venv_python if (root / ".venv" / "bin" / "python3").is_file() else sys.executable
+        # See the ASGI branch: venv python first, else the gateway's own interpreter —
+        # one policy shared with the stdio MCP registration path.
+        python_bin = resolve_app_python(root)
         cmd = [python_bin, entry_str]
         cwd = str(root)
 
@@ -924,7 +931,7 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
         # overload resolution on the build fleet): start_new_session=True is a
         # no-op on Windows, creationflags resolves to 0 (no-op) on POSIX.
         try:
-            proc = subprocess.Popen(
+            proc = popen_limited(
                 sandboxed_cmd,
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
@@ -937,9 +944,9 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
                 # ceiling: the backend is the ANCESTOR of its build workloads
                 # (vite/pip) and a 1024 hard cap starves every descendant.
                 # All other apps keep the standard configured policy.
-                preexec_fn=(build_resource_limit_preexec()
-                            if app_name in _BUILD_CAPABLE_APPS
-                            else resource_limit_preexec()),
+                profile=(RLIMIT_PROFILE_BUILD
+                         if app_name in _BUILD_CAPABLE_APPS
+                         else RLIMIT_PROFILE_TOOL),
             )
         except OSError:
             log_fh.close()

@@ -182,6 +182,18 @@ _TURN_BUCKETS_MS: list[float] = [
     1800000, 2700000, 3600000,
 ]
 
+# Watchdog idle-at-decision. The watchdog consults the oracle from
+# check_after_secs (60s) and the default hard cap is 1h (3600s,
+# tool_stall_hard_cap_secs), so the range is 1s .. 4h — headroom above the cap
+# because per-agent overrides can raise it; densest around the window
+# boundaries (300s stale / 900s model-silent / 3600s cap) that the
+# distribution is meant to tune. Sub-minute bounds exist because tests and
+# per-agent overrides can legitimately act earlier than the default 60s gate.
+_WATCHDOG_IDLE_BUCKETS_MS: list[float] = [
+    1000, 5000, 15000, 30000, 60000, 120000, 180000, 300000, 450000,
+    600000, 900000, 1800000, 3600000, 5400000, 7200000, 10800000, 14400000,
+]
+
 # Instrument name -> boundaries. This map is the COMPLETE set of kirocrew
 # duration histograms: the Views below are built from it and there is no
 # catch-all, because the OTEL SDK applies EVERY matching View rather than the
@@ -191,12 +203,21 @@ _TURN_BUCKETS_MS: list[float] = [
 # Consequence: a new histogram missing from this map falls back to OTEL's
 # default 10s-ceiling boundaries. `test/metrics/test_provider_bucket_views.py`
 # fails when a histogram metric name in the source has no entry here — add the
-# instrument to this map when you add the metric.
+# instrument to this map when you add the metric. All values are ms — the
+# dashboard's generic aggregation reports every histogram under *_ms keys, so
+# a non-ms instrument would surface 1000x off there.
 _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.gateway.request.duration": _FAST_BUCKETS_MS,
     "kirocrew.db.query.duration": _FAST_BUCKETS_MS,
     "kirocrew.mcp.backend.acquire.duration": _FAST_BUCKETS_MS,
     "kirocrew.skill.lazy_load.duration": _FAST_BUCKETS_MS,
+    # Per-section first-turn context assembly. The spread within ONE build is
+    # the widest of any instrument here: trivial string appends land under a
+    # millisecond while a section that performs a query embedding reaches
+    # several seconds. _FAST_BUCKETS_MS spans 0.5ms..60s, so the sub-ms sections
+    # keep resolution and a slow embed stays below the top bound instead of
+    # collapsing into +Inf.
+    "kirocrew.context.section.duration": _FAST_BUCKETS_MS,
     # Telegram Bot API round-trips: typically 50-500ms, but a 429 retry_after
     # wait or a transport timeout reaches seconds -- _FAST_BUCKETS_MS spans
     # 0.5ms..60s, which covers both without flooring the tail percentiles.
@@ -209,6 +230,7 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.mcp.lazy_load.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.gateway.boot.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.turn.duration": _TURN_BUCKETS_MS,
+    "kirocrew.watchdog.idle.duration": _WATCHDOG_IDLE_BUCKETS_MS,
 }
 
 _lock = threading.Lock()
@@ -338,10 +360,12 @@ def _build_recorder() -> _Build:
 
     # PeriodicExportingMetricReader starts its daemon ticker thread inside
     # __init__, so if any later step (MeterProvider construction, etc.) raises,
-    # the reader is already ticking. Hoist the list here so the except can reap
-    # every reader it started — otherwise an orphaned thread keeps running and
-    # spamming export WARNINGs for the life of the process even though metrics
-    # are "disabled".
+    # the reader is already ticking. This list is bound BEFORE the try — binding
+    # it inside would leave it unbound when the first reader's constructor
+    # raises, and the except would then fail on the reap instead of degrading —
+    # and each reader joins it once constructed, so the except reaps every one.
+    # Otherwise an orphaned thread keeps running and spamming export WARNINGs for
+    # the life of the process even though metrics are "disabled".
     started_readers: list = []
     try:
         directory = (
@@ -349,23 +373,24 @@ def _build_recorder() -> _Build:
             if cfg.local_dir
             else _default_metrics_dir()
         )
-        reader = PeriodicExportingMetricReader(
-            JsonlMetricExporter(
-                directory,
-                retention_days=cfg.retention_days,
-                max_total_mb=cfg.max_total_mb,
-            ),
-            export_interval_millis=float(cfg.export_interval_seconds) * 1000.0,
+        started_readers.append(
+            PeriodicExportingMetricReader(
+                JsonlMetricExporter(
+                    directory,
+                    retention_days=cfg.retention_days,
+                    max_total_mb=cfg.max_total_mb,
+                ),
+                export_interval_millis=float(cfg.export_interval_seconds) * 1000.0,
+            )
         )
-        readers = [reader]
-        started_readers = readers
         # Opt-in OTLP egress: only when telemetry.otlp_endpoint is set.
         # Empty endpoint => local-only, no network egress (the default).
         otlp_reader = _build_otlp_reader(cfg)
+        otlp_active = otlp_reader is not None
         if otlp_reader is not None:
-            readers.append(otlp_reader)
+            started_readers.append(otlp_reader)
         provider = MeterProvider(
-            metric_readers=readers,
+            metric_readers=started_readers,
             resource=Resource.create({"service.name": _SERVICE_NAME}),
             # One View per instrument, from _HISTOGRAM_BUCKETS_MS. Deliberately
             # NOT a catch-all `instrument_type=Histogram` View: the OTEL SDK
@@ -382,18 +407,17 @@ def _build_recorder() -> _Build:
                 for name, bounds in _HISTOGRAM_BUCKETS_MS.items()
             ],
         )
-        _provider_built = provider
         logger.info(
             "telemetry enabled; local JSONL sink at %s (otlp=%s)",
             directory,
-            "on" if len(readers) > 1 else "off",
+            "on" if otlp_active else "off",
         )
-        if len(readers) > 1:
+        if otlp_active:
             # Name the egress start on its own line: a file/CLI enable is trusted
             # and ungated, so this log is the only record that metrics began
             # leaving the machine.
             logger.info("telemetry OTLP export active; metrics leave this machine")
-        return _Build(MetricsRecorder(provider.get_meter(_SCOPE)), _provider_built, consent)
+        return _Build(MetricsRecorder(provider.get_meter(_SCOPE)), provider, consent)
     except Exception as exc:
         logger.warning("telemetry init failed; metrics disabled: %s", exc)
         # Reap EVERY reader already started, not just the first: with
@@ -694,14 +718,57 @@ def shutdown() -> None:
         _flush_detached_provider(doomed)
 
 
+# reset_for_testing() waits at most this long for an in-flight consent-check
+# worker to finish before returning. The worker is a daemon thread whose
+# ``finally`` unconditionally clears ``_check_in_flight`` (see
+# ``_consent_worker``), so under normal load this bound is never approached;
+# it exists so a genuinely stuck worker fails the test loudly instead of
+# reset_for_testing() handing back a "clean" state while a stale thread can
+# still mutate module globals underneath the next test.
+_RESET_WAIT_BOUND_SECS = 10.0
+_RESET_WAIT_POLL_SECS = 0.01
+
+
+def _wait_for_in_flight_consent_worker() -> None:
+    """Block until ``_check_in_flight`` is False, or raise past the bound.
+
+    Test-only: called from ``reset_for_testing`` so every test starts from a
+    state with no consent-check worker still running. Polling a plain bool
+    under ``_lock`` matches how ``_check_in_flight`` is read and written
+    everywhere else in this module, and keeps this seam simple since it only
+    ever runs between tests, never on a request path.
+    """
+    deadline = time.monotonic() + _RESET_WAIT_BOUND_SECS
+    while True:
+        with _lock:
+            if not _check_in_flight:
+                return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "reset_for_testing: a consent-check worker is still in flight "
+                f"after {_RESET_WAIT_BOUND_SECS}s; a test must never proceed "
+                "with a live stale worker able to mutate module state"
+            )
+        time.sleep(_RESET_WAIT_POLL_SECS)
+
+
 def reset_for_testing() -> None:
     """Drop the cached recorder + provider so the next get_recorder() rebuilds.
 
     Also clears ``_ever_built``, so the next build is synchronous and a test can
     assert on the result without polling. Production keeps that flag set, which is
     what pushes a post-shutdown rebuild off the calling thread.
+
+    Waits (bounded) for any in-flight consent-check worker to finish before
+    returning. ``shutdown()`` alone does not stop that worker — it only bumps
+    the generation the worker checks before installing its result — so a
+    worker started by an earlier test can still be mid-run here. Owning that
+    wait in this one seam, rather than in each test's own helpers, is what
+    guarantees every test starts from a state with no worker able to mutate
+    module globals underneath it.
     """
     global _ever_built
     shutdown()
+    _wait_for_in_flight_consent_worker()
     with _lock:
         _ever_built = False

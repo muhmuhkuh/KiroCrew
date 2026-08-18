@@ -7,7 +7,7 @@
  * `Group by` folds rows on an ATTRIBUTE (agent, channel). Sorting, expansion,
  * grouping, and aggregation come from `@tanstack/react-table`.
  */
-import { type MutableRefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type MutableRefObject, useCallback, useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -27,6 +27,7 @@ import {
 import { ChevronDown, ChevronRight, ChevronUp, MemoryStick, Columns3, TriangleAlert } from 'lucide-react'
 import { api } from '../../api/client'
 import { Btn, Card, ContentSkeleton, EmptyState, IconButton, SearchInput } from '../../components/ui'
+import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table'
 import InfoTip from '../../components/InfoTip'
 import SegmentedControl, { type Segment } from '../../components/SegmentedControl'
@@ -113,38 +114,12 @@ export default function SessionsTab({ planeStateRef }: Props) {
     saved?.visibility ?? { share: false, channel: false },
   )
   const [pickerOpen, setPickerOpen] = useState(false)
-  const pickerRef = useRef<HTMLDivElement>(null)
-  const pickerBtnRef = useRef<HTMLButtonElement>(null)
 
   // Persist state to planeStateRef on every change so it survives plane flips.
   useEffect(() => {
     const state: SessionsPlaneState = { sorting, groupBy, filter, visibility }
     planeStateRef.current = { ...planeStateRef.current, sessions: state }
   }, [sorting, groupBy, filter, visibility, planeStateRef])
-
-  // Finding 4: Escape + outside-click to close the Columns popover
-  useEffect(() => {
-    if (!pickerOpen) return
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (pickerBtnRef.current?.contains(t)) return
-      if (pickerRef.current?.contains(t)) return
-      setPickerOpen(false)
-      pickerBtnRef.current?.focus()
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setPickerOpen(false)
-        pickerBtnRef.current?.focus()
-      }
-    }
-    document.addEventListener('mousedown', onDown)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [pickerOpen])
 
   const { data, isPending, isError, isFetching, refetch } = useQuery<Payload>({
     queryKey: ['sessionsMemory'],
@@ -155,7 +130,6 @@ export default function SessionsTab({ planeStateRef }: Props) {
   const sessions = data?.sessions ?? EMPTY_SESSIONS
   const tasks = data?.tasks ?? EMPTY_TASKS
   const totals = data?.totals
-  const unattributed = data?.unattributed ?? null
   const hostMb = totals?.host_mb ?? null
   const rows = useMemo(() => buildTree(sessions, tasks), [sessions, tasks])
   const maxima = useMemo(() => columnMaxima(rows), [rows])
@@ -316,16 +290,14 @@ export default function SessionsTab({ planeStateRef }: Props) {
   ]
   const hideable = table.getAllLeafColumns().filter(c => c.getCanHide())
 
-  /** Whether to show the unattributed row: only when procs > 0. */
-  const showUnattributed = unattributed != null && unattributed.procs > 0
 
+  /** Radix returns focus to the trigger when the popover closes. */
   const closePicker = useCallback(() => {
     setPickerOpen(false)
-    pickerBtnRef.current?.focus()
   }, [])
 
   return (
-    <Card className="mb-6 overflow-hidden">
+    <Card className="mb-6">
       {/* Stale-data notice. Shown when a poll has failed but a previous payload is
           still on screen: the rows below are real, just not current, and saying so
           is what lets the user trust them without mistaking them for live. */}
@@ -358,45 +330,44 @@ export default function SessionsTab({ planeStateRef }: Props) {
           onChange={e => setFilter(e.currentTarget.value)}
           className="w-[150px]"
         />
-        <div className="relative ml-auto">
-          <Btn
-            ref={pickerBtnRef}
-            type="button"
-            aria-expanded={pickerOpen}
-            aria-haspopup="true"
-            onClick={() => setPickerOpen(o => !o)}
-            className="text-[11.5px] gap-1.5"
+        {/* The Radix popover primitive owns what a menu surface needs to get
+            right: focus moves into the panel on open and back to the trigger on
+            close, Escape and outside-press dismiss, and the panel stays anchored
+            to its trigger across scroll and resize instead of being positioned
+            once at open time. */}
+        <Popover open={pickerOpen} onOpenChange={setPickerOpen}>
+          <PopoverTrigger asChild>
+            <Btn type="button" className="ml-auto text-[11.5px] gap-1.5">
+              <Columns3 size={13} aria-hidden="true" className="lucide-inline" />
+              {i18nT('pages.sessionsTab.columns')}
+            </Btn>
+          </PopoverTrigger>
+          <PopoverContent
+            align="end"
+            sideOffset={4}
+            aria-label={i18nT('pages.sessionsTab.columns')}
+            className="w-auto min-w-40 p-1.5"
           >
-            <Columns3 size={13} aria-hidden="true" className="lucide-inline" />
-            {i18nT('pages.sessionsTab.columns')}
-          </Btn>
-          {pickerOpen && (
-            <div
-              ref={pickerRef}
-              role="dialog"
-              aria-label={i18nT('pages.sessionsTab.columns')}
-              className="absolute right-0 z-20 mt-1 min-w-40 rounded border border-border bg-bg-elevated p-1.5 shadow-lg"
-            >
-              {hideable.map(col => (
-                <label key={col.id} className="flex items-center gap-2 px-1.5 py-1 text-[12px] cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={col.getIsVisible()}
-                    onChange={col.getToggleVisibilityHandler()}
-                  />
-                  {flexRender(col.columnDef.header, {} as never) as never}
-                </label>
-              ))}
-              <div className="mt-1 border-t border-border pt-1">
-                <Btn type="button" onClick={closePicker} className="w-full text-[11px] justify-center">
-                  {i18nT('pages.sessionsTab.done')}
-                </Btn>
-              </div>
+            {hideable.map(col => (
+              <label key={col.id} className="flex items-center gap-2 px-1.5 py-1 text-[12px] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={col.getIsVisible()}
+                  onChange={col.getToggleVisibilityHandler()}
+                />
+                {flexRender(col.columnDef.header, {} as never) as never}
+              </label>
+            ))}
+            <div className="mt-1 border-t border-border pt-1">
+              <Btn type="button" onClick={closePicker} className="w-full text-[11px] justify-center">
+                {i18nT('pages.sessionsTab.done')}
+              </Btn>
             </div>
-          )}
-        </div>
+          </PopoverContent>
+        </Popover>
       </div>
 
+      <div className="overflow-hidden rounded-b-lg">
       {isPending ? (
         // "No active sessions" is a claim about the machine, and during the first
         // fetch it is one we cannot make — a slow or failing endpoint made the page
@@ -435,7 +406,7 @@ export default function SessionsTab({ planeStateRef }: Props) {
             </Btn>
           }
         />
-      ) : table.getRowModel().rows.length === 0 && !showUnattributed ? (
+      ) : table.getRowModel().rows.length === 0 ? (
         <EmptyState
           icon={<MemoryStick className="lucide-inline" />}
           title={i18nT('pages.sessionsTab.no_active_sessions')}
@@ -485,35 +456,6 @@ export default function SessionsTab({ planeStateRef }: Props) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {/* Unattributed row — pinned above all sessions, outside sort.
-                Finding 6: use warn tint instead of danger for a documented-healthy state. */}
-            {showUnattributed && (
-              <TableRow data-testid="unattributed-row" className="text-warn">
-                {table.getHeaderGroups()[0]?.headers.map(h => {
-                  const colId = h.column.id
-                  const isName = colId === 'name'
-                  let content: string
-                  if (isName) content = ''
-                  else if (colId === 'rssMb') content = fmtMb(unattributed!.rss_mb)
-                  else if (colId === 'procs') content = fmtNumber(unattributed!.procs)
-                  else if (colId === 'uptimeS') content = fmtUptime(unattributed!.oldest_uptime_s)
-                  else content = '—'
-                  return (
-                    <TableCell
-                      key={h.id}
-                      className={isName ? 'px-3 py-1 text-left text-[12.5px] text-warn font-medium' : `px-3 py-1 ${NUM} text-warn`}
-                    >
-                      {isName ? (
-                        <span className="inline-flex items-center gap-1.5">
-                          <span>{i18nT('pages.sessionsTab.unattributed')}</span>
-                          <InfoTip text={i18nT('pages.sessionsTab.unattributed_hint')} />
-                        </span>
-                      ) : content}
-                    </TableCell>
-                  )
-                })}
-              </TableRow>
-            )}
             {table.getRowModel().rows.map(row => {
               const r = row.original
               const grouped = row.getIsGrouped()
@@ -636,15 +578,9 @@ export default function SessionsTab({ planeStateRef }: Props) {
         <FooterStat label={i18nT('pages.sessionsTab.footer_sessions')} value={fmtNumber(sessions.length)} />
         <FooterStat label={i18nT('pages.sessionsTab.footer_task_sessions')} value={fmtNumber(tasks.length)} />
         <FooterStat label={i18nT('pages.sessionsTab.footer_session_procs')} value={fmtNumber(procTotal)} />
-        {showUnattributed && (
-          <FooterStat
-            label={i18nT('pages.sessionsTab.unattributed')}
-            value={`${fmtNumber(unattributed!.procs)} · ${fmtGb(unattributed!.rss_mb)}`}
-            warn
-          />
-        )}
       </div>
       )}
+      </div>
     </Card>
   )
 }

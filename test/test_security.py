@@ -209,6 +209,13 @@ class TestRedactCredentials:
     # the intended token (the redaction test is unchanged). The split keeps any
     # single source literal from being a complete provider token, so GitHub
     # push-protection / secret scanners don't flag these synthetic fixtures.
+    #
+    # The explicit ``ids=`` labels exist for the same reason one level up:
+    # without them pytest derives each test ID from the REASSEMBLED value, and
+    # the full key-shaped string then lands verbatim in every derived artifact
+    # (.test_durations, junit XML, CI logs). Push protection rejects any branch
+    # carrying such an artifact — that is what kept the Update Test Durations
+    # workflow from ever landing its PR. Keep these labels secret-shape-free.
     @pytest.mark.parametrize(
         "secret",
         [
@@ -228,6 +235,22 @@ class TestRedactCredentials:
             "dop_v1_" "abcdefghijklmnopqrstuvwxyz1234567890abcdefghijklmnopqrst",  # DigitalOcean
             "GOCSPX-" "abcdefghijklmnopqrstuvwx",  # Google OAuth
         ],
+        ids=[
+            "github-classic-pat",
+            "github-oauth",
+            "github-fine-grained-pat",
+            "gitlab-pat",
+            "stripe-live",
+            "stripe-test",
+            "stripe-restricted",
+            "sendgrid",
+            "openai-project",
+            "anthropic",
+            "npm-token",
+            "pypi-token",
+            "digitalocean",
+            "google-oauth",
+        ],
     )
     def test_redacts_third_party_credentials(self, secret: str) -> None:
         text = f"KEY={secret}"
@@ -245,6 +268,9 @@ class TestRedactCredentials:
             "sk_live_" "51HG7aBcDeFgHiJkLmNoPqRsTuVwXyZ",  # Stripe live
             "xoxb-" "1234567890-abcdefghijklmnop",  # Slack bot token
         ],
+        # Safe display labels: pytest would otherwise derive the ID from the
+        # reassembled token — see the note on the parametrize above.
+        ids=["github-classic-pat", "anthropic", "openai-project", "stripe-live", "slack-bot"],
     )
     def test_warning_does_not_leak_secret_prefix(self, secret: str) -> None:
         """The warnings list must carry NO secret bytes — only length metadata.
@@ -3666,6 +3692,347 @@ class TestIsSensitiveBashCommand:
         # A benign host that resolves elsewhere must not be flagged as IMDS.
         assert _check_imds_access("curl http://93.184.216.34/") is None
         assert canonicalize_ip("8.8.8.8") == "8.8.8.8"
+
+    # ── Unresolved shell-variable indirection bypass ──
+
+    def test_variable_indirection_denied(self) -> None:
+        """Shell-variable indirection must not bypass the sensitive-path gate."""
+        cmd = "F=security_policy.json; cat ~/.kiro/crew/$F"
+        result = security.is_sensitive_bash_command(cmd)
+        assert result is not None
+        assert "unresolved shell variable" in result.lower() or "sensitive" in result.lower()
+
+    def test_variable_indirection_variants(self) -> None:
+        """Multiple forms of unresolved variables in path position are blocked."""
+        cases = [
+            "cat ${HOME}/.kiro/crew/${F}",
+            "cat ~/.aws/$PROFILE/credentials",
+            "cat ~/.ssh/$KEYNAME",
+        ]
+        for cmd in cases:
+            result = security.is_sensitive_bash_command(cmd)
+            assert result is not None, f"Expected denial for: {cmd}"
+
+    def test_normal_home_expansion_still_works(self) -> None:
+        """$HOME expansion to sensitive paths is still caught (regression)."""
+        cmd = "cat $HOME/.aws/config"
+        result = security.is_sensitive_bash_command(cmd)
+        assert result is not None
+
+    def test_non_path_variables_allowed(self) -> None:
+        """Variables that aren't in path-like tokens don't trigger the gate."""
+        # echo $USER has no / so _is_path_like is False
+        safe_cases = [
+            "echo $USER",
+            "echo hello",
+            "ls /tmp",
+        ]
+        for cmd in safe_cases:
+            result = security.is_sensitive_bash_command(cmd)
+            assert result is None, f"Unexpected denial for: {cmd}"
+
+
+class TestWindowsPathShapes:
+    """Native Windows path spellings must be recognized as path-like so the
+    normalizer pass routes them through is_sensitive_path() -- on Windows
+    hosts the fence targets are os.sep-joined, and a backslash spelling that
+    never reaches the check would leave every fenced dir shell-reachable.
+    Recognition is limited lexically to the drive/share holding Path.home():
+    every fenced target lives under home, and a foreign-drive token would only
+    feed realpath a disconnected mapped drive or dead UNC host (a synchronous
+    network stall on the permission gate)."""
+
+    def test_home_drive_paths_are_path_like(self) -> None:
+        from unittest.mock import patch
+
+        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
+            assert security._is_path_like("C:\\Users\\u\\.aws\\credentials")
+            assert security._is_path_like("c:/Users/u/.aws/credentials")
+
+    def test_foreign_drive_and_unc_are_not_probed(self, monkeypatch) -> None:
+        # A pure-backslash token on another drive/share gains no NEW
+        # recognition; treating it as path-like would only cost a realpath
+        # probe of a possibly-dead network target.
+        from unittest.mock import patch
+
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
+            assert not security._is_path_like("Z:\\stale\\mapped\\drive")
+            assert not security._is_path_like("\\\\dead-server\\share\\x")
+
+    def test_cross_drive_forward_slash_token_stays_path_like(self) -> None:
+        # KIROCREW_HOME may legitimately live on another drive, and its
+        # keystone leaves are re-anchored there. A forward-slash spelling was
+        # path-like via the generic "/" branch before drive shapes were
+        # recognized -- the foreign-drive check must FALL THROUGH to it, not
+        # intercept it, or the governance ceiling on that drive becomes
+        # shell-reachable.
+        from unittest.mock import patch
+
+        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
+            assert security._is_path_like("D:/kirocrew/security_policy.json")
+
+    def test_kirocrew_home_drive_anchors_backslash_recognition(self, monkeypatch) -> None:
+        # A BACKSLASH spelling under a cross-drive KIROCREW_HOME must also be
+        # recognized: the keystone leaves are re-anchored under that root, so
+        # its drive is an anchor alongside the user home's.
+        from unittest.mock import patch
+
+        monkeypatch.setenv("KIROCREW_HOME", "D:\\crew")
+        with patch.object(security.Path, "home", return_value=Path("C:\\Users\\u")):
+            assert security._is_path_like("D:\\crew\\security_policy.json")
+            # Drives matching NEITHER root stay unrecognized (no realpath probe).
+            assert not security._is_path_like("Z:\\stale\\mapped\\drive")
+
+    def test_unc_home_share_is_path_like(self, monkeypatch) -> None:
+        from unittest.mock import patch
+
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        with patch.object(
+            security.Path, "home", return_value=Path("\\\\srv\\homes\\u")
+        ):
+            assert security._is_path_like("\\\\srv\\homes\\u\\.aws\\credentials")
+            assert not security._is_path_like("\\\\other\\share\\x")
+            # A share that merely extends the name past the segment boundary
+            # is a DIFFERENT share -- probing it would realpath a possibly
+            # dead SMB target.
+            assert not security._is_path_like("\\\\srv\\homes-dead\\share\\x")
+
+    def test_backslash_relative_is_path_like(self) -> None:
+        assert security._is_path_like(".\\x\\y")
+        assert security._is_path_like("..\\x\\y")
+
+    def test_drive_shapes_are_inert_on_posix_homes(self, monkeypatch) -> None:
+        # With a POSIX home and no drive-lettered KIROCREW_HOME, no anchor
+        # root has a drive, so drive/UNC tokens are not path-like at all --
+        # no behavior change for POSIX workflows. (KIROCREW_HOME must be
+        # cleared: on Windows CI it is a drive-lettered path and a legitimate
+        # anchor root.)
+        from unittest.mock import patch
+
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        with patch.object(security.Path, "home", return_value=Path("/home/u")):
+            assert not security._is_path_like("C:\\Users\\u\\.aws\\credentials")
+            assert not security._is_path_like("\\\\server\\share\\x")
+
+    def test_non_path_tokens_stay_non_path_like(self) -> None:
+        # ``key:value`` option tokens and URLs must not become path-like --
+        # the drive-letter form requires a separator right after the colon.
+        assert not security._is_path_like("key:value")
+        assert not security._is_path_like("C:no-separator")
+        assert not security._is_path_like("https://x.example/a")
+
+    def test_native_spelling_is_blocked_in_raw_text_on_any_host(self) -> None:
+        # The raw regex pass sees the command BEFORE tokenization, so it is
+        # the only layer that can catch an embedded interpreter script or a
+        # quoted native spelling -- and it is host-independent, so these must
+        # block everywhere, not just on Windows runners.
+        cmds = [
+            "python -c \"open(r'C:\\Users\\u\\AppData\\Roaming\\kiro-cli\\data.sqlite3','w')\"",
+            "python -c \"open(r'C:\\Users\\u\\.aws\\credentials')\"",
+            "type 'C:\\Users\\u\\.ssh\\id_rsa'",
+            "cat '%USERPROFILE%\\.aws\\credentials'",
+            "type '\\\\srv\\homes\\u\\.ssh\\id_rsa'",
+            "type 'C:/Users/u/.aws/credentials'",
+            # PowerShell spelling of the profile variable.
+            "Get-Content '$env:USERPROFILE\\.aws\\credentials'",
+            # cmd.exe expansion-modifier spelling.
+            "type '%USERPROFILE:~0%\\.ssh\\id_rsa'",
+            # Braced PowerShell spelling.
+            "Get-Content '${env:USERPROFILE}\\.aws\\credentials'",
+            # HOMEDRIVE+HOMEPATH concatenation is the same home by definition.
+            'Get-Content "$env:HOMEDRIVE$env:HOMEPATH\\AppData\\Roaming\\kiro-cli\\data.sqlite3"',
+            "type '%HOMEDRIVE%%HOMEPATH%\\.ssh\\id_rsa'",
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.parametrize("leaf", security._WRITE_PROTECTED_BASH_LEAVES)
+    def test_native_spelling_of_write_protected_leaf_is_blocked_on_any_host(
+        self, leaf: str
+    ) -> None:
+        # The write-protected leaf branch is POSIX-separator anchored, so on a
+        # Windows host the resolved home literal (``C:\Users\u``) spells every
+        # leaf with backslashes and reached the fenced file unblocked. Each leaf
+        # is an input to an authorization decision (migration completion, the
+        # on-call schedule, the incident index, the alias ownership record), so
+        # the native spelling has to be gated in the raw text like the fenced
+        # dirs already are -- host-independently, since the raw pass never
+        # depends on the runner's OS.
+        win_leaf = leaf.replace("/", "\\")
+        for prefix in security.crew_home_prefixes():
+            win_prefix = prefix.replace("/", "\\")
+            for anchor in ("C:\\Users\\u", "%USERPROFILE%", "$env:USERPROFILE"):
+                target = f"{anchor}\\{win_prefix}\\{win_leaf}"
+                for cmd in (
+                    f'echo forged > "{target}"',
+                    f'copy /Y evil.json "{target}"',
+                    f"python -c \"open(r'{target}','w')\"",
+                    f'del "{target}"',
+                ):
+                    assert is_sensitive_bash_command(cmd) is not None, cmd
+        # Adding a leaf must not fence the whole crew home: unrelated content in
+        # the same native spelling stays writable.
+        assert (
+            is_sensitive_bash_command('echo x > "C:\\Users\\u\\.kiro\\crew\\sessions.db"')
+            is None
+        )
+
+    def test_appdata_alias_of_fenced_store_is_blocked(self) -> None:
+        # %APPDATA% points INTO AppData\Roaming, so this spelling names the
+        # store without the AppData\Roaming text the home-anchored branch
+        # matches on -- it needs its own alias branch.
+        cmds = [
+            'del "%APPDATA%\\kiro-cli\\data.sqlite3"',
+            "type '%APPDATA%\\amazon-q\\data.sqlite3'",
+            "cat '%APPDATA%/kiro-cli/data.sqlite3'",
+            'del "$env:APPDATA\\kiro-cli\\data.sqlite3"',
+            # Single-dot segments are canonical-equivalent to their absence.
+            'cmd /c copy /Y evil.sqlite "%APPDATA%\\.\\kiro-cli\\data.sqlite3"',
+            # cmd.exe expansion modifiers resolve to the same location.
+            'cmd /c copy "%APPDATA:~0%\\kiro-cli\\data.sqlite3" .\\loot.db',
+            # Braced PowerShell spelling.
+            'del "${env:APPDATA}\\kiro-cli\\data.sqlite3"',
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+        # Other %APPDATA% content stays allowed.
+        assert is_sensitive_bash_command('type "%APPDATA%\\SomeApp\\config.json"') is None
+
+    def test_backslash_relative_traversal_is_blocked(self) -> None:
+        assert is_sensitive_bash_command("type ..\\..\\.aws\\credentials") is not None
+        assert (
+            is_sensitive_bash_command(
+                "type ..\\..\\AppData\\Roaming\\kiro-cli\\data.sqlite3"
+            )
+            is not None
+        )
+        # The POSIX spelling keeps matching through the widened alternation.
+        assert is_sensitive_bash_command("dd if=../../.aws/credentials") is not None
+
+    def test_benign_native_spellings_stay_allowed(self) -> None:
+        assert is_sensitive_bash_command("type 'C:\\Users\\u\\project\\readme.md'") is None
+        assert (
+            is_sensitive_bash_command("python -c \"open(r'C:\\temp\\x.txt')\"") is None
+        )
+
+    def test_down_up_traversal_reentry_is_blocked(self) -> None:
+        # A same-level excursion (X\..) is a canonical no-op, so a spelling
+        # that re-enters the fenced location still names it.
+        cmds = [
+            (
+                "python -c \"open(r'C:\\Users\\u\\AppData\\Roaming\\..\\Roaming"
+                "\\kiro-cli\\data.sqlite3','w')\""
+            ),
+            "type 'C:\\Users\\u\\.aws\\..\\.aws\\credentials'",
+            'del "%APPDATA%\\..\\Roaming\\kiro-cli\\data.sqlite3"',
+        ]
+        for cmd in cmds:
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="fence targets are os.sep-joined; the match is only real on Windows",
+    )
+    def test_backslash_spelling_of_fenced_dirs_is_blocked_on_windows(self) -> None:
+        # Single quotes keep the backslashes literal through POSIX shlex, so
+        # the token reaches is_sensitive_path() in its native spelling.
+        home = str(Path.home())
+        for fenced in (".aws\\credentials", "AppData\\Roaming\\kiro-cli\\data.sqlite3"):
+            cmd = f"type '{home}\\{fenced}'"
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+
+class TestBareTokenProtectedLeaves:
+    """The distinctive leaves are refused by NAME, with no anchor required.
+
+    Every other leaf branch needs a home anchor plus a crew prefix, so one ``cd`` walks
+    around all of them: after ``cd ~/.kiro/crew`` a relative ``echo forged >
+    connections-tool-aliases.json`` names no home, no prefix and no separator. For the
+    alias ownership record that is not a residual limit to accept the way it is for
+    credential paths -- the file IS the deletion grant (``alias_record.load_claimed``
+    returns the pairs the rebuild may strip from the spec), so the contract is about the
+    FILENAME: any command naming it as a path segment is refused, and anchoring is not
+    part of the contract.
+    """
+
+    def test_relative_redirect_after_cd_is_blocked(self) -> None:
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"cd ~/.kiro/crew && echo forged > {leaf}",
+                f"cd $HOME/.kiro/crew; echo forged >> {leaf}",
+                # no space between the operator and the target
+                f"cd ~/.kirocrew && echo forged >{leaf}",
+                f"cd ~/.kiro/crew && echo forged > '{leaf}'",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_bare_name_with_any_verb_is_blocked(self) -> None:
+        # Verb-independent, like the anchored branches: naming the file is the signal,
+        # so a novel or forgotten write verb cannot slip past an enumerated list.
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"tee {leaf}",
+                f"touch {leaf}",
+                f"rm -f {leaf}",
+                f"mv /tmp/forged.json {leaf}",
+                f"cp /tmp/forged.json {leaf}",
+                f"cat {leaf}",
+                f"python -c \"open('{leaf}','w')\"",
+                f"install -m 600 /tmp/forged.json {leaf}",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_subdir_relative_spellings_are_blocked(self) -> None:
+        # A path SEPARATOR before the name is the common bare-relative spelling and is
+        # outside the ``[\s'\"=:,;]`` token anchor the anchored branches use.
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"echo forged > ./{leaf}",
+                f"tee ./{leaf}",
+                f"cp /tmp/f.json crew/{leaf}",
+                f"echo forged > ../crew/{leaf}",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_windows_relative_spelling_is_blocked(self) -> None:
+        # Host-independent: the raw pass never depends on the runner's OS, and a
+        # backslash-relative name carries no anchor for the Windows leaf branch either.
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            for cmd in (
+                f"echo forged > .\\{leaf}",
+                f'copy /Y evil.json ".\\{leaf}"',
+                f"echo forged > crew\\{leaf}",
+                f"python -c \"open(r'.\\{leaf}','w')\"",
+            ):
+                assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_unrelated_names_and_crew_content_stay_allowed(self) -> None:
+        # Bare-token matching is deliberately narrow: it fences ONE distinctive
+        # filename, not the crew home and not every name that contains it.
+        assert is_sensitive_bash_command("touch ~/.kiro/crew/sessions.db") is None
+        assert is_sensitive_bash_command("touch ~/.kirocrew/sessions.db") is None
+        assert is_sensitive_bash_command("cat ~/.kiro/crew/config.json") is None
+        for leaf in security._BARE_TOKEN_PROTECTED_LEAVES:
+            # a DIFFERENT file whose name merely ends with the protected one
+            assert is_sensitive_bash_command(f"touch my-{leaf}") is None
+            assert is_sensitive_bash_command(f"cat legacy-{leaf}") is None
+            # a longer name that merely starts with it
+            assert is_sensitive_bash_command(f"cat {leaf}x") is None
+            assert is_sensitive_bash_command(f"cat {leaf}5") is None
+
+    def test_generic_leaves_are_not_bare_matched(self) -> None:
+        # SCOPE GUARD: bare-token matching is only safe for a globally distinctive
+        # name. Admitting a generic leaf (``index.json``, ``config.json``,
+        # ``rotation.yaml``) would refuse a large fraction of ordinary commands, so the
+        # tuple must never grow one -- and the anchored forms must keep working.
+        for generic in ("index.json", "config.json", "rotation.yaml", ".data-home-ready"):
+            assert generic not in security._BARE_TOKEN_PROTECTED_LEAVES
+            assert is_sensitive_bash_command(f"touch {generic}") is None
+        for leaf in security._WRITE_PROTECTED_BASH_LEAVES:
+            for prefix in security.crew_home_prefixes():
+                anchored = f"echo forged > ~/{prefix}/{leaf}"
+                assert is_sensitive_bash_command(anchored) is not None, anchored
 
 
 class TestDeniedCommandsKeystone:

@@ -10,6 +10,7 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -18,6 +19,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,7 @@ from kiro_crew.apps.bridges import (
     deregister_app,
     deregister_app_crons_from_service,
     register_app,
+    register_app_crons_with_service,
 )
 from kiro_crew.apps.manager import (
     disable_app,
@@ -38,11 +41,9 @@ from kiro_crew.apps.manager import (
     uninstall_app,
 )
 from kiro_crew.apps.scaffold import scaffold_app
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.cli_server import _marker_port, resolve_client_port
 from kiro_crew.config import config_dir
 from kiro_crew.config.loader import (
-    DASHBOARD_PORT,
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
@@ -51,6 +52,7 @@ from kiro_crew.config.loader import (
     config_local_path,
     config_path,
     read_config_for_update,
+    update_config_locked,
 )
 from kiro_crew.cron import CronSchedule, CronService, format_schedule
 from kiro_crew.cron_trigger import trigger_cron_job
@@ -62,7 +64,9 @@ from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import Lesson, LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.port_resolution import resolve_client_port_ex
 from kiro_crew.security import (
+    BUILTIN_DENIED_RULES,
     BUILTIN_DENY_PATTERNS,
     is_sensitive_path,
     redact,
@@ -72,8 +76,14 @@ from kiro_crew.security import (
     scan_memory,
 )
 from kiro_crew.sel import sel
-from kiro_crew.validation import _AGENT_NAME_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN, WORKSPACE_NAME_RE
-from kiro_crew.vector_memory import VectorMemoryStore
+from kiro_crew.validation import (
+    _AGENT_NAME_RE,
+    CHANNEL_ID_RE,
+    CHANNEL_MAX_LEN,
+    WORKSPACE_NAME_RE,
+    normalize_lesson_category,
+)
+from kiro_crew.vector_memory import VectorMemoryStore, _lesson_display_text
 
 # Workspace dirs are confined to the data home: a workspace is agent-writable
 # working state, so letting --dir escape would let it be pointed at ~/.ssh or the
@@ -82,6 +92,14 @@ from kiro_crew.vector_memory import VectorMemoryStore
 _WS_DIR_OUTSIDE_HOME = (
     "Error: --dir must resolve inside the KiroCrew data home ({home}); got {given!r}. "
     "Pass a relative directory name (e.g. 'workspace-myproject')."
+)
+
+# Strip ANSI escape sequences and C0/C1 control characters from lesson text
+# before printing to the terminal, preventing OSC-based clipboard/title attacks.
+_TERMINAL_CTRL_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"  # CSI sequences
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences
+    r"|[\x00-\x08\x0b-\x1f\x7f-\x9f]"  # C0/C1 controls (keep \n \t)
 )
 
 
@@ -527,6 +545,48 @@ def _cleanup_app_crons_from_scheduler(app_name: str) -> int:
     return removed
 
 
+def _register_app_crons_to_scheduler(app_name: str) -> list[str]:
+    """Promote the enabled app's cron definitions into the shared scheduler store.
+
+    Mirrors ``_cleanup_app_crons_from_scheduler`` for the enable direction: the
+    HTTP enable route promotes app crons into the running CronService via
+    ``hooks_integration.on_app_enable``, but the CLI runs in a separate process
+    with no handle on the gateway's service — so without a store write here, an
+    app enabled from the CLI has its crons lie dormant until the next gateway
+    restart. Writing through a store-backed CronService closes that gap: the
+    running gateway's timer tick re-syncs ``crons.json`` by content digest at
+    least every ``_TIMER_POLL_SECS``, picking up externally-added jobs by
+    design. ``register_app_crons_with_service`` applies the same trust gate and
+    command/script vetting as the gateway paths and is idempotent (jobs already
+    present by name are skipped). Returns the newly registered job names.
+    """
+    svc = CronService(base_dir=config_dir())
+    svc._load()
+    try:
+        # register_app_crons_with_service is async (routes through the async
+        # CronSDK mutators). The CLI is a loop-less process, so drive it with a
+        # one-shot event loop. No scheduler is running here, so nothing is armed.
+        registered = asyncio.run(register_app_crons_with_service(app_name, svc))
+        sel().log_api_access(
+            caller="cli",
+            operation="app_crons_register",
+            outcome="completed",
+            resources=f"app={app_name} crons={registered}",
+        )
+    except Exception as exc:
+        sel().log_api_access(
+            caller="cli",
+            operation="app_crons_register",
+            outcome="failed",
+            resources=app_name,
+            error=str(exc),
+        )
+        raise
+    if registered:
+        print(f"  registered {len(registered)} cron job(s) with scheduler")
+    return registered
+
+
 def _run_app_mcp_server(app_name: str) -> None:
     """Run the named app's stdio MCP server in this process.
 
@@ -603,6 +663,7 @@ def _handle_app(args: argparse.Namespace) -> None:
                 print(f"   Agents registered: {len(reg.agents)}")
             if reg.skills:
                 print(f"   Skills registered: {len(reg.skills)}")
+            _register_app_crons_to_scheduler(args.name)
         else:
             print(f"❌ {result.error}", file=sys.stderr)
             sys.exit(1)
@@ -783,13 +844,11 @@ def _cron(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        if channel:
-
-            if len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
-                print(
-                    f"Error: invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})"
-                )
-                return
+        if channel and (len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel)):
+            print(
+                f"Error: invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})"
+            )
+            return
         if cron_expr:
             job = svc.add_job(
                 name=args.name,
@@ -834,7 +893,7 @@ def _cron(args: argparse.Namespace) -> None:
 
     elif action == "update":
         kwargs: dict = {}
-        for field in ("name", "message", "every_secs", "cron_expr", "channel"):
+        for field in ("name", "message", "every_secs", "cron_expr", "channel", "timeout_secs"):
             val = getattr(args, field, None)
             if val is not None:
                 if field == "channel":
@@ -865,7 +924,11 @@ def _cron(args: argparse.Namespace) -> None:
         if "every_secs" in kwargs and "cron_expr" in kwargs:
             print("Provide --every or --cron, not both")
             return
-        updated = svc.update_job(args.job_id, **kwargs)
+        try:
+            updated = svc.update_job(args.job_id, **kwargs)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
         if updated:
 
             audit_resources = f"job_id={args.job_id} fields={','.join(sorted(kwargs))}"
@@ -911,7 +974,10 @@ def _cron(args: argparse.Namespace) -> None:
             print(f"Job not found: {args.job_id}")
 
     elif action == "trigger":
-        port = DASHBOARD_PORT
+        # Instance-aware, for the same reason as the MCP trigger: DASHBOARD_PORT reads
+        # KIROCREW_PORT only, so on a --port auto gateway it names a sibling, and the
+        # paired credential would let that sibling run the job.
+        port, _evidence_backed = resolve_client_port_ex(None)
         secret_path = config_dir() / ".local_secret"
         ok, msg = trigger_cron_job(args.job_id, port, secret_path)
         print(msg)
@@ -1118,6 +1184,40 @@ def _security(args: argparse.Namespace) -> None:
         print("Usage: kirocrew security {audit|deny-list|events|verify}")
 
 
+def _print_denied_command_summary(*, ids: bool) -> None:
+    """Print the built-in denied-command catalog as grouped counts (or, with
+    ``--ids``, each category's rule ids).
+
+    The 139 built-in rules are visible and configurable to the USER (Settings
+    → Security renders them in category accordions, backed by
+    ``GET /api/security/denied-commands``) but were invisible to the AGENT --
+    ``policy show`` reported everything except them, so an agent planning a
+    multi-step task had no way to learn a class of work is hard-denied before
+    committing to a plan that turns out to be impossible. See issue #3454.
+
+    Deliberately just counts + ids, not the full 139 regex patterns: enough
+    for planning ("this class of work is blocked") and for citing a rule id
+    when relaying a refusal, without bloating the output the way dumping
+    every pattern would.
+    """
+    by_category: dict[str, list] = {}
+    for rule in BUILTIN_DENIED_RULES:
+        by_category.setdefault(rule.category, []).append(rule)
+    counts = Counter({cat: len(rules) for cat, rules in by_category.items()})
+    print(
+        f"   • commands.denied: {len(BUILTIN_DENIED_RULES)} rules "
+        f"in {len(by_category)} categories"
+    )
+    if ids:
+        for cat, rules in sorted(by_category.items(), key=lambda kv: -len(kv[1])):
+            rule_ids = ", ".join(r.id for r in rules)
+            print(f"       {cat}({len(rules)}): {rule_ids}")
+    else:
+        summary = " ".join(f"{cat}({n})" for cat, n in counts.most_common())
+        print(f"       {summary}")
+        print("     (add --ids for rule ids, or see Settings → Security)")
+
+
 def _policy(args: argparse.Namespace) -> None:
     """Governance policy + profile inspection (read-only; safe to expose to LLM).
 
@@ -1126,7 +1226,12 @@ def _policy(args: argparse.Namespace) -> None:
     effective ceiling.  No mutation — purely diagnostic, so it is MCP-safe.
     """
     from kiro_crew.platform.context import current_context
-    from kiro_crew.platform.governance import SCOPE_CATALOG, gate_decision, resolve
+    from kiro_crew.platform.governance import (
+        CAPABILITY,
+        SCOPE_CATALOG,
+        gate_decision,
+        resolve,
+    )
     from kiro_crew.platform.governance_profiles import (
         get_store_profile,
         resolve_active_scope,
@@ -1138,6 +1243,7 @@ def _policy(args: argparse.Namespace) -> None:
     if action == "show":
         if ceiling is None:
             print("No enterprise security policy is active (editable secure-defaults).")
+            _print_denied_command_summary(ids=getattr(args, "ids", False))
             return
         # Report the PROVEN provenance, not the claimed one: printing a bare
         # issuer implied a trust decision nothing had made.  signature_summary()
@@ -1153,6 +1259,7 @@ def _policy(args: argparse.Namespace) -> None:
             print("   (no governed scopes)")
         for scope in sorted(ceiling.controls):
             print(f"   • {scope}: {ceiling.controls[scope]}")
+        _print_denied_command_summary(ids=getattr(args, "ids", False))
 
     elif action == "validate":
         ok = True
@@ -1160,6 +1267,31 @@ def _policy(args: argparse.Namespace) -> None:
             print("Policy: none (editable secure-defaults) — nothing to validate.")
         else:
             print(f"Policy: v{ceiling.version} OK ({len(ceiling.controls)} governed scopes).")
+            # A capability the policy does not name is UNGOVERNED, and an
+            # ungoverned control is permitted — omission never denies (see the
+            # CAPABILITY-DEFAULT CONTRACT in platform/governance.py). That is the
+            # same rule every other archetype follows, but it is the one authors
+            # most often get wrong, because a partial `capabilities` block LOOKS
+            # like a complete statement. Report the gap so an unpinned row reads
+            # as a choice instead of an oversight.
+            unnamed = sorted(
+                scope
+                for scope, spec in SCOPE_CATALOG.items()
+                if spec.kind == CAPABILITY and scope not in ceiling.controls
+            )
+            if unnamed and len(unnamed) < sum(
+                1 for spec in SCOPE_CATALOG.values() if spec.kind == CAPABILITY
+            ):
+                print(
+                    f"   ⚠️  governs capabilities but leaves {len(unnamed)} "
+                    "row(s) UNGOVERNED (therefore permitted):"
+                )
+                for scope in unnamed:
+                    print(f"        {scope}")
+                print(
+                    "      Omission does not deny. Name each row explicitly "
+                    "(enabled true or false) if you meant to decide it."
+                )
         # Force-load every profile; the store records invalid ones as deny-all.
         from kiro_crew.platform.governance_profiles import _profiles_dir
 
@@ -1351,15 +1483,32 @@ def _learn(args: argparse.Namespace) -> None:
             if vs_lessons:
                 for e in vs_lessons:
                     val = json.loads(e["value_json"])
-                    print(f"  [knowledge] {val}")
+                    # Rendered text for either storage shape: mapping-shaped rows
+                    # (write_lesson's format and the onboarding import's) would
+                    # otherwise print as a Python dict repr.
+                    #
+                    # The label reads the row's own category so this surface agrees
+                    # with the dashboard's lessons panel; a legacy string row
+                    # carries none, and the shared helper supplies the store's
+                    # own "knowledge" default (display policy, strict=False).
+                    category = normalize_lesson_category(
+                        val.get("category") if isinstance(val, dict) else None,
+                        strict=False,
+                    )
+                    text = _TERMINAL_CTRL_RE.sub("", _lesson_display_text(val) or str(val))
+                    print(f"  [{_TERMINAL_CTRL_RE.sub('', category)}] {text}")
             else:
                 lessons = jsonl_store.load_all()
                 if not lessons:
                     print("No lessons.")
                     return
                 for le in lessons:
-                    neg = f" — {le.negative}" if le.negative else ""
-                    print(f"  [{le.category}] {le.rule}{neg}")
+                    neg = f" — {_TERMINAL_CTRL_RE.sub('', str(le.negative))}" if le.negative else ""
+                    # Same display policy as the vector-store branch above and
+                    # the dashboard's JSONL path: a blank/legacy category gets
+                    # the store's own "knowledge" default instead of printing [].
+                    category = normalize_lesson_category(le.category, strict=False)
+                    print(f"  [{_TERMINAL_CTRL_RE.sub('', category)}] {_TERMINAL_CTRL_RE.sub('', str(le.rule))}{neg}")
 
         elif action == "remove":
             if vs.get_lessons() and vs.delete_lesson(args.query):
@@ -1393,7 +1542,13 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                     val = json.loads(e["value_json"])
                 except Exception:
                     val = e["value_json"]
-                print(f"  {e['key']}: {val}  (confidence={e['confidence']}, source={e['source']})")
+                # A lesson row stores its rule and NOT-clause as separate fields,
+                # so printing the decoded value would show a Python dict repr on
+                # this surface while every other reader shows the prose.
+                if str(e["key"]).startswith("lesson."):
+                    val = _lesson_display_text(val) or val
+                safe_val = _TERMINAL_CTRL_RE.sub("", str(val))
+                print(f"  {e['key']}: {safe_val}  (confidence={e['confidence']}, source={e['source']})")
 
         elif action == "search":
             results = store.search_episodic(query_text=args.query, limit=10)
@@ -1418,7 +1573,11 @@ def _memory_cmd(args: argparse.Namespace) -> None:
             print(
                 f"  Episodic: {stats['episodic_active']} active, {stats['episodic_deleted']} deleted"
             )
-            print(f"  FAISS index: {stats['faiss_index_size']} vectors")
+            print(f"  Embedded: {stats['embedded_count']}/{stats['episodic_active']}")
+            if stats["faiss_available"]:
+                print(f"  FAISS accelerator: {stats['faiss_index_size']} vectors indexed")
+            else:
+                print("  FAISS accelerator: not installed — stdlib cosine fallback (exact)")
             print(f"  Audit events: {stats['events_count']}")
 
         elif action == "audit":
@@ -1840,11 +1999,12 @@ def _tailnet(args: argparse.Namespace) -> None:
         print("👻 Tailnet dashboard access")
         if pinned:
             print(
-                "   Policy:     PINNED OFF by your administrator "
-                "(capabilities.tailnet_origin)"
+                "   Policy:     PINNED OFF by your administrator " "(capabilities.tailnet_origin)"
             )
-        print(f"   Trust:      {'enabled' if enabled else 'disabled'} "
-              f"(dashboard.tailscale.enabled)")
+        print(
+            f"   Trust:      {'enabled' if enabled else 'disabled'} "
+            f"(dashboard.tailscale.enabled)"
+        )
         print(f"   Name:       {name or '— (no tailnet name resolvable right now)'}")
         published = state.published
         label = {True: "yes", False: "no", None: "unknown"}[published]
@@ -1979,77 +2139,76 @@ def _telemetry(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
     path = config_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"❌ Could not read {path}: {exc}", file=sys.stderr)
-        sys.exit(1)
-    if not isinstance(data, dict):
-        # Refuse rather than replace. Coercing to {} would make this toggle
-        # silently overwrite the whole file (a JSON array, string, or number is
-        # not a config we can merge into) and then print success — destroying
-        # whatever the user had. A toggle must never be a data-loss path.
-        print(
-            f"❌ {path} is not a JSON object ({type(data).__name__}); refusing to "
-            "overwrite it. Fix or move the file, then retry.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    # Same rule as the whole-file check above, applied per section: coercing a
-    # non-object section to {} would DISCARD whatever the user had there and then
-    # print success. Absent is fine (create it); present-but-wrong-type is a
-    # refusal, because this command cannot know what the value was meant to be.
-    sections: dict[str, dict[str, object]] = {}
-    for name in ("telemetry", "dashboard"):
-        existing = data.get(name)
-        if existing is None:
-            sections[name] = {}
-            continue
-        if not isinstance(existing, dict):
+
+    def _mutate_telemetry(data: dict) -> dict:
+        """Apply telemetry toggle inside the config lock."""
+        if not isinstance(data, dict):
+            # Should not happen (read_config_for_update rejects non-objects),
+            # but guard defensively.
             print(
-                f"❌ {path} has a non-object \"{name}\" value "
-                f"({type(existing).__name__}); refusing to overwrite it. Fix or "
-                "remove it, then retry.",
+                f"❌ {path} is not a JSON object ({type(data).__name__}); refusing to "
+                "overwrite it. Fix or move the file, then retry.",
                 file=sys.stderr,
             )
             sys.exit(1)
-        sections[name] = existing
+        # Same rule as the whole-file check above, applied per section: coercing a
+        # non-object section to {} would DISCARD whatever the user had there and then
+        # print success. Absent is fine (create it); present-but-wrong-type is a
+        # refusal, because this command cannot know what the value was meant to be.
+        sections: dict[str, dict[str, object]] = {}
+        for name in ("telemetry", "dashboard"):
+            existing = data.get(name)
+            if existing is None:
+                sections[name] = {}
+                continue
+            if not isinstance(existing, dict):
+                print(
+                    f'❌ {path} has a non-object "{name}" value '
+                    f"({type(existing).__name__}); refusing to overwrite it. Fix or "
+                    "remove it, then retry.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            sections[name] = existing
 
-    sections["telemetry"]["beacon_enabled"] = want
-    data["telemetry"] = sections["telemetry"]
-    # Running this command IS the informed choice the first-run chapter exists to
-    # collect, so record the ack. Otherwise `telemetry enable` on a fresh
-    # headless install would write beacon_enabled: true and still send nothing,
-    # because the first-egress gate would keep waiting for a dashboard screen the
-    # user may never open.
-    sections["dashboard"]["privacy_acked"] = True
-    data["dashboard"] = sections["dashboard"]
-    # Preserve the existing permissions. atomic_write creates a NEW file and
-    # renames it over the old one, so without this an operator's tightened mode
-    # is silently replaced by the umask default (0600 -> 0644 on a typical host).
-    # config.json can hold inline credentials, so a telemetry toggle must never
-    # widen who can read it. Default 0o600 for a file we are creating.
+        sections["telemetry"]["beacon_enabled"] = want
+        data["telemetry"] = sections["telemetry"]
+        # Running this command IS the informed choice the first-run chapter exists to
+        # collect, so record the ack. Otherwise `telemetry enable` on a fresh
+        # headless install would write beacon_enabled: true and still send nothing,
+        # because the first-egress gate would keep waiting for a dashboard screen the
+        # user may never open.
+        sections["dashboard"]["privacy_acked"] = True
+        data["dashboard"] = sections["dashboard"]
+        return data
+
     try:
-        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-    except OSError:
-        mode = 0o600
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # atomic_write, never path.write_text: this rewrites the user's WHOLE
-        # config.json, so a disk-full or interrupted write would truncate it and
-        # every later load would silently discard their configuration. Temp file
-        # + rename means the old file survives any failure. fsync so the rename
-        # is durable across a power loss.
-        atomic_write(path, json.dumps(data, indent=2) + "\n", fsync=True, mode=mode)
-        # atomic_write's `mode` is POSIX-only — it routes through fchmod_safe,
-        # which is a documented NO-OP on Windows. So on Windows the replacement
-        # file inherits the DIRECTORY's ACL, and a permissive data home would make
-        # a config.json holding inline credentials readable by other local users.
-        # restrict_to_owner applies an owner-only DACL there (and 0600 on POSIX),
-        # and is fail-loud, so a lockdown that cannot be applied surfaces below
-        # rather than silently leaving the file wide open.
+        update_config_locked(path, mutate=_mutate_telemetry, fsync=True, stamp_meta=False)
+        # restrict_to_owner: the atomic write creates a NEW inode, so without
+        # this an operator's tightened mode is silently replaced by the umask
+        # default.  config.json can hold inline credentials, so a telemetry
+        # toggle must never widen who can read it.  The locked helper preserves
+        # mode on POSIX; restrict_to_owner applies the owner-only DACL on
+        # Windows (and 0600 on POSIX for new files). Fail-loud so a lockdown
+        # that cannot be applied surfaces rather than silently leaving the file
+        # wide open.
+        try:
+            mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        except OSError:
+            mode = 0o600
         if not platform_compat.IS_POSIX or mode == 0o600:
             platform_compat.restrict_to_owner(path)
+    except ConfigReadError as exc:
+        err_str = str(exc)
+        if "not a JSON object" in err_str:
+            print(
+                f"❌ {path} is not a JSON object; refusing to "
+                "overwrite it. Fix or move the file, then retry.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"❌ Could not read {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
     except OSError as exc:
         print(f"❌ Could not write {path}: {exc}", file=sys.stderr)
         sys.exit(1)

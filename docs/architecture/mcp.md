@@ -86,9 +86,20 @@ same server's spec from the other sources in priority order (kirocrew, then
 kiro-global, then provider-global) before dropping it. When it falls back to a
 different source it adopts that source's `command`, `args` and `env` **as a
 unit**, so one source's command is never paired with another's arguments.
-Resolution uses the same `augmented_path()` the probe uses, so a server cannot
-probe healthy on the dashboard while being silently dropped from the agent
-config.
+Resolution, the dashboard probe, and the `env.PATH` written into the agent
+config all go through the same `env.spec_env_path()`, so a server cannot probe
+healthy on the dashboard while being silently dropped from the agent config —
+or launched from it with a PATH the probe never validated.
+
+A spec's `env` is applied per key by the consumer that spawns the server, so a
+declared `PATH` **replaces** the child's inherited one rather than extending it.
+A spec that names one directory to add would therefore hand the server a PATH
+holding only that directory. `spec_env_path()` expands a declared `env.PATH`
+into the full effective PATH — the spec's own entries first, then the augmented
+inherited PATH, deduped — before it is written out. Consequence to know about:
+the emitted value is a snapshot of the rebuild-time environment, so it encodes
+this host's directories (mise data dir, installed Node version bins, the
+running interpreter's bin) and is not portable to another machine.
 
 ### `includeMcpJson` is pinned false
 
@@ -120,13 +131,78 @@ from the live `kirocrew` binary, strips stale remote-transport fields (`url`,
 gateway is actually running under while preserving the user's own env keys.
 User customizations such as `autoApprove` are preserved.
 
+An entry may also carry a **`spec_gate`** — a predicate consulted at spec
+EMISSION time. `kirocrew-computer` is the one row that has one, and the
+distinction it draws is the difference between a capability that advertises no
+tools and one that costs nothing: emitting the entry is what makes kiro-cli spawn
+the backend, so an in-process enable check can only ever refuse work in a process
+that is already resident (~109 MB, per chat process, including every `spawn_run`
+subagent). While the gate is closed the server appears in neither `mcpServers`
+nor `tools`, so nothing is spawned at all. Both loops that write specs honour it,
+and asymmetrically on purpose:
+
+- `build_agent_config()` withholds the entry **and pops one arriving from the
+  user override file** — a platform gate exists because there is no driver on
+  this OS, and an override must not smuggle a server past it;
+- `_refresh_dynamic_fields()` **retracts** an entry a previous pass wrote while
+  the gate was open, because a skip-only refresh would mean turning a feature off
+  never reclaims the process turning it on started;
+**The `@server` refs in `tools` / `allowedTools` are left exactly as they are.**
+Withholding the entry is the whole control: a `@server` ref resolves against the
+agent's own `mcpServers` plus the global `mcp.json`, so with no entry in either
+there is nothing to launch — the ref names nothing and mounts nothing.
+
+| | |
+|---|---|
+| **Preserved** | the user's `tools` and `allowedTools` refs, verbatim — including a mount hand-narrowed to a single `@server/tool` |
+| **NOT preserved** | the entry's `autoApprove` and user `env` keys. An off/on cycle resets these; the operator re-applies them |
+
+Stripping the refs as well is the tidier-looking design and it is where a whole
+class of defects came from. The removed set is not reconstructible from the server
+name — a user can narrow `tools` to ONE `@server/tool` ref while the re-enable path
+re-adds the BARE ref — so anything that prunes must also stash and restore, and
+every way that stash can fail silently **widens** the mount: an unwritable stash, a
+stash cleared before the spec write landed, a rebuild path that skipped the
+restore. Leaving the refs alone has none of those states, and the only place a stash
+could live is a sidecar the agent itself can write.
+
+That last point is why the entry's own fields are still dropped rather than stashed:
+a restored `autoApprove` would be an **agent-authored** value that a later rebuild
+installs into the spec, and kiro-cli approves an auto-approved MCP tool *locally* —
+no permission request is emitted, so `hooks.on_tool_call` (deny floor,
+sensitive-path check, governance ceiling) and the SEL audit are never reached. For
+tools that can click and type into an already-authenticated application that is a
+self-granted gate bypass. Losing an approval is the safe direction; restoring one
+from a file the agent can write is not.
+
+Withholding is recorded to SEL as `mcp_server_withheld`, derived from the gate plus
+the shipped template rather than from a config delta — nothing in the spec changes
+shape when a gate closes, so there is no delta to observe, and the audit trail would
+otherwise have no record that a shipped server was deliberately not emitted.
+
+The gate decision is snapshotted **once per rebuild** and threaded through both emit
+loops, so a keystone flip landing mid-rebuild cannot produce a spec that emits one
+server's entry under the old decision and another's under the new one.
+
+Under an enterprise MCP registry, `_refresh_dynamic_fields()` also maintains a
+`"type": "registry"` marker on these three entries — added when
+`agent.mcp_registry_mode` is declared, and REMOVED when it is not. The marker is
+maintained rather than preserved because it tracks the account the gateway is
+signed in to, not a user preference, and because the client's filter is
+symmetric: outside registry mode a marked entry is the one that gets dropped.
+`command`/`args` stay either way, since the registry path is not the only
+consumer of this spec (doctor's handshake probe and the CC sidecar sync both
+launch from it). See
+[../guides/enterprise-mcp-governance.md](../guides/enterprise-mcp-governance.md).
+
 `kirocrew-computer` carries **no `autoApprove` key and none may ever be added.**
 kiro-cli approves an auto-approved MCP tool locally and emits no permission
 request, so `hooks.on_tool_call` (the PreToolUse deny floor, sensitive-path
 check and governance ceiling) is never reached for it. For a tool that can click
 and type into an already-authenticated application, that would be a complete
 gate bypass. Its stdio shim answers an empty `tools/list` while the keystone
-enable is off, so a disabled feature costs the model no context.
+enable is off — retained as defence in depth for a mid-session disable, on top of
+the `spec_gate` above that keeps the process from existing in the first place.
 
 ### The final auto-approve pass
 
@@ -173,10 +249,42 @@ Probes run from `POST /api/mcp/probe`:
 - **stdio** servers are spawned and driven through an MCP `initialize` handshake
   followed by `tools/list`.
 - **HTTP** servers get the same two JSON-RPC calls over POST.
+- **Both calls must succeed for `ok`.** An initialize that answers and a
+  `tools/list` that does not (no response, an error reply, a non-200) is a
+  server no session can get a tool out of — the badge certifies "tools usable",
+  so that combination reports as an error naming `tools/list`, not as `ok` with
+  an empty list.
+- Every result carries **`probedAt`** (wall-clock seconds of the probe that
+  produced the status) and **`probeMode`** (`handshake` for a real round trip,
+  `declared` for the managed in-process fallback below). Both ride the cache
+  into the API payload, so the UI can say *when* a status was true — the caches
+  legitimately serve results up to their TTL, and an undated "Online" reads as
+  "now".
 - Timeout is `dashboard.mcp_probe_timeout_secs` (default 15s;
   `_PROBE_TIMEOUT_SECS` is the fallback if config is not loaded yet). Results
   are cached for `_PROBE_TTL_SECS` (1800s), after which status reads as
-  "outdated".
+  "outdated" — with `probedAt` preserved, because *when it was last true* is
+  the most useful thing an outdated row can say.
+- The handshake response is kept, not just the tool names: advertised
+  `capabilities`, the `protocolVersion` the server ANSWERED with, `serverInfo`,
+  and per-tool `annotations`. These feed the shareability verdict (below); the
+  probe already paid for the round-trip, so reading them costs nothing.
+- `client_info` overrides the identity sent in the handshake. The shareability
+  pre-flight uses it to ask one server under two identities; such a run is
+  excluded from the shared per-name probe cache, because a synthetic-identity
+  handshake is a diagnostic and not the canonical observation the dashboard
+  renders.
+- A remote server that answers the handshake with `401` — or with `403` carrying a
+  `WWW-Authenticate` challenge — and whose config has no static `Authorization`
+  header gets status `needs_auth` and an empty `error`, not `error`. The probe
+  holds no OAuth token, because kiro-cli owns token custody
+  ([design-notes/mcp-oauth-ownership.md](design-notes/mcp-oauth-ownership.md)), so
+  that answer carries no verdict on the server: an unauthorized server and one the
+  runtime calls successfully both return it. The dashboard renders `needs_auth` as
+  "Not verified" for that reason — naming an action the user may not need would
+  assert more than the probe observed. A `401` on an entry that DOES carry a static
+  `Authorization` header stays `error`: a supplied credential was rejected, which
+  is a real fault.
 - A probed stdio child that ignores a closed stdin costs
   `_PROBE_TEARDOWN_WAIT_SECS` twice (graceful wait, then again after SIGKILL)
   before the process-group reap, which is why that budget is a named constant
@@ -221,7 +329,12 @@ Probes run from `POST /api/mcp/probe`:
     - The substitution is logged at **WARNING**, once per server: `ok` here means
       "this package declares these tools", not "the server answered", and the
       default log level is WARNING, so at info it would be invisible on exactly the
-      hosts where it always happens. Third-party servers have no declaration to
+      hosts where it always happens. The result also carries
+      `probeMode: "declared"` into the cache and the API payload, and the
+      dashboard renders it as a **warn `Declared` badge rather than a green
+      `Online`** — colour carries the distinction, because a scan of a dozen
+      rows reads colour long before it reads small print. Third-party servers
+      have no declaration to
       read and keep the honest `mcp_probe_sandbox_unavailable` error.
     - Modules are imported **lazily** (they pull in the validation/artifacts graph,
       which cannot be imported at `mcp_discovery` import time). Any failure returns
@@ -242,6 +355,19 @@ is not in the probe cache yet, so a freshly added server transitions from
 `list_servers()` call, because the stored absolute path goes stale after an
 update: first `agent._resolve_kirocrew_bin()`, then `shutil.which("kirocrew")`
 on the augmented PATH.
+
+## Shareability verdicts
+
+`GET /api/mcp-gateway/servers` returns a `recommendation` per row: whether the
+server looks safe to stub, and separately whether its backend looks safe to
+share. The verdict is derived on this host from evidence ranked
+observation > measurement > declaration, and a server the gateway has WATCHED
+behave per-client while shared is never offered again. Nothing about which
+servers a machine runs ships with Kiro Crew and nothing leaves the host.
+
+Full contracts — the two on-disk records, the reason-code vocabulary, what the
+pre-flight can and cannot decide, and the seed-once rule — live in
+[`docs/system-specs/modules/mcp-shareability.md`](../system-specs/modules/mcp-shareability.md).
 
 ## Dashboard MCP management
 
@@ -273,7 +399,20 @@ remove`, hand-edits) are picked up naturally.
 
 Apply does **not** restart sessions. Scope changes take effect at the next
 session spawn; the header's Apply & Restart calls `POST /api/sessions/restart`
-to drain the warm pool of pre-spawned processes carrying the old config.
+to drain the warm pool of pre-spawned processes carrying the old config, so a
+freshly installed server is mounted on the next session rather than the one
+after it. The response carries `mcp_sync_ok`, and `RestartButton` READS it: a
+reconcile that failed is reported in the danger tint instead of the usual
+"sessions restarted, config applied". Honesty that lives only in a JSON body no
+user sees is not honesty — the sessions did restart, but against a config that
+may not match the sources, and that is the one thing the caller needs told.
+
+A probe that FAILS after the sanitizer stripped a declared env key names the key
+in its error (`_note_denied_env`). The sanitizer's own WARNING goes to the
+gateway log, which is not where someone staring at a red badge is looking: a
+Python server configured through `env.PYTHONPATH` fails the probe while working
+in a session, and unexplained that reads as a probe bug rather than the
+launcher boundary it is.
 
 ## How app agents reach MCP servers
 
@@ -290,6 +429,12 @@ dead URL, and kiro-cli connects to every server in the agent config on each
 request, so one dead entry surfaces as a transient 5xx and then a hard error for
 **all** requests, not just that app's. The enable path re-registers with the
 real port once the backend is up.
+
+Connection and tool exposure are separate. An entry in `mcpServers` is still
+connected even when it has no matching `@server` reference in `tools`; omitting
+the reference hides that server's tools from the agent but does not avoid the
+process or connection cost. Isolation and feature gates that must avoid that
+cost therefore remove the server entry itself as well as its tool reference.
 
 An app agent that references a host-managed server (`@kirocrew-core`,
 `@kirocrew-cron`) in its `tools` gets the launch spec copied in by
@@ -345,8 +490,9 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | Server | Process | Tools |
 |--------|---------|-------|
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger` |
-| `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
+| `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_move_session` |
 
 CLI commands and their MCP twins:
 
@@ -369,7 +515,8 @@ CLI commands and their MCP twins:
 | `kirocrew computer apps` | `computer_list_apps` | `kirocrew-computer` |
 
 `kirocrew-core` tools with no CLI twin, grouped by concern (authoritative list:
-the `tools/list` payload in `mcp_core.py`):
+`kiro_crew.mcp_tools.build_tool_list()`, which is what `mcp_core._list_tools`
+answers `tools/list` from):
 
 - **Subagents:** `spawn_status`, `spawn_continue`, `spawn_steer`,
   `spawn_release`, `spawn_sub_agents`, `wait`
@@ -398,14 +545,167 @@ the `tools/list` payload in `mcp_core.py`):
   (method, path) allowlist of Ops Mission Control routes; the agent never
   sees a credential (same shape as `issue_radar_record_investigation`)
 
-External servers a user may install (a Playwright proxy under the canonical
-`playwright-mcp` alias, a Slack server, anything else) are ordinary user-added
-servers: they live in one of the scope files and are merged into the agent config
-at render time. They are not managed, so a `mcp_server_alias` normalization pass
-rewrites slash-containing keys to kiro-safe aliases and
-`browser.setup.converge_playwright_servers()` folds every Playwright-proxy entry onto the one
-canonical key, keyed by resolved launch target, so a legacy slash-free key
-re-injected from `~/.kiro/crew/mcp.json` cannot spawn a second backend.
+### A `kirocrew-core` tool has two halves
+
+Each tool is declared twice in the same per-domain module under
+`kiro_crew/mcp_tools/` (`spawn.py`, `artifacts.py`, `workflows.py`, …), and
+nothing at runtime notices when only one half lands:
+
+- Its **descriptor** — name, model-facing description, JSON Schema — is returned
+  by that module's `schemas()`. `build_tool_list()` concatenates every domain's,
+  and `mcp_core._list_tools` answers `tools/list` from it.
+- Its **handler** is an entry in that module's `HANDLERS` map, called as
+  `handler(name, args)`. `dispatch()` finds it by name and
+  `mcp_core._call_tool_inner` delegates to that.
+
+A descriptor with no handler advertises a tool that answers with the
+dispatcher's fallthrough; a handler with no descriptor is unreachable, because
+the model is never told the name. `test/test_mcp_tool_registry.py` fails when
+either half is missing, when the two halves land in different domains, or when a
+name is claimed twice.
+
+Handlers reach the server's shared plumbing — `_post`/`_get`, the identity
+resolvers, the governance vets — as **attributes of `mcp_core`**, not as direct
+imports. That is deliberate: an attribute lookup resolves at call time, so a test
+that rebinds one (`patch("kiro_crew.mcp_core._post")`, `setattr(mcp_core, "sel",
+…)`) still intercepts the handler. A direct import would bind at import time and
+silently escape every such patch. `mcp_core._HANDLER_SURFACE` names the bindings
+that exist only for this purpose, so an import cleanup cannot quietly delete one.
+
+The remaining upward dependency is known: the plumbing could move to a module the
+handlers own, which would make `mcp_tools` a leaf. That is a separate change —
+it has to retarget every patch site, which is mechanical but touches far more
+test code than moving the handlers did.
+
+Descriptors carry no per-caller state and are rebuilt per call, not cached: some
+quote a live value (the concurrent sub-agent cap), and a cache would pin the
+first reading for the life of the server process.
+
+External servers a user may install (a Slack server, anything else) are ordinary
+user-added servers: they live in one of the scope files and are merged into the
+agent config at render time. They are not managed, so a `mcp_server_alias`
+normalization pass rewrites slash-containing keys to kiro-safe aliases: kiro-cli
+splits an agent `@server` reference on `/`, so a slash-containing key is
+mis-parsed as `@server/tool` and exposes none of the server's tools.
+
+**Browsing is deliberately not an MCP server.** The agent drives a browser by
+running `playwright-cli` commands on its ordinary shell path, so no tool schemas
+are re-sent per request and the accessibility tree stays on disk instead of
+entering the model context. See [browser](../system-specs/modules/browser.md).
+
+## What belongs in `kirocrew-core`, and what does not
+
+`kirocrew-core` is the surface EVERY session carries. kiro-cli reads `tools/list`
+once per session, so a tool listed there spends context in every request of every
+session for as long as the session lives — whether or not that session will ever
+use it. With `agent.tool_search` on (the default) Kiro Crew forces kiro's deferral
+always-on, so the per-request cost is a name plus a description rather than a full
+JSON schema; it is smaller, not zero, and it scales with the tool count.
+
+That makes the placement question a real one rather than a matter of taste:
+
+- **Core** is for capabilities a session may need *without being asked* —
+  subagents, messaging, memory, artifacts, session-bound directives.
+- **Its own server** is for a capability an agent is granted on purpose. Give it
+  the `kirocrew-dashboard` shape: an **assignable set**, marked `opt_in` in
+  `_MANAGED_MCP_SERVERS` so neither spec writer adds it to the default agent.
+  kiro-cli loads a server only when `tools` names it, so an unassigned set costs
+  a session literally zero — which an always-refusing tool in core cannot
+  achieve, since it still ships its description every turn.
+
+**Assignment is the mechanism; a config bool is not.** Which agents get a set is
+decided by their own specs: the entry in `mcpServers` plus the matching
+`@<server>` ref in `tools`. Only `kirocrew.json` is rewritten on install, and a
+refresh keeps an existing grant's command current without ever introducing one,
+so a hand-granted set survives upgrades and an ungranted one does not come back
+behind the user's back. Adding a second boolean in `config.json` on top of that
+gates nothing an unreferenced server was not already denying.
+
+**Granularity: the set, not the tool.** A spec that references a server gets
+every tool in it. So a capability that must be grantable *separately* belongs in
+a server of its own, not alongside a set someone might want for other reasons.
+
+**A grant is not authority over everything the tools can name.** Assignment says
+which agent may call a set; it does not say what that agent may reach. The
+dashboard set resolves the calling session strictly — only a gateway-injected
+per-call caller context, an injected session key, or an HMAC-verified host pid
+counts, never a `/proc` ancestor walk, which would resolve a subagent to its
+parent slot — and then bounds itself by what that caller owns:
+
+| Caller | Sees | May file | May reshape the tree |
+|--------|------|----------|----------------------|
+| the person's own agent | every session | any session | yes |
+| an app agent | only its own app's sessions | only its own app's sessions | no |
+| a delegated caller whose slot cannot be located | nothing | nothing | no |
+| a `dashboard:` caller whose named slot is absent | nothing | nothing | no |
+| unverifiable | nothing | nothing | no |
+
+A delegated caller gets its own row because absence of a slot means different
+things for different callers. A Slack thread or a channel session has no
+dashboard slot and never had an app to be confined to, so it is unscoped. A
+subagent or a scheduled job also matches no slot, but it runs on behalf of
+whatever created it — and a cron can be created by an app — so reading absence
+as "no app" would let an app that may not touch a foreign session gain that
+reach by spawning a helper or scheduling a job. Delegated callers inherit
+authority; they never mint it.
+
+A `dashboard:` caller is refused for a different reason, and it is deliberately
+not on that delegated list. It is not delegated work — it *names* a slot. So
+absence is never the "never had a slot to be confined to" case that makes a
+Slack thread unscoped; it means the named slot is not there, which happens when
+the tab was closed while the call was still in flight (slot removal is
+synchronous and does not drain in-flight MCP calls) or when the key is wrong. An
+app-owned session going through that race would otherwise hand its agent
+authority the app itself does not have.
+
+Note this refusal is strictly narrower than inverting the default for every
+caller: Slack threads, channel sessions and crons do not carry the `dashboard:`
+prefix, so it costs them nothing.
+
+**The delegated list is knowingly incomplete.** It enumerates the delegated key
+forms that exist today, so a key form added later reads as unscoped until it is
+added to it. The sound shape is the inverse — grant authority only on positive
+confirmation that the caller is the person, refusing everything unplaceable —
+but that also removes these tools from callers who legitimately have no slot and
+no app, including the person's own crons. Until that inversion is taken, the gap
+is documented here rather than hidden.
+
+The asymmetry in the last column is not an oversight. Sessions carry an owning
+app, so "yours" is a decidable question and an app is confined to its own.
+Folders carry no owner at all: one tree serves the person and every app, so
+there is no app-private folder to bound a create, rename, reparent or delete to.
+Until folders have ownership, an app is refused the tree-shaping verbs outright
+rather than handed authority nothing can scope — while keeping the two things
+that are already scoped to it, reading the tree and filing its own sessions.
+
+**Assignment is still not authorization.** Being unreferenced by default keeps a
+capability cheap and deliberate; it does not prove the user consented to reach the
+agent does not otherwise have. For that, `config.json` is the WRONG home —
+`security.py` spells out why, and the keystone leaves (`computer_use.json`,
+`browser-mode-enabled`, the Ops Mission Control mode) exist because each grants
+something outside Kiro Crew (desktop input synthesis, the operator's logged-in
+browser, writes against production incident tooling) or is the security floor
+itself. One of those moved out of agent-writable config after review found exactly
+this mistake.
+
+The test is blast radius, not wording: ask what the agent gains that it did not
+already have. Folder tools grant no new read (`list_sessions` already returns every
+session's title and key) and cannot delete, so assignment alone is the right
+ceiling for them. Driving or stopping another session is not, and would need a
+keystone leaf on top of its own server. Ratchet each set so the next capability
+cannot arrive inside one whose grant was never meant to cover it.
+
+Per-agent scoping composes on top and needs no new mechanism: an agent spec's own
+`mcpServers` map decides which agents see a server at all
+(`agent_discovery.py`), so a server can be handed to an orchestrator-class agent
+without every agent inheriting it.
+
+Adding a managed server is a **parity tax** — the name must appear in
+`agent._MANAGED_MCP_SERVERS`, `mcp_discovery._MANAGED_SERVER_SUBCOMMANDS` and
+`_MANAGED_SERVER_TOOL_MODULES`, `mcp_cleanup.KIROCREW_BIN_MCP_SERVERS`,
+`onboarding_import._MANAGED_MCP_NAMES`, and the hidden `cli.py` subcommand.
+`test_computer_use_registration.py` asserts those registries are the same set, so
+a half-registered server fails the suite rather than shipping.
 
 ### The one deliberate exception
 

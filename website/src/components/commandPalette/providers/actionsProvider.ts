@@ -1,12 +1,14 @@
 import { createElement } from 'react'
 import type { ReactNode } from 'react'
-import { useMemo } from 'react'
+import { useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
-import { Command, MessageSquarePlus, SunMoon, Keyboard, Pin } from 'lucide-react'
+import { Command, MessageSquarePlus, SunMoon, Keyboard, Pin, Sparkles } from 'lucide-react'
 
 import { useAppDispatch, useAppSelector } from '../../../store'
 import { createSlot } from '../../../store/chatSlice'
+import { api } from '../../../api/client'
+import { type PonytailOverride } from '../../../lib/ponytail'
 import { useSessionActions } from '../../../hooks/useSessionActions'
 import { useTheme } from '../../../hooks/useTheme'
 import { fuzzyMatch, makeScoreThenNameComparator } from '../../../utils/fuzzyMatch'
@@ -73,6 +75,8 @@ export interface ActionsProviderDeps {
   openShortcuts: () => void
   /** Pin state + toggle for the active session; null when no session is active (action omitted). */
   pinCurrentSession?: { pinned: boolean; toggle: () => void } | null
+  /** Per-chat Ponytail override; null when no session is active (actions omitted). */
+  ponytail?: { set: (mode: PonytailOverride) => void } | null
 }
 
 const compareResults = makeScoreThenNameComparator<Result>(
@@ -126,6 +130,56 @@ export function createActionsProvider(deps: ActionsProviderDeps): ResourceProvid
       icon: inlineIcon(Pin),
       run: toggle,
     })
+  }
+
+  if (deps.ponytail) {
+    const ponytailActions: Array<{ key: string; mode: PonytailOverride; title: string; subtitle: string }> = [
+      {
+        key: 'ponytail-enable',
+        mode: 'full',
+        title: i18nT('components.commandPalette.providers.actionsProvider.enable_ponytail'),
+        subtitle: i18nT('components.commandPalette.providers.actionsProvider.enable_ponytail_description'),
+      },
+      {
+        key: 'ponytail-disable',
+        mode: 'off',
+        title: i18nT('components.commandPalette.providers.actionsProvider.disable_ponytail'),
+        subtitle: i18nT('components.commandPalette.providers.actionsProvider.disable_ponytail_description'),
+      },
+      {
+        key: 'ponytail-lite',
+        mode: 'lite',
+        title: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_lite'),
+        subtitle: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_lite_description'),
+      },
+      {
+        key: 'ponytail-full',
+        mode: 'full',
+        title: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_full'),
+        subtitle: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_full_description'),
+      },
+      {
+        key: 'ponytail-ultra',
+        mode: 'ultra',
+        title: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_ultra'),
+        subtitle: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_ultra_description'),
+      },
+      {
+        key: 'ponytail-global',
+        mode: '',
+        title: i18nT('components.commandPalette.providers.actionsProvider.use_global_ponytail_default'),
+        subtitle: i18nT('components.commandPalette.providers.actionsProvider.use_global_ponytail_default_description'),
+      },
+    ]
+    for (const action of ponytailActions) {
+      actions.push({
+        key: action.key,
+        title: action.title,
+        subtitle: action.subtitle,
+        icon: inlineIcon(Sparkles),
+        run: () => deps.ponytail?.set(action.mode),
+      })
+    }
   }
 
   return {
@@ -185,6 +239,13 @@ export function useActionsProvider(opts: { openShortcuts: () => void }): Resourc
   const activePinned = useAppSelector(
     (s) => s.dashboard.slots.find((slot) => slot.key === activeSlot)?.pinned ?? false,
   )
+  const setPonytail = useCallback((mode: PonytailOverride) => {
+    if (!activeSlot || typeof api.chatSlotPonytail !== 'function') return
+    api.chatSlotPonytail(activeSlot, mode).catch((err: unknown) => {
+      // eslint-disable-next-line no-console -- surface mode-switch failures for debugging
+      console.warn('Failed to set Ponytail mode', err)
+    })
+  }, [activeSlot])
 
   // "New session" is a write (createSlot); route it through useMutation for
   // error/loading state and consistency with paletteActions.ts's createSlot
@@ -206,7 +267,8 @@ export function useActionsProvider(opts: { openShortcuts: () => void }): Resourc
         pinCurrentSession: activeSlot
           ? { pinned: activePinned, toggle: () => togglePin(activeSlot) }
           : null,
+        ponytail: activeSlot ? { set: setPonytail } : null,
       }),
-    [doNewSession, cycle, openShortcuts, activeSlot, activePinned, togglePin],
+    [doNewSession, cycle, openShortcuts, activeSlot, activePinned, togglePin, setPonytail],
   )
 }

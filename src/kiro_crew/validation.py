@@ -31,6 +31,7 @@ from typing import Any
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 
 # ── Constants ──
 
@@ -39,10 +40,41 @@ MAX_TOOL_NAME_LEN = 256
 MAX_SHORT_STRING = 500  # names, IDs, categories
 MAX_MEDIUM_STRING = 5_000  # messages, rules
 MAX_LONG_STRING = 50_000  # task specs, inline content
+# A cron job's message IS a task prompt (real dispatched task specs routinely
+# exceed 5k chars), so it gets its own cap at task-spec scale instead of
+# borrowing MAX_MEDIUM_STRING — raising that shared constant would widen ~20
+# unrelated fields. Enforced at every create/update surface (MCP schemas,
+# dashboard REST) AND at the CronService persistence chokepoint
+# (_build_job/update_job), so the CLI and apps SDK cannot admit a larger value
+# than the validated surfaces.
+MAX_CRON_MESSAGE = 50_000
 MAX_RESPONSE_LEN = 100_000  # truncate tool responses
 
 # Allowed categories for lessons
 ALLOWED_LESSON_CATEGORIES = frozenset({"tool", "preference", "knowledge"})
+
+
+def normalize_lesson_category(value: object, *, strict: bool) -> str:
+    """Normalize a lesson category to a usable string label.
+
+    The single source of the category rules for every surface that labels a
+    lesson, so write-time and display-time policy cannot drift apart:
+
+    - ``strict=True`` (write path): clamp to ``ALLOWED_LESSON_CATEGORIES`` --
+      an unrecognized or non-string label is not a category, and "knowledge"
+      is the default every other writer uses. The ``isinstance`` check runs
+      first so an unhashable label (a dict or list from an LLM) cannot make
+      the set membership test raise.
+    - ``strict=False`` (display surfaces): only default non-string or blank
+      values, passing any other non-blank string through -- a category
+      accepted at write time keeps its own label when rendered.
+    """
+    if not isinstance(value, str):
+        return "knowledge"
+    if strict:
+        return value if value in ALLOWED_LESSON_CATEGORIES else "knowledge"
+    return value if value.strip() else "knowledge"
+
 
 # Allowed scopes for lessons (mirrors the learn_add MCP inputSchema enum).
 ALLOWED_LESSON_SCOPES = frozenset({"global", "workspace"})
@@ -1201,16 +1233,12 @@ FOLLOWUP_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Z
 # instead, per component so ``feat/x.lock`` is caught as well as ``x.lock``.
 _GIT_RESERVED_REFS = frozenset({"HEAD"})
 
-# Windows reserved device names. A branch is a loose ref FILE
-# (`.git/refs/heads/<component>`), and Windows cannot create a file whose stem is
-# a device name — so `feat/CON` claims fine but the checkout fails, surfacing as
-# a false "Branch already exists". Rejected on every
-# platform so the grammar does not depend on where the gateway runs.
-_WINDOWS_DEVICE_STEMS = frozenset(
-    {"con", "prn", "aux", "nul"}
-    | {f"com{n}" for n in range(1, 10)}
-    | {f"lpt{n}" for n in range(1, 10)}
-)
+# A branch is a loose ref FILE (`.git/refs/heads/<component>`), and Windows
+# cannot create a file whose stem is a device name — so `feat/CON` claims fine
+# but the checkout fails, surfacing as a false "Branch already exists". Rejected
+# on every platform so the grammar does not depend on where the gateway runs.
+# The stem vocabulary is shared with the app-name grammar; see
+# ``constants.WINDOWS_DEVICE_STEMS``.
 
 
 def is_valid_followup_branch(branch: str) -> bool:
@@ -1223,7 +1251,7 @@ def is_valid_followup_branch(branch: str) -> bool:
         if not part or part.endswith(".") or part.endswith(".lock"):
             return False
         # Device names are reserved with OR without an extension (CON, CON.txt).
-        if part.split(".")[0].lower() in _WINDOWS_DEVICE_STEMS:
+        if part.split(".")[0].lower() in WINDOWS_DEVICE_STEMS:
             return False
     return True
 
@@ -1712,6 +1740,42 @@ ARTIFACT_FOLDER_DELETE_SCHEMA = ToolSchema(
     ],
 )
 
+# Chat (sidebar) folders. Same reference model as the artifact folders above —
+# a folder is addressed by id OR by a ``/``-separated human path — so the two
+# bounds are shared. Folder names cap at 100 chars server-side
+# (chat_folders.api_chat_folder_create truncates); reject longer input here
+# instead of silently filing the session under a truncated name.
+CHAT_FOLDER_TREE_SCHEMA = ToolSchema(
+    tool_name="chat_folder_tree",
+    fields=[],
+)
+
+CHAT_FOLDER_CREATE_SCHEMA = ToolSchema(
+    tool_name="chat_folder_create",
+    fields=[
+        FieldSpec("name", str, required=True, max_len=_ARTIFACT_FOLDER_NAME_MAX),
+        FieldSpec("parent", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
+CHAT_FOLDER_MOVE_SCHEMA = ToolSchema(
+    tool_name="chat_folder_move",
+    fields=[
+        FieldSpec("folder", str, required=True, max_len=_ARTIFACT_FOLDER_REF_MAX),
+        FieldSpec("new_parent", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
+CHAT_FOLDER_MOVE_SESSION_SCHEMA = ToolSchema(
+    tool_name="chat_folder_move_session",
+    fields=[
+        # A session reference is a slot key, a ``dashboard:`` session key, or an
+        # exact session title — none share a charset, so only bound the length.
+        FieldSpec("session", str, required=True, max_len=512),
+        FieldSpec("folder", str, max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
 ARTIFACT_MOVE_SCHEMA = ToolSchema(
     tool_name="artifact_move",
     fields=[
@@ -2047,7 +2111,7 @@ CRON_ADD_SCHEMA = ToolSchema(
     tool_name="cron_add",
     fields=[
         FieldSpec("name", str, required=True, max_len=MAX_SHORT_STRING),
-        FieldSpec("message", str, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("message", str, max_len=MAX_CRON_MESSAGE),
         FieldSpec("every", int, min_val=60, max_val=86400 * 30),
         FieldSpec("cron_expr", str, max_len=100),
         FieldSpec("at", (int, float), min_val=0, max_val=4102444800),  # up to 2100
@@ -2103,6 +2167,7 @@ CRON_ADD_SCHEMA = ToolSchema(
         ),
         FieldSpec("command", str, max_len=5000, pattern=re.compile(r"^[^\x00-\x1f\x7f]*$")),
         FieldSpec("timeout", int, min_val=0, max_val=3600),
+        FieldSpec("timeout_secs", int, min_val=1, max_val=86400),
     ],
     custom_validator=_validate_cron_add_requires_message_or_script,
 )
@@ -2145,16 +2210,26 @@ CRON_RESUME_SCHEMA = ToolSchema(
 
 # ── Tool Schemas (Hooks) ──
 
+
+def _validate_hook_has_action(args: dict) -> None:
+    """A hook must have either a command or skills — an empty hook is invalid."""
+    if not args.get("command") and not args.get("skills"):
+        raise ValidationError("command", "either command or skills must be provided")
+
+
 HOOK_CREATE_SCHEMA = ToolSchema(
     tool_name="hook_create",
     fields=[
         FieldSpec("name", str, required=True, max_len=200),
-        FieldSpec("command", str, required=True, max_len=2000),
+        FieldSpec("command", str, max_len=2000, default=""),
         FieldSpec("event", str, required=True, allowed=ALLOWED_HOOK_EVENTS),
         FieldSpec("matcher", str, max_len=500, default=""),  # optional: empty = match all
+        FieldSpec("matcher_mode", str, max_len=10, default="glob", allowed=frozenset({"glob", "regex", "contains"})),
+        FieldSpec("skills", list, default=[], item_type=str, item_max_len=100),
         FieldSpec("timeout", int, min_val=1, max_val=300, default=30),
         FieldSpec("enabled", bool, default=True),
     ],
+    custom_validator=_validate_hook_has_action,
 )
 
 HOOK_UPDATE_SCHEMA = ToolSchema(
@@ -2164,6 +2239,8 @@ HOOK_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("command", str, max_len=2000),  # optional on update
         FieldSpec("event", str, allowed=ALLOWED_HOOK_EVENTS),
         FieldSpec("matcher", str, max_len=500),  # optional: empty = match all
+        FieldSpec("matcher_mode", str, max_len=10, allowed=frozenset({"glob", "regex", "contains"})),
+        FieldSpec("skills", list, item_type=str, item_max_len=100),
         FieldSpec("timeout", int, min_val=1, max_val=300),
         FieldSpec("enabled", bool),
     ],
@@ -2426,7 +2503,7 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
         fields=[
             FieldSpec("job_id", str, required=True, max_len=16, pattern=_JOB_ID_RE),
             FieldSpec("name", str, max_len=MAX_SHORT_STRING),
-            FieldSpec("message", str, max_len=MAX_MEDIUM_STRING),
+            FieldSpec("message", str, max_len=MAX_CRON_MESSAGE),
             FieldSpec("cron_expr", str, max_len=100),
             FieldSpec("every", int, min_val=60, max_val=86400 * 30),
             FieldSpec("agent", str, max_len=MAX_SHORT_STRING, pattern=_AGENT_NAME_RE),
@@ -2448,6 +2525,8 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
             FieldSpec("persistent_session", bool),
             FieldSpec("minimal_context", bool),
             FieldSpec("hide_in_chat", bool),
+            FieldSpec("timeout", int, min_val=0, max_val=3600),
+            FieldSpec("timeout_secs", int, min_val=1, max_val=86400),
         ],
     ),
     "cron_remove": CRON_REMOVE_SCHEMA,
@@ -2531,6 +2610,21 @@ def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
         max_val=_cu_types.MAX_SCREEN_COORD,
     )
 
+
+# ── Tool Schemas (MCP Dashboard — server ``kirocrew-dashboard``) ──
+#
+# Registered separately from MCP_CORE_SCHEMAS because the dashboard-control tools
+# ship in their own MCP server: core is the always-present surface, and a
+# capability the user opts into does not belong in every session's context. The
+# registry must exist for the same reason the core one does — call_tool_with_logging
+# routes validation through it, and a tool absent from its server's registry has
+# its args passed through raw.
+MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
+    "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
+    "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
+    "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
+    "chat_folder_move_session": CHAT_FOLDER_MOVE_SESSION_SCHEMA,
+}
 
 MCP_COMPUTER_SCHEMAS: dict[str, ToolSchema] = {
     _cu_types.TOOL_LIST_APPS: ToolSchema(tool_name=_cu_types.TOOL_LIST_APPS, fields=[]),

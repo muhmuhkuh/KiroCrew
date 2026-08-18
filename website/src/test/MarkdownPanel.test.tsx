@@ -102,6 +102,32 @@ describe('MarkdownPanel OverflowMenu', () => {
     expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
   })
 
+  /**
+   * The reveal entry names the GATEWAY's file manager: `/api/reveal` shells out
+   * there, so a dashboard opened from a Mac against a Linux gateway must not say
+   * Finder. `'gateway'` is the sentinel a non-owner dashboard user gets and must
+   * never be read as a platform we can name.
+   */
+  it.each([
+    ['darwin', 'Open in Finder'],
+    ['win32', 'Open in File Explorer'],
+    ['gateway', 'Show in file manager'],
+    ['linux', 'Show in file manager'],
+  ])('names the reveal entry for a %s gateway host', (platform, label) => {
+    queryClient.setQueryData(['kiro-prerequisite'], { platform })
+    openMenu()
+    expect(screen.getByText(label)).toBeInTheDocument()
+    fireEvent.click(screen.getByText(label))
+    expect(api.revealPath).toHaveBeenCalledExactlyOnceWith('/tmp/hello.txt', 'reveal')
+  })
+
+  it('never offers two spellings of the same reveal entry at once', () => {
+    queryClient.setQueryData(['kiro-prerequisite'], { platform: 'darwin' })
+    openMenu()
+    expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+    expect(screen.queryByText('Open in File Explorer')).not.toBeInTheDocument()
+  })
+
   it('tells the user the path was copied when the host has no desktop', async () => {
     vi.mocked(api).revealPath = vi.fn().mockResolvedValue({ ok: true, copy: '/tmp/hello.txt' })
     openMenu()
@@ -229,6 +255,37 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
     // roving focus as a menuitem would be a dead stop on the keyboard path.
     expect(itemsInOrder()).not.toContain('In Library')
     expect(screen.queryByText('Add to Knowledge')).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * The menu opens with real DOM focus on its first row (`useListboxKeyboard`,
+ * WAI-ARIA menu pattern), so whichever tint marks the focused row is on screen
+ * from the moment the menu appears — before the pointer has gone anywhere near
+ * it. That tint must therefore be scoped to `focus-visible`, which a
+ * script-moved focus only matches when a keypress moved it: a bare `focus:`
+ * tint is the same colour as `hover:`, leaving the first row lit for the whole
+ * time the menu is open and two rows lit as soon as the pointer picks another.
+ *
+ * Asserted across the whole inventory, not just the first row: the way this
+ * regresses is a new entry pasted from an existing one.
+ */
+describe('OverflowMenu roving-focus tint', () => {
+  const rows = () => Array.from(document.querySelectorAll<HTMLElement>('[role="menu"] [role="menuitem"]'))
+
+  it('focuses the first row on open and tints rows only under :focus-visible', async () => {
+    render(
+      <OverflowMenu filePath="/tmp/notes.md" content="x" onRefresh={vi.fn()} onFullscreen={vi.fn()} />,
+      { wrapper },
+    )
+    fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
+    expect(rows()[0]).toHaveTextContent('Refresh')
+    // The hook moves focus in a 0ms timeout, so it lands after this tick.
+    await waitFor(() => expect(document.activeElement).toBe(rows()[0]))
+    for (const row of rows()) {
+      expect(row.className).toContain('focus-visible:bg-bg-hover')
+      expect(row.className).not.toMatch(/(^|\s)focus:bg-/)
+    }
   })
 })
 

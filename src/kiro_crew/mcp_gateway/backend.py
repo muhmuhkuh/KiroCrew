@@ -27,13 +27,14 @@ from typing import Any, Mapping, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
-from kiro_crew.executors import maintenance_executor
+from kiro_crew.executors import image_executor, maintenance_executor
 from kiro_crew.mcp_caller import (
     CALLER_CAPABILITY_KEY,
     CALLER_META_KEY,
     CallerContext,
     build_caller_meta,
 )
+from kiro_crew.mcp_gateway import hazards
 from kiro_crew.mcp_gateway.apps import (
     WithheldTools,
     append_marker,
@@ -41,6 +42,11 @@ from kiro_crew.mcp_gateway.apps import (
     extract_ui_resource_uri,
     strip_model_hidden_tools,
     write_spool,
+)
+from kiro_crew.mcp_gateway.image_budget import (
+    line_may_carry_image_block,
+    parse_image_bearing_frame,
+    rewrite_image_frame,
 )
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, RESPONSE_SPILL_THRESHOLD_BYTES
 from kiro_crew.mcp_gateway.spill import maybe_spill_response
@@ -303,32 +309,42 @@ def mcp_apps_env_override() -> bool | None:
 def _mcp_apps_enabled() -> bool:
     """Feature gate for MCP Apps. **Tightest-wins**: any explicit off disables.
 
-    1. ``KIROCREW_MCP_APPS`` off -> disabled. Absolute kill switch.
-    2. ``mcp_gateway.apps_enabled = false`` -> disabled, EVEN with the env flag
-       on. This is what makes the dashboard opt-out trustworthy across process
-       boundaries: a daemon that outlives its gateway keeps its own environment,
-       so an env-first precedence let an *adopted* daemon carry on rendering
-       after the user had switched the feature off. Deciding it here, in the
-       process that actually renders, needs no cross-process probe of anyone's
-       environment.
-    3. ``KIROCREW_MCP_APPS`` on -> enabled (explicit override for tests and the
-       e2e harness), having cleared the opt-out above.
-    4. Otherwise ``mcp_gateway.enabled`` — the broker must be running, because
-       the render and callback paths live inside it, so ``apps_enabled`` alone
-       can never grant the feature.
+    Capability follows the STUB, not a new preference. This function only ever
+    runs inside a backend, and a backend only exists because a stub reached the
+    broker for a server the operator stubbed, so the opt-in has already happened
+    by the time control is here. That is why there is no *forward-facing* apps
+    switch any more: a preference could not grant the feature (with no stub there
+    is no render or callback path to grant).
 
-    ``apps_enabled`` defaults True when absent, so step 2 fires only on a value
-    an operator actually wrote: "not configured" is not an opt-out.
+    What survives is the two ways an operator can still say **no**:
+
+    1. ``KIROCREW_MCP_APPS`` off -> disabled. Absolute kill switch, for tests,
+       the e2e harness, and an operator who wants a stubbed server's backend
+       shared without its server-authored UI.
+    2. A stored ``mcp_gateway.apps_enabled = false`` -> disabled, EVEN with the
+       env flag on. This key is retired going forward — nothing writes it, the
+       MCP Management page does not surface it, and the docs no longer teach it —
+       but a released version honoured it as a trustworthy opt-out, so a config
+       that already carries ``false`` keeps its opt-out. Dropping it here would
+       silently start executing server-authored UI for the one operator who took
+       the trouble to turn it off. It defaults True when absent, so this fires
+       only on a value someone actually wrote: "not configured" is not an opt-out.
+
+    The released gate had a third leg — it also required ``mcp_gateway.enabled``,
+    because back then the broker existed only when sharing was on. That leg is
+    deliberately gone, and it costs no released behaviour: under the current
+    migration ``enabled: false`` resolves to an EMPTY stub set, so no stub, no
+    backend, and this gate never runs for such an install.
 
     Fails CLOSED: if config cannot be read, the feature is disabled. An
-    unreadable config in gatewayd is an abnormal state, and silently disabling
-    an optional rendering feature is the low-harm outcome versus rendering
-    against an operator preference we could not confirm.
+    unreadable config in gatewayd is an abnormal state, and silently disabling an
+    optional rendering feature is the low-harm outcome versus rendering against
+    an operator preference we could not confirm.
 
     Read per-call (``KiroCrewConfig.load`` is fingerprint-cached, so this is a
     dict lookup in the common case) so the gateway reflects a config change
-    without a daemon restart — including a daemon this gateway merely adopted
-    and therefore cannot restart.
+    without a daemon restart — including a daemon this gateway merely adopted and
+    therefore cannot restart.
     """
     override = mcp_apps_env_override()
     if override is False:
@@ -340,12 +356,7 @@ def _mcp_apps_enabled() -> bool:
     except Exception:  # pragma: no cover - defensive; fail closed
         logger.debug("mcp-apps: config unreadable; treating feature as disabled", exc_info=True)
         return False
-    if not gw.apps_enabled:
-        return False
-    # Deliberately NOT gated on ``gw.enabled``: pooling decides whether backends
-    # are shared, not whether the stub exists. The stub carries the app-call
-    # relay either way.
-    return True
+    return bool(gw.apps_enabled)
 
 
 def _inject_client_extensions(msg: dict[str, Any]) -> dict[str, Any]:
@@ -1037,6 +1048,48 @@ class Backend:
                     continue
                 if not line:
                     break
+                # Enforce the inline-image budget on tool results BEFORE the
+                # spill step: a downscaled image both shrinks what spill writes
+                # to disk and, more importantly, keeps an oversized image block
+                # out of kiro-cli's conversation history, where it would be
+                # replayed to the model on every later turn and wedge the
+                # session (see kiro_crew.imaging MAX_IMAGE_EDGE_PX). Two
+                # stages on two pools: the byte probe admits every frame that
+                # COULD carry an image block (its negative is provable, but
+                # any escaped non-ASCII text also matches), so a cheap
+                # parse-confirm runs on the maintenance pool first -- like the
+                # spill rewrite -- and only genuinely image-bearing frames
+                # reach the image pool, where seconds-long Pillow decodes
+                # from one server would otherwise head-of-line block every
+                # other server's text-only results behind the probe's false
+                # positives.
+                if line_may_carry_image_block(line):
+                    try:
+                        loop = asyncio.get_running_loop()
+                        image_msg = await loop.run_in_executor(
+                            maintenance_executor(),
+                            parse_image_bearing_frame,
+                            line,
+                        )
+                        if image_msg is not None:
+                            line = await loop.run_in_executor(
+                                image_executor(),
+                                rewrite_image_frame,
+                                image_msg,
+                                line,
+                                self.pool_key.server_name,
+                            )
+                    except Exception:
+                        # The rewrite never RAN (executor shutdown/saturation);
+                        # per-block fail-closed lives inside the hook. Routing
+                        # the raw line keeps co-pooled tenants alive, but the
+                        # frame may carry an unverified image -- log loudly
+                        # enough to diagnose a wedge that follows.
+                        logger.warning(
+                            "image-budget rewrite could not run for %s; routing raw line",
+                            self.pool_key.server_name,
+                            exc_info=True,
+                        )
                 # Spill oversized (but under the read limit) responses to a
                 # sidecar file and truncate inline, so a large-but-legitimate
                 # tool result doesn't balloon the shared daemon's memory or the
@@ -1153,6 +1206,7 @@ class Backend:
                     "notification %r (not broadcast to avoid cross-tenant leak)",
                     self.pid, method,
                 )
+                self._record_hazard(hazards.HAZARD_UNATTRIBUTABLE_NOTIFICATION)
             return
         # Server-to-client request (has method AND id) — route ONLY when we can
         # attribute it unambiguously:
@@ -1196,10 +1250,48 @@ class Backend:
                     "cross-tenant leak — recycling"
                 )
                 logger.warning("backend pid=%s %s", self.pid, reason)
+                self._record_hazard(hazards.HAZARD_UNROUTABLE_SERVER_REQUEST)
                 self._dead_reason = self._dead_reason or reason
                 await self._broadcast_backend_gone(reason)
             return
         logger.debug("backend pid=%s emitted malformed JSON-RPC: %r", self.pid, msg)
+
+    def _record_hazard(self, code: str) -> None:
+        """Note that this server exhibited per-client behaviour while shared.
+
+        Only meaningful once MORE THAN ONE client is attached. A backend serving
+        a single client legitimately owns it, so an unattributable frame there
+        proves nothing: there is no second tenant it could have leaked to.
+        ``exclusive_token`` is not sufficient to express that — a pooled backend
+        also serves exactly one client from the moment it starts until a second
+        stub attaches, and recording during that window would disqualify a
+        server for behaviour that is correct.
+
+        Biased toward under-recording on purpose. A false hazard withdraws a
+        recommendation for a server that is fine, so the bar is real traffic on a
+        genuinely shared backend; a missed one costs a withdrawal that the next
+        observation makes again.
+
+        The observation is stamped with what this backend actually launched, read
+        straight off the pool key, so upgrading or reconfiguring the server
+        invalidates it rather than holding the new version responsible for the
+        behaviour of the one it replaced.
+
+        In-memory only — the flush is off-loop.
+        """
+        if self.exclusive_token or self.refcount <= 1:
+            return
+        key = self.pool_key
+        name = key.server_name
+        identity = hazards.launch_identity(
+            key.command_args_hash, key.effective_env_hash, key.binary_version
+        )
+        if name and hazards.record_observed(name, code, identity):
+            logger.warning(
+                "hazard: server %r first exhibited %s while shared; the "
+                "MCP page will withdraw its recommendation",
+                name, code,
+            )
 
     async def _fail_init(self, reason: str) -> None:
         """Transition init to the terminal ``"failed"`` state and flush every

@@ -23,7 +23,13 @@ from typing import Callable
 import pytest
 
 from kiro_crew import vector_memory as vm
-from kiro_crew.vector_memory import VectorMemoryStore
+from kiro_crew.vector_memory import VectorMemoryStore, _lesson_display_text
+
+
+def _lesson_texts(store: VectorMemoryStore) -> list[str]:
+    """Stored lessons rendered as text — write_lesson stores the mapping shape."""
+    return [_lesson_display_text(json.loads(e["value_json"])) for e in store.get_lessons()]
+
 
 _DIM = 8
 
@@ -372,8 +378,7 @@ class TestDeleteLesson:
         assert store.write_lesson("Always pin the release tag before publishing a wheel")
         assert store.write_lesson("Never bind a diagnostic server to a public interface")
         assert store.delete_lesson("RELEASE TAG") is True
-        remaining = [json.loads(e["value_json"]) for e in store.get_lessons()]
-        assert remaining == ["Never bind a diagnostic server to a public interface"]
+        assert _lesson_texts(store) == ["Never bind a diagnostic server to a public interface"]
 
     def test_no_match_reports_false(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -474,6 +479,25 @@ class TestBackfillSweeps:
         blob = _raw_semantic_embedding(store, key)
         assert blob is not None and len(blob) == _DIM * 4
 
+    def test_backfill_embeds_the_bare_rule_matching_the_write_path(self, tmp_path: Path) -> None:
+        """write_lesson embeds only the rule, so a backfilled mapping row must
+        embed the same input -- embedding rule+clause would put its vector in a
+        different space than the query vectors it is compared against."""
+        store = _store(tmp_path)
+        assert store.write_lesson("Pin the port", "tool", "Do not autopick")
+        key = store.get_lessons()[0]["key"]
+        assert _raw_semantic_embedding(store, key) is None
+
+        embedded_inputs: list[str] = []
+
+        def _capture(text: str) -> list[float]:
+            embedded_inputs.append(text)
+            return [0.5] * _DIM
+
+        store.embed_fn = _capture
+        assert store._backfill_lesson_embeddings() == 1
+        assert embedded_inputs == ["Pin the port"]
+
     def test_lessons_with_unparseable_values_are_skipped(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         assert store.write_lesson("Always squash a review branch down to one commit")
@@ -521,8 +545,7 @@ class TestLessonDedup:
         assert store.write_lesson(
             "Always pin the release tag before publishing a wheel to the CDN"
         )
-        remaining = [json.loads(e["value_json"]) for e in store.get_lessons()]
-        assert remaining == ["Always pin the release tag before publishing a wheel to the CDN"]
+        assert _lesson_texts(store) == ["Always pin the release tag before publishing a wheel to the CDN"]
 
     def test_an_unpackable_stored_vector_does_not_break_the_dedup_scan(
         self, tmp_path: Path
@@ -607,6 +630,78 @@ class TestKeywordFallback:
         )
         hits = store.search_episodic(query_text="deployment", limit=5, tag_filter=["ops"])
         assert [h["text"] for h in hits] == ["A fragment about the nightly deployment pipeline"]
+
+
+class TestCosineSimDimensionGuard:
+    """Regression for #3466: `_cosine_sim` used to silently truncate a
+    dimension-mismatched pair via `zip` instead of rejecting it, so a row
+    embedded at a different dimensionality (e.g. a leftover from a previous
+    embedding-model generation) returned a plausible-looking partial-overlap
+    score instead of 0.0."""
+
+    def test_mismatched_length_scores_zero(self) -> None:
+        a = [1.0, 0.0, 0.0, 0.0]
+        b = [1.0, 0.0, 0.0]  # one dimension short
+        assert VectorMemoryStore._cosine_sim(a, b) == 0.0
+
+    def test_matching_length_is_unaffected(self) -> None:
+        a = [1.0, 0.0, 0.0, 0.0]
+        b = [1.0, 0.0, 0.0, 0.0]
+        assert VectorMemoryStore._cosine_sim(a, b) == pytest.approx(1.0)
+
+    def test_zero_vector_still_scores_zero_not_a_zerodivisionerror(self) -> None:
+        assert VectorMemoryStore._cosine_sim([0.0, 0.0], [1.0, 0.0]) == 0.0
+
+
+class TestStoredSimilarityScorer:
+    """Regression for #3466: the scorer built by `_stored_similarity_scorer`
+    backs the two threshold callers (semantic dedup, contradiction detection)
+    as well as the two ranking callers, so it must (1) reject a mismatched
+    dimension the same way `_cosine_sim` now does, (2) return the raw
+    (possibly negative) cosine value rather than clamping at 0.0 -- a
+    threshold caller comparing against a band that may include non-positive
+    bounds needs the true value, and (3) agree with `_cosine_sim` to float64
+    precision, not the ~1e-7 the numpy path's old float32 accumulation gave.
+    """
+
+    def _row(self, vec: list) -> dict:
+        import struct
+
+        return {"embedding": struct.pack(f"{len(vec)}f", *vec)}
+
+    @pytest.mark.parametrize("has_numpy", [True, False])
+    def test_mismatched_dimension_row_scores_zero(self, monkeypatch, has_numpy) -> None:
+        monkeypatch.setattr(vm, "_HAS_NUMPY", has_numpy and vm._HAS_NUMPY)
+        query = [1.0, 0.0, 0.0]
+        scorer = VectorMemoryStore._stored_similarity_scorer(query)
+        assert scorer(self._row([1.0, 0.0])) == 0.0  # one short
+        assert scorer(self._row([1.0, 0.0, 0.0, 0.0])) == 0.0  # one long
+
+    @pytest.mark.parametrize("has_numpy", [True, False])
+    def test_negative_cosine_is_returned_uncapped(self, monkeypatch, has_numpy) -> None:
+        monkeypatch.setattr(vm, "_HAS_NUMPY", has_numpy and vm._HAS_NUMPY)
+        query = [1.0, 0.0]
+        scorer = VectorMemoryStore._stored_similarity_scorer(query)
+        # Exactly opposite direction -> cosine == -1.0, not clamped to 0.0.
+        assert scorer(self._row([-1.0, 0.0])) == pytest.approx(-1.0)
+
+    @pytest.mark.parametrize("has_numpy", [True, False])
+    def test_agrees_with_cosine_sim_on_a_normal_pair(self, monkeypatch, has_numpy) -> None:
+        monkeypatch.setattr(vm, "_HAS_NUMPY", has_numpy and vm._HAS_NUMPY)
+        query = [0.37, -1.2, 0.05, 2.1, 0.0, -0.9]
+        row = [1.1, 0.3, -0.4, 0.02, 0.6, -1.5]
+        scorer = VectorMemoryStore._stored_similarity_scorer(query)
+        got = scorer(self._row(row))
+        want = VectorMemoryStore._cosine_sim(query, row)
+        # float32-stored row (as every scorer input is) vs the float64-list
+        # _cosine_sim compares against: agreement is bounded by the storage
+        # round-trip precision, not by the scorer's own arithmetic anymore.
+        assert got == pytest.approx(want, abs=1e-6)
+
+    def test_no_query_embedding_returns_a_constant_zero_scorer(self) -> None:
+        scorer = VectorMemoryStore._stored_similarity_scorer(None)
+        assert scorer(self._row([1.0, 0.0])) == 0.0
+        assert scorer({}) == 0.0
 
 
 class TestEpisodicPromotion:
@@ -1099,22 +1194,23 @@ class TestLessonDedupPaths:
         store = _store(tmp_path)
         assert store.write_lesson("pin dependency versions")
         assert store.write_lesson("Always pin dependency versions in the manifest")
-        lessons = store.get_lessons()
-        assert len(lessons) == 1
-        assert "manifest" in json.loads(lessons[0]["value_json"])
+        texts = _lesson_texts(store)
+        assert len(texts) == 1
+        assert "manifest" in texts[0]
 
     def test_topic_overlap_replaces_the_older_lesson(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         assert store.write_lesson("Rebase feature branches before pushing them")
         assert store.write_lesson("Rebase branches before pushing, never merge upward")
-        lessons = store.get_lessons()
-        assert len(lessons) == 1
-        assert "never merge upward" in json.loads(lessons[0]["value_json"])
+        texts = _lesson_texts(store)
+        assert len(texts) == 1
+        assert "never merge upward" in texts[0]
 
-    def test_a_negative_example_is_appended_to_the_value(self, tmp_path: Path) -> None:
+    def test_a_negative_example_is_stored_as_its_own_field(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
         assert store.write_lesson("Quote shell arguments", negative="bare interpolation")
-        assert "NOT: bare interpolation" in json.loads(store.get_lessons()[0]["value_json"])
+        decoded = json.loads(store.get_lessons()[0]["value_json"])
+        assert decoded["negative"] == "bare interpolation"
 
     def test_a_non_user_source_lowers_the_confidence(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
@@ -1129,7 +1225,7 @@ class TestLessonDedupPaths:
         store.embed_fn = _TableEmbedder({short_rule: _unit(0), long_rule: _unit(0)})
         assert store.write_lesson(short_rule)
         assert store.write_lesson(long_rule)
-        assert [json.loads(e["value_json"]) for e in store.get_lessons()] == [long_rule]
+        assert _lesson_texts(store) == [long_rule]
 
     def test_semantic_dedup_rejects_the_shorter_rule(self, tmp_path: Path) -> None:
         long_rule = "Submarine hatches demand orange lanterns for visibility"
@@ -1138,7 +1234,7 @@ class TestLessonDedupPaths:
         store.embed_fn = _TableEmbedder({short_rule: _unit(0), long_rule: _unit(0)})
         assert store.write_lesson(long_rule)
         assert not store.write_lesson(short_rule)
-        assert [json.loads(e["value_json"]) for e in store.get_lessons()] == [long_rule]
+        assert _lesson_texts(store) == [long_rule]
 
     def test_the_rule_vector_is_persisted(self, tmp_path: Path) -> None:
         store = _store(tmp_path)

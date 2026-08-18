@@ -16,6 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.providers.cleanup import _is_safe_path
 
@@ -50,6 +51,35 @@ def _agent_dir(agent_id: str) -> Path:
     if resolved == parent or not resolved.is_relative_to(parent):
         raise ValueError(f"Path traversal blocked for agent_id: {agent_id!r}")
     return resolved
+
+
+def agent_dir_for_display(agent_id: str) -> Path:
+    """The run directory in the home spelling the reader's own tooling uses.
+
+    :func:`_agent_dir` returns a symlink-RESOLVED path, and must: a traversal
+    check is only sound against the canonical target. That resolved spelling is
+    the right one to open a file with, and the wrong one to hand to somebody as
+    a path to go read.
+
+    On a host whose home is itself a symlink the two spellings differ. An Amazon
+    cloud desktop's ``/home/<user> -> /local/home/<user>`` is the ordinary case,
+    and there ``data_home()`` under ``$HOME`` resolves to a ``/local/home/...``
+    prefix that the reader's path allowlist -- keyed on the ``$HOME`` it was
+    given -- does not match. The file is readable; the spelling is not
+    recognized. So a result path emitted in resolved form is refused, while the
+    identical file in declared form is allowed, and the refusal arrives as an
+    approval prompt that times out rather than as an error anyone can act on.
+
+    Hence: validate on the resolved form, hand out the declared one. Callers
+    doing file I/O keep using :func:`_agent_dir`; this is for a path that a
+    human or an agent will read and then act on.
+
+    Raises the same ``ValueError`` as :func:`_agent_dir` for a rejected
+    ``agent_id`` -- the validation is not duplicated here, it is delegated, so
+    the two cannot drift apart.
+    """
+    _agent_dir(agent_id)  # validation only; the return value is deliberately unused
+    return _subagents_dir() / agent_id
 
 
 # ── create ───────────────────────────────────────────────────────────
@@ -319,21 +349,21 @@ def prune_stale_tombstones(max_age_days: int = 7, delivered_ttl_secs: int = 3600
 
 
 def _cleanup_session_files_sync(
-    session_id: str, provider: str = "acp", *, cwd: str = ""
+    session_id: str, provider: str = PROVIDER_LABEL_DEFAULT, *, cwd: str = ""
 ) -> None:
     """Delete LLM provider session files for a completed subagent.
 
     Synchronous — used during tombstone pruning (which runs in the reaper loop).
     Best-effort: logs warnings on failure, never raises.
 
-    For ``claude_code`` provider, *cwd* is required to derive the CC
-    project directory name.  If not provided, cleanup is skipped with a
-    debug-level log (the files will leak until manual deletion).
+    Only the kiro-cli backend stores transcripts where this function can reach
+    them. Any other *provider* is logged and its files are left in place, since
+    reporting success without deleting anything hides the leak.
     """
     if not session_id or session_id in (".", ".."):
         return
     try:
-        if provider == "acp":
+        if provider == PROVIDER_LABEL_DEFAULT:
             sessions_dir = kiro_sessions_dir()
             for suffix in (".json", ".jsonl"):
                 target = sessions_dir / f"{session_id}{suffix}"
@@ -351,6 +381,16 @@ def _cleanup_session_files_sync(
                         target,
                         exc_info=True,
                     )
+        else:
+            # Every other backend owns its own session storage, which this
+            # function has no route to. Say so rather than returning as if the
+            # files had been removed.
+            logger.debug(
+                "_cleanup_session_files_sync: no cleanup route for provider %s; "
+                "session %s files retained",
+                provider,
+                session_id,
+            )
     except Exception:
         logger.warning(
             "_cleanup_session_files_sync: unexpected error cleaning session %s",

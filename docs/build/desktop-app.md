@@ -13,7 +13,7 @@ build is driven by [`packaging/build-desktop.sh`](../../packaging/build-desktop.
 ## What `make desktop` produces
 
 ```bash
-make desktop               # macOS: ONE universal DMG (arm64 + x86_64) · Linux: AppImage
+make desktop               # macOS: ONE universal DMG (arm64 + x86_64) · Linux: AppImage + deb + rpm
 UNIVERSAL=0 make desktop   # macOS: faster host-arch-only DMG (local iteration)
 ```
 
@@ -23,7 +23,7 @@ Output lands in **`website/electron/dist/`**:
 |---------|----------|----------|
 | `make desktop` | macOS | `KiroCrew-<version>-universal.dmg` |
 | `UNIVERSAL=0 make desktop` | macOS | `KiroCrew-<version>-arm64.dmg` (Apple Silicon host) or `KiroCrew-<version>.dmg` (Intel host) |
-| `make desktop` | Linux | `KiroCrew-*.AppImage` (host arch) |
+| `make desktop` | Linux | `KiroCrew-*.AppImage`, `*.deb`, `*.rpm` (host arch) |
 
 The electron-builder configuration lives in
 [`website/electron/package.json`](../../website/electron/package.json):
@@ -34,7 +34,20 @@ The electron-builder configuration lives in
   remains aligned with `productName` because Electron uses it to locate the
   `KiroCrew Helper` app bundles during startup
 - mac target: `dmg` (category `public.app-category.developer-tools`)
-- linux target: `AppImage` (category `Development`)
+- linux targets: `AppImage`, `deb`, `rpm` (category `Development`). One backend
+  tree is packaged three times, with `scripts/stamp-distribution.sh` re-run
+  between electron-builder invocations so each artifact's beacon `dist` names
+  its OWN format -- a single stamp would label one artifact as another.
+- `desktopName` + `linux.syncDesktopName` are what make window association
+  work: Electron derives its app_id from `desktopName`, and electron-builder
+  derives the `.desktop` file's name and `StartupWMClass` from the same value,
+  so the three agree by construction instead of by coincidence. Overriding
+  `StartupWMClass` by hand breaks that agreement.
+- `deb.depends` declares alternatives (`libgtk-3-0 | libgtk-3-0t64`) because
+  Ubuntu 24.04's 64-bit `time_t` transition renamed several libraries;
+  `rpm.depends` needs no such thing but uses entirely different names
+  (`gtk3`, `nss`, `alsa-lib`). Both lists are verified against a real
+  `apt-get install` / `dnf` resolution by `scripts/smoke-linux-packages.sh`.
 
 ### macOS default — one universal DMG for both arches
 
@@ -58,15 +71,19 @@ an Intel Mac where the universal build cannot run. Per-arch targets:
 |--------|-----------|----------|
 | macOS arm64 (Apple Silicon) | Apple Silicon Mac (`UNIVERSAL=0`) | arm64 `.dmg` |
 | macOS x86_64 (Intel) | Intel Mac | x86_64 `.dmg` |
-| Linux x86_64 | x86_64 Linux | x86_64 `.AppImage` |
-| Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage` |
+| Linux x86_64 | x86_64 Linux | x86_64 `.AppImage`, `.deb`, `.rpm` |
+| Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage`, `.deb`, `.rpm` |
 
 **Both Linux architectures ship.** `build-desktop.yml` builds them on
 `ubuntu-22.04` and `ubuntu-22.04-arm`, and `publish-linux.yml` runs once per
 arch — each writing its own immutable S3 key, its own electron-updater channel
 file (`latest-linux.yml` for x64, `latest-linux-arm64.yml` for arm64) and its own
-`latest` alias. Published basenames are `KiroCrew-x86_64.AppImage` and
-`KiroCrew-aarch64.AppImage`.
+`latest` alias. Published basenames are `KiroCrew-<arch>.<ext>` for each of the
+six (arch, format) pairs -- `KiroCrew-x86_64.deb`, `KiroCrew-aarch64.rpm`, and so
+on. A package format also gets its own feed DIRECTORY
+(`feed/<channel>/deb/latest-linux.yml`), because electron-updater derives the
+channel FILE name from platform and arch with no hook to change it, so two
+formats sharing a directory would overwrite each other's metadata.
 
 Two properties are load-bearing and worth knowing before you touch that lane:
 
@@ -75,7 +92,15 @@ Two properties are load-bearing and worth knowing before you touch that lane:
   install, plus the `python -m kiro_crew --version` self-containment gate), so a
   host that cannot execute the target architecture cannot build it. macOS gets
   away with one host only because Rosetta 2 executes the x86_64 slice.
-- **The runner's glibc is the floor for every user.** The AppImage links against
+- **The runner's glibc is the ceiling on what the artifacts may require.** The
+  binaries link against it, so the runner bounds compatibility. The MEASURED
+  requirement of the shipped binaries is lower than the runner's own version:
+  the highest `GLIBC_*` symbol version across the Electron binary and every
+  bundled `.so` is **2.34**, which covers Ubuntu 22.04+, Debian 12+, Fedora,
+  CentOS Stream 9 and Amazon Linux 2023, and excludes Ubuntu 20.04, Debian 11
+  and Amazon Linux 2. Read the requirement with
+  `objdump -T <binary> | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1` rather
+  than assuming it equals the runner's glibc. The AppImage links against
   it, which is why both Linux legs stay on 22.04 (glibc 2.35) rather than moving
   to 24.04 (2.39) — the newer floor would exclude AL2023, Debian 12 and RHEL 9.
 
@@ -122,6 +147,15 @@ x64 gate doubles as proof the bundle runs under Rosetta. In
 `backend-dist/**` (single-arch Mach-O files inside a universal app are
 intentional there), and `extraResources` ships the `backend-dist/` directory
 wholesale so single- and dual-backend layouts both package.
+
+> **Renaming `backend-dist/` is load-bearing at runtime.** The backend detects
+> "am I the bundled interpreter?" via
+> `platform_compat.is_bundled_interpreter()`
+> (`BUNDLED_BACKEND_DIST_DIRNAME`), which is what stops `pip` from writing
+> into the signed bundle during app builds. `test/test_platform_compat.py`
+> pins that constant to both `extraResources` here and
+> `packaging/build-desktop.sh`, so a rename fails a test — update the constant
+> and the packaging layer in the same change.
 
 **Trade-off:** the DMG carries two full Python backend trees, so it is
 roughly **2× the size** of a per-arch DMG — expect ~350–400 MB. That is the
@@ -191,12 +225,12 @@ bump one, bump the other and the root `version` fields in
 `packages[""].version`, NOT the dependency entries that coincidentally share a
 version), or `npm ci` will complain about a lock mismatch.
 
-> **npm registry pin (required):** both `website/.npmrc` *and*
-> `website/electron/.npmrc` pin `registry=https://registry.npmjs.org/`. The
-> electron pin is load-bearing — without it `npm ci` in `website/electron/`
-> inherits whatever registry the machine's global `~/.npmrc` sets and can fail
-> with an auth error on a non-public registry. Any new npm subproject needs its
-> own public-registry `.npmrc`.
+> **npm registry (system-configured):** the `.npmrc` files deliberately do NOT
+> pin a registry. `npm ci` inherits whatever registry the machine's `~/.npmrc`
+> or environment configures, so mirrors and private registries work for
+> builders who cannot reach `https://registry.npmjs.org/`. If your configured
+> registry lacks a public package or its auth token expired, fix your registry
+> config rather than adding a pin back.
 
 ## Build pipeline
 
@@ -319,6 +353,31 @@ handles terminate observed descendants without trusting recycled PIDs. Cleanup
 finishes before the gateway permits a retry.
 Hosting setup in the gateway provides one implementation and one UI for the
 desktop app, local browser, remote browser, Linux, and Windows.
+
+### Native window chrome
+
+The dashboard's 42px top bar is also the window titlebar on macOS and Windows.
+macOS insets the native traffic lights on the left. Windows uses Electron's
+title-bar overlay to retain native minimize/maximize/close controls on the right.
+The application menu rests as a compact hamburger on the left. Opening it shows
+the File submenu and expands File/Edit/View/Connection/Window/Help inline;
+hovering another label replaces the submenu without ending the menu session.
+Escape, an outside click, selecting a command, or moving focus to another window
+closes the popup and collapses the labels back to the hamburger. The menu surface
+uses the dashboard theme because native Windows popups capture window input and
+cannot support hover switching; a narrow IPC bridge keeps command execution and
+standard Electron roles in the main process.
+When a remote crew is connected, the instance switcher shares the same bounded
+left region as the menu: it is a single trigger naming the crew on screen (see
+InstanceTabBar's SwitcherMenu), not a row of per-crew tabs, so it costs constant
+width whether the menu is collapsed to a hamburger or expanded to full labels.
+The centered command palette yields that region rather than the reverse — the
+correct priority while the menu is open is labels > instance status > an idle
+search affordance — and the palette remains reachable through its keyboard
+shortcut even while hidden.
+The command-palette trigger is positioned from the window midpoint rather than
+the remaining flex space, so asymmetric menu and status controls do not shift it.
+Linux retains the window manager's native frame and menu bar.
 
 ### `find-bin.js` — locating the binary
 
@@ -529,5 +588,5 @@ See [`website/electron/README.md`](../../website/electron/README.md) and
 
 ## See also
 
-- [install.md](../guides/install.md) — all three build/run methods and the Makefile targets
+- [install.md](../guides/install.md) — all three build/run methods and the build targets
 - [README](../README.md) — project overview and Quick Start

@@ -8,6 +8,8 @@ catalog, the pure ``compute_effective_denied`` resolver, the dual-tier
 from __future__ import annotations
 
 import json
+import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -502,42 +504,113 @@ class TestIsDeniedReDoSResistance:
     # all the resolution this needs.
     _BUDGET_SECONDS = 5.0
 
-    #: Growth factor allowed when the input DOUBLES. Linear is ~2.0; the measured spread on an
-    #: idle machine is 1.7–2.2 across n=1000..8000, so 3.0 leaves real headroom while still
-    #: separating linear from quadratic (4.0) and from anything exponential.
-    _MAX_DOUBLING_RATIO = 3.0
+    @staticmethod
+    def _cpu_cost(fn: Callable[[], object]) -> float:
+        """CPU consumed by THIS thread while ``fn`` runs — the cost chokepoint.
+
+        ``thread_time`` is the one clock that isolates the subject's own work: wall-clock
+        adds however long the OS gave the core to other processes, and ``process_time``
+        adds CPU burned by OTHER THREADS of this process, so a concurrent in-process burst
+        wider than one sampling window lands in some samples and not others and perturbs
+        any comparison built on them. ``is_denied`` is single-threaded pure-regex work, so
+        per-thread CPU is its complete cost, and a genuinely catastrophic pattern inflates
+        it just the same (measured 1:1 against wall-clock when idle: 2.228s vs 2.230s).
+        """
+        start = time.thread_time()
+        fn()
+        return time.thread_time() - start
 
     def _elapsed(self, command: str) -> float:
-        """CPU time, not wall-clock — the property under test is algorithmic complexity.
+        """CPU time of one ``is_denied`` scan — see ``_cpu_cost`` for the clock choice."""
+        return self._cpu_cost(lambda: is_denied(command))
 
-        Wall-clock measures this process's work PLUS however long the OS gave the core to
-        someone else, so on a loaded CI runner (four xdist workers over two vCPUs) a scan that
-        burns ~2s of CPU can report >5s elapsed and fail a test whose subject never regressed.
-        ``process_time`` counts only CPU consumed by this process, which is exactly what a
-        backtracking blow-up inflates: measured 1:1 against wall-clock when idle (2.228s vs
-        2.230s), and a genuinely catastrophic pattern burns CPU rather than waiting.
+    def test_elapsed_routes_through_the_cpu_cost_chokepoint(self, monkeypatch):
+        # Every timing sample in this class must go through ``_cpu_cost`` — a raw
+        # clock read in ``_elapsed`` would silently re-open the burst-perturbation
+        # channel while every behavioral test stays green.
+        calls: list[object] = []
+
+        def fake_cpu_cost(fn: Callable[[], object]) -> float:
+            calls.append(fn)
+            fn()
+            return 0.123
+
+        monkeypatch.setattr(
+            TestIsDeniedReDoSResistance, "_cpu_cost", staticmethod(fake_cpu_cost)
+        )
+        assert self._elapsed("git status") == 0.123
+        assert len(calls) == 1
+
+    def test_cpu_cost_is_immune_to_other_threads_where_process_time_is_not(self):
+        """The measurement clock must not see other threads' CPU.
+
+        The budget tests in this class bound single CPU-cost samples, so any clock that can
+        be inflated by a concurrent in-process CPU burst (another worker thread, GC) turns
+        one-sided bursts into false budget failures.
+        This pins the invariant with a synthetic workload whose true cost is fixed by
+        construction: spin until this thread has consumed a set amount of CPU, while
+        burst threads saturate the process. ``_cpu_cost`` must report the true cost;
+        the process-wide clock demonstrably cannot, which is why ``_cpu_cost`` exists.
         """
-        start = time.process_time()
-        is_denied(command)
-        return time.process_time() - start
+        true_cost = 0.05
 
-    def _doubling_ratio(self, build: Callable[[int], str], n: int) -> float:
-        """CPU cost at ``2n`` divided by cost at ``n`` — the shape, not the magnitude.
+        def burn() -> None:
+            end = time.thread_time() + true_cost
+            while time.thread_time() < end:
+                pass
 
-        Absolute budgets cannot express "is this linear?" on instrumented runs. Coverage
-        (`--cov`, which CI enables on 3.12 only) multiplies the cost of every executed line, so
-        the same un-regressed matcher measured ~2s bare and >5s under coverage — which is why
-        3.12 shard 2 failed while 3.10 passed on the identical commit. Raising the budget would
-        have hidden a future real regression behind the instrumentation overhead; a RATIO is the
-        honest expression of the property, because a roughly constant multiplier cancels.
+        stop = threading.Event()
 
-        Best-of-3 per point: this is a floor measurement, and scheduler noise only ever adds.
-        """
-        best = min(self._elapsed(build(n)) for _ in range(3))
-        double = min(self._elapsed(build(2 * n)) for _ in range(3))
-        # Guard a degenerate denominator: if the small case is unmeasurable the ratio is
-        # meaningless, so report a passing value rather than dividing by ~0.
-        return double / best if best > 1e-6 else 1.0
+        def spin() -> None:
+            while not stop.is_set():
+                for _ in range(1000):
+                    pass
+
+        spinners = [threading.Thread(target=spin, daemon=True) for _ in range(2)]
+        for thread in spinners:
+            thread.start()
+        try:
+            # Majority vote across 5 independent samples, not a per-sample assert:
+            # both checks below depend on the OS scheduler actually interleaving
+            # this thread against the 2 spinners within each iteration's narrow
+            # window, which a heavily loaded shared CI runner (many concurrent
+            # pytest-xdist workers contending for the same cores) can occasionally
+            # fail to do for a single sample without the underlying invariant
+            # being false. A genuine break in `_cpu_cost` (seeing other threads'
+            # CPU, or the burst harness generating no process-level signal at all)
+            # still fails a majority of samples, since it holds on every iteration.
+            failures = []
+            for _ in range(5):
+                process_start = time.process_time()
+                measured = self._cpu_cost(burn)
+                process_delta = time.process_time() - process_start
+                if measured >= true_cost * 2.0:
+                    failures.append(
+                        f"_cpu_cost reported {measured:.3f}s for {true_cost}s of "
+                        "own-thread work — the clock is seeing other threads' CPU"
+                    )
+                    continue
+                # The control: the process-wide clock DOES absorb the burst (it
+                # accumulates the spinners' CPU during their GIL timeslices), so a
+                # clean _cpu_cost reading above is discriminating, not vacuous.
+                if process_delta <= measured:
+                    failures.append(
+                        "process_time did not exceed thread_time under a "
+                        "2-spinner burst — the burst harness is not generating "
+                        "in-process noise"
+                    )
+            assert len(failures) <= 1, (
+                f"{len(failures)}/5 samples failed (need a majority to hold): "
+                + "; ".join(failures)
+            )
+        finally:
+            stop.set()
+            for thread in spinners:
+                thread.join(timeout=5.0)
+            assert not any(thread.is_alive() for thread in spinners), (
+                "burst spinner failed to stop — it would poison every later "
+                "process-wide timing in this worker"
+            )
 
     def test_git_prefixed_flag_spam_returns_fast(self):
         # The historical regression input: whitespace/flag spam after ``git``.
@@ -554,30 +627,113 @@ class TestIsDeniedReDoSResistance:
         assert self._elapsed("aws " + ("-x " * 5000)) < self._BUDGET_SECONDS
         assert self._elapsed("aws " + ("--foo=bar " * 5000)) < self._BUDGET_SECONDS
 
-    def test_mid_dotstar_chain_spam_stays_linear(self):
+    def test_mid_dotstar_chain_spam_stays_linear(self, monkeypatch):
         """``python.*open.*/\\.ssh/`` is polynomial per pattern under a single ``re.search``;
         fragment-splitting on the top-level ``.*`` gaps keeps it linear even when every literal
         (``python``/``open``/``/.ssh/``) is present, which defeats a literal pre-filter.
 
-        Asserted as a SCALING ratio rather than an absolute budget. This is the one input in
-        this class expensive enough that instrumentation changes the answer: the same
-        un-regressed matcher costs ~1.7s of CPU bare and >5s under ``--cov``, which CI enables
-        on 3.12 only — so an absolute 5s ceiling failed 3.12 shard 2 while 3.10 passed on the
-        identical commit. Raising the budget would bank the instrumentation overhead as
-        headroom and hide the next real regression; the ratio states the actual property and is
-        insensitive to a constant multiplier. The absolute bound is still asserted at the
-        smaller size, where there is real margin either way.
+        Asserted DETERMINISTICALLY, not by timing. A timed doubling ratio cannot separate this
+        property from the runner: on a shared CI host, scheduler noise, frequency scaling, and
+        co-tenant cache contention inflate even a thread-CPU ratio past any bound tight enough
+        to catch a quadratic (measured 3.2x against a 3.0 bound with the property intact), so
+        the ratio form false-reds PRs whose diff never touches the matcher. What makes the scan
+        linear is structural, so it is asserted structurally, and a regression has to break one
+        of these to reintroduce super-linear cost:
+
+          1. ROUTING — the chain rules take the full-input fragment path (never the bounded
+             whole-regex fallback, whose truncation cap is pinned separately by
+             ``test_documented_bound_user_only_builtins_full_input``), and every fragment they
+             split into is a plain literal, so each is one forward ``re.search`` scan with no
+             variable-width backtracking;
+          2. INVOCATIONS — doubling the adversarial input leaves the engine-invocation trace
+             IDENTICAL (same searches, same patterns, same order), so the only thing that grows
+             with the input is the length of each single linear scan.
+
+        The small-size absolute CPU budget stays as the catastrophic-blowup backstop for cost
+        added outside the matcher, where this trace cannot see it.
         """
-        for build in (
+        from kiro_crew.security import _DENY_MATCHER_CACHE, _deny_matcher
+
+        builds = (
             lambda n: "/.ssh/ " + ("python open " * n),
             lambda n: "/.ssh/ open " + ("python open " * n),
-        ):
-            assert self._elapsed(build(2000)) < self._BUDGET_SECONDS
-            ratio = self._doubling_ratio(build, 2000)
-            assert ratio < self._MAX_DOUBLING_RATIO, (
-                f"cost grew {ratio:.1f}x when the input doubled — linear is ~2x, so this "
-                "is the super-linear backtracking the fragment split exists to prevent"
+        )
+
+        # (1) Routing: the chain rules stay on the literal-fragment fast path.
+        chain_ids = {"sensitive-file-read-python-aws", "sensitive-file-read-python-ssh"}
+        chain_rules = [r for r in BUILTIN_DENIED_RULES if r.id in chain_ids]
+        assert {r.id for r in chain_rules} == chain_ids, (
+            "the mid-dotstar chain rules under test are gone from the catalog"
+        )
+        for rule in chain_rules:
+            matcher = _deny_matcher(rule.pattern)
+            assert matcher._disabled is False
+            assert matcher._bounded is False, (
+                f"{rule.id} left the full-input fragment path — the bounded fallback "
+                "truncates, so this is both a coverage loss and the polynomial "
+                "whole-regex scan the split exists to avoid"
             )
+            fragments = [p.pattern for p in matcher._frag_res]
+            assert len(fragments) >= 3, fragments
+            for fragment in fragments:
+                assert not re.search(r"[.*+?()\[\]{}|^$]", re.sub(r"\\.", "", fragment)), (
+                    f"fragment {fragment!r} of {rule.id} is not a plain literal — a "
+                    "single forward scan is no longer guaranteed linear"
+                )
+
+        # (2) Invocations, observed through delegating stand-ins for every memoized
+        # matcher's compiled patterns.
+        trace: list[tuple[str, str]] = []
+
+        class _TracingPattern:
+            """Records each ``search`` invocation, then delegates to the real pattern."""
+
+            def __init__(self, inner: re.Pattern[str], kind: str) -> None:
+                self._inner = inner
+                self._kind = kind
+                self.pattern = inner.pattern
+
+            def search(self, text: str, *args: int) -> re.Match[str] | None:
+                trace.append((self._kind, self._inner.pattern))
+                return self._inner.search(text, *args)
+
+        # Prime the memoized cache so every effective rule's matcher exists to wrap.
+        assert is_denied(builds[0](50)) is None
+        for matcher in _DENY_MATCHER_CACHE.values():
+            if matcher._frag_res:
+                monkeypatch.setattr(
+                    matcher,
+                    "_frag_res",
+                    [_TracingPattern(p, "frag") for p in matcher._frag_res],
+                )
+            if matcher._whole_re is not None:
+                monkeypatch.setattr(
+                    matcher, "_whole_re", _TracingPattern(matcher._whole_re, "bounded")
+                )
+
+        def traced(command: str) -> list[tuple[str, str]]:
+            trace.clear()
+            # The spam matches no rule, so evaluation runs the FULL catalog — a deny
+            # would short-circuit the loop and make the traces trivially equal.
+            assert is_denied(command) is None
+            return list(trace)
+
+        for build in builds:
+            base_trace = traced(build(2000))
+            double_trace = traced(build(4000))
+            frag_searches = {p for kind, p in base_trace if kind == "frag"}
+            assert {"python", "open"} <= frag_searches, (
+                "the chain fragments never ran — the instrument is not observing the "
+                "path under test"
+            )
+            assert double_trace == base_trace, (
+                "doubling the input changed WHAT the evaluation layer executes — "
+                "per-position or retry work that scales with the input is the "
+                "super-linear backtracking the fragment split exists to prevent"
+            )
+            # Catastrophic-blowup backstop, at the small size where 5s is generous
+            # margin even under coverage instrumentation.
+            assert self._elapsed(build(2000)) < self._BUDGET_SECONDS
 
     def test_long_leading_junk_then_real_deny_needle_still_caught(self):
         # A legitimate destructive command sits AFTER a long junk prefix in its
@@ -2845,3 +3001,149 @@ class TestCredentialMintSegmentScoping:
         mentioned_after = f"grep {_TOK}_auth.py  # in a {_NAME} worktree"
         assert _denied_by(under_path) is None
         assert _denied_by(mentioned_after) is None
+
+
+class TestSelfFloorShortCircuit:
+    """Perf gate for the self-protection floor (issue #3603).
+
+    The floor predicates tokenize the command and descend every nested shell
+    payload, which dominates deny-scan cost on complex bash. The gate
+    ``_self_floor_can_fire`` skips that descent when firing is provably
+    impossible. Ratcheted on STRUCTURE, never timing: (a) a benign command
+    performs ZERO descents; (b) every obfuscated spelling the floor denies
+    today still passes the gate, so no bypass window opens.
+    """
+
+    def _descent_calls(self, monkeypatch, text: str) -> int:
+        from kiro_crew import security
+
+        calls = {"n": 0}
+        real = security._self_token_frames
+
+        def spy(t: str):
+            calls["n"] += 1
+            return real(t)
+
+        monkeypatch.setattr(security, "_self_token_frames", spy)
+        security._is_credential_mint(text)
+        security._is_self_kill(text)
+        return calls["n"]
+
+    def test_benign_command_skips_the_descent_entirely(self, monkeypatch):
+        # The 95%+ common case: a tool name plus a path. No self name, no
+        # shell machinery — the recursive tokenize-and-descend must not run.
+        for benign in (
+            "fs_read /workplace/user/project/src/main.py",
+            "ls -la /tmp/foo",
+            "git status",
+            "cat notes.txt",
+            "npm run build",
+        ):
+            assert self._descent_calls(monkeypatch, benign) == 0, (
+                f"descent ran for benign input: {benign!r}"
+            )
+
+    def test_name_carrying_command_still_descends(self, monkeypatch):
+        # A real candidate must reach the full structural scan.
+        assert self._descent_calls(monkeypatch, "kirocrew token") >= 1
+        assert self._descent_calls(monkeypatch, "pkill -f kirocrew") >= 1
+
+    def test_gate_is_a_necessary_condition_not_a_name_grep(self):
+        """Every obfuscated spelling the floor denies must pass the gate.
+
+        The issue proposed gating on a raw ``_SELF_NAME_RE`` search; that is
+        UNSOUND — each input below fires a predicate today while its raw text
+        never matches ``kiro[-.]?crew``. The gate must answer True for all of
+        them (over-matching is safe; under-matching is a bypass).
+        """
+        from kiro_crew import security
+
+        for evasive in (
+            "python -m kiro_crew token",  # underscored module spelling
+            "[k]irocrew token",  # one-char bracket class
+            "kiro$()crew token",  # empty command substitution
+            "kiro${x:-crew} token",  # parameter default
+            'bash -c "\\x6birocrew token"',  # printf hex escape
+            'k""iro""crew token',  # empty-string concatenation
+            "kiro?rew token",  # glob the shell expands before exec
+            "kill $(pgrep -f kirocrew)",  # bare kill via substitution
+            'python -c "exec(__import__(\'base64\').b64decode(\'x\'))" token',
+        ):
+            assert security._self_floor_can_fire(evasive), (
+                f"gate would bypass the floor for {evasive!r}"
+            )
+
+    def test_gated_predicates_still_deny_the_obfuscation_corpus(self):
+        """End-to-end: the predicates (with the gate in front) keep firing."""
+        from kiro_crew import security
+
+        for mint in (
+            "[k]irocrew token",
+            "kiro$()crew token",
+            "kiro${x:-crew} token",
+            'bash -c "\\x6birocrew token"',
+            'k""iro""crew token',
+            "kiro?rew token",
+        ):
+            assert security._is_credential_mint(mint), f"mint not caught: {mint!r}"
+        assert security._is_self_kill("kill $(pgrep -f kirocrew)")
+        assert security._is_self_kill("pkill -f kirocrew")
+
+    def test_gate_declines_plain_text_without_machinery(self):
+        from kiro_crew import security
+
+        for plain in (
+            "ls -la /tmp/foo",
+            "git status",
+            "grep token app.log",
+            "cat /workplace/user/notes.txt",
+        ):
+            assert not security._self_floor_can_fire(plain), (
+                f"gate over-triggered on {plain!r}"
+            )
+
+    def test_tilde_expansion_still_reaches_the_floor(self, monkeypatch):
+        """``pkill -f ~`` IS a self-kill whenever $HOME lies under the product
+        tree: the kill predicates expanduser their targets, so the raw text
+        carries neither the self name nor any other machinery character.
+        ``~`` must therefore be in the machinery class, or the gate opens a
+        real bypass (pre-push review finding).
+        """
+        from kiro_crew import security
+
+        # expanduser reads HOME on POSIX but USERPROFILE on Windows — set
+        # both so the tilde target resolves under the product tree everywhere.
+        monkeypatch.setenv("HOME", "/opt/kiro-crew")
+        monkeypatch.setenv("USERPROFILE", "/opt/kiro-crew")
+        for kill in ("pkill -f ~", "killall ~", "pkill -f ~/"):
+            assert security._self_floor_can_fire(kill), (
+                f"gate would bypass the floor for {kill!r}"
+            )
+        # End-to-end: the gated predicate still denies it.
+        assert security._is_self_kill("pkill -f ~")
+
+    def test_quote_glued_dynamic_exec_still_reaches_the_floor(self):
+        """Empty-quote glue hides the dynamic-exec verb exactly as it hides the
+        name.  ``python -c "ex""ec(...)"`` carries no product name, no machinery
+        character, and no *raw* ``exec(`` — yet the floor denies it as a
+        credential mint, because the tokenizer removes the quotes before
+        ``_inline_payload_reaches_cli`` looks.  The gate must therefore search
+        the dynamic-exec marker on the quote-stripped text too, not only on the
+        raw text (pre-merge review finding, confirmed by two reviewers).
+        """
+        from kiro_crew import security
+
+        glued = "ex" + '""' + "ec"
+        cmd = f'python -c "{glued}(open(chr(47)).read())"'
+
+        # Precondition: none of the other branches can catch this input, so the
+        # test genuinely exercises the stripped dynamic-exec branch.
+        assert not security._SELF_FLOOR_NAME_HINT_RE.search(cmd)
+        assert not security._SELF_FLOOR_MACHINERY_RE.search(cmd)
+        assert not security._INLINE_DYNAMIC_EXEC_RE.search(cmd)
+
+        assert security._self_floor_can_fire(cmd), (
+            "gate would bypass the floor for quote-glued dynamic exec"
+        )
+        # And the floor's verdict survives the gate: still denied end-to-end.
+        assert security._is_credential_mint(cmd)

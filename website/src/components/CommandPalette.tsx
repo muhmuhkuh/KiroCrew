@@ -25,6 +25,7 @@ import { useAppsProvider } from './commandPalette/providers/appsProvider'
 import { Highlighted } from './commandPalette/Highlighted'
 
 import { i18nT } from '../i18n/t'
+import { useVisualViewport } from '../hooks/useVisualViewport'
 /**
  * Search Everywhere command palette.
  *
@@ -109,6 +110,7 @@ export default function CommandPalette({
   openShortcuts,
   openInSplit,
 }: CommandPaletteProps) {
+  const vv = useVisualViewport()
   // P0 providers. Each is memoized inside its hook, so identities are stable.
   const all = useAllAggregator()
   const sessions = useSessionsProvider({ openInSplit })
@@ -477,26 +479,62 @@ export default function CommandPalette({
     </div>
   ) : loading ? (
     <div className="px-3 py-6 text-center text-[12px] text-muted">{i18nT('components.commandPalette.searching')}</div>
+  ) : scopeProvider?.minQueryChars != null &&
+    debouncedQuery.trim().length > 0 &&
+    debouncedQuery.trim().length < scopeProvider.minQueryChars ? (
+    // Sub-threshold query on a scoped tab whose provider declares a minimum
+    // (issue #1830): the provider never searched, so "No matches" would be a
+    // lie — say "keep typing" instead. Ordered AFTER isError/loading (a failure
+    // or in-flight fetch keeps its copy) and BEFORE the generic no-matches.
+    // Evaluated against debouncedQuery, NOT the live query: `results` are
+    // produced from debouncedQuery, so the raw query would disagree with the
+    // rendered data inside the debounce window at every threshold crossing
+    // (typing the 2nd char would flash "No matches" against the 1-char empty
+    // result — the exact lie this branch removes).
+    // The All tab never lands here: `scopeProvider` is undefined when
+    // unscoped, and the aggregator's client-side scopes can genuinely answer a
+    // one-character query. An empty query keeps the recents quick-switcher
+    // (the non-empty guard).
+    <div className="px-3 py-6 text-center text-[12px] text-muted">
+      {i18nT('components.commandPalette.min_query_chars', {
+        min: scopeProvider.minQueryChars,
+        scope: scopeProvider.label.toLowerCase(),
+      })}
+    </div>
   ) : (
     <div className="px-3 py-6 text-center text-[12px] text-muted">
       {query.trim()
-        ? 'No matches'
+        ? i18nT('components.commandPalette.no_matches')
         : scopeLabel
           ? i18nT('components.commandPalette.no_scope', { scope: scopeLabel.toLowerCase() })
-          : 'No recent sessions'}
+          : i18nT('components.commandPalette.no_recent_sessions')}
     </div>
   )
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+      // Pinned to the VISUAL viewport, not `inset-0`. A keyboard shrinks the visual
+      // viewport on every browser; only Chromium also shrinks the layout one (via
+      // `interactive-widget`), so on iOS Safari an `inset-0` overlay keeps its full
+      // height and its lower half sits behind the keyboard, unreachable. iOS also
+      // scrolls the focused input into view, which moves the visual viewport's
+      // origin -- hence the top offset as well as the height.
+      className="fixed left-0 right-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+      style={{ top: vv.offsetTop, height: vv.height }}
       role="dialog"
       aria-modal="true"
       aria-label={i18nT('components.commandPalette.search_everywhere')}
       onMouseDown={onClose}
     >
       <div
-        className="mt-[12vh] w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col max-h-[70vh]"
+        className="w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col"
+        // Both numbers come from the VISUAL viewport in px, not a percentage
+        // and not a `vh`. A percentage MARGIN resolves against the containing
+        // block's WIDTH -- `mt-[8%]` measured 31px, not the 68px it reads like
+        // -- and `vh` measures the layout viewport, which a keyboard does not
+        // shrink on iOS. At rest these equal the previous 12vh / 70vh exactly,
+        // so the at-rest panel is unchanged.
+        style={{ marginTop: Math.round(vv.height * 0.12), maxHeight: Math.round(vv.height * 0.70) }}
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/* Search input */}
@@ -538,7 +576,12 @@ export default function CommandPalette({
             }}
             placeholder={scopeLabel ? i18nT('components.commandPalette.search_scope', { scope: scopeLabel.toLowerCase() }) : i18nT('components.commandPalette.search_for_anything')}
             aria-label={i18nT('components.commandPalette.search_everywhere')}
-            className="flex-1 bg-transparent border-none outline-none text-[14px] text-text placeholder:text-muted"
+            // min-w-0 defeats the input's `min-width: auto` intrinsic floor (~20
+            // characters). Without it this flex item refuses to shrink, so on a
+            // narrow viewport the row overflows instead and the modal's
+            // overflow-hidden clips whatever trails the input — the Tab hint and,
+            // worse, the close button.
+            className="flex-1 min-w-0 bg-transparent border-none outline-none text-[14px] text-text placeholder:text-muted"
           />
           {scopeHint && (
             <span className="shrink-0 flex items-center gap-1 text-[11px] text-muted">

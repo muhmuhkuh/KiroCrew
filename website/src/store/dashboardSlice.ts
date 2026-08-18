@@ -111,14 +111,28 @@ const dashboardSlice = createSlice({
       const slot = (state.slots ?? []).find(s => s.key === action.payload.slot)
       if (slot) slot.todo = action.payload.todo
     },
-    // Bump a slot's recency timestamp (last_ts) on live message activity so the sidebar
-    // recency tint re-ranks immediately off the finer-grained chat_message stream (vs
-    // waiting for the next full sseSlots push). last_ts is the last message of any role,
-    // so this covers user sends as well as agent output. Reducer stays pure — the caller
-    // supplies ts (falling back to now at the dispatch site).
-    touchSlotActivity(state, action: PayloadAction<{ key: string; ts: string }>) {
-      const slot = state.slots.find(s => s.key === action.payload.key)
-      if (slot) slot.last_ts = action.payload.ts
+    // Bump a slot's recency timestamps on live message activity so the sidebar
+    // re-ranks immediately off the finer-grained chat_message stream (vs waiting
+    // for the next full sseSlots push). `last_ts` is the last message of any role,
+    // so it moves for agent output too. `last_turn_ts` — the key the list is
+    // ORDERED by — moves only when `settled` is set (an inbound prompt), because a
+    // list that re-ranks on every streamed tool call swaps rows under the pointer
+    // while several sessions work. A turn ENDING re-ranks via the slots push that
+    // already carries the running-flag flip.
+    //
+    // Neither field may move BACKWARDS: an authoritative slots snapshot can land
+    // between a caller buffering the event and dispatching it, and overwriting
+    // that with an older arrival time reorders the sidebar. The two are guarded
+    // separately because mid-turn `last_ts` is ahead of `last_turn_ts`, so a
+    // shared check would discard a legitimate settling bump. Reducer stays pure —
+    // the caller supplies ts (falling back to now at the dispatch site).
+    touchSlotActivity(state, action: PayloadAction<{ key: string; ts: string; settled?: boolean }>) {
+      const { key, ts, settled } = action.payload
+      const slot = state.slots.find(s => s.key === key)
+      if (!slot) return
+      const t = Date.parse(ts)
+      if (!slot.last_ts || Date.parse(slot.last_ts) <= t) slot.last_ts = ts
+      if (settled && (!slot.last_turn_ts || Date.parse(slot.last_turn_ts) <= t)) slot.last_turn_ts = ts
     },
     setChannelTrusted(state, action: PayloadAction<boolean>) { state.channelTrusted = action.payload },
     sseSlotTitle(state, action: PayloadAction<{ key: string; title: string }>) {
@@ -160,6 +174,47 @@ const dashboardSlice = createSlice({
           if (action.payload.ci !== undefined) link.ci = action.payload.ci
         }
       }
+    },
+    /**
+     * Patch ONE channel's link row, against whatever is in the store right now.
+     *
+     * The channel menu's callbacks must not rebuild the whole `links` array from
+     * the array their render closed over: with two toggles in flight at once
+     * (Slack and Discord, say) both derive from the same pre-mutation snapshot, so
+     * the second dispatch overwrites the first and the sibling row silently
+     * reverts until the next slots push corrects it. Each row is independently
+     * mutable by design — one row per channel — so the store operation is per-row
+     * too, which makes losing a sibling impossible rather than merely unlikely.
+     *
+     * Matched on channel PLUS `origin` when the caller supplies it. A session can
+     * hold two deliveries on one channel at once — the conversation it was born in
+     * and an explicit mirror to that same channel — and those mute separately, so
+     * channel alone is ambiguous and picked whichever row came first. The
+     * predicate here is deliberately the same one the caller used to choose the
+     * endpoint's flag (`direction === 'origin'`), not equality against `direction`,
+     * so a `'both'` row is classified identically on both sides. Callers with only
+     * one possible row for the channel (Slack) may omit it. `patch` leaves a row
+     * that does not exist alone rather than inventing one: an invented row cannot
+     * know `paused`, which is how a disconnected channel came to render as
+     * connected.
+     */
+    patchSlotLink(
+      state,
+      action: PayloadAction<{
+        key: string
+        channel: string
+        origin?: boolean
+        patch: Partial<NonNullable<ChatSlot['links']>[number]>
+      }>,
+    ) {
+      const slot = state.slots.find(s => s.key === action.payload.key)
+      if (!slot?.links) return
+      const wantOrigin = action.payload.origin
+      const row = slot.links.find(candidate => (
+        candidate.channel === action.payload.channel
+        && (wantOrigin === undefined || (candidate.direction === 'origin') === wantOrigin)
+      ))
+      if (row) Object.assign(row, action.payload.patch)
     },
     updateSlotFolder(state, action: PayloadAction<{ key: string; folderId: string }>) {
       const slot = state.slots.find(s => s.key === action.payload.key)
@@ -254,7 +309,7 @@ const dashboardSlice = createSlice({
 })
 
 export const { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
-  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks } = dashboardSlice.actions
+  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
 
 /**
  * Resolve a slot's surface key. Backend emits `surface` (mirrors `mode` today

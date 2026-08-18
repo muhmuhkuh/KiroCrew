@@ -1,8 +1,33 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
 import { act, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
+
+// Prevent happy-dom from scheduling a real iframe fetch task when src is set.
+// The component sets `<iframe src="http://localhost:7778/?token=tok">` which
+// happy-dom attempts to navigate (even with disableIframePageLoading: true it
+// logs a DOMException + dispatches an error event). Override the src property
+// to store the value (so getAttribute assertions pass) without triggering
+// happy-dom's [connectedToDocument] navigation path.
+const _iframeSrcStore = new WeakMap<HTMLIFrameElement, string>()
+Object.defineProperty(HTMLIFrameElement.prototype, 'src', {
+  set(value: string) { _iframeSrcStore.set(this, value); this.setAttribute('src', value) },
+  get() { return _iframeSrcStore.get(this) ?? this.getAttribute('src') ?? '' },
+  configurable: true,
+})
+const origSetAttribute = HTMLIFrameElement.prototype.setAttribute
+HTMLIFrameElement.prototype.setAttribute = function (name: string, value: string) {
+  if (name === 'src') {
+    // Store as a DOM attribute (readable via getAttribute) but call the
+    // parent Element.setAttribute which does NOT trigger iframe navigation.
+    Element.prototype.setAttribute.call(this, name, value)
+    return
+  }
+  origSetAttribute.call(this, name, value)
+}
+afterAll(() => { HTMLIFrameElement.prototype.setAttribute = origSetAttribute })
+
 vi.mock('../lib/embedded', () => ({ isEmbeddedPane: vi.fn(() => false) }))
 import { isEmbeddedPane } from '../lib/embedded'
 
@@ -260,14 +285,15 @@ describe('InstancesViewport', () => {
 
     expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
     // The full switcher renders atop the panel: Local + the instance tab.
-    const bar = await screen.findByRole('tablist', { name: /Remote crews/i })
+    const bar = await screen.findByRole('group', { name: /Remote crews/i })
     expect(bar).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: /Local/i })).toBeInTheDocument()
-    expect(screen.getByRole('tab', { name: /Cloud One/i })).toBeInTheDocument()
+    await u.click(screen.getByRole('button', { name: /Switch crew/i }))
+    expect(screen.getByRole('menuitemradio', { name: /Local/i })).toBeInTheDocument()
+    expect(screen.getByRole('menuitemradio', { name: /Cloud One/i })).toBeInTheDocument()
 
     // Clicking Local escapes the disconnect view.
-    await u.click(screen.getByRole('tab', { name: /Local/i }))
-    expect(store.getState().instances.activeId).toBeNull()
+    await u.click(screen.getByRole('menuitemradio', { name: /Local/i }))
+    await waitFor(() => expect(store.getState().instances.activeId).toBeNull())
   })
 
   it('insets the panel tab bar clear of the macOS traffic lights when macInset is set', async () => {
@@ -292,7 +318,7 @@ describe('InstancesViewport', () => {
     })
     renderWithProviders(<InstancesViewport macInset />, { store })
 
-    const bar = await screen.findByRole('tablist', { name: /Remote crews/i })
+    const bar = await screen.findByRole('group', { name: /Remote crews/i })
     expect(bar.style.paddingLeft).toBe('84px')
   })
 
@@ -348,7 +374,7 @@ describe('InstancesViewport', () => {
 
     expect(await screen.findByText(/Loading pane/i)).toBeInTheDocument()
     // The full switcher renders atop the overlay: the user can always escape.
-    const bar = await screen.findByRole('tablist', { name: /Remote crews/i })
+    const bar = await screen.findByRole('group', { name: /Remote crews/i })
     expect(bar).toBeInTheDocument()
     // Not the error panel — no Retry while the load is still in flight.
     expect(screen.queryByText(/Connection error/i)).toBeNull()
@@ -467,7 +493,7 @@ describe('InstancesViewport', () => {
       vi.useRealTimers()
     }
     // The escape-hatch strip is on the panel (query resolves under real timers).
-    expect(await screen.findByRole('tablist', { name: /Remote crews/i })).toBeInTheDocument()
+    expect(await screen.findByRole('group', { name: /Remote crews/i })).toBeInTheDocument()
   })
 
   it('Retry after a load timeout force-reloads the iframe even for an identical token', async () => {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -40,6 +41,23 @@ from kiro_crew.apps.registry import (
 def _explicit_registry_execution_admission(monkeypatch):
     """Registry tests exercise admitted installs unless they say otherwise."""
     monkeypatch.setattr("kiro_crew.apps.execution.third_party_execution_allowed", lambda: True)
+
+
+@pytest.fixture(autouse=True)
+def _catalog_absent(monkeypatch):
+    """Pin "official catalog reachable, app absent" for the whole module.
+
+    This module is about SEED and EXTERNAL-registry resolution; the official
+    catalog is upstream of both in ``_resolve_registry_row``, and its real
+    lookup performs a fresh uncached HTTPS fetch on every call (#4236).
+    Before the suite-wide network guard these tests silently depended on the
+    runner's live network being up. A test that wants a different catalog
+    answer overrides this by monkeypatching the same seam itself.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.apps.official_catalog.inventory_for_install",
+        lambda name: None,
+    )
 
 
 @pytest.fixture()
@@ -1797,6 +1815,190 @@ class TestSameRepoCredentialCarveOut:
 
 
 # ---------------------------------------------------------------------------
+# Operator-configured registry branch overrides per-app declarations (#3330)
+# ---------------------------------------------------------------------------
+
+
+class TestConfiguredBranchOverride:
+    @pytest.mark.asyncio
+    async def test_configured_branch_overrides_declared_branch(
+        self, cache_dir, monkeypatch, caplog
+    ):
+        # A same-repo entry declaring its own branch (e.g. "main", written in
+        # anticipation of an eventual merge) must NOT win over the branch the
+        # operator configured — the index was read from the configured branch,
+        # so the declared one describes a state that does not exist there yet.
+        import kiro_crew.apps.registry as reg
+
+        async def _fake_index(repo, branch):
+            return [{"name": "eager-app", "subdirectory": "apps/eager", "branch": "main"}]
+
+        monkeypatch.setattr(reg, "_fetch_external_registry_index", _fake_index)
+
+        class _Reg:
+            name = "acme"
+            repo = "https://github.com/acme/apps"
+            branch = "develop"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.apps.registry"):
+            entries = await reg._fetch_and_cache_external_registry(_Reg())
+        assert entries[0]["branch"] == "develop"
+        # The cached copy carries the override too — install reads the cache.
+        cached = reg._read_external_registry_cache("acme", ignore_ttl=True)
+        assert cached[0]["branch"] == "develop"
+        # The divergence is logged, naming both branches and the entry.
+        divergence_logs = [
+            r for r in caplog.records if "declares branch" in r.getMessage()
+        ]
+        assert len(divergence_logs) == 1
+        msg = divergence_logs[0].getMessage()
+        assert "eager-app" in msg and "'main'" in msg and "'develop'" in msg
+
+    @pytest.mark.asyncio
+    async def test_entry_without_branch_inherits_configured_branch(
+        self, cache_dir, monkeypatch, caplog
+    ):
+        # An entry omitting a branch still inherits the configured one, and no
+        # divergence warning fires for it.
+        import kiro_crew.apps.registry as reg
+
+        async def _fake_index(repo, branch):
+            return [{"name": "plain-app", "subdirectory": "apps/plain"}]
+
+        monkeypatch.setattr(reg, "_fetch_external_registry_index", _fake_index)
+
+        class _Reg:
+            name = "acme"
+            repo = "https://github.com/acme/apps"
+            branch = "develop"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.apps.registry"):
+            entries = await reg._fetch_and_cache_external_registry(_Reg())
+        assert entries[0]["branch"] == "develop"
+        assert not [r for r in caplog.records if "declares branch" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_matching_declared_branch_does_not_warn(
+        self, cache_dir, monkeypatch, caplog
+    ):
+        # A declaration that AGREES with the configured branch is not a
+        # divergence — the warning must fire only on a genuine mismatch.
+        import kiro_crew.apps.registry as reg
+
+        async def _fake_index(repo, branch):
+            return [{"name": "same-app", "subdirectory": "apps/same", "branch": "develop"}]
+
+        monkeypatch.setattr(reg, "_fetch_external_registry_index", _fake_index)
+
+        class _Reg:
+            name = "acme"
+            repo = "https://github.com/acme/apps"
+            branch = "develop"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.apps.registry"):
+            entries = await reg._fetch_and_cache_external_registry(_Reg())
+        assert entries[0]["branch"] == "develop"
+        assert not [r for r in caplog.records if "declares branch" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_cross_repo_entry_keeps_declared_branch(
+        self, cache_dir, monkeypatch, caplog
+    ):
+        # A cross-repo entry's declared branch names a ref in ANOTHER
+        # repository, about which the configured registry branch carries no
+        # information. The override must not touch it (and must not warn) —
+        # forcing reg.branch there would clone a ref the app repo may not have.
+        import kiro_crew.apps.registry as reg
+
+        async def _fake_index(repo, branch):
+            return [
+                {
+                    "name": "sibling-app",
+                    "gitUrl": "https://github.com/acme/other-repo",
+                    "subdirectory": "apps/sibling",
+                    "branch": "main",
+                }
+            ]
+
+        monkeypatch.setattr(reg, "_fetch_external_registry_index", _fake_index)
+
+        class _Reg:
+            name = "acme"
+            repo = "https://github.com/acme/apps"
+            branch = "develop"
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.apps.registry"):
+            entries = await reg._fetch_and_cache_external_registry(_Reg())
+        assert entries[0]["branch"] == "main"
+        assert not [r for r in caplog.records if "declares branch" in r.getMessage()]
+
+    @pytest.mark.asyncio
+    async def test_cross_repo_entry_without_branch_inherits(self, cache_dir, monkeypatch):
+        # A cross-repo entry with no usable declared branch (absent or an
+        # explicit JSON null) still inherits the configured branch, so None
+        # can never flow to the clone coordinates.
+        import kiro_crew.apps.registry as reg
+
+        async def _fake_index(repo, branch):
+            return [
+                {
+                    "name": "bare-app",
+                    "gitUrl": "https://github.com/acme/other-repo",
+                    "subdirectory": "apps/bare",
+                    "branch": None,
+                }
+            ]
+
+        monkeypatch.setattr(reg, "_fetch_external_registry_index", _fake_index)
+
+        class _Reg:
+            name = "acme"
+            repo = "https://github.com/acme/apps"
+            branch = "develop"
+
+        entries = await reg._fetch_and_cache_external_registry(_Reg())
+        assert entries[0]["branch"] == "develop"
+
+    def test_stale_cache_branch_repaired_on_direct_lookup(self, cache_dir, monkeypatch):
+        # A cache written before this policy existed (or before the operator
+        # changed the registry's configured branch) still carries the old
+        # per-app branch. The direct install lookup reads the cache without a
+        # listing refresh (ignore_ttl), so the repair must happen at read time.
+        from types import SimpleNamespace
+
+        import kiro_crew.apps.registry as reg
+
+        reg._write_external_registry_cache(
+            "acme",
+            [
+                {
+                    "name": "legacy-app",
+                    "gitUrl": "https://github.com/acme/apps",
+                    "repo": "https://github.com/acme/apps",
+                    "subdirectory": "apps/legacy",
+                    "branch": "main",
+                }
+            ],
+        )
+        mock_config = MagicMock()
+        mock_config.registries = [
+            SimpleNamespace(name="acme", repo="https://github.com/acme/apps", branch="develop")
+        ]
+        monkeypatch.setattr(
+            "kiro_crew.apps.registry._load_registry_file",
+            lambda: [],
+        )
+        monkeypatch.setattr(
+            "kiro_crew.config.loader.KiroCrewConfig.load",
+            lambda: mock_config,
+        )
+
+        result = get_registry_app("legacy-app")
+        assert result is not None
+        assert result["branch"] == "develop"
+
+
+# ---------------------------------------------------------------------------
 # Untrusted index `subdirectory` path-traversal gate (CWE-22 → RCE).
 # ---------------------------------------------------------------------------
 
@@ -3217,6 +3419,258 @@ class TestInstallScriptFailurePreservesStaleCheckout:
         # The old checkout content is inside the stale dir (user can recover).
         assert (stale_paths[0] / "local-edits.txt").exists()
         assert (stale_paths[0] / "local-edits.txt").read_text() == "precious data"
+
+    @pytest.mark.asyncio
+    async def test_same_repo_stale_is_restored_when_install_from_registry_fails(self, tmp_path):
+        """Path-level companion to the helper tests: the `finally` in
+        install_from_registry must actually fire.
+
+        The helper was unit-tested while the WIRING was not, which is how a
+        branch-based restoration that missed the `onInstall` exit shipped. This drives
+        the same failure the test above drives, but with a SAME-REPOSITORY move, which
+        must be put back rather than retained.
+        """
+        from kiro_crew.apps.registry import install_from_registry
+
+        pkg_dir = tmp_path / "testapp"
+        pkg_dir.mkdir()
+        (pkg_dir / "app.json").write_text(
+            '{"name": "testapp", "setup": {"onInstall": "exit 1"}}', encoding="utf-8"
+        )
+        (pkg_dir / "replacement.txt").write_text("freshly fetched", encoding="utf-8")
+        stale_dir = tmp_path / "testapp.stale-deadbeef"
+        stale_dir.mkdir()
+        (stale_dir / "my-work.txt").write_text("important", encoding="utf-8")
+
+        async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+            return {
+                "ok": True,
+                "pkg_dir": pkg_dir,
+                "_pending_stale_cleanup": [stale_dir],
+                "_restorable_stale": [stale_dir],
+            }
+
+        class _ScriptFailProc:
+            returncode = 1
+
+            async def communicate(self):
+                return (b"script failed", None)
+
+        def _fake_wrap_argv(argv, mode="standard"):
+            return list(argv), None
+
+        with (
+            patch(
+                "kiro_crew.apps.registry.get_registry_app",
+                return_value={"repo": "https://example.com/app.git", "branch": "main"},
+            ),
+            patch(
+                "kiro_crew.apps.registry._entry_git_url",
+                return_value="https://example.com/app.git",
+            ),
+            patch("kiro_crew.apps.registry._clone_build_app", new=_fake_clone_build),
+            patch("kiro_crew.apps.registry.app_admission_denied", return_value=None),
+            patch("kiro_crew.apps.registry.app_execution_denied", return_value=None),
+            patch(
+                "kiro_crew.apps.registry._fetch_app_manifest",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("kiro_crew.apps.registry.wrap_argv", side_effect=_fake_wrap_argv),
+            patch(
+                "kiro_crew.apps.registry.create_subprocess_limited",
+                new=AsyncMock(return_value=_ScriptFailProc()),
+            ),
+            # The destination is derived from the app name in production
+            # (`pkg_dir = app_source_dir(app_name)` is its only assignment), so the
+            # test has to say where that is rather than relying on the result dict.
+            patch("kiro_crew.apps.registry.app_source_dir", return_value=pkg_dir),
+            patch("kiro_crew.apps.registry.sel"),
+        ):
+            result = await install_from_registry("testapp")
+
+        assert not result["ok"]
+        assert (pkg_dir / "my-work.txt").read_text(encoding="utf-8") == "important", (
+            "the user's edited checkout must be back in place after a failed update"
+        )
+        assert not (pkg_dir / "replacement.txt").exists(), "the replacement is discarded"
+        assert not stale_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_restoration_works_when_the_failure_dict_omits_pkg_dir(self, tmp_path, monkeypatch):
+        """The exit Design Review found, which four rounds of rollback work missed.
+
+        Every post-clone FAILURE dict omits `pkg_dir`, so reading it raised a KeyError
+        that the broad catch swallowed -- the restoration silently did nothing on
+        exactly the exits it exists for, and the suite was green because every existing
+        test drove a failure that came AFTER an ok result carrying `pkg_dir`.
+        """
+        from kiro_crew.apps.registry import install_from_registry
+
+        pkg_dir = tmp_path / "testapp"
+        pkg_dir.mkdir()
+        (pkg_dir / "replacement.txt").write_text("half-installed", encoding="utf-8")
+        stale_dir = tmp_path / "testapp.stale-deadbeef"
+        stale_dir.mkdir()
+        (stale_dir / "my-work.txt").write_text("important", encoding="utf-8")
+
+        async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+            # Shaped like a real post-clone refusal: ok=False, NO pkg_dir, but the
+            # rollback state is present.
+            return {
+                "ok": False,
+                "name": app_name,
+                "error": "blocked by admission policy: not allowlisted",
+                "_restorable_stale": [stale_dir],
+            }
+
+        with (
+            patch(
+                "kiro_crew.apps.registry.get_registry_app",
+                return_value={"repo": "https://example.com/app.git", "branch": "main"},
+            ),
+            patch(
+                "kiro_crew.apps.registry._entry_git_url",
+                return_value="https://example.com/app.git",
+            ),
+            patch("kiro_crew.apps.registry._clone_build_app", new=_fake_clone_build),
+            patch("kiro_crew.apps.registry.app_admission_denied", return_value=None),
+            patch("kiro_crew.apps.registry.app_execution_denied", return_value=None),
+            patch(
+                "kiro_crew.apps.registry._fetch_app_manifest",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("kiro_crew.apps.registry.app_source_dir", return_value=pkg_dir),
+            patch("kiro_crew.apps.registry.sel"),
+        ):
+            result = await install_from_registry("testapp")
+
+        assert not result["ok"]
+        assert (pkg_dir / "my-work.txt").read_text(encoding="utf-8") == "important", (
+            "a failure dict without pkg_dir must still get the checkout restored"
+        )
+        assert not stale_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_provenance_write_does_not_roll_back_the_source(self, tmp_path):
+        """`install_app` has already copied the files, so treating a failed receipt as
+        "not durable" would leave installed files from the NEW version beside a source
+        tree from the OLD one -- worse than either outcome."""
+        from kiro_crew.apps.registry import install_from_registry
+
+        pkg_dir = tmp_path / "testapp"
+        pkg_dir.mkdir()
+        (pkg_dir / "app.json").write_text('{"name": "testapp"}', encoding="utf-8")
+        (pkg_dir / "replacement.txt").write_text("the installed version", encoding="utf-8")
+        stale_dir = tmp_path / "testapp.stale-deadbeef"
+        stale_dir.mkdir()
+        (stale_dir / "old.txt").write_text("previous", encoding="utf-8")
+
+        async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+            return {
+                "ok": True,
+                "pkg_dir": pkg_dir,
+                "_pending_stale_cleanup": [stale_dir],
+                "_restorable_stale": [stale_dir],
+            }
+
+        class _Ok:
+            ok = True
+            name = "testapp"
+            message = "installed"
+            error = None
+
+        def _boom(*a, **k):
+            raise OSError("provenance store unwritable")
+
+        with (
+            patch(
+                "kiro_crew.apps.registry.get_registry_app",
+                return_value={"repo": "https://example.com/app.git", "branch": "main"},
+            ),
+            patch(
+                "kiro_crew.apps.registry._entry_git_url",
+                return_value="https://example.com/app.git",
+            ),
+            patch("kiro_crew.apps.registry._clone_build_app", new=_fake_clone_build),
+            patch("kiro_crew.apps.registry.app_admission_denied", return_value=None),
+            patch("kiro_crew.apps.registry.app_execution_denied", return_value=None),
+            patch(
+                "kiro_crew.apps.registry._fetch_app_manifest",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("kiro_crew.apps.registry.get_app", return_value=None),
+            patch("kiro_crew.apps.registry.install_app", return_value=_Ok()),
+            patch("kiro_crew.apps.registry.set_app_provenance", side_effect=_boom),
+            patch("kiro_crew.apps.registry.sel"),
+        ):
+            result = await install_from_registry("testapp")
+
+        assert not result["ok"], "the bookkeeping failure is still reported"
+        assert (pkg_dir / "replacement.txt").exists(), (
+            "the installed source tree must NOT be rolled back under installed files"
+        )
+        assert stale_dir.exists(), "the previous checkout is retained, not restored"
+
+    @pytest.mark.asyncio
+    async def test_a_successful_install_is_not_rolled_back(self, tmp_path):
+        """Scope guard for the `finally`: a durable success must keep the freshly
+        fetched tree, and retain the old one as a sibling rather than restoring it."""
+        from kiro_crew.apps.registry import install_from_registry
+
+        pkg_dir = tmp_path / "testapp"
+        pkg_dir.mkdir()
+        (pkg_dir / "app.json").write_text('{"name": "testapp"}', encoding="utf-8")
+        (pkg_dir / "replacement.txt").write_text("freshly fetched", encoding="utf-8")
+        stale_dir = tmp_path / "testapp.stale-deadbeef"
+        stale_dir.mkdir()
+        (stale_dir / "my-work.txt").write_text("important", encoding="utf-8")
+
+        async def _fake_clone_build(git_url, app_name, log_lines, branch="main", **kwargs):
+            return {
+                "ok": True,
+                "pkg_dir": pkg_dir,
+                "_pending_stale_cleanup": [stale_dir],
+                "_restorable_stale": [stale_dir],
+            }
+
+        class _Ok:
+            ok = True
+            name = "testapp"
+            message = "installed"
+            error = None
+
+        with (
+            patch(
+                "kiro_crew.apps.registry.get_registry_app",
+                return_value={"repo": "https://example.com/app.git", "branch": "main"},
+            ),
+            patch(
+                "kiro_crew.apps.registry._entry_git_url",
+                return_value="https://example.com/app.git",
+            ),
+            patch("kiro_crew.apps.registry._clone_build_app", new=_fake_clone_build),
+            patch("kiro_crew.apps.registry.app_admission_denied", return_value=None),
+            patch("kiro_crew.apps.registry.app_execution_denied", return_value=None),
+            patch(
+                "kiro_crew.apps.registry._fetch_app_manifest",
+                new=AsyncMock(return_value=None),
+            ),
+            patch("kiro_crew.apps.registry.get_app", return_value=None),
+            patch("kiro_crew.apps.registry.install_app", return_value=_Ok()),
+            patch("kiro_crew.apps.registry.set_app_provenance"),
+            # Needed for the rollback destination to be observable at all: without it a
+            # wrongly-triggered restore would land outside tmp_path and the assertions
+            # below would pass for the wrong reason.
+            patch("kiro_crew.apps.registry.app_source_dir", return_value=pkg_dir),
+            patch("kiro_crew.apps.registry.sel"),
+        ):
+            result = await install_from_registry("testapp")
+
+        assert result["ok"], result
+        assert (pkg_dir / "replacement.txt").exists(), (
+            "a durable success must keep the tree it installed"
+        )
+        assert stale_dir.exists(), "the old checkout is retained beside it, not restored"
 
     @pytest.mark.asyncio
     async def test_stale_not_cleaned_when_install_from_registry_fails(self, tmp_path):

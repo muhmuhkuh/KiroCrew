@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import datetime as _dt
 import errno
 import hashlib
 import json
 import logging
 import mimetypes
+import ntpath
 import os
 import re
+import stat as _stat_mod
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import uuid
@@ -29,6 +34,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.hooks import safe_read_prefix
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
 from kiro_crew.security import (
     BINARY_MIME_ALLOWLIST,
     is_sensitive_path,
@@ -73,10 +79,6 @@ def _sel():
 
 async def api_reveal_path(request: web.Request) -> web.Response:
     """POST /api/reveal — reveal a file/folder in Finder or open with default app."""
-    import shutil  # noqa: F811
-    import subprocess  # noqa: F811
-    import sys  # noqa: F811
-
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -91,26 +93,28 @@ async def api_reveal_path(request: web.Request) -> web.Response:
             outcome="denied", error="sensitive_path",
             resources=path, metadata={"action": action})
         return web.json_response({"error": "access denied"}, status=403)
+    # Every ALLOWED outcome leaves through the single audited return below —
+    # including the clipboard answer, which is a granted decision whose host
+    # simply had no file manager. An early return here would drop that decision
+    # from the SEL log, so the branches record what happened instead of exiting.
+    #
+    # Both spawns live in platform_compat, which owns the safety properties:
+    # absolute trusted launchers rather than bare argv names, a folder rather
+    # than the file on the platforms where handing a file to the file manager
+    # would launch it, and Windows refused outright for the launch-by-association
+    # verb. They answer False both for a host with no launcher and for one that
+    # refuses to start, and either way this degrades to the clipboard rather than
+    # failing a click in the file viewer.
     if action == "open":
         if not os.path.isfile(path):
             return web.json_response({"error": "not a regular file"}, status=400)
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        elif shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", path])
-        else:
-            return web.json_response({"ok": True, "copy": path})
+        copied = not platform_compat.open_with_default_app(path)
     else:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", path])
-        elif shutil.which("xdg-open"):
-            subprocess.Popen(["xdg-open", str(Path(path).parent)])
-        else:
-            return web.json_response({"ok": True, "copy": path})
+        copied = not platform_compat.reveal_in_file_manager(path)
     _sel().log_tool_invocation(
         session_key="api", source="api", tool_name="reveal_path",
         outcome="success", resources=path, metadata={"action": action})
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "copy": path} if copied else {"ok": True})
 
 
 async def api_outbox_notify(request: web.Request) -> web.Response:
@@ -278,8 +282,6 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
 
 async def api_outbox_download(request: web.Request) -> web.StreamResponse:
     """GET /api/outbox/{filename} — download a file from the outbox."""
-    import urllib.parse  # noqa: F811
-
     from kiro_crew.config.loader import outbox_dir  # noqa: F811
     from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F811
 
@@ -466,7 +468,13 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
             downstream_service="slack",
             error=f"path_not_allowed: {file_path}",
         )
-        return web.json_response({"error": "file_path must be under ~/.kirocrew/"}, status=403)
+        return web.json_response(
+            {
+                "error": "file_path must be under the outbox directory or the workspace root",
+                "code": "path_not_allowed",
+            },
+            status=403,
+        )
     try:
         raw = safe_read_file_bytes(str(resolved))
     except FileTooLargeError as e:
@@ -822,6 +830,30 @@ def _write_file_restricted(path: Path, data: bytes) -> None:
         os.close(fd)
 
 
+def _open_rb_nofollow(path: str) -> int:
+    """Open *path* read-only in binary, refusing symlinks, on every platform.
+
+    POSIX gets the atomic form: ``O_NOFOLLOW`` makes the kernel itself fail
+    the open with ``ELOOP`` when the final component is a symlink, so there is
+    no check-then-open race. Windows has no ``O_NOFOLLOW`` (referencing it
+    raises AttributeError, turning every read into an HTTP 500), so there the
+    guard is a pre-open ``lstat``: reject symlinks and any reparse point
+    (junctions included) with the same ``ELOOP`` errno the POSIX branch
+    produces, keeping callers' error handling identical. The window between
+    lstat and open is acceptable defence-in-depth there -- path containment
+    was already enforced by the caller's validation, and creating a symlink
+    on Windows requires elevated or developer-mode privileges. ``O_BINARY``
+    keeps the CRT from text-mode translating file bytes on Windows; it is 0
+    elsewhere.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        st = os.lstat(path)
+        if _stat_mod.S_ISLNK(st.st_mode) or getattr(st, "st_reparse_tag", 0) != 0:
+            raise OSError(errno.ELOOP, "symlinks not allowed", path)
+    return os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_BINARY", 0))
+
+
 # Magic-byte signatures for content-type validation at the upload boundary
 # (CWE-434). The extension is attacker-controlled, so binary types are verified
 # against their file signature BEFORE the bytes are written. Text formats (and
@@ -1083,7 +1115,6 @@ async def api_workspaces(request: web.Request) -> web.Response:
 
 async def api_workspaces_create(request: web.Request) -> web.Response:
     """POST /api/workspaces — create a new workspace."""
-    import asyncio  # noqa: F811
     import shutil  # noqa: F811
 
     from kiro_crew.validation import WORKSPACE_NAME_RE  # noqa: F811
@@ -1448,9 +1479,6 @@ async def api_file_watch(request: web.Request) -> web.StreamResponse:
 
 async def api_file_read(request: web.Request) -> web.Response:
     """GET /api/file-read?path=... — read file content for the markdown panel."""
-    import logging  # noqa: F811
-    import os  # noqa: F811
-
     from kiro_crew.validation import (  # noqa: F811
         FILE_READ_SCHEMA,
         ValidationError,
@@ -1459,23 +1487,18 @@ async def api_file_read(request: web.Request) -> web.Response:
 
     raw_path = request.query.get("path", "")
     # Resolve relative paths against project dir when resolve=1
-    if request.query.get("resolve") == "1" and raw_path and not raw_path.startswith(("/", "~")):
-        proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if not proj:
+    if request.query.get("resolve") == "1":
+        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        if _resolve_err == "cannot_resolve":
             return web.json_response(
                 {"error": "cannot resolve: no project dir configured"},
                 status=400,
             )
-        raw_path = os.path.join(proj, raw_path)
-        # Ensure resolved path stays within project directory
-        resolved = os.path.realpath(raw_path)
-        resolved_proj = os.path.realpath(proj)
-        if not (resolved == resolved_proj or resolved.startswith(resolved_proj + os.sep)):
+        if _resolve_err == "outside_project":
             return web.json_response(
                 {"error": "path outside project directory"},
                 status=400,
             )
-        raw_path = resolved
 
     try:
         validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
@@ -1595,20 +1618,16 @@ async def api_file_download(request: web.Request) -> web.Response:
 
     raw_path = request.query.get("path", "")
     # Resolve relative paths against project dir when resolve=1 (mirrors api_file_read)
-    if request.query.get("resolve") == "1" and raw_path and not raw_path.startswith(("/", "~")):
-        proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-        if not proj:
+    if request.query.get("resolve") == "1":
+        raw_path, _resolve_err = _resolve_project_relative(raw_path)
+        if _resolve_err == "cannot_resolve":
             return web.json_response(
                 {"error": "cannot resolve: no project dir configured"}, status=400,
             )
-        raw_path = os.path.join(proj, raw_path)
-        resolved = os.path.realpath(raw_path)
-        resolved_proj = os.path.realpath(proj)
-        if not (resolved == resolved_proj or resolved.startswith(resolved_proj + os.sep)):
+        if _resolve_err == "outside_project":
             return web.json_response(
                 {"error": "path outside project directory"}, status=400,
             )
-        raw_path = resolved
 
     try:
         validate_tool_args({"path": raw_path}, FILE_READ_SCHEMA)
@@ -1639,9 +1658,10 @@ async def api_file_download(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "not found"}, status=404)
 
-    # Read raw bytes via O_NOFOLLOW to atomically reject symlinks (no TOCTOU race).
+    # Read raw bytes rejecting symlinks (atomic O_NOFOLLOW on POSIX; lstat
+    # guard + O_BINARY on Windows -- see _open_rb_nofollow).
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = _open_rb_nofollow(path)
         with os.fdopen(fd, "rb") as f:
             st = os.fstat(f.fileno())
             if st.st_size > _MAX_UPLOAD_BYTES:
@@ -1714,8 +1734,6 @@ async def api_file_download(request: web.Request) -> web.Response:
 
 async def api_file_raw(request: web.Request) -> web.Response:
     """GET /api/file-raw?path=... — serve a file with its native content type (images, etc.)."""
-    import os  # noqa: F811
-
     import kiro_crew.dashboard.handlers as _h  # noqa: F811
 
     def _log(outcome: str, res: str) -> None:
@@ -1735,10 +1753,11 @@ async def api_file_raw(request: web.Request) -> web.Response:
     if not os.path.isfile(path):
         _log("not_found", path)
         return web.json_response({"error": "not found"}, status=404)
-    # Open with O_NOFOLLOW to atomically reject symlinks (no TOCTOU race).
+    # Open rejecting symlinks (atomic O_NOFOLLOW on POSIX; lstat guard +
+    # O_BINARY on Windows -- see _open_rb_nofollow).
     # Read header + full content through the same fd to avoid re-opening.
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = _open_rb_nofollow(path)
         with os.fdopen(fd, "rb") as f:
             st = os.fstat(f.fileno())
             if st.st_size > _MAX_UPLOAD_BYTES:
@@ -1793,11 +1812,320 @@ async def api_file_raw(request: web.Request) -> web.Response:
     return web.Response(body=data, headers=headers)
 
 
-async def api_file_write(request: web.Request) -> web.Response:
-    """POST /api/file-write — write file content from the markdown panel."""
-    import logging  # noqa: F811
+# ── /api/file-stream: Range-capable audio/video serving ─────────────────────
+# The media cap is deliberately larger than _MAX_UPLOAD_BYTES: screen
+# recordings routinely exceed 50 MB, and unlike file-raw this endpoint never
+# materializes the file in memory -- Range streaming reads bounded chunks, so
+# the cap only bounds what one URL can address, not per-request memory.
+_STREAM_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_STREAM_CHUNK_BYTES = 256 * 1024
+# Text-exfiltration probe window. Real media is binary within the first
+# bytes; content that decodes as UTF-8 text this deep is a text file wearing
+# a media magic, which the redaction scan below must see.
+_STREAM_TEXT_PROBE_BYTES = 64 * 1024
+
+
+def _resolve_project_relative(raw: str) -> tuple[str, str | None]:
+    """Resolve a relative path against KIROCREW_PROJECT_DIR (resolve=1).
+
+    Returns (path, None) on success -- absolute and ~-paths pass through
+    unchanged -- or ("", error_code) with "cannot_resolve" (no project dir
+    configured) or "outside_project" (the joined path escapes the project
+    directory after realpath).
+    """
+    if not raw or raw.startswith(("/", "~")):
+        return raw, None
+    # Windows-absolute shapes (UNC \\server\share, drive C:\...) are not
+    # project-relative: pass them to the validator unchanged. Joining them
+    # would let os.path.realpath contact the named host (SMB round-trip)
+    # before any validation runs; the validator's own network-path gate
+    # sits BEFORE its realpath, so it is the safe place for these.
+    if raw.startswith("\\") or ntpath.splitdrive(raw)[0]:
+        return raw, None
+    proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
+    if not proj:
+        return "", "cannot_resolve"
+    candidate = os.path.realpath(os.path.join(proj, raw))
+    resolved_proj = os.path.realpath(proj)
+    if not (candidate == resolved_proj or candidate.startswith(resolved_proj + os.sep)):
+        return "", "outside_project"
+    return candidate, None
+
+
+# Container signature -> Content-Type. Sniffed from the file's first bytes so
+# the endpoint serves media by CONTENT, not by extension claim (CWE-434 shape,
+# same posture as file-raw's image allowlist). Entries are (offset, magic,
+# mime). MP4-family uses the ftyp box at offset 4 (bytes 0-3 are the box
+# size); WebM and Matroska share the EBML magic and both play in <video>.
+_MEDIA_MAGIC: tuple[tuple[int, bytes, str], ...] = (
+    (4, b"ftyp", "video/mp4"),          # mp4 / m4v / m4a / mov (BMFF family)
+    (0, b"\x1a\x45\xdf\xa3", "video/webm"),  # webm / mkv (EBML)
+    (0, b"OggS", "audio/ogg"),          # ogg audio or video; <audio>/<video> both accept
+    (0, b"fLaC", "audio/flac"),
+    (0, b"ID3", "audio/mpeg"),          # mp3 with ID3v2 tag
+    (0, b"\xff\xfb", "audio/mpeg"),     # bare mp3 frame sync (MPEG1 layer3)
+    (0, b"\xff\xf3", "audio/mpeg"),
+    (0, b"\xff\xf2", "audio/mpeg"),
+)
+
+
+def _sniff_media_type(header: bytes) -> str | None:
+    """Return the media Content-Type for ``header`` bytes, or None."""
+    for offset, magic, mime in _MEDIA_MAGIC:
+        if header[offset:offset + len(magic)] == magic:
+            return mime
+    # WAV: RIFF....WAVE compound signature (offset 8 discriminates from WebP)
+    if header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        return "audio/wav"
+    return None
+
+
+def _parse_range_header(value: str, size: int) -> tuple[int, int] | None:
+    """Parse a single-range ``bytes=`` header against ``size``.
+
+    Returns (start, end) inclusive, or None for an unsatisfiable or
+    malformed header. Multi-range requests are treated as malformed --
+    <audio>/<video> elements only ever issue single ranges, and multipart
+    responses would complicate the reader for no consumer.
+    """
+    if not value.startswith("bytes="):
+        return None
+    spec = value[len("bytes="):]
+    if "," in spec or "-" not in spec:
+        return None
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s == "":
+            # suffix form: last N bytes
+            suffix = int(end_s)
+            if suffix <= 0:
+                return None
+            start = max(0, size - suffix)
+            end = size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else size - 1
+    except ValueError:
+        return None
+    if start < 0 or start >= size or end < start:
+        return None
+    return start, min(end, size - 1)
+
+
+async def api_file_stream(request: web.Request) -> web.StreamResponse:
+    """GET /api/file-stream?path=... -- serve audio/video with Range support.
+
+    Powers inline <video>/<audio> playback in the file viewer. file-raw is
+    unsuitable for media: it whole-reads the file into memory, rejects
+    anything over the upload cap, and ignores Range headers -- and seeking in
+    a media element requires 206 Partial Content. This endpoint follows the
+    same security pattern (dashboard path validation, sensitive-path block,
+    symlink-refusing open, content sniffing before serving) but streams
+    bounded chunks off the event loop, so memory stays constant regardless
+    of file size. All reads go through the SAME fd the header was sniffed
+    from, so the served bytes cannot be swapped after the check.
+
+    Accepted gap (documented, not a defect): the redaction probe covers the
+    first 64 KiB. Complete coverage is unreachable for a Range endpoint --
+    the client controls byte offsets, so any pattern scan can be split
+    across range boundaries -- and the sibling binary-serving endpoint
+    (file-raw) performs no content scan at all. The probe exists to catch
+    the honest-mistake shape: a text file wearing a forged media magic.
+    """
     import os  # noqa: F811
 
+    import kiro_crew.dashboard.handlers as _h  # noqa: F811
+
+    def _log(outcome: str, res: str) -> None:
+        _sel().log_tool_invocation(
+            session_key="dashboard", tool_name="file_stream", outcome=outcome, resources=res,
+        )
+
+    raw_path = request.query.get("path", "")
+    resolve_requested = request.query.get("resolve") == "1"
+
+    def _open_media(raw: str) -> tuple:
+        """Validate, open, and sniff the media file. Runs on a worker thread.
+
+        Everything filesystem-touching lives here: relative-path resolution
+        against the project dir (the resolve=1 contract shared with
+        file-read/file-download), realpath resolution inside the validator,
+        the sensitive-path check, existence probe, the symlink-refusing open,
+        fstat, and the header read. Returns either
+        ("ok", file_object, size, content_type, path) or a refusal tuple
+        ("refused", code, path_for_log). A malformed path (embedded NUL
+        makes realpath raise ValueError) is an invalid path, not a crash.
+        """
+        try:
+            if resolve_requested:
+                raw, resolve_err = _resolve_project_relative(raw)
+                if resolve_err:
+                    return ("refused", resolve_err, raw)
+            validated = _h._validate_dashboard_path(raw)
+        except ValueError:
+            validated = None
+        if not validated:
+            return ("refused", "invalid_path", raw)
+        from kiro_crew.security import is_sensitive_path as _isp  # noqa: F811
+        if _isp(validated):
+            return ("refused", "sensitive_path", validated)
+        if not os.path.isfile(validated):
+            return ("refused", "not_found", validated)
+        try:
+            fd = _open_rb_nofollow(validated)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                return ("refused", "symlink_refused", validated)
+            return ("refused", "read_failed", validated)
+        fobj = os.fdopen(fd, "rb")
+        try:
+            size = os.fstat(fobj.fileno()).st_size
+            # fstat is authoritative for THIS fd; a file that grows afterwards
+            # only extends past the size we announce, never past the cap check.
+            if size > _STREAM_MAX_BYTES:
+                fobj.close()
+                return ("refused", "file_too_large", validated)
+            header = fobj.read(16)
+            content_type = _sniff_media_type(header)
+            if not content_type:
+                fobj.close()
+                return ("refused", "not_media", validated)
+            # Sibling-control parity: file-download refuses text content that
+            # redact() flags. Media magics can be weak (the bare mp3 frame
+            # sync is two bytes), so a credential-bearing TEXT file with a
+            # forged prefix must not stream out here. Decode with
+            # errors="replace" -- exactly as the download scan does -- so an
+            # invalid byte (including the forged magic itself) cannot skip
+            # the credential pass; replacement chars break no real credential
+            # pattern, and genuine binary media decodes to replacement-dense
+            # junk that redact() leaves unchanged. The scan is bounded to the
+            # probe window; the full-file scan remains the download path's.
+            probe = header + fobj.read(_STREAM_TEXT_PROBE_BYTES - len(header))
+            probe_text = probe.decode("utf-8", errors="replace")
+            if redact(probe_text) != probe_text:
+                fobj.close()
+                return ("refused", "content_redacted", validated)
+            fobj.seek(0)
+        except Exception:
+            with contextlib.suppress(Exception):
+                fobj.close()
+            return ("refused", "read_failed", validated)
+        return ("ok", fobj, size, content_type, validated)
+
+    result = await asyncio.to_thread(_open_media, raw_path)
+    if result[0] == "refused":
+        _, code, res = result
+        outcome = "not_found" if code == "not_found" else (
+            "failure" if code == "read_failed" else "denied"
+        )
+        _log(outcome, res)
+        # One literal response per refusal class: the error-response contract
+        # requires the {"error", "code"} body and the status to be statically
+        # checkable at each call site.
+        if code == "invalid_path":
+            return web.json_response(
+                {"error": "invalid or forbidden path", "code": "invalid_path"}, status=400
+            )
+        if code == "cannot_resolve":
+            return web.json_response(
+                {"error": "cannot resolve: no project dir configured", "code": "cannot_resolve"},
+                status=400,
+            )
+        if code == "outside_project":
+            return web.json_response(
+                {"error": "path outside project directory", "code": "outside_project"},
+                status=400,
+            )
+        if code == "sensitive_path":
+            return web.json_response(
+                {"error": "sensitive path blocked", "code": "sensitive_path"}, status=403
+            )
+        if code == "not_found":
+            return web.json_response({"error": "not found", "code": "not_found"}, status=404)
+        if code == "symlink_refused":
+            return web.json_response(
+                {"error": "symlinks not allowed", "code": "symlink_refused"}, status=403
+            )
+        if code == "file_too_large":
+            return web.json_response(
+                {"error": "file too large", "code": "file_too_large"}, status=413
+            )
+        if code == "not_media":
+            return web.json_response(
+                {"error": "file content is not a supported media format", "code": "not_media"},
+                status=415,
+            )
+        if code == "content_redacted":
+            return web.json_response(
+                {"error": "file content was redacted; stream aborted",
+                 "code": "content_redacted"},
+                status=400,
+            )
+        return web.json_response(
+            {"error": "cannot read file", "code": "read_failed"}, status=500
+        )
+    _, f, size, content_type, path = result
+
+    try:
+        start, end = 0, size - 1
+        status = 200
+        range_header = request.headers.get("Range")
+        if range_header:
+            parsed = _parse_range_header(range_header, size)
+            if parsed is None:
+                _log("denied", path)
+                return web.json_response(
+                    {"error": "range not satisfiable", "code": "bad_range"},
+                    status=416,
+                    headers={"Content-Range": f"bytes */{size}"},
+                )
+            start, end = parsed
+            status = 206
+
+        resp = web.StreamResponse(status=status)
+        resp.content_type = content_type
+        resp.content_length = end - start + 1
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        if status == 206:
+            resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        # SEL: record the ALLOW decision before any bytes move. prepare() and
+        # the write loop can be cancelled by a client disconnect, and a
+        # permitted read must never leave the audit trail empty because the
+        # client hung up first.
+        _log("success", path)
+        await resp.prepare(request)
+
+        await asyncio.to_thread(f.seek, start)
+        remaining = end - start + 1
+        while remaining > 0:
+            try:
+                chunk = await asyncio.to_thread(f.read, min(_STREAM_CHUNK_BYTES, remaining))
+            except OSError:
+                # A mid-stream filesystem error must leave a SEL outcome; the
+                # response is already streaming so all we can do is stop short.
+                _log("failure", path)
+                raise
+            if not chunk:
+                break  # file truncated under us; the announced length just ends short
+            remaining -= len(chunk)
+            try:
+                await resp.write(chunk)
+            except (ConnectionResetError, ConnectionError):
+                break  # client hung up (scrubbing, tab close) -- normal for media
+        with contextlib.suppress(Exception):
+            await resp.write_eof()
+        return resp
+    finally:
+        # close() can wait on the buffered-file lock while a worker-thread
+        # read is in flight (task cancellation), so it must not run on the
+        # event loop either.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(f.close)
+
+
+async def api_file_write(request: web.Request) -> web.Response:
+    """POST /api/file-write — write file content from the markdown panel."""
     from kiro_crew.validation import (  # noqa: F811
         FILE_WRITE_SCHEMA,
         ValidationError,
@@ -1840,7 +2168,6 @@ async def api_file_write(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "not found"}, status=404)
     try:
-        import os  # noqa: F811
         import shutil  # noqa: F811
         import tempfile  # noqa: F811
 
@@ -1927,9 +2254,9 @@ def _fuzzy_score(q: str, name: str, rel: str) -> float:
 
 async def api_file_search(request: web.Request) -> web.Response:
     """GET /api/file-search?q=... — fuzzy filename search for the @-mention file picker."""
-    import os  # noqa: F811
-    import time  # noqa: F811
-
+    # Re-imported at call time (not reused from the module-level binding) so a
+    # test that stubs ``kiro_crew.security.is_sensitive_path`` is observed by the
+    # project-root rejection below.
     from kiro_crew.security import is_sensitive_path  # noqa: F811
 
     caller = request.get("user", "dashboard")
@@ -2245,8 +2572,6 @@ def _browse_files_sync(base: str, skip: set[str]) -> tuple[list[dict], list[dict
 
 async def api_browse_dirs(request: web.Request) -> web.Response:
     """GET /api/browse-dirs?path=... — list subdirectories for directory browser."""
-    import os  # noqa: F811
-
     from kiro_crew.security import is_sensitive_path  # noqa: F811
 
     caller = request.get("user", "dashboard")
@@ -2528,9 +2853,9 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
     from kiro_crew.config.loader import KiroCrewConfig  # noqa: F811
 
     # Offloaded: KiroCrewConfig.load() stats, reads, parses, and validates config
-    # files. The client now polls this endpoint on an interval to pick up
-    # externally edited dashboard.gitlab_hosts, so a slow or network-backed config
-    # directory would otherwise stall the sole event loop on every poll.
+    # files. The client polls this endpoint on an interval to pick up externally
+    # edited dashboard.gitlab_hosts, so a slow or network-backed config directory
+    # would otherwise stall the sole event loop on every poll.
     try:
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
     except asyncio.CancelledError:
@@ -2562,7 +2887,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
             )
             return web.json_response({"error": "request body must be a JSON object"}, status=400)
-        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "folder_suggestions_enabled"}
+        _allowed = {"restore_sessions", "restore_window_minutes", "merge_queued_messages", "widget_density", "use_builtin_browser", "verbosity", "quick_send", "session_grid", "tail_fork_enabled", "link_previews", "mcp_app_panel", "auto_open_git_panel", "folder_suggestions_enabled"}
         # One-release backward-compat shim for removed key; delete after all clients update.
         deprecated_ignored_keys = {"tail_fork_head_handling"}
         # Read-only keys the GET exposes: both settings surfaces save with
@@ -2582,6 +2907,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
             )
             return web.json_response({"error": f"Unknown fields: {unknown}"}, status=400)
+        updates: dict[str, object] = {}
         if "restore_sessions" in body:
             val = body["restore_sessions"]
             if not isinstance(val, bool):
@@ -2591,10 +2917,10 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "restore_sessions must be a boolean"}, status=400
                 )
-            cfg.dashboard.restore_sessions = val
+            updates["restore_sessions"] = val
         try:
             if "restore_window_minutes" in body:
-                cfg.dashboard.restore_window_minutes = max(
+                updates["restore_window_minutes"] = max(
                     0, min(1440, int(body["restore_window_minutes"]))
                 )
         except (TypeError, ValueError):
@@ -2613,7 +2939,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "merge_queued_messages must be a boolean"}, status=400
                 )
-            cfg.dashboard.merge_queued_messages = val
+            updates["merge_queued_messages"] = val
         if "widget_density" in body:
             val = body["widget_density"]
             if val not in ("more", "less"):
@@ -2623,7 +2949,26 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "widget_density must be 'more' or 'less'"}, status=400
                 )
-            cfg.dashboard.widget_density = val
+            updates["widget_density"] = val
+        # Apply ONLY when it is the sole submitted setting. The Browser panel
+        # sends it alone; the Chat settings panel PUTs the whole config object
+        # from its own (possibly stale) cache, and applying it on that path would
+        # let a Chat-panel save silently revert a toggle another client changed
+        # (lost update).
+        if body.keys() == {"use_builtin_browser"}:
+            val = body["use_builtin_browser"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "use_builtin_browser must be a boolean",
+                        "code": "invalid_use_builtin_browser",
+                    },
+                    status=400,
+                )
+            updates["use_builtin_browser"] = val
         if "verbosity" in body:
             val = body["verbosity"]
             if val not in ("default", "concise", "ultra"):
@@ -2633,7 +2978,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "verbosity must be 'default', 'concise' or 'ultra'"}, status=400
                 )
-            cfg.dashboard.verbosity = val
+            updates["verbosity"] = val
         if "tail_fork_enabled" in body:
             val = body["tail_fork_enabled"]
             if not isinstance(val, bool):
@@ -2643,7 +2988,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "tail_fork_enabled must be a boolean"}, status=400
                 )
-            cfg.dashboard.tail_fork_enabled = val
+            updates["tail_fork_enabled"] = val
         if "folder_suggestions_enabled" in body:
             val = body["folder_suggestions_enabled"]
             if not isinstance(val, bool):
@@ -2657,7 +3002,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
-            cfg.dashboard.folder_suggestions_enabled = val
+            updates["folder_suggestions_enabled"] = val
         if "link_previews" in body:
             val = body["link_previews"]
             if not isinstance(val, bool):
@@ -2671,7 +3016,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
-            cfg.dashboard.link_previews = val
+            updates["link_previews"] = val
         if "quick_send" in body:
             val = body["quick_send"]
             if not isinstance(val, bool):
@@ -2681,7 +3026,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "quick_send must be a boolean"}, status=400
                 )
-            cfg.dashboard.quick_send = val
+            updates["quick_send"] = val
         if "session_grid" in body:
             val = body["session_grid"]
             if not isinstance(val, bool):
@@ -2691,7 +3036,7 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                 return web.json_response(
                     {"error": "session_grid must be a boolean"}, status=400
                 )
-            cfg.dashboard.session_grid = val
+            updates["session_grid"] = val
         if "mcp_app_panel" in body:
             val = body["mcp_app_panel"]
             if not isinstance(val, bool):
@@ -2705,8 +3050,88 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
-            cfg.dashboard.mcp_app_panel = val
-        cfg.save()
+            updates["mcp_app_panel"] = val
+        if "auto_open_git_panel" in body:
+            val = body["auto_open_git_panel"]
+            if not isinstance(val, bool):
+                _sel().log_tool_invocation(
+                    session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+                )
+                return web.json_response(
+                    {
+                        "error": "auto_open_git_panel must be a boolean",
+                        "code": "invalid_auto_open_git_panel",
+                    },
+                    status=400,
+                )
+            updates["auto_open_git_panel"] = val
+        # Serialize the read-modify-write under BOTH config locks so no concurrent
+        # writer -- in-process OR another process -- can clobber it:
+        #  * update_config_locked holds the cross-process advisory file lock
+        #    (<config>.lock) for the whole read-modify-write, so a concurrent
+        #    `kirocrew config set` (which takes that same file lock) cannot land
+        #    between our read and write and be silently discarded.
+        #  * wrapping it in _get_config_lock() (the repo-wide, loop-bound asyncio
+        #    lock) serializes it against the legacy in-process writers that still
+        #    save under that asyncio lock alone.
+        # Both run OFF-THREAD so the event loop is never blocked. Only the
+        # dashboard.<field> keys this request validated are written, leaving every
+        # other config section on disk untouched. GET stays lock-free.
+        from kiro_crew.config.loader import update_config_locked  # noqa: F811
+        from kiro_crew.dashboard.handlers.agents import (  # lazy: import cycle
+            _get_config_lock,
+        )
+
+        def _apply_dashboard_updates(data: dict) -> dict:
+            # `dashboard` is normally a dict; tolerate a missing or malformed
+            # (non-dict, e.g. a hand-edited/corrupt `[]`) section by replacing it
+            # with a fresh dict rather than raising TypeError mid-write. The prior
+            # non-dict value carried no valid dashboard settings, so this recovers
+            # the section instead of losing data, and leaves other config keys
+            # untouched.
+            section = data.get("dashboard")
+            if not isinstance(section, dict):
+                section = data["dashboard"] = {}
+            for _field, _value in updates.items():
+                section[_field] = _value
+            return data
+
+        try:
+            async with _get_config_lock():
+                await asyncio.to_thread(
+                    lambda: update_config_locked(mutate=_apply_dashboard_updates)
+                )
+        except asyncio.CancelledError:
+            # Cancellation (client disconnect / gateway shutdown) during the
+            # off-thread write does NOT hit the `except Exception` below
+            # (CancelledError is a BaseException), and the worker may still land
+            # the write -- so the authorized attempt would vanish from the SEL
+            # chain. Log a failure outcome, then re-raise so cancellation still
+            # propagates. Mirrors the load guard above; both satisfy the
+            # backend-security-controls audit contract.
+            _sel().log_tool_invocation(
+                session_key="dashboard",
+                tool_name="dashboard_config_write",
+                outcome="failure",
+                error="request_cancelled",
+            )
+            raise
+        except Exception:
+            # Any other failure to land the write -- e.g. a corrupt on-disk config
+            # makes update_config_locked's fail-closed read raise ConfigReadError
+            # (not an OSError, so nothing else catches it) -- must still leave a
+            # tamper-evident SEL entry rather than escaping as an unlogged 500.
+            _sel().log_tool_invocation(
+                session_key="dashboard", tool_name="dashboard_config_write", outcome="failure"
+            )
+            logger.exception("dashboard config write failed")
+            return web.json_response(
+                {
+                    "error": "failed to save dashboard config",
+                    "code": "dashboard_config_write_failed",
+                },
+                status=500,
+            )
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="dashboard_config_write", outcome="success"
         )
@@ -2720,10 +3145,12 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "restore_window_minutes": cfg.dashboard.restore_window_minutes,
             "merge_queued_messages": cfg.dashboard.merge_queued_messages,
             "widget_density": cfg.dashboard.widget_density,
+            "use_builtin_browser": cfg.dashboard.use_builtin_browser,
             "verbosity": cfg.dashboard.verbosity,
             "quick_send": cfg.dashboard.quick_send,
             "session_grid": cfg.dashboard.session_grid,
             "mcp_app_panel": cfg.dashboard.mcp_app_panel,
+            "auto_open_git_panel": cfg.dashboard.auto_open_git_panel,
             "tail_fork_enabled": cfg.dashboard.tail_fork_enabled,
             "link_previews": cfg.dashboard.link_previews,
             "folder_suggestions_enabled": cfg.dashboard.folder_suggestions_enabled,
@@ -2737,3 +3164,827 @@ async def api_dashboard_config(request: web.Request) -> web.Response:
             "jira_hosts": list(cfg.dashboard.jira_hosts),
         }
     )
+
+
+# ── /api/file-sheet: xlsx → JSON cell grid ───────────────────────────────────
+# Caps bound what one request can materialize server-side and ship to the
+# browser. 500 rows matches CsvViewer's display cap so the two table viewers
+# truncate consistently. The member/expansion caps bound zip inflation: the
+# on-disk size cap only limits the COMPRESSED archive, and a crafted workbook
+# can expand orders of magnitude larger than it stores.
+_SHEET_MAX_SHEETS = 20
+_SHEET_MAX_ROWS = 500
+_SHEET_MAX_COLS = 100
+_SHEET_MAX_MEMBERS = 4096
+_SHEET_MAX_EXPANDED_BYTES = 200 * 1024 * 1024
+# Text amplification caps. Shared strings are stored once in the archive but
+# referenced per cell, so the expansion cap above does not bound the RESPONSE:
+# one 32 KiB string referenced by every cell would amplify into gigabytes of
+# JSON. Cells truncate individually, and the whole workbook gets a cumulative
+# text budget past which the preview refuses (the frontend degrades to the
+# download card).
+_SHEET_MAX_CELL_CHARS = 2000
+_SHEET_MAX_TEXT_CHARS = 5 * 1000 * 1000
+
+
+class _SheetRefusal(Exception):
+    """Deliberate refusal carrying its HTTP status and machine-readable code;
+    raised on the worker thread and mapped to a response by api_file_sheet."""
+
+    def __init__(self, status: int, message: str, code: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+def _sheet_cell_json(value: object) -> object:
+    """Serialize one workbook cell value into a JSON-safe primitive."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, str):
+        # Workbook text is file content leaving the host through the dashboard
+        # — same egress class as api_file_read, so the same redaction applies.
+        # Redact BEFORE truncating so the scan always sees the complete text,
+        # then cap the cell so one shared string cannot bloat every row.
+        value = redact(value)
+        if len(value) > _SHEET_MAX_CELL_CHARS:
+            return value[:_SHEET_MAX_CELL_CHARS] + "…"
+        return value
+    if isinstance(value, float):
+        # NaN/Infinity are rejected by JSON.parse in the browser; the stdlib
+        # encoder would happily emit the JS-only tokens.
+        if value != value or value in (float("inf"), float("-inf")):
+            return str(value)
+        return value
+    if isinstance(value, _dt.datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, (_dt.date, _dt.time)):
+        return value.isoformat()
+    return redact(str(value))
+
+
+def _sheet_formula_text(value: object) -> str | None:
+    """Return the formula source ("=…") for a formula-pass cell value, else None."""
+    text: object = value
+    if not (isinstance(text, str) and text.startswith("=")):
+        # Array formulas come back as openpyxl ArrayFormula objects carrying .text.
+        text = getattr(value, "text", None)
+    if isinstance(text, str) and text.startswith("="):
+        text = redact(text)
+        if len(text) > _SHEET_MAX_CELL_CHARS:
+            return text[:_SHEET_MAX_CELL_CHARS] + "…"
+        return text
+    return None
+
+
+def _load_sheet_payload(path: str) -> dict:
+    """Open, vet, and parse the workbook into the sheet-grid payload.
+
+    Runs ENTIRELY on a worker thread (via asyncio.to_thread) so filesystem
+    latency, the first (heavy) openpyxl import, and parse time never stall the
+    gateway event loop. The open goes through _open_rb_nofollow: atomic
+    O_NOFOLLOW on POSIX, and the lstat-based symlink/reparse guard on Windows,
+    where os.O_NOFOLLOW does not exist. openpyxl is a soft import: absence
+    surfaces as ImportError from this thread and the handler maps it to 501.
+    """
+    import io
+
+    import openpyxl  # noqa: F401  (probe here, off-loop; parse imports lazily too)
+
+    fd = _open_rb_nofollow(path)
+    with os.fdopen(fd, "rb") as f:
+        # Bounded read is the size guard: a pre-check via fstat would race a
+        # concurrent writer (the file can grow between the stat and the read,
+        # e.g. an agent still generating the workbook), while reading at most
+        # cap+1 bytes bounds memory unconditionally.
+        data = f.read(_MAX_UPLOAD_BYTES + 1)
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise _SheetRefusal(413, "file too large", "file_too_large")
+    header = data[:4]
+    # OOXML spreadsheets are ZIP containers; refuse anything else before
+    # openpyxl touches the bytes.
+    if not header.startswith(b"PK\x03\x04"):
+        raise _SheetRefusal(415, "not an OOXML spreadsheet", "not_a_spreadsheet")
+    # Vet the archive's declared inventory before anything inflates it --
+    # including ZipFile construction itself, which materializes one ZipInfo
+    # per central-directory entry. The EOCD preflight bounds that allocation
+    # from the raw bytes; the infolist() pass then bounds what openpyxl can
+    # actually expand (zipfile truncates each member at its declared
+    # file_size, so the central directory's numbers are authoritative).
+    _vet_zip_eocd(data)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        infos = zf.infolist()
+        if (
+            len(infos) > _SHEET_MAX_MEMBERS
+            or sum(i.file_size for i in infos) > _SHEET_MAX_EXPANDED_BYTES
+        ):
+            raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+    return _parse_workbook_grid(data)
+
+
+# Generous per-entry allowance for the central-directory size preflight: a
+# record is 46 bytes plus name/extra/comment, and OOXML part names are short.
+_SHEET_MAX_CDIR_ENTRY_BYTES = 512
+
+
+def _vet_zip_eocd(data: bytes) -> None:
+    """Refuse archives whose end-of-central-directory record declares an
+    oversized inventory, BEFORE zipfile.ZipFile is constructed.
+
+    ZipFile.__init__ walks the whole central directory and allocates a
+    ZipInfo per entry, so a crafted archive with hundreds of thousands of
+    entries exhausts memory during construction -- ahead of any infolist()
+    check. The EOCD carries both the entry count and the central-directory
+    byte size; capping both bounds that allocation regardless of which field
+    lies (zipfile itself iterates the directory by its byte size).
+    """
+    # EOCD (PK\x05\x06) sits within the last 22 + 65535 bytes (fixed record
+    # plus maximum comment length).
+    tail_start = max(0, len(data) - (22 + 65535))
+    eocd = data.rfind(b"PK\x05\x06", tail_start)
+    if eocd < 0 or len(data) < eocd + 22:
+        raise _SheetRefusal(415, "not an OOXML spreadsheet", "not_a_spreadsheet")
+    count = int.from_bytes(data[eocd + 10 : eocd + 12], "little")
+    cdir_size = int.from_bytes(data[eocd + 12 : eocd + 16], "little")
+    if count == 0xFFFF or cdir_size == 0xFFFFFFFF:
+        # Saturated classic fields mean the archive declares >= 65535 entries
+        # or a >= 4 GiB central directory -- both orders of magnitude past
+        # this endpoint's caps, so the ZIP64 records that would carry the
+        # real numbers can never change the verdict. Refusing outright keeps
+        # the vet free of a second record-location protocol to get right.
+        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+    if (
+        count > _SHEET_MAX_MEMBERS
+        or cdir_size > _SHEET_MAX_MEMBERS * _SHEET_MAX_CDIR_ENTRY_BYTES
+    ):
+        raise _SheetRefusal(413, "workbook expands too large", "workbook_expands_too_large")
+
+
+def _parse_workbook_grid(data: bytes) -> dict:
+    """Parse xlsx bytes into a JSON-safe sheet grid. Runs on a worker thread.
+
+    The workbook is loaded twice in read-only streaming mode: once with
+    data_only=True (formula cells yield the value cached by the writing
+    application) and once with data_only=False (formula cells yield the
+    formula source). Cells prefer the cached value; when a file carries no
+    cache — typical for openpyxl-generated workbooks — the formula text is
+    shown instead of an empty cell. Both loads stream the same bytes, so the
+    row structures are identical and can be zipped in lockstep.
+    """
+    import io
+    import itertools
+
+    from openpyxl import load_workbook
+
+    wb_vals = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    wb_form = load_workbook(io.BytesIO(data), read_only=True, data_only=False)
+    try:
+        names = wb_vals.sheetnames
+        sheets: list[dict] = []
+        # Cumulative post-truncation text budget across the whole workbook:
+        # shared strings are stored once but referenced per cell, so archive
+        # size caps alone do not bound the JSON response this grid becomes.
+        text_chars = 0
+        for name in names[:_SHEET_MAX_SHEETS]:
+            ws_v, ws_f = wb_vals[name], wb_form[name]
+            if not hasattr(ws_v, "iter_rows"):  # chartsheets have no cell grid
+                continue
+            # Dimension records can lie (some writers emit a stale ref such as
+            # A1:A1 for a populated sheet); read-only mode trusts them, so
+            # iter_rows would stop early and silently truncate the preview.
+            # Force a real scan of each sheet instead.
+            if hasattr(ws_v, "reset_dimensions"):
+                ws_v.reset_dimensions()
+                ws_f.reset_dimensions()
+            raw: list[list[object]] = []
+            rows_truncated = False
+            cols_truncated = False
+            paired = zip(ws_v.iter_rows(values_only=True), ws_f.iter_rows(values_only=True))
+            for vrow, frow in itertools.islice(paired, _SHEET_MAX_ROWS + 1):
+                if len(raw) >= _SHEET_MAX_ROWS:
+                    rows_truncated = True
+                    # No total is reported: any count derived from workbook
+                    # geometry is attacker-influenced (a single sparse row at
+                    # index 1e9 makes the read-only reader synthesize a
+                    # billion empties), so nothing here iterates past the cap.
+                    break
+                if len(vrow) > _SHEET_MAX_COLS:
+                    cols_truncated = True
+                out: list[object] = []
+                for vv, fv in list(zip(vrow, frow))[:_SHEET_MAX_COLS]:
+                    ftxt = _sheet_formula_text(fv)
+                    cell = ftxt if (vv is None and ftxt) else _sheet_cell_json(vv)
+                    if isinstance(cell, str):
+                        text_chars += len(cell)
+                        if text_chars > _SHEET_MAX_TEXT_CHARS:
+                            raise _SheetRefusal(
+                                413, "workbook text too large to preview",
+                                "workbook_text_too_large",
+                            )
+                    out.append(cell)
+                raw.append(out)
+            # Trim trailing all-empty rows, then normalize every row to the
+            # widest non-empty extent so the client renders a rectangle.
+            while raw and all(c is None or c == "" for c in raw[-1]):
+                raw.pop()
+            width = 0
+            for r in raw:
+                w = len(r)
+                while w and (r[w - 1] is None or r[w - 1] == ""):
+                    w -= 1
+                width = max(width, w)
+            rows = [r[:width] + [None] * (width - len(r[:width])) for r in raw] if width else []
+            sheets.append({
+                # Names take the same redact+truncate path as cell text — a
+                # crafted workbook.xml can carry arbitrarily long sheet names.
+                "name": _sheet_cell_json(name),
+                "rows": rows,
+                "truncated_rows": rows_truncated,
+                "truncated_cols": cols_truncated,
+            })
+        return {
+            "sheets": sheets,
+            "total_sheets": len(names),
+            "truncated_sheets": len(names) > _SHEET_MAX_SHEETS,
+        }
+    finally:
+        wb_vals.close()
+        wb_form.close()
+
+
+async def api_file_sheet(request: web.Request) -> web.Response:
+    """GET /api/file-sheet?path=… — parse an OOXML spreadsheet into a JSON cell grid.
+
+    Powers the file viewer's inline xlsx preview. Follows the api_file_raw
+    security pattern: dashboard path validation, sensitive-path block, a
+    symlink-refusing open (_open_rb_nofollow: atomic O_NOFOLLOW on POSIX,
+    lstat guard on Windows), size and zip-expansion caps, and a ZIP magic-byte
+    check before openpyxl touches the bytes. All file IO and parsing runs on a
+    worker thread so a large workbook cannot stall the event loop, and cell
+    text is credential-redacted like every other dashboard egress. openpyxl is
+    soft-imported: without it the endpoint answers 501 and the frontend
+    degrades to the download card.
+    """
+    import os  # noqa: F811
+
+    import kiro_crew.dashboard.handlers as _h  # noqa: F811
+
+    def _log(outcome: str, res: str) -> None:
+        _sel().log_tool_invocation(
+            session_key="dashboard", tool_name="file_sheet", outcome=outcome, resources=res,
+        )
+
+    raw_path = request.query.get("path", "")
+    path = _h._validate_dashboard_path(raw_path)
+    if not path:
+        _log("denied", raw_path)
+        return web.json_response(
+            {"error": "invalid or forbidden path", "code": "invalid_path"}, status=400
+        )
+    from kiro_crew.security import is_sensitive_path as _isp  # noqa: F811
+    if _isp(path):
+        _log("denied", path)
+        return web.json_response(
+            {"error": "sensitive path blocked", "code": "sensitive_path"}, status=403
+        )
+    if not os.path.isfile(path):
+        _log("not_found", path)
+        return web.json_response({"error": "not found", "code": "not_found"}, status=404)
+    try:
+        payload = await asyncio.to_thread(_load_sheet_payload, path)
+    except asyncio.CancelledError:
+        # Shutdown or client disconnect mid-parse: the file was already
+        # opened, so the access must not vanish from the audit trail.
+        _log("cancelled", path)
+        raise
+    except ImportError:
+        # openpyxl absent: the preview is unavailable, not broken. The probe
+        # runs inside the worker thread so even the first heavy import never
+        # touches the event loop.
+        _log("failure", path)
+        return web.json_response(
+            {"error": "spreadsheet preview unavailable", "code": "preview_unavailable"},
+            status=501,
+        )
+    except _SheetRefusal as refusal:
+        # Both refusal kinds map to literal statuses so the response shape
+        # stays statically checkable; the carried code names the exact cause.
+        _log("denied", path)
+        if refusal.status == 415:
+            return web.json_response({"error": str(refusal), "code": refusal.code}, status=415)
+        return web.json_response({"error": str(refusal), "code": refusal.code}, status=413)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:  # symlink, from _open_rb_nofollow on any OS
+            _log("denied", path)
+            return web.json_response(
+                {"error": "symlinks not allowed", "code": "symlink_refused"}, status=403
+            )
+        _log("failure", path)
+        return web.json_response({"error": "cannot read file", "code": "read_failed"}, status=500)
+    except Exception:
+        # openpyxl's failure surface is wide (bad zip members, malformed XML,
+        # unexpected workbook parts). Every parse failure degrades to the same
+        # client answer, and the frontend falls back to the download card.
+        logger.warning("file-sheet: cannot parse workbook %s", path, exc_info=True)
+        _log("failure", path)
+        return web.json_response(
+            {"error": "cannot parse workbook", "code": "parse_failed"}, status=422
+        )
+    _log("success", path)
+    return web.json_response(payload)
+
+
+# ── Git status & log endpoints ──────────────────────────────────────────────
+
+
+# Ceiling on captured git stdout for the Git-panel endpoints. Status output is
+# repo-content-sized (an agent-authored repo can make it arbitrarily large) and
+# these endpoints are POLLED by the dashboard, so an unbounded
+# ``capture_output=True`` buffer is a memory-DoS surface. 8 MB comfortably
+# holds the 500-file slice the responses return while bounding the worst case.
+_GIT_PANEL_STDOUT_CAP = 8 * 1024 * 1024
+
+
+def _run_git_bounded(
+    args: list[str], cwd: str, env: dict, timeout: float,
+    cap: int = _GIT_PANEL_STDOUT_CAP,
+) -> tuple[int, str, bool]:
+    """Run git capturing at most ``cap`` bytes of stdout.
+
+    Returns ``(returncode, stdout_text, truncated)``. When the process
+    outlives ``timeout`` or overflows ``cap`` it is killed and reported as
+    truncated with a nonzero returncode -- callers already treat nonzero as
+    "no data", which is the safe degraded answer for a pathological repo.
+    """
+    # OS-sandbox + credential-scrubbed env chokepoint (worktree.py's _run_git
+    # pattern): the repository content is agent-influenced, and git filter
+    # drivers (filter.<name>.clean/process from .git/config) can run during
+    # status re-hashing -- ``-c`` flags cannot neutralize arbitrary driver
+    # names, so isolation, not argument hygiene, is the containment. Fail
+    # CLOSED: no sandbox backend means no data, not an unisolated spawn.
+    cleanup: str | None = None
+    try:
+        argv, env, cleanup = sandboxed_spawn_argv(args, mode="strict", env=env)
+    except RuntimeError:
+        return -9, "", False
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        try:
+            proc = popen_limited(
+                argv, cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            # The cwd (project dir) can vanish between the handler's isdir
+            # check and this spawn, and the git binary itself can be absent.
+            # Both are "no data", never a 500 out of a polling endpoint.
+            return -9, "", False
+        buf = bytearray()
+        overflow = False
+
+        def _drain() -> None:
+            nonlocal overflow
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    return
+                if len(buf) + len(chunk) > cap:
+                    buf.extend(chunk[: cap - len(buf)])
+                    overflow = True
+                    return
+                buf.extend(chunk)
+
+        reader = threading.Thread(target=_drain, daemon=True)
+        reader.start()
+        reader.join(timeout)
+        timed_out = reader.is_alive()
+        if timed_out or overflow:
+            proc.kill()
+            reader.join(5)
+        try:
+            rc = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = -9
+        if timed_out or overflow:
+            rc = rc or -9
+        return rc, bytes(buf).decode("utf-8", "replace"), timed_out or overflow
+    finally:
+        if cleanup:
+            with contextlib.suppress(OSError):
+                os.unlink(cleanup)
+
+
+def _porcelain_unquote(path: str) -> str:
+    """Decode a C-quoted porcelain v1 path (``"foo \\"bar\\""`` -> ``foo "bar"``).
+
+    Porcelain v1 wraps a path in double quotes and backslash-escapes it when it
+    contains quotes, backslashes, or control characters (``core.quotePath=false``
+    already keeps plain non-ASCII raw). Returning the quoted display form would
+    point the row -- and a subsequent open/save -- at a file that does not
+    exist. Decode failures fall back to the raw string rather than raising.
+    """
+    if len(path) < 2 or not (path.startswith('"') and path.endswith('"')):
+        return path
+    body = path[1:-1]
+    out = bytearray()
+    i = 0
+    escapes = {"n": 10, "t": 9, "r": 13, "a": 7, "b": 8, "f": 12, "v": 11,
+               "\\": 92, '"': 34}
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8"))
+            i += 1
+            continue
+        if i + 1 >= len(body):
+            return path  # dangling escape: not valid quoting, keep raw
+        nxt = body[i + 1]
+        if nxt in escapes:
+            out.append(escapes[nxt])
+            i += 2
+        elif nxt.isdigit() and i + 3 < len(body) + 1 and body[i + 1:i + 4].isdigit():
+            out.append(int(body[i + 1:i + 4], 8) & 0xFF)
+            i += 4
+        else:
+            return path
+    return out.decode("utf-8", "replace")
+
+
+# Repo-scoped config keys that hand git a program to run when it touches file
+# content (status re-hashes modified files through ``filter.<name>.clean``).
+# ``-c`` cannot neutralize arbitrary driver names, so a repo declaring one is
+# refused outright — the same fail-closed stance as worktree.py's
+# ``_checkout_filter``.
+_GIT_FILTER_KEY_RE = re.compile(
+    r"^filter\..+\.(process|smudge|clean)$", re.IGNORECASE
+)
+
+
+def _repo_declares_filter_driver(git_cmd: list[str], base: str, env: dict) -> bool:
+    """True when repo-supplied config names a content-filter driver (or the
+    probe cannot prove it does not).
+
+    Mirrors ``worktree.py::_checkout_filter``: drivers can only come from a
+    config file the repository supplies — ``--local`` (``.git/config``) and,
+    when ``extensions.worktreeConfig`` is on, ``--worktree``
+    (``$GIT_DIR/config.worktree``). ``--includes`` is mandatory: a specific-scope
+    query defaults include-following OFF, so a driver reached through
+    ``include.path`` would be invisible to the probe yet still execute.
+    Global/system config is deliberately not probed (the user's own machine
+    setup, e.g. ``git lfs install``, is not repository-supplied). A probe that
+    fails refuses: an unreadable scope cannot be proven filter-free. The probe
+    itself is safe — ``git config`` reads files and never runs drivers.
+    """
+    scopes = ["--local"]
+    ext_rc, ext_out, _ = _run_git_bounded(
+        [*git_cmd, "config", "--bool", "--get", "extensions.worktreeConfig"],
+        cwd=base, env=env, timeout=5,
+    )
+    if ext_rc == 0 and ext_out.strip() == "true":
+        scopes.append("--worktree")
+    for scope in scopes:
+        rc, out, _ = _run_git_bounded(
+            [*git_cmd, "config", scope, "--includes", "--name-only", "--list"],
+            cwd=base, env=env, timeout=5,
+        )
+        if rc != 0:
+            return True
+        for key in out.splitlines():
+            if _GIT_FILTER_KEY_RE.match(key.strip()):
+                return True
+    return False
+
+
+async def api_project_git_status(request: web.Request) -> web.Response:
+    """GET /api/project/git/status?path=... - working tree status for a project dir.
+
+    Returns staged/unstaged/untracked files with per-file line-change counts.
+    Path must match a known project directory (same allow-list as api_project_git).
+    """
+    state: DashboardState = request.app["state"]
+    caller = request.get("user", "dashboard")
+    raw = request.query.get("path", "").strip()
+    if not raw:
+        return web.json_response({"error": "path required", "code": "path_required"}, status=400)
+    project = await asyncio.to_thread(
+        _match_known_project_for, _slot_project_snapshot(state), raw
+    )
+    if project is None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_git_status",
+            outcome="denied",
+            resources=raw,
+            error="not a known project directory",
+        )
+        return web.json_response({"error": "Unknown project directory", "code": "unknown_project_dir"}, status=403)
+
+    base = await asyncio.to_thread(
+        lambda: os.path.realpath(os.path.expanduser(project))
+    )
+    # Both probes stat the filesystem (a stalled network mount would block the
+    # event loop), so they run in a worker thread like the realpath above.
+    if await asyncio.to_thread(is_sensitive_path, base):
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_git_status",
+            outcome="denied",
+            resources=base,
+            error="sensitive path",
+        )
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
+    # Log the allow decision here (not after _run) so every authorized access
+    # is audited, including the not-a-directory / not-a-repo early answers.
+    _sel().log_api_access(
+        caller=caller, operation="project_git_status", outcome="allowed", resources=base
+    )
+    if not await asyncio.to_thread(os.path.isdir, base):
+        return web.json_response({"repo": False, "files": []})
+
+    def _run() -> dict:
+        _git_cmd = [
+            "git",
+            "-c", "diff.textconv=",
+            "-c", "core.attributesFile=/dev/null",
+            "-c", f"core.hooksPath={os.devnull}",
+            "-c", "core.fsmonitor=",
+            # Repo-local .gitattributes is still consulted despite the
+            # attributesFile override, so keep driver escape hatches shut and
+            # emit non-ASCII paths raw (UTF-8) instead of C-quoted so the
+            # panel can open them.
+            "-c", "core.quotePath=false",
+        ]
+        _env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
+
+        # Check if it's a repo
+        probe_rc, _probe_out, _ = _run_git_bounded(
+            [*_git_cmd, "rev-parse", "--git-dir"], cwd=base, env=_env, timeout=5,
+        )
+        if probe_rc != 0:
+            return {"repo": False, "files": []}
+
+        # Refuse repos whose own config names a content-filter driver: status
+        # re-hashes modified files through ``filter.<name>.clean``, which would
+        # execute that program on every 5s poll. Degraded-but-safe empty answer.
+        if _repo_declares_filter_driver(_git_cmd, base, _env):
+            return {"repo": True, "files": []}
+
+        # Get repo root and branch info
+        root_rc, root_out, _ = _run_git_bounded(
+            [*_git_cmd, "rev-parse", "--show-toplevel"], cwd=base, env=_env, timeout=5,
+        )
+        repo_root = root_out.strip() if root_rc == 0 else base
+
+        # Branch + ahead/behind via status -b
+        status_rc, status_out, _ = _run_git_bounded(
+            [*_git_cmd, "status", "--porcelain=v1", "-b", "--untracked-files=all"],
+            cwd=base, env=_env, timeout=10,
+        )
+        if status_rc != 0:
+            return {"repo": True, "repoRoot": repo_root, "files": []}
+
+        lines = status_out.splitlines()
+        branch = None
+        ahead = 0
+        behind = 0
+
+        # Parse the branch header line: ## branch...tracking [ahead N, behind M]
+        if lines and lines[0].startswith("## "):
+            header = lines[0][3:]
+            # Extract branch name (before ... or end)
+            dot_idx = header.find("...")
+            if dot_idx >= 0:
+                branch = header[:dot_idx]
+            else:
+                # Could be "## branch" or "## No commits yet on branch"
+                if header.startswith("No commits yet on "):
+                    branch = header[len("No commits yet on "):]
+                else:
+                    branch = header.split()[0] if header else None
+            # Parse ahead/behind
+            bracket_idx = header.find("[")
+            if bracket_idx >= 0:
+                info = header[bracket_idx + 1:header.find("]")]
+                for part in info.split(","):
+                    part = part.strip()
+                    if part.startswith("ahead "):
+                        try:
+                            ahead = int(part[6:])
+                        except ValueError:
+                            pass
+                    elif part.startswith("behind "):
+                        try:
+                            behind = int(part[7:])
+                        except ValueError:
+                            pass
+
+        # Parse file entries
+        files: list[dict] = []
+        for line in lines[1:]:
+            if len(line) < 4:
+                continue
+            x = line[0]  # index status
+            y = line[1]  # worktree status
+            filepath = line[3:]
+
+            # Rename entries quote each side separately ("old" -> "new"), so
+            # split BEFORE unquoting would see the arrow inside quotes; the
+            # porcelain arrow separator is never itself quoted, so splitting
+            # first and unquoting each side is correct for both forms.
+
+            # Handle renames/copies: "R  old -> new". Gate on the status
+            # letters -- a plain modified file legitimately named
+            # "foo -> bar" must NOT be split, or its row would point at an
+            # unrelated file and clicking it edits the wrong one.
+            if (x in ("R", "C") or y in ("R", "C")) and " -> " in filepath:
+                filepath = filepath.split(" -> ", 1)[1]
+            filepath = _porcelain_unquote(filepath)
+
+            # Determine status code and staged flag
+            if x == "?" and y == "?":
+                files.append({"path": filepath, "status": "?", "staged": False})
+            elif x == "!" and y == "!":
+                continue  # ignored
+            else:
+                # If X is non-space/non-?, there's a staged change
+                if x not in (" ", "?", "!"):
+                    files.append({"path": filepath, "status": x, "staged": True})
+                # If Y is non-space, there's an unstaged change
+                if y not in (" ", "?", "!"):
+                    files.append({"path": filepath, "status": y, "staged": False})
+
+        # Merge numstat for line counts (staged + unstaged vs HEAD)
+        try:
+            numstat_rc, numstat_out, _ = _run_git_bounded(
+                [*_git_cmd, "diff", "--numstat", "--no-textconv",
+                 "--no-ext-diff", "HEAD"],
+                cwd=base, env=_env, timeout=10,
+            )
+            if numstat_rc == 0:
+                stats: dict[str, tuple[int | None, int | None]] = {}
+                for ns_line in numstat_out.splitlines():
+                    parts = ns_line.split("\t", 2)
+                    if len(parts) == 3:
+                        add_s, del_s, ns_path = parts
+                        adds = int(add_s) if add_s != "-" else None
+                        dels = int(del_s) if del_s != "-" else None
+                        # numstat C-quotes the same class of paths status does;
+                        # unquote so the merge key matches the parsed rows.
+                        stats[_porcelain_unquote(ns_path)] = (adds, dels)
+                for f in files:
+                    if f["path"] in stats:
+                        adds, dels = stats[f["path"]]
+                        if adds is not None:
+                            f["additions"] = adds
+                        if dels is not None:
+                            f["deletions"] = dels
+        except FileNotFoundError:
+            pass
+
+        result: dict = {"repo": True, "repoRoot": repo_root, "files": files[:500]}
+        if len(files) > 500:
+            result["truncated"] = True
+        if branch:
+            result["branch"] = branch
+        if ahead:
+            result["ahead"] = ahead
+        if behind:
+            result["behind"] = behind
+        return result
+
+    result = await asyncio.to_thread(_run)
+    # Egress redaction: repo content (paths, branch label, repo root) is
+    # agent-influenceable and this response body is rendered by the dashboard,
+    # so it goes through the same redaction as api_project_git. Normal values
+    # pass through unchanged.
+    if result.get("repoRoot"):
+        result["repoRoot"] = redact(result["repoRoot"])
+    if result.get("branch"):
+        result["branch"] = redact(result["branch"])
+    for f in result.get("files", []):
+        f["path"] = redact(f["path"])
+    return web.json_response(result)
+
+
+async def api_project_git_log(request: web.Request) -> web.Response:
+    """GET /api/project/git/log?path=...&limit=N - recent commit log for a project dir.
+
+    Returns short sha, subject, author, date (ISO), and isHead flag.
+    Path must match a known project directory (same allow-list as api_project_git).
+    """
+    state: DashboardState = request.app["state"]
+    caller = request.get("user", "dashboard")
+    raw = request.query.get("path", "").strip()
+    if not raw:
+        return web.json_response({"error": "path required", "code": "path_required"}, status=400)
+
+    limit_s = request.query.get("limit", "20")
+    try:
+        limit = max(1, min(100, int(limit_s)))
+    except (ValueError, TypeError):
+        limit = 20
+
+    project = await asyncio.to_thread(
+        _match_known_project_for, _slot_project_snapshot(state), raw
+    )
+    if project is None:
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_git_log",
+            outcome="denied",
+            resources=raw,
+            error="not a known project directory",
+        )
+        return web.json_response({"error": "Unknown project directory", "code": "unknown_project_dir"}, status=403)
+
+    base = await asyncio.to_thread(
+        lambda: os.path.realpath(os.path.expanduser(project))
+    )
+    # Both probes stat the filesystem (a stalled network mount would block the
+    # event loop), so they run in a worker thread like the realpath above.
+    if await asyncio.to_thread(is_sensitive_path, base):
+        _sel().log_api_access(
+            caller=caller,
+            operation="project_git_log",
+            outcome="denied",
+            resources=base,
+            error="sensitive path",
+        )
+        return web.json_response({"error": "Access denied", "code": "access_denied"}, status=403)
+    # Log the allow decision here (not after _run) so every authorized access
+    # is audited, including the not-a-directory / not-a-repo early answers.
+    _sel().log_api_access(
+        caller=caller, operation="project_git_log", outcome="allowed", resources=base
+    )
+    if not await asyncio.to_thread(os.path.isdir, base):
+        return web.json_response({"repo": False, "commits": []})
+
+    def _run() -> dict:
+        _git_cmd = [
+            "git",
+            "-c", "diff.textconv=",
+            "-c", "core.attributesFile=/dev/null",
+            "-c", f"core.hooksPath={os.devnull}",
+            "-c", "core.fsmonitor=",
+            # Repo-local .gitattributes is still consulted despite the
+            # attributesFile override, so keep driver escape hatches shut and
+            # emit non-ASCII paths raw (UTF-8) instead of C-quoted so the
+            # panel can open them.
+            "-c", "core.quotePath=false",
+        ]
+        _env = {**os.environ, "GIT_ATTR_NOSYSTEM": "1"}
+
+        # Check if it's a repo
+        probe_rc, _probe_out, _ = _run_git_bounded(
+            [*_git_cmd, "rev-parse", "--git-dir"], cwd=base, env=_env, timeout=5,
+        )
+        if probe_rc != 0:
+            return {"repo": False, "commits": []}
+
+        # Same filter-driver refusal as the status handler (defense in depth:
+        # ``git log`` does not run clean filters, but one uniform invariant --
+        # no git subcommand runs against a repo that names a driver -- is
+        # auditable; per-subcommand carve-outs are not).
+        if _repo_declares_filter_driver(_git_cmd, base, _env):
+            return {"repo": True, "commits": []}
+
+        # Get HEAD sha for isHead marking
+        head_rc, head_out, _ = _run_git_bounded(
+            [*_git_cmd, "rev-parse", "--short", "HEAD"], cwd=base, env=_env, timeout=5,
+        )
+        head_sha = head_out.strip() if head_rc == 0 else ""
+
+        # Separator unlikely in commit data
+        sep = "\x1f"
+        fmt = f"%h{sep}%s{sep}%an{sep}%aI"
+        log_rc, log_out, _ = _run_git_bounded(
+            [*_git_cmd, "log", f"--pretty=format:{fmt}", f"-{limit}"],
+            cwd=base, env=_env, timeout=15,
+        )
+        if log_rc != 0:
+            return {"repo": True, "commits": []}
+
+        commits: list[dict] = []
+        for line in log_out.splitlines():
+            parts = line.split(sep, 3)
+            if len(parts) < 4:
+                continue
+            sha, message, author, date = parts
+            commits.append({
+                "sha": sha,
+                "message": message,
+                "author": author,
+                "date": date,
+                "isHead": sha == head_sha,
+            })
+        return {"repo": True, "commits": commits}
+
+    result = await asyncio.to_thread(_run)
+    # Egress redaction: commit subjects and author names are repo content the
+    # agent can author, and this body is rendered by the dashboard.
+    for c in result.get("commits", []):
+        c["message"] = redact(c["message"])
+        c["author"] = redact(c["author"])
+    return web.json_response(result)

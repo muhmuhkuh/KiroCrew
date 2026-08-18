@@ -1,18 +1,20 @@
-import { safeSetItem } from '../utils/safeStorage'
+import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useQuery, useInfiniteQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query'
-import { AlertTriangle, Bookmark, Cloud, ExternalLink, Globe, Rocket, X, Share2, Loader2, LayoutDashboard, Table as TableIcon, Folder as FolderIcon, FolderPlus, FolderOpen, ChevronRight, ChevronDown, ChevronUp, MoreVertical, Pencil, Trash2, Star, FileText, FilePlus } from 'lucide-react'
+import { AlertTriangle, Bookmark, Cloud, ExternalLink, Globe, ImageOff, Rocket, X, Share2, Loader2, LayoutDashboard, Table as TableIcon, Folder as FolderIcon, FolderPlus, FolderOpen, ChevronRight, ChevronDown, ChevronUp, MoreVertical, Pencil, Trash2, Star, FileText, FilePlus } from 'lucide-react'
 import { openPopout } from '../utils/artifactPopout'
 import { VirtuosoMasonry } from '@virtuoso.dev/masonry'
 import type { ItemContent } from '@virtuoso.dev/masonry'
-import { DndContext, PointerSensor, useSensor, useSensors, DragOverlay, MeasuringStrategy, pointerWithin, type DragEndEvent, type DragStartEvent, type CollisionDetection, type Modifier } from '@dnd-kit/core'
+import { useCollapseOnScroll, COLLAPSE_MS, CHROME_ATTR } from '../hooks/useCollapseOnScroll'
+import { DndContext, MouseSensor, TouchSensor, useSensor, useSensors, DragOverlay, MeasuringStrategy, pointerWithin, type DragEndEvent, type DragStartEvent, type CollisionDetection, type Modifier } from '@dnd-kit/core'
 import SegmentedControl from '../components/SegmentedControl'
 import { api } from '../api/client'
 import { Card, CardTitle, PageHeader, Btn, Badge, SearchInput, EmptyState, Input, IconButton } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
 import RemoteArtifactCard from '../components/RemoteArtifactCard'
 import { useImeGuard } from '../hooks/useImeGuard'
+import { useIsMobile } from '../hooks/useIsMobile'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from '../components/MarkdownRenderer'
@@ -22,9 +24,11 @@ import { DndDraggable, DndDroppable } from '../components/dnd'
 import { useArtifactFolders, useMoveArtifactToFolder } from '../hooks/useArtifactFolders'
 import { childFolders, isDescendantFolder, folderSubtreeStats, folderBreadcrumb } from '../utils/artifactFolderTree'
 import { sanitize } from '../api/helpers'
+import { compareText } from '../i18n/format'
 import { useTheme } from '../hooks/useTheme'
 import { sanitizeCssValue } from '../lib/cssSanitize'
 import { framablePreviewUrl } from '../lib/safeUrl'
+import { useCloudDeploymentEnabled } from '../hooks/useCloudDeploymentEnabled'
 import { markJustCreatedBlank } from '../lib/blankHandoff'
 import { IMPORT_ACCEPT, IMPORTABLE_EXT_LIST, MAX_IMPORT_BYTES, planFileImport, wasContentRedacted, type ImportPlan, type ImportRejection } from '../lib/artifactImport'
 import { useAppPreview } from '../components/WebAppArtifactCard'
@@ -47,7 +51,7 @@ function readThemeVars(): Record<string, string> {
   return out
 }
 
-const KIND_OPTIONS = ['', 'widget', 'html', 'markdown', 'svg', 'json', 'text', 'webapp'] as const
+const KIND_OPTIONS = ['', 'widget', 'html', 'markdown', 'svg', 'json', 'text', 'webapp', 'image'] as const
 
 const KIND_BADGE: Record<Artifact['kind'], 'ok' | 'err' | 'warn' | 'aim'> = {
   widget: 'aim',
@@ -57,6 +61,7 @@ const KIND_BADGE: Record<Artifact['kind'], 'ok' | 'err' | 'warn' | 'aim'> = {
   json: 'ok',
   text: 'ok',
   webapp: 'aim',
+  image: 'warn',
 }
 
 /** Explain a refused "Add Artifact" pick in the library's error banner.
@@ -84,6 +89,63 @@ function isoToTs(iso: string): number {
   if (!iso) return 0
   const t = Date.parse(iso)
   return Number.isFinite(t) ? Math.floor(t / 1000) : 0
+}
+
+// ── Table column sorting ─────────────────────────────────────────────────
+// Clicking a header cycles asc → desc → default (the server's order). The
+// star and Actions columns are controls, not data, and stay unsortable.
+type SortKey = 'name' | 'slug' | 'kind' | 'source' | 'version' | 'tags' | 'updated'
+type SortState = { key: SortKey; dir: 'asc' | 'desc' } | null
+
+const ARTIFACT_SORT_STORAGE_KEY = 'mc-artifacts-sort'
+const SORT_KEYS = new Set<SortKey>(['name', 'slug', 'kind', 'source', 'version', 'tags', 'updated'])
+
+function readPersistedSort(): SortState {
+  try {
+    const value: unknown = JSON.parse(safeGetItem(ARTIFACT_SORT_STORAGE_KEY) ?? 'null')
+    if (!value || typeof value !== 'object') return null
+    const { key, dir } = value as { key?: unknown; dir?: unknown }
+    return typeof key === 'string' && SORT_KEYS.has(key as SortKey) && (dir === 'asc' || dir === 'desc')
+      ? { key: key as SortKey, dir }
+      : null
+  } catch {
+    return null
+  }
+}
+
+/** Type-aware comparator: numeric for version, chronological for updated,
+ * locale-collated natural string for the rest (compareText names the active
+ * UI locale — never the host's). Direction is applied by the caller. */
+function compareArtifacts(a: Artifact, b: Artifact, key: SortKey): number {
+  switch (key) {
+    case 'version':
+      return a.version - b.version
+    case 'updated': {
+      // Byte-order ISO-8601 compare (same backend format, +00:00 offset):
+      // chronological AND keeps the microsecond precision Date.parse drops,
+      // so two artifacts updated within the same second still order correctly.
+      const au = a.updated_at || ''
+      const bu = b.updated_at || ''
+      return au < bu ? -1 : au > bu ? 1 : 0
+    }
+    case 'source':
+      return compareText(a.session_title || a.source || '', b.session_title || b.source || '')
+    case 'tags':
+      return compareText((a.tags || []).join(', '), (b.tags || []).join(', '))
+    case 'slug':
+      return compareText(a.slug, b.slug)
+    case 'kind':
+      return compareText(a.kind, b.kind)
+    default:
+      return compareText(a.name, b.name)
+  }
+}
+
+function sortArtifacts(items: Artifact[], sort: SortState): Artifact[] {
+  if (!sort) return items
+  const mul = sort.dir === 'desc' ? -1 : 1
+  // Array.prototype.sort is stable, so equal rows keep the server's order.
+  return [...items].sort((a, b) => compareArtifacts(a, b, sort.key) * mul)
 }
 
 /** Infer an artifact `kind` for a session document from its extension.
@@ -257,6 +319,40 @@ function ContentThumb({ content, kind }: { content: string; kind: Artifact['kind
   )
 }
 
+/** Thumbnail for image artifacts: the picture streamed straight from the
+ * artifact's asset endpoint (the server sets Content-Type), object-fit
+ * contained and height-capped so cards stay uniform. Lazy so off-screen
+ * gallery cards don't fetch bytes until scrolled into view. Alt text prefers
+ * the stored `image.alt`, falling back to the artifact name. */
+function ImageThumb({ a }: { a: Artifact }) {
+  // The asset endpoint can legitimately 404/500 (pruned sidecar, unreadable
+  // file, refused mime). A bare <img> would leave the browser's broken-image
+  // glyph sitting in an otherwise healthy card with nothing to read.
+  const [failed, setFailed] = useState(false)
+  if (failed) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-1 max-h-[300px] h-[120px] overflow-hidden bg-bg-elevated p-2 text-center">
+        <ImageOff size={16} className="text-muted shrink-0" aria-hidden="true" />
+        <span className="text-[11px] text-muted">
+          {i18nT('pages.artifactsPage.image_could_not_be_loaded')}
+        </span>
+      </div>
+    )
+  }
+  return (
+    <div className="flex items-center justify-center max-h-[300px] overflow-hidden bg-bg-elevated p-2">
+      <img
+        src={`/api/artifacts/${a.slug}/asset`}
+        alt={a.image?.alt || a.name}
+        loading="lazy"
+        className="max-w-full max-h-[280px] object-contain"
+        draggable={false}
+        onError={() => setFailed(true)}
+      />
+    </div>
+  )
+}
+
 const WEBAPP_STATUS_DOT: Record<string, string> = {
   live: 'bg-ok',
   deploying: 'bg-warn animate-pulse',
@@ -276,6 +372,10 @@ function WebAppThumb({ art, mini = false }: { art: Artifact; mini?: boolean }) {
   const meta = art.webapp_metadata
   const status = meta?.lifecycle?.status ?? 'draft'
   const publicUrl = meta?.deploy_target?.public_url || ''
+  // When the platform withholds cloud deployment there is no deploy state worth
+  // reporting: every artifact would read "Not deployed" for a capability that is
+  // not on offer. The local preview below is unaffected and still renders.
+  const cloudDeployEnabled = useCloudDeploymentEnabled()
   // Local-first: serve the app's local copy through the gateway preview
   // channel (works for every lifecycle state); fall back to iframing the
   // live CloudFront deployment; else a status hero.
@@ -283,12 +383,12 @@ function WebAppThumb({ art, mini = false }: { art: Artifact; mini?: boolean }) {
   const frameUrl = previewBase
     || (!mini && status === 'live' && remoteFramable ? framablePreviewUrl(publicUrl) : null)
   const urlLabel = (() => {
-    if (!publicUrl) return i18nT('pages.artifactsPage.not_deployed')
+    if (!publicUrl) return cloudDeployEnabled ? i18nT('pages.artifactsPage.not_deployed') : ''
     try {
       const u = new URL(publicUrl)
       return `${u.host}${u.pathname}`
     } catch {
-      return i18nT('pages.artifactsPage.not_deployed')
+      return cloudDeployEnabled ? i18nT('pages.artifactsPage.not_deployed') : ''
     }
   })()
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -307,7 +407,7 @@ function WebAppThumb({ art, mini = false }: { art: Artifact; mini?: boolean }) {
   const heroIcon = status === 'expired'
     ? <Cloud size={mini ? 16 : 24} className="text-muted" aria-hidden="true" />
     : <Rocket size={mini ? 16 : 24} className={status === 'deploying' ? 'text-warn animate-pulse' : 'text-accent/70'} aria-hidden="true" />
-  const heroLabel = status === 'expired' ? i18nT('pages.artifactsPage.expired') : status === 'deploying' ? i18nT('pages.artifactsPage.deploying') : status === 'live' ? i18nT('pages.artifactsPage.live') : i18nT('pages.artifactsPage.not_deployed_2')
+  const heroLabel = status === 'expired' ? i18nT('pages.artifactsPage.expired') : status === 'deploying' ? i18nT('pages.artifactsPage.deploying') : status === 'live' ? i18nT('pages.artifactsPage.live') : cloudDeployEnabled ? i18nT('pages.artifactsPage.not_deployed_2') : i18nT('pages.artifactsPage.local_preview')
   return (
     <div className="bg-card">
       {/* chrome bar */}
@@ -560,7 +660,7 @@ function FolderMiniThumb({ a }: { a: Artifact }) {
   const content = full?.content || ''
   return (
     <div className="h-[84px] rounded-md border border-border overflow-hidden bg-bg-elevated pointer-events-none" title={a.name}>
-      {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} mini /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} />}
+      {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} mini /> : a.kind === 'image' ? <ImageThumb a={a} /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} />}
     </div>
   )
 }
@@ -717,8 +817,8 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
     : ''
   return (
     // Draggable onto folder cards / breadcrumb segments / table folder rows
-    //. PointerSensor's activation distance keeps plain clicks
-    // opening the card.
+    //. The sensors' activation constraints (see dndSensors) keep a plain click
+    // and a finger swipe reaching the card / the gallery scroller.
     <DndDraggable id={`artifact:${a.slug}`} data={{ type: 'artifact', slug: a.slug, name: a.name, folderId: a.folder_id || '' } satisfies LibraryDrag}>
       {({ setNodeRef, listeners, isDragging }) => (
     <div
@@ -738,7 +838,7 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
     >
       {/* Preview is non-interactive so clicks fall through to the card's onClick. */}
       <div className="pointer-events-none">
-        {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} />}
+        {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} /> : a.kind === 'image' ? <ImageThumb a={a} /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} />}
       </div>
       <div className="p-3">
         <div className="flex items-start justify-between gap-2">
@@ -824,6 +924,79 @@ const GridCard: ItemContent<GridEntry, LibCtx> = ({ data: entry, context }) => {
   return <LocalCardBody a={entry.art} context={context} />
 }
 
+/**
+ * Collapses its children to zero height when `collapsed`, freeing the space for
+ * whatever follows in the flex column.
+ *
+ * Animates an explicitly MEASURED height rather than interpolating
+ * `grid-template-rows` between `1fr` and `0fr`: that interpolation is not
+ * implemented uniformly across engines, and the scroll defect this serves was
+ * reported from WebKit — the same trap as shipping `overflow-clip-margin`, which
+ * WebKit does not implement, to fix a WebKit-only clipping bug.
+ *
+ * The height stays `auto` until the first measurement lands, so nothing is
+ * clipped on the first paint, and a ResizeObserver keeps the number honest when
+ * the toolbar rewraps (a rotation, a longer tag name, a locale change).
+ */
+function CollapsibleChrome({ collapsed, children }: { collapsed: boolean; children: React.ReactNode }) {
+  const inner = useRef<HTMLDivElement | null>(null)
+  const shell = useRef<HTMLDivElement | null>(null)
+  const [natural, setNatural] = useState<number | null>(null)
+
+  useEffect(() => {
+    const el = inner.current
+    if (!el) return
+    const measure = () => setNatural(el.offsetHeight)
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // `inert` is not a typed React 18 prop, and it is what keeps a zero-height
+  // toolbar out of the tab order and off the accessibility tree instead of
+  // leaving invisible-but-focusable controls behind. Engines without it simply
+  // ignore the attribute.
+  useEffect(() => {
+    shell.current?.toggleAttribute('inert', collapsed)
+  }, [collapsed])
+
+  return (
+    <div
+      ref={shell}
+      {...{ [CHROME_ATTR]: '' }}
+      className="overflow-hidden transition-[height,opacity] ease-out motion-reduce:transition-none"
+      // Duration comes from the hook's constant, not a Tailwind `duration-*`
+      // class: the settle window that stops the collapse from re-triggering is
+      // derived from the same number, and a hardcoded class here would let the
+      // two drift apart silently.
+      style={{
+        height: collapsed ? 0 : (natural ?? undefined),
+        opacity: collapsed ? 0 : 1,
+        transitionDuration: `${COLLAPSE_MS}ms`,
+      }}
+    >
+      {/* `flow-root` is load-bearing, not cosmetic. Without it this wrapper is
+        * not a block-formatting context, so the last child's bottom margin
+        * (the toolbar's `mb-3`) collapses THROUGH it and is not counted in
+        * `offsetHeight` — the measured height then comes out 12px short, the
+        * shell clips exactly that margin, and the gap between the chrome and
+        * the section below it disappears. */}
+      <div ref={inner} className="flow-root">{children}</div>
+    </div>
+  )
+}
+
+/** Card count at which the gallery switches from a content-sized CSS-columns
+ *  masonry to the virtualized one.
+ *
+ *  Module scope because TWO places decide on it: the gallery picks its render
+ *  mode, and the page decides which element owns vertical scrolling. Virtualized
+ *  mode brings its own scroller, so if these two ever read different numbers the
+ *  page ends up with two same-axis scrollers again — the exact defect the
+ *  single-scroller plumbing below exists to remove. */
+export const VIRTUALIZE_AT = 30
+
 /** The "Your Artifacts" grid of local artifacts. */
 function LibraryMasonry({
   entries,
@@ -850,19 +1023,28 @@ function LibraryMasonry({
   // At or above it, fall back to the virtualized masonry (fixed height +
   // internal scroll) so a large library of iframe-preview cards stays
   // performant.
-  const VIRTUALIZE_AT = 30
+  const virtualized = entries.length >= VIRTUALIZE_AT
   return (
     // -mr-3 offsets each card's own mr-3 so the trailing column's gutter
     // doesn't add page width; cards carry mr-3 (gutter) + mb-3 (row gap).
-    <div ref={ref} className="-mr-3">
-      {entries.length >= VIRTUALIZE_AT ? (
+    //
+    // When virtualized, this grows to fill the page's content column (the page
+    // stops scrolling and hands the axis over) so the masonry's own scroller is
+    // the ONLY vertical scroller. `min-h-0` is what lets a flex child actually
+    // shrink to its parent instead of its content.
+    <div ref={ref} className={virtualized ? '-mr-3 flex-1 min-h-0' : '-mr-3'}>
+      {virtualized ? (
         <VirtuosoMasonry
           key={cols}
           columnCount={cols}
           data={entries}
           context={context}
           ItemContent={GridCard}
-          style={{ height: 'min(72vh, 1000px)' }}
+          // 100% of the flex-sized parent, NOT a viewport fraction: a `72vh`
+          // box does not know how much room the toolbar and folder rows above
+          // it already took, so it overflowed the page column and forced a
+          // second scroller into existence.
+          style={{ height: '100%' }}
         />
       ) : (
         <div style={{ columnCount: cols, columnGap: 0 }}>
@@ -889,20 +1071,42 @@ function MasonryGridItem({ data, context, index }: { data: GridEntry; context: L
   )
 }
 
-/** Column headers shared by the flat table and the folder tree table. */
-function LibraryTableHead() {
+/** Column headers shared by the flat table and the folder tree table. Data
+ * columns sort on click (asc → desc → default); the star and Actions columns
+ * are control columns and stay plain. */
+function LibraryTableHead({ sort, onSort }: { sort: SortState; onSort: (key: SortKey) => void }) {
   const th = 'text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium'
+  const sortable = (key: SortKey, label: string, extra: string) => {
+    const active = sort?.key === key
+    return (
+      <th
+        className={`${th} ${extra}`}
+        aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : undefined}
+      >
+        <Btn
+          type="button"
+          onClick={() => onSort(key)}
+          className={`bg-transparent border-none p-0 gap-1 rounded-none text-[12px] font-medium uppercase tracking-[.04em] hover:bg-transparent active:scale-100 ${active ? 'text-text hover:text-text' : 'text-muted hover:text-text'}`}
+        >
+          {label}
+          {active && (sort.dir === 'asc'
+            ? <ChevronUp size={12} className="shrink-0" aria-hidden="true" />
+            : <ChevronDown size={12} className="shrink-0" aria-hidden="true" />)}
+        </Btn>
+      </th>
+    )
+  }
   return (
     <thead>
       <tr>
         <th className={`${th} w-[40px] text-center`} aria-label={i18nT('pages.artifactsPage.starred')}></th>
-        <th className={`${th} min-w-[160px]`}>{i18nT('pages.artifactsPage.name')}</th>
-        <th className={`${th} w-[180px]`}>{i18nT('pages.artifactsPage.slug')}</th>
-        <th className={`${th} w-[100px]`}>{i18nT('pages.artifactsPage.kind')}</th>
-        <th className={`${th} w-[110px]`}>{i18nT('pages.artifactsPage.source')}</th>
-        <th className={`${th} w-[60px]`}>{i18nT('pages.artifactsPage.ver')}</th>
-        <th className={`${th} min-w-[160px]`}>{i18nT('pages.artifactsPage.tags')}</th>
-        <th className={`${th} w-[110px]`}>{i18nT('pages.artifactsPage.updated')}</th>
+        {sortable('name', i18nT('pages.artifactsPage.name'), 'min-w-[160px]')}
+        {sortable('slug', i18nT('pages.artifactsPage.slug'), 'w-[180px]')}
+        {sortable('kind', i18nT('pages.artifactsPage.kind'), 'w-[100px]')}
+        {sortable('source', i18nT('pages.artifactsPage.source'), 'w-[110px]')}
+        {sortable('version', i18nT('pages.artifactsPage.ver'), 'w-[60px]')}
+        {sortable('tags', i18nT('pages.artifactsPage.tags'), 'min-w-[160px]')}
+        {sortable('updated', i18nT('pages.artifactsPage.updated'), 'w-[110px]')}
         <th className={`${th} w-[120px]`}>{i18nT('pages.artifactsPage.actions')}</th>
       </tr>
     </thead>
@@ -1135,7 +1339,18 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
         </button>
       </CardTitle>
       {!collapsed && (
-      <div ref={listRef} tabIndex={-1} className="flex flex-col gap-0.5 outline-none">
+      <>
+      {/* Expanded, this list is the full session-doc set (hundreds of rows). It
+        * lives inside the page column, which hands its scroll axis to the
+        * gallery once that virtualizes — so an unbounded list here is CLIPPED
+        * with no way to reach the rest of it. Cap it and let it scroll itself.
+        * Collapsed to five rows it needs no cap, so the common case still has a
+        * single scroller on the page. */}
+      <div
+        ref={listRef}
+        tabIndex={-1}
+        className={`flex flex-col gap-0.5 outline-none ${expanded ? 'max-h-[40vh] overflow-y-auto' : ''}`}
+      >
         {visible.map((d) => (
           <div key={d.path} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg">
             <SessionDocStar d={d} busy={materializingPath === d.path} onMaterialize={handleMaterialize} />
@@ -1146,18 +1361,23 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
             <span className="text-[12px] text-muted whitespace-nowrap shrink-0">{_timeAgo(isoToTs(d.updated_at))}</span>
           </div>
         ))}
-        {overflow && (
-          <Btn
-            onClick={() => setExpanded((v) => !v)}
-            className="justify-center w-full px-2 py-1.5 rounded-lg text-[11.5px] font-medium border-none"
-            aria-expanded={expanded}
-          >
-            {expanded
-              ? <><ChevronUp size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_less')}</>
-              : <><ChevronDown size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_all_count', { count: docs.length })}</>}
-          </Btn>
-        )}
       </div>
+      {/* OUTSIDE the scrollable list on purpose: inside it, "Show less" sat
+        * after the last of hundreds of rows, so the control that undoes the
+        * expansion was itself only reachable by scrolling past everything the
+        * expansion added. */}
+      {overflow && (
+        <Btn
+          onClick={() => setExpanded((v) => !v)}
+          className="justify-center w-full px-2 py-1.5 mt-1 rounded-lg text-[11.5px] font-medium border-none"
+          aria-expanded={expanded}
+        >
+          {expanded
+            ? <><ChevronUp size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_less')}</>
+            : <><ChevronDown size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_all_count', { count: docs.length })}</>}
+        </Btn>
+      )}
+      </>
       )}
     </Card>
   )
@@ -1167,6 +1387,8 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
  * rendered while any filter is active, when folder scoping is bypassed). */
 function LibraryTable({
   items,
+  sort,
+  onSort,
   onOpen,
   onDelete,
   deletingSlug,
@@ -1177,6 +1399,8 @@ function LibraryTable({
   materializingPath = null,
 }: {
   items: Artifact[]
+  sort: SortState
+  onSort: (key: SortKey) => void
   onOpen: (slug: string) => void
   onDelete: (a: Artifact) => void
   deletingSlug: string | null
@@ -1189,7 +1413,7 @@ function LibraryTable({
   return (
     <div className="overflow-x-auto">
       <table className="w-full border-collapse table-striped">
-        <LibraryTableHead />
+        <LibraryTableHead sort={sort} onSort={onSort} />
         <tbody>
           {items.map((a) => (
             <ArtifactRow key={a.slug} a={a} onOpen={onOpen} onDelete={onDelete} deletingSlug={deletingSlug} onTogglePin={onTogglePin} pinningSlug={pinningSlug} />
@@ -1267,8 +1491,10 @@ function FolderRow({ folder, folders, depth, expanded, onToggle, actions, dropHi
 /** Nested, collapsible tree table (browse mode): folders in pre-order with
  * their artifacts indented beneath, Unfiled at the end. Collapsed by default —
  * expansion is client-local (localStorage), by design (§2.5). */
-function LibraryTree({ items, folders, expandedIds, onToggleExpand, folderActions, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug, overFolderId, dragActive, sessionDocs = [], onMaterialize, materializingPath = null }: {
+function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand, folderActions, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug, overFolderId, dragActive, sessionDocs = [], onMaterialize, materializingPath = null }: {
   items: Artifact[]
+  sort: SortState
+  onSort: (key: SortKey) => void
   folders: ArtifactFolder[]
   expandedIds: ReadonlySet<string>
   onToggleExpand: (id: string) => void
@@ -1340,7 +1566,7 @@ function LibraryTree({ items, folders, expandedIds, onToggleExpand, folderAction
   return (
     <div className="overflow-x-auto">
       <table className="w-full border-collapse table-striped">
-        <LibraryTableHead />
+        <LibraryTableHead sort={sort} onSort={onSort} />
         <tbody>
           {rows}
           {folders.length > 0 && (
@@ -1387,7 +1613,12 @@ function LibraryTree({ items, folders, expandedIds, onToggleExpand, folderAction
 
 export default function ArtifactsPage() {  const navigate = useNavigate()
   const qc = useQueryClient()
+  // Hides the AWS deploy console entry when the platform withholds cloud
+  // deployment — otherwise the option is visible and only explains itself after
+  // a click.
+  const cloudDeployEnabled = useCloudDeploymentEnabled()
   const [filter, setFilter] = useState('')
+  const isMobile = useIsMobile()
   const [tagFilter, setTagFilter] = useState('')
   const [kindFilter, setKindFilter] = useState<string>('')
   // Default to "All" artifacts, but remember the last visit's choice: if the
@@ -1398,6 +1629,18 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   const [view, setView] = useState<'grid' | 'table'>(
     () => (localStorage.getItem('mc-artifacts-view') === 'table' ? 'table' : 'grid'),
   )
+  // Table column sort persists beside the view choice; null renders the
+  // server's order, and stale storage safely falls back to that default.
+  const [sort, setSort] = useState<SortState>(readPersistedSort)
+  const handleSort = useCallback((key: SortKey) => {
+    const next: SortState = sort?.key !== key
+      ? { key, dir: 'asc' }
+      : sort.dir === 'asc'
+        ? { key, dir: 'desc' }
+        : null
+    setSort(next)
+    safeSetItem(ARTIFACT_SORT_STORAGE_KEY, JSON.stringify(next))
+  }, [sort])
 
   // ── Folder browse scope ──────────────────────────────────────
   // The open folder rides the URL (?folder=<id>) so gallery navigation is
@@ -1659,9 +1902,28 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // ── Library drag-and-drop ─────────────────────────────────────────────────
   // One DndContext covers both views. Artifact → folder-drop moves it; folder
   // → folder-drop nests it into the target, cycle-guarded. (Folders sort
-  // alphabetically, so there is no manual sibling reorder.) The activation
-  // distance keeps clicks working.
-  const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }))
+  // alphabetically, so there is no manual sibling reorder.)
+  //
+  // Split mouse/touch sensors so a finger can both SCROLL and drag (mirrors the
+  // Apps nav rail in App.tsx):
+  //  - MouseSensor: 6px distance, so a plain click still opens the card and only
+  //    a deliberate mouse drag starts a move.
+  //  - TouchSensor: 250ms press-and-hold (5px tolerance), so a finger swipe that
+  //    travels past the tolerance CANCELS the sensor and the gallery pans
+  //    natively; only a deliberate hold picks the card up.
+  //
+  // A single PointerSensor cannot do this. Past its activation distance
+  // `AbstractPointerSensor.handleMove` calls `preventDefault()` on every
+  // subsequent move event — and dnd-kit installs a non-passive window
+  // `touchmove` listener precisely so those calls take effect ("This is
+  // required for iOS Safari", TouchSensor.setup). Chromium ignores
+  // preventDefault on `pointermove` for panning, so the swallowed swipe only
+  // shows up on WebKit: a gesture starting on a CARD dies while the same
+  // gesture starting in the GAP between cards (no listener, no sensor) scrolls.
+  const dndSensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
+  )
   const [activeDrag, setActiveDrag] = useState<LibraryDrag | null>(null)
   // The folder the drag is currently over (''=unfile target, null=none) —
   // drives group highlighting: hovering anywhere over an expanded folder's
@@ -1757,6 +2019,11 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
         (a.session_title || '').toLowerCase().includes(q),
     )
   }, [artifacts, filter, pinnedOnly])
+
+  // Column-sorted rows for the table views. The tree view buckets by folder
+  // after sorting, so rows sort within each folder. The gallery has no
+  // columns, so it keeps the server's order.
+  const sortedVisible = useMemo(() => sortArtifacts(visible, sort), [visible, sort])
 
   // Browse-mode gallery scoping: no filters → only artifacts filed in the open
   // folder (a dangling folder_id degrades to unfiled). Any filter active →
@@ -1879,12 +2146,88 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           ? asMessage(materializeMut.error)
           : null
 
+  // Hooks must run before the `isLoading` early return below, so the scroll
+  // wiring lives here rather than beside the JSX it feeds.
+  //
+  // The virtualized gallery brings its OWN vertical scroller. Two same-axis
+  // scrollers on one page is a defect: whichever one the finger lands in decides
+  // whether anything moves, and the page-level one has only ~113px of travel
+  // once the gallery is on screen, so a swipe that lands there stops dead after
+  // a few pixels and reads as "this card does not scroll". Measured at 390px with
+  // 42 artifacts: page column 706px tall over 819px of content, gallery scroller
+  // 608px tall over 12485px. So exactly one element owns the axis; below the
+  // threshold the gallery is content-sized and the page column scrolls, as before.
+  const galleryOwnsScroll = view === 'grid' && gridEntries.length >= VIRTUALIZE_AT
+  // Hide-on-scroll for the page's own chrome. At 390x844 the title, subtitle,
+  // heading row and filter rows pin 317px — 38% of the viewport — above a 527px
+  // gallery, and the fraction is worse once the browser's own bars are counted.
+  // The gallery cannot simply hand the axis back and let the whole column
+  // scroll: `VirtuosoMasonry` takes either its own scroller or the DOCUMENT
+  // scroller (`useWindowScroll`; it has no `customScrollParent`), and this app's
+  // shell is `h-dvh` with `overflow-hidden` on body, so the document has zero
+  // travel (measured: scrollHeight - clientHeight = 0). So the chrome yields on
+  // the way down and returns on the way up instead.
+  //
+  // Narrow only: at desktop heights the chrome is a small fraction of the column
+  // and moving it on scroll would be motion nobody asked for.
+  const chromeHostRef = useRef<HTMLDivElement | null>(null)
+  const chromeCollapsed = useCollapseOnScroll(chromeHostRef, isMobile && galleryOwnsScroll)
+
   if (isLoading) return <div className="p-6 text-muted">{i18nT('pages.artifactsPage.loading')}</div>
 
+  // Both controls below are rendered ONCE and placed differently per width, not
+  // duplicated per branch: the view switcher owns a framer `layoutId`, and two
+  // live elements sharing one id fight over the same animated indicator.
+  const viewSwitcher = (
+    <SegmentedControl
+      segments={[
+        { key: 'grid', label: i18nT('pages.artifactsPage.gallery'), icon: <LayoutDashboard size={13} />, tooltip: i18nT('pages.artifactsPage.masonry_preview_gallery') },
+        { key: 'table', label: i18nT('pages.artifactsPage.table'), icon: <TableIcon size={13} />, tooltip: i18nT('pages.artifactsPage.compact_table') },
+      ]}
+      value={view}
+      onChange={(v) => { setView(v); safeSetItem('mc-artifacts-view', v) }}
+      layoutId="artifact-view"
+      // This control sits in a content-hugging group, so its own
+      // measurement always reads "plenty of room". Even on its own line
+      // the two labelled segments do not fit beside the create actions
+      // at 320px, and they are the widest thing in the row.
+      compact={isMobile}
+    />
+  )
+  const starredToggle = (
+    <div className="inline-flex items-center rounded-lg border border-border bg-bg-elevated p-0.5" role="group" aria-label={i18nT('pages.artifactsPage.filter_starred')}>
+      <button
+        type="button"
+        onClick={() => { setPinnedOnly(true); safeSetItem('mc-artifacts-pinned-only', '1') }}
+        aria-pressed={pinnedOnly}
+        className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none inline-flex items-center gap-1 ${pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
+      >
+        <Star size={12} className={pinnedOnly ? 'fill-current' : ''} /> {i18nT('pages.artifactsPage.starred')}
+      </button>
+      <button
+        type="button"
+        onClick={() => { setPinnedOnly(false); safeSetItem('mc-artifacts-pinned-only', '0') }}
+        aria-pressed={!pinnedOnly}
+        className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none ${!pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
+      >
+        {i18nT('pages.artifactsPage.all')}
+      </button>
+    </div>
+  )
+
+  // Scroll ownership and the hide-on-scroll wiring are decided above, before the
+  // `isLoading` early return, because hooks cannot run after it.
   return (
     <>
-      <PageHeader title={i18nT('pages.artifactsPage.artifacts')} subtitle={i18nT('pages.artifactsPage.widgets_files_and_snippets_live_tracked_with_ver')} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <CollapsibleChrome collapsed={chromeCollapsed}>
+        <PageHeader title={i18nT('pages.artifactsPage.artifacts')} subtitle={i18nT('pages.artifactsPage.widgets_files_and_snippets_live_tracked_with_ver')} />
+      </CollapsibleChrome>
+      <div
+        ref={chromeHostRef}
+        className={`px-4 md:px-6 flex-1 min-h-0 ${
+          galleryOwnsScroll ? 'flex flex-col overflow-hidden' : 'pb-8 overflow-y-auto'
+        }`}
+      >
         {(errMessage || mutErr || addError) && (
           <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
             <span className="text-danger text-lg shrink-0"><AlertTriangle className="lucide-inline" /></span>
@@ -1896,7 +2239,17 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           </div>
         )}
 
-        <div className="flex items-center justify-between gap-3 mb-3">
+        {/* Collapses with the page title on the way down. The heading row and
+          * the filters are the other 180px of the 317px of pinned chrome; the
+          * breadcrumb and folder cards below stay put because they are content,
+          * not chrome. */}
+        <CollapsibleChrome collapsed={chromeCollapsed}>
+        {/* `flex-wrap` moves the ACTION GROUP to its own line when the title
+          * cannot share one with it — it does not let the button row itself
+          * wrap, which is what would cost the row its ranking. Without it the
+          * title is the flex item that gives, and at 320px it is squeezed to a
+          * few pixels while the view switcher still hangs off the right edge. */}
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
           <h3 className="text-sm font-semibold text-text-strong">{i18nT('pages.artifactsPage.your_artifacts')}</h3>
           <div className="flex items-center gap-2">
             {/* Split button: creating a blank document is the common verb and
@@ -1914,9 +2267,22 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Btn
-                    aria-label={i18nT('pages.artifactsPage.more_ways_to_add_an_artifact')}
+                    // On a phone this menu also holds the folder action, so an
+                    // add-only name would under-promise its contents — and the
+                    // name is all a screen reader gets from a chevron.
+                    aria-label={isMobile
+                      ? i18nT('pages.artifactsPage.more_actions')
+                      : i18nT('pages.artifactsPage.more_ways_to_add_an_artifact')}
                     disabled={addArtifactMut.isPending}
-                    className="rounded-l-none border-l-0 px-1"
+                    // The caret holds only a 13px icon, so its content box is
+                    // ~7px shorter than the labelled half next to it (whose
+                    // text line-height sets the split button's height). The
+                    // parent centres it, which shows as a gap above AND below
+                    // the caret — `self-stretch` makes it take the row's height
+                    // instead, keeping the seam a single continuous edge without
+                    // pinning a literal height that the label's font would
+                    // outgrow.
+                    className="rounded-l-none border-l-0 px-1 self-stretch"
                   >
                     {addArtifactMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <ChevronDown size={13} />}
                   </Btn>
@@ -1925,6 +2291,33 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                   <DropdownMenuItem onSelect={handleAddArtifact}>
                     <FileText size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.import_from_a_file')}
                   </DropdownMenuItem>
+                  {/* On a phone this menu is also where the folder action lives:
+                    * three peer controls do not fit a 320px line in the wide
+                    * locales (fr/it/bn run ~40% longer than en), and clipping
+                    * one off the edge is the only worse outcome than moving it
+                    * one tap away. Creating is the row's verb, so creating is
+                    * what keeps the visible slot. */}
+                  {isMobile && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={handleNewFolder}>
+                        <FolderPlus size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.new_folder')}
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                  {/* Deploy LEAVES the page rather than filtering it, so on a
+                    * phone it is the one control in the toolbar that can move
+                    * behind a tap without costing anything: keeping it visible
+                    * is what forced the filter row to wrap and left a lone
+                    * right-floated button on a line of its own. */}
+                  {isMobile && cloudDeployEnabled && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={() => navigate('/deploy')}>
+                        <Globe size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.artifact_deploy')}
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -1936,21 +2329,28 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               className="hidden"
               onChange={handleAddArtifactFile}
             />
-            <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
-              <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
-            </Btn>
-            <SegmentedControl
-              segments={[
-                { key: 'grid', label: i18nT('pages.artifactsPage.gallery'), icon: <LayoutDashboard size={13} />, tooltip: i18nT('pages.artifactsPage.masonry_preview_gallery') },
-                { key: 'table', label: i18nT('pages.artifactsPage.table'), icon: <TableIcon size={13} />, tooltip: i18nT('pages.artifactsPage.compact_table') },
-              ]}
-              value={view}
-              onChange={(v) => { setView(v); safeSetItem('mc-artifacts-view', v) }}
-              layoutId="artifact-view"
-            />
+            {!isMobile && (
+              <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
+                <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
+              </Btn>
+            )}
+            {/* On a phone the view switcher moves down to pair with the Starred
+              * toggle: both answer "what am I looking at", and putting them on
+              * one justified row gives the toolbar's last line a left AND a
+              * right edge instead of a single stranded control. */}
+            {!isMobile && viewSwitcher}
           </div>
         </div>
-        <div className="flex flex-wrap gap-2 items-center mb-3">
+        {/* Narrow-first toolbar: one control per row, every row spanning the
+          * full content width, so the four rows share one left edge and one
+          * right edge. A single `flex-wrap` row is what produced the scatter —
+          * it broke wherever the widths happened to land (search + kind on one
+          * line, a right-floated Deploy alone on the next, a left-aligned
+          * toggle on a third), giving every line a different x. From `md` up
+          * `md:contents` dissolves the mobile grouping wrappers so the same
+          * children are direct flex items again and the desktop row is
+          * byte-for-byte the layout it was. */}
+        <div className="flex flex-col gap-2 mb-3 md:flex-row md:flex-wrap md:items-center">
             <SearchInput
               placeholder={i18nT('pages.artifactsPage.filter_by_name_slug_description')}
               value={filter}
@@ -1961,47 +2361,48 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 sentinel, so it stays a selectable option as long as '' is present
                 in `options` — which is why it leads each array and takes its
                 visible label from the matching `optionLabels` slot. */}
-            <SimpleSelect
-              options={[...KIND_OPTIONS]}
-              optionLabels={KIND_OPTIONS.map((k) => (k ? `kind: ${k}` : i18nT('pages.artifactsPage.all_kinds')))}
-              value={kindFilter}
-              aria-label={i18nT('pages.artifactsPage.filter_by_kind')}
-              onChange={setKindFilter}
-            />
-            {/* The popup is exactly this trigger's width, so a trigger sized to
-                its own placeholder would clip the user-defined tag names it
-                lists. Floor the TRIGGER, not the panel — that keeps the two in
-                lockstep while leaving the rows readable. */}
-            <SimpleSelect
-              style={{ minWidth: 180 }}
-              options={['', ...allTags]}
-              optionLabels={[i18nT('pages.artifactsPage.all_tags'), ...allTags.map((t) => `${i18nT('pages.artifactsPage.tag')} ${t}`)]}
-              value={tagFilter}
-              aria-label={i18nT('pages.artifactsPage.filter_by_tag')}
-              onChange={setTagFilter}
-            />
-            <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
-              <Globe size={13} /> {i18nT('pages.artifactsPage.artifact_deploy')}
-            </Btn>
-            <div className="inline-flex items-center rounded-lg border border-border bg-bg-elevated p-0.5" role="group" aria-label={i18nT('pages.artifactsPage.filter_starred')}>
-              <button
-                type="button"
-                onClick={() => { setPinnedOnly(true); safeSetItem('mc-artifacts-pinned-only', '1') }}
-                aria-pressed={pinnedOnly}
-                className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none inline-flex items-center gap-1 ${pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
-              >
-                <Star size={12} className={pinnedOnly ? 'fill-current' : ''} /> {i18nT('pages.artifactsPage.starred')}
-              </button>
-              <button
-                type="button"
-                onClick={() => { setPinnedOnly(false); safeSetItem('mc-artifacts-pinned-only', '0') }}
-                aria-pressed={!pinnedOnly}
-                className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none ${!pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
-              >
-                {i18nT('pages.artifactsPage.all')}
-              </button>
+            <div className="flex gap-2 md:contents">
+              <div className="flex-1 min-w-0 md:flex-initial">
+                <SimpleSelect
+                  options={[...KIND_OPTIONS]}
+                  optionLabels={KIND_OPTIONS.map((k) => (k ? `kind: ${k}` : i18nT('pages.artifactsPage.all_kinds')))}
+                  value={kindFilter}
+                  aria-label={i18nT('pages.artifactsPage.filter_by_kind')}
+                  onChange={setKindFilter}
+                />
+              </div>
+              {/* The popup is exactly this trigger's width, so a trigger sized to
+                  its own placeholder would clip the user-defined tag names it
+                  lists. Floor the TRIGGER, not the panel — that keeps the two in
+                  lockstep while leaving the rows readable. The floor is desktop
+                  only: sharing the row half-and-half already gives the trigger
+                  ~179px at 390px, and a hard 180px floor on a phone would push
+                  the pair past the viewport instead. */}
+              <div className="flex-1 min-w-0 md:flex-initial md:min-w-[180px]">
+                <SimpleSelect
+                  options={['', ...allTags]}
+                  optionLabels={[i18nT('pages.artifactsPage.all_tags'), ...allTags.map((t) => `${i18nT('pages.artifactsPage.tag')} ${t}`)]}
+                  value={tagFilter}
+                  aria-label={i18nT('pages.artifactsPage.filter_by_tag')}
+                  onChange={setTagFilter}
+                />
+              </div>
             </div>
+            {cloudDeployEnabled && !isMobile && (
+              <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
+                <Globe size={13} /> {i18nT('pages.artifactsPage.artifact_deploy')}
+              </Btn>
+            )}
+            {isMobile
+              ? (
+                <div className="flex items-center justify-between gap-2">
+                  {starredToggle}
+                  {viewSwitcher}
+                </div>
+              )
+              : starredToggle}
           </div>
+        </CollapsibleChrome>
 
           {/* One DndContext spans breadcrumb + folder cards + gallery/table so
               artifacts and folders can be dragged between all of them. */}
@@ -2014,6 +2415,27 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             onDragEnd={handleDragEnd}
             onDragCancel={handleDragCancel}
           >
+            {/* Everything between the chrome and the gallery is capped and
+              * scrolls itself once the gallery owns the page's scroll axis.
+              *
+              * Without the cap this content is a plain flex sibling of a
+              * `flex-1 min-h-0` gallery inside an `overflow-hidden` column, so a
+              * tall stack of folder cards is absorbed by flex-shrink and there is
+              * NOTHING that can scroll it into view. Measured at 390x844 with a
+              * 700px stand-in above the gallery: it rendered at 562px (squeezed
+              * 138px), the gallery collapsed to 0px — the artifact list vanishes
+              * outright — and no ancestor scroller could reach either
+              * (`docScrollable: 0`).
+              *
+              * `shrink-0` is what stops the squeeze; `max-h-[45%]` is what leaves
+              * the gallery a floor to live in. Below the virtualization threshold
+              * the page column still scrolls, so no cap is wanted there. Marked
+              * as chrome so scrolling this region does not also hide the toolbar
+              * above it. */}
+            <div
+              {...(galleryOwnsScroll ? { [CHROME_ATTR]: '' } : {})}
+              className={galleryOwnsScroll ? 'shrink-0 max-h-[45%] overflow-y-auto' : ''}
+            >
             {view === 'grid' && !filtersActive && scopeFolderId && (
               <FolderBreadcrumbBar folders={folders} currentFolderId={scopeFolderId} onNavigate={openFolder} />
             )}
@@ -2075,13 +2497,16 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               * views fold the docs into their own rows instead. Skipped while
               * folder-scoped (docs are unfiled) and in the Starred view. */}
             {view === 'grid' && !pinnedOnly && !tagFilter && (filtersActive || !scopeFolderId) && (
-              <SessionDocsGallery
-                docs={sessionDocs}
-                pending={sessionDocsQ.isPending}
-                onMaterialize={handleMaterialize}
-                materializingPath={materializingPath}
-              />
+              <CollapsibleChrome collapsed={chromeCollapsed}>
+                <SessionDocsGallery
+                  docs={sessionDocs}
+                  pending={sessionDocsQ.isPending}
+                  onMaterialize={handleMaterialize}
+                  materializingPath={materializingPath}
+                />
+              </CollapsibleChrome>
             )}
+            </div>
 
             {gridEntries.length === 0 && (view === 'grid' || filtersActive) ? (
               (artifacts.length === 0 && folders.length === 0) ? (
@@ -2112,7 +2537,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               />
             ) : filtersActive ? (
               <LibraryTable
-                items={visible}
+                items={sortedVisible}
+                sort={sort}
+                onSort={handleSort}
                 onOpen={handleOpen}
                 onDelete={handleDelete}
                 deletingSlug={deleteMut.isPending ? (deleteMut.variables as string) : null}
@@ -2124,7 +2551,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               />
             ) : (
               <LibraryTree
-                items={visible}
+                items={sortedVisible}
+                sort={sort}
+                onSort={handleSort}
                 folders={folders}
                 expandedIds={expandedIds}
                 onToggleExpand={toggleExpanded}

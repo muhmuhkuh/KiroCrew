@@ -2002,6 +2002,55 @@ def test_revoked_cookie_survives_store_reload(tmp_path) -> None:
     assert reloaded.is_revoked(nonce) is True
 
 
+def test_revoked_store_locks_the_file_down_to_its_owner(tmp_path, monkeypatch) -> None:
+    """The denylist is locked to its owner through the fail-loud helper.
+
+    A bare ``os.chmod(path, 0o600)`` only toggles the read-only ATTRIBUTE on
+    Windows: it leaves the parent-inherited DACL in place, so the file stays
+    readable by other local accounts, and because the call still succeeds the
+    warn-and-continue handler never fires. ``restrict_to_owner`` is the helper
+    that applies an owner-only DACL there and raises when it cannot — the same
+    one the app-token secret in this module and ``token_secret.py`` already use.
+    """
+    from kiro_crew import platform_compat
+    from kiro_crew.dashboard import token_auth as token_auth_mod
+
+    locked: list[tuple[str, int]] = []
+    real_restrict = platform_compat.restrict_to_owner
+
+    def _spy(path) -> None:
+        # Record the size at lockdown time: the nonce list must not be sitting
+        # in the file yet (see the ordering assertion below).
+        locked.append((str(path), os.path.getsize(str(path))))
+        real_restrict(path)
+
+    monkeypatch.setattr(token_auth_mod.platform_compat, "restrict_to_owner", _spy)
+
+    state_path = tmp_path / "token_revoked_nonces.json"
+    store = RevokedNonceStore(state_path=state_path)
+    store.revoke("nonce-locked", time.time() + 3600)
+
+    assert locked, (
+        "the revoked-nonce store was persisted without restrict_to_owner; a raw "
+        "chmod is a no-op on Windows and leaves the denylist readable by other "
+        "local accounts")
+    locked_path, size_at_lockdown = locked[0]
+    assert size_at_lockdown == 0, (
+        "the denylist was written before the lockdown applied; on Windows "
+        "restrict_to_owner shells out to icacls, so the nonces would sit under "
+        "the parent-inherited DACL for the length of that call")
+    assert locked_path.startswith(str(state_path)), (
+        f"locked down {locked_path}, which is not the store's own temp file")
+
+    # The store still works, and on POSIX the resulting mode is observable.
+    assert store.is_revoked("nonce-locked") is True
+    if platform_compat.IS_POSIX:
+        # Windows locks the file down via an owner DACL, which does not surface
+        # in st_mode (files report 0o666) — that path is covered by
+        # test_platform_compat::TestRestrictToOwner.
+        assert (state_path.stat().st_mode & 0o777) == 0o600
+
+
 def test_revoked_store_evicts_expired_entry() -> None:
     """An entry whose session_exp has passed is treated as not-revoked (the
     token is rejected by the expiry check anyway) and dropped lazily."""
@@ -3045,3 +3094,25 @@ async def test_restart_unbound_cookie_without_peer_keeps_todays_semantics(
     resp = await mw(_make_request(cookies={"mc_token_5476": token}), _ok_handler)
     assert resp.status == 200
     assert token not in _ta._state._peer_bindings
+
+
+def test_app_token_path_allowed_implicit_ws():
+    """``/api/ws`` is the only implicitly allowed path.
+
+    It is connection infrastructure rather than a capability, and the implicit
+    grant is sound only because the WS layer filters events per app
+    (``ws_event_scope.py``). ``/api/status`` has NO such response-level filter
+    and discloses ``owner_id_hash``, host specs, cron/usage stats and the live
+    safety-override state, so it must be declared like any other capability.
+    Functional paths must still be declared, so the negative case is asserted
+    alongside.
+    """
+    from kiro_crew.dashboard.token_auth import app_token_path_allowed
+
+    assert app_token_path_allowed("some-app", "/api/ws") is True
+    assert app_token_path_allowed("some-app", "/api/status") is False
+    # Undeclared functional paths stay denied.
+    assert app_token_path_allowed("some-app", "/api/chat") is False
+    assert app_token_path_allowed("some-app", "/api/spawn") is False
+    # An empty app name must never be granted, even for implicit paths.
+    assert app_token_path_allowed("", "/api/ws") is False

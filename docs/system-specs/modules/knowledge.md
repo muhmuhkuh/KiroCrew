@@ -14,6 +14,82 @@ files / uploads / artifacts / URLs
    → local_knowledge_search (MCP) / dashboard Knowledge tab
 ```
 
+### LLM worker-pool policy
+
+Knowledge ingestion and URL-content acquisition use separate long-lived worker
+pools. The extraction pool uses `knowledge.extraction_pool_size` and requests
+Knowledge-specific reasoning effort `high`; the URL-fetch pool has one worker and
+sends no explicit effort, so it retains the provider default. Both pools drive the
+same `kirocrew-knowledge` agent and preserve the existing model resolution:
+`knowledge.extraction_model` → `agent.model` → provider/`auto`.
+
+The extraction effort is a Knowledge policy, independent of
+`agent.role_efforts.background`, which controls other background workers. For the
+Kiro ACP backend, the worker applies the requested level through the `/effort`
+command; Claude ACP uses its advertised session config option. Capability
+negotiation may select the highest supported level at or below `high`, while an
+unsupported model or rejected command falls back to provider default.
+
+Separate pools make the different workload policies structural for long-lived
+sessions rather than relying on a worker being reused by only one workload by
+convention.
+
+## Role & boundary
+
+The Knowledge Library is the agent's **precise-recall complement to memory** — it is defined as much by the two things it is *not*:
+
+- **Not memory.** The memory subsystem (see `memory-skills-hooks.md`) carries the small, distilled, always-on picture and is **injected into every prompt** by `ContextBuilder`; it is lossy by design (it dedups, decays, and paraphrases). The Knowledge Library instead holds the durable, **verbatim, cited** detail that memory can only approximate, and it is **pulled on demand**: the LLM reaches it only through the `local_knowledge_search` MCP tool, never as per-turn context injection (§4). Its job is to surface the exact chunk — with a citation back to source (§4, "Citation enrichment") — precisely when memory's recall is imprecise or absent.
+- **Not a workspace.** It is not scratch space for the current task's files or state; it is the durable, source-owned record that outlives any single task or session. A live project directory is *ingested* as a read-only `local_folder` source by `project_docs.py` (§2b), not adopted as a working set.
+
+This is the boundary the two automatic write paths (§2b) capture against: verbatim, long-tail durable detail that memory would only paraphrase belongs here; small, always-shaping, distilled knowledge belongs in memory; transient current-task state belongs in neither. How well the KB fills that role is measured against the criteria in "Success criteria" below.
+
+## Success criteria
+
+The Knowledge Library's job — surface the exact, cited chunk when memory's recall falls short — is judged on **two tiers**. No dedicated harness for either exists in-tree yet (see "What is measured today"); this section defines the target so a retrieval change (recency weighting, a reranker, content-typed TTL) can be judged against a fixed bar rather than by eye.
+
+### Tier 1 — intrinsic retrieval quality
+
+Against a **frozen golden set** of `(query → the chunk(s) that should answer it)`, does retrieval fetch the right chunk and rank it high? Definitions follow the IR / RAG canon:
+
+| Metric | Definition | Reads |
+|--------|------------|-------|
+| **recall@k** | `|relevant ∩ retrieved@k| / |relevant|` — fraction of relevant chunks that land in the top-k | coverage / completeness |
+| **precision@k** | `|relevant ∩ retrieved@k| / k` — fraction of the top-k that is relevant | signal-to-noise |
+| **MRR** | mean of `1 / rank_of_first_relevant` over queries | how early the first hit lands |
+| **nDCG@k** | graded relevance with a log-rank discount, normalized to the ideal ordering | rank quality when relevance is graded, not binary |
+| **hit@k** | binary: did *any* relevant chunk make the top-k | cheap "did retrieval work at all" gate |
+
+RAGAS names the rank-aware pair **context precision** / **context recall** (the latter needs a reference answer); they are the same two ideas applied to the retrieved context.
+
+### Tier 2 — extrinsic task-lift
+
+Does that recall change the outcome? Measured A/B — the same task set run with the KB **on** vs **off** (or vs a baseline), scored on **task success**, not retrieval position. Recall without task-lift means the KB retrieves the wrong thing well. This mirrors how mature agent harnesses gate on outcome rather than retrieval — GAIA2 (pass@1 against a write-action verifier), SWE-bench (fail-to-pass test execution), τ-bench (grounded end-state diff) — and π-Bench's practice of scoring "used the right context" as an axis distinct from "task completed." A companion generation check, **faithfulness** (fraction of the answer's claims actually supported by the retrieved chunk; RAGAS, reference-free), guards against a cited-but-unsupported answer.
+
+### Query classes the golden set must cover
+
+A clean teach→recall set overstates quality: memory/KB systems break on the *hard* classes. The set must enumerate them explicitly (taxonomy adapted from the LobsterAIAgent memory harness and LongMemEval):
+
+- **Clean-fact recall** — baseline single-hop lookup.
+- **Multi-hop** — the answer requires joining two or more chunks (the entity graph's reason to exist, §4).
+- **Time-bound / freshness** — a fact true only "as of" a date; the correct *version* must win.
+- **Correction** — a later chunk fixes an earlier stated fact; the corrected value must be surfaced.
+- **Contradiction** — two chunks conflict; retrieval must surface the conflict, not silently pick one.
+- **Retraction** — a withdrawn fact must stop being recalled.
+- **Reinforcement / corroboration** — repeated independent sources should raise confidence, not merely duplicate.
+- **Hypothetical-exclusion** — speculative or conditional statements must NOT return as settled fact.
+- **Abstention** — when the answer is genuinely absent, retrieval should return nothing above the score floor rather than a false near-match (LongMemEval scores this explicitly).
+- **Citation-fidelity** — the returned chunk must actually support the claim it is cited for (§4, "Citation enrichment").
+
+### What is measured today
+
+The code computes and floors a retrieval **score**, but no Tier-1/Tier-2 metric and none of the hard query classes above:
+
+- `HybridRetriever.search` fuses the keyword + graph + vector legs by RRF (`_rrf_fuse`, k=60; vector leg weighted `VECTOR_RRF_WEIGHT = 2.0`), tie-broken by `updated_at` recency — a secondary sort key, **not** a decay weight (`retrieval.py`, §4).
+- Results below `min_score = 0.012` are dropped by the tool caller (`mcp_tools/knowledge.py`), not inside the retriever.
+- `kirocrew eval` ships four scenarios (`smoke_test`, `memory_recall_basic`, `lesson_application`, `context_accumulation`) scored per-assertion (`contains` / `regex` / `judge`) with an optional 1–5 LLM judge (`eval/judge.py`, pass ≥ 3.0). All four are clean single-fact teach→recall or accumulate→summarize flows; none exercises correction / contradiction / retraction / time-bound / reinforcement / hypothetical, and none reports recall@k, MRR, or task-lift.
+
+The gap is therefore a **KB-scoped golden set over the query classes above, plus an A/B task-lift harness** — the precondition for tuning recency, adding a reranker, or content-typed TTL against evidence rather than intuition.
+
 ## Key Files
 
 | File | Responsibility |
@@ -110,7 +186,7 @@ Base metadata always carries `format`, `title` (file stem), `file_size`, `extens
 - **Scheduled sweeps.** `KnowledgeWatcher._maybe_dedup_sweep` runs a full `dedup_sweep` every `knowledge.dedup_every_n_sweeps` sweeps (default 12, ~hourly at the 300s interval; 0 disables). The targeted per-ingest call and the pre-ingest exact-hash gate cannot catch a near-duplicate or a pre-existing one, so the periodic pass is required for duplicates to actually be collapsed.
 - **One document, several locations.** A document held by two sources is ONE stored copy with a `source_locations` row per source, not two copies where one is destroyed. A collapse attaches the loser's source as a location of the winner's items, deletes the loser's redundant copy, and records `merged_into_source_id` on the loser's state row. Three consequences follow, and each closes a way the previous design lost data: `delete_source_cascade` re-points `items.source_id` to a surviving holder instead of deleting a document another source holds (`reassign_item_source` is the only path that moves ownership, since `_ITEM_COLUMNS` deliberately excludes the column); deleting the winner clears the marker so the document is ingested again rather than stranded; and "empty source" now means holding nothing by location either, in both the dedup check and the boot-time orphan sweep, because reaping a source would delete the very rows recording co-ownership. The marker names a SOURCE and never the winner's item ids: `item_ids` means "the items this row owns", and dedup derives a document's hash and embedding from whatever it points at, so a row naming the winner's items would be enumerated as a second document over one physical item set — and collapsing that pair deletes the surviving copy. `_match_reason` refuses any pair whose `item_ids` overlap for the same reason. Per-source counts report what a source HOLDS, while the Library total counts documents, so a shared document is visible under both sources without inflating the total.
 
-- **Pre-ingest duplicate gate.** `IngestionPipeline._skip_as_duplicate` refuses a write whose whole-text `content_hash` already exists in another source, on every ingest path, recording a terminal `ingestion_jobs` row with `status='skipped_duplicate'`. Refusing is not the same as doing nothing: the items the call was going to REPLACE are deleted first, because the document's content changed to something already stored elsewhere and its previous items are now superseded. Leaving them would keep the old text searchable and — since the state row is then recorded with an empty group — unreachable by the deleted-file path. A folder file refused this way is marked `deduped` rather than `done`; an artifact or agent document gets the same marker in its item-state row so the owning sync does not retry a write the gate will refuse again. The gate is not order-blind: it consults the same `PERSISTENT_SOURCE_TYPES` ranking `pick_winner` uses, so an incoming **persistent** source (folder / vault / wiki) is allowed to land when the current holder is **transient** (a one-shot upload or chat capture), and the post-ingest sweep then collapses the pair keeping the persistent copy. Refusing on arrival order alone inverted that ranking: the folder copy was marked `deduped`, the only searchable copy stayed inside the upload, and deleting the upload left none. Equal rank still refuses, which is the cheap path — it skips the chunking and extraction the sweep would immediately undo. Exact-hash only — the fuzzy tier needs embeddings and cannot run inline.
+- **Pre-ingest duplicate gate.** `IngestionPipeline._skip_as_duplicate` refuses a write whose whole-text `content_hash` already exists in another source, on every ingest path, recording a terminal `ingestion_jobs` row with `status='skipped_duplicate'`. Refusing is not the same as doing nothing: the items the call was going to REPLACE are deleted first, because the document's content changed to something already stored elsewhere and its previous items are now superseded. Leaving them would keep the old text searchable and — since the state row is then recorded with an empty group — unreachable by the deleted-file path. A folder file refused this way is marked `deduped` rather than `done`; an artifact or agent document gets the same marker in its item-state row so the owning sync does not retry a write the gate will refuse again. The gate is not order-blind: it consults the same `PERSISTENT_SOURCE_TYPES` ranking `pick_winner` uses, so an incoming **persistent** source (folder / vault / wiki) is allowed to land when the current holder is **transient** (a one-shot upload or chat capture), and the post-ingest sweep then collapses the pair keeping the persistent copy. Refusing on arrival order alone inverted that ranking: the folder copy was marked `deduped`, the only searchable copy stayed inside the upload, and deleting the upload left none. Equal rank still refuses, which is the cheap path — it skips the chunking and extraction the sweep would immediately undo. Exact-hash only — the fuzzy tier needs embeddings and cannot run inline. The whole gate is ONE `BEGIN IMMEDIATE` transaction that re-reads the holder **under the write lock** and declines to dedupe when it is gone (a cheap unlocked probe runs first so the common not-a-duplicate answer does not serialize every ingest): it makes the incoming source DEPEND on the holder, so a concurrent `delete_source_cascade` must not cascade that copy away in between. The scan's terminal `deduped` write (`FolderWatcher._record_deduped_state`) takes the same lock and derives the file's item group from **its own row** instead of assuming it empty, because a cascade landing after the gate committed reassigns the surviving item to this source and can adopt it into that row; predicting `[]` there would erase the adoption and leave the last copy owned but named by no row — unreachable by the deleted-file path and undeletable. The derivation is row-scoped, never by `(source_id, content_hash)`: two documents in one source may legitimately hold identical text, and a hash-scoped read would name one physical item into both rows, destroying it on the first delete of either. **All three doc-state tables do this**, through the one primitive `KnowledgeStore.surviving_group_in_txn(table, source_id, key)` — `folder_file_state` keyed by `file_path`, `artifact_item_state` and `agent_item_state` by `slug` (`_DOC_STATE_KEY_COL`). An aggregate row that ends up owning items is written `active`, not `deduped`, because `find_document_by_hash` only matches `active` and a row owning content while reporting `deduped` would let the same text in again under a second slug. Every one of the three takes `BEGIN IMMEDIATE` and therefore runs off the event loop through `run_to_completion`; `test_deduped_state_writes_are_never_called_on_the_event_loop` is the ratchet. **Known gap, pre-existing and folder-only:** for a transformed file (PDF/DOCX/HTML) the adoption itself matches nothing, because `_adopt_reassigned_item` keys on `COALESCE(text_hash, content_hash)` and a refused folder row derives `text_hash` from a byte-identical sibling row it may not have — so nothing lands in the row for the terminal write to preserve. The aggregate tables store the text hash in `content_hash` directly and are unaffected. Closing it needs the incoming document's text hash carried out of the gate rather than derived from a sibling.
 - **Legacy items with a null `content_hash` are not exact-matchable.** The column arrived by `ALTER TABLE`, so rows written before it are null, and tier-1 requires both sides non-null — on a real Library that was 435 of 526 folder items. Those documents reach de-duplication only through the filename+embedding tier. Backfilling is NOT done here: the extracted text is not retained, so the pipeline's hash cannot be reproduced, and any derived value has to be grouped per DOCUMENT (`folder_file_state` / item-state rows) rather than per source — grouping by source gives every file in a folder one identical key, which the sweep then reads as an exact match and collapses. What IS enforced is that every ingest path stamps the column, asserted by test, so the gap cannot grow.
 
 ## 2b. Automatic write paths (`doc_filter.py`, `project_docs.py`, `agent_source.py`)
@@ -175,6 +251,25 @@ through `IngestionPipeline.ingest_file` — one ingestion path — and content a
 redacted before they cross into the store. Adds are serialised by a module lock, because
 new items are attributed to a document by diffing the source's item ids around the
 ingest.
+
+**Ownership is recorded from inside the ingest, not after it returns.** The items become
+durable during `ingest_file`; `ingest_file` therefore takes an `on_committed` callback and
+invokes it in its finalize hop, on the success branch, right after the superseded group is
+deleted. The ids it hands over are **collected at each `add_item`**, not inferred from a
+before/after comparison of the source: `import_bundle` writes into the same aggregate in
+its own transaction and under no shared lock, so a comparison would attribute anything it
+committed meanwhile to whichever document happened to be ingesting — giving that document
+delete authority over knowledge it never created, and destroying it on the next edit. Writing the group
+afterwards instead would leave several awaits — the temp-file cleanup, the job-status read
+— between the items existing and the record that makes them replaceable, and each is a
+cancellation point on the gateway loop. Interrupted there, nothing names the items, and
+**both** of the aggregate's duplicate defences read that same row: `get_state` reports no
+previous group, so the next add replaces nothing and `find_document_by_hash` cannot see
+the content either. The document is then stored twice, and because replacement is what
+carries delete authority, an edited re-add leaves the superseded version searchable
+permanently. Running inside the hop gives the ownership write the same run-to-completion
+guarantee as the delete it belongs with. The `deduped` marker is written by the caller
+instead, because the duplicate gate returns before the hop ever runs.
 
 The tool takes the document TEXT and **never opens a file**. A path opened here on
 behalf of whatever supplied it is exactly the case where a component can be swapped for a

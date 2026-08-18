@@ -126,6 +126,28 @@ describe('createActionsProvider — pin current session', () => {
   })
 })
 
+describe('createActionsProvider — Ponytail actions', () => {
+  it('sets every available Ponytail mode through the injected callback', async () => {
+    const { d } = deps()
+    const set = vi.fn()
+    const arr = await run(createActionsProvider({ ...d, ponytail: { set } }), '')
+    const expected: Array<[string, string]> = [
+      ['Enable Ponytail', 'full'],
+      ['Disable Ponytail', 'off'],
+      ['Set Ponytail: Lite', 'lite'],
+      ['Set Ponytail: Full', 'full'],
+      ['Set Ponytail: Ultra', 'ultra'],
+      ['Use global Ponytail default', ''],
+    ]
+
+    for (const [title, mode] of expected) {
+      arr.find((r) => r.title === title)!.onActivate()
+      expect(set).toHaveBeenLastCalledWith(mode)
+    }
+    expect(set).toHaveBeenCalledTimes(expected.length)
+  })
+})
+
 describe('createActionsProvider — filtering', () => {
   it('filters to actions whose title matches the query', async () => {
     const { d } = deps()

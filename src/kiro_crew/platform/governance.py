@@ -936,12 +936,39 @@ class ScopeSpec:
     kind: str
     matcher: str = _DEFAULT_MATCHER
     ordinal_scale: str = ""
-    capability_default: bool = False  # policy-absence default for CapabilityGate
+    capability_default: bool = False  # see the CAPABILITY-DEFAULT CONTRACT note below
     # for CapabilityGate: scope-name -> matcher for its inner ScopedRulesets
     scope_matchers: Mapping[str, str] = field(default_factory=dict)
 
 
-# Built-in catalog.  ``capability_default`` follows Validation rule 8.
+# ── CAPABILITY-DEFAULT CONTRACT (read before touching any capability_default) ──
+#
+# ``capability_default`` supplies ``enabled`` when the capability's KEY IS PRESENT
+# in the document but its ``enabled`` field is omitted, e.g.
+#
+#     "capabilities": {"publish": {"scopes": {"destinations": {...}}}}
+#
+# which configures publish's destinations without stating whether publish is on,
+# and therefore resolves to this default.  That is the ONLY case it covers.
+#
+# It does NOT apply when the key is absent.  ``_parse_controls`` materializes only
+# the children physically present in the document, so an unnamed capability is an
+# absent scope, and ``resolve`` PERMITS an absent scope (``_PERMIT_NOT_GOVERNED``)
+# exactly as it does for an unnamed ``mcp``, ``commands`` or ``network.egress``.
+# Omission means ungoverned-and-permitted for every archetype; capabilities are
+# not a special case, and making them one would put a namespace-specific rule in
+# a loader whose whole contract is that a newly registered scope family parses
+# without a loader edit.
+#
+# Consequence for authors, and the reason a governed fleet should enumerate all of
+# them: a policy cannot deny a capability by leaving it out.  ``kirocrew policy
+# validate`` reports a partially-governed ``capabilities`` block so the gap is
+# visible instead of implied.
+#
+# Verified 2026-08-11 by executing parse_policy + resolve; several comments below
+# previously described the absent-key case and were wrong.
+
+# Built-in catalog.
 SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "tools": ScopeSpec(RULESET, matcher="identifier"),
     "mcp": ScopeSpec(RULESET, matcher="mcp"),
@@ -967,19 +994,29 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # by kiro_crew.safety_override at the activation seam, against the HOST
     # profile and fail-closed.
     "yolo_duration": ScopeSpec(RULESET, matcher="identifier"),
-    # Capabilities (Validation rule 8 registered defaults):
+    # Capabilities (registered defaults — see the CAPABILITY-DEFAULT CONTRACT above):
     "capabilities.spawn": ScopeSpec(
         CAPABILITY, capability_default=True, scope_matchers={"agents": "identifier"}
     ),
     "capabilities.memory_writes": ScopeSpec(CAPABILITY, capability_default=True),
+    # Web browsing (the ``browser`` MCP tool driving the native panel, and the
+    # playwright-cli fallback it points at) is a governable egress surface: an
+    # enterprise policy that denies it must stop the agent browsing on the
+    # native path too, not only the shell ``commands`` path playwright-cli sits
+    # behind. Default True (on) — like memory_writes, an ordinary capability
+    # that is available unless a policy explicitly sets
+    # ``{"capabilities": {"browse": {"enabled": false}}}``.
+    "capabilities.browse": ScopeSpec(CAPABILITY, capability_default=True),
     "capabilities.script_hooks": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.cron": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.messaging": ScopeSpec(CAPABILITY, capability_default=False),
     # Publishing an artifact's bytes to an external destination is an
     # exfil/external-side-effect surface (like messaging), so it is opt-in
-    # (capability_default=False): when a policy governs capabilities.* but omits
-    # publish, publishing is denied.  When NO policy is present the standalone
-    # default still permits everything.  The inner ``destinations`` ruleset
+    # (capability_default=False): a policy that names ``publish`` while omitting
+    # ``enabled`` — typically to configure its destinations — resolves to denied.
+    # Note this does NOT make omission of the whole key deny: an unnamed publish
+    # is ungoverned and permitted (see the CAPABILITY-DEFAULT CONTRACT above).
+    # The inner ``destinations`` ruleset
     # bounds WHICH publish-provider ids are allowed once the capability is on
     # (the direct analogue of capabilities.spawn's ``agents`` ruleset).  WHO
     # implements a destination is the orthogonal CPP PublishRegistry seam; this
@@ -992,8 +1029,8 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # injected into the agent's FIRST turn — third-party text entering the
     # model's context (mirrors capabilities.publish being a governable external
     # surface). Making it a capability row lets an enterprise POLICY
-    # force-disable persona injection wholesale. Default True: policy-absence
-    # keeps personas working (this is a tone-only surface; the deny floor +
+    # force-disable persona injection wholesale. Default True: naming the row
+    # without ``enabled`` keeps personas working (this is a tone-only surface; the deny floor +
     # PreToolUse gate still bind every action the persona could ask for), while
     # a governing policy can pin it off. Data row only — CONTRACT_VERSION and
     # the evaluator are untouched (per spec).
@@ -1004,8 +1041,8 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # surface that, like capabilities.publish, an enterprise POLICY must be able
     # to close. Making install a capability row lets a managed-fleet ceiling
     # ban pack installation wholesale (consulted in ``api_themes_install``).
-    # Default True: policy-absence keeps install working for the standalone
-    # single-user owner; a governing policy can pin it off. Data row only —
+    # Default True: naming the row without ``enabled`` keeps install working for the
+    # standalone single-user owner; a governing policy can pin it off. Data row only —
     # CONTRACT_VERSION and the evaluator are untouched (mirrors theme_persona).
     "capabilities.theme_install": ScopeSpec(CAPABILITY, capability_default=True),
     # The anonymous heartbeat (``beacon.py``) and official-app install receipt
@@ -1019,7 +1056,8 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # ``security._SENSITIVE_HOME_DIRS``, so the agent can neither read nor rewrite
     # its own ceiling.
     #
-    # Default True: policy-absence keeps the documented default-on behavior for the
+    # Default True: naming the row without ``enabled`` keeps the documented default-on
+    # behavior for the
     # standalone user, who still has the toggle, the CLI, and the env var. Consulted
     # at THREE chokepoints, because any one alone would be a half-control:
     #   * ``beacon.should_send`` — blocks the send itself (the actual egress);
@@ -1052,12 +1090,12 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # ``security._SENSITIVE_HOME_DIRS`` — the agent can neither read nor rewrite
     # its own ceiling.
     #
-    # Default True: policy-absence must keep TODAY's behaviour byte-for-byte.
-    # The feature is already off by default in config, so a default of False
-    # would mean a fleet policy that governs some OTHER ``capabilities.*`` row
-    # silently forbids tailnet derivation it never mentioned — a behaviour change
-    # for an unrelated policy, which is the failure ``capability_default`` exists
-    # to avoid (Validation rule 8). An enterprise that wants it off says so.
+    # Default True: naming this row without ``enabled`` must keep TODAY's behaviour
+    # byte-for-byte. The feature is already off by default in config, so a default
+    # of False would deny tailnet derivation for a policy that mentioned the row
+    # only to configure something about it. (An unnamed row is ungoverned and
+    # permitted regardless of this default — see the CAPABILITY-DEFAULT CONTRACT
+    # above.) An enterprise that wants it off says so.
     # Consulted at THREE chokepoints, because any one alone is a half-control:
     #   * ``tailnet.resolve_tailnet_host`` — returns "" so no origin is derived
     #     and the daemon is not even consulted (the action itself);
@@ -1146,6 +1184,20 @@ class UpdatePins:
     source: str = ""
     # The minimum version this fleet may run. Empty = no floor.
     min_version: str = ""
+    # The operator-authored shell commands for the command update provider. Their
+    # PRESENCE is what enables the provider (there is no mechanism selector): when
+    # either is set, resolve_provider() returns a CommandProvider. They live HERE
+    # (in the keystone-protected security_policy.json the agent cannot write),
+    # never in config.json, because a command provider executes unsandboxed code
+    # as the gateway — placing its commands in an agent-writable file would let a
+    # prompt-injected agent run arbitrary code. config.json has no path into this
+    # seam at all.
+    check_command: str = ""
+    apply_command: str = ""
+    # Per-platform command overrides, keyed by "{sys.platform}-{machine}"
+    # (e.g. "linux-x86_64", "darwin-arm64"). Falls back to the top-level
+    # check_command/apply_command when the current platform has no override.
+    platform_commands: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     def permits_source(self, url: str) -> bool:
         """Does *url* satisfy the source pin? An empty pin permits anything.
@@ -1186,15 +1238,58 @@ class UpdatePins:
 
     @staticmethod
     def from_dict(d: Mapping[str, object]) -> "UpdatePins":
-        _reject_unknown_keys(d, {"source", "min_version"}, "updates")
-        for key in ("source", "min_version"):
+        _reject_unknown_keys(
+            d,
+            {
+                "source",
+                "min_version",
+                "check_command",
+                "apply_command",
+                "platform_commands",
+            },
+            "updates",
+        )
+        for key in ("source", "min_version", "check_command", "apply_command"):
             # `str(raw or "")` would coerce `"source": false` to "" — silently
             # UNPINNING a policy that plainly meant to pin. Fail closed instead.
             if d.get(key) is not None and not isinstance(d[key], str):
                 raise PlatformCompositionError(f"updates.{key} must be a string")
+        raw_platform = d.get("platform_commands")
+        platform_commands: dict[str, dict[str, str]] = {}
+        if raw_platform is not None:
+            if not isinstance(raw_platform, Mapping):
+                raise PlatformCompositionError("updates.platform_commands must be a mapping")
+            for plat_key, plat_val in raw_platform.items():
+                if not isinstance(plat_key, str) or not isinstance(plat_val, Mapping):
+                    raise PlatformCompositionError(
+                        "updates.platform_commands entries must map a platform string "
+                        "to a command mapping"
+                    )
+                entry: dict[str, str] = {}
+                for cmd_key, cmd_val in plat_val.items():
+                    if cmd_key not in ("check_command", "apply_command"):
+                        raise PlatformCompositionError(
+                            f"updates.platform_commands.{plat_key} has unknown key {cmd_key!r}"
+                        )
+                    if not isinstance(cmd_val, str):
+                        raise PlatformCompositionError(
+                            f"updates.platform_commands.{plat_key}.{cmd_key} must be a string"
+                        )
+                    # Stripped like source/min_version above: a whitespace-only
+                    # command is truthy, so it would pass the presence check that
+                    # SELECTS the provider, and `sh -c "   "` exits 0. That reads
+                    # as a successful update, so the gateway restarts, the version
+                    # has not changed, the check still reports an update, and the
+                    # unattended path loops. Normalising here means absent and
+                    # blank are the same thing everywhere downstream.
+                    entry[cmd_key] = cmd_val.strip()
+                platform_commands[plat_key] = entry
         return UpdatePins(
             source=str(d.get("source") or "").strip(),
             min_version=str(d.get("min_version") or "").strip(),
+            check_command=str(d.get("check_command") or "").strip(),
+            apply_command=str(d.get("apply_command") or "").strip(),
+            platform_commands=platform_commands,
         )
 
 

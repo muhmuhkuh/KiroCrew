@@ -35,6 +35,8 @@ export interface ChatConfig {
   followUpLayout: FollowUpLayout
   streamMode: StreamMode
   showContextPct: boolean
+  /** Show used/window token counts in the inline context readout. */
+  showContextTokens: boolean
   defaultAutopilot: boolean
   /** Pin the most recent prompt above the fold as a sticky banner. */
   pinLastPrompt: boolean
@@ -47,7 +49,16 @@ export type FollowUpLayout = 'multiline' | 'scroll'
 export type StreamMode = 'immediate' | 'smooth'
 
 const LS_KEY = 'mc-chat-config'
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: true, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, defaultAutopilot: false, pinLastPrompt: true }
+/** `tagColumnsEnabled` MUST default to false: board-vs-list is derived from
+ *  this client-only flag AND the server-side column list, so a default of true
+ *  means any client with no stored config (a new user, a second browser, a
+ *  fresh Electron profile, a synced instance that inherited tag_boards.json,
+ *  or a client whose quota-safe write was dropped) opens straight into board
+ *  view the moment one column exists on the gateway — without anyone choosing
+ *  it. The sidebar's view toggle persists this flag BEFORE creating its first
+ *  column, so a deliberate board user always has an explicit `true` stored and
+ *  is unaffected by the default. */
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true }
 
 const VALID_FILE_CHIP_STYLES: ReadonlySet<FileChipStyle> = new Set(['expanded', 'minimal'])
 const VALID_FOLLOW_UP_LAYOUTS: ReadonlySet<FollowUpLayout> = new Set(['multiline', 'scroll'])
@@ -78,6 +89,7 @@ export function loadChatConfig(): ChatConfig {
     if (!VALID_FOLLOW_UP_LAYOUTS.has(cfg.followUpLayout)) cfg.followUpLayout = 'scroll'
     if (!VALID_STREAM_MODES.has(cfg.streamMode)) cfg.streamMode = 'smooth'
     if (typeof cfg.showContextPct !== 'boolean') cfg.showContextPct = false
+    if (typeof cfg.showContextTokens !== 'boolean') cfg.showContextTokens = false
     if (typeof cfg.showTurnStats !== 'boolean') cfg.showTurnStats = true
     if (typeof cfg.pinLastPrompt !== 'boolean') cfg.pinLastPrompt = true
     return cfg
@@ -95,11 +107,13 @@ export interface DashboardConfig {
   restore_window_minutes: number
   merge_queued_messages: boolean
   widget_density: 'more' | 'less'
+  use_builtin_browser: boolean
   verbosity: 'default' | 'concise' | 'ultra'
   quick_send: boolean
   session_grid: boolean
   tail_fork_enabled: boolean
   link_previews: boolean
   mcp_app_panel: boolean
+  auto_open_git_panel: boolean
   folder_suggestions_enabled: boolean
 }

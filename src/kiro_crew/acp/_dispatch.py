@@ -65,6 +65,7 @@ def build_session_new_params(
     *,
     mcp_servers: list[dict[str, Any]] | None = None,
     claude_meta: bool = False,
+    kas_custom_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the params for a ``session/new`` request.
 
@@ -72,6 +73,12 @@ def build_session_new_params(
     ``mcpServers`` field as malformed and exits cleanly (rc=0, no stderr) — so
     both backends must send it, even as an empty list. The ``claude_meta`` flag
     adds the SDK envelope the claude-agent-acp backend requires.
+
+    ``kas_custom_agents`` carries agent definitions to KAS, which has no
+    ``--agent`` flag and advertises only its own built-in modes: an injected
+    agent is registered, surfaces as a mode, and can then be activated by the
+    ordinary ``session/set_mode``. The two ``_meta`` envelopes belong to
+    different backends, so they never both apply.
     """
     params: dict[str, Any] = {
         "cwd": str(cwd),
@@ -79,6 +86,8 @@ def build_session_new_params(
     }
     if claude_meta:
         params["_meta"] = {"claudeCode": {"options": {}}}
+    if kas_custom_agents:
+        params["_meta"] = {"kiro": {"customAgents": kas_custom_agents}}
     return params
 
 
@@ -217,7 +226,9 @@ def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
     pct = params.get("contextUsagePercentage")
     try:
         pct_val = float(pct) if pct is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a JSON integer beyond float range — malformed telemetry
+        # must degrade to "absent", never raise inside the turn dispatch path.
         pct_val = None
     credits = 0.0
     metering = params.get("meteringUsage")
@@ -226,7 +237,7 @@ def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
             if isinstance(entry, dict) and entry.get("unit") == "credit":
                 try:
                     credits += float(entry.get("value", 0) or 0)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
     return pct_val, credits
 
@@ -309,21 +320,49 @@ def make_unified_diff(old: str, new: str, path: str, max_len: int = 6000) -> str
     return "".join(udiff).rstrip()[:max_len]
 
 
-def select_tool_title(title: object, raw_input: object) -> str | None:
+def select_tool_title(
+    title: object,
+    raw_input: object,
+    kind: object = None,
+    *,
+    is_shell: bool | None = None,
+) -> str | None:
     """Pick the pill label, preferring a human-readable ``description`` when present.
 
     Some backends' Bash tool emits a ``description`` field alongside ``command``
     (e.g. "List KiroCrew ACP module files" rather than ``ls /workplace/...``).
-    We surface it on the pill when supplied; otherwise we fall back to the
-    SDK-provided ``title`` (the literal tool invocation). Used for both the
+    We surface it on the pill when supplied, then the literal shell command for
+    a shell tool, and only then the SDK-provided ``title``. Used for both the
     initial ``tool_call`` and the second-phase ``tool_call_update`` refinement
     so the title rule stays consistent across both events.
+
+    The command outranks ``title`` because backends disagree on what ``title``
+    holds for a shell call: some send the invocation itself, others a generic
+    kind label ("Run Command") that names no command at all. Reading the
+    command yields the same pill for the first shape and an informative one for
+    the second, and it is never the weaker choice — a genuinely human-readable
+    label arrives as ``description``, which still wins.
+
+    ``is_shell`` overrides the kind-derived classification for a caller holding
+    a RESOLVED signal. A ``tool_call_update`` may omit ``kind`` entirely, and
+    reading that absence as non-shell would put the generic title back on a
+    pill the initial ``tool_call`` had already labelled with its command.
     """
     if isinstance(raw_input, dict):
         desc = raw_input.get("description")
         if isinstance(desc, str) and desc.strip():
             return desc
-    if isinstance(title, str) and title:
+    kind_str = kind if isinstance(kind, str) else None
+    shell = is_shell_kind(kind_str) if is_shell is None else is_shell
+    # Shell kinds only, so an fs tool's operation name ("strReplace") is never
+    # mistaken for a command.
+    if shell and isinstance(raw_input, dict):
+        cmd = raw_input.get("command")
+        if isinstance(cmd, str) and cmd.strip():
+            return cmd
+    # The flat title field defaults to an "unknown" sentinel when a backend
+    # omits it; treat that (and blanks) as absent rather than surfacing it.
+    if isinstance(title, str) and title and title != "unknown":
         return title
     return None
 
@@ -420,6 +459,34 @@ def parse_text_chunk(update: dict[str, Any]) -> tuple[str | None, bool]:
 _ACP_SHELL_KIND = "execute"
 
 
+def reject_option_id(params: dict) -> str | None:
+    """The least-destructive reject optionId a permission request advertises.
+
+    Used when auto-answering a ``session/request_permission`` for a session
+    this client never registered (a backend-internal subagent). Prefer the
+    request's own ``reject_once``-kind option; fall back to a legacy id that
+    names reject. ``None`` means the caller must answer with the ``cancelled``
+    outcome instead — kiro-cli maps that to cancelling the child's turn, which
+    is strictly worse than a per-tool reject, so this is the last resort.
+    """
+    raw = params.get("options")
+    if not isinstance(raw, list):
+        return None
+    options = [o for o in raw if isinstance(o, dict)]
+    for want_kind in ("reject_once", "reject_always"):
+        for opt in options:
+            opt_id = opt.get("optionId") or opt.get("id")
+            if opt.get("kind") == want_kind and isinstance(opt_id, str) and opt_id:
+                return opt_id
+    # Legacy kiro payloads omit `kind` — match well-known reject ids only, so
+    # an allow option can never be picked by accident.
+    for opt in options:
+        opt_id = opt.get("optionId") or opt.get("id")
+        if isinstance(opt_id, str) and opt_id in ("reject_once", "reject_always", "reject"):
+            return opt_id
+    return None
+
+
 def is_shell_kind(kind: str | None) -> bool:
     """True when an ACP tool_kind denotes a shell/exec command."""
     return kind == _ACP_SHELL_KIND
@@ -445,6 +512,7 @@ def build_permission_event(
     raw_params_cache: dict[str, dict] | None = None,
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
+    cache_scope: str = "",
 ) -> tuple[AcpEvent, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
 
@@ -531,9 +599,17 @@ def build_permission_event(
     # complete params cached by toolCallId; the permission message only has a
     # truncated human-readable title.
     tool_call_id = tool_call.get("toolCallId", "")
+    # ORIGIN-BOUND cache key. toolCallIds are backend/LLM-authored: without
+    # scoping, a child session could replay a consumed parent toolCallId and
+    # inherit the parent's trusted provenance (params/shell/MCP identity) for
+    # a DIFFERENT operation. Scoping by the emitting frame's sessionId means
+    # provenance is only readable by the origin that wrote it, while
+    # same-origin repeat frames (re-ask after reject_once, mode-change
+    # re-prompt) still find their entry.
+    _ck = f"{cache_scope}|{tool_call_id}" if cache_scope else tool_call_id
     tool_input = ""
-    if tool_call_id and tool_input_cache is not None and tool_call_id in tool_input_cache:
-        tool_input = tool_input_cache.pop(tool_call_id)
+    if tool_call_id and tool_input_cache is not None and _ck in tool_input_cache:
+        tool_input = tool_input_cache.pop(_ck)
     if not tool_input:
         raw_input = tool_call.get("input") or tool_call.get("params")
         if raw_input:
@@ -558,7 +634,7 @@ def build_permission_event(
     # .pop()): a later tool_call_update refinement reads this same cache, so
     # popping here would make it wrongly report is_shell=False.
     cached_shell = (
-        shell_cache.get(tool_call_id) if (shell_cache is not None and tool_call_id) else None
+        shell_cache.get(_ck) if (shell_cache is not None and tool_call_id) else None
     )
     is_shell = bool(cached_shell)
     if cached_shell is None and tool_input:
@@ -577,8 +653,16 @@ def build_permission_event(
     # shared path. Primary source: the raw dict the preceding tool_call cached by
     # toolCallId; fallback: an inline dict on the permission frame itself.
     _resolved_raw_params: dict | None = None
+    _raw_params_trusted = False
     if tool_call_id and raw_params_cache is not None:
-        _resolved_raw_params = raw_params_cache.pop(tool_call_id, None)
+        # .get() (not .pop()), matching the sibling shell/MCP/tool-name caches:
+        # a second permission frame for the same toolCallId (re-ask after
+        # reject_once, re-prompt after a mode change) must still find the
+        # params — popping made provenance single-use and downgraded the
+        # repeat frame to low fidelity. The per-turn dispatch .clear()
+        # handles cleanup.
+        _resolved_raw_params = raw_params_cache.get(_ck)
+        _raw_params_trusted = _resolved_raw_params is not None
     if _resolved_raw_params is None:
         _inline = tool_call.get("input") or tool_call.get("params")
         if isinstance(_inline, dict):
@@ -589,6 +673,8 @@ def build_permission_event(
         request_id=request_id,
         title=title,
         tool_kind=tool_kind,
+        raw_params_trusted=_raw_params_trusted,
+        shell_classified=cached_shell is not None,
         options=options,
         tool_input=tool_input,
         tool_call_id=tool_call_id,
@@ -600,7 +686,7 @@ def build_permission_event(
         # it; the per-turn dispatch .clear() handles cleanup. Empty on a miss
         # (fail-closed for the app-own-server auto-approve).
         mcp_server_name=(
-            mcp_server_name_cache.get(tool_call_id, "")
+            mcp_server_name_cache.get(_ck, "")
             if (mcp_server_name_cache is not None and tool_call_id)
             else ""
         ),
@@ -609,7 +695,7 @@ def build_permission_event(
         # canonical mcp__<server>__<tool> on the permission path (no _meta here).
         # Empty on a miss (fail-closed: no trusted tool name → no auto-approve).
         tool_name=(
-            tool_name_cache.get(tool_call_id, "")
+            tool_name_cache.get(_ck, "")
             if (tool_name_cache is not None and tool_call_id)
             else ""
         ),
@@ -624,6 +710,7 @@ def _build_tool_call_event(
     raw_params_cache: dict[str, dict] | None = None,
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
+    cache_scope: str = "",
 ) -> AcpEvent:
     """Build an ``EVENT_TOOL_CALL`` from a ``tool_call`` update (with redaction)."""
     title = update.get("title", "unknown")
@@ -631,17 +718,26 @@ def _build_tool_call_event(
     raw_input = update.get("rawInput") or update.get("input") or update.get("params")
     purpose = extract_tool_purpose(raw_input)
     tool_call_id = update.get("toolCallId", "")
+    # ORIGIN-BOUND cache key (see build_permission_event): entries written
+    # here are readable only under the same emitting-session scope.
+    _ck = f"{cache_scope}|{tool_call_id}" if cache_scope else tool_call_id
     # Cache the STRUCTURED raw params (dict) keyed by toolCallId so a later
     # permission_request — which carries only a truncated title — can recover
     # them for governance enforcement (raw_tool_params). Mirrors AcpClient's
     # _tool_call_params. shell_cache/tool_input_cache below serve display/is_shell.
     if tool_call_id and raw_params_cache is not None and isinstance(raw_input, dict):
-        raw_params_cache[tool_call_id] = raw_input
+        raw_params_cache[_ck] = raw_input
     # Capture the shell signal from the RAW kind (before redaction) so a later
     # permission_request (which carries no kind) can inherit it via shell_cache.
+    # Cache ONLY when the update actually carried a usable kind: a missing kind
+    # defaults to "unknown"/non-shell for THIS event's display, but caching that
+    # False would let the later permission event read it as a RESOLVED non-shell
+    # classification (shell_classified) and skip the low-fidelity downgrade
+    # without any classification having actually happened.
+    _kind_resolved = isinstance(update.get("kind"), str) and bool(update.get("kind"))
     is_shell = is_shell_kind(kind)
-    if tool_call_id and shell_cache is not None:
-        shell_cache[tool_call_id] = is_shell
+    if tool_call_id and shell_cache is not None and _kind_resolved:
+        shell_cache[_ck] = is_shell
     # Capture the TRUSTED MCP server identity (_meta.kiro.mcpServerName) so the
     # later permission_request — the dashboard's gate path, which carries no
     # _meta — can inherit it via mcp_server_name_cache. This is what lets the
@@ -650,13 +746,13 @@ def _build_tool_call_event(
     # "" and the branch never matches.
     _mcp_server_name = _kiro_mcp_server_name(update)
     if tool_call_id and mcp_server_name_cache is not None:
-        mcp_server_name_cache[tool_call_id] = _mcp_server_name
+        mcp_server_name_cache[_ck] = _mcp_server_name
     # Same lifecycle for the trusted tool name (_meta.kiro.toolName) so the
     # permission event can reconstruct the canonical mcp__<server>__<tool> for
     # per-tool governance in the app-own-server auto-approve.
     _tool_name = _kiro_tool_name(update)
     if tool_call_id and tool_name_cache is not None:
-        tool_name_cache[tool_call_id] = _tool_name
+        tool_name_cache[_ck] = _tool_name
     # Initial tool input string from raw params.
     input_str = ""
     if tool_call_id and raw_input:
@@ -695,10 +791,10 @@ def _build_tool_call_event(
     if input_str:
         input_str = _redact(input_str)
     if tool_call_id and input_str and tool_input_cache is not None:
-        tool_input_cache[tool_call_id] = input_str
+        tool_input_cache[_ck] = input_str
     if purpose:
         purpose = _redact(purpose)
-    title = select_tool_title(title, raw_input) or ""
+    title = select_tool_title(title, raw_input, kind, is_shell=is_shell) or ""
     if title:
         title = _redact(title)
     if kind:
@@ -923,6 +1019,8 @@ def _build_tool_refinement_event(
     update: dict[str, Any],
     tool_input_cache: dict[str, str] | None,
     shell_cache: dict[str, bool] | None = None,
+    raw_params_cache: dict[str, dict] | None = None,
+    cache_scope: str = "",
 ) -> AcpEvent | None:
     """Build an ``EVENT_TOOL_CALL_UPDATE`` (refined title/kind/input) for a tool.
 
@@ -934,6 +1032,8 @@ def _build_tool_refinement_event(
     tool_use_id = update.get("toolCallId", "")
     if not tool_use_id:
         return None
+    # ORIGIN-BOUND cache key (see build_permission_event).
+    _rk = f"{cache_scope}|{tool_use_id}" if cache_scope else tool_use_id
     title = update.get("title")
     kind = update.get("kind")
     raw_input = update.get("rawInput")
@@ -965,23 +1065,48 @@ def _build_tool_refinement_event(
     if input_str:
         input_str = _redact(input_str)
         if tool_input_cache is not None:
-            tool_input_cache[tool_use_id] = input_str
-    title_source = select_tool_title(title, raw_input)
-    title_str = _redact(title_source) if title_source else ""
-    kind_str = _redact(kind) if isinstance(kind, str) and kind else ""
+            tool_input_cache[_rk] = input_str
+    # The refinement's rawInput is the COMPLETE params object — cache it for
+    # the permission event's structured-params (path/arg scope) checks, same
+    # as the initial tool_call does. Without this, a backend whose initial
+    # tool_call streams empty rawInput leaves raw_params_cache forever empty
+    # and every child permission request downgrades to low fidelity.
+    if raw_params_cache is not None and isinstance(raw_input, dict) and raw_input:
+        raw_params_cache[_rk] = raw_input
     # Refresh the cached shell signal only when this refinement carries a kind
     # (kind is optional on updates); a kind-less refinement must not clobber a
-    # True cached by the initial tool_call. Mirrors AcpClient exactly.
+    # True cached by the initial tool_call. Mirrors AcpClient exactly. Resolved
+    # BEFORE the title so the label rule sees the real classification rather
+    # than a missing kind.
     if shell_cache is not None:
         if isinstance(kind, str) and kind:
-            shell_cache[tool_use_id] = is_shell_kind(kind)
-        is_shell = shell_cache.get(tool_use_id, False)
+            shell_cache[_rk] = is_shell_kind(kind)
+        is_shell = shell_cache.get(_rk, False)
     else:
         is_shell = is_shell_kind(kind) if isinstance(kind, str) and kind else False
+    # A refinement carrying a title but no rawInput still overwrites the pill,
+    # so the command has to be recoverable from the params the initial
+    # tool_call cached — otherwise a backend that sends a generic title on both
+    # events lands that label on a pill the first event got right.
+    _title_params: object = raw_input
+    if not (isinstance(raw_input, dict) and raw_input) and raw_params_cache is not None:
+        _title_params = raw_params_cache.get(_rk)
+    title_source = select_tool_title(title, _title_params, kind, is_shell=is_shell)
+    title_str = _redact(title_source) if title_source else ""
+    kind_str = _redact(kind) if isinstance(kind, str) and kind else ""
+    # The refinement's rawInput is the COMPLETE params object, so it carries the
+    # reserved purpose argument too. Read it here or the purpose is lost on every
+    # backend whose initial tool_call streams an empty rawInput — and consumers
+    # that treat an empty purpose as "fall back to the raw title" (the session
+    # list's running-status line) would replace a good purpose with a command.
+    purpose = extract_tool_purpose(raw_input)
+    if purpose:
+        purpose = _redact(purpose)
     return AcpEvent(
         kind=EVENT_TOOL_CALL_UPDATE,
         title=title_str,
         tool_kind=kind_str,
+        tool_purpose=purpose,
         tool_input=input_str,
         tool_call_id=tool_use_id,
         raw_tool_params=raw_input if isinstance(raw_input, dict) else None,
@@ -999,6 +1124,7 @@ def parse_session_update(
     raw_params_cache: dict[str, dict] | None = None,
     mcp_server_name_cache: dict[str, str] | None = None,
     tool_name_cache: dict[str, str] | None = None,
+    cache_scope: str = "",
 ) -> list[AcpEvent]:
     """Parse one ``session/update`` inner ``update`` dict into ``AcpEvent``s.
 
@@ -1034,6 +1160,7 @@ def parse_session_update(
                 raw_params_cache,
                 mcp_server_name_cache,
                 tool_name_cache,
+                cache_scope=cache_scope,
             )
         )
         return events
@@ -1041,7 +1168,10 @@ def parse_session_update(
         result = _build_tool_result_event(update)
         if result is not None:
             events.append(result)
-        refine = _build_tool_refinement_event(update, tool_input_cache, shell_cache)
+        refine = _build_tool_refinement_event(
+            update, tool_input_cache, shell_cache, raw_params_cache,
+            cache_scope=cache_scope,
+        )
         if refine is not None:
             events.append(refine)
         # A todo_list result carries the agent's whole task list. Emit it as an

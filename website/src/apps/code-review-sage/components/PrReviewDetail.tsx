@@ -22,6 +22,7 @@ import ReportView from './ReportView'
 import DraftReviewActions from './DraftReviewActions'
 import FailureNotice from './FailureNotice'
 import PrStatusChips from './PrStatusChips'
+import ReviewChat from './ReviewChat'
 import RunProgress from './RunProgress'
 import PostCommentsButton from './PostCommentsButton'
 import RunStatusPill from './RunStatusPill'
@@ -253,6 +254,13 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
               : i18nT('apps.codeReviewSage.components.prReviewDetail.did_not_complete_for_this_change')}
         />
       )}
+      {/* Questions about the findings sit between reading them and sending
+          them: "why is this a problem?" is what you ask before deciding whether
+          to post it. The panel is collapsed by default and only offers a composer
+          while the reviewer that produced these findings is still loaded. */}
+      {prRun && (
+        <ReviewChat runId={prRun.run_id} changeId={pr.change_id} />
+      )}
       {/* Posting the findings above leaves a PENDING review -- a draft only its
           author can see. This releases it with a verdict, so the whole loop
           (review -> post -> publish) closes here instead of on github.com.
@@ -318,7 +326,7 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
 
   return (
     <article className="h-full flex flex-col min-h-0">
-      <header className="px-6 pt-5 pb-3 border-b border-border flex-shrink-0">
+      <header className="px-4 md:px-6 pt-5 pb-3 border-b border-border flex-shrink-0">
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0">
             <h1 className="text-[21px] font-bold leading-tight text-text-strong break-words">
@@ -421,7 +429,7 @@ export default function PrReviewDetail({ pr }: { pr: PrRef }) {
         </div>
       </header>
 
-      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-6 py-5 flex flex-col gap-5">
+      <div className="flex-1 min-h-0 overflow-y-auto scrollbar-none px-4 md:px-6 py-5 flex flex-col gap-5">
         {tab === 'review' && reviewBody}
         {tab === 'source' && sourceBody()}
       </div>

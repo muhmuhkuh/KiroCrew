@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+import tempfile
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -399,6 +402,13 @@ def test_provider_executable_rejects_relative_override(monkeypatch) -> None:
         source._resolve_provider_executable("gh")
 
 
+_tmp_owner_ok = (
+    sys.platform == "win32"
+    or os.stat(tempfile.gettempdir()).st_uid in (0, os.geteuid())
+)
+
+
+@pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
 def test_provider_executable_accepts_user_owned_install(monkeypatch, tmp_path) -> None:
     """The default policy accepts the user's own gh — the Homebrew case that
     previously forced a `sudo cp` into a root-owned directory."""
@@ -412,6 +422,7 @@ def test_provider_executable_accepts_user_owned_install(monkeypatch, tmp_path) -
     assert source._resolve_provider_executable("gh") == str(executable.resolve())
 
 
+@pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
 def test_provider_executable_accepts_symlinked_install(monkeypatch, tmp_path) -> None:
     """Homebrew's layout (bin/gh -> ../Cellar/gh/<v>/bin/gh) resolves through the
     symlink instead of being refused for not being canonical."""
@@ -2810,6 +2821,9 @@ async def test_direct_fetch_pending_bound_is_combined_and_coalesces(monkeypatch)
         return [{"name": "test", "bucket": "pending"}]
 
     monkeypatch.setattr(source, "_DIRECT_FETCH_PENDING_MAX", 16)
+    # Admission now WAITS for room before refusing, so a test asserting the
+    # ceiling has to shrink the budget or it would sit out the real one.
+    monkeypatch.setattr(source, "_DIRECT_FETCH_WAIT_SECS", 0.05)
     monkeypatch.setattr(
         source,
         "_DIRECT_FETCH_MAX_RESERVED_BYTES",
@@ -2927,6 +2941,7 @@ async def test_stale_and_fresh_full_fetches_fit_exact_reservation_ceiling(
         "_DIRECT_FETCH_MAX_RESERVED_BYTES",
         2 * source._FULL_FETCH_RESERVATION_BYTES,
     )
+    monkeypatch.setattr(source, "_DIRECT_FETCH_WAIT_SECS", 0.05)
     url = "https://github.com/acme/repo/pull/23"
     stale = source.asyncio.create_task(source.fetch_pull_request(url, refresh=True))
     await old_started.wait()
@@ -2984,6 +2999,7 @@ async def test_direct_fetch_bound_counts_detached_stale_full_task(monkeypatch) -
         return membership
 
     monkeypatch.setattr(source, "_DIRECT_FETCH_PENDING_MAX", 1)
+    monkeypatch.setattr(source, "_DIRECT_FETCH_WAIT_SECS", 0.05)
     monkeypatch.setattr(source, "_fetch_github", fetch)
     monkeypatch.setattr(source, "_run_json", run)
     url = "https://github.com/acme/repo/pull/23"
@@ -3011,6 +3027,198 @@ async def test_direct_fetch_bound_counts_detached_stale_full_task(monkeypatch) -
     assert not source._FULL_FETCH_TASKS
     assert not source._FULL_FETCH_GENERATIONS
     source._CACHE.clear()
+
+
+def _reset_direct_fetch_state() -> None:
+    source._CACHE.clear()
+    source._FULL_FETCH_INFLIGHT.clear()
+    source._FULL_FETCH_TASKS.clear()
+    source._FULL_FETCH_GENERATIONS.clear()
+    source._CHECKS_FETCH_INFLIGHT.clear()
+    source._ISSUE_CACHE.clear()
+    source._ISSUE_FETCH_INFLIGHT.clear()
+    source._ISSUE_FETCH_TASKS.clear()
+    source._DIRECT_FETCH_RESERVATIONS.clear()
+    source._DIRECT_FETCH_WAITERS.clear()
+
+
+def _reserved_bytes() -> int:
+    tasks = source._direct_fetch_tasks()
+    return sum(
+        amount
+        for task, amount in source._DIRECT_FETCH_RESERVATIONS.items()
+        if task in tasks and not task.done()
+    )
+
+
+@pytest.mark.asyncio
+async def test_saturated_pool_queues_the_next_fetch_instead_of_refusing(monkeypatch) -> None:
+    """A caller arriving at a full pool WAITS for room and then succeeds.
+
+    The panel's read is a user-facing load: refusing it outright turned ordinary
+    concurrent use (two windows on two PRs) into an error card with a manual
+    Retry. Waiting keeps the memory ceiling intact while removing the dead end.
+    """
+    _reset_direct_fetch_state()
+    release = source.asyncio.Event()
+    started = 0
+
+    async def fetch(ref):
+        nonlocal started
+        started += 1
+        await release.wait()
+        return {"provider": "github", "url": ref.url}
+
+    monkeypatch.setattr(source, "_fetch_github", fetch)
+    monkeypatch.setattr(
+        source,
+        "_DIRECT_FETCH_MAX_RESERVED_BYTES",
+        2 * source._FULL_FETCH_RESERVATION_BYTES,
+    )
+    first = source.asyncio.create_task(
+        source.fetch_pull_request("https://github.com/acme/repo/pull/1", refresh=True)
+    )
+    second = source.asyncio.create_task(
+        source.fetch_pull_request("https://github.com/acme/repo/pull/2", refresh=True)
+    )
+    while started < 2:
+        await source.asyncio.sleep(0)
+    assert _reserved_bytes() == source._DIRECT_FETCH_MAX_RESERVED_BYTES
+
+    queued = source.asyncio.create_task(
+        source.fetch_pull_request("https://github.com/acme/repo/pull/3", refresh=True)
+    )
+    for _ in range(10):
+        await source.asyncio.sleep(0)
+    # Queued, not resolved and not failed, and it did not breach the ceiling to
+    # get there.
+    assert not queued.done()
+    assert source._DIRECT_FETCH_WAITERS
+    assert _reserved_bytes() <= source._DIRECT_FETCH_MAX_RESERVED_BYTES
+
+    release.set()
+    assert (await source.asyncio.wait_for(queued, timeout=5))["url"] == (
+        "https://github.com/acme/repo/pull/3"
+    )
+    await first
+    await second
+    await source.asyncio.sleep(0)
+    assert not source._DIRECT_FETCH_RESERVATIONS
+    assert not source._DIRECT_FETCH_WAITERS
+    source._CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_queued_fetch_waits_outside_the_cache_lock(monkeypatch) -> None:
+    """The admission wait must not hold ``_CACHE_LOCK``.
+
+    An in-flight fetch takes the same lock to write its result, so waiting for
+    capacity while holding it would deadlock: the queued caller would block the
+    very completion that frees its room. This is the regression guard for that
+    shape -- move the wait back inside the lock and this test times out.
+    """
+    _reset_direct_fetch_state()
+    release = source.asyncio.Event()
+    started = 0
+
+    async def fetch(ref):
+        nonlocal started
+        started += 1
+        await release.wait()
+        return {"provider": "github", "url": ref.url}
+
+    monkeypatch.setattr(source, "_fetch_github", fetch)
+    monkeypatch.setattr(
+        source, "_DIRECT_FETCH_MAX_RESERVED_BYTES", source._FULL_FETCH_RESERVATION_BYTES
+    )
+    holder = source.asyncio.create_task(
+        source.fetch_pull_request("https://github.com/acme/repo/pull/4", refresh=True)
+    )
+    while started < 1:
+        await source.asyncio.sleep(0)
+    queued = source.asyncio.create_task(
+        source.fetch_pull_request("https://github.com/acme/repo/pull/5", refresh=True)
+    )
+    for _ in range(10):
+        await source.asyncio.sleep(0)
+    assert not queued.done()
+
+    release.set()
+    # Both complete: the holder could still take _CACHE_LOCK to write its cache
+    # entry while the queued caller was waiting.
+    assert await source.asyncio.wait_for(holder, timeout=5)
+    assert await source.asyncio.wait_for(queued, timeout=5)
+    source._CACHE.clear()
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_is_marked_retryable_for_the_client(monkeypatch) -> None:
+    """The wait-budget error carries ``code: source_busy``.
+
+    A generic provider error (auth, missing PR) must stay fail-fast in the UI, so
+    the retryable case needs its own machine-readable marker rather than the
+    client pattern-matching on prose.
+    """
+    _reset_direct_fetch_state()
+    monkeypatch.setattr(
+        source,
+        "fetch_pull_request",
+        AsyncMock(side_effect=source.SourceCapacityError("Too many source requests are pending.")),
+    )
+    async with TestClient(TestServer(_app())) as client:
+        response = await client.post(
+            "/api/source/pull-request", json={"url": "https://github.com/acme/repo/pull/9"}
+        )
+        assert response.status == 503
+        assert (await response.json())["code"] == "source_busy"
+
+
+@pytest.mark.asyncio
+async def test_provider_error_is_not_marked_retryable(monkeypatch) -> None:
+    """Revert guard for the marker: a real provider failure must NOT be busy."""
+    _reset_direct_fetch_state()
+    monkeypatch.setattr(
+        source,
+        "fetch_pull_request",
+        AsyncMock(side_effect=source.SourceProviderError("gh could not authenticate")),
+    )
+    async with TestClient(TestServer(_app())) as client:
+        response = await client.post(
+            "/api/source/pull-request", json={"url": "https://github.com/acme/repo/pull/9"}
+        )
+        assert response.status == 503
+        assert (await response.json())["code"] == "provider_error"
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_audits_its_own_reason(monkeypatch, _mock_source_sel) -> None:
+    """The audit reason must match the code the caller receives.
+
+    Back-pressure recorded as ``provider_error`` would read, in the audit trail,
+    as the provider having failed. The pairing lives in one place so the two
+    cannot drift.
+    """
+    _reset_direct_fetch_state()
+    monkeypatch.setattr(
+        source,
+        "fetch_pull_request",
+        AsyncMock(side_effect=source.SourceCapacityError("Too many source requests are pending.")),
+    )
+    async with TestClient(TestServer(_app())) as client:
+        await client.post(
+            "/api/source/pull-request", json={"url": "https://github.com/acme/repo/pull/9"}
+        )
+    reasons = [
+        call.kwargs.get("error") for call in _mock_source_sel.log_api_access.call_args_list
+    ]
+    assert "capacity_exhausted" in reasons
+    assert "provider_error" not in reasons
+
+
+@pytest.mark.asyncio
+async def test_capacity_error_remains_a_source_provider_error() -> None:
+    """Every existing ``except SourceProviderError`` site must still catch it."""
+    assert issubclass(source.SourceCapacityError, source.SourceProviderError)
 
 
 @pytest.mark.asyncio
@@ -5318,14 +5526,15 @@ def test_jira_ref_never_passes_the_change_gate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_issue_refuses_jira(monkeypatch) -> None:
-    """Jira chips are link-outs: fetch_issue must refuse before any CLI runs."""
+async def test_fetch_issue_jira_no_credentials(monkeypatch) -> None:
+    """Jira issues raise a descriptive error when no credentials are configured."""
 
     async def no_hosts() -> frozenset[str]:
         return frozenset()
 
     monkeypatch.setattr(source, "ensure_gitlab_hosts_loaded", no_hosts)
-    with pytest.raises(ValueError, match="Jira"):
+    monkeypatch.setattr(source, "_get_jira_auth", lambda host: None)
+    with pytest.raises(ValueError, match="jira_no_credentials"):
         await source.fetch_issue("https://acme.atlassian.net/browse/PROJ-123")
 
 
@@ -6560,6 +6769,7 @@ async def test_fetch_issue_reserves_direct_fetch_capacity(monkeypatch) -> None:
 
     monkeypatch.setattr(source, "_fetch_github_issue", fake_fetch)
     monkeypatch.setattr(source, "_DIRECT_FETCH_PENDING_MAX", 1)
+    monkeypatch.setattr(source, "_DIRECT_FETCH_WAIT_SECS", 0.05)
 
     inflight = asyncio.ensure_future(
         source.fetch_issue("https://github.com/acme/repo/issues/12")
@@ -6596,7 +6806,7 @@ async def test_issue_endpoint_maps_value_error_to_400(monkeypatch) -> None:
     async with TestClient(TestServer(_app())) as client:
         response = await client.post("/api/source/issue", json={"url": "nope"})
         assert response.status == 400
-        assert await response.json() == {"error": "An issue URL is required."}
+        assert await response.json() == {"error": "An issue URL is required.", "code": "invalid_request"}
 
 
 @pytest.mark.asyncio
@@ -6610,7 +6820,10 @@ async def test_issue_endpoint_maps_provider_error_to_503(monkeypatch) -> None:
     async with TestClient(TestServer(_app())) as client:
         response = await client.post("/api/source/issue", json={"url": _ISSUE_URL})
         assert response.status == 503
-        assert await response.json() == {"error": "gh timed out"}
+        # `code` distinguishes a real provider failure from admission pressure, so
+        # the client retries only the latter. Issues share the pull-request
+        # admission pool, so this endpoint can report either.
+        assert await response.json() == {"error": "gh timed out", "code": "provider_error"}
 
 
 @pytest.mark.asyncio
@@ -6988,3 +7201,382 @@ class TestBranchPatternSlashSemantics:
         # The reported fail-open: a `releases/*` rule must not open APPROVE for
         # `releases/x/y`, which GitHub does not protect.
         assert not source._branch_pattern_matches("*", "releases/x")
+
+
+# ── Jira issue fetching tests ────────────────────────────────────────────────
+
+
+class TestAdfToPlainText:
+    """The ADF plain-text extractor handles Atlassian Document Format JSON."""
+
+    def test_simple_paragraph(self):
+        adf = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": "Hello world"}],
+                }
+            ],
+        }
+        assert source._adf_to_plain_text(adf) == "Hello world\n"
+
+    def test_multiple_paragraphs(self):
+        adf = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Line 1"}]},
+                {"type": "paragraph", "content": [{"type": "text", "text": "Line 2"}]},
+            ],
+        }
+        assert source._adf_to_plain_text(adf) == "Line 1\nLine 2\n"
+
+    def test_inline_card_extracts_url(self):
+        adf = {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {
+                    "type": "paragraph",
+                    "content": [
+                        {"type": "inlineCard", "attrs": {"url": "https://example.com"}},
+                    ],
+                }
+            ],
+        }
+        assert "https://example.com" in source._adf_to_plain_text(adf)
+
+    def test_empty_and_non_dict_returns_empty(self):
+        assert source._adf_to_plain_text(None) == ""
+        assert source._adf_to_plain_text("just a string") == ""
+        assert source._adf_to_plain_text({}) == ""
+
+    def test_nested_list_structure(self):
+        adf = {
+            "type": "doc",
+            "content": [
+                {
+                    "type": "bulletList",
+                    "content": [
+                        {
+                            "type": "listItem",
+                            "content": [
+                                {"type": "paragraph", "content": [{"type": "text", "text": "item"}]}
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+        result = source._adf_to_plain_text(adf)
+        assert "item" in result
+
+
+class TestGetJiraAuth:
+    """Credential resolution for Jira hosts."""
+
+    def test_returns_none_when_no_config(self, monkeypatch):
+        """No entries → None."""
+
+        class FakeDashboard:
+            jira_auth = []
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        assert source._get_jira_auth("acme.atlassian.net") is None
+
+    def test_matches_host_case_insensitively(self, monkeypatch):
+        class FakeEntry:
+            host = "Acme.atlassian.net"
+            email = "user@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {"JIRA_API_TOKEN": "secret123"}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("user@acme.com", "secret123")
+
+    def test_strips_port_443(self, monkeypatch):
+        class FakeEntry:
+            host = "jira.internal:443"
+            email = ""
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                return {"JIRA_API_TOKEN": "pat-token"}
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        result = source._get_jira_auth("jira.internal")
+        assert result == ("", "pat-token")
+
+    def test_raises_value_error_on_config_load_failure(self, monkeypatch):
+        """Config errors propagate as ValueError, not silent None."""
+
+        class BrokenConfig:
+            @classmethod
+            def load(cls):
+                raise RuntimeError("corrupt config.json")
+
+        monkeypatch.setattr(source, "KiroCrewConfig", BrokenConfig)
+        with pytest.raises(ValueError, match="jira_config_error"):
+            source._get_jira_auth("acme.atlassian.net")
+
+    def test_per_host_token_takes_precedence(self, monkeypatch):
+        """JIRA_TOKEN_<hex> is preferred over global JIRA_API_TOKEN."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                host_key = "acme.atlassian.net".encode().hex().upper()
+                return {
+                    "JIRA_API_TOKEN": "global-fallback",
+                    f"JIRA_TOKEN_{host_key}": "per-host-secret",
+                }
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("dev@acme.com", "per-host-secret")
+
+
+class TestJiraIsCloud:
+    def test_cloud_host(self):
+        assert source._jira_is_cloud("acme.atlassian.net") is True
+
+    def test_server_host(self):
+        assert source._jira_is_cloud("jira.internal.corp") is False
+
+    def test_subdomain_required_for_cloud(self):
+        # The URL parser already rejects bare .atlassian.net, but _jira_is_cloud
+        # is about suffix matching, not URL parsing. Any valid Cloud host has a
+        # non-empty org prefix.
+        assert source._jira_is_cloud("x.atlassian.net") is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_jira_issue_no_credentials_raises_value_error(monkeypatch):
+    """When no credentials are configured, a ValueError with the expected prefix is raised."""
+    monkeypatch.setattr(source, "_get_jira_auth", lambda host: None)
+    ref = source.SourceRef(
+        provider="jira",
+        url="https://acme.atlassian.net/browse/PROJ-123",
+        host="acme.atlassian.net",
+        owner="",
+        repo="PROJ",
+        number=123,
+        kind="issue",
+    )
+    with pytest.raises(ValueError, match="jira_no_credentials"):
+        await source._fetch_jira_issue(ref)
+
+
+def test_parse_jira_cloud_url() -> None:
+    """Jira Cloud URLs parse correctly."""
+    ref = source.parse_source_url("https://acme.atlassian.net/browse/PROJ-42")
+    assert ref.provider == "jira"
+    assert ref.host == "acme.atlassian.net"
+    assert ref.repo == "PROJ"
+    assert ref.number == 42
+    assert ref.kind == "issue"
+    assert ref.url == "https://acme.atlassian.net/browse/PROJ-42"
+
+
+def test_parse_jira_self_hosted_url(monkeypatch) -> None:
+    """Self-hosted Jira URLs parse when host is in the allowlist."""
+    monkeypatch.setattr(source, "_allowed_jira_hosts", lambda: frozenset({"jira.internal.corp"}))
+    ref = source.parse_source_url("https://jira.internal.corp/browse/TEAM-99")
+    assert ref.provider == "jira"
+    assert ref.host == "jira.internal.corp"
+    assert ref.repo == "TEAM"
+    assert ref.number == 99
+
+
+# --- Jira linked issues (issue #2584) ---
+
+
+class TestJiraLinkedChanges:
+    """Tests for _jira_linked_changes parsing."""
+
+    def test_outward_link_parsed(self) -> None:
+        """An outward issue link is parsed with the correct relation label."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                    "outwardIssue": {
+                        "key": "PROJ-456",
+                        "fields": {
+                            "summary": "Blocked task",
+                            "status": {"statusCategory": {"key": "new"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert len(result) == 1
+        assert result[0]["provider"] == "jira"
+        assert result[0]["url"] == "https://acme.atlassian.net/browse/PROJ-456"
+        assert result[0]["number"] == 456
+        assert result[0]["title"] == "Blocked task"
+        assert result[0]["state"] == "open"
+        assert result[0]["relation"] == "blocks"
+        assert result[0]["issueKey"] == "PROJ-456"
+
+    def test_inward_link_parsed(self) -> None:
+        """An inward issue link is parsed with the inward relation label."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                    "inwardIssue": {
+                        "key": "TEAM-10",
+                        "fields": {
+                            "summary": "Upstream dep",
+                            "status": {"statusCategory": {"key": "indeterminate"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://jira.corp/jira")
+        assert len(result) == 1
+        assert result[0]["relation"] == "is blocked by"
+        assert result[0]["url"] == "https://jira.corp/jira/browse/TEAM-10"
+        assert result[0]["state"] == "open"
+        assert result[0]["issueKey"] == "TEAM-10"
+
+    def test_done_status_maps_to_closed(self) -> None:
+        """A linked issue with statusCategory 'done' maps to state 'closed'."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Relates", "inward": "relates to", "outward": "relates to"},
+                    "outwardIssue": {
+                        "key": "FIX-7",
+                        "fields": {
+                            "summary": "Done fix",
+                            "status": {"statusCategory": {"key": "done"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert result[0]["state"] == "closed"
+
+    def test_duplicate_keys_deduped(self) -> None:
+        """Duplicate issue keys are folded."""
+        link = {
+            "type": {"name": "Relates", "inward": "relates to", "outward": "relates to"},
+            "outwardIssue": {
+                "key": "DUP-1",
+                "fields": {"summary": "Dup", "status": {"statusCategory": {"key": "new"}}},
+            },
+        }
+        fields = {"issuelinks": [link, link]}
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert len(result) == 1
+
+    def test_empty_issuelinks(self) -> None:
+        """Empty or missing issuelinks returns an empty list."""
+        assert source._jira_linked_changes({}, "https://x") == []
+        assert source._jira_linked_changes({"issuelinks": []}, "https://x") == []
+
+    def test_malformed_link_skipped(self) -> None:
+        """A link with neither inwardIssue nor outwardIssue is skipped."""
+        fields = {
+            "issuelinks": [
+                {"type": {"name": "Bad", "inward": "x", "outward": "y"}},
+                "not a dict",
+                None,
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert result == []
+
+    def test_missing_summary_uses_key_as_title(self) -> None:
+        """When summary is missing, the issue key is used as the title."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Rel", "inward": "r", "outward": "r"},
+                    "outwardIssue": {
+                        "key": "NO-SUM-1",
+                        "fields": {"status": {"statusCategory": {"key": "new"}}},
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert result[0]["title"] == "NO-SUM-1"
+
+    def test_multiple_links(self) -> None:
+        """Multiple links are all returned in order."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                    "outwardIssue": {
+                        "key": "A-1",
+                        "fields": {"summary": "First", "status": {"statusCategory": {"key": "new"}}},
+                    },
+                },
+                {
+                    "type": {"name": "Duplicates", "inward": "is duplicated by", "outward": "duplicates"},
+                    "inwardIssue": {
+                        "key": "B-2",
+                        "fields": {"summary": "Second", "status": {"statusCategory": {"key": "done"}}},
+                    },
+                },
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://x.atlassian.net")
+        assert len(result) == 2
+        assert result[0]["issueKey"] == "A-1"
+        assert result[0]["relation"] == "blocks"
+        assert result[1]["issueKey"] == "B-2"
+        assert result[1]["relation"] == "is duplicated by"
+        assert result[1]["state"] == "closed"

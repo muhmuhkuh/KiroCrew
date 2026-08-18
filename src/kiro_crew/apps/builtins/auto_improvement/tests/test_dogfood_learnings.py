@@ -30,6 +30,19 @@ from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
 from kiro_crew.apps.builtins.auto_improvement.backend import store
 from kiro_crew.apps.builtins.auto_improvement.spine.driver import BudgetCaps
 
+#: Windows' extended-length path prefix. ``os.readlink`` returns an absolute target with
+#: it attached, and ``pathlib`` reads the prefix as part of the drive, so it survives
+#: ``resolve()`` too -- it has to be stripped explicitly to compare paths across
+#: platforms.
+_EXTENDED_LENGTH_PREFIX = "\\\\?\\"
+
+
+def _without_extended_prefix(target: str) -> str:
+    """*target* with the Windows extended-length prefix removed; unchanged elsewhere."""
+    if target.startswith(_EXTENDED_LENGTH_PREFIX):
+        return target[len(_EXTENDED_LENGTH_PREFIX) :]
+    return target
+
 
 class TestMetricDirectionIsPlumbed:
     """The keeper accepts ``direction`` — but a parameter nobody passes is dead code."""
@@ -707,7 +720,7 @@ class TestSubprocessFallbackIsAudited:
         def _no_spawn(*a, **kw):  # pragma: no cover - reaching this IS the failure
             raise AssertionError("spawned a permissionless agent without an audit trail")
 
-        monkeypatch.setattr(ar.subprocess, "Popen", _no_spawn)
+        monkeypatch.setattr(ar, "popen_limited", _no_spawn)
         result = ar.AgentRunner().run("do a thing", cwd=str(tmp_path))
         assert result.ok is False
         assert "audited" in result.error
@@ -1442,7 +1455,7 @@ class TestFallbackAgentCannotSeeCredentials:
         # module scope, so it is bound here at import time and patching
         # `kiro_crew.sandbox` would not affect the already-bound reference.
         monkeypatch.setattr(ar, "sandboxed_spawn_argv", _fake_spawn)
-        monkeypatch.setattr(ar.subprocess, "Popen", lambda *a, **k: object())
+        monkeypatch.setattr(ar, "popen_limited", lambda *a, **k: object())
         ar.AgentRunner()._spawn_sandboxed_agent(["/bin/true"], str(tmp_path))
 
         assert seen["mode"] == "strict", "the unattended agent must not see credential dirs"
@@ -4846,7 +4859,17 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
         )
         # Copied verbatim as a link (its stored target is the original path), NOT resolved
         # into a real file that materialized the secret bytes inside the RED tree.
-        assert os.readlink(staged_link) == str(secret), "the staged link's target was rewritten"
+        #
+        # Compared as PATHS with the Windows extended-length prefix stripped, not as the
+        # raw string `os.readlink` returns. Windows stores an absolute symlink target as
+        # `\\?\C:\...`, and neither a string comparison nor `Path.resolve()` closes that
+        # gap -- `pathlib` reads `\\?\C:` as the drive and keeps it. Comparing `Path`
+        # objects also gets Windows' case-insensitivity for free. The assertion still says
+        # what it did: a target rewritten to point inside the RED tree is a different path,
+        # and the sibling `is_symlink()` check above is what catches a dereferenced copy.
+        assert Path(_without_extended_prefix(os.readlink(staged_link))) == secret, (
+            "the staged link's target was rewritten"
+        )
 
 
 class TestANestedProcessCannotAuthenticateToGitHub:

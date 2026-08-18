@@ -29,6 +29,7 @@ import os
 import shlex
 import shutil
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -470,6 +471,29 @@ def _valid_override_home() -> Path | None:
     return p
 
 
+def shared_kiro_settings_writable() -> bool:
+    """False when this process must not write the user's kiro-cli settings.
+
+    ``~/.kiro/settings/mcp.json`` belongs to the kiro-cli installation, not to a
+    Kiro Crew data home, so it is resolved from the real home and a throwaway
+    instance shares it with the operator's live one. A pod is throwaway by
+    construction: its home is empty, so any decision it reaches about which MCP
+    servers should exist is a decision about a different install. Writing that
+    decision to the shared file disarms the live instance -- a pod boots with no
+    browser-mode marker, concludes browsing is off, and deletes the operator's
+    browse entry.
+
+    Keyed on ``KIROCREW_POD`` rather than on the presence of a data-home override,
+    because a custom ``KIROCREW_HOME`` is a normal single-instance install (the
+    desktop build uses one) and must keep its own registration working. Only an
+    instance that declares itself a pod is refused.
+
+    Reads stay allowed. Only the write side is refused, so a pod can still report
+    what it sees.
+    """
+    return not os.environ.get("KIROCREW_POD")
+
+
 def config_dir() -> Path:
     global _config_dir_memo
     override_raw = os.environ.get("KIROCREW_HOME")
@@ -622,6 +646,44 @@ def config_package_dir() -> Path:
     the config package, so this is simply its parent directory.
     """
     return Path(__file__).resolve().parent
+
+
+def _in_ephemeral_tree(path: Path, env: Mapping[str, str] | None = None) -> bool:
+    """Whether *path* lives inside an AppImage's ephemeral runtime mount.
+
+    An AppImage runs from a squashfs the runtime mounts under a randomized
+    ``/tmp/.mount_<name>XXXXXX`` directory and unmounts on exit, so anything
+    resolved there is valid ONLY for the life of that process. A machine-wide
+    launcher aimed into it dangles the moment the app quits — the same hazard as
+    :func:`_in_linked_git_worktree`, from a different direction.
+
+``$APPDIR`` (the mount point) is exported by the AppImage runtime and is the
+    authoritative signal; ``$APPIMAGE`` names the outer image file rather than the
+    mount, so it cannot answer an ancestry test. The ``.mount_`` path component is
+    the fallback for a child process that inherited no environment, matched on the
+    RESOLVED path so a symlink into the mount cannot slip past.
+
+    Deliberately NOT "anything under the temp directory". A scratch tree in
+    ``/tmp`` is every bit as ephemeral, but a blanket temp-dir rule cannot tell a
+    reaped work directory from a legitimate install a developer or test placed
+    there, and the launcher those produce is caught precisely by
+    :func:`_bin_is_usable` instead — by the interpreter being gone, which is the
+    property that actually breaks the command.
+
+    Stdlib-only and subprocess-free for the same reason as the worktree guard:
+    this runs on the gateway start path.
+    """
+    env = os.environ if env is None else env
+    appdir = (env.get("APPDIR") or "").strip()
+    if appdir:
+        try:
+            if path == Path(appdir) or Path(appdir) in path.parents:
+                return True
+        except (OSError, ValueError):
+            pass
+    # `.mount_` is the AppImage runtime's own prefix, so this does not condemn
+    # unrelated temp paths.
+    return any(part.startswith(".mount_") for part in path.parts)
 
 
 def _in_linked_git_worktree(path: Path) -> bool:

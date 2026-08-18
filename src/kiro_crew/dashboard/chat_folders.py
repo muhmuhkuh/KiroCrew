@@ -13,6 +13,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+from kiro_crew.dashboard.chat_utils import effective_session_key
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.llm_helpers import run_bg_oneliner
@@ -184,6 +185,55 @@ async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
     return await state.mutate_folders(_clear)
 
 
+# The internal callers this module recognizes on ``X-Internal-Caller``.
+# Exact-listed and ratcheted in ``test_chat_folder_audit_origin.py``: adding a
+# caller here must be a conscious edit paired with a test, never a silent
+# widen — the point of the header is that a NEW internal caller surfaces as
+# ``unknown-internal`` in the audit until someone decides what to call it,
+# instead of silently inheriting another component's label (#3503).
+_KNOWN_INTERNAL_CALLERS = frozenset({"kirocrew-dashboard"})
+
+
+def _audit_origin(request: web.Request) -> tuple[str, str]:
+    """SEL ``(source, caller)`` for a folder mutation.
+
+    ``source`` stays in SEL's documented *interface* vocabulary (``dashboard``,
+    ``mcp``, ...) so operator queries like ``source == "mcp"`` keep matching
+    every MCP-driven event uniformly; the validated component identity rides
+    in ``caller``, which SEL already carries for exactly this purpose.
+
+    These endpoints are driven by BOTH the browser and the ``chat_folder_*``
+    MCP tools (``/api/chat`` is a mixed-internal path). A request without
+    ``X-Internal-Secret`` is the browser: ``("dashboard", "dashboard")``. An
+    internal request names its component in ``X-Internal-Caller`` (attached by
+    the MCP stdio servers' shared loopback request helpers — see
+    ``mcp_shared.set_internal_caller``), validated against
+    ``_KNOWN_INTERNAL_CALLERS``. Inferring the identity from the secret alone
+    was correct only while exactly one internal caller existed, and would
+    silently mislabel every write the moment a second one is added.
+
+    Trust model: the secret is verified by the token-auth middleware before
+    this handler runs, so authentication is settled here. The caller header is
+    ATTRIBUTION on top of that — it grants nothing (a browser sending the
+    header without the secret still audits as ``dashboard``), and an
+    unrecognized or missing value on an authenticated internal request is
+    recorded as ``caller="unknown-internal"`` with a warning rather than
+    trusted into the audit log.
+    """
+    if request.headers.get("X-Internal-Secret") is None:
+        return "dashboard", "dashboard"
+    caller = (request.headers.get("X-Internal-Caller") or "").strip()
+    if caller in _KNOWN_INTERNAL_CALLERS:
+        return "mcp", caller
+    logger.warning(
+        "internal folder write without a recognized X-Internal-Caller (got %r) — "
+        "audited as unknown-internal; a new internal caller must be added to "
+        "_KNOWN_INTERNAL_CALLERS alongside its ratchet test",
+        caller[:64],
+    )
+    return "mcp", "unknown-internal"
+
+
 async def api_chat_folders(request: web.Request) -> web.Response:
     """GET /api/chat/folders — list all project folders (with archived-session counts)."""
     state: DashboardState = request.app["state"]
@@ -294,9 +344,10 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
             status=400,
         )
     state.push_slots_update()
+    source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller="dashboard", operation="chat.folder_create",
-        outcome="allowed", source="dashboard", resources=str(folder["id"]),
+        caller=caller, operation="chat.folder_create",
+        outcome="allowed", source=source, resources=str(folder["id"]),
     )
     return web.json_response(folder, status=201)
 
@@ -423,9 +474,10 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             status=409,
         )
     state.push_slots_update()
+    source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller="dashboard", operation="chat.folder_update",
-        outcome="allowed", source="dashboard", resources=fid,
+        caller=caller, operation="chat.folder_update",
+        outcome="allowed", source=source, resources=fid,
     )
     return web.json_response(folder)
 
@@ -484,11 +536,45 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
         state.push_slots_update()
         raise
     state.push_slots_update()
+    source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller="dashboard", operation="chat.folder_delete",
-        outcome="allowed", source="dashboard", resources=fid,
+        caller=caller, operation="chat.folder_delete",
+        outcome="allowed", source=source, resources=fid,
     )
     return web.json_response({"ok": True})
+
+
+def _effective_request_app(state: DashboardState, request: web.Request) -> str:
+    """App identity to enforce ownership against, or "" for the dashboard user.
+
+    Two transports reach these routes with app identity carried differently:
+
+    * An **app token** — the middleware validates it and publishes the name as
+      ``request["app"]``.
+    * The **managed MCP set** — it authenticates with the internal secret,
+      which carries no app claim at all, so ``request["app"]`` is empty. An app
+      agent granted ``@kirocrew-dashboard`` would therefore arrive here
+      indistinguishable from the dashboard user and be allowed to mutate a
+      session it does not own.
+
+    The secret proves the call came from inside, not who made it, so the
+    identity is taken from the authenticated CALLING SESSION instead: the
+    ``X-Session-Key`` header names the caller's slot, and a slot created by an
+    app carries that app in ``_app`` (App Kit §5.2). Falling back to the caller
+    rather than trusting the transport keeps app isolation intact on a path the
+    app-token check cannot see.
+
+    Never read from request BODY or tool arguments — a caller that could name
+    its own scope could name someone else's.
+    """
+    declared = request.get("app", "")
+    if declared:
+        return str(declared)
+    sk = request.headers.get("X-Session-Key", "").strip()
+    if not sk or sk == "dashboard:ui":
+        return ""
+    caller = state._slots.get(sk.split(":", 1)[-1] if ":" in sk else sk)
+    return str(getattr(caller, "_app", "") or "") if caller else ""
 
 
 async def api_chat_slot_folder(request: web.Request) -> web.Response:
@@ -499,6 +585,30 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    # App ownership (App Kit §5.2) — the same deny-by-default rule
+    # api_chat_slot_mode applies, and it matters HERE because filing is a write
+    # to a session's own state: refiling moves a foreign session in the sidebar
+    # and re-injects its folder breadcrumb on that session's next turn, so an
+    # app holding this route could reach a session it does not own. Reported as
+    # the same 404 for both reasons on purpose — a distinct code per reason
+    # would turn it into an existence oracle for slots the caller cannot see.
+    request_app = _effective_request_app(state, request)
+    if request_app and getattr(slot, "_app", "") != request_app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.slot_folder",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error=(
+                "app cannot access unscoped slots"
+                if not getattr(slot, "_app", "")
+                else "app does not own this slot"
+            ),
+        )
+        return web.json_response(
+            {"error": "not found", "code": "slot_not_found"}, status=404
+        )
     try:
         body = await request.json()
     except Exception:
@@ -522,9 +632,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
         )
     await save_slot_off_loop(state, slot, force=True)
     state.push_slots_update()
+    source, caller = _audit_origin(request)
     sel().log_api_access(
-        caller="dashboard", operation="chat.slot_folder",
-        outcome="allowed", source="dashboard", resources=name,
+        caller=caller, operation="chat.slot_folder",
+        outcome="allowed", source=source, resources=name,
     )
     return web.json_response({"ok": True, "folder_id": slot.folder_id})
 
@@ -551,7 +662,7 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "pinned": slot.pinned})
 
 
-_VALID_MODES = ("", "orchestrator")
+_VALID_MODES = ("", "orchestrator", "crew")
 
 
 async def api_chat_slot_mode(request: web.Request) -> web.Response:
@@ -562,6 +673,30 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
+    # App ownership (App Kit §5.2) — the same deny-by-default rule api_chat_send
+    # and api_chat_slot_create apply, and it matters HERE because the mode
+    # decides which execution model a session runs under: an app holding
+    # `/api/chat` could otherwise list a foreign slot and PATCH it into (or out
+    # of) crew mode, changing a session it does not own. One code for both
+    # reasons on purpose — a distinct code per reason would turn this 404 into an
+    # existence oracle for slots the caller may not know about.
+    request_app = request.get("app", "")
+    if request_app and getattr(slot, "_app", "") != request_app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="chat.slot_mode",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={slot.key}",
+            error=(
+                "app cannot access unscoped slots"
+                if not getattr(slot, "_app", "")
+                else "app does not own this slot"
+            ),
+        )
+        return web.json_response(
+            {"error": "not found", "code": "slot_not_found"}, status=404
+        )
     try:
         body = await request.json()
     except Exception:
@@ -569,7 +704,58 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     mode = body.get("mode", "")
     if mode not in _VALID_MODES:
         return web.json_response({"error": "invalid mode"}, status=400)
-    if slot.running:
+    # Crew keeps its durable queue in a directory named after the slot, and a
+    # key that folds to nothing but dots has no such directory (see
+    # `CrewStore`). That refusal would otherwise land on the first crew MESSAGE
+    # — an unhandled 500 on a tab the switch had already reported as crew, and
+    # on every message after it. Refuse the switch instead, while it is still a
+    # request with an answer.
+    # Deferred import: this module is reachable from the gateway's boot path
+    # (gateway -> kiro_crew.dashboard -> chat_folders), and crew is a
+    # dashboard-only subsystem, so importing it at module scope made
+    # `--no-dashboard` pay for it before the API was ready to serve. Inside a
+    # mode-switch handler the cost is a sys.modules hit.
+    from kiro_crew.crew_chat import CrewOrchestrator, is_crew_capable_slot_key
+
+    if mode == "crew" and not is_crew_capable_slot_key(slot.key):
+        return web.json_response(
+            {"error": "this session name cannot run crew mode",
+             "code": "crew_unsupported_slot"},
+            status=400,
+        )
+    # Work in SUBAGENTS keeps `slot.running` false the whole time, so that flag
+    # alone lets the mode flip mid-flight and interleave two execution models in
+    # one session. Two separate questions are needed, because the risk is not
+    # symmetric:
+    #  * ANY direction — a plain-chat subagent may be running on this slot right
+    #    now, and its completion follows the default `_run_chat` path, so
+    #    ENTERING crew mode has to be refused for that too, not just leaving it.
+    #    (Gating the whole check on `slot.mode == "crew"` missed exactly this.)
+    #  * LEAVING crew — the orchestrator may still hold crew topics or a live
+    #    queue, which only it can answer for.
+    busy = False
+    subs = getattr(state, "subagents", None)
+    if subs is not None:
+        try:
+            # The key the SPAWN ran under, which for a channel-linked slot is the
+            # channel session, not `dashboard:<tab>` — `has_pending_work_for`
+            # matches `parent_session_key` exactly, so deriving it differently
+            # here reports "idle" while that slot's subagents are still running
+            # and flips the execution model out from under them.
+            busy = bool(subs.has_pending_work_for(effective_session_key(slot)))
+        except Exception:
+            busy = True       # fail closed: refuse rather than risk the flip
+    if not busy and slot.mode == "crew":
+        # isinstance, not `is not None` — matching gateway.py's own check on this
+        # attribute. A stand-in object passes an identity check and then answers
+        # `has_live_work` with something truthy, refusing a switch that is fine.
+        crew = getattr(state, "crew", None)
+        if isinstance(crew, CrewOrchestrator):
+            try:
+                busy = bool(await crew.has_live_work(name))
+            except Exception:
+                busy = True
+    if slot.running or busy:
         sel().log_api_access(
             caller="dashboard", operation="chat.slot_mode",
             outcome="denied", source="dashboard", resources=name,

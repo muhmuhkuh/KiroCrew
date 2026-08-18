@@ -145,7 +145,7 @@ def _manifest(
 
 
 def _capture_popen(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    """Freeze the spawn at Popen and capture the argv + kwargs it built."""
+    """Freeze the spawn at the limiter and capture the argv + kwargs it built."""
 
     seen: dict[str, Any] = {}
 
@@ -154,7 +154,7 @@ def _capture_popen(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         seen["kwargs"] = kwargs
         raise _StopSpawn()
 
-    monkeypatch.setattr(bmod.subprocess, "Popen", _popen)
+    monkeypatch.setattr(bmod, "popen_limited", _popen)
     return seen
 
 
@@ -164,7 +164,13 @@ def _record_runs(
     result: Any = None,
     exc: BaseException | None = None,
 ) -> list[list[str]]:
-    """Record every ``subprocess.run`` argv, optionally failing the call."""
+    """Record every run argv, optionally failing the call.
+
+    Both entry points, because this module has two: the dependency installers go
+    through ``run_limited`` (resource limits applied post-exec), while the nvm and
+    lsof probes are plain ``subprocess.run`` -- they carry no resource policy, so
+    there was nothing for the limiter to deliver for them.
+    """
 
     calls: list[list[str]] = []
 
@@ -176,6 +182,7 @@ def _record_runs(
             return result
         return SimpleNamespace(returncode=0, stdout="")
 
+    monkeypatch.setattr(bmod, "run_limited", _run)
     monkeypatch.setattr(bmod.subprocess, "run", _run)
     return calls
 
@@ -213,8 +220,6 @@ def spawn_root(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(bmod, "app_execution_denied", lambda _name, **_kw: None)
     monkeypatch.setattr(bmod, "wrap_argv", lambda argv, **_kw: (list(argv), None))
     monkeypatch.setattr(bmod, "cgroup_scope_argv", lambda argv: list(argv))
-    monkeypatch.setattr(bmod, "resource_limit_preexec", lambda: None)
-    monkeypatch.setattr(bmod, "build_resource_limit_preexec", lambda: None)
     monkeypatch.setattr(bmod, "_health_check_loop", lambda *_a, **_k: None)
     _install_fake_socket(monkeypatch, connect_exc=OSError("connection refused"))
     return root
@@ -637,7 +642,7 @@ class TestAdoptExistingInstance:
         (spawn_root / "server.py").write_text("x = 1\n")
         _install_fake_socket(monkeypatch, connect_exc=None)  # port answers => occupied
         monkeypatch.setattr(
-            bmod.subprocess, "Popen", lambda *_a, **_k: pytest.fail("spawned onto a taken port")
+            bmod, "popen_limited", lambda *_a, **_k: pytest.fail("spawned onto a taken port")
         )
         return spawn_root
 
@@ -732,6 +737,39 @@ class TestDependencyInstall:
         assert any("venv" in argv for argv in runs), runs
         assert any("install" in argv for argv in runs), runs
 
+    def test_the_installer_never_shells_out_to_a_bare_interpreter(
+        self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Venv creation must use sys.executable and pip must run as
+        `<venv python> -m pip` — `.venv/bin/pip` is POSIX-only and a bare
+        `python3` relies on PATH. Anything else leaves a Windows venv created
+        but never provisioned, which the venv-first interpreter policy would
+        then prefer while it holds none of the app's dependencies."""
+        import sys
+
+        from kiro_crew.apps.interpreter import venv_python_path
+
+        (spawn_root / "server.py").write_text("x = 1\n")
+        (spawn_root / "requirements.txt").write_text("requests\n")
+        runs = _record_runs(monkeypatch)
+        _capture_popen(monkeypatch)
+        with pytest.raises(_StopSpawn):
+            bmod._start_app_backend_body("deps-argv", _manifest("server.py"))
+        venv_argv = next(argv for argv in runs if "venv" in argv)
+        # Assert on the argv TOKEN, never on a substring of the joined command.
+        # sys.executable's own basename is frequently `python3` (any mise- or
+        # pyenv-managed interpreter, and /usr/bin/python3 itself), so a
+        # substring check for "python3 -m venv" matches the correct absolute
+        # form and fails on exactly the hosts it is meant to pass on.
+        assert venv_argv[0] == sys.executable, venv_argv
+        assert venv_argv[0] != "python3", venv_argv
+        assert venv_argv[1:3] == ["-m", "venv"], venv_argv
+        pip_argv = next(argv for argv in runs if "install" in argv)
+        assert pip_argv[0] == str(venv_python_path(spawn_root)), pip_argv
+        assert pip_argv[1:3] == ["-m", "pip"], pip_argv
+        # `.venv/bin/pip` is POSIX-only; the interpreter must run pip as a module.
+        assert not pip_argv[0].replace("\\", "/").endswith("/bin/pip"), pip_argv
+
     def test_a_failed_dependency_install_does_not_block_the_spawn(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -759,7 +797,7 @@ class TestNodeDispatch:
         (spawn_root / "server.js").write_text("// noop\n")
         monkeypatch.setattr(bmod, "_find_node_binary", lambda: None)
         monkeypatch.setattr(
-            bmod.subprocess, "Popen", lambda *_a, **_k: pytest.fail("spawned without node")
+            bmod, "popen_limited", lambda *_a, **_k: pytest.fail("spawned without node")
         )
         with caplog.at_level(logging.ERROR):
             assert bmod._start_app_backend_body("nodeless", _manifest("server.js")) is None
@@ -859,14 +897,24 @@ class TestAsgiDispatch:
     def test_the_app_venv_interpreter_is_preferred_when_present(
         self, spawn_root: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        venv_bin = spawn_root / ".venv" / "bin"
-        venv_bin.mkdir(parents=True)
-        (venv_bin / "python3").write_text("")
+        # Real venv layout per platform: POSIX ships bin/python3, native Windows
+        # ships Scripts\python.exe (and no python3). The shared resolver honours
+        # both and requires the file to be runnable, so a permission-stripped
+        # interpreter cannot become a guaranteed-EACCES spawn target.
+        from kiro_crew import platform_compat as _pc
+
+        if _pc.IS_WINDOWS:
+            venv_py = spawn_root / ".venv" / "Scripts" / "python.exe"
+        else:
+            venv_py = spawn_root / ".venv" / "bin" / "python3"
+        venv_py.parent.mkdir(parents=True)
+        venv_py.write_text("#!/bin/sh\n")
+        venv_py.chmod(0o755)
         (spawn_root / "app.py").write_text(self._ASGI_SRC)
         seen = _capture_popen(monkeypatch)
         with pytest.raises(_StopSpawn):
             bmod._start_app_backend_body("asgi-venv", _manifest("app.py"))
-        assert seen["argv"][0] == str(venv_bin / "python3")
+        assert seen["argv"][0] == str(venv_py)
 
 
 # ---------------------------------------------------------------------------
@@ -933,7 +981,7 @@ class TestSpawnOutcome:
             "_record_app_pid",
             lambda name, pid, port: recorded.append((name, pid, port)),
         )
-        monkeypatch.setattr(bmod.subprocess, "Popen", lambda *_a, **_k: _FakeProc(pid=777))
+        monkeypatch.setattr(bmod, "popen_limited", lambda *_a, **_k: _FakeProc(pid=777))
         ap = bmod._start_app_backend_body("okapp", _manifest("server.py"))
         assert ap is not None
         assert ap.pid == 777
@@ -956,7 +1004,7 @@ class TestSpawnOutcome:
             kwargs["stdout"].flush()
             return _FakeProc(returncode=1)
 
-        monkeypatch.setattr(bmod.subprocess, "Popen", _popen)
+        monkeypatch.setattr(bmod, "popen_limited", _popen)
         with caplog.at_level(logging.ERROR):
             assert bmod._start_app_backend_body("dyingapp", _manifest("server.py")) is None
         assert any("PORT COLLISION" in r.getMessage() for r in caplog.records)
@@ -1661,7 +1709,7 @@ class TestDefensiveBranches:
         monkeypatch.setattr(bmod, "sel", _no_sel)
         monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(500))
         monkeypatch.setattr(
-            bmod.subprocess, "Popen", lambda *_a, **_k: pytest.fail("spawned onto a taken port")
+            bmod, "popen_limited", lambda *_a, **_k: pytest.fail("spawned onto a taken port")
         )
         result = bmod._start_app_backend_body(
             "occupied", _manifest("server.py", port=str(bmod._MIN_PORT + 14))

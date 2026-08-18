@@ -61,6 +61,15 @@ def _make_orchestrator(
 # ─── Helper utilities ────────────────────────────────────────────────────
 
 
+def _fake_async_proc(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b""):
+    """A stand-in for an ``asyncio.create_subprocess_exec`` child process."""
+    proc = MagicMock()
+    proc.returncode = returncode
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.kill = MagicMock()
+    return proc
+
+
 def _mock_sessions():
     """Return a mock SessionManager with common methods."""
     s = MagicMock()
@@ -345,8 +354,11 @@ class TestInitServices:
                                         with patch("kiro_crew.slack.gateway.HistoryConsolidator"):
                                             with patch("kiro_crew.slack.gateway.ChannelHistory"):
                                                 with patch("kiro_crew.agent.rebuild_agent_config", return_value=Path("/tmp/a")):
-                                                    with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="kiro-cli 1.30.0")):
-                                                        orch._init_services()
+                                                    with patch(
+                                                        "asyncio.create_subprocess_exec",
+                                                        new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
+                                                    ):
+                                                        asyncio.run(orch._init_services())
 
         assert orch.sessions is not None
         assert orch.ctx_builder is not None
@@ -377,8 +389,11 @@ class TestInitServices:
                                         with patch("kiro_crew.slack.gateway.HistoryConsolidator"):
                                             with patch("kiro_crew.slack.gateway.ChannelHistory"):
                                                 with patch("kiro_crew.agent.rebuild_agent_config", return_value=Path("/tmp/a")):
-                                                    with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="kiro-cli 1.30.0")):
-                                                        orch._init_services()
+                                                    with patch(
+                                                        "asyncio.create_subprocess_exec",
+                                                        new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
+                                                    ):
+                                                        asyncio.run(orch._init_services())
 
         assert orch.slack is None
         assert orch.sessions is not None
@@ -838,6 +853,7 @@ class TestCheckForUpdates:
         orch.dashboard_state = ds
         orch._auto_apply_update = AsyncMock()
         import kiro_crew.dashboard.handlers as _h
+        from kiro_crew.platform.governance import UpdatePins
         orig = _h._update_info.copy()
         # Create a config with auto_update=False
         fake_cfg = MagicMock()
@@ -846,7 +862,11 @@ class TestCheckForUpdates:
             _h._update_info.update({"available": True, "version": "9.9.9"})
             with patch.object(_h, "_do_update_check", new_callable=AsyncMock):
                 with patch("kiro_crew.config.KiroCrewConfig.load", return_value=fake_cfg):
-                    await orch._check_for_updates()
+                    with patch(
+                        "kiro_crew.platform.governance.active_update_pins",
+                        return_value=UpdatePins(),
+                    ):
+                        await orch._check_for_updates()
         finally:
             _h._update_info.clear()
             _h._update_info.update(orig)
@@ -952,7 +972,7 @@ class TestBrazilInstallAndDeps:
     def test_check_missing_deps_no_missing(self):
         orch = _make_orchestrator()
         with patch("importlib.util.find_spec", return_value=MagicMock()):
-            orch._check_missing_deps()  # should not raise
+            asyncio.run(orch._check_missing_deps())  # should not raise
 
     def test_check_missing_deps_brazil_skips(self):
         orch = _make_orchestrator()
@@ -961,7 +981,7 @@ class TestBrazilInstallAndDeps:
                 with patch.object(
                     GatewayOrchestrator, "_is_brazil_install", return_value=True
                 ):
-                    orch._check_missing_deps()  # should not raise, skips pip
+                    asyncio.run(orch._check_missing_deps())  # should not raise, skips pip
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2263,10 +2283,15 @@ class TestRunGateway:
 
         cfg = KiroCrewConfig()
         with patch.object(cfg, "load_credentials", return_value={}):
-            with patch.object(
-                GatewayOrchestrator, "run", new_callable=AsyncMock
-            ) as mock_run:
-                await run_gateway(cfg, no_dashboard=True, no_crons=True)
+            # The aggregate-cgroup-ceiling apply shells out to systemctl —
+            # a host-service mutation the rootdir guard refuses; stub it.
+            with patch(
+                "kiro_crew.slack.gateway.ensure_agents_slice_limits", return_value=True
+            ):
+                with patch.object(
+                    GatewayOrchestrator, "run", new_callable=AsyncMock
+                ) as mock_run:
+                    await run_gateway(cfg, no_dashboard=True, no_crons=True)
         mock_run.assert_awaited_once()
 
 
@@ -2390,7 +2415,7 @@ class TestRunMethod:
         orch = _make_orchestrator()
 
         # Mock all init methods
-        orch._init_services = MagicMock()
+        orch._init_services = AsyncMock()
         # _init_services is mocked so vector_memory never gets created — mock
         # the default-on embeddings wiring too (it dereferences vector_memory).
         orch._start_embeddings = AsyncMock()
@@ -2437,7 +2462,7 @@ class TestRunMethod:
 
         orch = _make_orchestrator(no_dashboard=True)
 
-        orch._init_services = MagicMock()
+        orch._init_services = AsyncMock()
         orch._start_embeddings = AsyncMock()
         # run() spawns _auto_migrate_memory as a fire-and-forget task; with
         # _init_services mocked it would raise AttributeError on
@@ -4243,7 +4268,7 @@ class TestRunSignalAndBgSession:
         orch = _make_orchestrator(no_dashboard=True)
         orch._cfg.memory.embedding_provider = "llama_cpp"
 
-        orch._init_services = MagicMock()
+        orch._init_services = AsyncMock()
         orch._start_embeddings = AsyncMock()
         # run() spawns _auto_migrate_memory as a fire-and-forget task; with
         # _init_services mocked it would raise AttributeError on
@@ -4297,7 +4322,7 @@ class TestBgSessionDashboardBranch:
         """_start_bg_session prints dashboard URLs when not _no_dashboard."""
         orch = _make_orchestrator(no_dashboard=False, no_open=True)
 
-        orch._init_services = MagicMock()
+        orch._init_services = AsyncMock()
         orch._start_embeddings = AsyncMock()
         # run() spawns _auto_migrate_memory as a fire-and-forget task; with
         # _init_services mocked it would raise AttributeError on
@@ -4361,10 +4386,16 @@ class TestCheckMissingDepsPip:
                 with patch.object(
                     GatewayOrchestrator, "_is_brazil_install", return_value=False
                 ):
-                    with patch("subprocess.run") as mock_run:
-                        mock_run.return_value = MagicMock(returncode=0)
-                        orch._check_missing_deps()
-                    mock_run.assert_called_once()
+                    mock_exec = AsyncMock(return_value=_fake_async_proc(returncode=0))
+                    with patch("asyncio.create_subprocess_exec", mock_exec):
+                        asyncio.run(orch._check_missing_deps())
+                    mock_exec.assert_awaited_once()
+                    # Pin the command shape so a refactor cannot silently stop
+                    # installing (sys.executable -m pip install ...).
+                    import sys as _sys
+
+                    args = mock_exec.await_args.args
+                    assert args[:4] == (_sys.executable, "-m", "pip", "install")
 
     def test_pip_install_failure(self):
         orch = _make_orchestrator()
@@ -4373,11 +4404,302 @@ class TestCheckMissingDepsPip:
                 with patch.object(
                     GatewayOrchestrator, "_is_brazil_install", return_value=False
                 ):
-                    with patch("subprocess.run") as mock_run:
-                        mock_run.return_value = MagicMock(
-                            returncode=1, stderr=b"error"
-                        )
-                        orch._check_missing_deps()  # should not raise
+                    mock_exec = AsyncMock(
+                        return_value=_fake_async_proc(returncode=1, stderr=b"error")
+                    )
+                    with patch("asyncio.create_subprocess_exec", mock_exec):
+                        asyncio.run(orch._check_missing_deps())  # should not raise
+
+    def test_pip_install_timeout_kills_child(self):
+        """A wedged pip is killed and reaped; boot continues without raising."""
+        orch = _make_orchestrator()
+        proc = MagicMock()
+        proc.returncode = None
+        proc.kill = MagicMock()
+
+        async def _communicate():
+            if proc.kill.called:
+                return (b"", b"")  # post-kill reap returns immediately
+            await asyncio.sleep(3600)  # hang until wait_for cancels us
+            return (b"", b"")
+
+        proc.communicate = MagicMock(side_effect=_communicate)
+        with patch("importlib.util.find_spec", return_value=None):
+            with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
+                with patch.object(
+                    GatewayOrchestrator, "_is_brazil_install", return_value=False
+                ):
+                    with patch.object(
+                        GatewayOrchestrator, "_DEP_INSTALL_TIMEOUT_SECS", 0.05
+                    ):
+                        with patch(
+                            "asyncio.create_subprocess_exec",
+                            AsyncMock(return_value=proc),
+                        ):
+                            asyncio.run(orch._check_missing_deps())  # no raise
+        proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_version_probe_transport_error_does_not_abort_boot(self):
+        """_warn_if_kiro_cli_outdated must never raise.
+
+        A pipe/transport error from communicate() propagating out of this
+        helper would abort run() before the dashboard binds. The child is
+        still killed+reaped best-effort.
+        """
+        calls = {"n": 0}
+
+        async def _communicate():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("broken pipe")
+            return (b"", b"")  # the post-kill reap
+
+        proc = MagicMock()
+        proc.returncode = None
+        proc.kill = MagicMock()
+        proc.communicate = MagicMock(side_effect=_communicate)
+        orch = _make_orchestrator()
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            await orch._warn_if_kiro_cli_outdated()  # must not raise
+        proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pip_install_cancellation_kills_child(self):
+        """Gateway shutdown mid-install must not orphan pip.
+
+        A leaked pip would race the NEXT boot's install of the same
+        distributions — the half-installed state this repair path exists to
+        fix.
+        """
+        proc = MagicMock()
+        proc.returncode = None
+        proc.kill = MagicMock()
+
+        async def _communicate():
+            await asyncio.sleep(3600)  # hang until cancelled
+            return (b"", b"")
+
+        proc.communicate = MagicMock(side_effect=_communicate)
+        orch = _make_orchestrator()
+        with patch("importlib.util.find_spec", return_value=None):
+            with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
+                with patch.object(
+                    GatewayOrchestrator, "_is_brazil_install", return_value=False
+                ):
+                    with patch(
+                        "asyncio.create_subprocess_exec", AsyncMock(return_value=proc)
+                    ):
+                        task = asyncio.create_task(orch._check_missing_deps())
+                        await asyncio.sleep(0.05)  # let it reach the await
+                        task.cancel()
+                        with pytest.raises(asyncio.CancelledError):
+                            await task
+        proc.kill.assert_called_once()
+
+
+class TestInitServicesLoopResponsiveness:
+    """The event loop must keep servicing callbacks during slow startup work.
+
+    Invariant (issue #3051): the loop runs callbacks one at a time, so a
+    synchronous subprocess/scan inside ``_init_services`` starves every other
+    coroutine — including the loop-stall watchdog heartbeat once armed — for
+    its whole duration.
+
+    These tests assert the PROPERTY, not a duration (#4235): a fast ticker
+    runs concurrently with the init work, and the stand-in for each slow
+    call blocks — in whatever execution context production invoked it —
+    until it OBSERVES the ticker advance. Fixed code runs the work off the
+    loop (``asyncio.to_thread`` / an async subprocess), so the loop stays
+    free, the ticker advances, and the probe returns almost immediately. A
+    mutant reverted to the old synchronous on-loop shape blocks the loop
+    itself, the ticker can never advance while the probe waits, and the
+    probe gives up at a deliberately generous deadline and flags
+    starvation.
+
+    The previous shape bounded the ticker's max inter-tick gap by an
+    absolute, load-adaptive ceiling; a scheduler stall on a saturated
+    runner blew the ceiling with the invariant intact (a 1.87s gap against
+    the 0.40s floor at a commit whose diff contained zero Python files).
+    Polling for the property makes host contention cost only wall-clock,
+    never the verdict, while an on-loop regression still fails
+    deterministically: ticks CANNOT happen while the loop is blocked, so no
+    amount of waiting turns a mutant green.
+    """
+
+    # Ticks a probe must observe while the slow work is in flight. Each tick
+    # proves the loop scheduled another coroutine DURING the work; requiring
+    # a handful rules out a single lucky wakeup counting as liveness.
+    _MIN_TICKS_DURING_WORK = 5
+    # How long a probe waits for those ticks before declaring the loop
+    # starved. Generous on purpose (testing-conventions § Determinism: poll
+    # with a generous deadline): a loaded host only DELAYS ticks, so
+    # contention costs wall-clock, never the verdict. Only a blocked loop —
+    # where ticks cannot happen at all — exhausts it, so this is paid only
+    # on a genuinely regressed run.
+    _PROBE_DEADLINE_SECS = 30.0
+
+    @staticmethod
+    def _make_ticker(state: dict):
+        """A coroutine that advances ``state['ticks']`` whenever the loop is free.
+
+        Stand-in for the loop-stall watchdog heartbeat: anything that blocks
+        the loop freezes this counter for the whole block.
+        """
+
+        async def _ticker():
+            while True:
+                await asyncio.sleep(0.01)
+                state["ticks"] += 1
+
+        return _ticker
+
+    def _make_probe(self, state: dict, label: str, result=None):
+        """A stand-in for slow init work that polls the loop-liveness property.
+
+        Runs in whatever execution context production invokes it in. Off the
+        loop (the fixed shape) the ticker keeps running, the tick delta
+        reaches ``_MIN_TICKS_DURING_WORK`` almost immediately, and *label* is
+        recorded in ``state['probed']``. On the loop (the regressed shape)
+        the ticker is starved for exactly as long as this function runs, the
+        delta can never advance, and *label* lands in ``state['starved']``
+        once the deadline expires.
+        """
+
+        def _probe(*args, **kwargs):
+            start = state["ticks"]
+            give_up = time.monotonic() + self._PROBE_DEADLINE_SECS
+            while state["ticks"] - start < self._MIN_TICKS_DURING_WORK:
+                if time.monotonic() >= give_up:
+                    state["starved"].append(label)
+                    return result
+                time.sleep(0.01)
+            state["probed"].append(label)
+            return result
+
+        return _probe
+
+    @pytest.mark.asyncio
+    async def test_slow_pip_install_does_not_starve_heartbeat(self):
+        orch = _make_orchestrator()
+        state: dict = {"ticks": 0, "starved": [], "probed": []}
+        _ticker = self._make_ticker(state)
+
+        async def _async_exec(*args, **kwargs):
+            # The FIXED shape: production awaits communicate() on the loop,
+            # so this waits for the ticker asynchronously — each await IS the
+            # loop servicing another callback, which is the property.
+            proc = MagicMock()
+            proc.returncode = 0
+            proc.kill = MagicMock()
+
+            async def _communicate():
+                start = state["ticks"]
+                give_up = time.monotonic() + self._PROBE_DEADLINE_SECS
+                while state["ticks"] - start < self._MIN_TICKS_DURING_WORK:
+                    if time.monotonic() >= give_up:
+                        state["starved"].append("pip-communicate")
+                        return (b"", b"")
+                    await asyncio.sleep(0.01)
+                state["probed"].append("pip-communicate")
+                return (b"", b"")
+
+            proc.communicate = MagicMock(side_effect=_communicate)
+            return proc
+
+        # The OLD, buggy shape: a mutant reverted to subprocess.run invokes
+        # this synchronously ON the loop, where the probe's ticks can never
+        # arrive — it flags starvation at the deadline. Patched on the
+        # subprocess MODULE (not the gateway namespace) because the fixed
+        # gateway no longer imports subprocess at all.
+        _blocking_run = self._make_probe(
+            state,
+            "pip-blocking-run",
+            result=MagicMock(returncode=0, stdout="", stderr=b""),
+        )
+
+        with patch("importlib.util.find_spec", return_value=None):
+            with patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/proj"}):
+                with patch.object(
+                    GatewayOrchestrator, "_is_brazil_install", return_value=False
+                ):
+                    with patch(
+                        "asyncio.create_subprocess_exec", side_effect=_async_exec
+                    ):
+                        with patch(
+                            "subprocess.run",
+                            side_effect=_blocking_run,
+                        ):
+                            ticker_task = asyncio.create_task(_ticker())
+                            try:
+                                # Above every probe deadline so a regressed
+                                # run fails on the starvation assert below,
+                                # not on a torn-down timeout.
+                                await asyncio.wait_for(
+                                    orch._check_missing_deps(), timeout=60
+                                )
+                            finally:
+                                ticker_task.cancel()
+        assert state["starved"] == [], (
+            f"loop starved during dep install: {state['starved']} observed no "
+            f"ticker progress within {self._PROBE_DEADLINE_SECS:.0f}s"
+        )
+        assert "pip-communicate" in state["probed"], (
+            "dep install never awaited the async subprocess — the loop-free "
+            f"path was not taken (probed={state['probed']})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_slow_fts_rebuild_does_not_starve_heartbeat(self):
+        """rebuild_index and vector init scale with usage; both must run off-loop."""
+        orch = _make_orchestrator(slack_enabled=False)
+        state: dict = {"ticks": 0, "starved": [], "probed": []}
+        _ticker = self._make_ticker(state)
+
+        mock_mem_inst = MagicMock()
+        mock_mem_inst.init = MagicMock()
+        mock_mem_inst.rebuild_index = MagicMock(
+            side_effect=self._make_probe(state, "rebuild-index", result=3)
+        )
+        mock_vm_inst = MagicMock()
+        mock_vm_inst.init = MagicMock(
+            side_effect=self._make_probe(state, "vector-init")
+        )
+        with patch("kiro_crew.slack.gateway.MemoryStore", return_value=mock_mem_inst):
+            with patch("kiro_crew.vector_memory.VectorMemoryStore") as mock_vm:
+                mock_vm.return_value = mock_vm_inst
+                with patch("kiro_crew.slack.gateway.SkillsLoader"):
+                    with patch("kiro_crew.slack.gateway.HookManager"):
+                        with patch("kiro_crew.slack.gateway.LessonStore"):
+                            with patch("kiro_crew.slack.gateway.ContextBuilder"):
+                                with patch("kiro_crew.slack.gateway.ConversationLog", return_value=MagicMock()):
+                                    with patch("kiro_crew.slack.gateway.SessionManager"):
+                                        with patch("kiro_crew.slack.gateway.HistoryConsolidator"):
+                                            with patch("kiro_crew.slack.gateway.ChannelHistory"):
+                                                with patch("kiro_crew.agent.rebuild_agent_config", return_value=Path("/tmp/a")):
+                                                    with patch(
+                                                        "asyncio.create_subprocess_exec",
+                                                        new=AsyncMock(return_value=_fake_async_proc(stdout=b"kiro-cli 1.30.0")),
+                                                    ):
+                                                        ticker_task = asyncio.create_task(_ticker())
+                                                        try:
+                                                            # Above the sum of both probe
+                                                            # deadlines so a regressed run
+                                                            # fails on the starvation
+                                                            # assert, not on teardown.
+                                                            await asyncio.wait_for(
+                                                                orch._init_services(), timeout=90
+                                                            )
+                                                        finally:
+                                                            ticker_task.cancel()
+        assert state["starved"] == [], (
+            f"loop starved during service init: {state['starved']} observed no "
+            f"ticker progress within {self._PROBE_DEADLINE_SECS:.0f}s"
+        )
+        assert {"rebuild-index", "vector-init"} <= set(state["probed"]), (
+            "service init skipped a probed call — the invariant was not "
+            f"exercised (probed={state['probed']})"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5576,14 +5898,128 @@ class TestChannelTransportStartGate:
         assert orch._socket_client is socket_client
 
 
-class TestMandatoryUpdateOnWheelInstall:
-    """A policy min-version makes an update mandatory. On a wheel/cli.sh install
-    the git-based auto-apply cannot run, so the mandatory branch must NOTIFY
-    (warn + light the dashboard badge) instead of silently returning — which is
-    what it did before, leaving the host below the floor with no signal."""
+class TestProviderFailureDoesNotFallBackToLegacy:
+    """A policy-selected provider OWNS the update. Falling through to the legacy
+    updater on its failure would run the built-in git/CDN update on a host whose
+    administrator selected a different package manager."""
 
     @pytest.mark.asyncio
-    async def test_mandatory_update_on_wheel_notifies_not_silent(self, monkeypatch):
+    async def test_provider_raising_does_not_run_legacy(self, monkeypatch):
+        from kiro_crew.platform.update_provider import CommandProvider
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+
+        provider = CommandProvider(check_command="c", apply_command="a")
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_provider.resolve_provider", lambda: provider
+        )
+        boom = AsyncMock(side_effect=RuntimeError("provider exploded"))
+        monkeypatch.setattr(orch, "_check_for_updates_via_provider", boom)
+        legacy = AsyncMock()
+        monkeypatch.setattr(orch, "_check_for_updates_legacy", legacy)
+
+        # Contained, not propagated: this runs on the gateway boot path.
+        await orch._check_for_updates()
+
+        legacy.assert_not_awaited()
+        boom.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resolution_failure_still_uses_legacy(self, monkeypatch):
+        """Only RESOLUTION failures may fall back: if the policy cannot be read
+        we do not know a provider was selected, so built-in behaviour is right."""
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+
+        def _boom():
+            raise RuntimeError("policy unreadable")
+
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_provider.resolve_provider", _boom
+        )
+        legacy = AsyncMock()
+        monkeypatch.setattr(orch, "_check_for_updates_legacy", legacy)
+
+        await orch._check_for_updates()
+        legacy.assert_awaited_once()
+
+
+class TestWheelInstallerRejectsUnsafeCdnBase:
+    """The installer command embeds the CDN bases and is handed to a shell, and
+    KIROCREW_CDN_BASE is operator-set, so a metacharacter could append a second
+    command. `kirocrew update` already gates on this; the unattended path must too."""
+
+    @pytest.mark.asyncio
+    async def test_unsafe_base_refuses_before_spawning(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        handlers._update_info.clear()
+        handlers._update_info.update({"update_command": "curl x | sh"})
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: False
+        )
+        spawn = AsyncMock()
+        monkeypatch.setattr("asyncio.create_subprocess_exec", spawn)
+
+        await orch._auto_apply_wheel_update()
+
+        spawn.assert_not_awaited()
+        ds.push_refresh.assert_called_with("update_available")
+
+
+class TestProviderNotificationIsVisible:
+    """The SSE snapshot renders the update badge from _update_info["available"],
+    which only the legacy check writes. A provider carries its own result, so
+    notifying without publishing it left the badge reading a stale False and the
+    operator never saw a waiting policy-defined update."""
+
+    @pytest.mark.asyncio
+    async def test_auto_update_off_publishes_state_before_notifying(self, monkeypatch):
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+        from kiro_crew.platform.update_provider import UpdateCheckResult
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        handlers._update_info.clear()
+        handlers._update_info.update({"available": False})
+        monkeypatch.setattr(gov, "update_required", lambda _v: False)
+
+        cfg = MagicMock()
+        cfg.auto_update = False
+        # A real provider: the method asserts isinstance(provider, UpdateProvider),
+        # which a bare MagicMock does not satisfy.
+        from kiro_crew.platform.update_provider import CommandProvider
+
+        provider = CommandProvider(check_command="c", apply_command="a")
+        provider.check = AsyncMock(  # type: ignore[method-assign]
+            return_value=UpdateCheckResult(available=True, remote_version="9.9.9")
+        )
+
+        with patch("kiro_crew.config.KiroCrewConfig.load", return_value=cfg):
+            await orch._check_for_updates_via_provider(provider)
+
+        # The badge must be able to see it, not just the log.
+        assert handlers._update_info["available"] is True
+        assert handlers._update_info["remote_version"] == "9.9.9"
+        ds.push_refresh.assert_called_with("update_available")
+
+
+class TestMandatoryUpdateOnWheelInstall:
+    """A policy min-version makes an update mandatory. On a wheel/cli.sh install
+    the gateway now auto-applies via the signed installer (cli.sh handles
+    RSA-SHA256 verification). The _auto_apply_wheel_update method is called
+    instead of merely lighting the dashboard badge."""
+
+    @pytest.mark.asyncio
+    async def test_mandatory_update_on_wheel_auto_applies(self, monkeypatch):
         import kiro_crew.dashboard.handlers as handlers
         import kiro_crew.platform.update_governance as gov
 
@@ -5594,14 +6030,14 @@ class TestMandatoryUpdateOnWheelInstall:
         async def _noop_check():
             return None
 
-        # Wheel install below a policy floor: a feed-checkable layout reports
-        # self_updatable False, and the check can leave available False (a
-        # pre-release remote reads as not-newer) even though the floor mandates
-        # the update. Start from available False to prove the branch lights it.
+        # Wheel install below a policy floor with a NEWER build available: the
+        # mandatory update applies. (A mandatory floor with no newer build is
+        # covered by test_mandatory_wheel_no_newer_build_notifies below — that
+        # path must NOT apply, to avoid an infinite update→restart loop.)
         handlers._update_info.clear()
         handlers._update_info.update(
             {
-                "available": False,
+                "available": True,
                 "self_updatable": False,
                 "install_kind": "wheel",
                 # A feed-checkable wheel carries an installer command; that is
@@ -5615,15 +6051,53 @@ class TestMandatoryUpdateOnWheelInstall:
 
         apply_called = AsyncMock()
         monkeypatch.setattr(orch, "_auto_apply_update", apply_called)
+        wheel_apply_called = AsyncMock()
+        monkeypatch.setattr(orch, "_auto_apply_wheel_update", wheel_apply_called)
 
         await orch._check_for_updates()
 
-        # Must NOT attempt the git apply on a non-git tree, and must surface it.
+        # Must NOT attempt the git apply on a non-git tree.
         apply_called.assert_not_awaited()
-        ds.push_refresh.assert_called_once_with("update_available")
-        # The dashboard badge reads _update_info["available"]; a mandatory
-        # update must light it even though the check left it False.
-        assert handlers._update_info.get("available") is True
+        # Must call the wheel auto-apply for mandatory updates.
+        wheel_apply_called.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mandatory_wheel_no_newer_build_notifies(self, monkeypatch):
+        """A wheel install below the floor but with NO newer build available
+        must NOT apply — applying would reinstall the same below-floor version
+        and execv-restart into the same state forever. It notifies instead."""
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+
+        async def _noop_check():
+            return None
+
+        handlers._update_info.clear()
+        handlers._update_info.update(
+            {
+                "available": False,  # floor pinned above the latest build
+                "self_updatable": False,
+                "install_kind": "wheel",
+                "update_command": "curl -fsSL … | sh",
+            }
+        )
+        monkeypatch.setattr(handlers, "_do_update_check", _noop_check)
+        monkeypatch.setattr(gov, "update_required", lambda _v: True)
+        monkeypatch.setattr(gov, "min_version", lambda: "9.9.9")
+
+        wheel_apply_called = AsyncMock()
+        monkeypatch.setattr(orch, "_auto_apply_update", AsyncMock())
+        monkeypatch.setattr(orch, "_auto_apply_wheel_update", wheel_apply_called)
+
+        await orch._check_for_updates()
+
+        # Must NOT apply (would loop); must notify via the dashboard badge.
+        wheel_apply_called.assert_not_awaited()
+        ds.push_refresh.assert_called_with("update_available")
 
     @pytest.mark.asyncio
     async def test_mandatory_update_on_externally_managed_does_not_badge(self, monkeypatch):

@@ -105,6 +105,28 @@ class PostureControl:
 # Where a sink runs only ONE of the two scanners, its detail text says so.
 _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
     (
+        "Browser CLI install failures",
+        "browser_cli/install.py",
+        "The stderr of a failed `npm install -g @playwright/cli` / browser download, "
+        "which reaches TWO surfaces: a `logger.warning` line (durable, and pasted "
+        "into bug reports via `kirocrew logs`) and the Settings > Browser error card. "
+        "npm quotes the command's own environment back on failure, so the text can "
+        "carry a registry `_authToken`, an inline-credential proxy URL, or a "
+        "`*_TOKEN=` echo -- shapes the shared credential family does NOT match, so "
+        "this sink adds its own npm patterns on top of the shared two-pass and "
+        "redacts at the source rather than at either boundary.",
+    ),
+    (
+        "Session intent summaries",
+        "session_summary.py",
+        "Intent-summary payloads persisted to the `.intents` sidecar and served by "
+        "`GET /api/chat/slots/{slot}/summary`. The payload is model output derived "
+        "from transcript text, so a secret or beacon URL pasted into the chat can be "
+        "reproduced inside it; `normalize_payload` runs the whole nested payload "
+        "through the credential + exfiltration-URL chain before the write, because "
+        "the sidecar is durable and read straight back to the panel.",
+    ),
+    (
         "Session storage inventory",
         "dashboard/handlers/session_storage.py",
         "A session's title and its first message, served by "
@@ -167,6 +189,18 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "and the peer stores it 0600 — so Layer B never leaves the operator's own "
         "trust boundary. Inbound Layer B is validated structurally (parse-only, "
         "never rewritten) and refused whole if any record does not parse.",
+    ),
+    (
+        "Federated session search",
+        "dashboard/handlers_instances.py",
+        "Rows returned by GET /api/instances/search-sessions, straight to the "
+        "browser. Two distinct inputs make it an output boundary of its own: "
+        "PEER rows are untrusted remote JSON (allowlist-reshaped, then title/"
+        "snippet re-redacted locally — the peer claims to have scrubbed, this "
+        "hub does not take its word for it), and LOCAL rows come from "
+        "conversation_log.search_sessions directly, bypassing the "
+        "/api/sessions/search handler where the local redaction normally runs, "
+        "so the same title/snippet scrub is applied here.",
     ),
     (
         "Profile artifact",
@@ -348,6 +382,14 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "to the browser.",
     ),
     (
+        "Session detach notice",
+        "dashboard/state.py",
+        "The notice sent to a channel whose session-resume binding was cleared — a "
+        "separate egress boundary from the browser payload, and its session title is "
+        "user-controlled, so the rendered notice is re-scanned through the shared "
+        "display_safe sink before it reaches the transport.",
+    ),
+    (
         "Channel session surfacing",
         "dashboard/channel_slots.py",
         "Titles and hydrated transcript of a Slack/Discord/Teams conversation as it is "
@@ -438,6 +480,14 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "Workflow injections",
         "dashboard/workflow_inject.py",
         "Workflow progress summaries injected back into a session.",
+    ),
+    (
+        "Crew Mode delivery",
+        "crew_chat.py",
+        "Every crew-slot post (`_post`): forwarded subagent summaries/errors, "
+        "decision-agent questions, and topic-meta renders — all LLM-authored — "
+        "written to the transcript, broadcast over WS, and persisted to the "
+        "conversation log.",
     ),
     (
         "Onboarding import",
@@ -578,6 +628,27 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "abort a send when redaction would alter the content — not egress.)",
     ),
     (
+        "MCP custom server specs",
+        "dashboard/handlers/mcp_custom.py",
+        "Editable MCP server specs returned by the dashboard HTTP API to the browser. "
+        "Configured header values receive credential redaction only before they cross "
+        "that boundary.",
+    ),
+    (
+        "MCP probe results",
+        "dashboard/handlers/mcp.py",
+        "Cached MCP probe results returned by the dashboard HTTP API to the browser. "
+        "Configured header values and reflected credentials in probe errors receive "
+        "redaction before they cross that boundary.",
+    ),
+    (
+        "MCP server metadata",
+        "mcp_discovery.py",
+        "McpServerInfo.to_dict() is the serialization boundary for every dashboard "
+        "MCP listing; header values and reflected credentials in probe errors are "
+        "redacted there before the payload leaves the backend.",
+    ),
+    (
         "MCP app tool results",
         "dashboard/handlers/mcp_apps.py",
         "Recursively redacts every string leaf of an MCP app's tool result before "
@@ -715,10 +786,20 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # goes out to a human.
         "context.py",
         "agent.py",
+        # Gate-side log hygiene: the update provider redacts an update command's
+        # stderr before writing it to the gateway log. It is a boot-time
+        # operational log line, not an output boundary bound for a human or a
+        # third party — the redaction is defensive so a credential-bearing
+        # installer error cannot leak into the log ring / /api/logs stream.
+        "platform/update_provider.py",
         # The shared recursive redactor helper itself — a pure scrubber, not an
         # egress boundary; the modules that CALL it (mochi routes/hooks) are the
         # registered sinks.
         "apps/builtins/mochi/redact.py",
+        # Same shape: hosts _redact_memory_field, the shared recursive scrubber
+        # for memory fields. It owns no output of its own — the handler modules
+        # that call it (memory.py, cron.py) are the covered surfaces.
+        "dashboard/handlers/_shared.py",
         # Same shape: applies a redactor the CALLER injects, to scan the form a
         # platform will actually render (markup collapsed, ANSI stripped). It owns
         # no output of its own -- the registered sinks are the modules that call
@@ -727,9 +808,19 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "autonudge_authz.py",
         "acp/_dispatch.py",
         "acp/client.py",
+        # Redacts the tool title in the auto-rejected-permission WARNING (a
+        # gate-side log line) and defers user-facing display to the routed
+        # permission event, whose sinks are already registered.
+        "acp/runtime.py",
         "acp/session_handle.py",
         "platform/defaults.py",
         "platform/interfaces.py",
+        # Inbound sanitization: the browser MCP tool redacts UNTRUSTED native-panel
+        # content (a page's text/console output) before it returns into the agent's
+        # context. It scrubs what comes IN from an untrusted web page, not an output
+        # bound for a third party -- so it is defensive input hygiene, not an egress
+        # sink.
+        "mcp_tools/browser.py",
         # Comparison-only: applies the redactors to compute a match identity and
         # discards the result. The two files being merged can hold the same
         # message with and without redaction, so a raw comparison would keep both
@@ -784,7 +875,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "dashboard/handlers/discover.py",
         "dashboard/handlers/hooks.py",
         "dashboard/handlers/knowledge.py",
-        "dashboard/handlers/mcp.py",
         "dashboard/handlers/memory.py",
         "dashboard/handlers/optimizer.py",
         "dashboard/handlers/prompts.py",
@@ -802,13 +892,38 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "knowledge/ingestion.py",
         "mcp_core.py",
         "mcp_cron.py",
-        "mcp_discovery.py",
+        # Same class as mcp_core.py: an MCP stdio server redacts tool RESULTS and
+        # agent-authored names before they are persisted or returned, but the
+        # egress boundary itself is the transport the result crosses, not this
+        # module.
+        "mcp_dashboard.py",
         "mcp_gateway/backend.py",
+        # The kirocrew-core tool handlers, moved out of mcp_core.py into their
+        # domain modules. Same classification as mcp_core.py above for the same
+        # reason: a tool result's user-visible surface is a registered sink
+        # downstream, and these redact before returning to it. `learn.py` is
+        # absent because it calls no redactor -- the allowlist is checked for
+        # stale entries too.
+        "mcp_tools/apps.py",
+        "mcp_tools/artifacts.py",
+        "mcp_tools/control.py",
+        "mcp_tools/knowledge.py",
+        "mcp_tools/messaging.py",
+        "mcp_tools/sessions.py",
+        "mcp_tools/skills.py",
+        "mcp_tools/spawn.py",
+        "mcp_tools/workflows.py",
         "workflows/agent_exec.py",
         "workflows/agent_pool.py",
         "workflows/runner.py",
         "workflows/store.py",
         "apps/event_bus.py",
+        # Redacts agent progress text INBOUND, before it is persisted into the
+        # app's own queue JSON (`/thread`). Because the stored copy is already
+        # scrubbed, every later read of it — the panel's own `/queue`, and the
+        # thread rendered beside a pin — serves clean data, so there is no
+        # separate egress boundary to register.
+        "apps/builtins/design_tweak/backend/server.py",
         "sync_bridge.py",
         "suggestions.py",
         "tips.py",
@@ -854,7 +969,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # Redaction of a LOG line or a diagnostic URL/token, not agent output on
         # its way to a user. These match the (deliberately broad) redactor regex
         # in the drift guard but are not egress paths.
-        "browser/setup.py",
         "cli_doctor.py",
         "cloud/connect.py",
         "cloud/login.py",
@@ -912,6 +1026,15 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # are the app's own surface, same classification as its siblings above.
         "apps/builtins/code_review_sage/sage_lib/store.py",
         "apps/builtins/code_review_sage/sage_lib/discovery.py",
+        # `followup` scrubs every turn of a review's stored question history at
+        # its read boundary: the reviewer can repeat a credential it read in the
+        # diff, a tool title carries the arguments it was called with, and it can
+        # write that file itself. `backend/routes` scrubs the reviewed pull
+        # request's title before it becomes a chat session's name. Same
+        # classification as their siblings — the app's own surface, rendered by
+        # this app's panel, not a core egress path.
+        "apps/builtins/code_review_sage/sage_lib/followup.py",
+        "apps/builtins/code_review_sage/backend/routes.py",
         "apps/builtins/dev_fleet/server.py",
         "apps/builtins/issue_radar/backend/routes.py",
         "apps/builtins/meetings/backend/domain/session.py",
@@ -1081,6 +1204,7 @@ _SCHEMA_REGISTRY_NAMES: tuple[str, ...] = (
     "MCP_CORE_SCHEMAS",
     "MCP_CRON_SCHEMAS",
     "MCP_COMPUTER_SCHEMAS",
+    "MCP_DASHBOARD_SCHEMAS",
 )
 
 

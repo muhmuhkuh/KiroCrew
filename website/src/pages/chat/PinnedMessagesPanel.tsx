@@ -1,9 +1,10 @@
-import { memo, useEffect, useRef, useState } from 'react'
-import { Pin, PinOff, Copy, Link2, X } from 'lucide-react'
+import { memo, useEffect, useState } from 'react'
+import { PinOff, Copy, Link2 } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
 import { fmtDateTime } from '../../i18n/format'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
+import { HOVER_NONE_ACTIONS_ROW_CLS } from '../../utils/touchActions'
 import Clickable from '../../components/Clickable'
 import type { ChatPin } from '../../api/pins'
 
@@ -13,7 +14,6 @@ interface PinnedMessagesPanelProps {
   slotKey: string
   slotTitle?: string
   mode?: string
-  onClose: () => void
   onJumpToMessage: (messageTs: string, mid?: string) => void
   onUnpin: (id: string) => void
 }
@@ -29,54 +29,37 @@ function relativeTime(iso: string, now: number): string {
   return i18nT('pages.chat.pins.days_ago', { count: days })
 }
 
+/**
+ * Body of the side panel's Pins tab.
+ *
+ * Deliberately chrome-less: no title row and no close button. The panel's tab
+ * strip already names this view and owns closing it, so a header here would be
+ * a second title and a second close affordance for one surface.
+ *
+ * No focus-on-mount either, which is what the standalone panel this replaced
+ * used to do to reach its own Escape handler. ActivityViewer's Escape handler is
+ * bound to its container, so it fires once focus is inside the panel and not
+ * while focus is still on the tab-strip control that opened it — the same for
+ * every view in this panel, none of which grabs focus. Taking focus here would
+ * make Pins the only one that does, against the menu's return-focus contract.
+ */
 const PinnedMessagesPanel = memo(function PinnedMessagesPanel({
-  pins, loading, slotKey, slotTitle, mode, onClose, onJumpToMessage, onUnpin,
+  pins, loading, slotKey, slotTitle, mode, onJumpToMessage, onUnpin,
 }: PinnedMessagesPanelProps) {
-  const panelRef = useRef<HTMLDivElement>(null)
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
-    const panel = panelRef.current
-    panel?.focus()
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return
-      event.preventDefault()
-      event.stopPropagation()
-      onClose()
-    }
-    panel?.addEventListener('keydown', handleEscape)
     const interval = window.setInterval(() => setNow(Date.now()), 60_000)
-    return () => {
-      panel?.removeEventListener('keydown', handleEscape)
-      window.clearInterval(interval)
-    }
-  }, [onClose])
+    return () => window.clearInterval(interval)
+  }, [])
 
   return (
     <div
-      ref={panelRef}
       role="region"
-      tabIndex={-1}
       aria-label={i18nT('pages.chat.pins.pinned_messages')}
       className="flex flex-col h-full bg-bg"
       data-testid="pinned-messages-panel"
     >
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-        <div className="flex items-center gap-2 text-sm font-medium text-text">
-          <Pin size={14} />
-          <span>{i18nT('pages.chat.pins.pinned_messages')}</span>
-          {pins.length > 0 && <span className="text-muted text-xs">({pins.length})</span>}
-        </div>
-        <button
-          onClick={onClose}
-          className="text-muted hover:text-text p-1 rounded transition-colors"
-          aria-label={i18nT('pages.chat.pins.close_panel')}
-        >
-          <X size={14} />
-        </button>
-      </div>
-
       {/* Body */}
       <div className="flex-1 overflow-y-auto px-3 py-2">
         {loading && <div className="text-muted text-sm text-center py-4">{i18nT('pages.chat.pins.loading')}</div>}
@@ -104,8 +87,8 @@ const PinnedMessagesPanel = memo(function PinnedMessagesPanel({
             <div className="text-sm text-text line-clamp-2 leading-snug">
               {pin.preview}
             </div>
-            {/* Hover actions */}
-            <div className="flex items-center gap-1 mt-0.5 opacity-0 group-hover/pin:opacity-100 transition-opacity">
+            {/* Hover actions — forced visible + 40px targets where the pointer cannot hover */}
+            <div className={`flex items-center gap-1 mt-0.5 opacity-0 group-hover/pin:opacity-100 transition-opacity ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
               <button
                 onClick={(e) => { e.stopPropagation(); copyToClipboard(pin.preview) }}
                 className="text-muted hover:text-text p-0.5 rounded transition-colors"

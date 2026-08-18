@@ -44,6 +44,9 @@ import reducer, {
   selectSlotPendingSpawnApprovals,
   selectSlotPendingApproval,
   selectComposerBusy,
+  sweepStaleOptimistic,
+  confirmOptimisticSend,
+  OPTIMISTIC_TIMEOUT_MS,
 } from '../store/chatSlice'
 import './mockApiClient'
 
@@ -851,6 +854,313 @@ describe('sseChatMessage', () => {
     expect(state.messages).toHaveLength(1)
     expect(state.messages[0].role).toBe('permission')
   })
+
+  it('reconciles user echo (with mid) even when assistant frames arrived first (#2845)', () => {
+    // Race condition: user sends a message, agent starts streaming before the
+    // server echoes the user frame with its mid. The reconcile uses the
+    // client-generated sendId to correlate the echo with its optimistic bubble.
+    let state = withSlot
+    // 1. Optimistic user bubble via appendMessage (like ChatPage send handler).
+    state = reducer(state, appendMessage({ role: 'user', content: 'deploy to prod', cls: '', ts: '2026-08-11T09:59:59.000000+00:00', meta: { sendId: 's-test-123' } }))
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[0].meta?.sendId).toBe('s-test-123')
+
+    // 2. Agent starts streaming before the user echo arrives.
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'Starting deployment...' }))
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[1].role).toBe('streaming')
+
+    // 3. Server echoes the user frame WITH mid AND the same sendId.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'deploy to prod',
+      ts: '2026-08-11T10:00:00.000000+00:00', meta: { mid: 'm-user-1', sendId: 's-test-123' },
+    }))
+
+    // Should NOT duplicate the user message — still 2 messages total.
+    expect(state.messages).toHaveLength(2)
+    // The original user bubble now has the mid from the server echo.
+    expect(state.messages[0].role).toBe('user')
+    expect(state.messages[0].content).toBe('deploy to prod')
+    expect(state.messages[0].meta?.mid).toBe('m-user-1')
+    expect(state.messages[0].ts).toBe('2026-08-11T10:00:00.000000+00:00')
+    // Optimistic marker cleared after reconcile.
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('reconciles user echo even when tool frames intervene (#2845)', () => {
+    let state = withSlot
+    // 1. Optimistic user bubble via appendMessage.
+    state = reducer(state, appendMessage({ role: 'user', content: 'fix the bug', cls: '', ts: '2026-08-11T10:00:59.000000+00:00', meta: { sendId: 's-test-456' } }))
+    // 2. Tool frame arrives (agent called a tool before echo).
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'tool', content: '🔧 bash' }))
+    // 3. Streaming starts.
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'Reading...' }))
+    expect(state.messages).toHaveLength(3)
+
+    // 4. Server echo with mid and sendId.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'fix the bug',
+      ts: '2026-08-11T10:01:00.000000+00:00', meta: { mid: 'm-user-2', sendId: 's-test-456' },
+    }))
+
+    // No duplicate — still 3.
+    expect(state.messages).toHaveLength(3)
+    expect(state.messages[0].role).toBe('user')
+    expect(state.messages[0].meta?.mid).toBe('m-user-2')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('does not reconcile a message with different sendId even if content matches (#2845)', () => {
+    let state = withSlot
+    // Optimistic bubble with one sendId.
+    state = reducer(state, appendMessage({ role: 'user', content: 'yes', cls: '', ts: '2026-08-11T10:00:00.000000+00:00', meta: { sendId: 's-mine' } }))
+
+    // A distinct channel message with same content but a DIFFERENT sendId
+    // (or no sendId) — must NOT be consumed.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'yes',
+      ts: '2026-08-11T10:00:01.000000+00:00', meta: { mid: 'm-channel', sendId: 's-other' },
+    }))
+
+    // Both messages kept — different sendIds mean different sends.
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
+    // Original optimistic bubble still has its sendId and is still optimistic.
+    expect(state.messages[0].meta?.sendId).toBe('s-mine')
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+  })
+
+  it('does not reconcile channel messages that lack sendId', () => {
+    let state = withSlot
+    // Optimistic bubble.
+    state = reducer(state, appendMessage({ role: 'user', content: 'hello', cls: '', ts: '2026-08-11T10:00:00.000000+00:00', meta: { sendId: 's-abc' } }))
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'working...' }))
+
+    // Channel message with same content but no sendId.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'hello',
+      ts: '2026-08-11T10:00:02.000000+00:00', meta: { mid: 'm-chan' },
+    }))
+
+    // Not reconciled — pushed as new.
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
+  })
+
+  it('does not reconcile into a steered user message', () => {
+    let state = withSlot
+    // A steered user message (meta.steer = true) — these have their own
+    // reconcile path and lifecycle; the regular echo must not touch them.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'steer instruction',
+      meta: { steer: true, mid: 'm-steer-1' },
+    }))
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'following steer...' }))
+    expect(state.messages).toHaveLength(2)
+
+    // A regular echo arrives with same content — should push as new, not
+    // mutate the steered bubble.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'steer instruction',
+      ts: '2026-08-11T09:04:00.000000+00:00', meta: { mid: 'm-new-user' },
+    }))
+    expect(state.messages).toHaveLength(3)
+    // The steered bubble is untouched.
+    expect(state.messages[0].meta?.steer).toBe(true)
+    expect(state.messages[0].meta?.mid).toBe('m-steer-1')
+  })
+})
+
+describe('sseChatMessage — pipelined sends reconcile (#3898)', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withSlot = { ...initial, activeSlot: 'slot-1' }
+
+  it('reconciles echo for first message when second was sent before echo arrived', () => {
+    let state = withSlot
+    // User sends message A, then message B in quick succession (pipelined).
+    state = reducer(state, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-first' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-second' } }))
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(state.messages[1].meta?.optimistic).toBe(true)
+
+    // Echo for message A arrives — must find it past message B.
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'first',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-first', sendId: 's-first' },
+    }))
+
+    // Should NOT duplicate — still 2 messages.
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.mid).toBe('m-first')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    // sendId stripped after reconcile
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    // Second message still optimistic
+    expect(state.messages[1].meta?.optimistic).toBe(true)
+    expect(state.messages[1].meta?.sendId).toBe('s-second')
+  })
+
+  it('reconciles echo for second message after first was already reconciled', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-first' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-second' } }))
+
+    // Reconcile first
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'first',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-first', sendId: 's-first' },
+    }))
+    // Reconcile second
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'second',
+      ts: '2026-08-16T10:00:01.100Z', meta: { mid: 'm-second', sendId: 's-second' },
+    }))
+
+    expect(state.messages).toHaveLength(2)
+    expect(state.messages[0].meta?.mid).toBe('m-first')
+    expect(state.messages[1].meta?.mid).toBe('m-second')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    expect(state.messages[1].meta?.optimistic).toBeUndefined()
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    expect(state.messages[1].meta?.sendId).toBeUndefined()
+  })
+
+  it('reconciles pipelined sends even with streaming frames interleaved', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'msg-a', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-a' } }))
+    // Streaming from first turn starts
+    state = reducer(state, sseChatMessage({ slot: 'slot-1', role: 'chunk', content: 'Thinking...' }))
+    // User sends second message (new turn)
+    state = reducer(state, appendMessage({ role: 'user', content: 'msg-b', cls: '', ts: '2026-08-16T10:00:02.000Z', meta: { sendId: 's-b' } }))
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
+
+    // Echo for msg-a arrives
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'msg-a',
+      ts: '2026-08-16T10:00:00.050Z', meta: { mid: 'm-a', sendId: 's-a' },
+    }))
+
+    // Should reconcile without duplication
+    const userMsgs = state.messages.filter(m => m.role === 'user')
+    expect(userMsgs).toHaveLength(2)
+    expect(userMsgs[0].meta?.mid).toBe('m-a')
+    expect(userMsgs[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('strips sendId from meta after successful reconcile', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'hello', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-hello' } }))
+    expect(state.messages[0].meta?.sendId).toBe('s-hello')
+
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'hello',
+      ts: '2026-08-16T10:00:00.100Z', meta: { mid: 'm-hello', sendId: 's-hello' },
+    }))
+
+    // sendId stripped — it was a wire-only correlation ID
+    expect(state.messages[0].meta?.sendId).toBeUndefined()
+    expect(state.messages[0].meta?.mid).toBe('m-hello')
+  })
+
+  it('sweepStaleOptimistic marks timed-out bubbles as stale', () => {
+    let state = withSlot
+    // Simulate an optimistic message with an old timestamp by using a custom
+    // appendMessage with a backdated optimisticTs (Immer freezes state, so
+    // we dispatch a raw action with the timestamp already set).
+    const oldTs = Date.now() - 35_000
+    state = reducer(state, appendMessage({ role: 'user', content: 'old msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-old', optimistic: true, optimisticTs: oldTs } }))
+
+    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
+
+    expect(state.messages[0].meta?.stale).toBe(true)
+    expect(state.messages[0].meta?.optimistic).toBe(true) // still optimistic, just stale
+  })
+
+  it('sweepStaleOptimistic does not mark fresh optimistic bubbles as stale', () => {
+    let state = withSlot
+    state = reducer(state, appendMessage({ role: 'user', content: 'fresh msg', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-fresh' } }))
+    // optimisticTs is Date.now() — fresh
+
+    state = reducer(state, { type: 'chat/sweepStaleOptimistic' })
+
+    expect(state.messages[0].meta?.stale).toBeUndefined()
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+  })
+})
+
+/* #4131: the ONLY confirmation the dashboard composer ever receives is its own
+ * HTTP response. `DashboardState.append` suppresses the `chat_message` user echo
+ * for every dashboard send by design (`broadcast_user=False`, because the
+ * composer already rendered the bubble), so a surface that waits for the echo
+ * waits forever and the 30s sweep flags every message the user sends. */
+describe('confirmOptimisticSend — the send response retires the pending state', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withSlot = { ...initial, activeSlot: 'slot-1' }
+
+  it('clears the flags so a later sweep cannot flag an aged-out bubble', () => {
+    let state = reducer(withSlot, appendMessage({
+      role: 'user', content: 'ship it', cls: '', ts: '2026-08-16T10:00:00.000Z',
+      // Backdated past the timeout: without the confirm below, the next sweep
+      // would mark this stale and render "may not have been delivered".
+      meta: { sendId: 's-confirm-1', optimistic: true, optimisticTs: Date.now() - (OPTIMISTIC_TIMEOUT_MS + 5_000) },
+    }))
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-confirm-1' }))
+    state = reducer(state, sweepStaleOptimistic())
+
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    expect(state.messages[0].meta?.optimisticTs).toBeUndefined()
+    expect(state.messages[0].meta?.stale).toBeUndefined()
+    // sendId SURVIVES: a channel-linked slot can still deliver a late echo, and
+    // reconcileOptimisticEcho needs the id to update this row in place rather
+    // than push a duplicate bubble.
+    expect(state.messages[0].meta?.sendId).toBe('s-confirm-1')
+  })
+
+  it('un-warns a bubble the sweep already flagged (slow response, not a lost one)', () => {
+    let state = reducer(withSlot, appendMessage({
+      role: 'user', content: 'slow ack', cls: '', ts: '2026-08-16T10:00:00.000Z',
+      meta: { sendId: 's-confirm-2', optimistic: true, optimisticTs: Date.now() - (OPTIMISTIC_TIMEOUT_MS + 5_000) },
+    }))
+    state = reducer(state, sweepStaleOptimistic())
+    expect(state.messages[0].meta?.stale).toBe(true)
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-confirm-2' }))
+
+    expect(state.messages[0].meta?.stale).toBeUndefined()
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('confirms only the matching send, leaving a sibling in-flight bubble pending', () => {
+    let state = reducer(withSlot, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-a' } }))
+    state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-b' } }))
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-b' }))
+
+    expect(state.messages[0].meta?.optimistic).toBe(true)   // 's-a' still in flight
+    expect(state.messages[1].meta?.optimistic).toBeUndefined()
+  })
+
+  it('confirms a background slot bubble in slotMessages (split-view pane)', () => {
+    let state = reducer(withSlot, appendSlotMessage({
+      slot: 'pane-9',
+      message: { role: 'user', content: 'pane send', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-pane' } } as ChatMessage,
+    }))
+    expect(state.slotMessages['pane-9'][0].meta?.optimistic).toBe(true)
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'pane-9', sendId: 's-pane' }))
+
+    expect(state.slotMessages['pane-9'][0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('is a no-op for an unknown sendId (a busy-slot send appended no bubble)', () => {
+    let state = reducer(withSlot, appendMessage({ role: 'user', content: 'mine', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-mine' } }))
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-someone-else' }))
+
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+  })
 })
 
 describe('sseChatMessage — _segment handling', () => {
@@ -1389,6 +1699,35 @@ describe('slotHistory — session navigation stack', () => {
     expect(state.activeSlot).toBe('new-slot')
   })
 
+  it('createSlot.fulfilled starts the new chat with the side panel CLOSED', () => {
+    // The panel is open on the chat being left. A brand-new slot has no cached
+    // activity bucket, so it must land closed — the same `?? false` every other
+    // slot-entry path applies. Leaking the flag also left it unpersisted under
+    // the new slot's key, so a reload silently closed the panel again.
+    let state = { ...initial, activeSlot: 'A', activityOpen: true }
+    state = reducer(state, {
+      type: 'chat/createSlot/fulfilled',
+      meta: { arg: undefined, requestId: 'r1', requestStatus: 'fulfilled' as const, originActiveSlot: 'A' },
+      payload: { key: 'new-slot' },
+    })
+    expect(state.activityOpen).toBe(false)
+    // The chat being left keeps its own open state in its bucket.
+    expect(state.slotActivity['A']?.activityOpen).toBe(true)
+  })
+
+  it('createSlot.fulfilled leaves the panel alone when the user switched away', () => {
+    // Switched-away guard: the create must not touch the view at all, panel
+    // state included.
+    let state = { ...initial, activeSlot: 'B', activityOpen: true }
+    state = reducer(state, {
+      type: 'chat/createSlot/fulfilled',
+      meta: { arg: undefined, requestId: 'r1', requestStatus: 'fulfilled' as const, originActiveSlot: 'A' },
+      payload: { key: 'new-slot' },
+    })
+    expect(state.activeSlot).toBe('B')
+    expect(state.activityOpen).toBe(true)
+  })
+
   it('deleteSlot.fulfilled cleans deleted key from history', () => {
     let state = { ...initial, activeSlot: 'C', slotHistory: ['A', 'B'] }
     state = reducer(state, {
@@ -1805,12 +2144,81 @@ describe('sseThinkingChunk (model reasoning)', () => {
     state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'answer', seq: 0 }))
     expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(0)
   })
+
+  it('opens a NEW block for each reasoning burst across tool calls', () => {
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'burst one' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'burst two' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 fs_read', meta: { tool_call_id: 't2' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'burst three' }))
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking.map(m => m.content)).toEqual(['burst one', 'burst two', 'burst three'])
+    // emission order preserved: each burst sits next to the step it explains
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'tool', 'thinking'])
+  })
+
+  it('splices a post-tool burst ABOVE the turn\u2019s still-open streaming row', () => {
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'burst one' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'partial answer', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'burst two' }))
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'streaming'])
+    // the turn's text keeps accumulating into that same row, below both blocks
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: ' plus more', seq: 1 }))
+    expect(state.messages.filter(m => m.role === 'streaming')).toHaveLength(1)
+    expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(2)
+  })
+
+  it('keeps one burst when an out-of-band row lands below the open answer', () => {
+    // An approval row / queued bubble / stop event is pushed BELOW the turn's
+    // open streaming row, so the array tail is not the end of the turn.
+    // Measuring from `length` would split this one burst in two and drop the
+    // second half beneath the answer it explains.
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'first ' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'answer so far', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'error', content: '⟳ Connection lost' }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'second' }))
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking).toHaveLength(1)
+    expect(thinking[0].content).toBe('first second')
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'streaming', 'error'])
+  })
+
+  it('closes the burst when an approval pushes the tool call below the open answer', () => {
+    // The `tool` branch steps back over a trailing `streaming` row but not over
+    // an approval row, so an approval-gated call lands BELOW the text. The rows
+    // are then out of emission order and "above the open text row" is no longer
+    // "after the last tool" — the post-tool burst must still not be folded into
+    // the pre-tool block.
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'why the tool' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'pre-tool text', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'permission', content: 'approve?' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 shell', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'what the tool returned' }))
+
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking.map(m => m.content)).toEqual(['why the tool', 'what the tool returned'])
+    // the new burst lands after the tool it followed, not merged into the first
+    expect(state.messages[state.messages.length - 1].role).toBe('thinking')
+  })
+
+  it('keeps one burst when a queued bubble interrupts it before any text', () => {
+    // The user types while the model is still reasoning, so a `queued` row is
+    // appended before the first chunk. It interrupts the burst without ending
+    // it — the reasoning that follows is the same burst, not a second block.
+    let state = reducer(active, sseThinkingChunk({ slot: 'chat-1', content: 'still ' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'queued', content: 'and also check X' }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'thinking' }))
+    const thinking = state.messages.filter(m => m.role === 'thinking')
+    expect(thinking).toHaveLength(1)
+    expect(thinking[0].content).toBe('still thinking')
+  })
 })
 
 describe('thinking survives refreshSlot (client-only reasoning)', () => {
   const base = reducer(undefined, { type: '@@INIT' })
 
-  const refreshPayload = (key: string, messages: { role: string; content: string; cls?: string; ts?: string }[]) => ({
+  const refreshPayload = (key: string, messages: { role: string; content: string; cls?: string; ts?: string; meta?: Record<string, unknown> }[]) => ({
     key, messages, running: false, hasMore: false, total: messages.length, stopping: false,
   })
 
@@ -1847,6 +2255,36 @@ describe('thinking survives refreshSlot (client-only reasoning)', () => {
     state = reducer(state, refreshSlot.fulfilled(payload, 'r1', 'chat-1'))
     state = reducer(state, refreshSlot.fulfilled(payload, 'r2', 'chat-1'))
     expect(state.messages.filter(m => m.role === 'thinking')).toHaveLength(1)
+  })
+
+  it('parks the extra bursts of a multi-tool turn at the tail (known limit, #4218)', () => {
+    // Reasoning is client-only, so the refresh rebuilds the array from server
+    // history that has never seen a thinking row — the position of burst 2+ is
+    // unreconstructible here and they land below the answer. Pinned so the
+    // follow-up that fixes it (producer-side segment boundary, or the
+    // append-only transcript) shows the improvement in its diff rather than
+    // silently changing an untested behaviour. NOT a desired end state.
+    let state = reducer(base, setActiveSlot('chat-1'))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'why t1' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'tool', content: '🔧 grep', meta: { tool_call_id: 't1' } }))
+    state = reducer(state, sseThinkingChunk({ slot: 'chat-1', content: 'why t2' }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: 'chunk', content: 'The answer', seq: 0 }))
+    state = reducer(state, sseChatMessage({ slot: 'chat-1', role: '_done', content: '' }))
+    // live: each burst above the step it explains
+    expect(state.messages.map(m => m.role)).toEqual(['thinking', 'tool', 'thinking', 'assistant'])
+
+    state = reducer(state, refreshSlot.fulfilled(
+      refreshPayload('chat-1', [
+        { role: 'tool', content: '🔧 grep', cls: '', meta: { tool_call_id: 't1' } },
+        { role: 'assistant', content: 'The answer', cls: 'msg msg-a' },
+      ]),
+      'r1', 'chat-1',
+    ))
+
+    // Both blocks survive with the right text; the second one's POSITION does not.
+    expect(state.messages.filter(m => m.role === 'thinking').map(m => m.content))
+      .toEqual(['why t1', 'why t2'])
+    expect(state.messages.map(m => m.role)).toEqual(['tool', 'thinking', 'assistant', 'thinking'])
   })
 })
 

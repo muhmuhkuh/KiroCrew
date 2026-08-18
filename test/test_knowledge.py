@@ -9,6 +9,7 @@ import logging
 import sys
 from datetime import datetime, timedelta
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 
@@ -18,6 +19,7 @@ from kiro_crew.knowledge.extractor import EntityExtractor
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import HybridRetriever, _bytes_to_floats
 from kiro_crew.knowledge.store import KnowledgeStore, SimpleDiGraph
+from kiro_crew.knowledge.sync import SyncScheduler
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -213,7 +215,7 @@ class TestFileReader:
 
     def test_supported_formats(self):
         reader = FileReader()
-        for ext in ('.md', '.txt', '.py', '.html', '.json', '.yaml', '.csv'):
+        for ext in ('.md', '.txt', '.py', '.html', '.json', '.jsonl', '.ndjson', '.yaml', '.csv'):
             assert ext in reader.SUPPORTED, f"{ext} missing from SUPPORTED"
 
 
@@ -563,6 +565,160 @@ class TestKnowledgeStoreExtended:
         assert found is not None
         assert found["id"] == sid
         assert store.get_source_by_uri("/tmp/nope") is None
+
+    def test_add_source_persists_sync_status_column(self, store):
+        """The sync_status column and the properties JSON must agree on insert.
+
+        The dashboard reads the COLUMN to pick the row's control (the Confirm
+        button renders only for 'pending_confirmation'), so a column stuck at
+        the 'pending' default while properties carries 'pending_confirmation'
+        makes a folder source unstartable.
+        """
+        sid = store.add_source(
+            "vault", "local_folder", "/tmp/vault",
+            properties={"sync_status": "pending_confirmation"})
+        row = store.db.execute(
+            "SELECT sync_status, properties FROM sources WHERE id = ?", (sid,)).fetchone()
+        assert row["sync_status"] == "pending_confirmation"
+        assert json.loads(row["properties"])["sync_status"] == "pending_confirmation"
+
+    def test_add_source_sync_status_defaults_to_pending(self, store):
+        """A caller that states no sync_status keeps the column's default."""
+        sid = store.add_source("f", "local_file", "/tmp/nostatus.md", properties={})
+        row = store.db.execute(
+            "SELECT sync_status FROM sources WHERE id = ?", (sid,)).fetchone()
+        assert row["sync_status"] == "pending"
+
+    def test_add_source_rejects_non_initial_sync_status(self, store):
+        """A lifecycle state in properties never seeds the column.
+
+        The create endpoint passes request-body properties through, so a
+        caller-supplied 'syncing' would otherwise persist and make the sync
+        endpoint report a conflict forever for a source whose sync never
+        started. Only genuine initial states pass; the rest fall back to
+        'pending'.
+        """
+        for forged in ("syncing", "synced", "error", "paused", "missing", "garbage"):
+            sid = store.add_source(
+                "f", "local_file", f"/tmp/forged-{forged}.md",
+                properties={"sync_status": forged})
+            row = store.db.execute(
+                "SELECT sync_status FROM sources WHERE id = ?", (sid,)).fetchone()
+            assert row["sync_status"] == "pending", forged
+
+    def test_auto_source_persists_sync_status_column(self, store):
+        """The auto-source insert path keeps the same column/JSON invariant.
+
+        Drop-folder and project-docs auto sources seed sync_status='active' in
+        properties; the column must match or the dashboard renders the stale
+        'pending' control for a source the watcher is actively scanning.
+        """
+        sid, created = store.create_auto_source_unless_dismissed(
+            "drop", "local_folder", "/tmp/auto-drop",
+            {"sync_status": "active", "auto_added": True})
+        assert created and sid is not None
+        row = store.db.execute(
+            "SELECT sync_status FROM sources WHERE id = ?", (sid,)).fetchone()
+        assert row["sync_status"] == "active"
+
+    def test_migration_repairs_divergent_sync_status_rows(self, store, tmp_path):
+        """Reopening a store repairs rows whose column diverged from the JSON.
+
+        Rows inserted while the INSERT paths wrote only the properties JSON
+        have a column stuck at 'pending'; the migration copies the JSON state
+        over so those sources become startable. Rows a handler already
+        transitioned (non-'pending' column) are never touched.
+        """
+        divergent = str(uuid4())
+        live = str(uuid4())
+        agree = str(uuid4())
+        listprops = str(uuid4())
+        forged = str(uuid4())
+        now = datetime.now().isoformat()
+        for sid, column, props_json, uri in (
+            (divergent, "pending", json.dumps({"sync_status": "pending_confirmation"}), "/tmp/div"),
+            (live, "paused", json.dumps({"sync_status": "active"}), "/tmp/live"),
+            (agree, "pending", json.dumps({}), "/tmp/agree"),
+            # Imported/legacy rows can hold non-object JSON; the repair must
+            # skip them instead of crashing store initialization.
+            (listprops, "pending", "[]", "/tmp/listprops"),
+            # A lifecycle state in the JSON is never a valid initial state and
+            # must not be copied over (a forged 'syncing' would lock the sync
+            # endpoint into reporting a conflict).
+            (forged, "pending", json.dumps({"sync_status": "syncing"}), "/tmp/forged"),
+        ):
+            store.db.execute(
+                "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (sid, "s", "local_folder", uri, props_json, column, now, now))
+        store.db.commit()
+        store.close()
+
+        reopened = KnowledgeStore(str(tmp_path / "test.db"))
+        try:
+            rows = {r["id"]: r["sync_status"] for r in reopened.db.execute(
+                "SELECT id, sync_status FROM sources").fetchall()}
+            assert rows[divergent] == "pending_confirmation"
+            assert rows[live] == "paused"
+            assert rows[agree] == "pending"
+            assert rows[listprops] == "pending"
+            assert rows[forged] == "pending"
+        finally:
+            reopened.close()
+
+    def test_migration_skips_a_row_whose_properties_moved_mid_repair(self, store, tmp_path):
+        """A properties-only write landing mid-repair wins over the snapshot.
+
+        The repair reads both copies, then writes. ``SyncScheduler._record_failure``
+        moves the properties copy WITHOUT the column, so comparing only the column
+        would let the repair stamp 'pending_confirmation' onto a row whose JSON now
+        reads 'error' -- the dashboard would offer Confirm for a source the
+        scheduler has given up on. Comparing the properties blob as read skips that
+        row instead; the next store open repairs it.
+        """
+        import sqlite3
+
+        db_path = str(tmp_path / "test.db")
+        sid = str(uuid4())
+        now = datetime.now().isoformat()
+        store.db.execute(
+            "INSERT INTO sources (id, name, source_type, uri, properties, sync_status, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (sid, "s", "local_folder", "/tmp/race",
+             json.dumps({"sync_status": "pending_confirmation"}), "pending", now, now))
+        store.db.commit()
+        store.close()
+
+        real_loads = json.loads
+        fired: list[bool] = []
+
+        def failure_lands_mid_scan(raw):
+            parsed = real_loads(raw)
+            # Fire once, only for the row under test: the repair parses each
+            # candidate row between its SELECT and its UPDATE.
+            if (not fired and isinstance(parsed, dict)
+                    and parsed.get("sync_status") == "pending_confirmation"):
+                fired.append(True)
+                conn = sqlite3.connect(db_path, timeout=30)
+                try:
+                    conn.execute(
+                        "UPDATE sources SET properties = ? WHERE id = ?",
+                        (json.dumps({"sync_status": "error", "consecutive_failures": 3}), sid))
+                    conn.commit()
+                finally:
+                    conn.close()
+            return parsed
+
+        with patch("kiro_crew.knowledge.store.json.loads", failure_lands_mid_scan):
+            reopened = KnowledgeStore(db_path)
+        try:
+            assert fired, "the mid-scan write never landed; the test proves nothing"
+            row = reopened.db.execute(
+                "SELECT sync_status, properties FROM sources WHERE id = ?", (sid,)).fetchone()
+            assert row["sync_status"] == "pending"
+            assert json.loads(row["properties"])["sync_status"] == "error"
+        finally:
+            reopened.close()
 
     def test_update_source(self, store):
         sid = store.add_source("f", "local_file", "/tmp/f.md")
@@ -1733,3 +1889,59 @@ class TestEntityExtractorNonceDelimiters:
             nonces.append(nonce)
         # Per-chunk uuid: the two chunks must NOT share a nonce.
         assert nonces[0] != nonces[1], "each chunk must get a distinct per-chunk nonce"
+
+
+# ---------------------------------------------------------------------------
+# SyncScheduler.sync_all -- errored sources must be quiesced (issue #3946)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSyncAllSkipsErroredSources:
+    """sync_all must skip a source marked errored by EITHER writer.
+
+    KnowledgeIngestion marks failure in the sync_status COLUMN, while
+    SyncScheduler._record_failure historically wrote only the properties JSON.
+    sync_all must observe both so an errored source is never re-synced forever.
+    """
+
+    def _scheduler(self, store):
+        scheduler = SyncScheduler(store, pipeline=None, connectors={})
+        attempted: list[str] = []
+
+        async def _spy(source_id: str) -> dict:
+            attempted.append(source_id)
+            return {"synced": False, "items_created": 0, "error": None}
+
+        scheduler.sync_source = _spy  # type: ignore[method-assign]
+        return scheduler, attempted
+
+    async def test_column_only_error_is_skipped(self, store):
+        # A healthy source that should still be attempted.
+        ok_id = store.add_source("Healthy", "local_file", "/tmp/ok")
+        # A source errored the way ingestion.py does it: COLUMN only, no
+        # sync_status entry in the properties JSON.
+        err_id = store.add_source("Dead", "local_file", "/tmp/dead")
+        store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (err_id,))
+        store.db.commit()
+        # Guard: the failing writer really left the JSON untouched.
+        row = store.db.execute("SELECT properties FROM sources WHERE id = ?", (err_id,)).fetchone()
+        assert json.loads(row["properties"] or "{}").get("sync_status") is None
+
+        scheduler, attempted = self._scheduler(store)
+        await scheduler.sync_all()
+
+        assert err_id not in attempted, "column-only errored source must be skipped"
+        assert ok_id in attempted, "healthy source must still be synced"
+
+    async def test_legacy_json_only_error_is_still_skipped(self, store):
+        # A source errored the old way: sync_status lives only in the
+        # properties JSON, column falls back to its 'pending' default.
+        err_id = store.add_source("LegacyDead", "local_file", "/tmp/legacy",
+                                  properties={"sync_status": "error"})
+        col = store.db.execute("SELECT sync_status FROM sources WHERE id = ?", (err_id,)).fetchone()
+        assert col["sync_status"] != "error", "column should be pending for the legacy case"
+
+        scheduler, attempted = self._scheduler(store)
+        await scheduler.sync_all()
+
+        assert err_id not in attempted, "legacy JSON-only errored source must still be skipped"

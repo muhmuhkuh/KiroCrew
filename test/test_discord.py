@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -40,6 +41,7 @@ from kiro_crew.discord.commands import (
 from kiro_crew.discord.renderer import (
     DiscordApprovalDecider,
     DiscordRenderer,
+    _ends_inside_fence,
     _extract_options,
     _split_markdown,
     _split_text,
@@ -54,11 +56,16 @@ from kiro_crew.discord.transport import (
 from kiro_crew.discord.transport_dispatch import (
     _STEER_ACK_EMOJI,
     DiscordDispatcher,
-    _receipt_text,
 )
 from kiro_crew.messaging.attachments import cleanup
-from kiro_crew.messaging.link import ChannelLink, legacy_dashboard_mirror_key
+from kiro_crew.messaging.link import (
+    UNBIND_REASON_UNSPECIFIED,
+    ChannelLink,
+    legacy_dashboard_mirror_key,
+)
+from kiro_crew.messaging.queue_receipt import receipt_text as _receipt_text
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session import _opt_out_key
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -199,6 +206,7 @@ class FakeSessions:
         self.released: list[str] = []
         self.acquired: list[str] = []
         self.destroyed: list[str] = []
+        self.discarded: list[str] = []
         self.successes: list[str] = []
         self.failures: list[str] = []
         self.last_agent: Any = None
@@ -210,6 +218,22 @@ class FakeSessions:
         self.mirror_links: dict[str, Any] = {}
         self.origin_links: dict[str, Any] = {}
         self.inbound_mirror_keys: set[str] = set()
+        self.mirror_opt_outs: set[str] = set()
+        # Batch bookkeeping, mirroring the real SessionManager: the unlink path
+        # wraps its three clears in one batch, and a double without the context
+        # manager would make that path unreachable from these tests. Each entry is
+        # True when that mirror mutation ran inside a batch, so a test can pin
+        # that one user-visible action costs one whole-map write.
+        self.batch_depth = 0
+        self.batched_writes: list[bool] = []
+        # Interface parity with the real SessionManager: the dispatcher's
+        # disconnect gate consults this. Entries are ``(session_key, origin)``.
+        # Extended here rather than relying on the gate's fail-open, so a test
+        # about the gate exercises the gate instead of its fallback.
+        self.paused_deliveries: set[tuple[str, bool]] = set()
+
+    def is_mirror_paused(self, key: str, *, origin: bool = False) -> bool:
+        return (key, origin) in self.paused_deliveries
 
     async def get_or_create(self, key: str, *, agent: Any = None, channel_id: Any = None) -> Any:
         self.last_agent = agent
@@ -247,6 +271,7 @@ class FakeSessions:
         link: Any,
         *,
         accepts_inbound: bool = False,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
     ) -> None:
         # Interface parity with the real SessionMap: a conversation is exclusive
         # once it is inbound-committed — this claim is inbound-capable, or an
@@ -262,11 +287,32 @@ class FakeSessions:
             raise ConversationOwnershipConflict(
                 f"{getattr(link, 'channel_type', '?')} conversation is already held"
             )
+        self.batched_writes.append(self.batch_depth > 0)
         self.mirror_links[key] = link
         if accepts_inbound:
             self.inbound_mirror_keys.add(key)
         else:
             self.inbound_mirror_keys.discard(key)
+
+    @contextmanager
+    def batched_save(self) -> Any:
+        self.batch_depth += 1
+        try:
+            yield
+        finally:
+            self.batch_depth -= 1
+
+    def set_mirror_opt_out(self, key: str, opted_out: bool) -> None:
+        # Bucket-keyed, like the real manager: the refusal is a preference about
+        # the CONVERSATION, so it must outlive a generation rotation.
+        self.batched_writes.append(self.batch_depth > 0)
+        if opted_out:
+            self.mirror_opt_outs.add(_opt_out_key(key))
+        else:
+            self.mirror_opt_outs.discard(_opt_out_key(key))
+
+    def mirror_opt_out(self, key: str) -> bool:
+        return _opt_out_key(key) in self.mirror_opt_outs
 
     def get_mirror_link(self, key: str) -> Any:
         return self.mirror_links.get(key)
@@ -284,11 +330,16 @@ class FakeSessions:
             if candidate == link and (not inbound_only or key in self.inbound_mirror_keys)
         ]
 
-    def clear_mirror_link(self, key: str) -> bool:
+    def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
+        self.batched_writes.append(self.batch_depth > 0)
         self.inbound_mirror_keys.discard(key)
+        self.batched_writes.append(self.batch_depth > 0)
         return self.mirror_links.pop(key, None) is not None
 
-    def clear_mirror_links_at(self, link: Any) -> list[str]:
+    def clear_mirror_links_at(
+        self, link: Any, *, reason: str = UNBIND_REASON_UNSPECIFIED
+    ) -> list[str]:
+        self.batched_writes.append(self.batch_depth > 0)
         cleared = self.find_mirror_sessions(link)
         for key in cleared:
             self.inbound_mirror_keys.discard(key)
@@ -319,6 +370,9 @@ class FakeSessions:
     async def destroy(self, key: str) -> None:
         self.destroyed.append(key)
 
+    async def discard_conversation(self, key: str) -> None:
+        self.discarded.append(key)
+
 
 class _FakeHooks:
     auto_approve_subagent_spawn = False
@@ -337,12 +391,12 @@ class FakeCtx:
         return text, None
 
 
-def _cfg(soft: int = 80, default_agent: str = "") -> Any:
+def _cfg(soft: int = 80, default_agent: str = "", dm_scope: str = "per-channel-peer") -> Any:
     return SimpleNamespace(
         discord=SimpleNamespace(soft_threshold_pct=soft),
         agent=SimpleNamespace(default_agent=default_agent),
         messaging=SimpleNamespace(
-            dm_scope="per-channel-peer",
+            dm_scope=dm_scope,
             idle_reset_minutes=0,
             daily_reset_hour=-1,
             queue_mode="steer",
@@ -356,12 +410,13 @@ def _dispatcher(
     allowed_threads: set[str] | None = None,
     raise_on_get: bool = False,
     default_agent: str = "",
+    dm_scope: str = "per-channel-peer",
 ) -> tuple[DiscordDispatcher, FakeClient, FakeSessions]:
     sess = FakeSessions(raise_on_get=raise_on_get)
     d = DiscordDispatcher(
         sessions=sess,  # type: ignore[arg-type]
         ctx_builder=FakeCtx(),  # type: ignore[arg-type]
-        cfg=_cfg(default_agent=default_agent),
+        cfg=_cfg(default_agent=default_agent, dm_scope=dm_scope),
         allowed_user_ids=allowed,
         allowed_thread_ids=allowed_threads,
         agent=None,
@@ -431,6 +486,37 @@ class TestMidTurnOverride:
 
 # ── renderer.py helpers ──────────────────────────────────────────────────
 
+_ORACLE_CODE = "x = 1\n"
+_ORACLE_PROSE = "Ordinary prose about how chat surfaces render markdown.\n"
+
+#: Fence shapes swept by BOTH renderer oracles -- the strip/append symmetry one
+#: and the whitespace-fidelity one. Shared so neither can drift onto a corpus the
+#: other never sees. They cover the information a per-chunk fence walk cannot
+#: recover from the source: 3/4/5-backtick openers, authored inner bare ``` lines,
+#: literal backticks in prose, 4-space-indented lookalikes, info strings, and a
+#: run of blank lines at the tail.
+_FENCE_SHAPES = [
+    "```py\n" + _ORACLE_CODE * 40,  # open 3-backtick fence
+    "```py\n" + _ORACLE_CODE * 40 + "```\n",  # closed 3-backtick fence
+    "````md\n" + _ORACLE_CODE * 40,  # open 4-backtick fence
+    "````md\n" + ("```py\n" + _ORACLE_CODE + "```\n") * 25,  # inner bare closers
+    "````md\n" + ("```py\n" + _ORACLE_CODE + "```\n") * 25 + "````\n",  # …then closed
+    "`````\n" + ("```\n" + _ORACLE_CODE + "```\n") * 25,  # 5-backtick outer
+    _ORACLE_PROSE * 12,  # no fence at all
+    "You type ``` to open a block.\n" + _ORACLE_PROSE * 12,  # literal in prose
+    "You type ``` inline.\n\n```py\n" + _ORACLE_CODE * 30,  # literal, then open
+    _ORACLE_PROSE * 6 + "    ```\n" + _ORACLE_CODE * 20,  # indented lookalike
+    "   ```py\n" + _ORACLE_CODE * 40,  # 3-space indent still opens
+    "```a`b\n" + _ORACLE_CODE * 40,  # backtick in info string == inline code
+    "```py\n" + _ORACLE_CODE * 20 + "```\n\n```sh\nls\n" + _ORACLE_CODE * 20,  # two fences
+    "````md\n" + _ORACLE_CODE * 20 + "```\n" + _ORACLE_CODE * 20 + "\n\n\n",  # ws tail
+    # Blank code lines INSIDE a fence with more code after them -- the shape the
+    # remainder used to delete, swept at every limit so the cut lands on each
+    # newline of the run in turn.
+    "```py\n" + _ORACLE_CODE * 20 + "\n\n" + _ORACLE_CODE * 20,
+    "```py\n" + (_ORACLE_CODE + "\n\n\n") * 12,  # 4-newline runs throughout
+]
+
 
 class TestSplitText:
     def test_short_text_single_chunk(self) -> None:
@@ -447,10 +533,149 @@ class TestSplitText:
 
     def test_split_markdown_balances_fences(self) -> None:
         code = "```py\n" + ("x = 1\n" * 50) + "```"
-        chunks = _split_markdown(code, 120)
+        chunks, appended = _split_markdown(code, 120)
         assert len(chunks) > 1
         for ch in chunks:
             assert ch.count("```") % 2 == 0  # every chunk self-contained
+        # The source's own closer lands in the final chunk, so nothing was
+        # invented there.
+        assert appended is False
+
+    def test_split_markdown_reports_its_own_synthetic_closer(self) -> None:
+        # The flag is the splitter's record of what it appended to the FINAL
+        # chunk -- the only sound basis for the rotation's strip, since the
+        # per-chunk walk runs after a bare ``` reopen has already discarded the
+        # original opener's run length.
+        open_fence = "```py\n" + ("x = 1\n" * 50)
+        chunks, appended = _split_markdown(open_fence, 120)
+        assert len(chunks) > 1
+        assert appended is True
+        assert chunks[-1].endswith("\n```")
+        # A lone chunk is handed back untouched, so the flag alone expresses the
+        # "nothing to undo" case -- no len(chunks) guard is needed at the strip.
+        for text in ["```py\nx = 1\n", "type ``` here", "", "plain prose"]:
+            lone, lone_appended = _split_markdown(text, 1900)
+            assert len(lone) <= 1
+            assert lone_appended is False
+            assert lone == _split_text(text, 1900)
+
+    def test_inline_backticks_are_not_a_fence(self) -> None:
+        # A ``` written MID-LINE is prose about fencing, not a fence. Counting
+        # ``` substrings calls this "open" and flips every later fence decision.
+        assert not _ends_inside_fence("Type ``` to open a block.")
+        assert not _ends_inside_fence("Prose\nsay ``` here\nmore prose")
+        # ...and it must not mask a fence that really is open.
+        assert _ends_inside_fence("Type ``` first.\n\n```py\nx = 1\n")
+
+    def test_fence_state_walk_follows_commonmark(self) -> None:
+        assert _ends_inside_fence("```py\nx = 1\n")
+        assert not _ends_inside_fence("```py\nx = 1\n```")
+        assert not _ends_inside_fence("```py\nx = 1\n```\ntrailing prose")
+        # Up to 3 spaces of indent still opens; 4+ is an indented code line.
+        assert _ends_inside_fence("   ```\nx\n")
+        assert not _ends_inside_fence("    ```\nx\n")
+        # A closer may be LONGER than its opener but never shorter, and carries
+        # nothing after it -- an info string is legal only on the opener.
+        assert not _ends_inside_fence("```\nx\n`````")
+        assert _ends_inside_fence("`````\nx\n```")
+        assert _ends_inside_fence("```\nx\n``` not a closer")
+        # An info string containing a backtick is inline code, not a fence.
+        assert not _ends_inside_fence("```a`b\nx\n")
+
+    def test_continuation_preserves_leading_indentation(self) -> None:
+        # A cut landing just before an INDENTED line must not re-indent it: only
+        # newlines are stripped at the boundary, never horizontal whitespace.
+        text = "a" * 30 + "\n" + "    indented = 1\n" + "b" * 30
+        chunks = _split_text(text, 40)
+        assert len(chunks) > 1
+        assert chunks[1].startswith("    indented = 1")
+
+    def test_newline_only_remainder_keeps_blank_code_lines(self) -> None:
+        # Blank lines are CONTENT inside a fenced block. A boundary that leaves a
+        # remainder of nothing but newlines must not drop them, or the blank code
+        # lines vanish and every later code line shifts up one row.
+        text = "```py\n" + "x = 1\n" * 299 + "\n\n"
+        chunks = _split_text(text, 1800)
+        # The tail is its own chunk -- it neither vanished nor re-entered the
+        # loop unchanged. Its first newline terminates the last code line, so it
+        # is the separator this boundary represents and only it is absorbed; the
+        # two authored blank lines are what remain.
+        assert chunks[-1] == "\n\n"
+        # Exact accounting, replacing a raw total-newline count: that count came
+        # out equal only because the absorbed separator was being counted as
+        # content, which is one blank line more than the source has. Rejoining on
+        # the separator each cut consumed reproduces the source verbatim, so no
+        # newline is lost and none is invented.
+        assert "\n".join(chunks) == text
+
+    def test_all_newline_text_terminates(self) -> None:
+        # A zero-width cut on an all-newline tail must not re-enter the loop
+        # unchanged. Watchdogged so a regression fails instead of hanging.
+        done: list[list[str]] = []
+        t = threading.Thread(target=lambda: done.append(_split_text("\n\n", 1)), daemon=True)
+        t.start()
+        t.join(5.0)
+        assert done, "_split_text did not terminate on an all-newline tail"
+
+    def test_blank_code_lines_straddling_a_cut_survive(self) -> None:
+        # A blank line FOLLOWED BY CONTENT is an authored code line, not the
+        # boundary separator. The cut lands on the run, so lstrip("\n") deleted
+        # every newline in it at once and the next code line shifted up two rows.
+        text = "```py\nx = 1\n\n\ny = 2\ny = 3\n"
+        chunks = _split_text(text, 20)
+        assert len(chunks) == 2
+        assert chunks[0] == "```py\nx = 1"
+        # BOTH authored blank lines lead the continuation.
+        assert chunks[1] == "\n\ny = 2\ny = 3\n"
+        # Exactly one newline -- the separator this boundary itself represents --
+        # was absorbed, so rejoining on it reproduces the source verbatim.
+        assert "\n".join(chunks) == text
+
+    def test_prose_paragraph_gap_survives_a_cut(self) -> None:
+        # The prose twin: the blank line of a paragraph gap is equally authored.
+        text = "para one\n\npara two\n\npara three"
+        chunks = _split_text(text, 20)
+        assert chunks == ["para one\n\npara two", "\npara three"]
+        assert "\n".join(chunks) == text
+
+    def test_continuation_gains_no_leading_blank_line(self) -> None:
+        # The opposite failure mode of the widened preservation: where the source
+        # had a single separator and no blank line, the continuation must render
+        # exactly as it does today -- content first, no invented gap.
+        text = "a" * 30 + "\n" + "b" * 30
+        assert _split_text(text, 40) == ["a" * 30, "b" * 30]
+
+    def test_swept_cut_absorbs_at_most_one_newline(self) -> None:
+        """Whitespace-fidelity oracle over the same corpus as the strip sweep.
+
+        That sweep asserts only that non-whitespace survives, so it is blind to
+        blank lines -- exactly the class ``lstrip("\\n")`` deleted. Every chunk is
+        a verbatim slice of the source, so walking the slices in order exposes
+        what the splitter dropped at each cut: it must be whitespace only, and it
+        must be at most the single line separator the message boundary itself
+        represents. That bounds newline-run loss inside fences and in prose alike
+        at oracle strength, and it fails on ``lstrip("\\n")``, which drops the
+        whole run.
+        """
+        cuts = 0
+        for src in _FENCE_SHAPES:
+            for limit in list(range(40, 201, 7)) + [1900]:
+                chunks = _split_text(src, limit)
+                cuts += len(chunks) - 1
+                pos = 0
+                for ch in chunks:
+                    where = f"shape={src[:14]!r} limit={limit}"
+                    at = src.find(ch, pos)
+                    assert at >= 0, f"chunk is not a source slice: {where}"
+                    gap = src[pos:at]
+                    assert not gap.strip(), f"authored text dropped at a cut: {where}"
+                    assert gap.count("\n") <= 1, (
+                        f"cut absorbed {gap.count(chr(10))} newlines, "
+                        f"blank lines deleted: {where}"
+                    )
+                    pos = at + len(ch)
+                assert not src[pos:].strip(), f"authored tail dropped: {src[:14]!r}"
+        assert cuts > 300, cuts  # the sweep is not vacuous
 
 
 class TestOptionComponents:
@@ -1057,6 +1282,233 @@ class TestRenderer:
             assert len(text) <= 2000
 
     @pytest.mark.asyncio
+    async def test_rotation_mid_code_block_keeps_live_fence_open(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # Open a fence and stream past one message's worth of code so rotation
+        # fires while the model's closing ``` has NOT arrived yet.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 400)
+        # The SEALED chunk is self-contained (synthetic closer appended)…
+        sealed = cli.sent[0][0]
+        assert sealed.count("```") % 2 == 0
+        assert sealed.rstrip().endswith("```")
+        # …but the retained live buffer must keep its fence OPEN, or everything
+        # streamed afterwards renders as prose outside the code block.
+        assert "".join(r._buf).count("```") % 2 == 1
+        assert "".join(r._buf).startswith("```")  # continuation reopens the fence
+        # The model's real closer finally streams in.
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert final.count("```") % 2 == 0  # balanced -> no stray backticks
+        assert final.startswith("```") and final.rstrip().endswith("```")
+        assert "y = 2" in final.split("```")[1]  # post-rotation code stays inside
+
+    @pytest.mark.asyncio
+    async def test_rotation_mid_code_block_keeps_line_break(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # The retained tail's content ends with a newline; dropping the
+        # synthetic closer must not eat it, or the next streamed line lands on
+        # the previous one ("x = 1y = 2") and both code lines are corrupted.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 400)
+        assert "".join(r._buf).endswith("\n")
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert "x = 1y = 2" not in final
+        assert "x = 1\ny = 2" in final
+
+    @pytest.mark.asyncio
+    async def test_rotation_keeps_blank_code_lines(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # The rotation boundary lands on the blank lines the model just emitted
+        # INSIDE the open fence, leaving a newline-only remainder. Dropping it
+        # pulls the next code line up onto the last one.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 299 + "\n\n")
+        assert "".join(r._buf).endswith("\n\n\n")
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert "x = 1\ny = 2" not in final  # later code did not shift up
+        assert "\n\ny = 2" in final  # the blank code line survived
+
+    @pytest.mark.asyncio
+    async def test_rotation_keeps_blank_code_lines_before_more_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        r, cli = self._renderer()
+        monkeypatch.setattr(r, "_limit", lambda: 60)
+        await r.on_turn_start()
+        # Blank code lines straddling the rotation cut, with more code AFTER
+        # them. The all-newline-tail case is already pinned above; this is the
+        # one the round-2 remainder deleted -- the cut lands on the run, the
+        # sealed side keeps the code, and the blank lines belong to the tail.
+        await r.on_text_chunk("```py\n" + "x = 1\n" * 6 + "\n\n" + "y = 2\n" * 6)
+        sealed = cli.sent[0][0]
+        assert sealed.endswith("x = 1\n```")  # code sealed, synthetic closer on
+        # The retained tail reopens the fence and still carries BOTH blank lines.
+        assert "".join(r._buf) == "```\n" + "\n\n" + "y = 2\n" * 6
+        await r.on_text_chunk("```")
+        await r.on_done()
+        # The blank code line survived to what the user reads and the later code
+        # did not shift up. Only ONE blank line is asserted here: _strip_steering
+        # collapses every run of 3+ newlines to 2 on EVERY render, so the visible
+        # cap is that normalizer's (pre-existing, and the same before this cut
+        # changed), not the splitter's.
+        assert "\n\ny = 2" in cli.final_text()
+        assert "x = 1\ny = 2" not in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_rotation_ignores_inline_backticks_in_prose(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # Prose ABOUT fencing: the ``` sits mid-line, so it opens nothing. A
+        # ``` SUBSTRING count reads the stream as "inside a code block", so the
+        # splitter invents a closer for the sealed chunk, reopens the fence on
+        # the retained tail, and the rotation then deletes that tail's closer --
+        # leaving the live buffer inside an UNCLOSED code block, so every later
+        # sentence renders as code.
+        await r.on_text_chunk(
+            "To open a code block you type ``` at the start of a line. "
+            + ("Ordinary prose about how chat surfaces render markdown. " * 45)
+        )
+        buf = "".join(r._buf)
+        assert "```" not in buf  # no reopen, no synthetic closer
+        await r.on_text_chunk("Final sentence, outside any code block.")
+        await r.on_done()
+        # The author wrote no fence LINE anywhere, so any bare ``` line in any
+        # frame -- live or sealed -- is one this renderer invented.
+        for text in [t for t, _ in cli.sent] + [t for _, t, _c in cli.edits]:
+            assert not any(ln.strip() == "```" for ln in text.split("\n"))
+        assert "Final sentence, outside any code block." in cli.final_text()
+
+    @pytest.mark.asyncio
+    async def test_rotation_strips_closer_when_inline_backticks_hide_open_fence(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # The mirror miscount: one literal ``` in the prose plus a genuinely
+        # OPEN fence makes the substring count even, so the strip never fires
+        # and the retained tail is sealed shut around a live code block.
+        await r.on_text_chunk(
+            "You type ``` to open a block, like this:\n\n```py\n" + "x = 1\n" * 400
+        )
+        buf = "".join(r._buf)
+        assert buf.startswith("```")  # continuation reopens the live fence
+        assert not buf.rstrip().endswith("```")  # synthetic closer dropped
+        await r.on_text_chunk("y = 2\n```")
+        await r.on_done()
+        final = cli.final_text()
+        assert final.count("```") % 2 == 0
+        assert "x = 1\ny = 2" in final  # post-rotation code stayed in the block
+
+    @pytest.mark.asyncio
+    async def test_authored_trailing_backticks_survive_when_nothing_split(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # Prose about fencing ends with a literal ``` and is itself UNDER the
+        # cap -- only the long [OPTIONS:] trailer pushes the buffer over it. The
+        # trailer is detached before splitting, so the splitter hands back a
+        # lone chunk and reports no synthetic closer (appended_closer False).
+        # The strip therefore never fires and the author's backticks survive.
+        body = ("To fence a block in Discord, open the line with " * 36) + "type ```"
+        assert len(body) < r._limit()
+        trailer = "\n\n[OPTIONS: " + ("Yes " * 20) + " | " + ("No " * 20) + "]"
+        await r.on_text_chunk(body + trailer)
+        await r.on_done()
+        visible = "\n".join([t for t, _ in cli.sent] + [t for _, t, _c in cli.edits])
+        assert "type ```" in visible
+
+    @pytest.mark.asyncio
+    async def test_rotation_keeps_authored_inner_fence_line_in_4_backtick_block(self) -> None:
+        r, cli = self._renderer()
+        await r.on_turn_start()
+        # A 4-backtick block whose CONTENT is markdown containing 3-backtick
+        # examples -- how you document fencing. Per CommonMark the inner bare
+        # ``` closes nothing (a closer must be at least as long as its opener),
+        # so the source fence is still open at the cut.
+        #
+        # The splitter judges each chunk AFTER prepending a bare ``` reopen,
+        # which throws away the 4-backtick opener's run length: to the walk the
+        # tail's fence is a 3-backtick one that the authored inner ``` CLOSES,
+        # so it appends no synthetic closer. Any predicate re-derived from the
+        # source disagrees -- it still sees the 4-backtick fence open -- and the
+        # strip then deletes the author's own ``` line from the retained buffer.
+        src = "````markdown\n" + "Nest a block:\n\n```py\nx = 1\n```\n\n" * 90
+        assert len(src) > r._limit()
+        await r.on_text_chunk(src)
+        buf = "".join(r._buf)
+        assert len(buf) < len(src)  # the rotation really fired
+        # The author's inner closer is the last thing they wrote; it must still
+        # be there, with the blank line that followed it.
+        assert buf.endswith("```\n\n")
+        # Stronger: the retained tail IS the source's own tail (modulo the
+        # continuation reopen) -- not a shortened copy of it.
+        assert src.endswith(buf[4:] if buf.startswith("```\n") else buf)
+        # It survives all the way to what the user reads.
+        await r.on_text_chunk("Done.\n````")
+        await r.on_done()
+        frames = [t for t, _ in cli.sent] + [t for _, t, _c in cli.edits]
+        authored = src.count("\n```\n")
+        assert sum(f.count("\n```\n") for f in frames) >= authored
+
+    @pytest.mark.asyncio
+    async def test_rotation_strip_matches_the_splitter_in_both_directions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Swept oracle: the strip fires iff the splitter appended.
+
+        Two directions, both pinned. (a) Nothing the author wrote is ever
+        deleted -- the retained tail stays a suffix of the source and every
+        non-whitespace source character survives across the frames. (b) A
+        synthetic closer never survives into the retained tail, or the live
+        code block is sealed shut and every later token renders outside it.
+
+        Shapes cover the information the per-chunk walk cannot see from the
+        source: 3/4/5-backtick openers, authored inner bare ``` lines, literal
+        backticks in prose, 4-space-indented lookalikes, and info strings.
+        """
+        rotated = appends = 0
+        for src in _FENCE_SHAPES:
+            assert src and "[OPTIONS" not in src and "[STEERING" not in src  # no detach
+            for limit in list(range(40, 201, 7)) + [1900]:
+                chunks, appended = _split_markdown(src, limit)
+                rotated += len(chunks) > 1
+                appends += appended
+                r, cli = self._renderer()
+                monkeypatch.setattr(r, "_limit", lambda limit=limit: limit)
+                r._buf = [src]
+                await r._rotate_on_length()
+                tail = "".join(r._buf)
+                where = f"shape={src[:14]!r} limit={limit}"
+                # (b) the strip fired exactly when the splitter appended…
+                if appended:
+                    assert tail != chunks[-1], f"synthetic closer retained: {where}"
+                # …and never otherwise.
+                else:
+                    assert tail == chunks[-1], f"untouched tail was modified: {where}"
+                # (a) the retained tail is the source's own tail, modulo the
+                # bare ``` reopen a continuation chunk carries. This one does
+                # not consult the flag, so it holds the strip to the source even
+                # if the splitter's report were wrong.
+                assert src.endswith(tail[4:] if tail.startswith("```\n") else tail), (
+                    f"retained tail is not a source suffix: {where}"
+                )
+                # (a) nothing authored was dropped anywhere: every
+                # non-whitespace source character still appears, in order,
+                # across the sealed frames plus the retained tail. Synthetic
+                # backticks only ever ADD.
+                seen = "".join(t for t, _ in cli.sent) + tail
+                it = iter("".join(seen.split()))
+                assert all(c in it for c in "".join(src.split())), (
+                    f"authored characters deleted: {where}"
+                )
+        # The sweep must not go vacuous: most cases really rotate, and a large
+        # share really do get a synthetic closer on the final chunk.
+        assert rotated > 300 and appends > 100, (rotated, appends)
+
+    @pytest.mark.asyncio
     async def test_tool_footer_transient(self) -> None:
         r, cli = self._renderer()
         await r.on_turn_start()
@@ -1165,6 +1617,38 @@ class TestApprovalDecider:
 class TestDispatcher:
     def _msg(self, text: str, user: str = "u1", chan: str = "c1") -> InboundMessage:
         return InboundMessage(channel_type="discord", user_id=user, conversation_id=chan, text=text)
+
+    @pytest.mark.asyncio
+    async def test_a_disconnected_conversation_gets_no_reply(self) -> None:
+        """Disconnecting Discord in the dashboard must actually stop the replies.
+
+        Discord runs its OWN copy of the turn loop rather than going through
+        ``messaging.dispatch.drive_turn``, so the gate there does not reach it.
+        Before this, the dashboard control flipped its own label and nothing else:
+        the next message in the conversation was answered exactly as before.
+
+        The turn still runs and the message still lands in the session — the
+        binding is retained by design — so this asserts on what the CONVERSATION
+        receives, which is the whole of what "disconnect" promises.
+        """
+        d, cli, sess = _dispatcher({"u1"})
+        key = d._session_key("u1")
+        # True = the conversation this session was BORN in, which is what a Discord
+        # session's own key names.
+        sess.paused_deliveries.add((key, True))
+
+        await d.handle_message(self._msg("hello"))
+
+        assert cli.sent == [], f"a disconnected conversation still replied: {cli.sent}"
+
+    @pytest.mark.asyncio
+    async def test_a_connected_conversation_still_replies(self) -> None:
+        """The non-vacuity half: without it, a broken renderer would pass above."""
+        d, cli, _ = _dispatcher({"u1"})
+
+        await d.handle_message(self._msg("hello"))
+
+        assert cli.sent, "a connected conversation must still be answered"
 
     @pytest.mark.asyncio
     async def test_new_command_bumps_generation(self) -> None:
@@ -1562,7 +2046,7 @@ class TestDispatcher:
         assert any("timed out" in t for _, t, _ in cli.edits) or any(
             "timed out" in t for t, _ in cli.sent
         )
-        assert sess.destroyed == []  # healthy session preserved
+        assert sess.destroyed == [] and sess.discarded == []  # healthy session preserved
 
     @pytest.mark.asyncio
     async def test_link_and_unlink(self) -> None:
@@ -1574,6 +2058,205 @@ class TestDispatcher:
         assert sess.mirror_links[key].channel_id == "c1"
         await d.handle_message(self._msg("!unlink"))
         assert key not in sess.mirror_links
+
+    # ── Automatic origin mirroring ────────────────────────────────────────
+    #
+    # A Discord conversation IS its own mirror. Without the per-turn bind the
+    # binding existed only after an explicit `!link`, so a turn later taken from
+    # the dashboard resolved no `discord` target and the chat sat there looking
+    # dead while the conversation continued elsewhere.
+
+    @pytest.mark.asyncio
+    async def test_a_turn_binds_this_conversation_as_its_own_mirror(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("hello"))
+        key = d._session_key("u1")
+        assert sess.mirror_links[key] == ChannelLink("discord", channel_id="c1", thread_id=None)
+
+    @pytest.mark.asyncio
+    async def test_a_thread_turn_binds_the_thread_channel(self) -> None:
+        # A Discord thread IS a channel with its own id, so channel_id already
+        # scopes the conversation and is also where the transport posts.
+        d, _cli, sess = _dispatcher({"u1"}, allowed_threads={"t9"})
+        await d.handle_message(
+            InboundMessage(
+                channel_type="discord",
+                user_id="u1",
+                conversation_id="t9",
+                text="hello",
+                thread_id="t9",
+            )
+        )
+        key = d._session_key("u1", "t9")
+        assert sess.mirror_links[key] == ChannelLink("discord", channel_id="t9", thread_id=None)
+
+    @pytest.mark.asyncio
+    async def test_the_second_turn_writes_nothing(self) -> None:
+        # The bind is re-asserted per turn, so the repeating path must be a READ:
+        # a session-map mutation rewrites the whole map on the event loop.
+        d, _cli, sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("first"))
+        writes = len(sess.batched_writes)
+        await d.handle_message(self._msg("second"))
+        assert len(sess.batched_writes) == writes
+
+    @pytest.mark.asyncio
+    async def test_unlink_survives_the_users_next_message(self) -> None:
+        # The whole point of persisting the refusal: an entry with no binding is
+        # indistinguishable from one that was never linked, so without the flag
+        # "off" would last exactly one message.
+        d, _cli, sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("hello"))
+        await d.handle_message(self._msg("!unlink"))
+        await d.handle_message(self._msg("hello again"))
+        assert sess.mirror_links == {}
+
+    @pytest.mark.asyncio
+    async def test_unlink_survives_a_generation_rotation(self) -> None:
+        # `!new` (and the configured idle/daily reset) rotate the :genN suffix.
+        # Keyed per generation the refusal would expire on rotation, so an idle
+        # reset would undo the user's `!unlink` with no action on their part.
+        d, _cli, sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("!unlink"))
+        await d.handle_message(self._msg("!new"))
+        await d.handle_message(self._msg("hello"))
+        assert sess.mirror_links == {}
+
+    @pytest.mark.asyncio
+    async def test_link_withdraws_the_refusal_so_the_bind_resumes(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("!unlink"))
+        await d.handle_message(self._msg("!link"))
+        assert sess.mirror_opt_outs == set()
+        sess.mirror_links.clear()  # simulate a sweep / restart-cold binding
+        await d.handle_message(self._msg("hello"))
+        assert sess.mirror_links[d._session_key("u1")].channel_id == "c1"
+
+    @pytest.mark.asyncio
+    async def test_link_and_unlink_each_cost_one_batched_write(self) -> None:
+        # One user-visible action, one whole-map write — each mutation would
+        # otherwise rewrite the entire session map on the loop.
+        d, _cli, sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("!link"))
+        assert sess.batched_writes and all(sess.batched_writes)
+        sess.batched_writes.clear()
+        await d.handle_message(self._msg("!unlink"))
+        assert sess.batched_writes and all(sess.batched_writes)
+
+    @pytest.mark.asyncio
+    async def test_a_refused_link_persists_nothing(self) -> None:
+        """Ordering guard inside the batch.
+
+        ``batched_save`` writes on the way out even when the block raises, so a
+        refusal raised AFTER the opt-out withdrawal would persist that withdrawal
+        for a link that never happened — silently turning mirroring back on. The
+        claim is refused before it mutates anything, so it goes first.
+        """
+        d, cli, sess = _dispatcher({"u1"})
+        await d.handle_message(self._msg("!unlink"))
+        self._occupy_ambiguously(sess)
+        await d.handle_message(self._msg("!link"))
+        assert any("already linked here" in t for t, _ in cli.sent)
+        assert sess.mirror_opt_outs == {_opt_out_key(d._session_key("u1"))}, (
+            "a refused link must not withdraw the refusal"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_refused_bind_still_answers_the_turn(self) -> None:
+        # An uncaught raise on the turn path would drop the turn and answer the
+        # user nothing.
+        d, cli, sess = _dispatcher({"u1"})
+        self._occupy_ambiguously(sess)
+        await d.handle_message(self._msg("hello world"))
+        assert "Answer: hello world" in (cli.final_text() or "")
+        assert d._session_key("u1") not in sess.mirror_links
+
+    @pytest.mark.asyncio
+    async def test_a_unified_dm_scope_is_not_auto_bound(self) -> None:
+        # dm_scope=unified collapses every allowed user's DMs into one
+        # unified:{agent} bucket — channel and user drop out of the key — so an
+        # automatic bind would deliver one user's dashboard replies into another
+        # user's chat. `!link` stays available: it names the channel the user is in.
+        d, _cli, sess = _dispatcher({"u1", "u2"}, dm_scope="unified")
+        await d.handle_message(self._msg("hello", user="u1"))
+        assert sess.mirror_links == {}
+
+    @pytest.mark.asyncio
+    async def test_a_thread_route_is_still_bound_under_a_unified_scope(self) -> None:
+        # A guild thread keys per-channel-peer regardless of dm_scope, so its
+        # bucket still names one conversation.
+        d, _cli, sess = _dispatcher({"u1"}, allowed_threads={"t9"}, dm_scope="unified")
+        await d.handle_message(
+            InboundMessage(
+                channel_type="discord",
+                user_id="u1",
+                conversation_id="t9",
+                text="hello",
+                thread_id="t9",
+            )
+        )
+        assert sess.mirror_links[d._session_key("u1", "t9")].channel_id == "t9"
+
+    @pytest.mark.asyncio
+    async def test_a_dashboard_mirror_aimed_at_another_channel_survives(self) -> None:
+        # The dashboard can aim this session's mirror at any surface. Overwriting
+        # it on the next Discord message would silently redirect the owner's
+        # replies from the chat they chose into this one.
+        d, _cli, sess = _dispatcher({"u1"})
+        key = d._session_key("u1")
+        chosen = ChannelLink("telegram", channel_id="7", thread_id=None)
+        sess.mirror_links[key] = chosen
+        await d.handle_message(self._msg("hello"))
+        assert sess.mirror_links == {key: chosen}
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_session_is_not_bound_to_this_conversation(self) -> None:
+        """A resumed dashboard session's own surface owns its output.
+
+        Both writes live behind the ``resumed_key is None`` branch, which is what
+        keeps a dashboard entry from being stamped with Discord's identity;
+        ``set_origin_link`` is the observable half, since the mirror bind would
+        decline anyway on finding the resume binding for this same channel.
+        `!link` refuses in this state too, so the automatic path must not do what
+        the explicit one declines.
+        """
+        d, cli, sess = _dispatcher({"u1"})
+        resumed = ChannelLink("discord", channel_id="c1")
+        sess.mirror_links["dashboard:chat-1"] = resumed
+        sess.inbound_mirror_keys.add("dashboard:chat-1")
+        await d.handle_message(self._msg("hello world"))
+        assert "Answer: hello world" in (cli.final_text() or "")
+        assert sess.mirror_links == {"dashboard:chat-1": resumed}
+        assert sess.inbound_mirror_keys == {"dashboard:chat-1"}, "resume stayed two-way"
+        assert sess.origin_links == {}
+
+    @staticmethod
+    def _occupy_ambiguously(sess: FakeSessions) -> None:
+        """Occupy channel ``c1`` in the one state that reaches a refused claim.
+
+        Discord declares ``supports_session_resume``, so its conversations are
+        inbound-committable and an inbound-committed occupant refuses a claim. A
+        single such occupant never gets that far — the dispatcher routes the turn
+        to it and skips the bind, and `!link` refuses earlier. But
+        ``resumed_session`` fails CLOSED on duplicates: with two inbound bindings
+        it denies routing and reports none, so both paths proceed to a claim that
+        is then refused.
+        """
+        for key in ("dashboard:chat-9", "dashboard:chat-10"):
+            sess.mirror_links[key] = ChannelLink("discord", channel_id="c1")
+            sess.inbound_mirror_keys.add(key)
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_bind_to_another_channel_is_not_repointed(self) -> None:
+        # Nothing repoints a binding: a swept or rival-claimed one is REMOVED, not
+        # moved. So a discord binding naming another channel is deliberate (the
+        # dashboard can bind a surfaced session anywhere).
+        d, _cli, sess = _dispatcher({"u1"})
+        key = d._session_key("u1")
+        chosen = ChannelLink("discord", channel_id="c-elsewhere")
+        sess.mirror_links[key] = chosen
+        await d.handle_message(self._msg("hello"))
+        assert sess.mirror_links == {key: chosen}
 
     @pytest.mark.asyncio
     async def test_unlink_clears_binding_stranded_by_generation_rotation(self) -> None:

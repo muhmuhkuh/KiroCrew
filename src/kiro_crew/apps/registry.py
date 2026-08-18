@@ -35,13 +35,14 @@ import re
 import shutil
 import sys
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.apps import install_receipt
+from kiro_crew.apps import install_receipt, official_catalog
 from kiro_crew.apps.admission import app_admission_denied, verified_signer
 from kiro_crew.apps.execution import app_execution_denied
 from kiro_crew.apps.manager import (
@@ -72,7 +73,14 @@ logger = logging.getLogger(__name__)
 SOURCE_REGISTRY_PREFIX = "registry:"
 
 # A git object name: sha1 (40 hex) or sha256 (64 hex) repository format.
-_COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+#
+# Anchored at ``\Z`` rather than ``$``: Python's ``$`` matches before a trailing
+# newline, so ``$`` accepted a 40-hex value with ``"\n"`` appended. That matters at
+# both readers -- this pattern validates a pin before it reaches a git argument
+# vector, and it validates a SHA read back off disk in
+# :func:`_resolved_clone_commit`, where a value that only looks like a commit would
+# be reported as the landed one.
+_COMMIT_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 class StreamingLogLines(list):
@@ -676,6 +684,7 @@ async def _fetch_app_manifest(
     git_url: str = "",
     *,
     owner_designated: bool = False,
+    commit: str = "",
 ) -> dict[str, Any] | None:
     """Fetch app.json for an app from its source repo (lightweight).
 
@@ -695,6 +704,14 @@ async def _fetch_app_manifest(
     clone uses ``minimal_env()`` + context sandbox mode instead of the
     default anonymous+strict posture. Only set when the entry's effective
     clone URL is byte-identical to the owner-configured registry repo URL.
+
+    *commit*: a pinned commit. When set, the manifest is read from THAT tree
+    rather than a branch tip, and the local fast path compares commits instead of
+    branch names. This matters on the install path specifically: this manifest is
+    what the admission gate inspects, so reading it from a branch tip while the
+    install fetches a pinned commit would gate one tree and install another --
+    and a pinned row carries no branch at all, so the branch would silently be
+    the ``"main"`` default.
     """
     if not git_url:
         git_url = repo
@@ -710,15 +727,28 @@ async def _fetch_app_manifest(
     # repo A's manifest and then run repo B's code. So the local copy is only
     # used when the clone's origin still is git_url; otherwise fall through to
     # the throwaway clone of git_url, which always describes what gets cloned.
-    if app_name:
+    if app_name and not commit:
+        # A PINNED entry gets no local fast path at all.
+        #
+        # The persistent checkout is agent-writable, and `app.json` there can be
+        # edited without HEAD moving -- so a commit comparison attests where the tree
+        # was placed, never what it now holds. This manifest is what the admission and
+        # platform gates read, so a local edit bypasses `installMode`/`os`
+        # restrictions and gets the tree built server-side. It is the same reason a
+        # pinned install never reuses an existing checkout; the rule belongs here too,
+        # and previously stopped one caller short of this one.
+        #
+        # The cost is a shallow single-commit fetch per pinned listing, which the
+        # pinned branch below already performs.
         clone_dir = app_source_dir(app_name)
         manifest_dir = _contained_join(clone_dir, subdirectory)
         local_manifest = manifest_dir / "app.json" if manifest_dir is not None else None
+        fresh_enough = await _clone_branch_matches(clone_dir, branch)
         if (
             local_manifest is not None
             and local_manifest.is_file()
             and await _clone_origin_matches(clone_dir, git_url)
-            and await _clone_branch_matches(clone_dir, branch)
+            and fresh_enough
         ):
             try:
                 content = await asyncio.to_thread(local_manifest.read_text, "utf-8")
@@ -746,18 +776,7 @@ async def _fetch_app_manifest(
     tmp_root: str | None = None
     try:
         tmp_root = await asyncio.to_thread(tempfile.mkdtemp, prefix="kirocrew-manifest-")
-        clone_cmd = [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            branch,
-            "--single-branch",
-            git_url,
-            tmp_root,
-        ]
-        # Credential posture for the manifest clone. Default: anonymous+strict
+        # Credential posture for the manifest fetch. Default: anonymous+strict
         # (confused-deputy defense — see anonymous_git_env). Same-repo
         # carve-out: when owner_designated is True the clone URL is the
         # owner-configured registry repo itself, so the confused-deputy
@@ -769,25 +788,67 @@ async def _fetch_app_manifest(
         else:
             clone_env = anonymous_git_env()
             sandbox_mode = "strict"
-        sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
-        sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
-        proc = await create_subprocess_limited(
-            *sandboxed_cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=clone_env,
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-        )
-        _, stderr = await _communicate_with_timeout(proc, timeout=_CLONE_TIMEOUT)
-        if proc.returncode != 0:
-            logger.debug(
-                "manifest clone failed for %s: %s",
+
+        if commit:
+            # Read the manifest from the pinned tree. `--branch` cannot take a
+            # commit id, and on the install path this manifest is what the
+            # admission gate inspects -- gating a branch tip while installing a
+            # pinned commit would check one tree and install another.
+            fetch_log: list[str] = []
+            # A NONEXISTENT child, not `tmp_root` itself. `tmp_root` already exists
+            # (TemporaryDirectory created it), and `_git_fetch_commit` refuses a
+            # destination that exists but is not a checkout -- the guard that stops it
+            # from adopting, and later deleting, a directory it did not create. Handing
+            # it `tmp_root` made every pinned manifest fetch fail, which left the
+            # admission and platform-compatibility gates with no manifest at all.
+            fetch_dest = Path(tmp_root) / "pinned"
+            checkout_root = fetch_dest
+            err = await _git_fetch_commit(
                 git_url,
-                stderr.decode(errors="replace").strip(),
+                commit,
+                fetch_dest,
+                fetch_log,
+                clone_env=clone_env,
+                sandbox_mode=sandbox_mode,
             )
-            return None
-        manifest_dir = _contained_join(Path(tmp_root), subdirectory)
+            if err is not None:
+                logger.debug("manifest fetch of pinned commit failed for %s: %s", git_url, err)
+                return None
+        else:
+            clone_cmd = [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                branch,
+                "--single-branch",
+                git_url,
+                tmp_root,
+            ]
+            sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
+            sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
+            proc = await create_subprocess_limited(
+                *sandboxed_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=clone_env,
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            )
+            _, stderr = await _communicate_with_timeout(proc, timeout=_CLONE_TIMEOUT)
+            if proc.returncode != 0:
+                logger.debug(
+                    "manifest clone failed for %s: %s",
+                    git_url,
+                    stderr.decode(errors="replace").strip(),
+                )
+                return None
+            checkout_root = Path(tmp_root)
+        # Containment is measured from the root the tree actually landed in, which
+        # differs by branch: the pinned fetch uses a child of `tmp_root` so it gets a
+        # destination it created, the branch clone uses `tmp_root` itself.
+        manifest_dir = _contained_join(checkout_root, subdirectory)
         if manifest_dir is None:
             # Untrusted index subdirectory escaped the clone root (absolute,
             # ``..``, or a symlink resolving outside tmp_root) — refuse.
@@ -803,6 +864,128 @@ async def _fetch_app_manifest(
     finally:
         if tmp_root:
             await asyncio.to_thread(shutil.rmtree, tmp_root, ignore_errors=True)
+
+
+def _remote_controlled_url(entry: dict[str, Any]) -> bool:
+    """Whether *entry*'s clone URL came from content we do not control.
+
+    Drives the CREDENTIAL posture: a True answer means the clone runs
+    credential-free and strict-sandboxed (:func:`anonymous_git_env`), because the
+    URL is not one the owner typed.
+
+    Both markers qualify. ``_registry`` is an external index's row. ``_catalog`` is
+    the official catalog's, whose URL arrives in a document fetched over the network
+    whose signature this client does not yet verify -- so it is remote-controlled in
+    exactly the same way. Reading "no ``_registry``" as "owner-designated" held only
+    while the sole marker-less rows came from the wheel's bundled seed, which the
+    owner installed deliberately.
+    """
+    return bool(entry.get("_registry")) or bool(entry.get("_catalog"))
+
+
+def _official_entry(entry: dict[str, Any]) -> bool:
+    """Whether *entry* is an app WE list, which decides install-receipt eligibility.
+
+    Deliberately NOT the negation of :func:`_remote_controlled_url`. A catalog row
+    is remote-controlled (credential-free) AND official (receipt fires); collapsing
+    both onto one boolean is what made the catalog row take owner credentials.
+    """
+    return not entry.get("_registry")
+
+
+async def _move_checkout_aside(dest: Path, log_lines: list[str]) -> Path | None:
+    """Atomically rename *dest* to a sibling temp path under the app-sources root.
+
+    Returns the new path, or ``None`` if the rename failed. Nothing is ever
+    deleted here: the caller reports the failure and the retention sweep owns the
+    moved-aside directory's eventual removal.
+    """
+    aside = dest.with_name(f"{dest.name}.stale-{uuid.uuid4().hex[:8]}")
+    try:
+        await asyncio.to_thread(dest.rename, aside)
+    except OSError as exc:
+        log_lines.append(f"Could not move aside the checkout at {dest}: {exc}")
+        return None
+    # Refresh mtime so the retention clock starts now, not at the checkout's
+    # last-modified time (which may already exceed the sweep threshold).
+    # Best-effort: failure only shortens how long the directory survives.
+    try:
+        await asyncio.to_thread(os.utime, aside)
+    except OSError:
+        pass
+    return aside
+
+
+def _same_git_target(a: str, b: str) -> bool:
+    """Whether two clone URLs name the same repository.
+
+    Cosmetic variance between the separately-authored seed and catalog is a trailing
+    ``/``, a trailing ``.git``, and the case of the scheme and host -- those three
+    are normalised.
+
+    **The PATH keeps its case.** Repository paths are case-sensitive on plenty of
+    forges, so folding them makes two DIFFERENT repositories compare equal, and this
+    predicate is what decides whether a catalog row may stand in for a bundled app.
+    App trust is keyed by name, so a false "same target" here is the name-rebinding
+    that requiring URL equality exists to prevent.
+    """
+
+    def norm(url: str) -> str:
+        u = (url or "").strip().rstrip("/")
+        if u.endswith(".git"):
+            u = u[: -len(".git")]
+        scheme, sep, rest = u.partition("://")
+        if not sep:
+            # No scheme to split on (scp-style or a bare path): fold nothing, since
+            # the host cannot be told from the path without guessing.
+            return u
+        host, slash, path = rest.partition("/")
+        return f"{scheme.lower()}://{host.lower()}{slash}{path}"
+
+    return bool(a) and norm(a) == norm(b)
+
+
+def _catalog_row_supersedes_seed(seed: dict[str, Any], catalog_row: dict[str, Any]) -> bool:
+    """Whether *catalog_row* may stand in for the same-named *seed* row.
+
+    The catalog is the shelf and the bundled seed is its offline snapshot, so when
+    both describe the same app the catalog's row is the better one: it carries the
+    curated copy AND the commit pin, while the seed carries four coordinate fields
+    and no pin. Deferring to the seed instead is what made the pin dead data for
+    every app that actually has one -- both git catalog entries are also seed
+    entries, so a name-collision rule that favoured the seed discarded 100% of the
+    published pins.
+
+    Requiring URL equality is the security half. Without it, a catalog revision
+    could rebind a bundled app's NAME to a different repository, and app trust is
+    keyed by name -- so the row that replaces the seed must be describing the same
+    repository the wheel shipped against, not merely claiming the same name.
+    """
+    return _same_git_target(_entry_git_url(seed), _entry_git_url(catalog_row))
+
+
+def _is_catalog_row(entry: dict[str, Any]) -> bool:
+    """Whether *entry* came from the official catalog and may skip the manifest fetch.
+
+    Both halves are required. ``_catalog`` is on the row-projection allowlist, so
+    an external registry's index -- untrusted, index-controlled JSON -- can set it
+    on its own rows; ``_registry`` is attached server-side per configured registry
+    and cannot be forged. Testing only ``_catalog`` would let such a row skip the
+    fetch of the app's OWN manifest and keep index-supplied display copy instead,
+    which is the substitution the manifest fetch exists to prevent.
+    """
+    return bool(entry.get("_catalog")) and not entry.get("_registry")
+
+
+async def _identity(entry: dict[str, Any]) -> dict[str, Any]:
+    """Return *entry* unchanged, as an awaitable.
+
+    Lets the manifest-fetch gather hold a uniform list of coroutines while a
+    catalog row skips the fetch entirely: the alternative is branching on row
+    kind at the gather site AND at the result-zip below it, where an index
+    mismatch would silently pair a row with another row's manifest.
+    """
+    return entry
 
 
 async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
@@ -848,15 +1031,63 @@ async def _resolve_manifest(entry: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+#: Keys a registry index row may contribute to a merged app-store row.
+#
+# An index row is UNTRUSTED content — an external registry's index is
+# user-supplied JSON — so the merge projects these names explicitly instead of
+# spreading the row. Spreading shipped every key an index chose to invent
+# straight to the browser, which both grew the payload with fields no consumer
+# reads and gave an index a channel for keys the client never validated.
+#
+# Each name here has a reader: ``name`` is identity; ``gitUrl`` / ``repo`` /
+# ``branch`` / ``subdirectory`` are the clone coordinates
+# (``_entry_git_url``, ``install_from_registry``); ``resources`` selects the
+# self-managed install path; ``detectInstalled`` is the pre-install probe;
+# ``managed`` is the legacy registry-only flag; ``featured`` is the Discover
+# spotlight flag (kept only on non-external rows by ``_apply_trust_fields``);
+# ``_registry`` is the server-attached source tag; ``_index_author`` is the
+# author snapshot ``_apply_trust_fields`` consumes for the verified mark.
+#
+# Display fields are deliberately ABSENT: they come from the fetched
+# ``app.json`` below, so an index cannot publish display copy for an app whose
+# manifest says otherwise. Install-status and trust fields are also absent —
+# ``_enrich_with_install_status`` and ``_apply_trust_fields`` run after this
+# and stamp them server-side.
+_REGISTRY_ROW_KEYS: frozenset[str] = frozenset(
+    {
+        "name",
+        "gitUrl",
+        "repo",
+        "branch",
+        # `_catalog` must survive the merge or the row goes back through the
+        # per-app manifest clone it exists to make unnecessary.
+        #
+        # `commit` survives for data fidelity only, NOT as an authorization: this
+        # projection also builds rows from an external registry's index, so the
+        # value here is index-controlled. `install_from_registry` reads the pin only
+        # for `_is_catalog_row`, which no index row can satisfy.
+        "commit",
+        "_catalog",
+        "subdirectory",
+        "resources",
+        "detectInstalled",
+        "managed",
+        "featured",
+        "_registry",
+        "_index_author",
+    }
+)
+
+
 def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
     """Merge app.json fields into a registry entry.
 
-    Registry-only fields (name, repo, branch, managed, detectInstalled)
-    are preserved from the entry. Everything else comes from app.json,
-    with the blob proxy URL pattern applied to image paths.
+    Registry-only fields (``_REGISTRY_ROW_KEYS``) are preserved from the entry.
+    Everything else comes from app.json, with the blob proxy URL pattern
+    applied to image paths.
     """
     repo = entry.get("repo", "")
-    result = dict(entry)  # start with registry fields
+    result = {k: v for k, v in entry.items() if k in _REGISTRY_ROW_KEYS}
 
     # Top-level display fields from app.json
     for key in (
@@ -894,10 +1125,23 @@ def _merge_manifest(entry: dict[str, Any], manifest: dict[str, Any]) -> dict[str
     if "platform" in manifest:
         result["platform"] = manifest["platform"]
 
-    # Icon — convert repo-relative path to blob proxy URL
+    # Icon — convert repo-relative path to blob proxy URL.
+    #
+    # Only ``iconPath`` (repo-relative) is honoured, never a manifest-declared
+    # ``iconUrl``: an index-fetched manifest is untrusted content, and copying an
+    # absolute URL out of it would let a third party point the store's <img> at
+    # any host it likes. Rewriting a repo-relative path keeps every icon fetch
+    # on our own proxy, which enforces the extension allowlist and the
+    # trusted-host gate.
     icon_path = manifest.get("iconPath", "")
     if icon_path and repo:
         result["iconUrl"] = f"/api/apps/blob?repo={repo}&path={icon_path}"
+    # Dark-appearance variant. Raster icons have fixed bytes, so an app that
+    # must read well on both backgrounds ships two files; first-party
+    # ``/app-assets/`` SVGs are inlined and repaint from theme tokens instead.
+    icon_path_dark = manifest.get("iconPathDark", "")
+    if icon_path_dark and repo:
+        result["iconUrlDark"] = f"/api/apps/blob?repo={repo}&path={icon_path_dark}"
     # Lucide fallback icon from manifest extra fields
     if manifest.get("icon"):
         result["icon"] = manifest["icon"]
@@ -973,6 +1217,38 @@ def _enrich_with_install_status(
     return entries
 
 
+#: Index-declared author spellings that name US, folded by ``_fold_author``.
+#
+# The product name is two words, so the bundled catalog and the official
+# published catalog both state ``Kiro Crew``; the historical bundled spelling
+# was the single token ``kirocrew``. Both are us, so both mint the mark.
+FIRST_PARTY_AUTHORS: frozenset[str] = frozenset(
+    {"kirocrew", "kiro crew"}  # brand-ok: folded values, lower-cased by contract
+)
+
+
+def _fold_author(value: object) -> str:
+    """Fold an author name for the first-party comparison.
+
+    NFKC maps fullwidth forms onto ASCII, category-``Cf`` code points (ZWSP,
+    soft hyphen, bidi marks) are dropped, and runs of whitespace collapse to a
+    single space. Without this, ``Ｋｉｒｏ Ｃｒｅｗ`` and ``kiro\u200bcrew``
+    read as us to a human but compare unequal, so an index row that legitimately
+    names us in a non-ASCII form would silently lose the mark.
+
+    Widening the match is safe HERE and only here: ``_apply_trust_fields``
+    short-circuits every ``_registry``-tagged row to ``verified: False`` before
+    consulting the author at all, so the folded comparison is only ever reached
+    for rows whose index we ship or sign. Do not reuse this to GRANT trust on a
+    path where untrusted content supplies the name.
+    """
+    if not isinstance(value, str):
+        return ""
+    folded = unicodedata.normalize("NFKC", value)
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Cf")
+    return " ".join(folded.split()).lower()
+
+
 def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Stamp server-computed ``provenance`` and ``verified`` on every row.
 
@@ -992,11 +1268,26 @@ def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     - ``provenance``: ``"external"`` when ``_registry`` is set (the tag is
       applied server-side per configured registry and cannot be forged by
       index content); otherwise ``"builtin"`` when ``origin == "builtin"``,
-      else ``"core"`` (bundled ``app-registry.json`` or edition entry).
+      else ``"official"``.
+
+      ``"official"`` means "an app WE list", and the bundled
+      ``app-registry.json`` is one delivery of that list — the offline seed
+      that ships inside the wheel. It answers the same question the remote
+      signed catalog answers, so it gets the same value rather than a second
+      one: two provenance values for one claim would put a weaker integrity
+      guarantee (rides on the install artifact, cannot be revoked before the
+      next release) behind a label a client cannot tell apart from the
+      stronger one. The value names WHOSE list an app is on; how that list
+      reached the client is a separate axis, and belongs in a separate field
+      once there is more than one answer to record.
+
+      ``"core"`` was the previous spelling. Clients accept both during the
+      migration, so an older gateway's rows still label correctly.
     - ``verified``: ``True`` only when provenance is NOT ``"external"`` AND
       (``origin == "builtin"`` or the INDEX-declared author — snapshotted
       into ``_index_author`` by ``list_registry`` before the manifest merge
-      — is "kirocrew", case-insensitively). The badge asserts first-party
+      — names us after ``_fold_author`` (see ``FIRST_PARTY_AUTHORS``). The
+      badge asserts first-party
       provenance next to an Install button that runs setup code with
       gateway privileges, so it is never awardable from index-published
       trust keys or from the repo-fetched ``app.json``: a third-party core
@@ -1009,15 +1300,29 @@ def _apply_trust_fields(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     for entry in entries:
         index_author = entry.pop("_index_author", None)
-        author_lower = index_author.lower() if isinstance(index_author, str) else ""
+        folded_author = _fold_author(index_author)
         if entry.get("_registry"):
             entry["provenance"] = "external"
             entry["verified"] = False
             entry.pop("featured", None)
         else:
             builtin = entry.get("origin") == "builtin"
-            entry["provenance"] = "builtin" if builtin else "core"
-            entry["verified"] = builtin or author_lower == "kirocrew"
+            entry["provenance"] = "builtin" if builtin else "official"
+            if entry.get("_catalog"):
+                # A catalog row's author is curated copy from a document whose
+                # signature this client does not yet check, so it must never mint
+                # the first-party badge.
+                #
+                # The refusal lives HERE and not at the row's source because
+                # omitting `_index_author` upstream does not survive: the snapshot
+                # loop in `list_registry` assigns `_index_author = entry["author"]`
+                # unconditionally, which silently re-created the very path the
+                # omission was meant to close. This function is the trust
+                # boundary, so a rule stated anywhere else is a rule some later
+                # assignment can undo.
+                entry["verified"] = False
+            else:
+                entry["verified"] = builtin or folded_author in FIRST_PARTY_AUTHORS
     return entries
 
 
@@ -1307,6 +1612,51 @@ async def _fetch_external_registry_index(
             await asyncio.to_thread(shutil.rmtree, tmp_root, ignore_errors=True)
 
 
+def _apply_configured_branch(entries: list[dict[str, Any]], reg, *, warn: bool = False) -> None:
+    """Force the operator-configured registry branch onto same-repo entries.
+
+    The registry index is cloned and parsed from exactly ``reg.branch``, so a
+    same-repo entry declaring a different branch describes a state that does
+    not exist on the ref the operator asked for (e.g. a pre-merge entry
+    declaring ``main``); honouring it makes install clone a ref where the
+    app's subdirectory is missing. The declared value is index-controlled
+    (untrusted) content, while ``reg.branch`` already passed the branch regex
+    gate before the fetch, so the override also narrows what a registry index
+    can make the installer clone.
+
+    A cross-repo entry — one whose effective clone URL differs from the
+    configured registry repo — keeps its declaration: its branch names a ref
+    in ANOTHER repository, about which ``reg.branch`` carries no information.
+    The comparison is byte-identical string equality, matching the
+    owner-designated carve-out semantics (no normalization, no host-level
+    matching). A cross-repo entry with no usable declared branch still
+    inherits ``reg.branch`` (an explicit JSON ``null`` counts as absent, so
+    ``None`` can never flow to the clone coordinates).
+
+    Runs at fetch finalisation AND on every cache read that feeds a branch
+    consumer, so a cache written before the registry's branch config changed
+    (or by a version that honoured per-app declarations) cannot keep an
+    overridden branch alive until the next refresh. ``warn`` is set only on
+    the fetch path so a divergent declaration is logged once per refresh
+    rather than on every lookup.
+    """
+    for entry in entries:
+        declared_branch = entry.get("branch")
+        if _entry_git_url(entry) == reg.repo:
+            if warn and declared_branch is not None and declared_branch != reg.branch:
+                logger.warning(
+                    "External registry %s entry %r declares branch %r; using the "
+                    "configured registry branch %r",
+                    reg.name or reg.repo,
+                    entry.get("name"),
+                    declared_branch,
+                    reg.branch,
+                )
+            entry["branch"] = reg.branch
+        elif not declared_branch:
+            entry["branch"] = reg.branch
+
+
 async def _fetch_and_cache_external_registry(reg) -> list[dict[str, Any]] | None:
     """Fetch a registry's index, normalize entries, and write the cache.
 
@@ -1363,12 +1713,15 @@ async def _fetch_and_cache_external_registry(reg) -> list[dict[str, Any]] | None
             continue
         valid_entries.append(entry)
     entries = valid_entries
-    # Ensure each entry has gitUrl/repo/branch set (for install_from_registry)
+    # Ensure each entry has gitUrl/repo set (for install_from_registry), then
+    # apply the operator-configured branch policy (see _apply_configured_branch:
+    # same-repo entries get reg.branch forced with a divergence warning;
+    # cross-repo entries keep their declaration).
     for entry in entries:
         entry.setdefault("gitUrl", reg.repo)
         entry.setdefault("repo", reg.repo)
-        entry.setdefault("branch", reg.branch)
         entry["_registry"] = name
+    _apply_configured_branch(entries, reg, warn=True)
     await asyncio.to_thread(_write_external_registry_cache, name, entries)
     return entries
 
@@ -1398,6 +1751,9 @@ async def _load_external_registries() -> list[dict[str, Any]]:
         if cached is not None:
             for entry in cached:
                 entry["_registry"] = name
+            # Repair caches written before a branch-config change (or by a
+            # version that honoured per-app declarations) — see helper.
+            _apply_configured_branch(cached, reg)
             return cached
 
         # Fetch from repo (writes the cache on success).
@@ -1414,6 +1770,7 @@ async def _load_external_registries() -> list[dict[str, Any]]:
         if stale is not None:
             for entry in stale:
                 entry["_registry"] = name
+            _apply_configured_branch(stale, reg)
             return stale
         logger.warning("Failed to load external registry %s from %s", name, reg.repo)
         return []
@@ -1557,6 +1914,61 @@ async def list_registry() -> list[dict[str, Any]]:
     """
     entries = await asyncio.to_thread(_load_registry_file)
 
+    # The catalog is the shelf, and the bundled seed is its offline snapshot.
+    #
+    # This runs FIRST, before the manifest fetches below, because a catalog row
+    # already carries everything the list renders -- display copy, artwork, and
+    # the `version` that decides whether an update is available. Applied here,
+    # those rows need no per-app clone at all. Applied afterwards (which is what
+    # `annotate` alone did) the clone is paid for and then overwritten.
+    #
+    # Seed rows LOSE a name collision when both name the same repository, because
+    # the seed's four coordinate fields carry no pin: favouring it discarded every
+    # published pin, since both git catalog entries are also seed entries. The seed
+    # remains the fallback for when the catalog cannot be loaded at all (the
+    # `except` below), which is the availability job it actually exists for. A
+    # catalog row naming a DIFFERENT repository does not supersede -- see
+    # `_catalog_row_supersedes_seed`.
+    catalog_entries: list[dict[str, Any]] = []
+    try:
+        # A FRESH fetch, not `load_official_catalog` -- that reads the agent-writable
+        # cache, and a cached row that MATERIALISES inventory can render with official
+        # provenance and deduplicate the real same-named external row out of the
+        # listing. The consent prompt would then describe an official app while the
+        # name grant it produces installs the external one. The cache still feeds
+        # `annotate` further down, which is display copy for rows that exist anyway
+        # and skips rows carrying `_registry`.
+        catalog_entries = await asyncio.to_thread(official_catalog.fetch_inventory_entries)
+        if catalog_entries:
+            by_name = {e.get("name"): i for i, e in enumerate(entries)}
+            for row in official_catalog.inventory(catalog_entries):
+                idx = by_name.get(row.get("name"))
+                if idx is None:
+                    entries.append(row)
+                elif _catalog_row_supersedes_seed(entries[idx], row):
+                    # Same app, same repo: take the catalog's row whole. It carries
+                    # the pin and the curated copy; the seed carries neither.
+                    # Replacing rather than overlaying `commit` onto the seed row is
+                    # deliberate -- a row needs `_catalog` for the install path to
+                    # honour its pin at all, and a seed row given `_catalog` would
+                    # then skip the manifest fetch it depends on for display copy.
+                    entries[idx] = row
+                else:
+                    logger.warning(
+                        "catalog entry %r names a different repository than the "
+                        "bundled seed (%r vs %r); keeping the seed row",
+                        row.get("name"),
+                        _entry_git_url(row),
+                        _entry_git_url(entries[idx]),
+                    )
+    except Exception:  # noqa: BLE001 - degrade, never 500 the store
+        # No catalog inventory this listing. That is the behaviour the store had
+        # before this module existed (seed + built-ins discovered on disk), and it
+        # is the right degradation: a name we cannot confirm right now must not
+        # appear as an official row, because that row is what a consent grant is
+        # made against.
+        logger.warning("no official catalog inventory this listing", exc_info=True)
+
     # Load external registries from config, deduplicating against core and each other
     external_entries = await _load_external_registries()
     seen_names = {e.get("name") for e in entries}
@@ -1568,7 +1980,6 @@ async def list_registry() -> list[dict[str, Any]]:
 
     installed = await asyncio.to_thread(list_installed_apps)
     installed_map = {a["name"]: a for a in installed}
-
     # Snapshot the INDEX-declared author before the manifest merge below
     # overwrites ``author`` with the repo-fetched app.json value.
     # ``_apply_trust_fields`` derives ``verified`` from this snapshot only:
@@ -1579,9 +1990,16 @@ async def list_registry() -> list[dict[str, Any]]:
     for entry in entries:
         entry["_index_author"] = entry.get("author")
 
-    # Fetch manifests in parallel for all entries
+    # Fetch manifests in parallel, EXCEPT for catalog rows.
+    #
+    # A catalog row already carries the display fields and the `version` this
+    # list needs, baked at publish time from the app's own app.json by a pipeline
+    # that read it once, centrally. Cloning the app's repository again to learn
+    # what the catalog already told us is the per-app network cost this document
+    # exists to remove -- and it is O(N) in the number of third-party apps, which
+    # is exactly the number the store is meant to grow.
     resolved = await asyncio.gather(
-        *[_resolve_manifest(e) for e in entries],
+        *[_identity(e) if _is_catalog_row(e) else _resolve_manifest(e) for e in entries],
         return_exceptions=True,
     )
     entries = [r if isinstance(r, dict) else entries[i] for i, r in enumerate(resolved)]
@@ -1618,9 +2036,75 @@ async def list_registry() -> list[dict[str, Any]]:
         except (asyncio.TimeoutError, OSError):
             pass  # detection failed, treat as not installed
 
+    # Overlay the official catalog's curated fields LAST among the content
+    # sources, so they win over a fetched manifest -- that is what curation
+    # means: the catalog is ours, the manifest belongs to the app. It runs BEFORE
+    # the trust stamp so `_apply_trust_fields` still derives `verified` from the
+    # index-declared author snapshot, which the overlay deliberately leaves
+    # alone while the document's signature is not yet checked.
+    #
+    # Containment, not defensiveness. This handler has no try/except above it, so
+    # anything escaping the catalog step is an HTTP 500 for the WHOLE store -- and the
+    # curated copy is an enhancement to a listing that is already complete without it.
+    # "Anything went wrong, render what we had" is therefore the correct semantics at
+    # this seam specifically, and a broad catch here is not hiding a defect: it logs
+    # with a traceback, and the module's own precise guards still run first.
+    #
+    # Annotate from the SAME fresh entries the inventory came from, never the cache.
+    #
+    # Round 11 stopped the agent-writable cache from INTRODUCING a row; this stops it
+    # from REWRITING one. `annotate` overlays `displayName` and `description`, which
+    # are exactly what the consent modal renders, and it only skips rows carrying
+    # `_registry` -- so a poisoned cache entry could re-label a freshly fetched
+    # first-party row and the name-scoped grant would then execute the real app under
+    # a spoofed identity. Same value, different verb, same trust boundary.
+    #
+    # When the fetch failed, `catalog_entries` is empty and no catalog-derived copy is
+    # applied at all. That is the correct degradation: rows then render the copy their
+    # own manifest supplies, which is what the store did before this module existed.
+    # There is no third source to fall back to -- a second source for the same rows is
+    # precisely the defect.
+    if catalog_entries:
+        try:
+            official_catalog.annotate(entries, catalog_entries)
+        except Exception:  # noqa: BLE001 - degrade, never 500 the store
+            logger.warning("ignoring curated catalog copy after a failure", exc_info=True)
+
     return _apply_trust_fields(
         _enrich_with_install_status(entries, installed_map, detected)
     )
+
+
+async def list_catalog_apps() -> list[dict[str, Any]]:
+    """Store rows built from the published catalog, enriched and trust-stamped.
+
+    The JSON-only storefront path: when the published catalog is available its
+    rows REPLACE the seed + per-app manifest fetch, so the store renders the
+    published document's list and display copy. An empty result means the catalog
+    was unavailable, and the caller falls back to ``list_registry`` offline.
+
+    Install coordinates stay with the seed: the catalog is trusted only as far as
+    TLS, so a ``git`` row is kept only when the seed or an external registry also
+    names it, and it carries no clone URL of its own — install resolves the seed
+    entry by name. A catalog-only ``git`` name renders nothing until it is
+    installable. ``verified`` stays ``False`` for non-builtin rows until the
+    catalog signature is checked, so this path never mints the first-party badge
+    from a document trusted only as far as TLS.
+    """
+    # Off the event loop: the first call after a cache expiry does network I/O.
+    rows = await asyncio.to_thread(official_catalog.list_catalog_rows)
+    if not rows:
+        return []
+    installable = await asyncio.to_thread(_load_registry_file)
+    installable_names = {e.get("name") for e in installable if isinstance(e, dict)}
+    rows = [
+        row
+        for row in rows
+        if row.get("source", {}).get("type") != "git" or row.get("name") in installable_names
+    ]
+    installed = await asyncio.to_thread(list_installed_apps)
+    installed_map = {a["name"]: a for a in installed}
+    return _apply_trust_fields(_enrich_with_install_status(rows, installed_map))
 
 
 def get_server_platform() -> dict[str, str]:
@@ -1630,15 +2114,108 @@ def get_server_platform() -> dict[str, str]:
     return {"os": PlatformConfig.current_os(), "arch": _platform.machine()}
 
 
+def _seed_row(name: str) -> dict[str, Any] | None:
+    """The bundled seed row named *name*, if this wheel shipped one."""
+    for entry in _load_registry_file():
+        if isinstance(entry, dict) and entry.get("name") == name:
+            return entry
+    return None
+
+
+def _resolve_registry_row(name: str) -> tuple[dict[str, Any] | None, str]:
+    """Resolve *name* to an installable row, or a refusal reason.
+
+    Searches the official catalog first, then the bundled seed, then external
+    registry caches. Returns ``(row, reason)``; a non-empty *reason* means the
+    caller must REFUSE and must not substitute another row.
+
+    **"The catalog says there is no pin" and "I could not ask the catalog" are
+    different answers, and collapsing them is a security defect.** A seeded
+    official app has a published pin, so falling back to its branch-only seed row
+    on a lookup failure installs a mutable branch tip while the store claims the
+    app is pinned -- the pin silently not applying, which is this path's one
+    quiet-yet-"successful" failure mode. So a lookup FAILURE with a seed row
+    present refuses, while an authoritative "no catalog row" keeps using the seed.
+
+    The availability cost is bounded and small: an install already requires the
+    network to clone, so the only window this closes is "catalog host unreachable
+    while the git host is reachable". Refusing there is the same choice made for
+    the coordinate cache (never read for install) and for existing checkouts
+    (never reused) -- a security property that holds only when the network
+    cooperates is not one anybody can reason about.
+    """
+    seed_row = _seed_row(name)
+
+    catalog_row: dict[str, Any] | None = None
+    catalog_failed = False
+    try:
+        catalog_row = official_catalog.inventory_for_install(name)
+    except official_catalog.CatalogUnavailable as exc:
+        catalog_failed = True
+        logger.warning("cannot confirm official coordinates for %r: %s", name, exc)
+    except Exception:  # noqa: BLE001 - fail closed: an unexpected error is not "no row"
+        catalog_failed = True
+        logger.warning("official catalog lookup failed for %r", name, exc_info=True)
+
+    if catalog_row is not None and (
+        seed_row is None or _catalog_row_supersedes_seed(seed_row, catalog_row)
+    ):
+        # The catalog row carries the pin and the curated copy; a same-repo seed row
+        # carries neither, so it does not win. Deferring to it is what made every
+        # published pin unreachable on the install path.
+        return catalog_row, ""
+
+    if catalog_failed:
+        # Before ANY fallback, seed or external. Without the catalog we cannot know
+        # whether this name is a catalog app, and app trust is keyed by name: a
+        # same-named external registry row would install a different repository's
+        # code under a name the owner already permitted for execution. The local
+        # cache cannot be consulted to decide -- it is agent-writable, which is the
+        # surface `inventory_for_install` refuses to read in the first place.
+        detail = (
+            "is bundled and may carry an official commit pin"
+            if seed_row is not None
+            else "may be an official catalog app"
+        )
+        return None, (
+            f"app {name!r} {detail}, but the official catalog could not be reached to "
+            "confirm it — refusing to resolve it from another source. Retry when the "
+            "catalog is reachable."
+        )
+
+    if seed_row is not None:
+        return seed_row, ""
+    return _external_registry_row(name), ""
+
+
 def get_registry_app(name: str) -> dict[str, Any] | None:
     """Look up a registry app by name (synchronous, for internal use).
 
-    Searches the bundled registry first, then external registry caches.
+    Returns the row, or ``None`` when no source offers *name*.
+
+    RAISES :class:`official_catalog.CatalogUnavailable` when resolution was refused
+    because the catalog could not be consulted. Raising rather than returning None is
+    what lets the refusal keep its reason while this stays the single lookup the
+    install path goes through: a returned None is indistinguishable from "no such
+    app", and re-deriving the difference in the caller costs a second catalog fetch
+    and stops being sound as soon as the refusal covers more than one case.
+
+    Blocking (reads the bundled file, fetches the catalog over HTTPS, and reads
+    external index caches) — call it off the event loop.
     """
-    for entry in _load_registry_file():
-        if entry.get("name") == name:
-            return entry
-    # Search external registry caches
+    row, refusal = _resolve_registry_row(name)
+    if refusal:
+        raise official_catalog.CatalogUnavailable(refusal)
+    return row
+
+
+def _external_registry_row(name: str) -> dict[str, Any] | None:
+    """The first row named *name* from an owner-configured external registry cache.
+
+    Separate from the catalog/seed resolution above because these rows are a
+    different trust class: they carry ``_registry``, which flips provenance and is
+    attached here at the lookup boundary so a stale cache cannot omit it.
+    """
     from kiro_crew.config.loader import (
         KiroCrewConfig,  # circular import: loader.py imports from apps/ at module level; deferring avoids ImportError
     )
@@ -1650,6 +2227,8 @@ def get_registry_app(name: str) -> dict[str, Any] | None:
         if cached:
             for entry in cached:
                 if entry.get("name") == name:
+                    # Repair a stale cache's branch before install reads it.
+                    _apply_configured_branch([entry], reg)
                     # Old cache files may predate persisted origin tags. Restore
                     # the authoritative discriminator at the lookup boundary so
                     # privacy gates never mistake a custom source for official.
@@ -1671,6 +2250,50 @@ def _registry_app_candidates(name: str) -> list[dict[str, Any]]:
         for entry in _load_registry_file()
         if isinstance(entry, dict) and entry.get("name") == name
     ]
+    # The catalog is an inventory source, so it must appear here too. An app
+    # installed from a catalog-only row records its provenance, and provenance-
+    # pinned resolution then looks for a candidate offering that same source: a
+    # candidate set that omits the catalog refuses EVERY later update of exactly
+    # the apps this inventory exists to make installable.
+    try:
+        row = official_catalog.inventory_for_install(name)
+        if row is not None:
+            # REPLACE the equivalent seed candidates, do not merely outrank them.
+            #
+            # Ordering alone is not enough because provenance matching compares the
+            # recorded source URL EXACTLY: an app installed when the seed's URL had no
+            # `.git` suffix does not match a catalog URL that has one, so the match
+            # walks past the catalog row and takes the retained seed -- delivering a
+            # branch-tip update for an app the store presents as pinned. Ordering only
+            # helped in the case that never needed help (URLs already identical).
+            #
+            # Replacing also keeps this path consistent with `_resolve_registry_row`,
+            # where the catalog row wins outright; two resolvers disagreeing about the
+            # same collision is how one of them ends up wrong.
+            superseded = [c for c in candidates if _catalog_row_supersedes_seed(c, row)]
+            if superseded:
+                candidates = [c for c in candidates if c not in superseded]
+                candidates.insert(0, row)
+            else:
+                candidates.append(row)
+    except Exception:  # noqa: BLE001 - a failed lookup is not "no pin"; see below
+        # A seed candidate names the SAME repository as the catalog row it shadows,
+        # so provenance-pinned resolution would accept it and deliver a branch-tip
+        # update for an app the store says is pinned. With the pin unknowable, the
+        # seed candidates are dropped rather than offered.
+        logger.warning(
+            "official catalog lookup failed for %r; refusing to offer any candidate "
+            "rather than resolving an update from an unconfirmed source",
+            name,
+            exc_info=True,
+        )
+        # Return immediately. Clearing the seed candidates and then falling through
+        # to the external caches below still let a same-named external row answer --
+        # and a tampered cache row missing its `_registry` marker reads as official,
+        # so a provenance match would install an unpinned branch with the OWNER's
+        # credentials. `_resolve_registry_row` already refuses before any fallback;
+        # this is its sibling and must refuse the same way.
+        return []
     from kiro_crew.config.loader import (
         KiroCrewConfig,  # circular import: loader.py imports from apps/ at module level; deferring avoids ImportError
     )
@@ -1679,6 +2302,7 @@ def _registry_app_candidates(name: str) -> list[dict[str, Any]]:
         cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
         for entry in cached or []:
             if isinstance(entry, dict) and entry.get("name") == name:
+                _apply_configured_branch([entry], reg)
                 candidates.append(entry)
     return candidates
 
@@ -1720,7 +2344,12 @@ def _resolve_install_entry(name: str) -> tuple[dict[str, Any] | None, str]:
     meta = get_app(name) or {}
     pinned_url = str(meta.get("sourceUrl", "") or "")
     if not pinned_url:
-        return get_registry_app(name), ""
+        try:
+            return get_registry_app(name), ""
+        except official_catalog.CatalogUnavailable as exc:
+            # A refusal, not an absence: report the cause so the user is not sent
+            # looking for a missing app during a catalog outage.
+            return None, str(exc)
     entry = _pinned_registry_entry(name, meta)
     if entry is None:
         return None, (
@@ -1744,6 +2373,7 @@ def _external_registry_app_by_repo(repo: str) -> dict[str, Any] | None:
             cached = _read_external_registry_cache(reg.name or reg.repo, ignore_ttl=True)
             for entry in cached or []:
                 if isinstance(entry, dict) and entry.get("repo") == repo:
+                    _apply_configured_branch([entry], reg)
                     return entry
     except Exception:  # fail open: branch resolution must never break blob serving
         logger.debug("_external_registry_app_by_repo: read failed", exc_info=True)
@@ -1859,6 +2489,53 @@ def _resolved_clone_commit(clone_root: Path) -> str:
     except (OSError, UnicodeDecodeError):
         pass
     return ""
+
+
+def _restore_moved_aside(
+    moved_aside: Path | None, pkg_dir: Path, log_lines: list[str], reason: str
+) -> None:
+    """Put a moved-aside checkout back at *pkg_dir*, setting the replacement aside.
+
+    One restoration path, called from every exit that abandons a replacement clone.
+    A pinned install moves the previous checkout aside on EVERY reinstall, so an exit
+    that forgets this leaves the user's only edited copy as a `.stale-*` sibling that
+    the retention sweep later deletes.
+
+    TWO RENAMES, NO RECURSIVE DELETE, and that shape is what makes it callable from
+    anywhere. Two review rounds pulled in opposite directions here: awaiting is unsound
+    during cancellation (re-entering a loop being torn down surfaces as
+    ``RuntimeError: Event loop is closed``), while a synchronous ``rmtree`` of a large
+    checkout stalls the gateway's tasks and heartbeat on the loop thread. Both are right,
+    so neither answer is -- the deletion itself is what has to go.
+
+    What actually saves the user's data is the rename, which is O(1) on one filesystem.
+    The discarded replacement is renamed to a ``.partial-*`` sibling and left for
+    :func:`_sweep_stale_checkouts`, which already owns both the ``stale`` and ``partial``
+    prefixes. So this function is cheap enough to run inline on any path, needs no thread
+    and no loop, and cannot block.
+    """
+    if moved_aside is None or not moved_aside.exists():
+        return
+    if pkg_dir.exists():
+        discarded = pkg_dir.with_name(f"{pkg_dir.name}.partial-{uuid.uuid4().hex[:8]}")
+        try:
+            pkg_dir.rename(discarded)
+        except OSError as exc:
+            # Cannot clear the destination, so the restore rename below would collide.
+            # Leave both trees in place and say where the copy is.
+            log_lines.append(
+                f"WARNING: could not set aside the replacement at {pkg_dir}: {exc}; "
+                f"the previous checkout is retained at {moved_aside.name}"
+            )
+            return
+    try:
+        moved_aside.rename(pkg_dir)
+        log_lines.append(f"Restored the previous checkout after {reason}")
+    except OSError as exc:
+        log_lines.append(
+            f"WARNING: could not restore the previous checkout from "
+            f"{moved_aside.name}: {exc}; it is retained there for manual recovery"
+        )
 
 
 async def _refuse_identity_mismatch(
@@ -2131,6 +2808,185 @@ async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
+async def _git_fetch_commit(
+    git_url: str,
+    commit: str,
+    dest: Path,
+    log_lines: list[str],
+    *,
+    clone_env: dict[str, str],
+    sandbox_mode: str,
+) -> dict[str, Any] | None:
+    """Materialise *dest* at exactly *commit*. Returns None on success.
+
+    ``git clone --branch`` cannot take a commit id -- it exits 128 with
+    ``Remote branch <sha> not found in upstream origin`` -- so a pinned entry
+    needs fetch-by-SHA instead. The published catalog pins every third-party app
+    to a commit, and this is the only path that honours that pin.
+
+    Four separate git invocations, each of which MUST carry the same credential
+    posture and sandbox mode as the clone it replaces: one that forgets is a
+    credential-exposure hole, not a style slip.
+
+    ``git remote add origin`` is not optional bookkeeping. ``git init`` + ``git
+    fetch <url> <sha>`` leaves NO origin remote, and the update path reads it
+    (:func:`_clone_origin_url`); without it every later update fails closed with
+    ``unreadable_clone_origin`` and deliberately does NOT delete the checkout, so
+    the app installs once and then needs manual cleanup to ever update again.
+
+    ``--filter=blob:none`` is deliberately absent. A server that does not support
+    it merely warns and sends everything, and a server that DOES support it turns
+    the app's source tree into a partial clone whose later file reads become lazy
+    network fetches -- during the build, off the install path's error handling.
+
+    ``--template=`` is likewise load-bearing: the owner-designated posture uses
+    :func:`minimal_env`, which does not disable the user's global git config, so a
+    configured ``init.templateDir`` would install hooks into this repository and
+    the checkout below would then execute ``post-checkout``.
+    """
+
+    async def run(argv: list[str], *, cwd: Path | None = None, timeout: int) -> tuple[int, str]:
+        sandboxed, _cleanup = wrap_argv(argv, mode=sandbox_mode)
+        sandboxed = cgroup_scope_argv(sandboxed)
+        proc = await create_subprocess_limited(
+            *sandboxed,
+            cwd=str(cwd) if cwd else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+            env=clone_env,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            await _kill_process_group(proc)
+            return 124, "timed out"
+        except asyncio.CancelledError:
+            await _kill_process_group(proc)
+            raise
+        return proc.returncode or 0, out.decode(errors="replace").strip()
+
+    # Hardening applied to the network step. None of these are set anywhere on
+    # the existing clone paths; the fetch is where an attacker-influenced URL
+    # meets git, so they start here rather than nowhere.
+    hardening = [
+        "-c",
+        "protocol.ext.allow=never",
+        "-c",
+        "submodule.recurse=false",
+        "-c",
+        "fetch.recurseSubmodules=no",
+    ]
+
+    # Destination lifecycle, stated as one invariant because three reviewer findings
+    # were three exits from the same mistake:
+    #
+    #   THIS FUNCTION MAY DELETE `dest` IF AND ONLY IF THIS INVOCATION CREATED IT
+    #   AND DID NOT SUCCEED -- and that is decided in ONE place, not per branch.
+    #
+    # The earlier drafts put cleanup on each failure branch, so each fix closed one
+    # exit and left the others: adopting a non-checkout destination (deleted the
+    # user's files), a moved-aside restore that skipped on cancellation, and finally
+    # a spawn exception between `git init` and `git remote add` that left a `.git`
+    # directory with no origin -- which then wedges every later attempt on
+    # `unreadable_clone_origin`, a fail-closed path that deliberately does not clean
+    # up after itself.
+    #
+    # Cleanup therefore belongs to the LIFETIME of the thing created, not to the
+    # enumeration of ways to fail. The `finally` below covers return, raise and
+    # cancellation without any branch having to remember.
+    created_here = False
+    succeeded = False
+    try:
+        if (dest / ".git").is_dir():
+            pass  # a checkout we can fetch into; never ours to delete
+        elif dest.exists():
+            # Refuse rather than adopt. `not (dest / ".git").is_dir()` answers "is
+            # there a checkout here", which is NOT "am I creating this": a plain
+            # directory of the user's files, or a `.git` FILE from a worktree link,
+            # would read as fresh.
+            log_lines.append(
+                f"Refusing to fetch into {dest}: it exists but is not a git checkout "
+                "(remove or fix it manually and retry)"
+            )
+            return {
+                "ok": False,
+                "name": dest.name,
+                "error": "destination_not_a_checkout",
+                "message": (
+                    "The destination exists but is not a git checkout. Remove or fix it "
+                    "manually and retry the install."
+                ),
+            }
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Set BEFORE the spawn: `git init` may create the directory and then
+            # fail, or the spawn itself may raise, and either way the directory is
+            # ours to discard.
+            created_here = True
+            code, out = await run(
+                ["git", "init", "--quiet", "--template=", str(dest)], timeout=15
+            )
+            if code != 0:
+                log_lines.append(f"git init failed (exit {code}): {out}")
+                return {"ok": False, "name": dest.name, "error": "git init failed"}
+            code, out = await run(
+                ["git", "remote", "add", "origin", git_url], cwd=dest, timeout=15
+            )
+            if code != 0:
+                log_lines.append(f"git remote add failed (exit {code}): {out}")
+                return {"ok": False, "name": dest.name, "error": "git remote add failed"}
+
+        log_lines.append(f"Fetching {git_url} at {commit[:12]}...")
+        code, out = await run(
+            ["git", *hardening, "fetch", "--depth", "1", "origin", commit],
+            cwd=dest,
+            timeout=_CLONE_TIMEOUT,
+        )
+        log_lines.append(out)
+        if code != 0:
+            # Fail closed. A server that will not serve this object (unreachable
+            # commit, or one no ref contains) must not degrade into "install the
+            # default branch instead" -- that is the pin silently not applying.
+            return {
+                "ok": False,
+                "name": dest.name,
+                "error": f"git fetch of pinned commit failed (exit {code})",
+            }
+
+        code, out = await run(
+            ["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=dest, timeout=15
+        )
+        if code != 0:
+            log_lines.append(f"git checkout failed (exit {code}): {out}")
+            return {
+                "ok": False,
+                "name": dest.name,
+                "error": "git checkout of pinned commit failed",
+            }
+
+        # The pin only becomes real here. `_resolved_clone_commit` degrades to "" on
+        # any read failure, so an empty answer is a FAILURE rather than a pass: the
+        # whole point is refusing to build a tree we cannot identify.
+        landed = await asyncio.to_thread(_resolved_clone_commit, dest)
+        if landed != commit:
+            log_lines.append(
+                f"pinned commit not honoured: asked for {commit}, checkout reports "
+                f"{landed or '<unknown>'} — refusing to install"
+            )
+            return {
+                "ok": False,
+                "name": dest.name,
+                "error": "pinned commit verification failed",
+            }
+        succeeded = True
+        return None
+    finally:
+        if created_here and not succeeded:
+            await asyncio.to_thread(shutil.rmtree, dest, True)
+
+
 async def _git_clone_or_pull(
     git_url: str,
     branch: str,
@@ -2139,6 +2995,8 @@ async def _git_clone_or_pull(
     *,
     index_originated: bool = False,
     pending_cleanup: list[Path] | None = None,
+    restorable_stale: list[Path] | None = None,
+    commit: str = "",
 ) -> dict[str, Any] | None:
     """Clone *git_url* into *dest*, or fast-forward it if already present.
 
@@ -2177,6 +3035,9 @@ async def _git_clone_or_pull(
     # Track a moved-aside directory if we need to preserve the old checkout
     # during origin-mismatch re-clone (delete-after-success pattern).
     moved_aside: Path | None = None
+    # Whether *moved_aside* is the same repository (restore it on failure) rather
+    # than a different one moved out of the way (retain it, never restore).
+    moved_aside_is_restorable = False
 
     if dest.is_dir() and (dest / ".git").is_dir():
         # The credential posture was decided from *git_url* — but a persisted
@@ -2220,102 +3081,152 @@ async def _git_clone_or_pull(
             # Move aside with an atomic same-filesystem rename into a sibling
             # temp path under the app-sources root. If rename fails (e.g. locked
             # files on Windows), return fail-closed without deleting dest.
-            stale_name = f"{dest.name}.stale-{uuid.uuid4().hex[:8]}"
-            moved_aside = dest.with_name(stale_name)
-            try:
-                await asyncio.to_thread(dest.rename, moved_aside)
-            except OSError as exc:
-                log_lines.append(
-                    f"Could not move aside the stale clone at {dest}: {exc}; "
-                    "refusing to build from it"
-                )
+            moved_aside = await _move_checkout_aside(dest, log_lines)
+            if moved_aside is None:
+                log_lines.append(f"Refusing to build from the stale clone at {dest}")
                 return {
                     "ok": False,
                     "name": dest.name,
                     "error": "stale_clone_not_removed",
                     "message": (
                         "A checkout of a different repository is present and could not be "
-                        f"moved aside: {exc}. Remove it manually and retry the install."
+                        "moved aside. Remove it manually and retry the install."
                     ),
                 }
-            # Refresh mtime so the retention clock starts now, not at the
-            # checkout's last-modified time (which may already exceed the
-            # sweep threshold).  Best-effort — failure here is harmless
-            # (the directory just survives slightly shorter than intended).
-            try:
-                await asyncio.to_thread(os.utime, moved_aside)
-            except OSError:
-                pass
 
     if dest.is_dir() and (dest / ".git").is_dir():
-        # Already cloned from the verified origin — fetch and fast-forward.
-        # (The origin-mismatch gate above guarantees this checkout's origin is
-        # byte-identical to git_url: a mismatched checkout was moved aside and
-        # never reused, so the fetch source and the provenance record are the
-        # same URL by construction.)
-        log_lines.append(f"Updating {git_url} (branch: {branch})...")
-        # Route through wrap_argv (OS sandbox) THEN cgroup_scope_argv, matching
-        # the fresh-clone path below — the cgroup DoS ceiling is the outermost
-        # layer but must not replace the wrap_argv sandbox on this
-        # agent-influenced git spawn.
-        pull_cmd, _cleanup = wrap_argv(
-            ["git", "pull", "--ff-only", "origin", branch],
-            mode=sandbox_mode,
-        )
-        pull_cmd = cgroup_scope_argv(pull_cmd)
-        proc = await create_subprocess_limited(
-            *pull_cmd,
-            cwd=str(dest),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=platform_compat.IS_POSIX,
-            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-            env=clone_env,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            log_lines.append(stdout.decode(errors="replace").strip())
-            if proc.returncode != 0:
-                # Fail closed: installing whatever the checkout happens to hold
-                # while persisting the catalog URL as its provenance would
-                # record a source the installed code was never fetched from.
-                log_lines.append(f"git pull failed (exit {proc.returncode}) — aborting")
+        if commit:
+            # A PINNED INSTALL NEVER REUSES AN EXISTING TREE.
+            #
+            # Four review rounds landed here, each a different way of trusting
+            # on-disk state: adopting a destination that was not a checkout, an
+            # exception leaving a half-built one, HEAD equality standing in for
+            # contents, and finally content `git status` cannot report at all. The
+            # last one is why no cleanliness check can close this class: `.git/`
+            # is never reported by any `git status` variant, so an added
+            # `.git/hooks/post-checkout` is invisible, and an untracked
+            # `sitecustomize.py` executes on interpreter start if the tree lands on
+            # `sys.path`. Both run attacker code while the receipt records the pin.
+            #
+            # So the pin's meaning is restored structurally instead: the tree the
+            # build sees is one this call fetched, not one it inspected. The old
+            # checkout is moved aside (never deleted) and the fresh-checkout path
+            # below fetches into an empty destination created by
+            # `git init --template=`, which is also what keeps hooks absent.
+            #
+            # The cost is one shallow fetch of a single commit per pinned reinstall.
+            # The fast path it replaces was buying that round-trip with trust in an
+            # agent-writable directory.
+            moved_aside = await _move_checkout_aside(dest, log_lines)
+            # This one is the SAME repository with the user's own edits, so a failed
+            # transaction must put it back. The origin-mismatch move above is a
+            # DIFFERENT repository's checkout: restoring that would hand the build the
+            # very tree the mismatch gate refused, so it is only ever retained. One
+            # list carrying both meanings is what made a failed pinned update either
+            # lose the user's edits or resurrect the wrong repo, depending on which
+            # rule won.
+            moved_aside_is_restorable = moved_aside is not None
+            if moved_aside is None:
                 return {
                     "ok": False,
-                    "error": f"git pull failed (exit {proc.returncode}); not installing stale code",
+                    "name": dest.name,
+                    "error": "existing_checkout_not_moved_aside",
+                    "message": (
+                        "The existing app checkout could not be moved aside, so a "
+                        "pinned install cannot be performed safely. Remove or move it "
+                        "manually and retry the install."
+                    ),
                 }
-        except asyncio.TimeoutError:
-            await _kill_process_group(proc)
-            log_lines.append("git pull timed out — aborting")
-            return {
-                "ok": False,
-                "error": "git pull timed out; not installing stale code",
-            }
-        return None
+            # Fall through: `dest` no longer exists, so the pinned fetch below
+            # creates it fresh inside the try/finally that owns restoration.
+        else:
+            # Already cloned from the verified origin — fetch and fast-forward.
+            # (The origin-mismatch gate above guarantees this checkout's origin is
+            # byte-identical to git_url: a mismatched checkout was moved aside and
+            # never reused, so the fetch source and the provenance record are the
+            # same URL by construction.)
+            log_lines.append(f"Updating {git_url} (branch: {branch})...")
+            # Route through wrap_argv (OS sandbox) THEN cgroup_scope_argv, matching
+            # the fresh-clone path below — the cgroup DoS ceiling is the outermost
+            # layer but must not replace the wrap_argv sandbox on this
+            # agent-influenced git spawn.
+            pull_cmd, _cleanup = wrap_argv(
+                ["git", "pull", "--ff-only", "origin", branch],
+                mode=sandbox_mode,
+            )
+            pull_cmd = cgroup_scope_argv(pull_cmd)
+            proc = await create_subprocess_limited(
+                *pull_cmd,
+                cwd=str(dest),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=platform_compat.IS_POSIX,
+                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+                env=clone_env,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+                log_lines.append(stdout.decode(errors="replace").strip())
+                if proc.returncode != 0:
+                    # Fail closed: installing whatever the checkout happens to hold
+                    # while persisting the catalog URL as its provenance would
+                    # record a source the installed code was never fetched from.
+                    log_lines.append(f"git pull failed (exit {proc.returncode}) — aborting")
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"git pull failed (exit {proc.returncode}); "
+                            "not installing stale code"
+                        ),
+                    }
+            except asyncio.TimeoutError:
+                await _kill_process_group(proc)
+                log_lines.append("git pull timed out — aborting")
+                return {
+                    "ok": False,
+                    "error": "git pull timed out; not installing stale code",
+                }
+            return None
 
-    # Fresh clone.
-    log_lines.append(f"Cloning {git_url} (branch: {branch})...")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    clone_cmd = [
-        "git",
-        "clone",
-        "--depth",
-        "1",
-        "--branch",
-        branch,
-        "--single-branch",
-        git_url,
-        str(dest),
-    ]
-    sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
-    sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
-
-    # If we moved aside a stale clone for re-clone, wrap the entire spawn+wait
-    # in try/finally so that ANY failure path (spawn exception, cancellation,
-    # timeout, nonzero exit) restores the moved-aside checkout. The old checkout
-    # must never disappear permanently due to a transient clone failure.
+    # Fresh checkout.
+    #
+    # Both the pinned and the branch path run inside the SAME try/finally below,
+    # which owns moved-aside restoration. The first draft gave the pinned path its
+    # own restore, which skipped on a spawn exception or cancellation -- and the two
+    # copies could nest, stranding the user's old checkout. One restoration path,
+    # exercised by both.
     clone_succeeded = False
     try:
+        if commit:
+            result = await _git_fetch_commit(
+                git_url,
+                commit,
+                dest,
+                log_lines,
+                clone_env=clone_env,
+                sandbox_mode=sandbox_mode,
+            )
+            if result is not None:
+                return result
+            clone_succeeded = True
+            return None
+
+        log_lines.append(f"Cloning {git_url} (branch: {branch})...")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        clone_cmd = [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            branch,
+            "--single-branch",
+            git_url,
+            str(dest),
+        ]
+        sandboxed_cmd, _cleanup = wrap_argv(clone_cmd, mode=sandbox_mode)
+        sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
+
         proc = await create_subprocess_limited(
             *sandboxed_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -2350,6 +3261,11 @@ async def _git_clone_or_pull(
                 # after the full install transaction succeeds.
                 if pending_cleanup is not None:
                     pending_cleanup.append(moved_aside)
+                # Reported separately, because only a same-repository move may be
+                # restored: putting an origin-mismatched checkout back would give the
+                # build the tree that gate refused.
+                if moved_aside_is_restorable and restorable_stale is not None:
+                    restorable_stale.append(moved_aside)
             else:
                 # Clone did NOT succeed — remove any partial dest and restore
                 # the old checkout so the user's code is not stranded.
@@ -2400,6 +3316,7 @@ async def _clone_build_app(
     index_originated: bool = False,
     subdirectory: str = "",
     entry_repo: str = "",
+    commit: str = "",
 ) -> dict[str, Any]:
     """Clone an app repo, gate its identity, then run its build.
 
@@ -2422,15 +3339,48 @@ async def _clone_build_app(
     # across the complete lifecycle transaction — clone/build, copy,
     # registration, and backend startup — so nested acquisition here would
     # deadlock (asyncio.Lock is not reentrant).
-    return await _clone_build_app_locked(
-        git_url,
-        app_name,
-        log_lines,
-        branch=branch,
-        index_originated=index_originated,
-        subdirectory=subdirectory,
-        entry_repo=entry_repo,
-    )
+    # The restoration state is collected HERE, at the single return, rather than
+    # stamped onto the result inside `_clone_build_app_locked`. That function has six
+    # exits and the state was only attached on the successful one, so a post-fetch
+    # failure -- a subdirectory that escapes containment, an identity mismatch, a
+    # rejected admission -- dropped it, and the caller's `finally` had nothing to
+    # restore from: the user's edited checkout went to the retention sweep. A list the
+    # callee fills and this one exit reads cannot be forgotten by a new exit.
+    restorable_stale: list[Path] = []
+    try:
+        result = await _clone_build_app_locked(
+            git_url,
+            app_name,
+            log_lines,
+            branch=branch,
+            index_originated=index_originated,
+            subdirectory=subdirectory,
+            entry_repo=entry_repo,
+            commit=commit,
+            restorable_stale=restorable_stale,
+        )
+    except BaseException:
+        # Cancellation and exceptions never reach the stamping line below, so the
+        # caller's `finally` would see no state and the user's moved-aside checkout
+        # would go to the retention sweep. There is no result dict to carry it on
+        # this path, so restore HERE, where both the state and the destination are
+        # known. `BaseException` on purpose: `CancelledError` is the reported case.
+        #
+        # SYNCHRONOUS, and that is the point: `await` during cancellation re-enters a
+        # loop that is being torn down, which surfaces as `RuntimeError: Event loop is
+        # closed` -- a failure this handler caused on three CI platforms at once. The
+        # work is a rmtree plus a rename, so it never needed the loop.
+        if restorable_stale:
+            _restore_moved_aside(
+                restorable_stale[0],
+                app_source_dir(app_name),
+                log_lines,
+                "the build was interrupted",
+            )
+        raise
+    if restorable_stale and isinstance(result, dict):
+        result["_restorable_stale"] = list(restorable_stale)
+    return result
 
 
 async def _unpoison_rejected_checkout(
@@ -2545,6 +3495,8 @@ async def _clone_build_app_locked(
     index_originated: bool = False,
     subdirectory: str = "",
     entry_repo: str = "",
+    commit: str = "",
+    restorable_stale: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Inner implementation of _clone_build_app, called under per-app lock."""
     if not _looks_like_git_url(git_url):
@@ -2556,6 +3508,8 @@ async def _clone_build_app_locked(
 
     pkg_dir = app_source_dir(app_name)
     pending_cleanup: list[Path] = []
+    if restorable_stale is None:
+        restorable_stale = []
     # Captured BEFORE the clone so a refusal below can tell a checkout this run
     # created (delete: no residue) from a pre-existing app workspace (preserve).
     checkout_preexisted = (pkg_dir / ".git").is_dir()
@@ -2584,6 +3538,8 @@ async def _clone_build_app_locked(
         log_lines,
         index_originated=index_originated,
         pending_cleanup=pending_cleanup,
+        restorable_stale=restorable_stale,
+        commit=commit,
     )
     if clone_err is not None:
         return clone_err
@@ -2677,7 +3633,21 @@ async def _clone_build_app_locked(
             "error": f"blocked by admission policy: {denied}",
         }
 
-    result = await _run_app_build(pkg_dir, app_name, log_lines)
+    # Build in the directory that actually HOLDS the package, not the clone root.
+    #
+    # A monorepo registry entry declares `subdirectory`, and historically it was
+    # joined only AFTER this build ran — so `_run_app_build` looked for
+    # pyproject.toml/package.json at the clone root, found none, logged "No build
+    # step detected — using source as-is", and returned ok=True having installed
+    # nothing. The app's own pyproject.toml was never seen. A silent success is
+    # the worst shape for this: `setup.onInstall` does get `cwd=app_source`, so
+    # an app could paper over it with a script, which is exactly how a bug like
+    # this stays hidden.
+    #
+    # `app_source` is already the containment-checked join of `subdirectory`
+    # under the clone root (the identity gate above fails closed on an escaping
+    # value), so it is safe to run the build command there.
+    result = await _run_app_build(app_source, app_name, log_lines)
     if result["ok"]:
         result["pkg_dir"] = pkg_dir
         # Surface the pre-clone checkout state so the caller's LATER gates
@@ -2759,16 +3729,56 @@ async def _run_app_build(
         or (build_dir / "setup.py").is_file()
         or (build_dir / "requirements.txt").is_file()
     ):
-        pip = shutil.which("pip") or shutil.which("pip3")
-        if pip:
-            if (build_dir / "requirements.txt").is_file() and not (
-                (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
-            ):
-                build_cmds.append([pip, "install", "-r", "requirements.txt"])
-            else:
-                build_cmds.append([pip, "install", "."])
+        # `sys.executable -m pip`, NOT `shutil.which("pip")`.
+        #
+        # A Python app has to land in the interpreter that will IMPORT it — the one
+        # running this gateway. `which("pip")` resolves to whatever pip is first on
+        # PATH, which is routinely a different interpreter: `bin/kirocrew` execs
+        # `.venv/bin/kirocrew` WITHOUT putting the venv's `bin/` on PATH, and
+        # `service/common.py::service_path()` prepends `~/.local/bin` ahead of it. So the
+        # build pip was whatever the user happened to have.
+        #
+        # The failure is SILENT, which is why it survived. Measured on a host whose first
+        # pip was 3.7 and whose gateway venv was 3.12: with a version-incompatible pip the
+        # install failed loudly, but with a *compatible-but-different* pip (3.10) it
+        # reported "Successfully installed", the build step reported success, and the
+        # package landed in `~/.local/lib/python3.10/site-packages` — invisible to the
+        # gateway, with `ENABLE_USER_SITE = False` in a venv so there is no fallback. The
+        # app installs, the entry point never appears, and nothing anywhere says why.
+        #
+        # Our own packages only fail loudly because they declare `requires-python`; a
+        # third-party app without that constraint fails silently on EVERY mismatch.
+        #
+        # EXCEPTION: never run pip against the desktop app's bundled interpreter.
+        # The desktop build ships a python-build-standalone runtime inside the
+        # application bundle (`Resources/backend-dist/...`); on macOS that bundle is
+        # code-signed, so a pip install writing into its site-packages invalidates
+        # the signature and breaks subsequent launches/updates — and the write is
+        # discarded on every app update anyway. This is a LOUD failure, not a
+        # soft-skip: a Python app that declares a build step needs its packages
+        # importable by the gateway, and skipping the install while reporting
+        # success would recreate exactly the silent-broken-install shape this
+        # function is written to prevent. Detection lives in
+        # platform_compat.is_bundled_interpreter() — the single owner of the
+        # packaging-layout sentinel — so a bundler rename breaks its pinned test
+        # instead of silently un-matching an inline check here.
+        if platform_compat.is_bundled_interpreter():
+            return {
+                "ok": False,
+                "name": app_name,
+                "error": (
+                    "Python apps that require a build step are not supported in "
+                    "the desktop app: its bundled interpreter is inside the "
+                    "signed application bundle and cannot install packages"
+                ),
+            }
+        pip_cmd = [sys.executable, "-m", "pip"]
+        if (build_dir / "requirements.txt").is_file() and not (
+            (build_dir / "pyproject.toml").is_file() or (build_dir / "setup.py").is_file()
+        ):
+            build_cmds.append([*pip_cmd, "install", "-r", "requirements.txt"])
         else:
-            log_lines.append("pip not found on PATH — skipping Python build step")
+            build_cmds.append([*pip_cmd, "install", "."])
 
     if not build_cmds:
         log_lines.append("No build step detected — using source as-is")
@@ -2875,6 +3885,53 @@ async def install_from_registry(
     repo = entry.get("repo", "")
     branch = entry.get("branch", "main")
     subdirectory = entry.get("subdirectory", "")
+    # Pinning is a CATALOG mechanism, so the pin is read only for a catalog row.
+    #
+    # `commit` is on the row-projection allowlist (`_REGISTRY_ROW_KEYS`), and that
+    # projection also builds rows from an external registry's index -- untrusted,
+    # index-controlled JSON. Reading it unconditionally would hand that index a
+    # capability its `branch` field cannot express: a fetch BY SHA reaches objects
+    # no branch contains (a commit force-pushed away, or one that only ever existed
+    # on a side ref), while a branch clone can only ever reach what a ref points at.
+    # The owner-configured `branch` would then stop bounding which code gets built
+    # and runs `onInstall`.
+    #
+    # `_is_catalog_row` is the right test rather than a bare `_catalog` check,
+    # because `_catalog` is index-settable while `_registry` is attached server-side
+    # per configured registry and cannot be forged.
+    if _is_catalog_row(entry):
+        commit = str(entry.get("commit", "") or "")
+    else:
+        commit = ""
+        if entry.get("commit"):
+            # Not a refusal: `branch` is exactly the coordinate such a row is
+            # entitled to, so honouring it is correct. But an index author who
+            # believes they pinned deserves to see that they did not.
+            logger.warning(
+                "ignoring commit pin on non-catalog row %r: pinning is a catalog "
+                "mechanism; installing from branch %r instead",
+                name,
+                branch,
+            )
+
+    # The pin is honoured or the install is refused -- there is no third option.
+    #
+    # `branch` above defaults to "main", and that default is what makes a quiet
+    # failure possible: a catalog row carries a commit and no branch, so a path
+    # that ignored `commit` would clone the tip of "main", SUCCEED, and record the
+    # tip's commit as this app's provenance. The store would then look like it
+    # installs pinned bytes while installing whatever the app's default branch
+    # holds today. Refusing a malformed pin is the only safe answer, because the
+    # alternative is inventing coordinates nobody signed.
+    if commit and not _COMMIT_SHA_RE.match(commit):
+        return {
+            "ok": False,
+            "name": name,
+            "error": (
+                f"app {name!r} carries a malformed pinned commit; refusing to "
+                f"install rather than fall back to a branch"
+            ),
+        }
 
     # Confused-deputy defense on the INSTALL path (companion to the automatic
     # browse/refresh defense in ``anonymous_git_env``). An entry that came from
@@ -2896,12 +3953,25 @@ async def install_from_registry(
     # AND sandbox mode together (the strict sandbox hiding ~/.ssh is the
     # load-bearing enforcement on credential-helper setups, not the env alone).
     # Sibling repos on the same host remain anonymous+strict.
-    index_originated = bool(entry.get("_registry"))
-    # OFFICIALNESS is decided here, BEFORE the owner-designated carve-out below:
-    # that carve-out flips index_originated as a CREDENTIAL decision (owner
-    # explicitly designated the repo), but an external-index entry never becomes
-    # an official-catalog entry — install receipts must not fire for it.
-    official_entry = not index_originated
+    # Credential posture and OFFICIALNESS are two different questions, and a
+    # catalog row is the case that separates them: its URL arrives in a document
+    # fetched over the network whose signature this client does not yet verify, so
+    # it is remote-controlled content exactly like an external index's URL -- but
+    # it IS an app we list, so its install receipt must still fire.
+    #
+    # Treating "no `_registry`" as "the owner designated this repo" was true while
+    # the only marker-less rows came from the wheel's bundled seed, which the owner
+    # installed deliberately. A catalog row is not that: nobody typed its URL, and
+    # a repointed row on a trusted forge would otherwise be cloned with the
+    # gateway's ambient git/ssh identity -- the confused-deputy read this posture
+    # exists to prevent.
+    index_originated = _remote_controlled_url(entry)    # OFFICIALNESS is decided from `_registry` ALONE, and BEFORE the
+    # owner-designated carve-out below: that carve-out flips index_originated as a
+    # CREDENTIAL decision (owner explicitly designated the repo), but an
+    # external-index entry never becomes an official-catalog entry — install
+    # receipts must not fire for it. A catalog row has no `_registry`, so it stays
+    # official even though it takes the credential-free posture above.
+    official_entry = _official_entry(entry)
     # The originating external registry id, recorded as provenance. Empty means
     # the bundled (KiroCrew-shipped) catalog, which is itself a distinct source.
     # Captured BEFORE the owner-designated carve-out (same reasoning as above):
@@ -2929,6 +3999,7 @@ async def install_from_registry(
         app_name=name,
         git_url=git_url,
         owner_designated=manifest_owner_designated,
+        commit=commit,
     )
 
     # Admission: gate AFTER the manifest fetch (so a signed manifest is verified)
@@ -3033,6 +4104,9 @@ async def install_from_registry(
         except (asyncio.TimeoutError, OSError):
             pass
 
+    build_result: dict[str, Any] = {}
+    # Cleared only after the transaction durably succeeds; the `finally` below reads it.
+    durable_success = False
     try:
         # Best-effort sweep of aged .stale-* / .partial-* dirs before the
         # install — prevents unbounded accumulation without blocking.
@@ -3050,8 +4124,11 @@ async def install_from_registry(
             log_lines,
             branch=branch,
             index_originated=index_originated,
+            # Passed so the BUILD runs where the package is. The containment check
+            # below is still authoritative for choosing app.json's directory.
             subdirectory=subdirectory,
             entry_repo=repo,
+            commit=commit,
         )
         if not build_result["ok"]:
             return {**build_result, "log": "\n".join(log_lines)}
@@ -3360,6 +4437,12 @@ async def install_from_registry(
 
             display = manifest_data.get("displayName", name)
             version = manifest_data.get("version", "0.0.0")
+            # Set BEFORE any of the fallible bookkeeping below, because this branch
+            # returns ok=True regardless of how the registration and provenance writes
+            # go: the clone is in place and the app will register itself on next
+            # launch. Leaving it False would report success to the caller while the
+            # `finally` rolled the source checkout back underneath it.
+            durable_success = True
             reg_result = register_external_app(
                 name=name,
                 version=version,
@@ -3421,6 +4504,14 @@ async def install_from_registry(
         # self-heals a legacy record: its next successful update writes the full
         # provenance it was missing.
         if result.ok:
+            # BEFORE the bookkeeping below, not after. `install_app`/`update_app` has
+            # already copied the files into place, so the installed app IS updated. If
+            # provenance persistence then raises, deciding "not durable" and rolling
+            # the SOURCE checkout back would leave installed files from the new
+            # version beside a source tree from the old one -- a torn state worse than
+            # either outcome. A failed receipt is a bookkeeping problem to log; it does
+            # not un-install what is installed.
+            durable_success = True
             set_app_provenance(
                 result.name,
                 source=f"{SOURCE_REGISTRY_PREFIX}{name}",
@@ -3455,3 +4546,46 @@ async def install_from_registry(
     except Exception as exc:
         logger.exception("Failed to install %s from registry", name)
         return {"ok": False, "name": name, "error": str(exc), "log": "\n".join(log_lines)}
+    finally:
+        # RESTORATION BELONGS TO THE LIFETIME, NOT TO THE LIST OF FAILURES.
+        #
+        # A pinned install moves the previous checkout aside on every reinstall, and
+        # this function has seven post-clone exits (containment, identity mismatch,
+        # two admission gates, onInstall, the install step, the happy path) plus an
+        # exception path and cancellation. Restoring on the branches instead meant an
+        # `onInstall` that exited non-zero returned early and left the user's only
+        # edited copy as a `.stale-*` sibling for the retention sweep to delete.
+        #
+        # One site, reached by every exit. It is a no-op unless a moved-aside
+        # checkout exists AND the transaction did not durably succeed, so the
+        # pre-clone exits and the happy path both pass through untouched.
+        if not durable_success:
+            try:
+                pending = build_result.get("_restorable_stale") or []
+                if pending:
+                    _restore_moved_aside(
+                        Path(pending[0]),
+                        # `app_source_dir(name)`, NOT `build_result["pkg_dir"]`: every
+                        # post-clone FAILURE dict omits `pkg_dir`, so reading it raised a
+                        # KeyError that the broad catch below swallowed -- the
+                        # restoration silently did nothing on exactly the exits it
+                        # exists for. The destination is a function of the app name, so
+                        # derive it instead of depending on a key the failure paths do
+                        # not carry. It is the clone ROOT either way: a `subdirectory`
+                        # entry points `app_source` inside the tree, while the
+                        # moved-aside sibling replaces the whole checkout.
+                        app_source_dir(name),
+                        log_lines,
+                        "the install did not complete",
+                    )
+            except Exception:  # noqa: BLE001 - never mask the outcome being returned
+                # WARNING, not debug: this catch is what hid the KeyError above for
+                # four review rounds. A restoration that could not run is a possible
+                # data loss, so it has to be visible in the log the user sees.
+                logger.warning(
+                    "could not restore the moved-aside checkout for %r", name, exc_info=True
+                )
+                log_lines.append(
+                    "WARNING: the previous checkout could not be restored; recover it "
+                    "from the .stale-* sibling directory"
+                )

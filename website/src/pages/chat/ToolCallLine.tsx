@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { shallowEqual } from 'react-redux'
 import { useAppSelector, useAppDispatch } from '../../store'
@@ -8,7 +8,7 @@ import { useLanguage } from '../../i18n/LanguageProvider'
 import { pickToolLabel } from '../../utils/toolLabel'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
-import { motion, AnimatePresence } from 'framer-motion'
+import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
 import type { ChatMessage } from '../../types'
 import { ToolDetails } from './ToolDetails'
 import { registerToolPill } from '../../store/toolPillRegistry'
@@ -35,6 +35,56 @@ import { api } from '../../api/client'
 // don't re-fire.)
 const revealedToolIds = new Set<string>()
 
+// ── Row slide (height easing) ──
+// The transcript is pinned to the bottom, and the virtualizer's pin is
+// deliberately INSTANT (a smooth pin chases the moving bottom while output
+// streams, so it never converges). Every height change therefore lands in a
+// single frame: a tool row mounting at its full height, or its status line
+// unmounting, teleports everything above it by that many pixels.
+//
+// Easing the ROW's height instead of the scroll leaves the pin instant and
+// spreads the same movement over ~13 frames, which reads as the content sliding.
+// It rides the path streaming growth already uses — the ResizeObserver reports
+// each frame's height and re-pins — so no new scroll machinery is involved.
+//
+// Kept short and cheap: this fires on every tool call, and each animated frame
+// costs one scrollTop write.
+const SLIDE_DURATION = 0.22
+const SLIDE_EASE = [0.4, 0, 0.2, 1] as const
+
+/**
+ * A tool row's secondary status line (shell elapsed time, `wait` countdown).
+ *
+ * Appears and disappears by easing its own height rather than mounting at full
+ * height, so the transcript above slides instead of stepping. The clip is only
+ * needed while the height is mid-animation, but it is harmless at rest: the box
+ * settles at its content height, so nothing is ever cut off.
+ *
+ * `children` are constructed by the caller even while hidden (ordinary JSX
+ * evaluation) — they must therefore stay cheap and side-effect free, which the
+ * two status lines are.
+ */
+function StatusRow({ show, children }: { show: boolean; children: ReactNode }) {
+  const reduce = useReducedMotion()
+  return (
+    <AnimatePresence initial={false}>
+      {show && (
+        <motion.div
+          initial={{ height: 0, opacity: 0 }}
+          animate={{ height: 'auto', opacity: 1 }}
+          exit={{ height: 0, opacity: 0 }}
+          transition={reduce
+            ? { duration: 0 }
+            : { height: { duration: SLIDE_DURATION, ease: SLIDE_EASE }, opacity: { duration: 0.15 } }}
+          style={{ overflow: 'hidden' }}
+        >
+          {children}
+        </motion.div>
+      )}
+    </AnimatePresence>
+  )
+}
+
 /** Inline tool call pill. Click toggles an expanded panel below the pill that
  *  shows purpose / input / output. */
 export default memo(function ToolCallLine({ message, running: _running, slot, onFileOpen, disclosure, disclosureKey, onDisclosureChange, appInPanel, onOpenApp }: { message: ChatMessage; running: boolean; slot?: string; onFileOpen?: (path: string) => void; disclosure?: boolean; disclosureKey?: string; onDisclosureChange?: (key: string, expanded: boolean) => void; appInPanel?: boolean; onOpenApp?: (toolCallId: string) => void }) {
@@ -55,7 +105,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
 
   // Pull the matching toolLog entry. Returns purpose/input/output for the inline
   // expansion as well as completion status for the icon.
-  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, purpose, input, output, auto, ts, hasEntry, isShell, toolName, fromLog } = useAppSelector(s => {
+  const { effectiveId, isDone: logIsDone, isRejected, isAutoDenied, purpose, input, output, auto, ts, executionStartedAt, hasEntry, isShell, toolName, fromLog } = useAppSelector(s => {
     // Slot-aware: for a non-active slot (split-view pane) read that slot's
     // per-slot tool log / messages / running state; `slot` undefined or equal to
     // the active slot → active-slot globals.
@@ -117,6 +167,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           output: e.output || '',
           auto: !!e.auto,
           ts: e.ts || 0,
+          executionStartedAt: e.execution_started_at || 0,
           hasEntry: true,
           // Older ACP update frames may omit is_shell; execute is the stable
           // tool-kind value used by the transport and keeps those frames live.
@@ -148,6 +199,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       // parse it for the meta-row time renderer. Falls to 0 if unparseable —
       // fmtTime hides the row when ts is 0.
       ts: typeof message.ts === 'number' ? message.ts : (message.ts ? Date.parse(String(message.ts)) || 0 : 0),
+      executionStartedAt: 0,
       // Treat the message as having an entry when persisted I/O is available,
       // so the empty-state copy only shows for truly bare historical messages.
       hasEntry: !!(metaInput || metaOutput),
@@ -244,8 +296,15 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   }, shallowEqual)
   const showWaitCountdown = !!waitState && waitState.deadline_ts > 0
   const [activityNow, setActivityNow] = useState(() => Date.now())
-  const activityStartRef = useRef(Date.now())
+  // Seed from execution_started_at (persisted in Redux, survives remount) when
+  // available — it records when execution actually began after approval. Falls
+  // back to ts (tool issuance time) then Date.now() for brand-new calls.
+  const activityStartRef = useRef(executionStartedAt || ts || Date.now())
   const wasPendingRef = useRef(hasPendingPerm)
+  // Tracks whether approval resolved during this mount — once set, the ts
+  // re-anchor effect is suppressed so the post-approval Date.now() anchor
+  // is not overwritten by the pre-approval ts.
+  const approvalResolvedRef = useRef(false)
   const [endingWait, setEndingWait] = useState(false)
 
   // Re-arm the button for a NEW sleep. Left latched otherwise: after a
@@ -276,11 +335,31 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       return
     }
     if (wasPendingRef.current) {
-      activityStartRef.current = Date.now()
+      const now = Date.now()
+      activityStartRef.current = now
       wasPendingRef.current = false
-      setActivityNow(Date.now())
+      approvalResolvedRef.current = true
+      setActivityNow(now)
+      // The durable anchor is stamped server-side: the approval_resolved
+      // frame sets execution_started_at on the tool entry in Redux (see
+      // sseActivityEvent), which the re-anchor effect below reads on remount.
     }
   }, [hasPendingPerm])
+
+  // When the tool log timestamp arrives (or on remount with a persisted ts),
+  // re-anchor the elapsed clock so it reflects real wall time since the tool
+  // started — not time since the component mounted. Skip if approval just
+  // resolved in this mount — the post-approval Date.now() is the correct anchor
+  // for approved commands (the pre-approval ts would inflate the timer by the
+  // entire approval wait). Also skip if executionStartedAt is set — it persists
+  // in Redux and is the authoritative anchor that survives remount.
+  useEffect(() => {
+    if (executionStartedAt) {
+      activityStartRef.current = executionStartedAt
+    } else if (ts && !hasPendingPerm && !approvalResolvedRef.current) {
+      activityStartRef.current = ts
+    }
+  }, [ts, hasPendingPerm, executionStartedAt])
 
   useEffect(() => {
     if (!showShellActivity && !showWaitCountdown) return
@@ -524,15 +603,51 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   const [revealPlayed, setRevealPlayed] = useState(false)
   const revealing = animateEntrance && !revealPlayed
 
+  // Height half of the entrance (see SLIDE_DURATION): grow from 0 so the rows
+  // above slide up instead of stepping. Same one-shot decision as the fade —
+  // a remount must not replay it — but tracked separately because the two have
+  // different lengths, and the height must be released as soon as IT finishes:
+  // a lingering inline px height would freeze the row at its entrance size and
+  // clip everything that grows later (details panel, MCP app iframe).
+  //
+  // `revealId` is REQUIRED, unlike for the fade. An id-less pre-persistence
+  // historical row cannot be recorded in `revealedToolIds`, so its
+  // `animateEntrance` is permanently true and the virtualizer would replay the
+  // grow every time the row re-enters the mounted window — shifting layout under
+  // a reader scrolling back through history. Replaying an opacity fade there
+  // moves nothing, so the fade keeps its id-less fallback; replaying a height
+  // does, so the slide takes stable identity or nothing.
+  const reduceMotion = useReducedMotion()
+  const [slidePlayed, setSlidePlayed] = useState(false)
+  const sliding = !!revealId && animateEntrance && !slidePlayed && !reduceMotion
+  // Release from the effect rather than from the completion callback alone, so
+  // the inline values are cleared however `sliding` ends — the animation
+  // finishing, or the OS reduced-motion preference flipping mid-flight, which
+  // drops `animate` while framer's `height: 0px` is still on the node and would
+  // otherwise leave the row collapsed forever.
+  useEffect(() => {
+    if (sliding) return
+    const el = containerRef.current
+    if (!el) return
+    el.style.height = ''
+    el.style.overflow = ''
+  }, [sliding])
+  const endSlide = useCallback(() => setSlidePlayed(true), [])
+
   return (
-    <div
+    <motion.div
       ref={containerRef}
       className={revealing ? 'ft-block-reveal' : undefined}
+      initial={sliding ? { height: 0 } : false}
+      animate={sliding ? { height: 'auto' } : undefined}
+      transition={{ height: { duration: SLIDE_DURATION, ease: SLIDE_EASE } }}
+      onAnimationComplete={sliding ? endSlide : undefined}
+      style={sliding ? { overflow: 'hidden' } : undefined}
       onAnimationEnd={revealing
         ? (e) => { if (e.target === e.currentTarget) setRevealPlayed(true) }
         : undefined}
     >
-      <div className="inline-flex items-start gap-1 group/toolpill max-w-full min-w-0">
+      <div className="inline-flex items-start gap-1 group/toolpill max-w-full min-w-0 -ml-2">
       {/* No `font-mono`: the pill's label is prose with the odd argument spliced
           in ("Searching for 'YOLO' in src"), not code, and Tailwind's
           `font-mono` pins `var(--mono)` — which the Font Family setting never
@@ -592,15 +707,15 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
       )}
       </div>
 
-      {showShellActivity && (
+      <StatusRow show={showShellActivity}>
         <div className="ml-3 mt-1 text-[12px] text-muted">
           <span className="sr-only" aria-live="polite">{i18nT('pages.chat.activityViewer.running')}</span>
           <span aria-hidden="true" className="tabular-nums font-mono">
             {i18nT('pages.chat.activityViewer.running')} · {elapsedLabel}
           </span>
         </div>
-      )}
-      {showWaitCountdown && (
+      </StatusRow>
+      <StatusRow show={showWaitCountdown}>
         <div className="ml-3 mt-1 flex items-center gap-2 text-[12px] text-muted" data-testid="wait-countdown">
           {/* The status word is announced once; the digits are aria-hidden so a
               screen reader is not re-read every second. Same split as the shell
@@ -629,7 +744,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
               : i18nT('pages.chat.toolCallLine.wait_end_now')}
           </button>
         </div>
-      )}
+      </StatusRow>
 
       <AnimatePresence initial={false}>
         {effectivelyExpanded && (
@@ -641,7 +756,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             transition={{ duration: 0.35, ease: [0.4, 0.0, 0.2, 1] /* Material standard */ }}
             style={{ overflow: 'hidden' }}
           >
-            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={label} input={input} output={isAutoDenied ? i18nT('pages.chat.toolCallLine.blocked_by_security_policy') : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} />
+            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={label} input={input} output={isAutoDenied ? i18nT('pages.chat.toolCallLine.blocked_by_security_policy') : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
           </motion.div>
         )}
       </AnimatePresence>
@@ -667,6 +782,6 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
           </button>
         )
         : <McpAppFrame payload={mcpApp} />)}
-    </div>
+    </motion.div>
   )
 })

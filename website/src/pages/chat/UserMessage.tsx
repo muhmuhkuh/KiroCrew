@@ -1,8 +1,9 @@
 import { memo, useState, useRef, useEffect, useCallback } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, AlertCircle } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
+import { HOVER_NONE_ACTIONS_ROW_CLS } from '../../utils/touchActions'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
 import { applySearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
@@ -133,13 +134,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   if (editing) {
     return (
-      <div data-role="user" className="group/msg flex flex-col items-end">
+      <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
         {/* `edit-grow` is a CSS grid auto-sizer: a hidden ::after mirror (fed by
             data-replicated-value) drives the grid track so the textarea grows
             with its own content — width AND height — exactly like the read-only
-            bubble it replaces, capped by max-w-[550px]. No JS measurement. */}
+            bubble it replaces, capped at 550px or the column, whichever is
+            smaller. No JS measurement. */}
         <div
-          className="edit-grow px-4 py-1.5 text-sm leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 max-w-[550px] outline outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow px-4 py-1.5 text-sm leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 max-w-[min(550px,100%)] outline outline-2 -outline-offset-2 outline-accent/60"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
         >
@@ -169,13 +171,15 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
 
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
-    <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-1.5 text-sm leading-relaxed rounded-xl overflow-hidden min-w-0 max-w-[550px] ${isSteer ? 'bg-accent-subtle text-text' : 'bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
+    <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-1.5 text-sm leading-relaxed rounded-xl overflow-hidden min-w-0 max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
       {renderContent(content, meta)}
     </div>
   )
 
   return (
-    <div data-role="user" className="group/msg flex flex-col items-end">
+    // Every box between the content column and the bubble is a fit-content flex
+    // item, so a percentage cap only bites once ALL of them carry one.
+    <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
       {/* User-typed line breaks (Shift+Enter) are preserved at the markdown
           level, NOT via container `white-space: pre-wrap`. renderUserContentCb
           renders user content through MarkdownRenderer with `softBreaks`, which
@@ -193,7 +197,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             <Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.steered_into_the_running_turn')}
           </div>
           <motion.div
-            className="relative"
+            className="relative max-w-full"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
@@ -211,7 +215,19 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           </motion.div>
         </>
       ) : bubble}
-      <div className="flex items-center gap-1.5 px-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300">
+      {/* Stale optimistic indicator — shown when the server echo never arrived
+          within the timeout window (#3898 item 3). */}
+      {!!(meta?.stale && meta?.optimistic) && (
+        <div className="inline-flex items-center gap-1 text-[12px] text-warning mt-0.5 pr-1" role="status" aria-label={i18nT('pages.chat.userMessage.message_unconfirmed') as string}>
+          <AlertCircle size={12} className="shrink-0" />
+          <span>{i18nT('pages.chat.userMessage.message_unconfirmed') as string}</span>
+        </div>
+      )}
+      {/* Where the pointer cannot hover the footer is always visible and its
+          descendant overrides grow every action to a 40px touch target (20px
+          icon + 10px padding); hover-capable pointers keep the reveal-on-hover
+          behavior and the compact 14px icons untouched. */}
+      <div className={`flex items-center gap-1.5 px-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
         <button
           onClick={() => {
             const pastes = (meta?.pastes as PasteBlock[] | undefined) || []

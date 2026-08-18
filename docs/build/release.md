@@ -18,7 +18,7 @@ macOS signing mechanics and notary-credential rotation live in
 |---------|---------|---------------|
 | `nightly` | `nightly.yml`: cron `0 6 * * *` (06:00 UTC) plus manual dispatch, from `main` HEAD | `<base>-nightly.<YYYYMMDD>t<HHMMSS>` |
 | `insider` | `release.yml`: push of a prerelease tag (`v0.2.0-rc.1`) | `<x.y.z>-rc.N` |
-| `stable` | `release.yml`: push of a bare semver tag (`v0.2.0`) | `<x.y.z>` |
+| `stable` | `release.yml`: push of a bare semver tag (`v0.2.0`) on a recorded candidate's commit; the run verifies and promotes that candidate's exact bytes, never rebuilding | Release identity `<x.y.z>`; artifacts retain the selected candidate's embedded `<x.y.z>rcN` version |
 
 The channel name is a literal path segment everywhere (`cli/insider/...`,
 `feed/insider/...`, the `:insider` image tag), so there is no name-to-prefix
@@ -33,6 +33,38 @@ deciding to promote, and merging back are human steps the pipeline knows nothing
 about, which is why there is no cut/promote/rollback workflow (see "Deliberately
 not built").
 
+## Stable promotion: exact tested bytes, never a rebuild
+
+Stable must ship the bytes insiders actually validated, not a same-commit
+rebuild that hopes for reproducibility. The mechanism:
+
+- **A successful prerelease run records the candidate.** After every publish
+  lane succeeds, `record-promotion` assembles the exact wheel/sdist, AppImage,
+  notarized zip/DMG, and the attested OCI manifest digest into a
+  `stable-promotion-<x.y.z>` GitHub artifact (90-day retention) whose manifest
+  (`scripts/release_promotion.py create`) carries per-file SHA-256/SHA-512/size
+  plus the source SHA, tag, run id, and versions.
+- **A bare `vX.Y.Z` tag resolves and verifies that record.** The
+  `resolve-promotion` job finds the newest **successful** same-commit,
+  same-base-version prerelease run, verifies the artifact ZIP against GitHub's
+  API-recorded digest, safely extracts it, and verifies every manifest field
+  and file digest (`scripts/release_promotion.py verify`). Only then do the
+  publish lanes move stable pointers/tags to those bytes. The stable run never
+  invokes the build workflows, CDSigner, Apple notarization, or the OCI
+  builder.
+- **Everything fails closed.** A missing, expired, ambiguous, or
+  digest-mismatched record aborts the promotion: cut and validate a fresh RC
+  rather than rebuilding stable.
+- **Promoted binaries retain the candidate's embedded version** (see "Version
+  stamping"), because rewriting embedded metadata would produce bytes users
+  never baked and invalidate the recorded digests and macOS signatures. The
+  bare git tag, GitHub Release, and stable channel are the final release
+  identity. pip users selecting a promoted (prerelease-versioned) wheel by
+  version must allow prereleases; the stable channel feed remains
+  channel-sticky.
+- **Hot patches follow the same rule**: at least one recorded RC before the
+  bare patch tag.
+
 ## Workflows in the release path
 
 Every one of these exists on `main`. Two trigger workflows call the same set of
@@ -43,13 +75,13 @@ concurrency group, and their version derivation.
 | Workflow | Kind | Role |
 |---|---|---|
 | `nightly.yml` | trigger (schedule + dispatch) | Derives the date stamp, then calls everything below. `concurrency: nightly-build` with `cancel-in-progress: true`. |
-| `release.yml` | trigger (`push` on `v*` tags) | Derives version + channel + wheel version from the tag, calls everything below, then creates the GitHub Release. `concurrency: release-publish` with `cancel-in-progress: false` (queued). |
+| `release.yml` | trigger (`push` on `v*` tags) | Derives version + channel + wheel version from the tag. A prerelease tag builds, publishes to insider, and records the immutable promotion bundle; a bare tag verifies that same-commit bundle and promotes the exact files/OCI digest to stable without building. Then creates the GitHub Release. `concurrency: release-publish` with `cancel-in-progress: false` (queued). |
 | `dependency-vulnerability.yml` | reusable gate | `scripts/check_npm_audit.py`. Runs first; every build job needs it. |
 | `build-wheel.yml` | reusable build | Stamps the PEP 440 version into `pyproject.toml` and `__init__.py`, stamps the distribution channel, builds the frontend and stages it into the package, then `python -m build`. Uploads artifact `cli-wheel` (wheel + sdist). Credential-free. |
-| `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` (AppImage) via `packaging/build-desktop.sh`. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. |
+| `build-desktop.yml` | reusable build | Matrix `macos-15` (universal macOS app) and `ubuntu-22.04` / `ubuntu-22.04-arm` (AppImage + deb + rpm) via `packaging/build-desktop.sh`, then a `smoke-linux-packages` job that installs the deb and rpm in Ubuntu 24.04 and Amazon Linux 2023 containers. Deliberately credential-free (`contents: read` only, pinned by `test_workflow_permissions.py`), so it builds **unsigned** and hands the `.app` downstream. |
 | `build-windows.yml` | reusable build | `windows-latest`, an NSIS `Setup.exe`. Separate from `build-desktop.yml` because Authenticode signing has to happen *inside* the build (the installer compresses its own already-signed executable), so this job holds an AWS Signer identity and `build-desktop.yml` can stay credential-free. Callers pass `soft_fail: true`, so a Windows failure cannot skip the mac/Linux lanes. |
 | `publish-cli.yml` | reusable publish | Wheel + `SHA256SUMS` + KMS-signed `cli-manifest.json` to `cli/<channel>/<version>/`, the same signed manifest to `feed/<channel>/latest-cli.json`, and a PEP 503 index under `feed/<channel>/simple/`. |
-| `publish-linux.yml` | reusable publish | AppImage to `desktop/<channel>/<version>/`, `feed/<channel>/latest-linux[-arm64].yml`, then the `latest/` alias. Invoked ONCE PER ARCH (`arch: x64` / `arch: arm64`), each with its own keys and feed. |
+| `publish-linux.yml` | reusable publish | One Linux artifact to `desktop/<channel>/<version>/`, its channel file under `<feed prefix>/latest-linux[-arm64].yml`, then the `latest/` alias. Invoked ONCE PER (ARCH, FORMAT) PAIR — `arch: x64\|arm64` × `format: appimage\|deb\|rpm`, six callers — each with its own keys and feed, so no two ever share one. |
 | `sign-and-notarize.yml` | reusable publish | Three chained jobs (`sign`, `notarize`, `publish`) covering the whole macOS trust chain and the mac feed write. |
 | `publish-docker.yml` | reusable publish | Multi-arch (`linux/amd64,linux/arm64`) image built from the same wheel, pushed to `ghcr.io/<owner>/kirocrew`. |
 | `publish-installer.yml` | independent publish | Publishes `cli.sh` to the distribution bucket root. Triggered by a push to `main` touching `cli.sh` (path-filtered), plus manual dispatch. **Not** part of a channel release. |
@@ -90,9 +122,15 @@ desktop/<channel>/<version>/KiroCrew.zip                      immutable
 desktop/<channel>/<version>/KiroCrew.dmg                      immutable
 desktop/<channel>/<version>/KiroCrew-x86_64.AppImage          immutable
 desktop/<channel>/<version>/KiroCrew-aarch64.AppImage         immutable
+desktop/<channel>/<version>/KiroCrew-x86_64.deb               immutable
+desktop/<channel>/<version>/KiroCrew-aarch64.deb              immutable
+desktop/<channel>/<version>/KiroCrew-x86_64.rpm               immutable
+desktop/<channel>/<version>/KiroCrew-aarch64.rpm              immutable
 desktop/<channel>/latest/KiroCrew.dmg                         pointer, max-age=300
 desktop/<channel>/latest/KiroCrew-x86_64.AppImage             pointer, max-age=300
 desktop/<channel>/latest/KiroCrew-aarch64.AppImage            pointer, max-age=300
+desktop/<channel>/latest/KiroCrew-<arch>.deb                  pointer, max-age=300
+desktop/<channel>/latest/KiroCrew-<arch>.rpm                  pointer, max-age=300
 feed/<channel>/latest-mac.yml                                 pointer, max-age=300
 feed/<channel>/latest-mac.json                                pointer, max-age=300 (legacy bridge)
 feed/<channel>/latest-linux.yml                               pointer, max-age=300  (x64)
@@ -197,7 +235,7 @@ triggers. Nothing about it is caller-specific: the trigger files carry only
 version derivation and `uses:` calls.
 
 1. **sign** (ubuntu). Flattens the build artifacts, attests SLSA provenance for
-   the wheel, sdist, and AppImage (not the mac zip or DMG, whose bytes are not
+   the wheel, sdist, and every Linux artifact (not the mac zip or DMG, whose bytes are not
    final yet), uploads everything to `pre-signed/`, extracts the `.app` from the
    `*-mac.zip`, and submits it to CDSigner with a manifest generated at sign
    time from the actual bundle contents by
@@ -264,7 +302,14 @@ and why the base must stay a bare `X.Y.Z`.
 |---------|------------------------|---------------------|
 | nightly | `0.2.0-nightly.20260708t061155` | `0.2.0.dev20260708061155` |
 | insider | `0.2.0-rc.1` | `0.2.0rc1` |
-| stable | `0.2.0` | `0.2.0` |
+| stable | retains the promoted candidate's stamp (`0.2.0-rc.N`) | retains `0.2.0rcN` |
+
+A bare stable tag does not stamp or build: it verifies the selected candidate's
+recorded manifest and reuses its embedded version and byte digests unchanged,
+because re-stamping would change (and invalidate) the tested, signed bytes. The
+bare `X.Y.Z` names the git tag, the GitHub Release, and the stable channel
+paths — the release identity — while the artifacts keep the candidate's
+embedded prerelease version.
 
 Two stamps exist because the consumers disagree: Squirrel and electron-builder
 need semver, the wheel needs PEP 440. `nightly.yml` reads the clock **once** and
@@ -399,16 +444,45 @@ and restarts the gateway; neither path consumes the channel feed.
 ## Client auto-update
 
 The desktop updater is `electron-updater` in `website/electron/auto-update.js`.
-It runs in packaged macOS and Linux builds only: `SUPPORTED_PLATFORMS` is exactly
-`{darwin, linux}`. The NSIS target removes the packaging blocker, since
-electron-updater's win32 path is `NsisUpdater`, but win32 stays out until a
-`latest.yml` feed is published and Authenticode signing is active: `NsisUpdater`
-verifies signatures fail-closed, so an unsigned installer would make every update
-fail rather than warn.
+It runs in packaged macOS, Linux and Windows builds: `SUPPORTED_PLATFORMS` is
+exactly `{darwin, linux, win32}`.
 On macOS electron-updater's `MacUpdater` downloads the archive itself and serves
 it to Electron's built-in `autoUpdater` (Squirrel.Mac) over a loopback proxy, so
 the atomic bundle swap is unchanged and `NSURLCache` is no longer in the feed
-path. On Linux it replaces the AppImage in place.
+path. On Linux the install shape decides: an AppImage is replaced in place (so
+the directory holding it must be writable, which `bundle-location.js`'s
+`canUpdateLinuxInstall` gates on), while a deb or rpm is handed to
+`dpkg`/`rpm` behind an elevation prompt by electron-updater's `DebUpdater` /
+`RpmUpdater`. `resolveLinuxInstall()` picks the shape from three positive
+signals — `resources/package-type`, `$APPIMAGE`, and an `/opt` install path —
+and a package whose FORMAT cannot be named is refused rather than pointed at
+another format's feed. On Windows `NsisUpdater` reads
+`latest.yml` and runs the NSIS installer, verifying the download's Authenticode
+signature **fail-closed** against the `publisherName` pinned in
+`website/electron/package.json`. That verification is why `publish-windows.yml`
+refuses to publish an installer whose signature or signer does not check out: a
+bad publish would not degrade updates, it would fail every client's update at
+once.
+
+Two Windows details do not generalise from the other platforms:
+
+- **Windows has exactly one channel file, whatever the arch.**
+  `Provider.getChannelFilePrefix()` appends an arch suffix for linux alone and
+  returns `""` for win32, so `NsisUpdater` always requests `latest.yml`. A second
+  Windows arch is a second entry inside that one file, never a second feed, and
+  it also has to contend with `Provider.findFile()` disambiguating entries by
+  matching `process.arch` against the URL path.
+- **`quitAndInstall` passes `isSilent` on win32 only.** `NsisUpdater` adds `/S`
+  only when silent, and the installer is assisted (`nsis.oneClick: false`), so
+  without it the app would quit and then wait for the user to click through a
+  setup wizard rather than swapping silently the way macOS and Linux do.
+
+`SUPPORTED_PLATFORMS` is necessary but not sufficient: a platform can have a lane
+on some channels and not others. `WINDOWS_CHANNELS` restricts Windows to
+`{nightly, insider}` because stable has no Windows lane (see below), and a client
+resolving a channel with no feed reports `disabled: "channel"` rather than
+arming an updater that can only 404. `test_windows_signing_contract.py` pins that
+set to the callers that actually invoke the lane, so the two cannot drift.
 
 The client resolves `{feedBase}/{channel}/` as a **directory** (the trailing
 slash matters: without it `new URL("latest-mac.yml", base)` replaces the last
@@ -475,12 +549,68 @@ natural quit through a `before-quit` hook in the same stop-gateway-first order.
 `build-windows.yml` builds and **Authenticode-signs** the NSIS `Setup.exe`
 through AWS Signer during the build (signing profile `KiroCrewWindowsExe`),
 whenever `AWS_WINDOWS_SIGNING_ROLE_ARN` is present and the caller passed
-`use_prod_environment: true`. The lane is **installer-only**: it publishes
-nothing, and electron-builder emits the installer flat into `dist/`. Because no publish
-lane consumes them, the artifacts are not attested yet; provenance will land
-in-lane the way `publish-linux.yml` does it. win32 auto-update stays disabled in
-the client. The supported Windows install path is source: see
-[../guides/windows-install.md](../guides/windows-install.md).
+`use_prod_environment: true`. Signing happens inside the build because the NSIS
+installer compresses its own already-signed executables.
+
+`publish-windows.yml` then publishes that installer on the **nightly and insider
+channels**, following the same contract as `publish-linux.yml`: an immutable
+versioned key, then the feed, then the mutable `latest/` alias.
+
+    desktop/<channel>/<version>/KiroCrew-Setup.exe            immutable
+    desktop/<channel>/<version>/KiroCrew-Setup.exe.blockmap   immutable
+    desktop/<channel>/latest/KiroCrew-Setup.exe               pointer, max-age=300
+    feed/<channel>/latest.yml                                 pointer, max-age=300
+
+Three things about this lane are deliberate rather than incidental:
+
+- **It verifies before it publishes.** `scripts/verify_windows_installer.py`
+  refuses an installer whose certificate table is empty, whose SIGNER
+  certificate is not the pinned publisher, or which carries no RFC3161
+  timestamp. It matches the signer alone because that is what the client checks,
+  so a build whose leaf is wrong but whose issuer happens to carry our name
+  cannot pass here and then be refused by every client. `build-windows.yml`
+  skips signing cleanly when its secret is absent, so "a working but unsigned
+  installer" is a state that actually occurs, and `NsisUpdater` verifies
+  fail-closed. Publishing one would break every client's update simultaneously.
+  The guard checks signature metadata, not the Authenticode digest: byte
+  identity from the build artifact to the CDN is already established by the
+  write-once versioned key and the feed step's read-back comparison.
+- **There is deliberately no architecture check**, and the analogy to
+  `publish-linux.yml`'s ELF-machine check does not transfer. An AppImage IS its
+  payload, so its ELF header describes what the user runs. An NSIS installer is
+  a stub that unpacks a payload, and NSIS ships only a 32-bit stub: the signed
+  x64 nightly reports COFF machine `0x014c` with a PE32 optional header. So the
+  header says nothing about the packaged architecture, and asserting `0x8664`
+  rejects every genuine installer. Architecture is bound by artifact identity
+  instead: the lane accepts `x64` alone and consumes the artifact the x64 build
+  job uploaded, by name.
+- **It does not trust `build-windows`'s job result.** That caller runs with
+  `soft_fail`, so its result is `success` even when the build failed and uploaded
+  nothing. The lane probes for the artifact and skips cleanly when it is absent,
+  which keeps a Windows-only failure from blocking the mac and Linux lanes. The
+  probe checks the listing's own exit status separately from the match, so an API
+  error is never laundered into "nothing to publish". It retries the listing
+  before giving up, because failing closed here also fails the run, and
+  `release_promotion.py` then refuses to promote that commit at all -- a single
+  API blip should not cost stable promotion of the mac, Linux and CLI artifacts
+  the same run already published, while a sustained failure still must. Asking the Actions API what this run uploaded needs `actions: read`,
+  which the reusable workflow and both caller jobs grant; without it the probe
+  403s and, because it fails closed, the lane aborts rather than publishing.
+- **The stable channel is not wired.** Stable republishes the immutable
+  promotion bundle that `scripts/release_promotion.py` verifies byte for byte,
+  and its `ARTIFACT_NAMES` table has no Windows role. Adding one would make a
+  stable release depend on a successful Windows build, which is the coupling
+  `soft_fail` exists to prevent, so giving Windows a promotion role is a separate
+  decision. Until it is made, Windows users track nightly or insider, and the
+  client refuses to offer stable updates rather than pointing at a feed nobody
+  wrote; the mechanism above is unchanged for stable once the bundle learns about
+  Windows.
+
+The `KiroCrew-Setup.exe` basename is a public contract: it is what
+`manualDownloadUrl()` hands a user whose in-app update failed, which is why it
+carries neither the version nor electron-builder's spaces. The blockmap must
+travel with the installer or electron-updater silently falls back to a full
+download for every update.
 
 Linux arm64 is no longer open: `build-desktop.yml` builds it on `ubuntu-22.04-arm`
 and `release.yml`/`nightly.yml` each call `publish-linux.yml` twice, once per arch.

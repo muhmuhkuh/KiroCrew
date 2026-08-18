@@ -15,6 +15,7 @@ import reducer, {
   selectUnreadByMode,
   sseSubagentStatus,
   sseSubagentText,
+  patchSlotLink,
 } from '../store/dashboardSlice'
 import type { StatusData, ChatSlot } from '../types'
 
@@ -88,11 +89,52 @@ describe('dashboardSlice', () => {
       expect(state.slots.find(s => s.key === 'chat-2')?.last_ts).toBeUndefined()
     })
 
+    it('leaves the ORDERING key alone for un-settled activity', () => {
+      // Agent output moves last_ts but must not re-rank the sidebar: a session
+      // streaming tool calls would otherwise climb over its neighbours on every
+      // event, swapping rows under the pointer while several agents work.
+      const withSlots = reducer(initial, sseSlots([slot1]))
+      const state = reducer(withSlots, touchSlotActivity({ key: 'chat-1', ts: '2026-07-09T22:00:00Z' }))
+      expect(state.slots[0].last_turn_ts).toBeUndefined()
+    })
+
+    it('bumps last_turn_ts too when the activity is settled', () => {
+      // An inbound prompt SHOULD move the session to the top immediately — the
+      // user just acted on it.
+      const withSlots = reducer(initial, sseSlots([slot1]))
+      const state = reducer(withSlots, touchSlotActivity({ key: 'chat-1', ts: '2026-07-09T22:00:00Z', settled: true }))
+      expect(state.slots[0].last_turn_ts).toBe('2026-07-09T22:00:00Z')
+      expect(state.slots[0].last_ts).toBe('2026-07-09T22:00:00Z')
+    })
+
     it('is a no-op for an unknown slot key', () => {
       const withSlots = reducer(initial, sseSlots([slot1]))
       const state = reducer(withSlots, touchSlotActivity({ key: 'missing', ts: '2026-07-09T22:00:00Z' }))
       expect(state.slots).toHaveLength(1)
       expect(state.slots[0].last_ts).toBeUndefined()
+    })
+
+    it('never moves either field backwards', () => {
+      // An authoritative slots snapshot can land between an event being buffered
+      // and dispatched; an older arrival time must not undo it.
+      const withSlots = reducer(initial, sseSlots([
+        { ...slot1, last_ts: '2026-07-09T22:00:00Z', last_turn_ts: '2026-07-09T21:00:00Z' },
+      ]))
+      const state = reducer(withSlots, touchSlotActivity({ key: 'chat-1', ts: '2026-07-09T20:00:00Z', settled: true }))
+      expect(state.slots[0].last_ts).toBe('2026-07-09T22:00:00Z')
+      expect(state.slots[0].last_turn_ts).toBe('2026-07-09T21:00:00Z')
+    })
+
+    it('applies a settling bump that is older than last_ts but newer than last_turn_ts', () => {
+      // Mid-turn the two fields diverge: last_ts is a streamed tool row, so a
+      // prompt arriving behind it is still the newest SETTLED instant. A shared
+      // monotonic check would silently drop it.
+      const withSlots = reducer(initial, sseSlots([
+        { ...slot1, last_ts: '2026-07-09T22:00:00Z', last_turn_ts: '2026-07-09T20:00:00Z' },
+      ]))
+      const state = reducer(withSlots, touchSlotActivity({ key: 'chat-1', ts: '2026-07-09T21:00:00Z', settled: true }))
+      expect(state.slots[0].last_ts).toBe('2026-07-09T22:00:00Z')
+      expect(state.slots[0].last_turn_ts).toBe('2026-07-09T21:00:00Z')
     })
   })
 
@@ -262,6 +304,70 @@ describe('dashboardSlice', () => {
       let state = reducer(initial, sseSubagentStatus({ slot: 'chat-1', running: 1 }))
       state = reducer(state, sseSubagentText({ slot: 'chat-1', id: 'sub-1', text: 'hello' }))
       expect(state.subagentText['chat-1']['sub-1']).toBe('hello')
+    })
+  })
+
+  /** One channel can carry TWO rows — the conversation a session was born in AND
+   *  an explicit mirror to that same channel — and they disconnect independently.
+   *  Matching on `channel` alone patched whichever row came first in the array, so
+   *  acting on the mirror moved the origin row's `paused` instead. The row the user
+   *  clicked never changed, which reads as a dead control: it renders connected and
+   *  cannot be reconnected.
+   */
+  describe('patchSlotLink disambiguates two rows on one channel', () => {
+    const twoDiscordRows = (): ChatSlot => ({
+      key: 'chat-1',
+      title: 'Chat 1',
+      messages: 1,
+      running: false,
+      pending_approval: false,
+      waiting_for_input: false,
+      last_activity_ts: undefined,
+      links: [
+        { channel: 'discord', label: 'Discord', target: 'dm-1', direction: 'origin', live: true, paused: false },
+        { channel: 'discord', label: 'Discord', target: 'chan-2', direction: 'out', live: true, paused: false },
+      ],
+    })
+    const rows = (s: ReturnType<typeof reducer>) => s.slots[0].links!
+
+    it('patches the mirror row and leaves the origin row alone', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      state = reducer(state, patchSlotLink({
+        key: 'chat-1', channel: 'discord', origin: false, patch: { paused: true },
+      }))
+      expect(rows(state)[1].paused).toBe(true)
+      expect(rows(state)[0].paused).toBe(false)
+    })
+
+    it('patches the origin row and leaves the mirror row alone', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      state = reducer(state, patchSlotLink({
+        key: 'chat-1', channel: 'discord', origin: true, patch: { paused: true },
+      }))
+      expect(rows(state)[0].paused).toBe(true)
+      expect(rows(state)[1].paused).toBe(false)
+    })
+
+    // Classified by origin-ness, not by equality against `direction`, so this
+    // lands the same side here as the flag the endpoint was called with.
+    it('treats a `both` row as the mirror, like the endpoint flag does', () => {
+      const slot = twoDiscordRows()
+      slot.links![1].direction = 'both'
+      let state = reducer(initial, sseSlots([slot]))
+      state = reducer(state, patchSlotLink({
+        key: 'chat-1', channel: 'discord', origin: false, patch: { paused: true },
+      }))
+      expect(rows(state)[1].paused).toBe(true)
+      expect(rows(state)[0].paused).toBe(false)
+    })
+
+    // Slack has exactly one row, so its callers omit the flag.
+    it('falls back to channel-only matching when origin is omitted', () => {
+      let state = reducer(initial, sseSlots([twoDiscordRows()]))
+      state = reducer(state, patchSlotLink({
+        key: 'chat-1', channel: 'discord', patch: { paused: true },
+      }))
+      expect(rows(state)[0].paused).toBe(true)
     })
   })
 })
