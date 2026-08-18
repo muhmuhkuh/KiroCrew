@@ -322,6 +322,11 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/backend/deps.py::install_deps",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_gh",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_git",
+        # GitLab analog of ``_gh`` above: fixed ``glab mr update <iid> --ready`` argv
+        # (shell=False), iid+project from an already-validated MR URL, host pinned via
+        # ``GITLAB_HOST`` in the child env (token withheld for self-managed) — same
+        # class as ``_gh``, which is allowlisted for the same reason.
+        "apps/builtins/auto_improvement/backend/pr_watchers.py::_gitlab_ready",
         "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_gh_prefers_ssh",
         "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_git",
         # Fixed `git rev-parse --verify` argv (shell=False) against the OPERATOR-chosen
