@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, mem
 import { ArrowUpFromLine, ArrowUp, Loader2, RotateCw, Plus, Crop, Bot, Mic, Square, BookOpen, X, ClipboardList, CheckCircle, Ban, Sparkles, Target, Lock, Folder, FolderOpen, FileText } from 'lucide-react'
 import CopyBranchButton from './CopyBranchButton'
 import { usePointerDrag } from '../hooks/usePointerDrag'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import VoiceStatusBar from './VoiceStatusBar'
 import VoiceDictationPanel, { useDictationPanelUsable } from './VoiceDictationPanel'
 import type { AudioSample } from '../hooks/mic'
@@ -29,8 +30,9 @@ import { isTouchDevice } from '../utils/isTouchDevice'
 import BusySendButton, { useBusySendMode } from './BusySendButton'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
 import { useImeGuard } from '../hooks/useImeGuard'
-import ContextBar, { contextTip, contextPctClamped, contextColor } from './ContextBar'
+import ContextBar, { contextTip, contextColor, composeContextReadout, contextPctClamped, fmtTokens } from './ContextBar'
 import PasteHighlightLayer, { INPUT_TYPO } from './PasteHighlightLayer'
+import PasteHoverLayer, { type PasteHoverHandle } from './PasteHoverLayer'
 import FollowUpBar from './FollowUpBar'
 import { dispatchLightbox } from './MarkdownRenderer'
 import { IMG_EXT, buildFileLabels } from '../utils/fileTokens'
@@ -114,7 +116,7 @@ import { matchFileToken, matchSkillToken, replaceTokenAtCaret } from './composer
 import { useStopEscapeHatch } from '../hooks/useStopEscapeHatch'
 
 import { i18nT } from '../i18n/t'
-import { fmtDateFields } from '../i18n/format'
+import { fmtDateFields, fmtPercent } from '../i18n/format'
 import SessionRefStrip from './SessionRefStrip'
 import type { SessionRef } from '../utils/sessionRefs'
 const INPUT_MIN_H = 44
@@ -122,6 +124,10 @@ const INPUT_DEFAULT_MAX_H = 140
 const INPUT_PREFILL_MAX_H = 320
 const INPUT_DRAG_MIN_H = 93
 const FILE_PREVIEW_H = 81 // h-16 (64px) + py-2 (16px) + border-t (1px)
+/** Same strip once any staged image carries a resize pill: the pill sits in flow
+ *  under its thumbnail, so the tallest chip grows by gap-0.5 (2px) + the pill's
+ *  own 18px. Keep in sync with ResizeBadge and FilePreviewStrip. */
+const FILE_PREVIEW_H_RESIZED = 101
 /** Height of the staged-session-reference strip: one chip row (py-1 + 12px text
  *  ≈ 26px) + py-2 (16px) + border-t (1px). Keep in sync with SessionRefStrip. */
 const SESSION_REF_STRIP_H = 43
@@ -323,6 +329,8 @@ interface ChatInputProps {
   contextUsedTokens?: number
   contextWindowTokens?: number
   showContextPct?: boolean
+  /** Show used/window token counts in the inline context readout. */
+  showContextTokens?: boolean
   isRunning?: boolean
   onStop?: () => void
   /**
@@ -407,7 +415,7 @@ interface ChatInputProps {
   onOptimizeResult?: (slotId: string | null, optimized: string) => void
 }
 
-/** Accent pill on a downscaled attachment chip. Hover (or focus) shows a
+/** Accent pill under a downscaled attachment chip. Hover (or focus) shows a
  *  styled tooltip with the resize details, portal-rendered above the chip so
  *  the strip's overflow-x-auto can't clip it. */
 function ResizeBadge({ resize }: { resize: ResizeInfo }) {
@@ -420,11 +428,21 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   const hide = () => setTip(null)
   return (
     <>
+      {/* In flow under the thumbnail, not overlaid on it. The chip's width comes
+          from the image's aspect ratio, so an overlaid pill has no width to fit
+          into: a phone screenshot gives it a 48px chip, while the widest catalog
+          values need 105px (bn) and 104px (de). Overlaid, that ends as one of
+          two defects — an unbreakable Latin word spilling sideways onto the
+          neighbouring chip, or a per-character-breaking script stacking down and
+          covering the thumbnail. In flow, the chip is simply as wide as the
+          wider of image and pill, so each locale pays only its own width and the
+          thumbnail is never covered in any of them. `whitespace-nowrap` is what
+          makes the chip grow instead of the pill wrapping. */}
       <span
         ref={ref}
         tabIndex={0}
         aria-label={i18nT('components.chatInput.resized_to_fit_model_limits_2', { fromW: resize.fromW, fromH: resize.fromH, toW: resize.toW, toH: resize.toH })}
-        className="absolute bottom-1 left-1 z-10 px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default"
+        className="px-1.5 py-[1px] rounded-full text-[10px] font-bold bg-accent text-accent-fg shadow-sm cursor-default whitespace-nowrap"
         onMouseEnter={show} onMouseLeave={hide} onFocus={show} onBlur={hide}
       >{i18nT('components.chatInput.resized')}</span>
       {tip && createPortal(
@@ -442,18 +460,42 @@ function ResizeBadge({ resize }: { resize: ResizeInfo }) {
   )
 }
 
-function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
+/** Stable default so an omitted `dirs` prop does not re-run the remeasure
+ *  effect on every render (a fresh [] literal changes deps each time). */
+const NO_DIRS: string[] = []
+
+function FilePreviewStrip({ files, dirs = NO_DIRS, resizedInfo, onRemove, onRemoveDir }: { files: string[]; dirs?: string[]; resizedInfo?: Record<string, ResizeInfo>; onRemove?: (path: string) => void; onRemoveDir?: (path: string) => void }) {
+  const [attachScroller, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+  // Chips are added and removed while the strip stays mounted (a paste, a
+  // remove), and the scroller keeps its own box through those changes, so the
+  // ResizeObserver never fires and no scroll event lands. Without this the cue
+  // goes stale: dark over a row that now fits, or absent over one that clips.
+  useEffect(() => { remeasure() }, [files, dirs, remeasure])
   const imgs = files.filter(p => IMG_EXT.test(p))
   const nonImgs = files.filter(p => !IMG_EXT.test(p))
   if (!imgs.length && !nonImgs.length && !dirs.length) return null
   return (
-    // NOTE: rendered height must match FILE_PREVIEW_H constant, update both together
-    <div className="flex gap-2 px-5 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-end" data-image-scope="">
+    // The wrapper exists for the edge cues: absolutely-positioned children of
+    // the scroller itself would travel with the scrolled content, so the fades
+    // anchor to a non-scrolling parent, same shape as the sibling strips.
+    <div className="relative">
+      {/* NOTE: rendered height must match FILE_PREVIEW_H / FILE_PREVIEW_H_RESIZED,
+          update them together.
+          items-start, not items-end: a chip carrying a resize pill is taller than a
+          plain one, and bottom-alignment would spend that difference staggering the
+          THUMBNAILS (the thing being compared) instead of letting the pills hang. */}
+      <div ref={attachScroller} data-testid="preview-strip" className="flex gap-2 px-4 py-2 border-t border-border bg-chrome/50 overflow-x-auto items-start" data-image-scope="">
       {imgs.map((path, i) => {
         const src = `/api/file-raw?path=${encodeURIComponent(path)}`
         const resize = resizedInfo?.[path]
         return (
-          <div key={path} className="relative group/preview shrink-0" title={path}>
+          <div key={path} className="group/preview shrink-0 flex flex-col items-start gap-0.5" title={path}>
+            {/* The corner controls anchor to the IMAGE, not to the chip: the chip
+                is as wide as the wider of image and resize pill, so a locale
+                whose pill is wider than the thumbnail (de: 104px pill, 48px
+                image) would otherwise strand the remove button 52px out in the
+                empty space beside the thumbnail it removes. */}
+            <div className="relative">
             <span className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-accent text-accent-fg text-[10px] font-bold flex items-center justify-center z-10">{i + 1}</span>
             <button
               type="button"
@@ -461,10 +503,24 @@ function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir
               className="block cursor-pointer"
               onClick={(e) => { const img = e.currentTarget.querySelector('img'); if (img) dispatchLightbox(img) }}
             >
-              <img src={src} alt={path} className="h-16 rounded border border-border object-contain hover:opacity-80 transition-opacity"
-                data-lightbox-image="" />
+              {/* min-w: the chip's height is fixed and its width follows the
+                  aspect ratio, so a 1170x2532 phone screenshot renders 31px
+                  wide — too narrow to tell one screenshot from another. This is
+                  a floor on recognisability, not part of the overlap fix: with
+                  the pill in flow the overlap is 0 at any width. bg-bg-hover
+                  backs the letterbox bands the floor creates, so the border
+                  reads as a tile rather than a partly-empty frame; it applies to
+                  every image chip, including transparent PNGs. No ceiling: a
+                  panorama makes a wide chip and scrolls its siblings out of view
+                  in this overflow-x-auto strip, but nobody has reported that. */}
+              <img src={src} alt={path} className="h-16 min-w-12 rounded border border-border object-contain bg-bg-hover hover:opacity-80 transition-opacity"
+                data-lightbox-image=""
+                // A thumbnail widens when its bytes arrive (h-16 + intrinsic
+                // ratio), which grows scrollWidth without resizing the
+                // scroller's own box — no ResizeObserver fires and no scroll
+                // lands, so only this load signal can refresh the cue.
+                onLoad={remeasure} />
             </button>
-            {resize && <ResizeBadge resize={resize} />}
             {onRemove && (
               <button
                 aria-label={i18nT('components.chatInput.remove')}
@@ -472,6 +528,8 @@ function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir
                 onClick={() => onRemove(path)} title={i18nT('components.chatInput.remove')}
               ><X className="lucide-inline" /></button>
             )}
+            </div>
+            {resize && <ResizeBadge resize={resize} />}
           </div>
         )
       })}
@@ -508,6 +566,19 @@ function FilePreviewStrip({ files, dirs = [], resizedInfo, onRemove, onRemoveDir
         </div>
         ))
       })()}
+      </div>
+      {/* Edge cues, same treatment as the sibling strips (SidePanelLayout's
+          tab strip, FollowUpBar's scroll row): a gradient says content
+          continues past the clipped edge, because the overlay scrollbar on
+          macOS/iOS leaves no visible sign while idle. from-bg-elevated matches
+          the composer surface the strip sits on. z-10 keeps the fade above the
+          chips' own z-10 badges; pointer-events-none keeps those interactive. */}
+      {edges.left && (
+        <div aria-hidden="true" data-testid="preview-strip-cue-left" className="pointer-events-none absolute left-0 top-px bottom-0 w-6 z-10 bg-gradient-to-r from-bg-elevated to-transparent" />
+      )}
+      {edges.right && (
+        <div aria-hidden="true" data-testid="preview-strip-cue-right" className="pointer-events-none absolute right-0 top-px bottom-0 w-6 z-10 bg-gradient-to-l from-bg-elevated to-transparent" />
+      )}
     </div>
   )
 }
@@ -569,6 +640,7 @@ function ChatInput({
   contextUsedTokens,
   contextWindowTokens,
   showContextPct,
+  showContextTokens,
   isRunning = false,
   onStop,
   continuable = false,
@@ -837,6 +909,13 @@ function ChatInput({
   // Backdrop mirror that paints chip backgrounds behind paste tokens; its scroll
   // is kept in lockstep with the textarea (see syncMirrorScroll on the textarea).
   const mirrorRef = useRef<HTMLDivElement>(null)
+  // Hover detection layer that shows paste previews on mouseover; scroll-synced
+  // identically to the backdrop mirror.
+  const hoverRef = useRef<PasteHoverHandle>(null)
+  // Id of the open paste-preview tooltip (or null). Wired to the textarea's
+  // aria-describedby so keyboard/screen-reader users get the preview announced
+  // when the caret enters a token — the AT half of the paste-preview a11y fix.
+  const [pastePreviewPanelId, setPastePreviewPanelId] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // "+" drop-up menu (upload file / image + browse toggle).
   const [plusOpen, setPlusOpen] = useState(false)
@@ -963,8 +1042,8 @@ function ChatInput({
     setPlusOpen(false)
   }
   // Split send button while the composer is BUSY: 'steer' (default) vs 'queue'.
-  // The mode is a shared, persisted preference — see BusySendButton.
-  const [busySendMode, setBusySendMode] = useBusySendMode()
+  // The mode is a persisted PER-SLOT preference — see BusySendButton.
+  const [busySendMode, setBusySendMode] = useBusySendMode(slotId)
   // Steer is the active Enter/send action only while the composer is busy and
   // not stopping, on a steer-capable slot, and the user hasn't switched the
   // split button to Queue. Everywhere else the composer falls back to onSend
@@ -987,6 +1066,15 @@ function ChatInput({
   }, [disabled, onFollowUpSend])
   const { botName } = useBranding()
   const isMobile = useIsMobile()
+  const [attachControlRow, controlRowEdges, remeasureControlRow] = useScrollEdges<HTMLDivElement>()
+  // The control row's chips are prop-driven (the auto-nudge loop chip, the
+  // approval-mode picker) and appear or change label while the row keeps its
+  // own box, so neither the ResizeObserver nor a scroll event reports the new
+  // content width — only this remeasure can refresh the cue. Boolean presence,
+  // not the callback itself: the handler's identity may change every render
+  // and would re-run the effect for nothing.
+  const hasAutoNudge = !!onAutoNudgeClick
+  useEffect(() => { remeasureControlRow() }, [hasAutoNudge, autoNudgeLoop, approvalMode, isMobile, remeasureControlRow])
   const ime = useImeGuard()
   const resolvedPlaceholder = placeholder || i18nT('components.chatInput.message_placeholder', { bot: botName })
   // An icon swap alone announces nothing, so the empty-state placeholder carries
@@ -1001,7 +1089,12 @@ function ChatInput({
   // gates the control on the interruption itself — but this component is still
   // callable with `continuable` alone, and in that case the hint survives and
   // the labeled Resume button carries the affordance on its own.
-  const continuePlaceholder = continuable && onContinue && continueIsRecovery
+  // The one expression both surfaces key off: the composer offers Resume
+  // exactly when the loop chip must stop pulsing. Hoisted so the two cannot
+  // drift — recomputing it at each site is how the chip silently regresses to
+  // claiming active work over a dead session.
+  const resumeOffered = !!(continuable && onContinue && continueIsRecovery)
+  const continuePlaceholder = resumeOffered
     ? i18nT('components.chatInput.turn_interrupted_press_continue')
     : ''
   const continueLabel = i18nT(continueIsRecovery
@@ -1951,6 +2044,9 @@ function ChatInput({
     if (!ta) return
     const ss = ta.selectionStart ?? 0
     const se = ta.selectionEnd ?? 0
+    // Keyboard/AT peek: a collapsed caret landing inside a token opens the
+    // preview (the handle no-ops for a non-collapsed selection).
+    hoverRef.current?.handleCaret(ss, se)
     // Collapsed caret inside a token is handled by the click expander — skip.
     if (ss === se) return
     const ranges = findTokenRanges(ta.value, pasteBlocks)
@@ -2039,12 +2135,16 @@ function ChatInput({
   // compensation must key off both staged families — otherwise a dirs-only
   // strip appears with no wrapper expansion and eats into the textarea.
   const hasFiles = pendingFiles.length > 0 || pendingDirs.length > 0
+  // A resize pill makes the strip taller, so the compensation has to know about
+  // it — otherwise the extra row eats into the textarea.
+  const hasResizedFile = pendingFiles.some(p => IMG_EXT.test(p) && !!resizedInfo?.[p])
   const hasSessionRefs = pendingSessions.length > 0
   /** Combined height of every strip currently stacked above the textarea. The
    *  manual-resize floor and the transient height adjustment below both work off
    *  this total, so adding a strip can never leave one of them counting only
    *  attachments. */
-  const stripH = (hasFiles ? FILE_PREVIEW_H : 0) + (hasSessionRefs ? SESSION_REF_STRIP_H : 0)
+  const stripH = (hasFiles ? (hasResizedFile ? FILE_PREVIEW_H_RESIZED : FILE_PREVIEW_H) : 0)
+    + (hasSessionRefs ? SESSION_REF_STRIP_H : 0)
   const prevStripH = useRef(stripH)
   const dragMinH = INPUT_DRAG_MIN_H + stripH
   const dragMinHRef = useRef(dragMinH)
@@ -2062,7 +2162,7 @@ function ChatInput({
 
   return (
     // 'input-area' is a stable theming hook — see website/docs/theming-contract.md
-    <div className={`input-area px-5 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
+    <div className={`input-area px-4 pb-1 ${hasApproval ? 'pt-0' : 'pt-1'} mx-auto w-full flex flex-col`}
       style={{ maxWidth: 'var(--mc-input-width, 900px)', ...(manualHeight !== null ? { minHeight: (INPUT_DRAG_MIN_H + stripH) + 'px' } : {}) }}>
 
       {/* Knowledge context chip */}
@@ -2387,6 +2487,8 @@ function ChatInput({
         <textarea
           ref={inputRef}
           aria-label={i18nT('components.chatInput.message_input')}
+          data-composer-input=""
+          aria-describedby={pastePreviewPanelId ?? undefined}
           data-composer-typo
           className={`relative w-full bg-transparent border-none ${INPUT_TYPO} text-text outline-none min-h-[44px] max-h-[50vh] placeholder:text-muted resize-none ${manualHeight !== null ? 'flex-1' : ''} ${disabled ? 'opacity-40 pointer-events-none' : ''} ${optimizing ? 'opacity-30' : ''}`}
           style={manualHeight !== null ? { height: '100%' } : undefined}
@@ -2422,11 +2524,15 @@ function ChatInput({
           onCut={handleCut}
           onClick={handleTextareaClick}
           onFocus={prefetchSkills}
+          onBlur={() => { if (hoverRef.current) hoverRef.current.handleMouseLeave() }}
           onMouseUp={handleSelectSnap}
           onSelect={handleSelectSnap}
           onInput={handleInput}
           onScroll={e => { if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop }}
+          onMouseMove={e => { if (pasteBlocks.length && hoverRef.current) hoverRef.current.handleMouseMove(e) }}
+          onMouseLeave={() => { if (hoverRef.current) hoverRef.current.handleMouseLeave() }}
         />
+        {pasteBlocks.length > 0 && <PasteHoverLayer ref={hoverRef} value={value} blocks={pasteBlocks} mirrorRef={mirrorRef} onActivePanelChange={setPastePreviewPanelId} />}
         </div>
 
         {/* Bottom icon row */}
@@ -2519,7 +2625,13 @@ function ChatInput({
                 )}
               </div>
             )}
-            <div className="flex items-center gap-0.5 min-w-0 overflow-x-auto flex-1">
+            {/* The wrapper exists for the edge cues: absolutely-positioned
+                children of the scroller itself would travel with the scrolled
+                content, so the fades anchor to this non-scrolling parent. It
+                also owns the flex sizing so the scroller keeps filling the
+                row. */}
+            <div className="relative min-w-0 flex-1">
+              <div ref={attachControlRow} data-testid="composer-control-row" className="flex items-center gap-0.5 overflow-x-auto">
 
               {onAutoNudgeClick && (
                 <AutoNudgePopover
@@ -2528,10 +2640,31 @@ function ChatInput({
                   open={autoNudgeOpen || false}
                   onOpenChange={v => onAutoNudgeClick(v)}
                   onChange={onAutoNudgeChange || (() => {})}
+                  // Same condition as the Resume placeholder (`resumeOffered`):
+                  // whenever the composer says "press Resume", the loop chip
+                  // must not pulse as if a cycle were executing.
+                  interrupted={resumeOffered}
                 />
               )}
               {!isMobile && approvalMode && (
                 <ApprovalModePicker mode={approvalMode} slotKey={activeSlot || ''} />
+              )}
+              </div>
+              {/* Edge cues, same treatment as the sibling strips that already
+                  ship it (FollowUpBar's scroll row, SidePanelLayout's tab
+                  strip): at narrow widths the loop chip and approval picker
+                  clip silently, and the overlay scrollbar on macOS/iOS leaves
+                  no idle trace. from-bg-elevated matches the composer surface.
+                  Deliberately NO z-index: positioned elements already paint
+                  above the row's in-flow buttons, and an explicit z-10 would
+                  win the tree-order tiebreak against the optimizing dim
+                  overlay (also z-10, earlier in the tree), punching an
+                  undimmed wedge through it. */}
+              {controlRowEdges.left && (
+                <div aria-hidden="true" data-testid="control-row-cue-left" className="pointer-events-none absolute left-0 top-0 bottom-0 w-6 bg-gradient-to-r from-bg-elevated to-transparent" />
+              )}
+              {controlRowEdges.right && (
+                <div aria-hidden="true" data-testid="control-row-cue-right" className="pointer-events-none absolute right-0 top-0 bottom-0 w-6 bg-gradient-to-l from-bg-elevated to-transparent" />
               )}
             </div>
             {isMobile && approvalMode && (
@@ -2755,7 +2888,21 @@ function ChatInput({
           )}
           </div>
           <div className="flex items-center shrink-0">
-          {contextPct != null && (
+          {contextPct != null && (() => {
+            const pct = Math.round(contextPct)
+            const win = contextWindowTokens || 0
+            const used = contextUsedTokens != null ? contextUsedTokens : (win ? Math.round((pct / 100) * win) : 0)
+            const remaining = win ? Math.max(win - used, 0) : 0
+            const approx = contextUsedTokens == null
+            const pctColor = contextColor(contextPct)
+            const showAnyReadout = !!(showContextPct || showContextTokens)
+            // Graceful degrade: on a narrow shelf, collapse to the percentage
+            // alone (or tokens, if that's the only segment enabled) so the
+            // readout never crowds out the agent/model controls.
+            const readout = shelfCompact
+              ? composeContextReadout(contextPct, used, win, { approx, showPct: showContextPct, showTokens: !!showContextTokens && !showContextPct })
+              : composeContextReadout(contextPct, used, win, { approx, showPct: showContextPct, showTokens: showContextTokens })
+            return (
             <div ref={ctxWrapRef} className="relative flex items-center">
               <button
                 className={`inline-flex items-center h-7 px-2.5 rounded-md transition-colors border-none cursor-pointer ${ctxPopoverOpen ? 'bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]' : 'bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))]'}`}
@@ -2764,41 +2911,29 @@ function ChatInput({
                 aria-label={i18nT('components.chatInput.context_usage')}
               >
                 <ContextBar pct={contextPct} width={40} height={3} />
-                {showContextPct && <span className="text-[11px] ml-1.5 tabular-nums" style={{ color: contextColor(contextPct) }}>{contextPctClamped(contextPct)}%</span>}
+                {showAnyReadout && <span className="text-[11px] ml-1.5 tabular-nums whitespace-nowrap" style={{ color: pctColor }}>{readout}</span>}
               </button>
               {ctxPopoverOpen && (
                 <div className="absolute bottom-full right-0 mb-1 z-[60] w-52 rounded-xl border border-border bg-bg-elevated shadow-xl p-3 animate-slide-up">
-                    {(() => {
-                      const pct = Math.round(contextPct)
-                      const win = contextWindowTokens || 0
-                      const used = contextUsedTokens != null ? contextUsedTokens : (win ? Math.round((pct / 100) * win) : 0)
-                      const remaining = win ? Math.max(win - used, 0) : 0
-                      const approx = contextUsedTokens == null
-                      const k = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}K` : `${n}`
-                      const pctColor = pct >= 90 ? 'var(--danger)' : pct >= 75 ? 'var(--warn)' : 'var(--accent)'
-                      return (
-                        <>
                           <div className="flex items-center justify-between mb-2">
                             <span className="text-[11px] font-semibold text-text">{i18nT('components.chatInput.context_window')}</span>
-                            <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{pct}%</span>
+                            <span className="text-[12px] font-mono font-bold" style={{ color: pctColor }}>{fmtPercent(contextPctClamped(contextPct) / 100)}</span>
                           </div>
                           <div className="flex flex-col gap-1 text-[11px] font-mono">
-                            <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.used')}</span><span className="text-text">{approx ? '~' : ''}{k(used)}</span></div>
-                            <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.remaining')}</span><span className="text-text">{approx ? '~' : ''}{k(remaining)}</span></div>
-                            <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.total')}</span><span className="text-text">{k(win)}</span></div>
+                            <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.used')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(used)}</span></div>
+                            <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.remaining')}</span><span className="text-text">{approx ? '~' : ''}{fmtTokens(remaining)}</span></div>
+                            <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.total')}</span><span className="text-text">{fmtTokens(win)}</span></div>
                           </div>
                           {modelName && (
                             <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
                               <span className="text-muted">{i18nT('components.chatInput.model')}</span><span className="text-text truncate max-w-[120px]" title={modelName}>{modelName}</span>
                             </div>
                           )}
-                        </>
-                      )
-                    })()}
                   </div>
               )}
             </div>
-          )}
+            )
+          })()}
           {onModelClick && modelName && (
             <button
               className="inline-flex items-center gap-1.5 h-7 min-w-0 text-[12px] text-muted hover:text-text px-2 rounded-md bg-transparent hover:bg-[color-mix(in_srgb,var(--bg-elevated)_84%,var(--text))] transition-colors border-none cursor-pointer disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-muted"

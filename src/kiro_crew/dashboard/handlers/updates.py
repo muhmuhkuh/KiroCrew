@@ -24,10 +24,10 @@ from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
     config_path,
-    read_config_for_update,
-    write_config_atomically,
+    update_config_locked,
 )
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.platform import update_layout
 from kiro_crew.platform.update_governance import (
     min_version,
     resolve_remote_url,
@@ -129,10 +129,20 @@ _ERR_UNKNOWN = "unknown"
 #: makes the Windows machine a thin client for a gateway running on EC2 Linux, so
 #: the backend answering this call is a Linux install that identifies itself
 #: correctly on its own.
+#: The one externally-managed distribution whose remedy is an image pull
+#: rather than the desktop app.
+_CONTAINER_DISTRIBUTION = "docker"
+
+#: DERIVED, not restated: ``update_layout.EXTERNALLY_MANAGED`` owns WHICH
+#: distributions are externally managed, and this module owns only the wording
+#: shown for them. The two lists were duplicated once, and the copy here fell
+#: behind when Linux gained deb and rpm -- a package install then reached
+#: ``_check_release_feed()`` and was compared against the CLI wheel channel,
+#: which is exactly the wrong-stream false positive described above. Deriving the
+#: key set makes that drift impossible: a format added there appears here.
 _EXTERNALLY_MANAGED = {
-    "dmg": _ERR_MANAGED_BY_APP,
-    "appimage": _ERR_MANAGED_BY_APP,
-    "docker": _ERR_MANAGED_BY_IMAGE,
+    dist: _ERR_MANAGED_BY_IMAGE if dist == _CONTAINER_DISTRIBUTION else _ERR_MANAGED_BY_APP
+    for dist in update_layout.EXTERNALLY_MANAGED
 }
 
 
@@ -318,13 +328,21 @@ def _wheel_update_command(channel: str, artifact_base: str) -> str:
     as untrusted display metadata.
 
     ``--proto '=https'`` is not decoration: this string is copied into a shell and
-    pipes an installer into ``sh``, and ``artifact_base`` is overridable via
+    runs an installer, and ``artifact_base`` is overridable via
     ``KIROCREW_CDN_BASE``. Without the restriction, an ``http://`` override would
     hand the user a command that fetches a script in plaintext and executes it, so
     an on-path attacker could swap the installer. curl refuses any other scheme,
     which is also exactly what ``cli.sh`` does for every fetch it makes itself.
+
+    Delegates to :func:`update_layout.wheel_update_command` rather than composing
+    a second copy: this string used to pipe curl into ``sh``, which reports only
+    the shell's status, so a failed download read as a successful update. Keeping
+    one builder is what stops the displayed command and the one the gateway runs
+    from drifting apart on that.
     """
-    return f"curl -fsSL --proto '=https' {artifact_base}/cli.sh | sh -s -- --channel {channel}"
+    from kiro_crew.platform.update_layout import wheel_update_command
+
+    return wheel_update_command(channel)
 
 
 def _set_update_info(**fields: object) -> None:
@@ -721,19 +739,33 @@ async def api_update_auto(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
     enabled = body.get("enabled", True)
-    # Read, modify, write config. The read fails CLOSED: treating an unreadable
-    # config as {} would write back a single-key file and wipe every other
-    # setting the user has (see read_config_for_update).
-    path = config_path()
+
+    def _set_auto_update(data: dict) -> dict:
+        data["auto_update"] = enabled
+        # RETURN it: `update_config_locked` reads a `None` return as "do not write" and
+        # exits with the data untouched, so an in-place-only callback silently drops the
+        # write while still reporting success.
+        return data
+
+    # `update_config_locked` holds the advisory lock across the READ and the write, so no
+    # other process can land between them -- the whole point, since the in-process
+    # `_get_config_lock()` this endpoint used to rely on does not serialize against the CLI
+    # or a second gateway.
+    #
+    # Offloaded because that lock is blocking: called inline from this coroutine it would
+    # stall every session and the liveness heartbeat while contended, which is what the
+    # repo's `no-blocking-call-on-event-loop` rule forbids.
+    #
+    # The read still fails CLOSED (`on_corrupt` defaults to "fail"): treating an unreadable
+    # config as {} would write back a single-key file and wipe every other setting the user
+    # has (see read_config_for_update).
     try:
-        data = read_config_for_update(path)
+        await asyncio.to_thread(update_config_locked, config_path(), mutate=_set_auto_update)
     except ConfigReadError:
         logger.exception("Refusing to toggle auto-update: config is unreadable")
         return web.json_response(
             {"error": "failed to read config file", "code": "config_unreadable"}, status=500
         )
-    data["auto_update"] = enabled
-    write_config_atomically(path, data)
     return web.json_response({"ok": True, "auto_update": enabled})
 
 
@@ -1081,6 +1113,31 @@ async def api_update_apply(request: web.Request) -> web.Response:
     """POST /api/update — git pull, rebuild, restart gateway."""
     state: DashboardState = request.app["state"]
 
+    # A policy-defined provider OWNS the update on this host. Checked before the
+    # git precondition below so an authenticated operator clicking Update cannot
+    # run the built-in mechanism their own policy excluded. A dashboard token
+    # proves who the caller is, not that this host may update by git.
+    from kiro_crew.platform.update_provider import apply_policy_update
+
+    applied = await apply_policy_update()
+    if applied is not None:
+        if not applied:
+            # A configured provider's failure is a failure. Falling through to
+            # the git path would be the bypass the policy exists to prevent.
+            state.push_update_progress(
+                "failed", "Policy-defined update command failed — see logs"
+            )
+            return web.json_response(
+                {
+                    "error": "policy-defined update command failed",
+                    "code": "policy_update_failed",
+                    "governance": True,
+                },
+                status=500,
+            )
+        await _restart_gateway(state)
+        return web.json_response({"ok": True, "status": "updating"})
+
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
     if not proj:
         return web.json_response({"error": "KIROCREW_PROJECT_DIR not set"}, status=400)
@@ -1310,8 +1367,27 @@ _log_ring_handler: _RingLogHandler | None = None
 
 
 async def _safe_ws_send(ws: web.WebSocketResponse, msg: str, state: DashboardState) -> None:
-    """Send to WS, removing dead subscribers on failure."""
+    """Send a log frame to one subscriber, re-checking its scope first.
+
+    Subscription is granted once, in the ``subscribe_logs`` handler, and the
+    handler above then fans out straight to ``_ws_log_subscribers`` without
+    passing the broadcast chokepoint. Re-check here, through
+    ``DashboardState._ws_client_allowed`` itself (rather than a hand-rolled
+    scope comparison) so revoking an app's ``log`` scope (a narrowed manifest,
+    or ``app disable``) stops the stream on a socket that is already
+    subscribed, and so this decision gets the same SEL audit trail as every
+    other event instead of a silent, unaudited duplicate of the check.
+
+    This runs on the event loop (the caller hands it to ``create_task`` via
+    ``call_soon_threadsafe``), which is what makes the check safe: the scope
+    cache must never be consulted from the logging thread, where a cold miss
+    would fall back to a synchronous manifest read.
+    """
     try:
+        if not ws.get("_is_dashboard_user", False):
+            if not state._ws_client_allowed(ws, "log", {}):
+                state._ws_log_subscribers.discard(ws)
+                return
         await ws.send_str(msg)
     except Exception:
         state._ws_log_subscribers.discard(ws)
@@ -1332,30 +1408,28 @@ class _RingLogHandler(logging.Handler):
         self._ring = ring
         self._max = max_size
         self._state: DashboardState | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
 
     def set_state(self, state: DashboardState) -> None:
         """Attach DashboardState for WS log broadcasting."""
         self._state = state
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._loop = None
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
             data = json.dumps({"level": record.levelname, "msg": msg})
             self._ring.append(data)
-            # Push to WS log subscribers (thread-safe via call_soon_threadsafe)
-            if self._state and self._loop and self._state._ws_log_subscribers:
+            # Push to WS log subscribers. emit() runs on ARBITRARY threads (any
+            # logger call anywhere), so the send is handed to the dashboard's one
+            # serving loop rather than to a copy latched by this handler.
+            loop = self._state.serving_loop if self._state else None
+            if self._state and loop and self._state._ws_log_subscribers:
                 ws_msg = json.dumps(
                     {"type": "log", "data": {"level": record.levelname, "msg": msg}}
                 )
                 for ws in list(self._state._ws_log_subscribers):
                     try:
-                        self._loop.call_soon_threadsafe(
-                            self._loop.create_task,
+                        loop.call_soon_threadsafe(
+                            loop.create_task,
                             _safe_ws_send(ws, ws_msg, self._state),
                         )
                     except RuntimeError:

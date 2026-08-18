@@ -12,6 +12,7 @@ output we can assert directly), and the process-helper return contracts.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
 import shutil
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -1853,7 +1855,7 @@ class TestFindListeningPidsErrors:
 
 class TestKillAsyncVariants:
     """Regression guards for the async ``kill_pid_async`` / ``kill_process_tree_async``
-    variants (Mesh-2801).
+    variants.
 
     The async wrappers exist so async call sites can offload the blocking
     Windows ``taskkill`` spawn to :func:`kiro_crew.executors.subprocess_executor`
@@ -2387,13 +2389,19 @@ def test_parent_map_ignores_a_planted_ps_earlier_on_path(tmp_path, monkeypatch):
     if platform_compat.IS_WINDOWS:  # pragma: no cover - POSIX lookup
         pytest.skip("POSIX binary resolution")
 
+    # The sentinel must be a number NO real process table can contain, because the
+    # assertion below reads its absence as proof the shim did not run. A plausible
+    # PID cannot do that job: `pid_max` is 4194304 on Linux, so a host whose counter
+    # has passed 999999 has a live process with that id and the test failed with
+    # "planted PATH shim was executed" while the shim had not run at all.
+    unreachable_pid = 99999999999
     shim = tmp_path / "ps"
-    shim.write_text("#!/bin/sh\necho '999999 999998'\n")
+    shim.write_text(f"#!/bin/sh\necho '{unreachable_pid} {unreachable_pid - 1}'\n")
     shim.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
 
     parent_map = platform_compat._posix_process_parent_map()
-    assert 999999 not in parent_map, "planted PATH shim was executed"
+    assert unreachable_pid not in parent_map, "planted PATH shim was executed"
     # A real snapshot still came back, so this is not passing by returning {}.
     assert os.getpid() in parent_map
 
@@ -2723,3 +2731,74 @@ def test_an_absent_tool_reports_no_unpinned_path(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
 
     assert pc.tool_outside_trusted_dirs("definitely-not-a-system-tool") is None
+
+
+# ── Desktop bundled-interpreter detection ──
+
+_REPO_ROOT = Path(__file__).parent.parent
+
+
+class TestIsBundledInterpreter:
+    """``is_bundled_interpreter`` is the single runtime owner of the desktop
+    packaging-layout sentinel; these tests pin both its behavior and its
+    agreement with the packaging layer, so a bundler directory rename breaks a
+    test here instead of silently un-matching the runtime guard (which would
+    let pip write into the signed macOS bundle)."""
+
+    def test_bundled_interpreter_path_is_detected(self, tmp_path, monkeypatch):
+        """The real desktop layout — a python-build-standalone runtime under
+        ``Resources/backend-dist/`` — must be recognized. The literal directory
+        name is deliberate here: the test pins the real-world layout, not the
+        constant (asserting via the constant would be tautological)."""
+        bundled = (
+            tmp_path
+            / "App.app"
+            / "Contents"
+            / "Resources"
+            / "backend-dist"
+            / "kirocrew-backend-arm64"
+            / "bin"
+            / "python3.12"
+        )
+        monkeypatch.setattr(pc.sys, "executable", str(bundled))
+        assert pc.is_bundled_interpreter() is True
+
+    def test_regular_interpreter_path_is_not_detected(self, tmp_path, monkeypatch):
+        """An ordinary venv interpreter must not trip the guard — a false
+        positive would refuse every Python app build on normal installs."""
+        regular = tmp_path / "gateway-venv" / "bin" / "python3.12"
+        monkeypatch.setattr(pc.sys, "executable", str(regular))
+        assert pc.is_bundled_interpreter() is False
+
+    def test_sentinel_matches_electron_builder_packaging_layout(self):
+        """Pin the constant to electron-builder's ``extraResources`` target so
+        a packaging rename fails HERE, not at runtime inside a signed bundle."""
+        pkg_json = _REPO_ROOT / "website" / "electron" / "package.json"
+        pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+        targets = {
+            res["to"]
+            for res in pkg["build"]["extraResources"]
+            if isinstance(res, dict) and "to" in res
+        }
+        assert pc.BUNDLED_BACKEND_DIST_DIRNAME in targets, (
+            "platform_compat.BUNDLED_BACKEND_DIST_DIRNAME no longer matches the "
+            "electron-builder extraResources target in website/electron/package.json. "
+            "If the desktop packaging directory was renamed, update the constant "
+            "(and this test) in the same change — otherwise the bundled-interpreter "
+            "guard silently stops matching and pip can write into the signed bundle."
+        )
+
+    def test_sentinel_matches_desktop_build_script_staging_dir(self):
+        """Same pin against the build script that stages the runtime trees.
+
+        Asserts the directory NAME as a path component — not any exact
+        shell-quoted expression — so a script refactor that introduces a
+        variable for the staging path does not false-positive this pin."""
+        script = (_REPO_ROOT / "packaging" / "build-desktop.sh").read_text(encoding="utf-8")
+        needle = f"/{pc.BUNDLED_BACKEND_DIST_DIRNAME}"
+        assert needle in script, (
+            "packaging/build-desktop.sh no longer stages anything under a "
+            f"'{pc.BUNDLED_BACKEND_DIST_DIRNAME}' directory — keep "
+            "platform_compat.BUNDLED_BACKEND_DIST_DIRNAME in sync with the "
+            "packaging layer (see is_bundled_interpreter)."
+        )

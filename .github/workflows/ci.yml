@@ -19,29 +19,23 @@ concurrency:
   # ~1.4min median merge gap, main gets periodic verdicts instead of none.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Tests that need capabilities the GH Actions runners lack (Linux-namespace
-# sandbox, a real git/gh, or POSIX rmtree/path assumptions). Deselected on
-# EVERY backend pytest invocation -- full AND reduced, Linux AND Windows --
-# from this single source so the lists cannot drift apart. They drifted once:
-# the reduced (frontend-only) runs omitted these, and the surface selector
-# legitimately lists test_dogfood_learnings.py as cross-surface, so a reduced
-# run re-ran a file the full run excludes and failed the shards. A --deselect
-# of a path a given run did not collect is a harmless no-op, so the reduced
-# runs carry the full list safely. Expanded UNQUOTED on purpose so it
-# word-splits into separate args (no deselect path contains a space).
-env:
-  BACKEND_DESELECTS: >-
-    --deselect=test/test_script_hooks.py
-    --deselect=test/test_cron_script.py
-    --deselect=src/kiro_crew/apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py
-    --deselect=src/kiro_crew/apps/builtins/ops_mission_control/tests/test_schedule_file.py
-    --deselect=src/kiro_crew/apps/builtins/auto_improvement/tests/test_dogfood_learnings.py
-    --deselect=src/kiro_crew/apps/builtins/auto_improvement/tests/test_pr_watchers.py
-    --deselect=src/kiro_crew/apps/builtins/auto_improvement/tests/test_lint_findings.py
-    --deselect=src/kiro_crew/apps/builtins/auto_improvement/tests/test_github_profile.py
-    --deselect=src/kiro_crew/apps/builtins/auto_improvement/tests/test_profile_capture.py
-    --deselect=src/kiro_crew/apps/builtins/auto_improvement/tests/test_runner.py
-    --deselect=src/kiro_crew/apps/builtins/auto_improvement/tests/test_perf_track_propose.py
+# There is deliberately no BACKEND_DESELECTS here any more. Eleven files used to be
+# deselected from EVERY backend pytest invocation because they drive a real
+# `git`/`gh`/`pytest` through `sandboxed_spawn_argv`, and a GH runner denies
+# `unshare(CLONE_NEWNS)` (EPERM) so `wrap_argv` fails closed. That kept 608 tests --
+# including the suites guarding the ops autonomy gate -- off every pull request.
+#
+# They no longer need it: each one that requires a sandbox carries its own
+# `skipif(not userns_available())`, so on a runner it skips with a named reason and on
+# a capable host it runs for real. MEASURED against a faithful local simulation of the
+# runner (`unshare(CLONE_NEWUSER)` ok, `CLONE_NEWNS` EPERM, no user session bus for the
+# cgroup scope, no gh token): 608 passed, 85 skipped, 0 failed.
+#
+# A whole-file deselect is the wrong tool for a missing host capability, and this is
+# why: it is invisible in the run output, it takes the file's OTHER tests with it, and
+# nothing goes red when the reason expires. A capability guard says which capability,
+# on which test, in the report. If a suite here starts needing one again, add the guard
+# -- not a deselect.
 
 jobs:
   # ── Surface detection (issue #1556) ──────────────────────────────────
@@ -68,6 +62,7 @@ jobs:
     outputs:
       only_backend: ${{ steps.decide.outputs.only_backend }}
       only_frontend: ${{ steps.decide.outputs.only_frontend }}
+      linux_packaging: ${{ steps.filter.outputs.linux_packaging }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -96,6 +91,16 @@ jobs:
               - '!website/**'
               - '!.github/**'
               - '!scripts/**'
+            # Independent of the three buckets above: it answers a different
+            # question ("could this diff change what a Linux package installs?")
+            # and so may overlap them freely.
+            linux_packaging:
+              - 'website/electron/package.json'
+              - 'website/electron/auto-update.js'
+              - 'website/electron/bundle-location.js'
+              - 'packaging/build-desktop.sh'
+              - 'scripts/stamp-distribution.sh'
+              - '.github/workflows/build-desktop.yml'
 
       - name: Decide surface
         id: decide
@@ -120,6 +125,47 @@ jobs:
           echo "only_backend=$only_backend"   >> "$GITHUB_OUTPUT"
           echo "only_frontend=$only_frontend" >> "$GITHUB_OUTPUT"
           echo "backend=$BACKEND frontend=$FRONTEND meta=$META full_run=$FULL_RUN -> only_backend=$only_backend only_frontend=$only_frontend"
+
+  # Build the Linux desktop packages and install them for real, but ONLY when the
+  # diff could change what a package installs. The check is expensive (a PBS
+  # interpreter, a full pip closure, then electron-builder three times), and it
+  # verifies things no cheaper gate can: dependency names that must exist in the
+  # target distro's repositories, the generated .desktop entry, and the maintainer
+  # scripts. Same trade the macOS-packaging path gate already makes.
+  #
+  # A packaging change that lands without this having run is the failure mode this
+  # exists to prevent: a package that builds green and refuses to install.
+  linux-packaging:
+    name: Linux Packaging (build + smoke-install)
+    needs: changes
+    if: ${{ needs.changes.outputs.linux_packaging == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      # Builds all three Linux formats from one backend tree, re-stamping the
+      # beacon distribution between electron-builder invocations.
+      - name: Build the Linux desktop packages
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: bash packaging/build-desktop.sh
+
+      - name: Install the packages in their target distros
+        run: ./scripts/smoke-linux-packages.sh website/electron/dist
 
   scrub-lint:
     name: De-Amazon Scrub Lint
@@ -185,6 +231,39 @@ jobs:
           # silently disables an exemption fails here instead of shipping green.
           python3 scripts/check_brand_name.py --test
           python3 scripts/check_brand_name.py
+
+  harness-parity:
+    name: Harness Parity Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check harness identity tests on the lines this change adds
+        # Kiro Crew drives one first-class harness (kiro-cli) and adapts the
+        # others. The defect class is a call site that spells "this is kiro" as
+        # the ABSENCE of another harness: correct with two backends, and then it
+        # hands the third a capability or a sandbox waiver nobody granted it.
+        # It fails toward the permissive answer, so nothing else goes red.
+        #
+        # Diff-scoped for the same reason as the brand gate above: the tree
+        # carries pre-existing negative tests in the dormant claude seam, and
+        # converting them is a separate change with its own review. Added lines
+        # are complete for regression, and the whole-tree count is still printed
+        # as a non-failing report. Invariants:
+        # docs/system-specs/modules/harness-parity.md
+        env:
+          # `base.sha` for the same reason as the brand gate: the merge ref this
+          # run checks out was computed against that exact commit.
+          HARNESS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          HARNESS_BASE_REF="$(bash "$GITHUB_WORKSPACE/.github/scripts/resolve-i18n-base.sh" \
+            "$HARNESS_BASE_REF" 'the harness-parity gate')" || exit 1
+          export HARNESS_BASE_REF
+          # Self-test first: it plants one probe per rule, so a regex typo that
+          # silently disables a rule fails here instead of shipping green.
+          python3 scripts/check_harness_parity.py --test
+          python3 scripts/check_harness_parity.py
 
   docs-lint:
     name: Docs Lint
@@ -346,38 +425,17 @@ jobs:
             pytest -q -n auto --timeout=120 \
               --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
               --no-cov \
-              $BACKEND_DESELECTS \
               "${TARGETS[@]}"
             exit 0
           fi
           pytest -q -n auto --timeout=120 \
             --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
-            ${{ matrix.python-version == '3.12' && '--cov=kiro_crew --cov=sage_lib' || '--no-cov' }} \
-            $BACKEND_DESELECTS
-        # Deselected tests require capabilities unavailable on GH Actions:
-        #   test_script_hooks, test_cron_script: Linux namespace sandbox (unshare NEWNS)
-        #   ops_mission_control test_ledger_sync_git, test_schedule_file: the same
-        #     capability gap, for the same reason. They drive REAL `git`/`gh` through
-        #     `sandboxed_spawn_argv`, which raises SandboxUnavailableError on these runners
-        #     (`unshare(CLONE_NEWNS)` -> EPERM), so all 29 + 1 of them fail here.
-        #   auto_improvement: same capability gap. These seven spawn a real `git`/`pytest`
-        #     through the profile's strict-mode sandbox (or need a real OS sandbox), which the
-        #     runner cannot provide; they pass locally with a working sandbox and are the exact
-        #     set kept off the shards while `testpaths` was a per-file list, now that the dir
-        #     is globbed. Making them CI-portable is tracked as a follow-up in the PR body.
-        #
-        #     These only became visible when `testpaths` grew to cover the in-package app
-        #     suites (see setup.cfg) -- before that they never ran in CI at all, on any job.
-        #     Surfacing them is the point of that change: the ~1490 tests guarding the ops
-        #     autonomy gate now run, and these two files are the residue that cannot.
-        #
-        #     They are NOT added to the namespace-sandbox job below. That was tried and the
-        #     job failed at the test step while its sandbox-verify step passed, so something
-        #     other than the namespace probe is missing there; the two files take ~6 minutes
-        #     against a real `git`, which is also a poor fit for a 20-minute job scoped to
-        #     118 fast tests. Left deselected rather than shipped red -- they run locally
-        #     (220 passed, real sandbox available) and in the app suite. Wiring them into a
-        #     job of their own is a follow-up, tracked in the PR body.
+            ${{ matrix.python-version == '3.12' && '--cov=kiro_crew --cov=sage_lib' || '--no-cov' }}
+        # Nothing is deselected. The eleven files that used to be -- the two sandbox
+        # suites, the two ops git/gh suites, and the seven auto_improvement suites --
+        # each carry `skipif(not userns_available())` on the tests that need a namespace
+        # sandbox, so on this runner (`unshare(CLONE_NEWNS)` -> EPERM) those skip with a
+        # named reason and the other ~523 run. See the note above the `jobs:` key.
 
       - name: Stage shard coverage data
         if: matrix.python-version == '3.12' && steps.scope.outputs.reduced != 'true'
@@ -482,21 +540,17 @@ jobs:
             while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then TARGETS+=("$line"); fi; done < "$TARGETS_FILE"
             pytest -q -n auto --timeout=180 --no-cov \
               --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
-              $BACKEND_DESELECTS \
               "${TARGETS[@]}"
             exit 0
           fi
           pytest -q -n auto --timeout=180 --no-cov \
-            --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
-            $BACKEND_DESELECTS
-        # Same deselects as backend-test (the Linux-namespace sandbox tests are
-        # unavailable here too). The ops git/gh suites are deselected for a second reason as
-        # well: they drive a real POSIX `git`/`gh` and the namespace-sandbox job that DOES run
-        # them is Linux-only, so on Windows they are simply out of scope. The seven
-        # auto_improvement suites are deselected for the same sandbox reason; the two that also
-        # carry POSIX path/rmtree assumptions (test_dogfood_learnings, test_pr_watchers) would
-        # fail on Windows regardless, and their residual node ids stay tracked in
-        # test/windows-expected-failures.txt.
+            --splits "$SHARD_COUNT" --group ${{ matrix.group }}
+        # Nothing is deselected here either, and the same guards carry it: Windows has no
+        # namespace sandbox at all, so `userns_available()` is False and every
+        # sandbox-dependent test skips. Residual POSIX assumptions in
+        # test_dogfood_learnings / test_pr_watchers stay tracked as node ids in
+        # test/windows-expected-failures.txt, which is the mechanism a whole-file deselect
+        # was standing in for.
 
   # macOS gateway line. Until this job existed macOS had ZERO pytest coverage in
   # CI -- the macos-14 runners appear only in build.yml, build-desktop.yml and
@@ -567,11 +621,21 @@ jobs:
             test/test_service.py \
             test/test_dev_fleet_app.py
 
-  # Runs the tests the sharded matrix deselects. They need unprivileged user
-  # namespaces (unshare NEWNS), which ubuntu-24.04 restricts via AppArmor --
-  # the same restriction codex-review.yml clears for its bwrap sandbox. Without
-  # this job the ~/.kiro/crew sensitive-path keystone has no CI coverage at all,
+  # The one job where the sandbox-dependent tests EXECUTE rather than skip. They need
+  # unprivileged user namespaces (unshare NEWNS), which ubuntu-24.04 restricts via
+  # AppArmor -- the same restriction codex-review.yml clears for its bwrap sandbox.
+  # Without this job the ~/.kiro/crew sensitive-path keystone has no CI coverage at all,
   # even though branch protection treats breaking it as a blocking offence.
+  #
+  # The shards now COLLECT these two files as well (nothing is deselected any more), but
+  # there the `skipif(not userns_available())` tests skip -- so this job is still what
+  # actually asserts the sandbox behaviour.
+  #
+  # The nine ops/auto_improvement suites belong here too, for the same reason, and were
+  # rejected the first time as "~6 minutes against a real git". That cost was the
+  # launcher's pre-exec hardlink scan arming on every spawn; measured after the fix, all
+  # eleven run in 38s under this job's environment. Adding them waits on that fix
+  # landing, so it is not part of this change.
   #
   backend-test-sandbox:
     name: Backend Tests (namespace sandbox)
@@ -695,7 +759,8 @@ jobs:
     # How backend got here, so the next person can judge the headroom:
     #   78.69%  starting point
     #   80.15%  #2090 stopped measuring test files CI never executes (the
-    #           BACKEND_DESELECTS set) -- an accounting fix, not new tests
+    #           BACKEND_DESELECTS set) -- an accounting fix, not new tests.
+    #           Since retired: CI runs those files, so they are measured again.
     #   81.50%  #2103 added unit coverage for 7 pure-logic-ish modules
     #   81.94%  #2115 added 11 dashboard/Slack/app-platform modules
     # 80% therefore leaves ~1.9pp of headroom, wider than the ~1.4pp the 77%
@@ -706,6 +771,14 @@ jobs:
     env:
       BACKEND_MIN: 80
       FRONTEND_MIN: 60
+      # The per-file floor, applied to BOTH lanes with a per-lane baseline of
+      # the files that were already below it. A project-wide average lets a
+      # well-covered large file pay for a bare small one, so it can be satisfied
+      # without touching the files that carry the risk; a per-file floor removes
+      # that subsidy. The rationale, the measured cost of this number, and the
+      # three baseline rules live in scripts/check_per_file_coverage.py's
+      # docstring -- deliberately not restated here, where it would go stale.
+      PER_FILE_MIN: 80
     # Always run so the required check emits a real verdict. Without
     # `if: always()`, a failing OR skipped dependency would SKIP this job, and
     # GitHub treats a skipped required check as SATISFIED -- silently defeating
@@ -773,6 +846,30 @@ jobs:
             exit 1
           fi
 
+      # Checked out for the per-file gate: it needs scripts/check_per_file_coverage.py
+      # and the two baselines from the tree. It sits BEFORE the artifact
+      # downloads because actions/checkout cleans the workspace by default and
+      # would otherwise delete them.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The gate parses the Cobertura reports through defusedxml rather than the
+      # stdlib parser, which resolves external entities -- and on a fork PR the
+      # report is produced by contributor-controlled code. Installed here because
+      # this job otherwise needs no Python dependencies.
+      #
+      # setup-python is a PREREQUISITE, not decoration: the runner image's /usr
+      # interpreter is externally managed (PEP 668), so `uv pip install --system`
+      # against it exits 2 with "externally managed". coverage-combine provisions
+      # the same pair for the same reason.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Install the per-file gate's XML parser
+        run: uv pip install --system 'defusedxml>=0.7,<1'
+
       - name: Download backend coverage
         if: needs.coverage-combine.result == 'success'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -818,6 +915,26 @@ jobs:
               print(f"::error::{label} coverage {rate:.2f}% below {floor:.0f}% minimum")
               sys.exit(1)
           PY
+
+      - name: Check per-file coverage, backend (floor ${{ env.PER_FILE_MIN }}%)
+        # Gated on the same condition as the project floor: on a frontend-only
+        # diff the backend suite ran as a coverage-free subset, and a subset's
+        # per-file rates are not comparable to a baseline recorded on the full
+        # suite -- enforcing them there would fail files whose tests never ran.
+        if: needs.coverage-combine.result == 'success'
+        run: |
+          python3 scripts/check_per_file_coverage.py backend-cov/coverage.xml \
+            --label Backend --floor "$PER_FILE_MIN" \
+            --baseline .github/coverage-baselines/backend.txt
+
+      - name: Check per-file coverage, frontend (floor ${{ env.PER_FILE_MIN }}%)
+        if: needs.changes.outputs.only_backend != 'true'
+        run: |
+          F=$(find frontend-cov -name 'cobertura*.xml' 2>/dev/null | head -1)
+          test -n "$F" || { echo "::error::cobertura report missing from coverage-frontend artifact"; exit 1; }
+          python3 scripts/check_per_file_coverage.py "$F" \
+            --label Frontend --floor "$PER_FILE_MIN" \
+            --baseline .github/coverage-baselines/frontend.txt
 
       - name: Coverage summary
         if: always()
@@ -1107,7 +1224,11 @@ jobs:
             # than SHARD_COUNT leaves some shards with no files, so
             # --passWithNoTests keeps an empty shard green (a legitimately empty
             # slice, not a lost suite).
-            npx vitest run --reporter=blob --passWithNoTests \
+            # blob alone prints no verdict (it only writes the artifact), so a
+            # failing shard's log would end at "exit code 1" with no FAIL line
+            # or summary; the second reporter keeps a human-readable verdict in
+            # this job's own log.
+            npx vitest run --reporter=blob --reporter=default --passWithNoTests \
               --shard=${{ matrix.shard }}/"$SHARD_COUNT" "${TARGETS[@]}"
           else
             # --reporter=blob stores results + per-shard coverage under
@@ -1115,7 +1236,11 @@ jobs:
             # the four shards back into one report and the merged cobertura the
             # Coverage Gate reads. Coverage is emitted per shard so the merge
             # can union it -- a single shard covers only the files it ran.
-            npx vitest run --coverage --reporter=blob \
+            # blob alone prints no verdict (it only writes the artifact), so a
+            # failing shard's log would end at "exit code 1" with no FAIL line
+            # or summary; the second reporter keeps a human-readable verdict in
+            # this job's own log.
+            npx vitest run --coverage --reporter=blob --reporter=default \
               --shard=${{ matrix.shard }}/"$SHARD_COUNT"
           fi
 
@@ -1165,6 +1290,7 @@ jobs:
           merge-multiple: true
 
       - name: Merge reports and coverage
+        id: merge
         working-directory: website
         # --merge-reports stitches the per-shard blobs back into one result set
         # WITHOUT re-running tests; --coverage unions the per-shard coverage and
@@ -1173,6 +1299,23 @@ jobs:
         # already consumes. A failed shard makes this exit non-zero, surfacing
         # the failure here too.
         run: npx vitest --merge-reports --coverage
+
+      - name: Reconcile shard verdicts against blob results
+        # Runs even when the merge step failed -- that is the case it exists
+        # for. A shard (or the merge) can exit non-zero without naming a
+        # failing test anywhere: a worker killed mid-run (the worker-OOM mode
+        # documented in website/vite.config.ts) fails the job while every test
+        # in the blob reads "pass". This step decodes the downloaded blobs,
+        # prints every failing test and unhandled runner error by name, and
+        # states the contradiction explicitly when a red verdict has no failing
+        # test behind it. Diagnostic only: it always exits 0 and never changes
+        # the job's verdict.
+        if: ${{ !cancelled() }}
+        working-directory: website
+        env:
+          FRONTEND_TEST_RESULT: ${{ needs.frontend-test.result }}
+          MERGE_RESULT: ${{ steps.merge.outcome }}
+        run: node "$GITHUB_WORKSPACE/.github/scripts/frontend-blob-reconcile.mjs" .vitest-reports
 
       - name: Upload merged coverage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

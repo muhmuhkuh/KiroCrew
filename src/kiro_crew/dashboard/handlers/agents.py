@@ -17,6 +17,7 @@ from aiohttp import web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
+from kiro_crew.agent import AGENT_FILENAME, get_shipped_tools, install_agent, kiro_agents_dir_path
 from kiro_crew.agent_discovery import (
     clear_list_agents_cache,
     list_agents,
@@ -82,8 +83,6 @@ def _namespaced_agent_file_exists(agent_name: str) -> bool:
     # Resolved per call, not read from a module constant: the agents dir tracks
     # the live data home (see config.md "Data Home"), and a frozen constant would
     # glob the real ~/.kiro from an isolated run.
-    from kiro_crew.agent import kiro_agents_dir_path
-
     try:
         for path in kiro_agents_dir_path().glob(f"*--{agent_name}.json"):
             try:
@@ -122,8 +121,6 @@ def _sel():
 def _auto_install_agent() -> None:
     """Re-install agent config to kiro-cli so changes take effect immediately."""
     try:
-        from kiro_crew.agent import install_agent  # noqa: F811
-
         install_agent()
         logger.info("Auto-applied agent config via dashboard")
     except Exception:
@@ -141,8 +138,6 @@ def _installed_agent_config() -> Path:
     This is the live config that kiro-cli reads.  Dashboard MCP toggle
     and sync operations write here — NOT to agents/defaults.json.
     """
-    from kiro_crew.agent import AGENT_FILENAME, kiro_agents_dir_path  # noqa: F811
-
     return kiro_agents_dir_path() / AGENT_FILENAME
 
 
@@ -173,8 +168,6 @@ async def api_agent_config(request: web.Request) -> web.Response:
             # so they don't reappear on upgrade.  Stored in ~/.kiro/crew/config.json
             # (NOT kirocrew.json — kiro-cli rejects unknown fields).
             # Per-key dict so removing from allowedTools only doesn't affect tools.
-            from kiro_crew.agent import get_shipped_tools  # noqa: F811
-
             shipped = get_shipped_tools()
             removed_per_key: dict[str, list[str]] = {}
             for key in ("tools", "allowedTools"):
@@ -208,6 +201,22 @@ async def api_agent_config(request: web.Request) -> web.Response:
             # directory per ref, which is synchronous filesystem work — running it
             # inline would stall the aiohttp event loop for the duration.
             await asyncio.to_thread(sanitize_agent_config_governance, config)
+            # Never persist Kiro Crew bookkeeping into the kiro spec —
+            # kiro-cli rejects unknown fields and drops the agent (#2570).
+            # Offloaded like the governance filter above: this reads/writes the
+            # agent_model_state.json sidecar, the same class of synchronous
+            # filesystem work that would otherwise stall the event loop.
+            # Only trust a submitted name when it is a non-empty string — any
+            # other JSON type (list, dict, number) would flow into the sidecar
+            # helper as a dict key and crash the endpoint with a 500.
+            raw_name = config.get("name")
+            name = raw_name if isinstance(raw_name, str) and raw_name.strip() else installed_path.stem
+            changed = await asyncio.to_thread(agent_state.lift_and_strip_bookkeeping, config, name)
+            if changed:
+                logger.info(
+                    "Stripped Kiro Crew bookkeeping keys from a PUT to agent config for %r",
+                    name,
+                )
             installed_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
             # Restart kiro-cli sessions so new config takes effect
             await _h._reset_all_sessions(request)
@@ -479,8 +488,6 @@ async def api_capability_skills_install(request: web.Request) -> web.Response:
         # Regenerate agent config to pick up new skill paths. install_agent()
         # does filesystem-heavy config rebuilding — offload it so it never
         # blocks the asyncio event loop (chat/heartbeat) under a slow FS.
-        from kiro_crew.agent import install_agent  # noqa: F811
-
         await asyncio.to_thread(install_agent)
         state: DashboardState = request.app["state"]
         state.push_refresh("agents")
@@ -507,8 +514,6 @@ async def api_capability_skills_uninstall(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": (res.message or "uninstall failed")[:500]}, status=500
             )
-        from kiro_crew.agent import install_agent  # noqa: F811
-
         await asyncio.to_thread(install_agent)
         state: DashboardState = request.app["state"]
         state.push_refresh("agents")
@@ -564,8 +569,6 @@ async def _mutate_agent_package(request: web.Request, *, install: bool) -> web.R
             return web.json_response({"error": _redact_external(message)}, status=500)
         # Filesystem-heavy config rebuild — offload so it never blocks the asyncio
         # event loop (chat turn + liveness heartbeat) on a slow FS.
-        from kiro_crew.agent import install_agent  # noqa: F811
-
         await asyncio.to_thread(install_agent)
         # list_agents() caches on a (count, newest-mtime-ns) signature, so a
         # mutation landing inside one mtime tick would otherwise serve a stale
@@ -1168,8 +1171,6 @@ async def api_slash_commands(request: web.Request) -> web.Response:
 async def api_agent_detail(request: web.Request) -> web.Response:
     """GET/DELETE/PATCH /api/agents/detail/{name} — view, delete, or update agent config."""
     name = request.match_info["name"]
-    from kiro_crew.agent import kiro_agents_dir_path  # noqa: F811
-
     # Parse body early so JSONDecodeError returns 400, not 404 from the file loop.
     patch_body = None
     if request.method == "PATCH":
@@ -1287,7 +1288,11 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                         # Re-read under the lock: the copy above was read before
                         # the lock and a concurrent PATCH may have superseded it.
                         data = json.loads(f.read_text(encoding="utf-8"))
-                        agent_name = data.get("name") or name
+                        # `spec_str` for the same reason as `declared` above: a
+                        # hand-edited spec can carry a structured (non-string)
+                        # "name", which would crash the sidecar helper's dict
+                        # lookup with an unhashable key.
+                        agent_name = spec_str(data, "name") or name
                         # Skills FIRST, before any state mutation. The mapping can
                         # reject the request (unknown key -> 400) and the model
                         # branch below writes the agent_state sidecar; doing model
@@ -1335,10 +1340,19 @@ async def api_agent_detail(request: web.Request) -> web.Response:
                             else:
                                 # Explicit pick: freeze it against default bumps.
                                 agent_state.set_model_managed(agent_name, False)
-                        # Never persist KiroCrew bookkeeping into the kiro spec —
-                        # kiro-cli rejects unknown fields and drops the agent.
-                        data.pop("model_managed", None)
-                        data.pop("cc_model", None)
+                        # Never persist Kiro Crew bookkeeping into the kiro spec —
+                        # kiro-cli rejects unknown fields and drops the agent. Same
+                        # shared helper as the PUT handler and migrate_agent_specs(),
+                        # so this fourth writer can't drift from the other three
+                        # (#2570). The model branch above may have just set the
+                        # sidecar explicitly; the helper only lifts a stale key out
+                        # of `data` when the sidecar is still unset, so it can't
+                        # clobber that just-written value. Offloaded like the PUT
+                        # handler: the helper does synchronous sidecar read/write
+                        # filesystem work that would stall the event loop.
+                        await asyncio.to_thread(
+                            agent_state.lift_and_strip_bookkeeping, data, agent_name
+                        )
                         f.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
                     # The list_agents() cache keys on a (count, newest-mtime-ns)
                     # signature; two writes inside the same mtime granularity
@@ -1514,8 +1528,6 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
         discovered_names = {a.name for a in discovered_agents}
 
         # Add new agents
-        from kiro_crew.agent import kiro_agents_dir_path  # noqa: F811
-
         mc_kiro_agents = {a.kiro_agent for a in cfg.agents.values()}
         for disc in discovered_agents:
             if (

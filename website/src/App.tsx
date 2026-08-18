@@ -8,10 +8,12 @@ import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds, changeAppro
 // before `getBuiltinSurfaces()` is invoked below to compute `NAV_ITEMS`.
 import './surfaces/builtins'
 import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel, surfacePreviewEnabled } from './surfaces/registry'
-import { createSlot, appendMessage, setSlotRunning, switchSlot } from './store/chatSlice'
+import { createSlot, appendMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { queryComposer } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
 import { applyNavIntentInMain } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
+import { agentSwitchFailureMessage } from './utils/agentSwitchFeedback'
 import { fetchNotifications, ackNotification } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
 import { useDashboardHealthProbe } from './hooks/useDashboardHealthProbe'
@@ -19,6 +21,7 @@ import { useTheme } from './hooks/useTheme'
 import { useBranding } from './hooks/useBranding'
 import { useRumPageView } from './hooks/useRumPageView'
 import { useIsMobile } from './hooks/useIsMobile'
+import { useSidePanelDock } from './hooks/useSidePanelDock'
 import { usePreviewFlagRevision } from './hooks/usePreviewFlag'
 import { setRailWidth, railWidthFor } from './hooks/useRailWidth'
 import { useNativeNotification } from './hooks/useNativeNotification'
@@ -26,9 +29,10 @@ import { useNotificationSound } from './hooks/useNotificationSound'
 import { recordSessionStart, recordEvent } from './rum'
 import { ZoomProvider } from './hooks/ZoomProvider'
 import { api, isAuthBannerShown } from './api/client'
+import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
-import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, ExternalLink, SquareTerminal, Bot } from 'lucide-react'
+import { Rocket, Menu, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -38,7 +42,7 @@ import { OnboardingShellHost } from './components/OnboardingChapterShell'
 import { PREVIEW_FOCUS_EVENT } from './components/WebPreviewPanel'
 import { motion, AnimatePresence } from 'framer-motion'
 import { usePersistedBool } from './hooks/usePersistedBool'
-import { isMacElectron, isWinElectron } from './lib/electron'
+import { isMacElectron, isWinElectron, isLinuxFramelessElectron } from './lib/electron'
 import { DndContext, closestCenter, MouseSensor, TouchSensor, useSensor, useSensors, DragOverlay, type DragStartEvent, type DragEndEvent } from '@dnd-kit/core'
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
@@ -69,6 +73,7 @@ import KiroCrewNavBridge from './components/KiroCrewNavBridge'
 import InstanceTabBar from './components/InstanceTabBar'
 import InstancesViewport from './components/InstancesViewport'
 import EmbeddedHostBridge from './components/EmbeddedHostBridge'
+import EmbeddedDragRegionReporter from './components/EmbeddedDragRegionReporter'
 import EmbedTabStrip from './components/EmbedTabStrip'
 import DeveloperPage from './pages/DeveloperPage'
 import SchedulePage from './pages/SchedulePage'
@@ -77,7 +82,7 @@ import UpdateModal from './components/UpdateModal'
 
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
-import { toggleBottomTerminal, useBottomTerminalOpen } from './hooks/useBottomTerminal'
+import { toggleBottomTerminal, useBottomTerminalOpen, useTerminalPosition } from './hooks/useBottomTerminal'
 import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
 import AppsPage from './pages/AppsPage'
@@ -98,13 +103,18 @@ import { useProvider } from './providers/context'
 import { useAgents } from './hooks/useAgents'
 import ShortcutsModal from './components/ShortcutsModal'
 import CommandPalette from './components/CommandPalette'
-import Modal from './components/Modal'
 import ReportProblemModal from './components/ReportProblemModal'
 import FeedbackPill from './components/FeedbackPill'
+import KiroAccountModal, { type KiroAccountUsage } from './components/KiroAccountModal'
+import WindowsTitlebarMenu from './components/WindowsTitlebarMenu'
 
 import { i18nT } from './i18n/t'
 import { appNavTarget } from './appNav'
-import { fmtCompact, fmtNumber, fmtPercent } from './i18n/format'
+import { fmtCompact, fmtPercent } from './i18n/format'
+
+const MAX_KIRO_BONUS_GRANT_NAME_CHARS = 100
+const MAX_KIRO_BONUS_CREDITS = 1_000_000
+const MAX_KIRO_BONUS_DAYS_LEFT = 3_650
 type LogSubscribeFn = (cb: ((data: { level: string; msg: string }) => void) | null) => void
 
 /** Minimal shape of an entry from `GET /api/apps`, limited to the fields the
@@ -164,13 +174,15 @@ export function metricColor(pct: number): string {
 }
 export const memColorClass = metricColor
 
-const TOPBAR_SEARCH_GAP = 12
-const TOPBAR_SEARCH_MIN_WIDTH = 240
-
-export function calculateTopbarSearchLayout(brandWidth: number, actionsWidth: number, viewportWidth: number) {
-  const gutter = Math.ceil(Math.max(brandWidth, actionsWidth)) + TOPBAR_SEARCH_GAP
-  return { gutter, visible: viewportWidth - (gutter * 2) >= TOPBAR_SEARCH_MIN_WIDTH }
-}
+// The top-bar search is laid out by CSS, not measured here: `.topbar` in
+// index.css is a three-track grid whose centre track is
+// `clamp(240px, 22vw, 480px)` and whose side tracks are equal `minmax(0,1fr)`
+// remainders, so the search is window-centred by construction and each side
+// group adapts its own contents with a container query. The previous
+// implementation centred an absolutely-positioned overlay on `50vw`, which
+// forced it to reserve `max(left, right)` on BOTH sides and drop itself entirely
+// once that mirrored gutter fell under a floor — on an asymmetric header that
+// discarded twice the difference between the two clusters.
 
 // Apps-nav fetch resilience (see refreshAppNav). The dashboard loads
 // `/api/apps` once on mount; right after a `kirocrew update` the gateway is
@@ -764,7 +776,7 @@ function NotificationsBellButton() {
                 the cards' own backdrop-blur still samples the page). */}
             <div
               aria-hidden="true"
-              className="absolute inset-y-0 -left-20 right-0 -z-10 pointer-events-none bg-black/[.03] [mask-image:linear-gradient(to_right,transparent,black_80px)] [-webkit-mask-image:linear-gradient(to_right,transparent,black_80px)]"
+              className="absolute inset-y-0 -left-20 right-0 -z-10 pointer-events-none bg-black/[.12] backdrop-blur-sm [mask-image:linear-gradient(to_right,transparent,black_80px)] [-webkit-mask-image:linear-gradient(to_right,transparent,black_80px)]"
             />
             <div className="flex-1 min-h-0 px-3 py-2 flex flex-col">
               <NotificationFeed
@@ -825,7 +837,10 @@ export default function App() {
   // in-window navigation back to this frame instead of escaping to '/'.
   const initialPopoutPath = useRef(window.location.pathname + window.location.search).current
   const dispatch = useAppDispatch()
-  const { connected, updateProgress } = useAppSelector(s => s.dashboard)
+  // The slice also carries the slot list and the subagent maps, so selecting all of
+  // it would re-render the root on dashboard traffic neither of these fields reads.
+  const connected = useAppSelector(s => s.dashboard.connected)
+  const updateProgress = useAppSelector(s => s.dashboard.updateProgress)
   // Gateway (web) update flag OR desktop updater availability (mirrored from
   // Electron update-state by useUpdateSubscription) -- both light the same
   // Settings nav dot below.
@@ -894,6 +909,10 @@ export default function App() {
   // every mousemove during a grip-drag, and a primitive snapshot lets
   // useSyncExternalStore's Object.is check skip those re-renders of App.
   const bottomTerminalOpen = useBottomTerminalOpen()
+  // Selected session's project directory: a terminal opened from the nav row
+  // starts there (server default when no session is selected or it has none).
+  const activeSlotProject = useAppSelector(selectActiveSlotProject)
+  const terminalPosition = useTerminalPosition()
   const navigate = useNavigate()
 
   // Main-dashboard role for the artifact popout nav-intent handshake: perform
@@ -989,7 +1008,17 @@ export default function App() {
   // can never disagree about what should be on screen.
   useEffect(() => {
     if (!themeBootReady) return
-    setShowAgentImport(!importOnboarded)
+    // OPEN-ONLY for the import chapter. Deriving `false` here is what made the
+    // page close itself: Import is the one chapter with a manual entry point
+    // (the `mc-start-import` event below), and for a user who already finished
+    // it this effect's own answer is `false`. So any later run — theme boot
+    // resolving, or any flag write — drove `initialOpen` true→false, and
+    // AgentImportFlow closes on that edge. Nothing is lost by not closing here:
+    // the real completion paths (`onComplete`, `onSkipAll`) already call
+    // `setShowAgentImport(false)` themselves, so the false branch was redundant
+    // for every case except the one it broke. Same split as the `onboarded`
+    // effect above, which only ever closes the tour.
+    if (!importOnboarded) setShowAgentImport(true)
     setShowPrivacy(importOnboarded && !privacyAcked)
     setShowOnboarding(importOnboarded && privacyAcked && !onboarded)
   }, [importOnboarded, privacyAcked, onboarded, themeBootReady])
@@ -1073,6 +1102,11 @@ export default function App() {
     return () => window.removeEventListener(PREVIEW_FOCUS_EVENT, onFocus)
   }, [])
   const isMobile = useIsMobile()
+  const [sidePanelDock] = useSidePanelDock()
+  // Side panel docked to the bottom (desktop only) swaps the shell from a
+  // 3-column grid with a full-height right rail to a 2-column grid with an
+  // extra bottom row that the panel fills.
+  const bottomDock = sidePanelDock === 'bottom' && !isMobile
   // Multi-instance: which instance fills the pane below the tab bar. null = Local
   // (the native dashboard); a non-null id means a remote instance's embedded
   // dashboard is shown instead, so the Local pane is hidden (not unmounted).
@@ -1105,7 +1139,7 @@ export default function App() {
   const [appNavOrder, setAppNavOrder] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem('mc-app-nav-order') || '[]') } catch { return [] } })
   // Preview-gated surfaces (see `utils/previewFlags.ts`) must not be advertised
   // anywhere. `surfacePreviewEnabled` is a synchronous storage read, so the rail
-  // needs this subscription to re-render when Developer > Config flips a flag —
+  // needs this subscription to re-render when Developer > Feature Previews flips a flag —
   // otherwise the row would appear only after a reload. The revision also
   // invalidates the memo below, which a bare re-render would not recompute.
   const previewFlagRevision = usePreviewFlagRevision()
@@ -1190,8 +1224,8 @@ export default function App() {
             // the builtin lucide glyph, then the generic package icon.
             const customIconUrl = target.iconUrl
             const builtinIcon = target.builtin ? getBuiltinIcon(iconName) : undefined
-            const baseIcon = customIconUrl
-              ? <AppIcon iconUrl={customIconUrl} icon={iconName} size={16} />
+            const baseIcon = customIconUrl || target.iconUrlDark
+              ? <AppIcon iconUrl={customIconUrl} iconUrlDark={target.iconUrlDark} icon={iconName} size={16} />
               : target.pageIconUrl
                 ? <img src={'/apps/' + a.name + '/ui/' + target.pageIconUrl} alt="" className="w-4 h-4 rounded-sm object-contain" />
                 : builtinIcon
@@ -1282,13 +1316,29 @@ export default function App() {
     mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
     onSuccess: () => {
       navigate('/chat')
-      requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus())
+      // Unguarded on purpose: this mutation only fires from the new-chat
+      // keyboard shortcut, and a pressed shortcut proves a keyboard exists —
+      // focusComposer()'s touch-device skip would wrongly suppress focus on a
+      // tablet with a physical keyboard. Next frame, so the new slot's
+      // composer has been committed to the DOM.
+      requestAnimationFrame(() => queryComposer()?.focus())
     },
   })
   const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
   const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger)
   const queryClient = useQueryClient()
   const provider = useProvider()
+  const agentSwitchNotice = useAppSelector(s => s.chat.agentSwitchNotice)
+  useEffect(() => {
+    if (!agentSwitchNotice) return
+    const timer = window.setTimeout(() => dispatch(setAgentSwitchNotice(null)), 6000)
+    return () => window.clearTimeout(timer)
+  }, [agentSwitchNotice, dispatch])
+  const switchActiveSlotAgent = useCallback((slot: string, agent: string) => {
+    dispatch(setAgentSwitchNotice(null))
+    void api.chatSlotAgent(slot, agent)
+      .catch(error => dispatch(setAgentSwitchNotice(agentSwitchFailureMessage(error))))
+  }, [dispatch])
   useKeyboardShortcuts({ onToggleShortcutsModal: toggleShortcutsModal, onNewChat: () => newChatMutation.mutate(), disabled: shortcutsOpen,
     onCycleAgent: () => {
       const slots = store.getState().dashboard.slots
@@ -1298,7 +1348,7 @@ export default function App() {
       const currentAgent = currentSlot?.agent || defaultAgent
       const idx = installedAgents.findIndex((a: { name: string }) => a.name === currentAgent)
       const nextIdx = (idx + 1) % installedAgents.length
-      api.chatSlotAgent(activeSlot, installedAgents[nextIdx].name)
+      switchActiveSlotAgent(activeSlot, installedAgents[nextIdx].name)
     },
     onCyclePrevAgent: () => {
       const slots = store.getState().dashboard.slots
@@ -1308,7 +1358,7 @@ export default function App() {
       const currentAgent = currentSlot?.agent || defaultAgent
       const idx = installedAgents.findIndex((a: { name: string }) => a.name === currentAgent)
       const prevIdx = (idx - 1 + installedAgents.length) % installedAgents.length
-      api.chatSlotAgent(activeSlot, installedAgents[prevIdx].name)
+      switchActiveSlotAgent(activeSlot, installedAgents[prevIdx].name)
     },
     onCycleReasoningEffort: () => {
       const activeSlot = store.getState().chat.activeSlot
@@ -1386,32 +1436,79 @@ export default function App() {
   // credits_covered on top — that double-counts the in-plan portion and is the
   // bug that rendered a capped 10K plan as "20.0K". Returns null until the
   // background cache warms.
-  const { data: kiroUsage } = useQuery({
+  //
+  // `isError` is read alongside `data` because `data` alone cannot tell "the
+  // backend cache has not warmed yet" (null) apart from "the request failed"
+  // (undefined) — both are falsy. Without it a failing endpoint renders as a
+  // spinner that never resolves, since the 30s refetch keeps retrying forever.
+  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | null>({
     queryKey: ['kiro-usage'],
     queryFn: () => api.sessionsUsage().then(d => {
-      const u = d?.usage || {}
+      const u: KiroUsagePayload = d?.usage || {}
       // Kiro credit plan (internal) — the only usage this pill surfaces.
       // Number.isFinite guards against a stray NaN ever rendering as "NaN / NaN".
-      if (Number.isFinite(u.credits_plan)) {
+      if (typeof u.credits_plan === 'number' && Number.isFinite(u.credits_plan)) {
         const limit = Math.round(u.credits_plan)
         // credits_used is the real total (backend sets it to covered + overage);
         // fall back to 0 (not the limit) when the source omits it, so a partial
         // payload never implies a maxed plan.
-        const used = Number.isFinite(u.credits_used) ? Math.round(u.credits_used) : 0
-        const overage = Number.isFinite(u.credits_overage) ? u.credits_overage : Math.max(0, used - limit)
-        // Bonus / welcome-credit pool (spent before the plan). Present only when
-        // the backend surfaced it; when absent the pill/modal behave exactly as
-        // before (plan-only).
-        const bonus = (Number.isFinite(u.bonus_limit) && u.bonus_limit > 0)
-          ? {
-              used: Number.isFinite(u.bonus_used) ? Math.round(u.bonus_used) : 0,
-              limit: Math.round(u.bonus_limit),
-              label: (typeof u.bonus_label === 'string' && u.bonus_label) ? u.bonus_label : i18nT('app.bonus_credits'),
-              expiresLabel: typeof u.bonus_expires_label === 'string' ? u.bonus_expires_label : undefined,
-            }
-          : undefined
+        const used = typeof u.credits_used === 'number' && Number.isFinite(u.credits_used)
+          ? Math.round(u.credits_used)
+          : 0
+        const overage = typeof u.credits_overage === 'number' && Number.isFinite(u.credits_overage)
+          ? u.credits_overage
+          : Math.max(0, used - limit)
+        // Bonus grants come from untrusted CLI output. Validate every field so
+        // one malformed grant cannot poison the readout or account panel.
+        const bonusCredits = Array.isArray(u.bonus_credits)
+          ? u.bonus_credits.flatMap(grant => {
+              if (
+                !grant
+                || typeof grant.name !== 'string'
+                || !grant.name
+                || grant.name.length > MAX_KIRO_BONUS_GRANT_NAME_CHARS
+                || typeof grant.used !== 'number'
+                || !Number.isFinite(grant.used)
+                || grant.used < 0
+                || grant.used > MAX_KIRO_BONUS_CREDITS
+                || typeof grant.total !== 'number'
+                || !Number.isFinite(grant.total)
+                || grant.total <= 0
+                || grant.total > MAX_KIRO_BONUS_CREDITS
+                || (grant.days_left !== undefined
+                  && (typeof grant.days_left !== 'number'
+                    || !Number.isFinite(grant.days_left)
+                    || grant.days_left < 0
+                    || grant.days_left > MAX_KIRO_BONUS_DAYS_LEFT))
+              ) return []
+              return [{
+                name: grant.name,
+                used: grant.used,
+                total: grant.total,
+                daysLeft: grant.days_left,
+              }]
+            })
+          : []
         const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined)
-        return { used, limit, overage, resets: u.resets, plan: u.plan, costUsd: u.cost_usd, overageRate: u.overage_rate, bonus, stale: u.stale === true, account: str(u.account), email: str(u.email), accountType: str(u.account_type), startUrl: str(u.start_url) }
+        const parsedOverageRate = typeof u.overage_rate === 'number'
+          ? u.overage_rate
+          : Number.parseFloat(u.overage_rate ?? '')
+        const normalized: KiroCreditUsage = {
+          used,
+          limit,
+          overage,
+          resets: u.resets,
+          plan: u.plan,
+          costUsd: u.cost_usd,
+          overageRate: Number.isFinite(parsedOverageRate) ? parsedOverageRate : undefined,
+          bonusCredits,
+          stale: u.stale === true,
+          account: str(u.account),
+          email: str(u.email),
+          accountType: str(u.account_type),
+          startUrl: str(u.start_url),
+        }
+        return normalized
       }
       // Non-Kiro provider (kiro-cli absent) -> hide. Empty cache (Kiro warming) -> spinner.
       if (u.available === false) return 'none' as const
@@ -1424,6 +1521,13 @@ export default function App() {
   useEffect(() => {
     if (kiroUsage === 'none') setKiroUsageOpen(false)
   }, [kiroUsage])
+  // ONE derivation feeds both the capsule segment and the account modal, so the
+  // drill-in can never report a different state from the pill that opened it —
+  // the modal spinning on "checking account" behind a pill that already says
+  // "unavailable" is the same falsy-collapse defect one level down.
+  const kiroUsageState: KiroAccountUsage = kiroUsageFailed && !kiroUsage
+    ? 'failed'
+    : (kiroUsage ?? null)
   const [metricsOpen, setMetricsOpen] = useState(() => localStorage.getItem('mc-topbar-metrics') === '1')
   // Readout capsule collapse: clicking the connection dot folds the capsule
   // down to just the dot; clicking again restores the full readout.
@@ -1614,31 +1718,12 @@ export default function App() {
   useEffect(() => {
     setRailWidth(railWidthFor({ isMobile, collapsed: effectiveCollapsed }))
   }, [isMobile, effectiveCollapsed])
-  const topbarBrandRef = useRef<HTMLDivElement>(null)
-  const topbarActionsRef = useRef<HTMLDivElement>(null)
-  const [topbarSearchLayout, setTopbarSearchLayout] = useState({ gutter: 360, visible: true })
-  useEffect(() => {
-    if (isMobile) return
-    const brand = topbarBrandRef.current
-    const actions = topbarActionsRef.current
-    if (!brand || !actions) return
-    const update = () => {
-      const brandWidth = brand.getBoundingClientRect().width
-      const actionsWidth = actions.getBoundingClientRect().width
-      if (brandWidth <= 0 || actionsWidth <= 0) return
-      const next = calculateTopbarSearchLayout(brandWidth, actionsWidth, window.innerWidth)
-      setTopbarSearchLayout(current => current.gutter === next.gutter && current.visible === next.visible ? current : next)
-    }
-    update()
-    const observer = new ResizeObserver(update)
-    observer.observe(brand)
-    observer.observe(actions)
-    window.addEventListener('resize', update)
-    return () => {
-      observer.disconnect()
-      window.removeEventListener('resize', update)
-    }
-  }, [isMobile])
+  // The header's three grid tracks (see `.topbar` in index.css) size themselves:
+  // the search width is a function of the window, the two side groups split the
+  // remainder, and each group re-lays-out its own contents with a container
+  // query. Nothing measures a cluster any more — the drag-region reporter
+  // addresses the header itself and the layout tests match the group classes, so
+  // the two cluster refs this used to keep are gone with the measurement.
   const closeMobileNav = isMobile ? () => setMobileNavOpen(false) : undefined
   const activePath = location.pathname
   const isChat = activePath === '/chat' || activePath.startsWith('/chat/') || activePath === '/'
@@ -1682,7 +1767,7 @@ export default function App() {
         <Route path="*" element={<Navigate to={initialPopoutPath} replace />} />
       </Routes>
     ) : isEmbed ? (
-      <div className="h-screen w-screen overflow-hidden bg-bg flex flex-col">
+      <div className="h-screen supports-[height:100dvh]:h-dvh w-screen overflow-hidden bg-bg flex flex-col">
         <KiroCrewNavBridge />
         <EmbedTabStrip />
         <div className="flex-1 min-h-0">
@@ -1695,17 +1780,24 @@ export default function App() {
         </div>
       </div>
     ) : (
-    <div className="h-screen w-screen flex flex-col overflow-hidden bg-bg">
+    /* h-dvh (100vh fallback) so the shell tracks the visible viewport on
+       mobile: a 100vh shell extends under the browser's collapsible UI,
+       which hides the bottom row (the chat composer) on phones. */
+    <div className="h-screen supports-[height:100dvh]:h-dvh w-screen flex flex-col overflow-hidden bg-bg">
       {/* Embedded remote panes receive their switcher model from the parent via
           this bridge (option B) — no-op in the top-level dashboard. */}
       <EmbeddedHostBridge />
+      {/* Embedded remote panes report their header's control-free gaps up to the
+          Electron host so it can make the pane title bar draggable — no-op in
+          the top-level dashboard and under a browser host. */}
+      <EmbeddedDragRegionReporter />
       <div className="flex-1 min-h-0 relative">
       {/* Local pane: the native dashboard. Hidden (not unmounted) while a remote
           instance tab is active, so local state/websocket survive the switch. */}
       <div className="absolute inset-0" style={{ display: activeInstanceId === null ? 'block' : 'none' }}>
     <div
       data-testid="dashboard-shell"
-      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
+      className={`relative z-[1] h-full grid ${shellEntered ? '' : 'animate-rise'} overflow-hidden bg-bg ${isMacElectron ? `mac-electron ${macFullscreen ? 'mac-fullscreen' : ''}` : ''} ${isWinElectron ? 'win-electron' : ''} ${isLinuxFramelessElectron ? 'linux-electron' : ''} ${isMobile ? 'grid-cols-[minmax(0,1fr)] grid-rows-[42px_minmax(0,1fr)]' : bottomDock ? 'grid-rows-[42px_minmax(0,1fr)_auto]' : 'grid-rows-[42px_minmax(0,1fr)]'}`}
       // Retire the entrance animation once it has played, so re-showing this
       // pane cannot replay it. Guarded on BOTH the keyframe name and the event
       // target: `animationend` bubbles, and descendants (banners, cards) use
@@ -1715,9 +1807,11 @@ export default function App() {
         if (e.target === e.currentTarget && e.animationName === 'rise') setShellEntered(true)
       }}
       style={{
-        gridTemplateAreas: isMobile ? '"topbar" "content"' : '"topbar topbar topbar" "nav content actbar"',
+        gridTemplateAreas: isMobile ? '"topbar" "content"' : bottomDock ? '"topbar topbar" "nav content" "nav actbar"' : '"topbar topbar topbar" "nav content actbar"',
         ...(!isMobile && {
-          gridTemplateColumns: `${railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr) auto`,
+          gridTemplateColumns: bottomDock
+            ? `${railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr)`
+            : `${railWidthFor({ isMobile, collapsed: effectiveCollapsed })}px minmax(0,1fr) auto`,
           // Transition fires only when the template string itself changes (the
           // collapse toggle) — content-driven resizes of the auto track (e.g.
           // the Activity panel opening) don't alter the value, so keeping this
@@ -1738,52 +1832,107 @@ export default function App() {
 
       {/* Topbar */}
       {/* stable theming hook — see website/docs/theming-contract.md */}
-      <header className="topbar topbar-glass relative flex items-center pl-3 pr-3 z-[45]" style={{ gridArea: 'topbar' }}>
+      <header className="topbar topbar-glass relative pl-2 pr-3 z-[45]" style={{ gridArea: 'topbar' }}>
         {/* Left: mobile menu toggle + inline instance selector. The brand now
             lives in the sidebar (item 1.1). The selector reuses InstanceTabBar's
             visibility rule — it renders nothing unless >=1 remote instance
             exists, so the common single-instance header-left is empty (only the
             macOS traffic-light clearance remains). */}
-        <div
-          ref={topbarBrandRef}
-          className={`relative flex items-center h-full shrink-0 gap-2 ${isMobile ? 'px-2' : ''}`}
-        >
+        {/* No mobile-only `px-2` here on purpose. The icon buttons inside carry
+            their own 8px, so this padding stacked on top of the header's `pl-2`
+            and pushed the hamburger out past the page's own left edge. Dropping
+            it lands the button's BOX at 8 + 8 = 16px, the page gutter; the glyph
+            inside it then needs its own 2.5px correction because `Menu`'s artwork
+            does not fill its box (see the button below). Box and glyph together
+            put the hamburger, the page title and the chat session-list toggle on
+            one line. Deliberately only the LEFT cluster:
+            `.tb-right` carries a padding/negative-margin pair that keeps the
+            notification badge's 4px overhang from being clipped, and re-tuning
+            that needs a real WebKit check, not a local one. */}
+        <div className="tb-left relative h-full">
+          {/* Windows only: the application menu shares this cluster. It needs no
+              width reservation of its own: the identity group is sized by its own
+              grid track, and the menu growing from the hamburger to its six
+              labels therefore consumes the GROUP's width -- which its container
+              query responds to -- instead of eating the centred search's. */}
+          {!isMobile && isWinElectron && <WindowsTitlebarMenu />}
+
           {isMobile && (
             <button className="p-2 rounded-md bg-transparent border-none cursor-pointer text-muted hover:text-text shrink-0" onClick={toggleNav} aria-label={i18nT('app.open_menu')}>
-              <Menu size={20} />
+              {/* `Menu` is the one icon in this app whose artwork does NOT fill its
+                  box: lucide draws its three rules from x=4 in a 24-unit viewBox, and
+                  the round cap adds half a stroke, so 3 units of the box are empty on
+                  the left. At size 20 that is 3 * 20/24 = 2.5px, which put the visible
+                  glyph at 18.5px while the button's box sat correctly on the 16px
+                  gutter -- reading as indented against a card border directly below it.
+                  A transform, not a margin: the box, the hit target and the hover pill
+                  stay on the 8px grid, and no sibling in the cluster shifts. Sized off
+                  the icon's own geometry, which `narrowFirstBaseline.test.ts` re-derives
+                  from lucide so a version bump that recentres `Menu` fails loudly.
+                  Icons that DO fill their box need none of this: the chat session
+                  toggle's `MessageSquare` starts at x=2, i.e. 0.67px at size 16. */}
+              <Menu size={20} className="-translate-x-[2.5px]" />
             </button>
           )}
-          {!isMobile && <InstanceTabBar variant="inline" />}
+          <InstanceTabBar variant="inline" />
         </div>
-        {!isMobile && topbarSearchLayout.visible && (
+        {/* Centre track: the ⌘K trigger. A flow item, not an overlay — its width
+            is the track's width, so it can never sit under a sibling cluster and
+            never has to be dropped to stay clear of one. On mobile the same
+            track holds the icon-only form below. */}
+        {!isMobile && (
           <button
             type="button"
             data-topbar-overlay
             onClick={commandPalette.openPalette}
-            className="absolute h-7 px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-hover transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
-            style={{ left: '50vw', transform: 'translateX(-50%)', width: 'calc(33.3333vw - 40px)', minWidth: TOPBAR_SEARCH_MIN_WIDTH }}
+            className="h-7 w-full px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-hover transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
             aria-label={i18nT('app.search_sessions_files_and_commands')}
             title={i18nT('app.search_everywhere_k')}
           >
             <span className="text-[13px] truncate min-w-0">{i18nT('app.k_search_for_anything')}</span>
           </button>
         )}
+        {/* Mobile centre track: the same trigger in its icon-only form, in the
+            same window-centred track the desktop one uses, so the control does
+            not change place at the breakpoint. A grid child of its own, not a
+            third sibling inside the actions group -- three action controls in one
+            horizontal row is what website/AUTOSDE.yaml's max-two-buttons-per-row
+            forbids. */}
+        {isMobile && (
+          <button
+            type="button"
+            onClick={commandPalette.openPalette}
+            className="h-7 w-7 rounded-md border border-border bg-card text-muted flex items-center justify-center cursor-pointer shrink-0"
+            aria-label={i18nT('app.search_sessions_files_and_commands')}
+            // Not the "(⌘K)" title the desktop trigger carries: this form only
+            // renders below 768px, where advertising a chord to a touch surface
+            // names a gesture the device may have no way to produce.
+            title={i18nT('app.search_sessions_files_and_commands')}
+          >
+            <SearchIcon size={14} />
+          </button>
+        )}
         {/* Theme decoration: the active theme's center top-bar element (e.g. a
             scanner sweep), chosen by resolved mode. Absent unless a registered
-            theme declares one; the flex:1 spacer keeps the actions right-aligned.
-            Wrapped in a slot-level ErrorBoundary (fallback=null) so a faulty
-            registered extension disables only itself instead of crashing the
-            whole shell via the root boundary. */}
+            theme declares one. It renders as a BACKGROUND layer rather than a
+            grid cell: the header's three tracks are load-bearing now (sides are
+            pure remainder), so a fourth flow item would land in an implicit
+            column and shift the search off centre. A sweep/scanline is visually
+            a backdrop anyway, so it is inert to pointers and sits behind the
+            controls. Wrapped in a slot-level ErrorBoundary (fallback=null) so a
+            faulty registered extension disables only itself instead of crashing
+            the whole shell via the root boundary. */}
         {(() => {
           if (branding?.topBarHideOnMobile && isMobile) return null
           const TB = resolvedMode === 'light' ? branding?.topBar?.light : branding?.topBar?.dark
           return TB ? (
             <ErrorBoundary key={`${colorTheme}:${resolvedMode}`} scope="theme-topbar" fallback={null}>
-              <div className="flex-1 min-w-0 h-full"><TB /></div>
+              <div className="absolute inset-0 pointer-events-none overflow-hidden" aria-hidden="true"><TB /></div>
             </ErrorBoundary>
           ) : null
         })()}
-        <div ref={topbarActionsRef} className="flex items-center gap-1.5 relative ml-auto">
+        <div className="tb-right relative">
+
           {/* Theme decoration: extra aside control (e.g. a stardate / clock). */}
           {branding?.topBarAside && !(branding?.topBarHideOnMobile && isMobile) && (
             <ErrorBoundary key={`${colorTheme}:${resolvedMode}`} scope="theme-aside" fallback={null}>
@@ -1842,7 +1991,7 @@ export default function App() {
             if (!capsuleCollapsed) {
             if (!isMobile) {
               if (!metricsOpen) {
-                segments.push(<button key="metrics" className={`${seg} text-muted hover:text-text`} onClick={() => { setMetricsOpen(true); safeSetItem('mc-topbar-metrics', '1') }} title={i18nT('app.system_metrics')} aria-label={i18nT('app.system_metrics')}><AudioWaveform size={12} /></button>)
+                segments.push(<button key="metrics" className={`${seg} text-muted hover:text-text`} onClick={() => { setMetricsOpen(true); safeSetItem('mc-topbar-metrics', '1') }} title={i18nT('app.system_metrics')} aria-label={i18nT('app.system_metrics')} aria-pressed={false}><AudioWaveform size={12} /></button>)
               } else if (!sysMetrics) {
                 if (sysMetricsError) segments.push(<button key="metrics" className={`${seg} text-danger text-[11px]`} title={i18nT('app.click_to_hide')} onClick={() => { setMetricsOpen(false); safeSetItem('mc-topbar-metrics', '0') }}><AudioWaveform size={11} /> {i18nT('app.metrics_unavailable')}</button>)
               } else {
@@ -1854,55 +2003,90 @@ export default function App() {
                 const dskValid = m.diskTotal > 0
                 const cpuValid = typeof m.cpuPct === 'number' && Number.isFinite(m.cpuPct)
                 const staleTitle = sysMetricsStale ? ` ${i18nT('app.stale_fetch_failing')}` : ''
-                segments.push(<button key="metrics" className={`${seg} gap-2 text-[11px] font-mono ${sysMetricsStale ? 'opacity-60' : ''}`} title={sysMetricsStale ? i18nT('app.metrics_are_stale_latest_fetch_failed') : i18nT('app.click_to_hide')} onClick={() => { setMetricsOpen(false); safeSetItem('mc-topbar-metrics', '0') }}>
+                // The container query can collapse this button to a bare icon, and
+                // the per-value tooltips ride on the spans it hides — so the
+                // readings have to live on the BUTTON's own title or they become
+                // unreachable on any window narrow enough to trip the rung.
+                // fmtPercent localizes the digits and the unit, and already
+                // renders a non-finite ratio as an em dash, which is what the
+                // invalid branches would otherwise hand-write.
+                const readings = [
+                  `${i18nT('app.cpu')} ${fmtPercent(cpuValid ? m.cpuPct / 100 : NaN)}`,
+                  `${i18nT('app.mem')} ${fmtPercent(memValid ? memPct : NaN)}`,
+                  `${i18nT('app.dsk')} ${fmtPercent(dskValid ? dskPct : NaN)}`,
+                ].join(' · ')
+                const metricsHint = sysMetricsStale ? i18nT('app.metrics_are_stale_latest_fetch_failed') : i18nT('app.click_to_hide')
+                segments.push(<button key="metrics" className={`${seg} gap-2 text-[11px] font-mono ${sysMetricsStale ? 'opacity-60' : ''}`} title={`${readings} — ${metricsHint}`} aria-pressed={true} onClick={() => { setMetricsOpen(false); safeSetItem('mc-topbar-metrics', '0') }}>
+                  {/* Both forms are rendered and the container query picks one:
+                      the rung has to fire on the GROUP's width, which no JS
+                      branch here can see. Collapsing to the icon (rather than
+                      hiding the button) keeps the toggle reachable. The label is
+                      sr-only rather than an aria-label so it NAMES the control in
+                      both forms without suppressing the readings themselves from
+                      the accessible name — on the narrow rung every visible text
+                      node is display:none, which would otherwise leave an
+                      unnamed icon-only button. */}
+                  <span className="sr-only">{i18nT('app.system_metrics')}</span>
+                  {/* Accent-tinted, unlike the off state's muted icon: collapsed,
+                      the two forms are otherwise the same glyph with the same
+                      name, so clicking the toggle would produce no perceivable
+                      change while still writing the preference. `aria-pressed`
+                      carries the same distinction to assistive tech. */}
+                  <AudioWaveform size={12} className="tb-narrow-only text-accent" />
+                  <span className="tb-drop-metrics flex items-center gap-2">
                   <span className={cpuValid ? metricColor(m.cpuPct / 100) : 'text-muted'} title={cpuValid ? `CPU: ${m.cpuPct.toFixed(0)}%${staleTitle}` : i18nT('app.cpu_unavailable')}>{i18nT('app.cpu')} {cpuValid ? `${m.cpuPct.toFixed(0)}%` : '—'}</span>
                   <span className={memValid ? metricColor(memPct) : 'text-muted'} title={memValid ? `Memory: ${m.memUsed.toFixed(1)}/${m.memTotal.toFixed(1)} GB${staleTitle}` : i18nT('app.memory_unavailable')}>{i18nT('app.mem')} {memValid ? `${(memPct * 100).toFixed(0)}%` : '—'}</span>
                   <span className={dskValid ? metricColor(dskPct) : 'text-muted'} title={dskValid ? `Disk: ${dskUsed.toFixed(0)}/${m.diskTotal.toFixed(0)} GB${staleTitle}` : i18nT('app.disk_unavailable')}>{i18nT('app.dsk')} {dskValid ? `${(dskPct * 100).toFixed(0)}%` : '—'}</span>
+                  </span>
                 </button>)
               }
             }
+            // Mobile: show metrics as a passive readout (not a button) when the
+            // capsule is expanded and data is available. No independent toggle —
+            // visibility is tied to the capsule expand/collapse state.
+            if (isMobile && sysMetrics) {
+              const m = sysMetrics
+              const memPct = m.memTotal > 0 ? m.memUsed / m.memTotal : 0
+              const dskUsed = m.diskTotal - m.diskFree
+              const dskPct = m.diskTotal > 0 ? dskUsed / m.diskTotal : 0
+              const cpuValid = typeof m.cpuPct === 'number' && Number.isFinite(m.cpuPct)
+              const memValid = m.memTotal > 0
+              const dskValid = m.diskTotal > 0
+              segments.push(<span key="metrics-mobile" className={`${seg} gap-2 text-[11px] font-mono tabular-nums`} aria-label={i18nT('app.system_metrics')}>
+                <span className={cpuValid ? metricColor(m.cpuPct / 100) : 'text-muted'}>{i18nT('app.cpu')} {cpuValid ? fmtPercent(m.cpuPct / 100) : '\u2014'}</span>
+                <span className={memValid ? metricColor(memPct) : 'text-muted'}>{i18nT('app.mem')} {memValid ? fmtPercent(memPct) : '\u2014'}</span>
+                <span className={dskValid ? metricColor(dskPct) : 'text-muted'}>{i18nT('app.dsk')} {dskValid ? fmtPercent(dskPct) : '\u2014'}</span>
+              </span>)
+            }
             // Usage segment — Kiro credit plan from KiroCrew's own usage
-            // cache. Spinner while the cache warms; hidden when unavailable.
-            if (kiroUsage !== 'none') {
-              if (!kiroUsage) {
+            // cache. Spinner while the cache warms, a dash when the fetch
+            // failed, hidden when the provider has no credit plan at all.
+            if (kiroUsageState !== 'none') {
+              if (kiroUsageState === 'failed') {
+                // Failed with nothing cached to fall back on. A dash says that;
+                // a spinner would claim a fetch is still in flight. A failure
+                // that arrives while a prior value is held keeps that value —
+                // the payload's own `stale` flag dims it instead.
+                //
+                // The dash renders on mobile too, where the reading and the
+                // spinner are both dropped: without it the failed and warming
+                // states are one coin glyph apart in opacity alone.
+                segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_unavailable')} aria-label={i18nT('app.kiro_credit_usage_unavailable')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+              } else if (!kiroUsageState) {
                 segments.push(<button key="usage" className={`${seg} text-muted`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_checking')} aria-label={i18nT('app.kiro_credit_usage_checking_2')}><Coins size={12} /> {!isMobile && <Loader2 size={11} className="animate-spin" />}</button>)
               } else {
-                // Pool the plan and any bonus/welcome credits into one total so
-                // the pill reflects what the user is actually spending (bonus is
-                // drawn down first). fmtK renders 1000 -> "1K" and 1500 -> "1.5K"
-                // (the old toFixed(0) turned 1.5K into a misleading "2K").
-                const totalUsed = kiroUsage.used + (kiroUsage.bonus ? kiroUsage.bonus.used : 0)
-                const totalLimit = kiroUsage.limit + (kiroUsage.bonus ? kiroUsage.bonus.limit : 0)
-                const pct = totalLimit > 0 ? (totalUsed / totalLimit) * 100 : 0
-                // `fmtCompact`, not a `/1000 + 'K'` ladder: de has no short form at
-                // these magnitudes and renders `447.500`, zh abbreviates on 万 as
-                // `44.8万`. English is unchanged (`447.5K`). German is therefore
-                // WIDER than before — that is CLDR's answer for the language, not a
-                // bug, so the pill is kept nowrap so it can never break mid-number.
-                const fmtK = (n: number) => fmtCompact(n)
-                const usedStr = fmtK(totalUsed)
-                const limitStr = fmtK(totalLimit)
-                // Two whole-sentence keys rather than a base string plus an
-                // appended bonus clause: the bonus phrase carries its own
-                // grammar and word order, so concatenating it would strand the
-                // translator with a fragment.
-                const title = kiroUsage.bonus
-                  ? i18nT('app.kiro_credits_title_with_bonus', {
-                    used: fmtNumber(totalUsed),
-                    limit: fmtNumber(totalLimit),
-                    planUsed: fmtNumber(kiroUsage.used),
-                    planLimit: fmtNumber(kiroUsage.limit),
-                    bonusLabel: kiroUsage.bonus.label,
-                    bonusUsed: fmtNumber(kiroUsage.bonus.used),
-                    bonusLimit: fmtNumber(kiroUsage.bonus.limit),
-                  })
-                  : i18nT('app.kiro_credits_title', {
-                    used: fmtNumber(totalUsed),
-                    limit: fmtNumber(totalLimit),
-                    pct: fmtPercent(pct / 100),
-                  })
-                segments.push(<button key="usage" className={kiroUsage.stale ? `${seg} opacity-60` : seg} onClick={() => setKiroUsageOpen(true)} title={title} aria-label={title}>
-                  <Coins size={12} /> {!isMobile && <span className="font-mono text-[11px] whitespace-nowrap tabular-nums">{usedStr}<span className="text-muted">/{limitStr}</span></span>}
+                // Pool every bonus grant into the compact readout. Bonus is
+                // drawn down before the plan, so excluding it looks like a
+                // frozen counter while promotional credits are active.
+                const bonusUsed = kiroUsageState.bonusCredits.reduce((sum, grant) => sum + grant.used, 0)
+                const bonusLimit = kiroUsageState.bonusCredits.reduce((sum, grant) => sum + grant.total, 0)
+                const totalUsed = kiroUsageState.used + bonusUsed
+                const totalLimit = kiroUsageState.limit + bonusLimit
+                const usedStr = fmtCompact(totalUsed)
+                const limitStr = fmtCompact(totalLimit)
+                const title = i18nT('components.kiroAccountModal.kiro_credit_usage')
+                segments.push(<button key="usage" className={kiroUsageState.stale ? `${seg} opacity-60` : seg} onClick={() => setKiroUsageOpen(true)} title={title} aria-label={title}>
+                  <Coins size={12} /> {!isMobile && <span className="tb-drop-usage font-mono text-[11px] whitespace-nowrap tabular-nums">{usedStr}<span className="text-muted">/{limitStr}</span></span>}
                 </button>)
               }
             }
@@ -1936,7 +2120,7 @@ export default function App() {
               <motion.div
                 layout
                 transition={{ layout: { duration: capsuleLayoutPulse ? 0.25 : 0, ease: 'easeOut' } }}
-                className={`flex items-center gap-2 h-7 px-2.5 rounded-xl transition-colors duration-300 ${offline ? 'bg-danger-subtle' : 'bg-card'}`}
+                className={`tb-capsule flex items-center gap-2 h-7 px-2.5 rounded-xl transition-colors duration-300 ${offline ? 'bg-danger-subtle' : 'bg-card'}`}
               >
                 {segments.flatMap((s, i) => (i === 0 ? [s] : [<span key={`sep-${i}`} className="w-px h-3.5 bg-border shrink-0" aria-hidden="true" />, s]))}
               </motion.div>
@@ -1957,10 +2141,12 @@ export default function App() {
               bordered pill (28px tall, 12px radius), separated from the readout
               capsule (item 2.3). */}
           {!isMobile && (
-            <FeedbackPill
-              onRequestFeature={requestFeature}
-              onReportProblem={() => setReportProblemOpen(true)}
-            />
+            <span className="tb-drop-feedback flex items-center">
+              <FeedbackPill
+                onRequestFeature={requestFeature}
+                onReportProblem={() => setReportProblemOpen(true)}
+              />
+            </span>
           )}
           {/* Notifications bell — borderless icon button, rightmost control.
               (The activity-panel open toggle now lives in the session header,
@@ -1969,6 +2155,13 @@ export default function App() {
           <NotificationsBellButton />
         </div>
       </header>
+
+      {agentSwitchNotice && (
+        <div role="status" className="fixed z-[70] top-14 left-4 right-4 sm:left-auto sm:w-[440px] bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 shadow-xl animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--warn) 45%, transparent)' }}>
+          <span className="text-sm text-text flex-1">{agentSwitchNotice.message}</span>
+          <button onClick={() => dispatch(setAgentSwitchNotice(null))} aria-label={i18nT('app.dismiss')} className="text-muted hover:text-text leading-none p-0.5"><X className="lucide-inline w-4 h-4" /></button>
+        </div>
+      )}
 
       {/* Report a Problem — mounted by the nav rail's "Report issue" link. */}
       <ReportProblemModal open={reportProblemOpen} onClose={() => setReportProblemOpen(false)} />
@@ -2220,7 +2413,7 @@ export default function App() {
           </div>
           {/* Hairline under the expanded header (collapsed rail has none —
               the big logo alone separates well). */}
-          {!effectiveCollapsed && <div aria-hidden="true" className="h-px bg-border shrink-0 mt-0.5 mb-[7px]" />}
+          {!effectiveCollapsed && <div aria-hidden="true" className="h-px bg-border shrink-0 mb-[7px]" />}
           {advertisedNavItems.filter(n => n.group === 'Main').map(n => <div key={n.id}>{renderNavRow(n)}</div>)}
           {/* Apps section header. "Explore" (the App Store) rides the header
               row in accent when expanded; collapsed it becomes a regular
@@ -2378,7 +2571,7 @@ export default function App() {
                   /* While popped out: focus only (a refused programmatic
                      focus is a harmless no-op). Explicit re-dock lives in the
                      TerminalDetachedBar below -- never a timing heuristic. */
-                  onClickOverride={() => { if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal() }}
+                  onClickOverride={() => { if (terminalPoppedOut) focusTerminalPopout(); else toggleBottomTerminal(activeSlotProject) }}
                 />
               )}
               <div>{renderNavRow(cap)}</div>
@@ -2441,7 +2634,7 @@ export default function App() {
                   alone names no target. Hidden while the rail is collapsed (folds
                   away via max-height so the collapse stays smooth). */}
               <div {...(effectiveCollapsed ? { inert: '' } : {})} className={`overflow-hidden transition-all duration-200 ${effectiveCollapsed ? 'max-h-0 opacity-0' : 'max-h-16 opacity-100 mt-1'}`}>
-                <div className="flex items-center border-t border-border-strong pl-3 pr-0.5 pt-2.5 pb-0.5 whitespace-nowrap">
+                <div className="flex items-center border-t border-border pl-3 pr-0.5 pt-2.5 pb-0.5 whitespace-nowrap">
                   {/* pl-3 puts the mark on the same 12px x-offset as the
                       nav-item icons above. No `gap` on this row ON PURPOSE: a row
                       gap applies between ALL THREE children (mark, links,
@@ -2473,13 +2666,20 @@ export default function App() {
         return isMobile ? (
           <AnimatePresence>
             {mobileNavOpen && (
+              /* mt-2, unlike the desktop rail's mt-0: this form is `fixed` to the
+                 VIEWPORT top rather than sitting in the grid row below the
+                 topbar, so mt-0 pressed the card's rounded top edge flat against
+                 the screen while mx-2/mb-2 inset the other three sides. Matching
+                 the 8px inset on all four keeps the drawer reading as one
+                 floating card. `top-0 bottom-0` with both margins resolves the
+                 height to viewport-16px, so nothing is clipped. */
               <motion.nav
                 key="mobile-nav-drawer"
                 initial={{ x: -240 }}
                 animate={{ width: 220, x: 0 }}
                 exit={{ x: -240 }}
                 transition={{ duration: 0.25, ease: [0.32, 0.72, 0, 1] }}
-                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-0 mb-2 shadow-sm z-50 overflow-hidden fixed top-0 left-0 bottom-0"
+                className="bg-bg-elevated border border-border rounded-xl flex flex-col mx-2 mt-2 mb-2 shadow-sm z-50 overflow-hidden fixed top-0 left-0 bottom-0"
                 role="navigation"
                 aria-label={i18nT('app.main_navigation')}
               >
@@ -2501,6 +2701,7 @@ export default function App() {
 
       {/* Content */}
       <div className="flex flex-col min-h-0 min-w-0" style={{ gridArea: 'content' }}>
+        <div className={`flex min-h-0 min-w-0 flex-1 ${terminalPosition === 'right' ? 'flex-row' : 'flex-col'}`}>
         <main id="main-content" tabIndex={-1} className={`flex flex-col min-h-0 min-w-0 flex-1 overflow-x-hidden ${needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'}`}>
           <MigrationCheck />
           <Routes>
@@ -2539,10 +2740,12 @@ export default function App() {
             <Route path="*" element={<ChatRedirect />} />
           </Routes>
         </main>
-        {/* App-wide docked terminal panel — spans every route, below <main>.
-            Toggled from the sidebar Terminal icon; hosts app-wide
-            shells. Distinct from the chat-scoped activity-bar terminal tabs. */}
-        {terminalEnabled && (terminalPoppedOut ? <TerminalDetachedBar /> : <BottomTerminalPanel />)}
+        {/* App-wide docked terminal panel — renders beside <main> (right) or
+            below it (bottom). The detached bar (popped-out state) always renders
+            below the flex wrapper as a full-width strip regardless of position. */}
+        {terminalEnabled && !terminalPoppedOut && <BottomTerminalPanel />}
+        </div>{/* /flex-row or flex-col wrapper */}
+        {terminalEnabled && terminalPoppedOut && <TerminalDetachedBar />}
 
         {/* Self-managed floating panels: lifecycle-driven (hidden → small → chip),
             not motion.* children, so they live outside AnimatePresence. The browse
@@ -2560,113 +2763,7 @@ export default function App() {
     )}
     </WsContext.Provider>
     {shortcutsOpen && <ShortcutsModal onClose={() => setShortcutsOpen(false)} />}
-    <Modal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} title={<span className="flex items-center gap-2"><Coins size={16} /> {i18nT('app.kiro_credits')}</span>} maxWidth={460}>
-      {!kiroUsage || kiroUsage === 'none' ? (
-        <div className="flex items-center gap-2 text-sm text-muted py-4">
-          <Loader2 size={14} className="animate-spin shrink-0" />
-          <span>{i18nT('app.checking_usage_running')} <code className="font-mono">{i18nT('app.kiro_cli_usage')}</code>…</span>
-        </div>
-      ) : (() => {
-        const bonus = kiroUsage.bonus
-        const totalUsed = kiroUsage.used + (bonus ? bonus.used : 0)
-        const totalLimit = kiroUsage.limit + (bonus ? bonus.limit : 0)
-        const pct = totalLimit > 0 ? (totalUsed / totalLimit) * 100 : 0
-        const planPct = kiroUsage.limit > 0 ? (kiroUsage.used / kiroUsage.limit) * 100 : 0
-        const bonusPct = bonus && bonus.limit > 0 ? (bonus.used / bonus.limit) * 100 : 0
-        const barColor = 'var(--accent)'
-        const Row = ({ label, value }: { label: string; value: React.ReactNode }) => (
-          <div className="flex justify-between items-baseline py-1.5 border-b" style={{ borderColor: 'var(--border)' }}>
-            <span className="text-[12px] text-muted">{label}</span>
-            <span className="text-[13px] font-medium text-text">{value}</span>
-          </div>
-        )
-        // One pool card (bonus or plan) with its own mini progress bar. Used
-        // only when a bonus pool exists, so the plan-only modal is unchanged.
-        const Pool = ({ name, used, limit, poolPct, color, meta }: { name: string; used: number; limit: number; poolPct: number; color: string; meta?: React.ReactNode }) => (
-          <div className="rounded-lg border p-2.5" style={{ borderColor: 'var(--border)' }}>
-            <div className="flex items-baseline gap-2">
-              <span className="flex items-center gap-1.5 text-[13px] font-medium text-text">
-                <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: color }} />{name}
-              </span>
-              <span className="ml-auto font-mono text-[12px] text-text">{fmtNumber(used)}<span className="text-muted">/{fmtNumber(limit)}</span></span>
-            </div>
-            <div className="w-full h-1.5 rounded-full overflow-hidden mt-2" style={{ background: 'var(--border)' }}>
-              <div className="h-full rounded-full" style={{ width: `${Math.min(poolPct, 100)}%`, background: color }} />
-            </div>
-            {meta && <div className="text-[11px] text-muted mt-1.5">{meta}</div>}
-          </div>
-        )
-        // Sign-in description shown under the identity: account type + issuer
-        // host ("IAM Identity Center · amzn.awsapps.com"). Collapses gracefully
-        // when either half is missing.
-        // kiro-cli distinguishes four auth kinds (social | idc | builderId |
-        // external_idp); social login covers Google/GitHub and reports
-        // accountType "Social". Unmapped values pass through verbatim rather
-        // than being hidden, so a new kind still says something truthful.
-        const acctKind = kiroUsage.accountType === 'IamIdentityCenter' ? i18nT('app.iam_identity_center')
-          : kiroUsage.accountType === 'BuilderId' ? i18nT('app.builder_id')
-          : kiroUsage.accountType === 'Social' ? i18nT('app.social_login')
-          : kiroUsage.accountType
-        let issuerHost: string | undefined
-        if (kiroUsage.startUrl) { try { issuerHost = new URL(kiroUsage.startUrl).host } catch { issuerHost = undefined } }
-        const signedInWith = [acctKind, issuerHost].filter(Boolean).join(' · ')
-        // Identity line prefers the real email; the org profile name is only a
-        // fallback for accounts where whoami gave us nothing.
-        const who = kiroUsage.email || kiroUsage.account
-        return (
-          <div className="flex flex-col gap-3">
-            {who && (
-              <div className="flex items-center gap-3 pb-3" style={{ borderBottom: '1px solid var(--border)' }}>
-                <div
-                  className="shrink-0 rounded-full flex items-center justify-center text-[15px] font-semibold uppercase"
-                  style={{ width: 40, height: 40, background: 'var(--accent)', color: '#fff' }}
-                  aria-hidden="true"
-                >
-                  {who.slice(0, 1)}
-                </div>
-                <div className="min-w-0">
-                  <div className="text-[15px] font-medium text-text truncate" title={who}>{who}</div>
-                  {signedInWith && <div className="text-[12px] text-muted break-words" title={signedInWith}>{i18nT('app.signed_in_with', { provider: signedInWith })}</div>}
-                </div>
-              </div>
-            )}
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-text">{fmtNumber(totalUsed)}</span>
-              <span className="text-sm text-muted">/ {fmtNumber(totalLimit)} {bonus ? i18nT('app.credits_total') : i18nT('app.credits')}</span>
-              <span className="ml-auto text-[12px] font-medium px-2 py-0.5 rounded-md" style={{ background: barColor, color: '#fff' }}>{fmtPercent(pct / 100)}</span>
-            </div>
-            <div className="w-full h-2 rounded-full overflow-hidden" style={{ background: 'var(--border)' }}>
-              <div className="h-full rounded-full transition-all" style={{ width: `${Math.min(pct, 100)}%`, background: barColor }} />
-            </div>
-            {bonus && (
-              <div className="flex flex-col gap-2">
-                <div className="text-[11px] uppercase tracking-wide text-muted mt-1">{i18nT('app.breakdown')}</div>
-                <Pool name={bonus.label} used={bonus.used} limit={bonus.limit} poolPct={bonusPct} color="var(--warn)" meta={bonus.expiresLabel} />
-                <Pool name={kiroUsage.plan || i18nT('app.plan')} used={kiroUsage.used} limit={kiroUsage.limit} poolPct={planPct} color="var(--accent)" meta={kiroUsage.resets ? `${i18nT('app.resets')} ${kiroUsage.resets}` : undefined} />
-              </div>
-            )}
-            <div className="mt-1">
-              {!bonus && kiroUsage.plan && <Row label={i18nT('app.plan')} value={kiroUsage.plan} />}
-              {!bonus && kiroUsage.resets && <Row label={i18nT('app.resets')} value={kiroUsage.resets} />}
-              <Row label={i18nT('app.overage_used')} value={`${fmtNumber(kiroUsage.overage)} credits`} />
-              {kiroUsage.overageRate && <Row label={i18nT('app.overage_rate')} value={`$${kiroUsage.overageRate} / credit`} />}
-              {kiroUsage.costUsd != null && <Row label={i18nT('app.est_overage_cost')} value={`$${kiroUsage.costUsd.toFixed(2)} USD`} />}
-            </div>
-            <p className="text-[11px] text-muted leading-relaxed mt-1">
-              {i18nT('app.monthly_kiro_credit_usage_from')} <code className="font-mono">{i18nT('app.kiro_cli_usage')}</code> {i18nT('app.across_chat_agents_mcp_and_subagents')}
-            </p>
-            <a
-              href="https://app.kiro.dev/settings/account"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-[12px] text-accent hover:underline mt-1 self-start"
-            >
-              {i18nT('app.manage_account')} <ExternalLink size={12} />
-            </a>
-          </div>
-        )
-      })()}
-    </Modal>
+    <KiroAccountModal open={kiroUsageOpen} onClose={() => setKiroUsageOpen(false)} usage={kiroUsageState} />
     <CommandPalette
       open={commandPalette.open}
       onClose={commandPalette.close}

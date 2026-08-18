@@ -183,6 +183,8 @@ _AGENT_DENIED_ENV_KEYS: list[str] = [
     "MICROSOFT_APP_PASSWORD",
     "MICROSOFT_APP_TENANT_ID",
     "WEIXIN_TOKEN",
+    "JIRA_API_TOKEN",
+    "JIRA_TOKEN_",
     "KIROCREW_OWNER_ID",
 ]
 
@@ -236,6 +238,12 @@ _WARM_JOIN_TIMEOUT_SECS = 2.0
 # reported transient forever — still gets told which sysctl to raise.
 _PROBE_STEP_NEWUSER = "unshare(CLONE_NEWUSER)"
 _PROBE_STEP_NEWNS = "unshare(CLONE_NEWNS)"
+#: Wire step the probe child sends INSTEAD of "U" when its ``CLONE_NEWUSER`` EINVAL
+#: is explained by the child having been multithreaded, carrying the thread count.
+#: The parent classifies it exactly as it classifies a plain EINVAL -- the step
+#: exists to carry the explanation, not to change the verdict. See
+#: ``_probe_child_thread_count``.
+_PROBE_STEP_MULTITHREADED = "M"
 
 # A probe child that vanished mid-handshake is a harness failure, not a kernel
 # verdict, so it must not be cached as "this host has no sandbox". Kept separate
@@ -397,6 +405,76 @@ def _close_probe_fds(*fds: int) -> None:
             pass
 
 
+_PROBE_CHILD_FD_SWEEP_CAP = 4096
+"""Fallback bound for the probe child's inherited-fd close sweep.
+
+Used only when ``SC_OPEN_MAX`` cannot be read or answers nonsense. When
+sysconf answers, its value (the soft ``RLIMIT_NOFILE``) is trusted as the
+bound: ``os.closerange`` delegates to ``close_range(2)`` on Linux >= 5.9, so
+a wide span costs one syscall rather than a walk, and silently clamping the
+bound would leave a high-numbered lock fd open with no diagnostic that the
+sweep came up short.
+"""
+
+
+def _fd_sweep_ranges(
+    keep: frozenset[int], limit: int | None = None
+) -> tuple[tuple[int, int], ...]:
+    """Precompute the ``os.closerange`` spans covering ``[0, bound)`` minus *keep*.
+
+    Runs in the PARENT, before ``os.fork()``. The probe child of a threaded
+    process must not allocate or take locks — another thread may own the
+    allocator lock at fork time and vanish, leaving it held forever in the
+    child — so everything that sorts, boxes, or asks ``sysconf`` happens here,
+    and the child is left executing bare ``closerange`` syscalls over the
+    returned pairs (:func:`_close_fd_ranges`).
+
+    The bound is ``SC_OPEN_MAX`` (the soft ``RLIMIT_NOFILE``);
+    :data:`_PROBE_CHILD_FD_SWEEP_CAP` applies only when sysconf cannot answer.
+    ``limit`` exists for tests. Never raises.
+    """
+    if limit is None:
+        try:
+            limit = int(os.sysconf("SC_OPEN_MAX"))
+        except (AttributeError, OSError, ValueError):
+            # AttributeError: os.sysconf does not exist off-POSIX (Windows);
+            # the sweep only runs on Linux, but this helper must keep its
+            # never-raises contract everywhere the tests exercise it.
+            limit = _PROBE_CHILD_FD_SWEEP_CAP
+    if limit <= 0:
+        limit = _PROBE_CHILD_FD_SWEEP_CAP
+    ranges: list[tuple[int, int]] = []
+    low = 0
+    for fd in sorted(k for k in keep if k >= 0):
+        if fd >= limit:
+            break
+        if fd > low:
+            ranges.append((low, fd))
+        low = fd + 1
+    if low < limit:
+        ranges.append((low, limit))
+    return tuple(ranges)
+
+
+def _close_fd_ranges(ranges: tuple[tuple[int, int], ...]) -> None:
+    """Close the precomputed fd spans: the probe child's half of the sweep.
+
+    Runs between ``os.fork()`` and ``os._exit`` in a child that never execs,
+    so ``O_CLOEXEC`` never fires and every inherited descriptor — the
+    ``gateway.lock`` flock fd and the dashboard listen socket included — is
+    still open. Without the sweep, a probe child orphaned by its parent's
+    death (gateway OOM-killed between fork and reap) keeps the lock fd open
+    and pins the data home until someone reclaims it.
+
+    Only ``os.closerange`` is invoked here: the spans were computed pre-fork
+    by :func:`_fd_sweep_ranges` precisely so this post-fork path does no
+    allocation-bearing work beyond iterating a ready tuple. ``closerange``
+    ignores bad fds, so this never raises.
+    """
+    for low, high in ranges:
+        os.closerange(low, high)
+
+
 def _probe_failure(label: str, err: int) -> tuple[bool, bool, str, str]:
     """Shape one failed probe step into ``(ok, transient, reason)``.
 
@@ -444,6 +522,40 @@ def _probe_child_unshare(libc: ctypes.CDLL, flags: int) -> int:
     if libc.unshare(flags) == 0:
         return 0
     return ctypes.get_errno() or errno.EPERM
+
+
+def _probe_child_thread_count() -> int:
+    """Live threads in the probe child, or 0 when it cannot be determined.
+
+    ``unshare(CLONE_NEWUSER)`` implies ``CLONE_THREAD``, which the kernel refuses
+    with **EINVAL** unless the caller's thread group holds exactly one task. A
+    ``fork()`` child is single-threaded by construction, so this normally reads 1 --
+    but ``os.register_at_fork`` handlers run INSIDE ``os.fork()``, before it
+    returns, and a library can start a thread there. OpenTelemetry's metric SDK does
+    exactly that: its ``PeriodicExportingMetricReader`` registers an
+    ``after_in_child`` hook that restarts its exporter thread in every child.
+
+    Used ONLY to explain an EINVAL, never to reclassify one. EINVAL is genuinely
+    ambiguous here -- a kernel built without ``CONFIG_USER_NS`` returns it too, and a
+    multithreaded child cannot tell the two apart, because it never gets far enough to
+    ask. Calling it transient would be just as wrong as calling it permanent, and it
+    would additionally withhold the ``no_backend`` opt-in (``sandbox_allow_unsandboxed_exec``)
+    from a host that really has no user namespaces. So the classification stays exactly
+    as it was and the REASON names the thread, which is the part a reader cannot infer:
+    a bare "errno 22 (EINVAL)" sends them to check their kernel config, which is the
+    wrong place. Making such a process probe successfully needs a single-threaded
+    child, i.e. a different spawn mechanism, and that is its own change.
+
+    ``st_nlink`` of ``/proc/self/task`` is ``2 + threads`` (each thread is a
+    subdirectory), so this is one ``stat`` and no list: the probe child of a threaded
+    process must not allocate, because another thread may have owned the allocator lock
+    at fork time and no longer exists to release it. Linux-only, like the rest of the
+    probe.
+    """
+    try:
+        return max(0, os.stat("/proc/self/task").st_nlink - 2)
+    except OSError:
+        return 0
 
 
 def _probe_write_identity_maps(pid: int, uid: int, gid: int) -> tuple[str, int] | None:
@@ -556,16 +668,35 @@ def _probe_reap(pid: int) -> None:
 
 
 def _probe_child_sequence(
-    libc: ctypes.CDLL, c2p_r: int, c2p_w: int, p2c_r: int, p2c_w: int
+    libc: ctypes.CDLL,
+    c2p_r: int,
+    c2p_w: int,
+    p2c_r: int,
+    p2c_w: int,
+    sweep_ranges: tuple[tuple[int, int], ...],
 ) -> None:
     """Probe child: run the launcher's two unshare steps, reporting each on the pipe.
 
     Never returns. It reports raw errnos and classifies nothing, so the entire
     verdict lives in the parent where a test can drive it without forking.
+    ``sweep_ranges`` was computed pre-fork by :func:`_fd_sweep_ranges` so this
+    path performs no allocation-bearing bookkeeping of its own.
     """
     try:
         _close_probe_fds(c2p_r, p2c_w)
+        # Drop every other inherited descriptor before touching namespaces:
+        # an orphaned probe child must not keep the gateway.lock fd (or the
+        # dashboard listen socket) open and pin the home. Only the handshake
+        # ends and the standard streams survive. (#3150)
+        _close_fd_ranges(sweep_ranges)
+        # Read BEFORE the unshare: it is the only moment the count is the one the
+        # kernel judged. Reported only alongside an EINVAL, and only to explain it --
+        # see _probe_child_thread_count for why it must not change the verdict.
+        threads = _probe_child_thread_count()
         err = _probe_child_unshare(libc, _CLONE_NEWUSER)
+        if err == errno.EINVAL and threads > 1:
+            os.write(c2p_w, b"M:%d\n" % threads)
+            os._exit(0)
         os.write(c2p_w, b"U:%d\n" % err)
         if err:
             os._exit(0)
@@ -588,6 +719,20 @@ def _probe_parent_sequence(
         death = _probe_child_death(pid)
         return (False, True, f"probe child {death}; no {_PROBE_STEP_NEWUSER} result", "")
     step, err = report
+    if step == _PROBE_STEP_MULTITHREADED:
+        # Same classification and same remedy as a plain EINVAL -- deliberately, see
+        # _probe_child_thread_count. Only the reason gains the thread count, because
+        # that is the one part a reader cannot infer from the errno.
+        ok, transient, reason, remedy = _probe_failure(_PROBE_STEP_NEWUSER, errno.EINVAL)
+        return (
+            ok,
+            transient,
+            f"{reason}; the probe child had {err} threads, which alone makes it "
+            "return EINVAL (CLONE_NEWUSER implies CLONE_THREAD) -- an "
+            "os.register_at_fork hook started one, so the kernel's own verdict is "
+            "unobtainable from this child",
+            remedy,
+        )
     if step != "U":
         return (False, True, f"probe child sent unexpected step {step!r}", "")
     if err:
@@ -659,6 +804,11 @@ def _probe_unshare_once() -> tuple[bool, bool, str, str]:
         _close_probe_fds(c2p_r, c2p_w)
         return _probe_failure("probe pipe", exc.errno or 0)
 
+    # Compute the child's fd sweep BEFORE forking: sorting, sysconf, and tuple
+    # building all allocate, and post-fork the allocator lock may be held by a
+    # thread that no longer exists in the child. (#3150)
+    sweep_ranges = _fd_sweep_ranges(frozenset({0, 1, 2, c2p_w, p2c_r}))
+
     try:
         pid = os.fork()
     except OSError as exc:
@@ -666,7 +816,7 @@ def _probe_unshare_once() -> tuple[bool, bool, str, str]:
         return _probe_failure("fork", exc.errno or 0)
 
     if pid == 0:
-        _probe_child_sequence(libc, c2p_r, c2p_w, p2c_r, p2c_w)  # never returns
+        _probe_child_sequence(libc, c2p_r, c2p_w, p2c_r, p2c_w, sweep_ranges)  # never returns
         os._exit(1)  # pragma: no cover - defensive
 
     _close_probe_fds(c2p_w, p2c_r)
@@ -1141,6 +1291,7 @@ sys.path[:] = [p for p in sys.path if p not in ("", sys.path[0])]
 import ctypes
 import ctypes.util
 import os
+import stat
 import tempfile
 
 _CLONE_NEWUSER = 0x10000000
@@ -1511,6 +1662,17 @@ def main():
         # a stderr warning rather than failing closed: /tmp on a busy host can
         # exceed any fixed budget from ordinary telemetry/cache churn, and
         # exiting here would break every sandbox spawn on such hosts.
+        #
+        # REGULAR FILES ONLY, and that guard is what keeps the walk rare. Linux
+        # does not allow a hardlink to a directory, so nlink > 1 says nothing
+        # about a directory — and every directory has nlink >= 2 for `.` and
+        # `..`. `SENSITIVE_FILES` deliberately carries every hidden path of BOTH
+        # kinds (the hiding loops classify per entry, see `_build_launcher_script`),
+        # so without this check two ordinary directories — `~/.kiro/crew-auth-staging`
+        # and `~/.gnupg` on the measuring host — seeded the match set on every
+        # spawn. The 100k-entry walk of $CWD and /tmp then ran every time, costing
+        # 1.5s per sandboxed spawn and emitting the truncation warning constantly,
+        # while no credential had an alias at all.
         _protected_inodes = set()
         for _pd in SENSITIVE_DIRS:
             if os.path.isdir(_pd):
@@ -1518,7 +1680,7 @@ def main():
                     for _fname in _files_scan:
                         try:
                             _st = os.stat(os.path.join(_root, _fname))
-                            if _st.st_nlink > 1:
+                            if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:
                                 _protected_inodes.add((_st.st_dev, _st.st_ino))
                         except OSError:
                             pass
@@ -1526,7 +1688,7 @@ def main():
         for _pf in SENSITIVE_FILES:
             try:
                 _st = os.stat(_pf)
-                if _st.st_nlink > 1:
+                if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:
                     _protected_inodes.add((_st.st_dev, _st.st_ino))
             except OSError:
                 pass
@@ -2783,6 +2945,26 @@ def _clamp_sandbox_mode(mode: str) -> str:
     return _clamp_sandbox_mode_to_floor(mode, _governance_sandbox_floor())
 
 
+def _floor_mandates_sandbox(floor: str | None) -> bool:
+    """True when an already-read ``sandbox.min_level`` *floor* requires isolation.
+
+    ``None`` means ungoverned.  A governed floor at the LOOSEST tier is a policy
+    that explicitly requires nothing, so testing the raw string for truthiness
+    would read "no isolation required" as "isolation mandatory" and refuse a
+    spawn the operator legitimately opted into — while telling them a floor of
+    ``off`` forbids unsandboxed execution.
+
+    The loosest tier is derived from the enforcer-owned ordinal registry rather
+    than hardcoded, matching :func:`_clamp_sandbox_mode_to_floor`: a renamed or
+    re-ordered scale must not silently invert this test.
+    """
+    if not floor:
+        return False
+    from kiro_crew.platform.governance import _ORDINAL_SCALES
+
+    return floor != _ORDINAL_SCALES["sandbox"][0]
+
+
 def _clamp_sandbox_mode_to_floor(mode: str, floor: str | None) -> str:
     """Clamp *mode* UP to an already-read ``sandbox.min_level`` *floor*, if any.
 
@@ -3147,7 +3329,22 @@ def wrap_argv(
         # This addresses a penetration-test finding — the previous behavior silently
         # returned unmodified argv, allowing the agent subprocess to access all
         # credential paths without any OS-level isolation.
-        if not _allow_unsandboxed_exec():
+        #
+        # ONE read of the opt-in: the gate below and the message that explains a
+        # refusal must describe the same state, and a concurrent config reload
+        # must not let them disagree about the same spawn.
+        opted_in = _allow_unsandboxed_exec()
+        # A governance ``sandbox.min_level`` floor OVERRIDES the config opt-in
+        # (issue #3162).  Before this, the floor did the opposite of what pinning
+        # it implies: it disabled the audited first-party carve-out below while
+        # leaving this broad opt-in untouched, so a governed fleet lost the
+        # constrained path and kept the unconstrained one.  ``config.json`` is not
+        # policy — the floor is — so the flag cannot re-open this on a governed
+        # host.  Derived from the ONE floor read taken at the top of this call,
+        # and via ``_floor_mandates_sandbox`` rather than raw truthiness, because
+        # a pinned floor of the loosest tier requires nothing and must not deny.
+        floor_mandates_sandbox = _floor_mandates_sandbox(governance_floor)
+        if floor_mandates_sandbox or not opted_in:
             # ONE read of the pair: a concurrent re-probe swaps the whole tuple,
             # so failure and remedy can never come from different probes.
             transient, probe_reason, probe_remedy = _last_unshare_failure or (
@@ -3244,6 +3441,41 @@ def wrap_argv(
                 )
             else:
                 guidance = _no_backend_guidance()
+            # When the policy floor is what refused, every guidance above points
+            # at the wrong lever: the operator HAS set the opt-in and the flag is
+            # deliberately powerless here, so naming it would send them down a
+            # dead end.  Replace the remedy rather than appending to it.
+            policy_overrode_opt_in = floor_mandates_sandbox and opted_in
+            if policy_overrode_opt_in:
+                guidance = (
+                    "This host is GOVERNED: an enterprise policy pins "
+                    f"sandbox.min_level={governance_floor!r}, which forbids "
+                    "unsandboxed execution regardless of "
+                    "agent.sandbox_allow_unsandboxed_exec — that flag is set on "
+                    "this host and is deliberately powerless against the policy, "
+                    "so editing config.json cannot resolve this. A governed host "
+                    "also withholds the first-party carve-out, so Kiro Crew's own "
+                    "built-in spawns are refused here too: this host runs no "
+                    "agent subprocess until it has a working sandbox backend "
+                    "(see docs/system-specs/modules/security.md) or the policy "
+                    "owner relaxes sandbox.min_level."
+                )
+                sel_reason = (
+                    "No sandbox backend available and a governance "
+                    f"sandbox.min_level={governance_floor!r} floor forbids "
+                    "unsandboxed exec (the config opt-in is set but overridden)"
+                )
+                refusal = (
+                    "Sandbox backend unavailable and a governance policy forbids "
+                    "unsandboxed execution. "
+                )
+            else:
+                sel_reason = (
+                    "No sandbox backend available and allow_unsandboxed_exec is not set"
+                )
+                refusal = (
+                    "Sandbox backend unavailable and allow_unsandboxed_exec is not set. "
+                )
             # Emit SEL audit event for this security-relevant denial so it
             # appears in the tamper-evident audit log (security-review requirement).
             try:
@@ -3256,16 +3488,13 @@ def wrap_argv(
                     tool_name=argv[0] if argv else "unknown",
                     tool_kind="subprocess",
                     outcome="denied",
-                    error=(
-                        "No sandbox backend available and allow_unsandboxed_exec "
-                        f"is not set (probe: {probe_reason})"
-                    ),
+                    error=(f"{sel_reason} (probe: {probe_reason})"),
                 )
             except Exception:
                 logger.warning("Failed to emit SEL audit event for sandbox denial", exc_info=True)
             raise SandboxUnavailableError(
-                "Sandbox backend unavailable and allow_unsandboxed_exec is not set. "
-                "No OS-level sandbox backend is available on this host, and the "
+                refusal
+                + "No OS-level sandbox backend is available on this host, and the "
                 "agent subprocess cannot be safely isolated. "
                 f"Probe detail: {probe_reason}. " + guidance,
                 kind=_classify_unavailable(transient),
@@ -3500,6 +3729,11 @@ _CGROUP_MEMORY_FRACTION = 0.65
 # so this is a belt-and-suspenders default, not the normal path.
 _CGROUP_FALLBACK_MAX_MEMORY_MB = 8192
 
+# The slice every agent scope nests under (systemd dash-hierarchy places it at
+# kirocrew.slice/kirocrew-agents.slice inside the user manager). It is also
+# the aggregate enforcement boundary — see ensure_agents_slice_limits().
+_CGROUP_AGENTS_SLICE = "kirocrew-agents.slice"
+
 
 def _default_max_memory_mb() -> int:
     """Return the default cgroup ``memory.max`` in MB: a fixed fraction
@@ -3521,6 +3755,26 @@ def _default_max_memory_mb() -> int:
 # within a process, and the probe shells out, so compute it once.
 _CGROUP_SCOPE_PROBE: tuple[bool, str] | None = None
 _CGROUP_WARNED = False
+
+
+def _warn_cgroup_unavailable(reason: str) -> None:
+    """Emit the one-time SECURITY warning for a host without cgroup enforcement.
+
+    Shared by the per-spawn wrapper and the slice-limit application so a host
+    where delegation is missing produces exactly ONE warning, no matter which
+    site notices first — both react to the same host condition.
+    """
+    global _CGROUP_WARNED
+    if _CGROUP_WARNED:
+        return
+    _CGROUP_WARNED = True
+    logger.warning(
+        "SECURITY: cgroup v2 scope enforcement unavailable (%s); agent "
+        "subprocess fork-bomb / memory-DoS ceilings are NOT enforced on "
+        "this host. RLIMIT_NOFILE still applies. See "
+        "docs/architecture/resource-protection.md.",
+        reason,
+    )
 
 
 def _probe_cgroup_scope() -> tuple[bool, str]:
@@ -3638,6 +3892,238 @@ def _cgroup_limits_from_config() -> tuple[int, int, int, int]:
     return max_procs, max_mem_mb, cpu_weight, max_cpu_percent
 
 
+# ── aggregate agent-slice soft ceiling (memory.high on kirocrew-agents.slice) ──
+# Per-scope MemoryMax bounds ONE runaway spawn tree, but scopes are created per
+# spawn: several concurrent agent trees, each legitimately under its own 65%
+# cap, can still sum past physical RAM and livelock a swapless host. memory.high
+# on the slice all agent scopes share throttles-and-reclaims the whole subtree
+# once the SUM of agent memory crosses it, keeping the kernel and the gateway
+# (which lives outside the slice) responsive — a soft layer BELOW the slice's
+# hard aggregate memory.max (ensure_agents_slice_limits), which OOM-kills a
+# scope only when throttling was not enough, while each scope's own memory.max
+# still hard-kills an individual runaway. Same trust model as the scope
+# ceilings: unprivileged, enforced by the user manager, requires the memory
+# controller delegated to the user slice (the existing _probe_cgroup_scope
+# check).
+
+# Fraction of physical RAM used for the default slice memory.high. Higher than
+# the per-scope 65% because it bounds the SUM of all agent scopes, and below
+# the slice's hard 80% memory.max so throttling engages before the kernel
+# OOM-kills, with OS + gateway headroom preserved even while the whole fleet
+# is being throttled.
+_SLICE_MEMORY_HIGH_FRACTION = 0.75
+# Fallback slice memory.high (MB) used only when physical RAM can't be read.
+# The slice path is Linux-only, where SC_PHYS_PAGES exists, so this is a
+# belt-and-suspenders default, not the normal path.
+_SLICE_FALLBACK_MEMORY_HIGH_MB = 12288
+
+# Last MemoryHigh value applied to the slice by THIS process ("24576M" /
+# "infinity"), or None before the first reconcile. The desired value is
+# host-derived and constant for the process's life (no config input), so
+# after the first successful apply every later reconcile reduces to a
+# string compare and no-ops. Kept as a reconcile (rather than a one-shot)
+# so an apply that failed transiently is retried on the next spawn.
+_SLICE_MEMHIGH_APPLIED: str | None = None
+# Process-level kill switch: set after a failed apply so a broken systemctl is
+# warned about ONCE and never hammered on every subsequent spawn.
+_SLICE_MEMHIGH_DISABLED = False
+
+
+def _default_slice_memory_high_mb() -> int:
+    """Return the default slice ``memory.high`` in MB: a fixed fraction
+    (:data:`_SLICE_MEMORY_HIGH_FRACTION`) of physical RAM, falling back to
+    :data:`_SLICE_FALLBACK_MEMORY_HIGH_MB` if host RAM can't be determined.
+    """
+    try:
+        total_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        mb = int(total_bytes * _SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
+        if mb > 0:
+            return mb
+    except (ValueError, OSError, AttributeError):
+        pass
+    return _SLICE_FALLBACK_MEMORY_HIGH_MB
+
+
+def _ensure_agent_slice_memory_high() -> None:
+    """Reconcile ``MemoryHigh`` on :data:`_CGROUP_AGENTS_SLICE` with the host default.
+
+    The slice is UID-GLOBAL: every gateway instance under this user (live,
+    dev-backend, pods with delegation) parents scopes into the same slice, so
+    the ceiling is deliberately NOT config-driven — a per-instance config key
+    would let one instance (e.g. a dev gateway configured permissively) lift
+    or lower the ceiling that protects the others. The value is always the
+    host-derived default (:func:`_default_slice_memory_high_mb`).
+
+    Runs ``systemctl --user set-property --runtime`` — unprivileged: the user
+    manager owns the slice, and the memory controller is delegated wherever the
+    caller's probe passed. ``--runtime`` is deliberate: the drop-in lives under
+    ``$XDG_RUNTIME_DIR`` and vanishes with the login session, so no persistent
+    unit files accumulate under ``~/.config`` and a stale ceiling can never
+    outlive the login session that set it.
+
+    Never raises: agent spawns must not fail because the ceiling could not be
+    applied. On failure it logs one loud warning and disarms for the rest of
+    the process.
+    """
+    global _SLICE_MEMHIGH_APPLIED, _SLICE_MEMHIGH_DISABLED
+    if _SLICE_MEMHIGH_DISABLED:
+        return
+    desired = f"{_default_slice_memory_high_mb()}M"
+    if desired == _SLICE_MEMHIGH_APPLIED:
+        return
+    try:
+        systemctl = platform_compat.trusted_system_bin("systemctl")
+        if systemctl is None:
+            raise FileNotFoundError("systemctl not found in trusted system dirs")
+        proc = subprocess.run(
+            [
+                systemctl,
+                "--user",
+                "set-property",
+                "--runtime",
+                _CGROUP_AGENTS_SLICE,
+                f"MemoryHigh={desired}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout or "").strip() or "non-zero exit")
+    except Exception as exc:
+        _SLICE_MEMHIGH_DISABLED = True
+        logger.warning(
+            "SECURITY: could not apply MemoryHigh=%s to %s (%s); the AGGREGATE "
+            "agent memory ceiling is NOT enforced on this host — per-scope "
+            "MemoryMax still applies. See "
+            "docs/architecture/resource-protection.md.",
+            desired,
+            _CGROUP_AGENTS_SLICE,
+            exc,
+        )
+        return
+    _SLICE_MEMHIGH_APPLIED = desired
+    logger.info("agent slice %s: MemoryHigh=%s applied", _CGROUP_AGENTS_SLICE, desired)
+
+
+# Last observed value of the slice's memory.events `high` counter, or None
+# before the first successful read. The first read only baselines — the
+# counter is monotonic for the slice cgroup's lifetime, so a nonzero value
+# may predate this process — and climbs are judged against it.
+_SLICE_MEMHIGH_EVENTS_SEEN: int | None = None
+# True while inside a climbing episode that has already been warned about, so
+# sustained throttling logs once per episode instead of on every spawn. Reset
+# when an observation finds the counter stable (episode over) or lower (slice
+# cgroup recreated).
+_SLICE_MEMHIGH_CLIMB_WARNED = False
+
+
+def _slice_memory_events_high() -> int | None:
+    """Return the ``high`` counter from the slice cgroup's ``memory.events``.
+
+    The slice directory comes from :func:`_agents_slice_cgroup_dir`, which
+    understands systemd's dash-hierarchy (``kirocrew-agents.slice`` nests
+    under ``kirocrew.slice`` in the user manager's subtree). ``None`` when it
+    cannot be read: not Linux, no cgroup v2, the slice cgroup not currently
+    materialized (systemd releases an empty slice), or unparseable content.
+    """
+    slice_dir = _agents_slice_cgroup_dir()
+    if slice_dir is None:
+        return None
+    return _read_cgroup_counters(slice_dir / "memory.events").get("high")
+
+
+def _check_slice_memory_pressure() -> None:
+    """Warn when the slice's ``memory.events`` ``high`` counter climbs.
+
+    Past ``memory.high`` the kernel throttles-and-reclaims the subtree
+    SILENTLY — agents just slow down; nothing kills and nothing alerts, since
+    per-scope ``MemoryMax`` never fired. The ``high`` counter climbing is the
+    kernel's only signal that the aggregate ceiling is throttling, and
+    surfacing it makes "agents mysteriously slow" diagnosable from the
+    gateway log as ceiling throttling rather than a hang.
+
+    Warned once per climbing episode: the first observed increase logs, later
+    increases stay silent until an observation finds the counter stable,
+    which closes the episode. A DECREASE means the slice cgroup was recreated
+    (an empty slice is released and its counters reset) — re-baseline
+    silently, never warn.
+    """
+    global _SLICE_MEMHIGH_EVENTS_SEEN, _SLICE_MEMHIGH_CLIMB_WARNED
+    current = _slice_memory_events_high()
+    if current is None:
+        return
+    previous = _SLICE_MEMHIGH_EVENTS_SEEN
+    _SLICE_MEMHIGH_EVENTS_SEEN = current
+    if previous is None or current <= previous:
+        # First read, counter stable, or slice cgroup recreated: (re)baseline
+        # and close any open episode.
+        _SLICE_MEMHIGH_CLIMB_WARNED = False
+        return
+    if _SLICE_MEMHIGH_CLIMB_WARNED:
+        return
+    _SLICE_MEMHIGH_CLIMB_WARNED = True
+    logger.warning(
+        "agent slice %s: memory.events high counter climbed %d -> %d — "
+        "aggregate agent memory crossed the slice MemoryHigh ceiling and the "
+        "kernel is throttling the whole agent subtree; agents run slowly "
+        "(not hung) until aggregate memory drops. See "
+        "docs/architecture/resource-protection.md.",
+        _CGROUP_AGENTS_SLICE,
+        previous,
+        current,
+    )
+
+
+# Serializes reconciliation workers. Deliberately a plain blocking mutex held
+# for the whole reconcile body: every schedule spawns its own short-lived
+# worker and workers queue on the mutex, so concurrent spawns never interleave
+# systemctl calls and a failed apply is retried by the next spawn's worker.
+# The desired value is host-derived and process-constant (no config input) —
+# the mutex guards the apply/retry handoff, not value freshness. Redundant
+# workers are near-free (the applied-value check reduces them to a string
+# compare), and thread count is bounded by concurrent agent spawns.
+_SLICE_MEMHIGH_MUTEX = threading.Lock()
+
+
+def _reconcile_slice_memory_high_off_thread() -> None:
+    """Reconcile ``MemoryHigh`` and check slice throttling in a daemon thread.
+
+    The reconciliation reads config and shells out to ``systemctl`` (up to
+    10s), and its caller sits on the agent-spawn path, which runs on the
+    gateway event loop — so it must never execute inline. Fire-and-forget is
+    semantically safe: ``MemoryHigh`` set on a slice applies to members that
+    are already running, so a reconciliation that lands moments after the
+    spawn still bounds it, and every later spawn re-reconciles. The worker
+    also runs :func:`_check_slice_memory_pressure`, so throttle visibility
+    shares the reconcile cadence (per spawn) and its kill switch.
+    """
+    global _SLICE_MEMHIGH_DISABLED
+    if _SLICE_MEMHIGH_DISABLED:
+        return
+
+    def _worker() -> None:
+        with _SLICE_MEMHIGH_MUTEX:
+            _ensure_agent_slice_memory_high()
+            _check_slice_memory_pressure()
+
+    try:
+        threading.Thread(
+            target=_worker, name="agent-slice-memhigh", daemon=True
+        ).start()
+    except RuntimeError as exc:
+        # Thread exhaustion. This sits on the agent-spawn path, so it must
+        # never abort the spawn. Disarm like any other reconciliation
+        # failure: per-scope MemoryMax still applies.
+        _SLICE_MEMHIGH_DISABLED = True
+        logger.warning(
+            "SECURITY: could not start the MemoryHigh reconciliation thread "
+            "(%s); the AGGREGATE agent memory ceiling is NOT enforced on this "
+            "host — per-scope MemoryMax still applies.",
+            exc,
+        )
+
+
 def cgroup_scope_argv(argv: list[str]) -> list[str]:
     """Wrap *argv* in a transient systemd --user --scope with cgroup v2 limits.
 
@@ -3654,6 +4140,13 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
     the returned argv's eventual PID is the real child — parent PID tracking,
     ``killpg``, and descendant scans are unaffected.
 
+    Every scope is parented under :data:`_CGROUP_AGENTS_SLICE`, and the
+    slice-level soft ceiling (``MemoryHigh``, see
+    :func:`_ensure_agent_slice_memory_high`) — a host-derived constant (75%
+    of RAM) — is ensured before each wrap, throttling the SUM of all
+    concurrent agent trees before the slice's hard ``MemoryMax``
+    (:func:`ensure_agents_slice_limits`) OOM-kills a scope.
+
     Layers OUTSIDE the OS-level sandbox: callers pass the already-``wrap_argv``-ed
     argv here so the child is filesystem-isolated AND cgroup-bounded.
 
@@ -3662,19 +4155,15 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
     warning — the RLIMIT_NOFILE preexec still applies, but the fork-bomb/memory
     DoS ceiling is NOT enforced there.
     """
-    global _CGROUP_WARNED
     available, reason = _probe_cgroup_scope()
     if not available:
-        if not _CGROUP_WARNED:
-            _CGROUP_WARNED = True
-            logger.warning(
-                "SECURITY: cgroup v2 scope enforcement unavailable (%s); agent "
-                "subprocess fork-bomb / memory-DoS ceilings are NOT enforced on "
-                "this host. RLIMIT_NOFILE still applies. See "
-                "docs/architecture/resource-protection.md.",
-                reason,
-            )
+        _warn_cgroup_unavailable(reason)
         return argv
+    # Reconcile the slice-level aggregate ceiling off-thread: this call site
+    # runs on the gateway event loop during agent spawn, and reconciliation
+    # does config reads + a systemctl subprocess. MemoryHigh on a slice
+    # applies to already-running members, so the spawn need not wait for it.
+    _reconcile_slice_memory_high_off_thread()
     max_procs, max_mem_mb, cpu_weight, max_cpu_percent = _cgroup_limits_from_config()
     props = [
         "-p",
@@ -3695,11 +4184,303 @@ def cgroup_scope_argv(argv: list[str]) -> list[str]:
         "--user",
         "--scope",
         "-q",
-        "--slice=kirocrew-agents.slice",
+        f"--slice={_CGROUP_AGENTS_SLICE}",
         *props,
         "--",
         *argv,
     ]
+
+
+# ── aggregate ceiling on the parent slice ──
+# The per-scope MemoryMax above bounds ONE spawn tree, but scopes are siblings:
+# N concurrent spawns may collectively request N x 65% of host RAM with no
+# single cgroup ever breaching its own limit. cgroup v2 enforces limits down
+# the tree — a descendant is bounded by the MINIMUM effective limit of itself
+# and all ancestors — so the parent slice every scope already nests under is
+# the natural aggregate boundary. ensure_agents_slice_limits() puts a ceiling
+# on it, yielding a two-level model: slice = aggregate across all concurrent
+# agent work, scope = per-tree (unchanged).
+
+# Aggregate memory.max as a fraction of physical RAM. Must sit ABOVE the
+# per-scope fraction (0.65) — otherwise the slice would shrink a single
+# spawn's existing headroom — and meaningfully below 1.0 so the OS and the
+# gateway keep breathing room even when agent work saturates the ceiling.
+_CGROUP_TOTAL_MEMORY_FRACTION = 0.80
+# Fallback aggregate memory.max (MB) when physical RAM can't be read. Above
+# the per-scope fallback (8192) for the same "never clamp a single scope
+# tighter than its own ceiling" reason as the fraction.
+_CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB = 12288
+# Aggregate pids.max across all concurrent scopes: four fully-loaded scopes'
+# worth (4 x 8192). Bounds the composition blow-up (32 scopes x 8192 tasks =
+# 262144 otherwise) while still allowing several concurrent JVM-scale builds,
+# each of which legitimately needs thousands of threads.
+_CGROUP_DEFAULT_MAX_TOTAL_TASKS = 32768
+
+
+def _default_max_total_memory_mb() -> int:
+    """Default aggregate ``memory.max`` (MB) for the agents slice: a fixed
+    fraction (:data:`_CGROUP_TOTAL_MEMORY_FRACTION`) of physical RAM, falling
+    back to :data:`_CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB` when RAM is unreadable.
+    """
+    try:
+        total_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        mb = int(total_bytes * _CGROUP_TOTAL_MEMORY_FRACTION) // (1024 * 1024)
+        if mb > 0:
+            return mb
+    except (ValueError, OSError, AttributeError):
+        pass
+    return _CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB
+
+
+def _slice_limits_from_config() -> tuple[int, int]:
+    """Return ``(max_total_memory_mb, max_total_tasks)`` for the agents slice.
+
+    Reads ``resource_limits.max_total_memory_mb`` / ``max_total_processes``
+    from the same config block as the per-scope knobs. ``0`` or junk means
+    "use default" — the aggregate ceiling is never left unset, matching the
+    per-scope rule in :func:`_cgroup_limits_from_config`. The two memory knobs
+    are deliberately independent of one another: per-scope answers "how big may
+    one tree get", aggregate answers "how much may all trees claim together".
+    """
+    total_mem_mb = _default_max_total_memory_mb()
+    total_tasks = _CGROUP_DEFAULT_MAX_TOTAL_TASKS
+    try:
+        # circular import: same constraint as _cgroup_limits_from_config —
+        # config.loader consumers import sandbox, so the import stays local.
+        from kiro_crew.config.loader import _raw_config
+
+        rl = _raw_config().get("resource_limits")
+        if isinstance(rl, dict):
+            # int(m) >= 1, not m > 0: a fractional 0.5 passes m > 0 but
+            # truncates to MemoryMax=0M, which kills every agent scope.
+            m = rl.get("max_total_memory_mb")
+            if isinstance(m, (int, float)) and not isinstance(m, bool) and int(m) >= 1:
+                total_mem_mb = int(m)
+            p = rl.get("max_total_processes")
+            if isinstance(p, (int, float)) and not isinstance(p, bool) and int(p) >= 1:
+                total_tasks = int(p)
+    except Exception:
+        logger.debug("slice limits: config unavailable, using defaults")
+    return total_mem_mb, total_tasks
+
+
+_SLICE_LIMITS_APPLIED = False
+
+
+def ensure_agents_slice_limits() -> bool:
+    """Apply the aggregate cgroup ceiling to the agents slice. Idempotent.
+
+    Runs ``systemctl --user set-property --runtime`` on
+    :data:`_CGROUP_AGENTS_SLICE`, setting ``MemoryMax`` (aggregate across ALL
+    concurrent agent scopes), ``MemorySwapMax=0`` (consistent with the
+    per-scope property: a true RSS ceiling, no swap escape), and ``TasksMax``
+    (aggregate fork-bomb ceiling). Called once at gateway startup.
+
+    ``--runtime`` over a shipped unit drop-in, deliberately: the property is
+    re-derived from config and re-applied on every gateway start, so a config
+    change can never leave a stale on-disk artifact behind, and uninstalling
+    leaves nothing to clean up. The property persists on the user manager
+    until logout/reboot — long enough, since the gateway is the long-lived
+    process that re-applies it.
+
+    Gated on the same :func:`_probe_cgroup_scope` capability check as the
+    per-scope wrapper: where delegation is unavailable this is skipped and the
+    single shared SECURITY warning covers both layers — no second warning for
+    the same host condition.
+
+    Blocking (shells out): call off-loop (``asyncio.to_thread``).
+
+    Returns True when the ceiling is in place (now or from an earlier call).
+    """
+    global _SLICE_LIMITS_APPLIED
+    if _SLICE_LIMITS_APPLIED:
+        return True
+    available, reason = _probe_cgroup_scope()
+    if not available:
+        _warn_cgroup_unavailable(reason)
+        return False
+    total_mem_mb, total_tasks = _slice_limits_from_config()
+    # PATH can legitimately lead with agent-writable directories (a worktree
+    # venv's bin, ~/.local/bin), so a bare "systemctl" would let a planted
+    # shim run with the gateway's environment. Resolve from fixed system
+    # directories only; unavailable = ceiling not applied (per-scope ceilings
+    # still hold).
+    systemctl = platform_compat.trusted_system_bin("systemctl")
+    if systemctl is None:
+        logger.warning(
+            "could not apply the aggregate cgroup ceiling to %s: no trusted "
+            "systemctl binary — per-scope ceilings still apply.",
+            _CGROUP_AGENTS_SLICE,
+        )
+        return False
+    cmd = [
+        systemctl,
+        "--user",
+        "set-property",
+        "--runtime",
+        _CGROUP_AGENTS_SLICE,
+        f"MemoryMax={total_mem_mb}M",
+        "MemorySwapMax=0",
+        f"TasksMax={total_tasks}",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning(
+            "could not apply the aggregate cgroup ceiling to %s: %s — "
+            "per-scope ceilings still apply, but N concurrent spawns may "
+            "collectively exceed host RAM.",
+            _CGROUP_AGENTS_SLICE,
+            exc,
+        )
+        return False
+    if proc.returncode != 0:
+        logger.warning(
+            "could not apply the aggregate cgroup ceiling to %s (rc=%d): %s — "
+            "per-scope ceilings still apply, but N concurrent spawns may "
+            "collectively exceed host RAM.",
+            _CGROUP_AGENTS_SLICE,
+            proc.returncode,
+            (proc.stderr or "").strip(),
+        )
+        return False
+    _SLICE_LIMITS_APPLIED = True
+    logger.info(
+        "aggregate cgroup ceiling on %s: MemoryMax=%dM MemorySwapMax=0 TasksMax=%d "
+        "(per-scope ceilings unchanged)",
+        _CGROUP_AGENTS_SLICE,
+        total_mem_mb,
+        total_tasks,
+    )
+    return True
+
+
+# cgroup v2 directory of the systemd user manager's subtree (transient
+# --user units always live under user@<uid>.service on the unified
+# hierarchy); ``{uid}`` is filled at resolve time. Module-level so tests can
+# point the resolver at a fabricated tree.
+_USER_MANAGER_CGROUP_BASE = "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+
+
+def _agents_slice_cgroup_dir() -> Path | None:
+    """Resolve the agents slice's cgroup directory, or None when absent.
+
+    systemd's dash-hierarchy places ``kirocrew-agents.slice`` under
+    ``kirocrew.slice`` inside the user manager's subtree; the direct
+    construction covers that. The shallow scan tolerates a manager that laid
+    the slice out differently (one extra level only — never a recursive walk).
+    The directory exists only while the slice is active (a runtime property or
+    a live scope holds it); None simply means "no agent work to observe".
+    """
+    if sys.platform != "linux":
+        return None
+    base = Path(_USER_MANAGER_CGROUP_BASE.format(uid=os.getuid()))
+    direct = base / "kirocrew.slice" / _CGROUP_AGENTS_SLICE
+    if direct.is_dir():
+        return direct
+    try:
+        for child in base.iterdir():
+            cand = child / _CGROUP_AGENTS_SLICE
+            if cand.is_dir():
+                return cand
+    except OSError:
+        pass
+    return None
+
+
+def _read_cgroup_counters(path: Path) -> dict[str, int]:
+    """Parse a ``memory.events``-style key/value cgroup file into a dict."""
+    counters: dict[str, int] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(" ")
+            if value.strip().isdigit():
+                counters[key] = int(value)
+    except OSError:
+        pass
+    return counters
+
+
+# Last-seen slice-level OOM counters, so only NEW kills are reported. Seeded
+# lazily from the current values on first read: kills that predate this
+# process must not fire a spurious warning at boot.
+_SLICE_OOM_SEEN: dict[str, int] | None = None
+
+
+def check_agents_slice_pressure() -> str | None:
+    """Report (and log) new OOM kills inside the agents slice, else None.
+
+    With an aggregate ceiling on the slice, a breach OOM-kills SOME scope in
+    it — the kernel picks the victim, not necessarily the spawn that grew.
+    Without attribution the operator-visible failure is "a random subagent
+    died". This turns it into a diagnosable event: which scopes took kills
+    (each scope's own ``memory.events.local oom_kill``), the slice's
+    ``memory.current`` vs ``memory.max`` at observation time, and whether the
+    SLICE ceiling itself engaged (``memory.events.local max`` on the slice —
+    the discriminator between a slice-level breach and a single scope hitting
+    its own per-tree limit).
+
+    Reads a handful of cgroup files; never raises. Polled from the resource
+    pressure sampler's worker thread, so it is already off-loop. The same
+    poll also re-applies the slice ceiling if a user-manager restart dropped
+    the --runtime property (see the self-heal block below).
+    """
+    global _SLICE_OOM_SEEN, _SLICE_LIMITS_APPLIED
+    slice_dir = _agents_slice_cgroup_dir()
+    if slice_dir is None:
+        return None
+    # Self-heal: the ceiling is a --runtime property, so a user-manager
+    # restart (logout/reboot) silently drops it while the gateway keeps
+    # running. This sampler already reads the slice each tick — if the
+    # ceiling we applied has vanished (memory.max reads "max"), re-apply it
+    # here instead of waiting for the next gateway start. Only when WE
+    # applied it before: a host that never passed the delegation gate must
+    # not start shelling out from the sampler.
+    if _SLICE_LIMITS_APPLIED:
+        try:
+            if (slice_dir / "memory.max").read_text().strip() == "max":
+                _SLICE_LIMITS_APPLIED = False
+                ensure_agents_slice_limits()
+        except OSError:
+            pass
+    events = _read_cgroup_counters(slice_dir / "memory.events")
+    local = _read_cgroup_counters(slice_dir / "memory.events.local")
+    current = {"oom_kill": events.get("oom_kill", 0), "max": local.get("max", 0)}
+    if _SLICE_OOM_SEEN is None:
+        _SLICE_OOM_SEEN = current
+        return None
+    new_kills = current["oom_kill"] - _SLICE_OOM_SEEN["oom_kill"]
+    slice_max_hits = current["max"] - _SLICE_OOM_SEEN["max"]
+    _SLICE_OOM_SEEN = current
+    if new_kills <= 0:
+        return None
+    victims: list[str] = []
+    try:
+        for child in slice_dir.iterdir():
+            if child.suffix == ".scope" and child.is_dir():
+                child_local = _read_cgroup_counters(child / "memory.events.local")
+                if child_local.get("oom_kill", 0) > 0:
+                    victims.append(child.name)
+    except OSError:
+        pass
+    mem_current = -1
+    try:
+        mem_current = int((slice_dir / "memory.current").read_text().strip())
+    except (OSError, ValueError):
+        pass
+    try:
+        mem_max = (slice_dir / "memory.max").read_text().strip()
+    except OSError:
+        mem_max = "?"
+    message = (
+        f"cgroup OOM kill inside {_CGROUP_AGENTS_SLICE}: {new_kills} new kill(s); "
+        f"slice memory.current={mem_current} memory.max={mem_max}; "
+        f"slice-level aggregate ceiling engaged: "
+        f"{'yes' if slice_max_hits > 0 else 'no (a scope hit its own per-tree limit)'}; "
+        f"scopes with recorded kills: {victims or '(already reaped)'}"
+    )
+    logger.warning("%s", message)
+    return message
 
 
 # ``systemd-run --user`` finds the caller's session bus through these two
@@ -3789,8 +4570,12 @@ def resource_limit_preexec() -> "Callable[[], None] | None":
     gives a child filesystem + credential isolation, and this gives it a
     kernel-enforced ceiling on processes / file descriptors / CPU / memory so a
     fork bomb or runaway allocation in a compromised tool or MCP server cannot
-    exhaust the host out from under the gateway. Every agent-influenced spawn
-    passes the result as ``preexec_fn=`` (see ``docs/architecture/resource-protection.md``).
+    exhaust the host out from under the gateway. Call sites do not use this
+    directly: agent-influenced spawns go through
+    :func:`create_subprocess_limited` / :func:`run_limited` /
+    :func:`popen_limited`, which deliver the same limits AFTER ``exec`` via the
+    spawn shim and fall back to this ``preexec_fn`` only on a host with no
+    usable shim (see ``docs/architecture/resource-protection.md``).
 
     Returns the callable from :func:`kiro_crew.security.apply_resource_limits`,
     or ``None`` on non-POSIX platforms (where there is nothing to enforce and
@@ -4194,3 +4979,114 @@ async def create_subprocess_limited(
     return await asyncio.create_subprocess_exec(
         *prefix, resolved, *argv[1:], preexec_fn=None, **kwargs
     )
+
+
+def _prepare_limited_spawn(
+    argv: "Sequence[str]", profile: str, kwargs: "dict[str, Any]", caller: str
+) -> "tuple[list[str], Callable[[], None] | None]":
+    """Resolve *argv* into the command to spawn plus the ``preexec_fn`` to pass.
+
+    Shared by :func:`run_limited` and :func:`popen_limited`, which differ only in
+    which ``subprocess`` entry point they hand the result to.
+
+    Two things make this the sync twin of :func:`create_subprocess_limited`
+    rather than a copy of it:
+
+    * The PATH search runs INLINE. The async wrapper hops to a worker thread
+      because ``shutil.which`` stats every ``PATH`` entry and one stalled
+      NFS/autofs mount would freeze the event loop. A synchronous caller is
+      already off the loop, so the hop would buy nothing and cost a thread.
+    * ``shell=True`` is refused. The shim ``exec``s an argv vector, so there is
+      no correct place to put a prefix in front of a shell command STRING;
+      wrapping it anyway would change what the shell parses.
+    """
+    if "preexec_fn" in kwargs:
+        raise TypeError(
+            f"{caller} owns preexec_fn: limits are applied post-exec by the "
+            "spawn shim, not post-fork"
+        )
+    if kwargs.get("shell"):
+        raise TypeError(
+            f"{caller} cannot wrap shell=True: the shim prefixes an argv "
+            "vector, and a shell command is a single string"
+        )
+    if not argv:
+        raise ValueError(f"{caller} requires a command")
+    prefix = spawn_shim_argv(profile)
+    if not prefix:
+        # No shim (Windows, a no-op profile, or a truncated install): keep
+        # whatever policy the profile carries on the legacy fork path. Dropping
+        # the caps silently would be worse than the fork hazard.
+        return list(argv), _preexec_for_profile(profile)
+    if not _needs_path_search(argv):
+        # Explicit path: exec resolves it, so stat-ing it here would only
+        # pre-empt a failure exec reports anyway.
+        resolved = argv[0]
+    else:
+        resolved = _resolve_spawn_target(argv, kwargs.get("env"), kwargs.get("cwd"))
+    return [*prefix, resolved, *argv[1:]], None
+
+
+def run_limited(
+    argv: "Sequence[str]",
+    *,
+    profile: str = RLIMIT_PROFILE_TOOL,
+    **kwargs: "Any",
+) -> "subprocess.CompletedProcess[Any]":
+    """``subprocess.run`` with resource limits applied AFTER ``exec``.
+
+    The synchronous counterpart of :func:`create_subprocess_limited`, and the
+    drop-in replacement for ``subprocess.run(..., preexec_fn=
+    resource_limit_preexec())``. Every keyword argument is forwarded untouched
+    except ``preexec_fn``, which this owns.
+
+    A synchronous spawn wedges the calling worker thread rather than the event
+    loop, so it does not take the whole gateway down the way the async hazard
+    did -- but it is the same ``fork()`` of the same multi-GB, ~118-thread
+    process, and the child still inherits a duplicate of every open fd until it
+    ``exec``s. Taking ``preexec_fn`` out of the picture removes both.
+
+    ``CompletedProcess.args`` and the ``cmd`` of a ``CalledProcessError`` /
+    ``TimeoutExpired`` are the command's own argv, not the shim's. That is
+    maintained here rather than free: the shim source rides in argv as a ~8 KB
+    ``-c`` string, and both exceptions render ``cmd`` into their message, so
+    reporting the spawned argv would put the whole shim in every failure log
+    line.
+    """
+    cmd, preexec = _prepare_limited_spawn(argv, profile, kwargs, "run_limited")
+    reported = list(argv)
+    try:
+        result = subprocess.run(cmd, preexec_fn=preexec, **kwargs)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        exc.cmd = reported
+        raise
+    result.args = reported
+    return result
+
+
+def popen_limited(
+    argv: "Sequence[str]",
+    *,
+    profile: str = RLIMIT_PROFILE_TOOL,
+    **kwargs: "Any",
+) -> "subprocess.Popen[Any]":
+    """``subprocess.Popen`` with resource limits applied AFTER ``exec``.
+
+    Same contract as :func:`run_limited`, for callers that need the handle
+    rather than the result -- a long-running child they will ``communicate()``
+    with, poll, or signal later.
+
+    The returned ``Popen`` is the command's own process, not a wrapper's, so
+    ``pid``, ``returncode``, signal delivery, and
+    ``platform_compat.kill_process_tree`` behave as they did before.
+
+    ``Popen.args`` is reset to the command's own argv for the same reason
+    :func:`run_limited` rewrites ``cmd``: ``communicate(timeout=...)`` builds its
+    ``TimeoutExpired`` from ``self.args``, so leaving the shim there would put
+    ~8 KB of shim source into the timeout message. Nothing in CPython reads
+    ``self.args`` functionally -- only ``__repr__`` and that exception.
+    """
+    cmd, preexec = _prepare_limited_spawn(argv, profile, kwargs, "popen_limited")
+    proc = subprocess.Popen(cmd, preexec_fn=preexec, **kwargs)
+    proc.args = list(argv)
+    return proc

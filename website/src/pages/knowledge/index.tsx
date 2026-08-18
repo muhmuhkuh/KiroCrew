@@ -1,16 +1,17 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Search, BookOpen, Network, FolderSync, HelpCircle, FileText, X, Copy } from 'lucide-react'
+import { Search, BookOpen, Network, FolderSync, HelpCircle, FileText, X, Copy, Settings } from 'lucide-react'
 import { Btn, SearchInput, Badge, EmptyState, ContentSkeleton } from '../../components/ui'
 import Clickable from '../../components/Clickable'
 import SimpleSelect from '../../components/SimpleSelect'
 import { knowledgeApi } from './api'
-import { useCopy, ITEM_TYPES, STATUSES, DEFAULT_STATUS_FILTER, ONBOARDING } from './helpers'
+import { useCopy, ITEM_TYPES, STATUSES, DEFAULT_STATUS_FILTER, ONBOARDING, FALLBACK_SUPPORTED_FORMATS, formatSupportedFormats } from './helpers'
 import DetailView from './DetailView'
 import SourcesList from './SourcesList'
 import { ItemCard } from './ItemCard'
 import { SourceGroup, NO_SOURCE } from './SourceGroup'
 import { EmbeddingStatus } from './EmbeddingStatus'
+import { SettingsTab } from './SettingsTab'
 import type { KnowledgeItem, Entity, Source, NamespaceInfo, IngestionJob } from './types'
 
 /**
@@ -31,7 +32,7 @@ const STATUS_LABEL_KEY = {
 import { i18nT } from '../../i18n/t'
 const KnowledgeGraph = lazy(() => import('./KnowledgeGraph'))
 
-const TABS = ['list', 'graph', 'sources'] as const
+const TABS = ['list', 'graph', 'sources', 'settings'] as const
 type Tab = typeof TABS[number]
 
 // Backend list_items() hard-caps page size at 100 (dashboard/handlers/knowledge.py).
@@ -52,11 +53,13 @@ const TAB_LABEL_KEY: Record<Tab, string> = {
   // role. Sharing it would lowercase this tab and let either use-site's
   // translation break the other.
   sources: 'pages.knowledge.index.sources_tab',
+  settings: 'pages.knowledge.index.settings_tab',
 }
 const TAB_ICON: Record<Tab, React.ReactNode> = {
   list: <FileText size={14} />,
   graph: <Network size={14} />,
   sources: <FolderSync size={14} />,
+  settings: <Settings size={14} />,
 }
 
 function EntityAutocomplete({ query, onSelect }: { query: string; onSelect: (name: string) => void }) {
@@ -252,12 +255,12 @@ export default function KnowledgePage() {
   })
   // Build the upload accept filter from the backend's advertised formats
   // (single source of truth) so it never drifts from FileReader.SUPPORTED.
-  // Falls back to a superset that includes .pdf if config hasn't loaded yet.
-  const uploadAccept = (config?.supported_formats && config.supported_formats.length
+  // Until config resolves, fall back to the parity-tested mirror of that list.
+  const supportedFormats = config?.supported_formats && config.supported_formats.length
     ? config.supported_formats
-    : ['.md', '.txt', '.py', '.java', '.ts', '.js', '.rs', '.go', '.html', '.htm',
-       '.csv', '.log', '.json', '.yaml', '.yml', '.sh', '.rb', '.c', '.cpp', '.h', '.docx', '.pdf']
-  ).filter(Boolean).join(',')
+    : FALLBACK_SUPPORTED_FORMATS
+  const uploadAccept = supportedFormats.filter(Boolean).join(',')
+  const supportedFormatsDisplay = formatSupportedFormats(supportedFormats.filter(Boolean))
   const acceptsNoExtension = config?.accepts_no_extension ?? true
 
   const { data: sources = [] } = useQuery({
@@ -501,7 +504,7 @@ export default function KnowledgePage() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex items-start sm:items-end justify-between gap-3 sm:gap-4 px-4 sm:px-6 pt-2 pb-3">
+      <div className="flex items-start sm:items-end justify-between gap-3 sm:gap-4 px-4 md:px-6 pt-2 pb-3">
         <div className="min-w-0">
           <div className="text-xl sm:text-2xl font-bold tracking-tight text-text-strong flex items-center gap-2">
             <BookOpen size={22} className="shrink-0" /> {i18nT('pages.knowledge.index.knowledge_library')}
@@ -522,7 +525,7 @@ export default function KnowledgePage() {
             </div>
             <p className="text-sm text-muted mb-3">{ONBOARDING.description}</p>
             <ol className="space-y-2">
-              {ONBOARDING.steps.map((s, i) => <li key={i} className="text-[13px] text-text flex gap-2"><span className="text-accent font-bold">{i + 1}.</span>{s}</li>)}
+              {ONBOARDING.steps(supportedFormatsDisplay).map((s, i) => <li key={i} className="text-[13px] text-text flex gap-2"><span className="text-accent font-bold">{i + 1}.</span>{s}</li>)}
             </ol>
             <div className="mt-4 pt-3 border-t border-border">
               <div className="text-[12px] font-medium text-text-strong mb-1">{i18nT('pages.knowledge.index.keyboard_shortcuts')}</div>
@@ -540,7 +543,7 @@ export default function KnowledgePage() {
 
       {/* Tabs — horizontally scrollable on narrow viewports so the active
           underline never spills past the container. */}
-      <div className="flex gap-1 px-4 sm:px-6 border-b border-border overflow-x-auto">
+      <div className="flex gap-1 px-4 md:px-6 border-b border-border overflow-x-auto">
         {TABS.map(t => (
           <button key={t} onClick={() => { setTab(t); setSelectedId(null); setSelectedItems(new Set()) }}
             className={`flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium border-b-2 transition-all bg-transparent cursor-pointer shrink-0 whitespace-nowrap ${tab === t ? 'border-accent text-text font-semibold' : 'border-transparent text-muted hover:text-text'}`}>
@@ -549,7 +552,7 @@ export default function KnowledgePage() {
         ))}
       </div>
 
-      <div className={`flex-1 px-4 sm:px-6 py-4 min-h-0 ${tab === 'graph' ? 'flex flex-col' : 'overflow-y-auto'}`} ref={listContainerRef}>
+      <div className={`flex-1 px-4 md:px-6 py-4 min-h-0 ${tab === 'graph' ? 'flex flex-col' : 'overflow-y-auto'}`} ref={listContainerRef}>
         <EmbeddingStatus />
         {isEmpty && tab === 'list' ? (
           <>
@@ -655,21 +658,23 @@ export default function KnowledgePage() {
               </div>
             )}
           </div>
+        ) : tab === 'settings' ? (
+          <SettingsTab />
         ) : (
-          <SourcesList onIngest={handleFiles} uploadNamespace={uploadNamespace} setUploadNamespace={setUploadNamespace} namespaces={namespaces} ingestionJobs={ingestionJobs} uploadAccept={uploadAccept} acceptsNoExtension={acceptsNoExtension} />
+          <SourcesList onIngest={handleFiles} uploadNamespace={uploadNamespace} setUploadNamespace={setUploadNamespace} namespaces={namespaces} ingestionJobs={ingestionJobs} uploadAccept={uploadAccept} supportedFormatsDisplay={supportedFormatsDisplay} acceptsNoExtension={acceptsNoExtension} />
         )}
       </div>
 
       {/* Stats bar */}
       {stats && (
-        <div className="border-t border-border px-4 sm:px-6 py-2 flex gap-x-3 gap-y-0.5 sm:gap-4 flex-wrap text-[11px] sm:text-[12px] text-muted shrink-0">
+        <div className="border-t border-border px-4 md:px-6 py-2 flex gap-x-3 gap-y-0.5 sm:gap-4 flex-wrap text-[11px] sm:text-[12px] text-muted shrink-0">
           <span className="whitespace-nowrap">{stats.items} {i18nT('pages.knowledge.index.items_2')}</span>
           <span className="whitespace-nowrap">{stats.entities} {i18nT('pages.knowledge.index.entities')}</span>
           <span className="whitespace-nowrap">{stats.relations} {i18nT('pages.knowledge.index.relations')}</span>
           <span className="whitespace-nowrap">{stats.sources} {i18nT('pages.knowledge.index.sources')}</span>
           {stats.embeddings?.enabled ? (
             <span className={`whitespace-nowrap ${stats.embeddings.available ? 'text-ok' : 'text-warn'}`} title={stats.embeddings.available ? `${stats.embeddings.model} — ${stats.embeddings.embedded_items} embedded` : i18nT('pages.knowledge.index.embedding_model_loading', { name: stats.embeddings.model })}>
-              ● {stats.embeddings.available ? `embeddings (${stats.embeddings.embedded_items})` : i18nT('pages.knowledge.index.embeddings_loading')}
+              ● {stats.embeddings.available ? i18nT('pages.knowledge.index.embeddings_count', { value: stats.embeddings.embedded_items }) : i18nT('pages.knowledge.index.embeddings_loading')}
             </span>
           ) : (
             <span className="text-muted whitespace-nowrap" title={i18nT('pages.knowledge.index.embedding_model_is_downloading_in_the_background')}>{i18nT('pages.knowledge.index.embeddings_initializing')}</span>

@@ -32,6 +32,7 @@ UNCLASSIFIED_LABEL: Final = "unclassified"
 # renaming one here is a breaking change for stored rows.
 _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("critical_rules", r"\[CRITICAL RULES"),
+    ("ponytail_mode", r"\[PONYTAIL MODE\]"),
     ("agent_instructions", r"\[AGENT SYSTEM PROMPT\]"),
     ("session_wrapper", r"\[SESSION CONTEXT"),
     ("date", r"\[CURRENT DATE\]"),

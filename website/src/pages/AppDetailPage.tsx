@@ -33,6 +33,7 @@ type AppInfo = {
   author: string
   icon?: string
   iconUrl?: string
+  iconUrlDark?: string
   tags?: string[]
   highlights?: string[]
   screenshots?: string[]
@@ -250,6 +251,7 @@ export default function AppDetailPage() {
           // icon and hero instead of the generic Package box.
           icon: registryEntry?.icon || m.ui?.pages?.[0]?.icon || '',
           iconUrl: registryEntry?.iconUrl || m.iconUrl || m.ui?.pages?.[0]?.iconUrl || '',
+          iconUrlDark: registryEntry?.iconUrlDark || m.iconUrlDark || '',
           tags: m.tags || registryEntry?.tags || [],
           highlights: m.highlights || registryEntry?.highlights || [],
           screenshots: registryEntry?.screenshots || m.screenshots || [],
@@ -543,9 +545,13 @@ export default function AppDetailPage() {
   const desktopOnly = needsDesktopApp(app)
   const canUpdate = app.lifecycle === 'gateway'
   const canUninstall = app.lifecycle !== 'locked'
-  const agentCount = app.manifest?.agents?.length || 0
-  const skillCount = app.manifest?.skills?.length || 0
-  const cronCount = app.manifest?.crons?.length || 0
+  // Resource lists, derived once. `manifest` is absent for a registry-only app,
+  // and `normalizeInstalledApp` fills the lists for an installed one — so the
+  // fallback here is the registry case, not a defence against a partial
+  // manifest, and nothing below re-asserts past it (#3689).
+  const agents = app.manifest?.agents || []
+  const skills = app.manifest?.skills || []
+  const crons = app.manifest?.crons || []
   // Theme-aware hero banner source (mirrors the Browse card resolution).
   // Prefer the wide detail-ratio banner (heroImageDetail*); fall back to the
   // Browse hero, then the opposite theme.
@@ -564,7 +570,7 @@ export default function AppDetailPage() {
   return (
     <>
       <PageHeader title={i18nT('pages.appDetailPage.apps')} subtitle={appDisplayName(app)} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {/* Back link */}
         <button className="flex items-center gap-1.5 text-[13px] text-muted hover:text-text mb-5 bg-transparent border-none cursor-pointer p-0 font-body transition-colors" onClick={() => navigate('/apps')}>
           <ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}
@@ -660,7 +666,7 @@ export default function AppDetailPage() {
         {/* Hero */}
         <div className="flex items-start gap-5 mb-6">
           <div className="w-24 h-24 rounded-2xl bg-accent/10 flex items-center justify-center shrink-0 overflow-hidden">
-            <AppIcon icon={app.icon} iconUrl={app.iconUrl} size={64} />
+            <AppIcon icon={app.icon} iconUrl={app.iconUrl} iconUrlDark={app.iconUrlDark} size={64} />
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3 mb-1 flex-wrap">
@@ -958,26 +964,26 @@ export default function AppDetailPage() {
           )}
 
           {/* Resources (installed only) */}
-          {app.installed && (agentCount > 0 || skillCount > 0 || cronCount > 0) && (
+          {app.installed && (agents.length > 0 || skills.length > 0 || crons.length > 0) && (
             <Card>
               <CardTitle>{i18nT('pages.appDetailPage.resources')}</CardTitle>
               <div className="grid gap-1.5 mt-2 text-[13px]">
-                {(app.manifest?.agents || []).length > 0 && (
+                {agents.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Bot size={13} className="mt-0.5 shrink-0" />
-                    <div>{app.manifest!.agents!.map((a: string) => a.split('/').pop()?.replace('.json', '')).join(', ')}</div>
+                    <div>{agents.map((a: string) => a.split('/').pop()?.replace('.json', '')).join(', ')}</div>
                   </div>
                 )}
-                {(app.manifest?.skills || []).length > 0 && (
+                {skills.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Zap size={13} className="mt-0.5 shrink-0" />
-                    <div>{app.manifest!.skills!.map((s: string) => s.split('/').pop()).join(', ')}</div>
+                    <div>{skills.map((s: string) => s.split('/').pop()).join(', ')}</div>
                   </div>
                 )}
-                {(app.manifest?.crons || []).length > 0 && (
+                {crons.length > 0 && (
                   <div className="flex items-start gap-2 text-muted">
                     <Clock size={13} className="mt-0.5 shrink-0" />
-                    <div>{app.manifest!.crons!.map((c) => c.name).join(', ')}</div>
+                    <div>{crons.map((c) => c.name).join(', ')}</div>
                   </div>
                 )}
               </div>

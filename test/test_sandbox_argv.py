@@ -8,6 +8,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -514,8 +516,14 @@ class TestHardlinkScanBudget:
         # common healthy-host spawn pays nothing (and emits no truncation
         # warning). Both collection loops (SENSITIVE_DIRS and
         # SENSITIVE_FILES) carry the gate.
+        #
+        # REGULAR FILES only, and that half is not cosmetic: every directory has
+        # nlink >= 2, and SENSITIVE_FILES carries directories on purpose, so a bare
+        # nlink test armed the walk on every spawn. Behaviour is covered in
+        # test_sandbox_hardlink_scan.py; this is the source-level pin that both
+        # collection loops still carry the gate.
         script = _build_launcher_script("strict")
-        assert script.count("if _st.st_nlink > 1:") == 2
+        assert script.count("if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:") == 2
 
     def test_per_root_budget_covers_a_busy_tmp(self):
         # The budget only applies once a credential inode is actually
@@ -1385,6 +1393,354 @@ class TestCgroupScopeArgv:
             self._reset_probe()
 
 
+class TestAgentsSliceLimits:
+    """ensure_agents_slice_limits() puts an AGGREGATE MemoryMax/TasksMax on
+    kirocrew-agents.slice — the parent of every per-spawn scope — so N
+    concurrent scopes cannot collectively request N x 65% of host RAM while
+    each stays inside its own per-scope ceiling."""
+
+    def _reset(self):
+        import kiro_crew.sandbox as sb
+
+        sb._CGROUP_SCOPE_PROBE = None
+        sb._CGROUP_WARNED = False
+        sb._SLICE_LIMITS_APPLIED = False
+        sb._SLICE_OOM_SEEN = None
+
+    def test_applies_runtime_property_once_idempotent(self):
+        """One systemctl invocation with the exact property set; a second call
+        is a no-op returning True (idempotent across restarts of the caller).
+        argv[0] must be the TRUSTED absolute path, never a bare name PATH
+        could resolve to an agent-planted shim."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            run_mock = MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+            with (
+                patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")),
+                patch("kiro_crew.sandbox._slice_limits_from_config", return_value=(10000, 32768)),
+                patch(
+                    "kiro_crew.platform_compat.trusted_system_bin",
+                    return_value="/usr/bin/systemctl",
+                ),
+                patch("kiro_crew.sandbox.subprocess.run", run_mock),
+            ):
+                assert sb.ensure_agents_slice_limits() is True
+                assert sb.ensure_agents_slice_limits() is True
+            assert run_mock.call_count == 1
+            argv = run_mock.call_args[0][0]
+            assert argv == [
+                "/usr/bin/systemctl",
+                "--user",
+                "set-property",
+                "--runtime",
+                "kirocrew-agents.slice",
+                "MemoryMax=10000M",
+                "MemorySwapMax=0",
+                "TasksMax=32768",
+            ]
+        finally:
+            self._reset()
+
+    def test_no_trusted_systemctl_means_no_apply(self):
+        """PATH is never consulted: when no trusted systemctl exists, the
+        ceiling is skipped (returns False), not resolved through PATH."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            run_mock = MagicMock()
+            with (
+                patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")),
+                patch("kiro_crew.platform_compat.trusted_system_bin", return_value=None),
+                patch("kiro_crew.sandbox.subprocess.run", run_mock),
+            ):
+                assert sb.ensure_agents_slice_limits() is False
+            run_mock.assert_not_called()
+        finally:
+            self._reset()
+
+    def test_skipped_when_unavailable_and_no_second_warning(self, caplog):
+        """No delegation -> no systemctl call, and the slice site plus the
+        per-spawn site together emit exactly ONE SECURITY warning."""
+        import logging
+
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            run_mock = MagicMock()
+            with (
+                patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(False, "not Linux")),
+                patch("kiro_crew.sandbox.subprocess.run", run_mock),
+                caplog.at_level(logging.WARNING, logger="kiro_crew.sandbox"),
+            ):
+                assert sb.ensure_agents_slice_limits() is False
+                out = sb.cgroup_scope_argv(["git", "status"])
+            run_mock.assert_not_called()
+            assert out == ["git", "status"]
+            security = [r for r in caplog.records if "SECURITY" in r.getMessage()]
+            assert len(security) == 1
+        finally:
+            self._reset()
+
+    def test_failed_apply_is_retried_next_call(self):
+        """A nonzero rc leaves the ceiling unapplied — the next call retries
+        rather than caching the failure as success."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            run_mock = MagicMock(return_value=MagicMock(returncode=1, stderr="boom"))
+            with (
+                patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")),
+                patch("kiro_crew.sandbox._slice_limits_from_config", return_value=(10000, 32768)),
+                patch(
+                    "kiro_crew.platform_compat.trusted_system_bin",
+                    return_value="/usr/bin/systemctl",
+                ),
+                patch("kiro_crew.sandbox.subprocess.run", run_mock),
+            ):
+                assert sb.ensure_agents_slice_limits() is False
+                assert sb.ensure_agents_slice_limits() is False
+            assert run_mock.call_count == 2
+        finally:
+            self._reset()
+
+    def test_config_overrides_slice_limits(self):
+        import kiro_crew.sandbox as sb
+
+        with patch(
+            "kiro_crew.config.loader._raw_config",
+            return_value={
+                "resource_limits": {
+                    "max_total_memory_mb": 4096,
+                    "max_total_processes": 1000,
+                }
+            },
+        ):
+            mem, tasks = sb._slice_limits_from_config()
+        assert mem == 4096
+        assert tasks == 1000
+
+    def test_config_defaults_when_absent_or_junk(self):
+        """Zero/junk falls back to the default rather than leaving the
+        aggregate unset — same rule as the per-scope ceiling."""
+        import kiro_crew.sandbox as sb
+
+        with patch("kiro_crew.config.loader._raw_config", return_value={}):
+            mem, tasks = sb._slice_limits_from_config()
+        assert mem == sb._default_max_total_memory_mb()
+        assert tasks == sb._CGROUP_DEFAULT_MAX_TOTAL_TASKS
+        with patch(
+            "kiro_crew.config.loader._raw_config",
+            return_value={
+                "resource_limits": {
+                    "max_total_memory_mb": 0,
+                    "max_total_processes": "x",
+                }
+            },
+        ):
+            mem, tasks = sb._slice_limits_from_config()
+        assert mem == sb._default_max_total_memory_mb()
+        assert tasks == sb._CGROUP_DEFAULT_MAX_TOTAL_TASKS
+        # Fractional values pass a naive `> 0` check but truncate to 0, which
+        # would emit MemoryMax=0M and kill every agent scope — must fall back.
+        with patch(
+            "kiro_crew.config.loader._raw_config",
+            return_value={
+                "resource_limits": {
+                    "max_total_memory_mb": 0.5,
+                    "max_total_processes": 0.9,
+                }
+            },
+        ):
+            mem, tasks = sb._slice_limits_from_config()
+        assert mem == sb._default_max_total_memory_mb()
+        assert tasks == sb._CGROUP_DEFAULT_MAX_TOTAL_TASKS
+
+    def test_default_total_memory_fraction_and_fallback(self):
+        """80% of RAM by default; flat fallback when RAM is unreadable. Both
+        must sit ABOVE their per-scope counterparts, or the slice would clamp
+        a single spawn tighter than its own documented ceiling."""
+        import kiro_crew.sandbox as sb
+
+        sixteen_g = 16 * 1024**3
+        with patch("os.sysconf", side_effect=lambda n: sixteen_g // 4096 if "PHYS" in n else 4096):
+            mb = sb._default_max_total_memory_mb()
+        assert mb == int(sixteen_g * sb._CGROUP_TOTAL_MEMORY_FRACTION) // (1024 * 1024)
+        with patch("os.sysconf", side_effect=OSError("no sysconf")):
+            assert sb._default_max_total_memory_mb() == sb._CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB
+        assert sb._CGROUP_TOTAL_MEMORY_FRACTION > sb._CGROUP_MEMORY_FRACTION
+        assert sb._CGROUP_FALLBACK_MAX_TOTAL_MEMORY_MB > sb._CGROUP_FALLBACK_MAX_MEMORY_MB
+
+    def test_per_scope_property_still_emitted_ratchet(self):
+        """RATCHET: the two-level model needs BOTH layers. The per-spawn scope
+        must keep emitting its own MemoryMax under the slice — a future change
+        must not silently replace per-tree bounding with aggregate-only."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with (
+                patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")),
+                patch(
+                    "kiro_crew.sandbox._cgroup_limits_from_config",
+                    return_value=(8192, 4096, 50, 0),
+                ),
+                patch("kiro_crew.sandbox._cpu_controller_delegated", return_value=False),
+            ):
+                out = sb.cgroup_scope_argv(["kiro-cli", "chat"])
+            assert f"--slice={sb._CGROUP_AGENTS_SLICE}" in out
+            assert "MemoryMax=4096M" in out
+            assert "TasksMax=8192" in out
+        finally:
+            self._reset()
+
+    def _fake_slice(self, tmp_path, *, oom_kill=0, local_max=0, current=100, mem_max="1000"):
+        d = tmp_path / "kirocrew-agents.slice"
+        d.mkdir(exist_ok=True)
+        (d / "memory.events").write_text(f"low 0\nhigh 0\nmax 0\noom 0\noom_kill {oom_kill}\n")
+        (d / "memory.events.local").write_text(
+            f"low 0\nhigh 0\nmax {local_max}\noom 0\noom_kill 0\n"
+        )
+        (d / "memory.current").write_text(f"{current}\n")
+        (d / "memory.max").write_text(f"{mem_max}\n")
+        return d
+
+    def test_slice_pressure_seeds_then_reports_new_kills(self, tmp_path):
+        """First read seeds the counters (no spurious boot warning); a later
+        oom_kill increase is reported with the victim scope and whether the
+        slice-level ceiling engaged."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            d = self._fake_slice(tmp_path, oom_kill=2)
+            with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=d):
+                assert sb.check_agents_slice_pressure() is None  # seed only
+                # A scope takes a kill and the slice's own limit engaged.
+                self._fake_slice(tmp_path, oom_kill=3, local_max=1)
+                victim = d / "run-r1.scope"
+                victim.mkdir()
+                (victim / "memory.events.local").write_text(
+                    "low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\n"
+                )
+                msg = sb.check_agents_slice_pressure()
+                assert msg is not None
+                assert "1 new kill(s)" in msg
+                assert "run-r1.scope" in msg
+                assert "aggregate ceiling engaged: yes" in msg
+                # No further change -> quiet.
+                assert sb.check_agents_slice_pressure() is None
+        finally:
+            self._reset()
+
+    def test_slice_pressure_scope_local_breach_is_distinguished(self, tmp_path):
+        """A kill without a slice-level max event reads as a per-scope breach."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            d = self._fake_slice(tmp_path)
+            with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=d):
+                assert sb.check_agents_slice_pressure() is None
+                self._fake_slice(tmp_path, oom_kill=1, local_max=0)
+                msg = sb.check_agents_slice_pressure()
+                assert msg is not None
+                assert "a scope hit its own per-tree limit" in msg
+        finally:
+            self._reset()
+
+    def test_slice_pressure_none_when_slice_absent(self):
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=None):
+                assert sb.check_agents_slice_pressure() is None
+        finally:
+            self._reset()
+
+    def test_slice_pressure_self_heals_a_vanished_ceiling(self, tmp_path):
+        """A user-manager restart drops the --runtime property. The sampler
+        detects memory.max reading 'max' and re-applies — but only when WE
+        applied the ceiling before."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            d = self._fake_slice(tmp_path, mem_max="max")
+            ensure_mock = MagicMock(return_value=True)
+            with (
+                patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=d),
+                patch("kiro_crew.sandbox.ensure_agents_slice_limits", ensure_mock),
+            ):
+                sb._SLICE_LIMITS_APPLIED = True
+                sb.check_agents_slice_pressure()
+                ensure_mock.assert_called_once()
+                assert sb._SLICE_LIMITS_APPLIED is False  # reset so the re-apply is real
+        finally:
+            self._reset()
+
+    def test_slice_pressure_no_heal_when_never_applied(self, tmp_path):
+        """A host that never passed the delegation gate must not start
+        shelling out from the sampler."""
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            d = self._fake_slice(tmp_path, mem_max="max")
+            ensure_mock = MagicMock(return_value=True)
+            with (
+                patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=d),
+                patch("kiro_crew.sandbox.ensure_agents_slice_limits", ensure_mock),
+            ):
+                sb._SLICE_LIMITS_APPLIED = False
+                sb.check_agents_slice_pressure()
+                ensure_mock.assert_not_called()
+        finally:
+            self._reset()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="cgroup v2 scope enforcement is Linux-only")
+    def test_real_scope_nests_under_agents_slice(self):
+        """On a delegation-capable host, a real scope's cgroup path runs
+        through kirocrew-agents.slice — the structural premise of the
+        aggregate boundary: whatever limit the slice carries, the kernel
+        min-composes it over every scope. When the live slice carries a
+        MemoryMax (a running gateway applied one), assert the scope's own
+        limit is not the only bound in the ancestry. Skips cleanly where
+        delegation is unavailable. No host state is mutated: the test only
+        spawns a scope (as every spawn does) and reads cgroup files."""
+        import kiro_crew.sandbox as sb
+
+        sb._CGROUP_SCOPE_PROBE = None
+        try:
+            available, _ = sb._probe_cgroup_scope()
+            if not available:
+                pytest.skip("no cgroup v2 delegation on this host")
+            with patch(
+                "kiro_crew.sandbox._cgroup_limits_from_config", return_value=(50, 512, 50, 0)
+            ):
+                argv = sb.cgroup_scope_argv(
+                    [
+                        sys.executable,
+                        "-c",
+                        "cg=open('/proc/self/cgroup').read().split('::',1)[1].strip()\n"
+                        "print(cg)\n"
+                        "print(open('/sys/fs/cgroup'+cg+'/memory.max').read().strip())\n",
+                    ]
+                )
+            out = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            assert out.returncode == 0, out.stderr
+            cg_path, scope_max = out.stdout.strip().splitlines()
+            assert "/kirocrew-agents.slice/" in cg_path
+            assert scope_max == str(512 * 1024 * 1024)
+        finally:
+            sb._CGROUP_SCOPE_PROBE = None
+
+
 class TestCgroupScopeBusEnv:
     """The systemd-run scope prepended by cgroup_scope_argv needs the user
     session bus in the environment it is spawned with. Callers that build that
@@ -1906,3 +2262,401 @@ class TestMacOsNestingDetection:
             assert sandbox_mod._macos_sandbox_state() is None
         finally:
             sandbox_mod._macos_sandbox_state.cache_clear()
+
+
+class TestAgentSliceMemoryHigh:
+    """_ensure_agent_slice_memory_high() reconciles the AGGREGATE MemoryHigh
+    ceiling on kirocrew-agents.slice — bounding the SUM of all concurrent agent
+    scopes, which the per-scope MemoryMax cannot (N scopes each under their own
+    65% cap can still livelock a swapless host together)."""
+
+    def test_spawn_path_schedules_reconciliation_off_thread(self):
+        # cgroup_scope_argv runs on the gateway event loop, so the
+        # reconciliation (config read + systemctl subprocess) must happen in
+        # a worker thread, never inline on the caller's thread.
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        calling_thread: list = []
+        done = threading.Event()
+
+        def record_thread() -> None:
+            calling_thread.append(threading.current_thread())
+            done.set()
+
+        try:
+            with patch(
+                "kiro_crew.sandbox._ensure_agent_slice_memory_high",
+                side_effect=record_thread,
+            ):
+                sb._reconcile_slice_memory_high_off_thread()
+                assert done.wait(5.0), "reconciliation thread never ran"
+            assert calling_thread[0] is not threading.current_thread()
+        finally:
+            self._restore()
+
+    def test_schedule_during_reconciliation_queues_and_applies(self):
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        first_started = threading.Event()
+        release = threading.Event()
+        calls: list = []
+
+        def slow_reconcile() -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                first_started.set()
+                release.wait(5.0)
+
+        try:
+            with patch(
+                "kiro_crew.sandbox._ensure_agent_slice_memory_high",
+                side_effect=slow_reconcile,
+            ):
+                sb._reconcile_slice_memory_high_off_thread()
+                assert first_started.wait(5.0)
+                # A schedule landing mid-reconciliation is NOT dropped: the
+                # second worker queues on the mutex and re-reconciles from
+                # live config after the first releases it.
+                sb._reconcile_slice_memory_high_off_thread()
+                release.set()
+                for _ in range(200):
+                    if len(calls) == 2:
+                        break
+                    time.sleep(0.01)
+            assert len(calls) == 2
+        finally:
+            self._restore()
+
+    def test_thread_start_failure_disarms_without_aborting_the_spawn(self) -> None:
+        # Thread exhaustion on the spawn path must not raise (aborting the
+        # agent spawn) nor retain the in-flight slot forever.
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with patch(
+                "kiro_crew.sandbox.threading.Thread",
+                side_effect=RuntimeError("can't start new thread"),
+            ):
+                sb._reconcile_slice_memory_high_off_thread()  # must not raise
+            assert sb._SLICE_MEMHIGH_DISABLED is True
+            # The serialization mutex is untouched by the failure path:
+            assert sb._SLICE_MEMHIGH_MUTEX.acquire(blocking=False)
+            sb._SLICE_MEMHIGH_MUTEX.release()
+        finally:
+            self._restore()
+
+    def _reset(self):
+        import kiro_crew.sandbox as sb
+
+        sb._SLICE_MEMHIGH_APPLIED = None
+        sb._SLICE_MEMHIGH_DISABLED = False
+        sb._SLICE_MEMHIGH_EVENTS_SEEN = None
+        sb._SLICE_MEMHIGH_CLIMB_WARNED = False
+
+    def _restore(self):
+        # Leave the module disarmed, matching the autouse conftest fixture's
+        # in-test state (it restores its own snapshot afterwards).
+        import kiro_crew.sandbox as sb
+
+        sb._SLICE_MEMHIGH_APPLIED = None
+        sb._SLICE_MEMHIGH_DISABLED = True
+        sb._SLICE_MEMHIGH_EVENTS_SEEN = None
+        sb._SLICE_MEMHIGH_CLIMB_WARNED = False
+
+    def test_applies_host_default_via_systemctl_runtime(self):
+        # The slice is UID-global (shared by live/dev/pod gateways), so the
+        # ceiling is deliberately NOT config-driven: always the host-derived
+        # default, so no single instance can lift the others' protection.
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with (
+                patch("kiro_crew.sandbox._default_slice_memory_high_mb", return_value=2048),
+                patch("kiro_crew.sandbox.platform_compat.trusted_system_bin", return_value="/usr/bin/systemctl"),
+                patch("kiro_crew.sandbox.subprocess.run") as run,
+            ):
+                run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+                sb._ensure_agent_slice_memory_high()
+            assert run.call_count == 1
+            argv = run.call_args[0][0]
+            assert argv == [
+                "/usr/bin/systemctl",
+                "--user",
+                "set-property",
+                "--runtime",
+                "kirocrew-agents.slice",
+                "MemoryHigh=2048M",
+            ]
+            assert sb._SLICE_MEMHIGH_APPLIED == "2048M"
+        finally:
+            self._restore()
+
+    def test_steady_state_is_a_noop(self):
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with (
+                patch(
+                    "kiro_crew.sandbox._default_slice_memory_high_mb",
+                    return_value=2048,
+                ),
+                patch("kiro_crew.sandbox.platform_compat.trusted_system_bin", return_value="/usr/bin/systemctl"),
+                patch("kiro_crew.sandbox.subprocess.run") as run,
+            ):
+                run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+                sb._ensure_agent_slice_memory_high()
+                sb._ensure_agent_slice_memory_high()  # same value -> no spawn
+                assert run.call_count == 1
+            assert sb._SLICE_MEMHIGH_APPLIED == "2048M"
+        finally:
+            self._restore()
+
+    def test_failure_warns_once_and_disarms(self, caplog):
+        import logging
+
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with (
+                patch("kiro_crew.sandbox._default_slice_memory_high_mb", return_value=2048),
+                patch("kiro_crew.sandbox.platform_compat.trusted_system_bin", return_value="/usr/bin/systemctl"),
+                patch("kiro_crew.sandbox.subprocess.run") as run,
+            ):
+                run.return_value = MagicMock(returncode=1, stderr="Failed to set", stdout="")
+                with caplog.at_level(logging.WARNING):
+                    sb._ensure_agent_slice_memory_high()
+                    sb._ensure_agent_slice_memory_high()  # disarmed -> no retry
+                assert run.call_count == 1
+            sec = [r for r in caplog.records if "SECURITY" in r.getMessage()]
+            assert len(sec) == 1
+            assert "MemoryHigh" in sec[0].getMessage()
+            assert sb._SLICE_MEMHIGH_DISABLED is True
+            assert sb._SLICE_MEMHIGH_APPLIED is None
+        finally:
+            self._restore()
+
+    def test_missing_systemctl_warns_and_disarms_without_raising(self, caplog):
+        import logging
+
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with (
+                patch("kiro_crew.sandbox._default_slice_memory_high_mb", return_value=2048),
+                patch("kiro_crew.sandbox.platform_compat.trusted_system_bin", return_value=None),
+            ):
+                with caplog.at_level(logging.WARNING):
+                    sb._ensure_agent_slice_memory_high()
+            assert sb._SLICE_MEMHIGH_DISABLED is True
+            assert any("SECURITY" in r.getMessage() for r in caplog.records)
+        finally:
+            self._restore()
+
+    def test_cgroup_scope_argv_reconciles_when_available(self):
+        import kiro_crew.sandbox as sb
+
+        sb._CGROUP_SCOPE_PROBE = None
+        try:
+            with (
+                patch("kiro_crew.sandbox._probe_cgroup_scope", return_value=(True, "ok")),
+                patch(
+                    "kiro_crew.sandbox._cgroup_limits_from_config",
+                    return_value=(8192, 8192, 50, 0),
+                ),
+                patch("kiro_crew.sandbox._cpu_controller_delegated", return_value=False),
+                patch(
+                    "kiro_crew.sandbox._reconcile_slice_memory_high_off_thread"
+                ) as ensure,
+            ):
+                out = sb.cgroup_scope_argv(["kiro-cli", "chat"])
+            ensure.assert_called_once_with()
+            assert "--slice=kirocrew-agents.slice" in out
+        finally:
+            sb._CGROUP_SCOPE_PROBE = None
+
+    def test_cgroup_scope_argv_skips_reconcile_when_unavailable(self):
+        """No delegation -> passthrough argv AND no systemctl side effect (the
+        non-Linux / no-delegation degradation path)."""
+        import kiro_crew.sandbox as sb
+
+        sb._CGROUP_SCOPE_PROBE = None
+        sb._CGROUP_WARNED = False
+        try:
+            with (
+                patch(
+                    "kiro_crew.sandbox._probe_cgroup_scope",
+                    return_value=(False, "not Linux"),
+                ),
+                patch("kiro_crew.sandbox._ensure_agent_slice_memory_high") as ensure,
+            ):
+                out = sb.cgroup_scope_argv(["git", "status"])
+            ensure.assert_not_called()
+            assert out == ["git", "status"]
+        finally:
+            sb._CGROUP_SCOPE_PROBE = None
+            sb._CGROUP_WARNED = False
+
+    def test_default_is_host_proportional_with_fallback(self):
+        import kiro_crew.sandbox as sb
+
+        sixteen_g = 16 * 1024**3
+        with patch("os.sysconf", side_effect=lambda n: sixteen_g // 4096 if "PHYS" in n else 4096):
+            mb = sb._default_slice_memory_high_mb()
+        assert mb == int(sixteen_g * sb._SLICE_MEMORY_HIGH_FRACTION) // (1024 * 1024)
+        with patch("os.sysconf", side_effect=OSError("no sysconf")):
+            assert sb._default_slice_memory_high_mb() == sb._SLICE_FALLBACK_MEMORY_HIGH_MB
+        with patch("os.sysconf", return_value=0):
+            assert sb._default_slice_memory_high_mb() == sb._SLICE_FALLBACK_MEMORY_HIGH_MB
+
+    def test_worker_checks_pressure_after_reconcile(self):
+        # Throttle visibility rides the reconcile worker: every scheduled
+        # reconcile also reads memory.events, including the steady state
+        # where the MemoryHigh apply itself is a no-op string compare.
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        done = threading.Event()
+        try:
+            with (
+                patch("kiro_crew.sandbox._ensure_agent_slice_memory_high") as ensure,
+                patch(
+                    "kiro_crew.sandbox._check_slice_memory_pressure",
+                    side_effect=lambda: done.set(),
+                ) as check,
+            ):
+                sb._reconcile_slice_memory_high_off_thread()
+                assert done.wait(5.0), "pressure check never ran"
+            ensure.assert_called_once_with()
+            check.assert_called_once_with()
+        finally:
+            self._restore()
+
+    def test_pressure_warns_once_per_climbing_episode(self, caplog):
+        # A sustained throttling episode logs ONCE (at the first observed
+        # increase), stays silent while the counter keeps climbing, and
+        # re-arms only after an observation finds the counter stable.
+        import logging
+
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            readings = iter([0, 3, 5, 5, 7])
+            with patch(
+                "kiro_crew.sandbox._slice_memory_events_high",
+                side_effect=lambda: next(readings),
+            ):
+                with caplog.at_level(logging.WARNING):
+                    sb._check_slice_memory_pressure()  # 0: baseline, silent
+                    sb._check_slice_memory_pressure()  # 0 -> 3: warns
+                    sb._check_slice_memory_pressure()  # 3 -> 5: same episode
+                    sb._check_slice_memory_pressure()  # 5 == 5: episode ends
+                    sb._check_slice_memory_pressure()  # 5 -> 7: warns again
+            warns = [r for r in caplog.records if "memory.events" in r.getMessage()]
+            assert len(warns) == 2
+            assert "0 -> 3" in warns[0].getMessage()
+            assert "5 -> 7" in warns[1].getMessage()
+        finally:
+            self._restore()
+
+    def test_pressure_first_read_baselines_without_warning(self, caplog):
+        # The counter is monotonic for the slice cgroup's lifetime, so a
+        # nonzero FIRST read may predate this process — never warn on it.
+        import logging
+
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        try:
+            with patch("kiro_crew.sandbox._slice_memory_events_high", return_value=42):
+                with caplog.at_level(logging.WARNING):
+                    sb._check_slice_memory_pressure()
+            assert not [r for r in caplog.records if "memory.events" in r.getMessage()]
+            assert sb._SLICE_MEMHIGH_EVENTS_SEEN == 42
+        finally:
+            self._restore()
+
+    def test_pressure_counter_reset_rebaselines_silently(self, caplog):
+        # systemd releases an empty slice; recreation resets memory.events to
+        # zero. A DECREASE is that reset, not a climb: re-baseline, close any
+        # open episode, and warn again only on a genuine later increase.
+        import logging
+
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        sb._SLICE_MEMHIGH_EVENTS_SEEN = 5
+        sb._SLICE_MEMHIGH_CLIMB_WARNED = True
+        try:
+            with caplog.at_level(logging.WARNING):
+                with patch("kiro_crew.sandbox._slice_memory_events_high", return_value=2):
+                    sb._check_slice_memory_pressure()
+                assert sb._SLICE_MEMHIGH_EVENTS_SEEN == 2
+                assert sb._SLICE_MEMHIGH_CLIMB_WARNED is False
+                with patch("kiro_crew.sandbox._slice_memory_events_high", return_value=4):
+                    sb._check_slice_memory_pressure()
+            warns = [r for r in caplog.records if "memory.events" in r.getMessage()]
+            assert len(warns) == 1
+            assert "2 -> 4" in warns[0].getMessage()
+        finally:
+            self._restore()
+
+    def test_pressure_unreadable_is_silent_and_keeps_state(self, caplog):
+        # An unreadable memory.events (slice not materialized, no cgroup v2,
+        # macOS/Windows) must neither warn nor clobber the baseline.
+        import logging
+
+        import kiro_crew.sandbox as sb
+
+        self._reset()
+        sb._SLICE_MEMHIGH_EVENTS_SEEN = 5
+        try:
+            with patch("kiro_crew.sandbox._slice_memory_events_high", return_value=None):
+                with caplog.at_level(logging.WARNING):
+                    sb._check_slice_memory_pressure()
+            assert not [r for r in caplog.records if "memory.events" in r.getMessage()]
+            assert sb._SLICE_MEMHIGH_EVENTS_SEEN == 5
+        finally:
+            self._restore()
+
+    def test_slice_memory_events_high_reads_counter(self, tmp_path):
+        import kiro_crew.sandbox as sb
+
+        evt = tmp_path / "memory.events"
+        evt.write_text("low 0\nhigh 42\nmax 1\noom 0\noom_kill 0\n", encoding="utf-8")
+        with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=tmp_path):
+            assert sb._slice_memory_events_high() == 42
+        with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=None):
+            assert sb._slice_memory_events_high() is None
+        empty = tmp_path / "no-events"
+        empty.mkdir()
+        with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=empty):
+            assert sb._slice_memory_events_high() is None
+        evt.write_text("low 0\nhigh notanumber\n", encoding="utf-8")
+        with patch("kiro_crew.sandbox._agents_slice_cgroup_dir", return_value=tmp_path):
+            assert sb._slice_memory_events_high() is None
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="the resolver is Linux-only")
+    def test_slice_memory_events_high_resolves_dash_hierarchy(self, tmp_path):
+        """Regression: on the standard systemd layout the agents slice nests
+        under kirocrew.slice (dash-hierarchy), NOT directly under
+        user@<uid>.service. The reader must find memory.events through the
+        real resolver on that layout — a hardcoded flat path used to miss it,
+        silently disabling the throttle warning."""
+        import kiro_crew.sandbox as sb
+
+        nested = tmp_path / "kirocrew.slice" / sb._CGROUP_AGENTS_SLICE
+        nested.mkdir(parents=True)
+        (nested / "memory.events").write_text(
+            "low 0\nhigh 7\nmax 0\noom 0\noom_kill 0\n", encoding="utf-8"
+        )
+        with patch.object(sb, "_USER_MANAGER_CGROUP_BASE", str(tmp_path)):
+            assert sb._agents_slice_cgroup_dir() == nested
+            assert sb._slice_memory_events_high() == 7

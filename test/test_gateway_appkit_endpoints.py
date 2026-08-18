@@ -879,6 +879,50 @@ class TestReverseProxy:
             await runner.cleanup()
 
     @pytest.mark.asyncio
+    async def test_hmac_includes_percent_encoded_query_string_with_spaces(self, monkeypatch):
+        """HMAC signature correctly signs percent-encoded query parameters (spaces, #, non-ASCII)."""
+        from kiro_crew.apps.proxy_auth import verify_proxy_request
+
+        received_headers: dict[str, str] = {}
+
+        async def echo_handler(request: web.Request) -> web.Response:
+            for k, v in request.headers.items():
+                received_headers[k.lower()] = v
+            auth_hdr = request.headers.get("x-kirocrew-proxy", "")
+            verified = verify_proxy_request(
+                auth_hdr,
+                method=request.method,
+                target=request.rel_url.raw_path_qs,
+                body=b"",
+                secret=self._secret,
+            )
+            if not verified:
+                return web.json_response({"error": "unauthorized"}, status=401)
+            return web.json_response({"ok": True, "raw_path_qs": request.rel_url.raw_path_qs})
+
+        backend_app = web.Application()
+        backend_app.router.add_route("*", "/{path:.*}", echo_handler)
+        runner = web.AppRunner(backend_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = runner.addresses[0][1]
+
+        import kiro_crew.apps.routes as rmod
+        monkeypatch.setattr(rmod, "_resolve_app_backend_url", lambda name: f"http://127.0.0.1:{port}")
+
+        try:
+            async with self._make_client() as client:
+                # Test path containing space (%20) (#2053)
+                resp = await client.get("/apps/proxy-app/api/read?path=/tmp/my%20notes.md")
+                assert resp.status == 200, f"Expected 200, got {resp.status}"
+                data = await resp.json()
+                assert data["ok"] is True
+                assert data["raw_path_qs"] == "/api/read?path=/tmp/my%20notes.md"
+        finally:
+            await runner.cleanup()
+
+    @pytest.mark.asyncio
     async def test_hmac_covers_body(self, monkeypatch):
         """HMAC binds sha256 of the request body (integrity)."""
         import hashlib
@@ -1321,7 +1365,21 @@ class TestRegistryInstallStream:
     async def test_unknown_app_streams_error(
         self, app_env: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Installing a non-existent app should stream a done event with error."""
+        """Installing a non-existent app should stream a done event with error.
+
+        ``inventory_for_install`` is pinned to ``None`` — "catalog reachable,
+        app absent", the exact scenario the assertion below describes. The
+        real call performs a fresh, deliberately UNCACHED HTTPS fetch on
+        every install (a planted cache row must not supply install
+        coordinates), so without this pin the test's verdict depended on
+        live network from the runner (#4236): a transient fetch failure
+        takes the fail-closed ``CatalogUnavailable`` branch instead, which
+        the companion test below pins separately.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.apps.official_catalog.inventory_for_install",
+            lambda name: None,
+        )
         async with self._make_client() as client:
             resp = await client.post(
                 "/api/apps/registry/install-stream",
@@ -1333,6 +1391,41 @@ class TestRegistryInstallStream:
             # Should contain a done event with error
             assert "event: done" in body
             assert "not found in registry" in body
+
+    @pytest.mark.asyncio
+    async def test_catalog_outage_streams_fail_closed_error(
+        self, app_env: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the catalog cannot be consulted, install refuses fail-closed.
+
+        The other branch of the fork the test above pins: ``None`` means
+        authoritative absence, ``CatalogUnavailable`` means "could not ask" —
+        and the install path must refuse rather than fall back to unpinned
+        coordinates. Both branches are now deterministic instead of being
+        selected by the CI runner's live network (#4236).
+        """
+        from kiro_crew.apps import official_catalog
+
+        def _outage(name: str) -> None:
+            raise official_catalog.CatalogUnavailable(
+                "simulated catalog outage (test)"
+            )
+
+        monkeypatch.setattr(
+            "kiro_crew.apps.official_catalog.inventory_for_install", _outage,
+        )
+        async with self._make_client() as client:
+            resp = await client.post(
+                "/api/apps/registry/install-stream",
+                json={"name": "nonexistent-app"},
+            )
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "text/event-stream"
+            body = await resp.text()
+            assert "event: done" in body
+            # The fail-closed refusal, not the absence message.
+            assert "official catalog could not be reached" in body
+            assert "not found in registry" not in body
 
     @pytest.mark.asyncio
     async def test_streams_log_lines_then_done(
@@ -1465,6 +1558,19 @@ class TestRegistryInstallStream:
 
 class TestInstallFromRegistryLogLines:
     """Verify install_from_registry accepts custom log_lines."""
+
+    @pytest.fixture(autouse=True)
+    def _catalog_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin "catalog reachable, app absent" for the unknown-app path.
+
+        These tests exercise the same live-fetching resolution path as
+        ``test_unknown_app_streams_error`` (#4236); without the pin their
+        verdict depends on the runner's network.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.apps.official_catalog.inventory_for_install",
+            lambda name: None,
+        )
 
     @pytest.mark.asyncio
     async def test_custom_log_lines_receives_entries(self) -> None:

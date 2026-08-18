@@ -29,6 +29,7 @@ try:  # POSIX only; pods are refused on hosts without it (require_backend)
 except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.platform_compat import IS_LINUX, IS_MACOS
 from kiro_crew.pod import launchd
@@ -42,6 +43,16 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,60}$")
 
 class PodError(RuntimeError):
     """A pod operation could not be completed (bad name, no worktree, mint failed…)."""
+
+
+class PodBackendAbsent(PodError):
+    """The pod service manager is provably not running on this host.
+
+    Raised only from branches where the backend is demonstrably absent (e.g.
+    Linux with no session bus socket and no DBUS_SESSION_BUS_ADDRESS). Callers
+    that need to distinguish 'backend absent, no pods possible' from 'backend
+    present but erroring' can catch this subclass specifically.
+    """
 
 
 def validate_name(name: str) -> str:
@@ -72,24 +83,31 @@ CRONS_TRUE: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 
 def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    f = cfg.env_file(name)
+    """Parsed ``KEY='value'`` pairs for pod *name*, ``{}`` on any ``OSError``.
+
+    Fail-OPEN by design, which bounds who may use it: a missing pod, an
+    unreadable pods dir and a comments-only file all yield the same empty
+    mapping, so a caller that must tell "absent" from "exists but cannot be
+    positively read" MUST NOT read the pin through here — see
+    ``dev_fleet._read_pin_strict``, which propagates the failure instead.
+    """
     try:
-        if f.exists():
-            for ln in f.read_text().splitlines():
-                ln = ln.strip()
-                if not ln or ln.startswith("#") or "=" not in ln:
-                    continue
-                key, val = ln.split("=", 1)
-                raw = val.strip()
-                # Strip a single matched surrounding quote pair only (the form
-                # write_env_file emits), so a value that legitimately contains a
-                # quote is not mangled.
-                if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
-                    raw = raw[1:-1]
-                out[key.strip()] = raw
+        text = cfg.env_file(name).read_text()
     except OSError:
-        pass
+        return {}
+    out: dict[str, str] = {}
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        key, val = ln.split("=", 1)
+        raw = val.strip()
+        # Strip a single matched surrounding quote pair only (the form
+        # write_env_file emits), so a value that legitimately contains a quote is
+        # not mangled.
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        out[key.strip()] = raw
     return out
 
 
@@ -100,15 +118,35 @@ def write_env_file(cfg: PodConfig, name: str, updates: dict[str, str]) -> None:
     newlines, so a multi-line value would not round-trip. ``--seed`` is
     user-supplied, so reject a newline-bearing value loudly (fail-closed) rather
     than silently writing an un-parseable file.
+
+    **Written atomically**, because readers are deliberately lock-free: ``boot``
+    reads this file without taking the mutex (so ``pod up`` can hold it across
+    the health wait without deadlocking against the process it waits for). An
+    in-place truncating rewrite therefore has a window where a reader — a
+    ``Restart=`` re-exec, say — sees a partial or empty file. A dropped
+    ``APPROVAL`` is not a benign default: ``boot`` leaves ``approval_mode``
+    unset, which falls through to ``cfg.agent.approval_mode`` and lands on
+    auto-approve, the LEAST restrictive outcome. Temp-file + rename means an
+    unlocked reader sees either the old file or the new one, never a torn one.
+
+    The merge additionally re-acquires :func:`pod_name_mutex`, which every
+    mutating pod path already holds at its call site. That is defense in depth
+    for direct callers rather than a fix for a live race, and it mirrors what
+    ``start_pod`` / ``stop_pod`` already do; reentrancy is what makes
+    re-acquiring it inside an outer transaction safe.
     """
-    data = read_env_file(cfg, name)
-    data.update(updates)
-    for key, val in data.items():
+    for key, val in updates.items():
         if "\n" in val or "\r" in val:
             raise PodError(f"pod env value for {key!r} must be single-line")
-    cfg.pods_dir.mkdir(parents=True, exist_ok=True)
-    body = "".join(f"{k}='{v}'\n" for k, v in data.items())
-    cfg.env_file(name).write_text(body)
+    with pod_name_mutex(cfg, name):
+        data = read_env_file(cfg, name)
+        data.update(updates)
+        for key, val in data.items():
+            if "\n" in val or "\r" in val:
+                raise PodError(f"pod env value for {key!r} must be single-line")
+        cfg.pods_dir.mkdir(parents=True, exist_ok=True)
+        body = "".join(f"{k}='{v}'\n" for k, v in data.items())
+        atomic_write(cfg.env_file(name), body, newline="")
 
 
 def pin_checkout(cfg: PodConfig, name: str, checkout: Path) -> None:
@@ -321,7 +359,7 @@ def require_systemd() -> None:
     if not has_session_bus():
         uid = getattr(os, "getuid", lambda: -1)()
         user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(uid)
-        raise PodError(
+        raise PodBackendAbsent(
             f"no `systemd --user` session bus for uid {uid} "
             f"(looked for {session_bus_socket()}).\n"
             "Pods are systemd --user units, so one is required.\n"
@@ -505,8 +543,10 @@ def _write_and_load_unit(cfg: PodConfig) -> subprocess.CompletedProcess | None:
     systemd executes is the definition it loaded — so a writer that renders the
     current hookless template and then fails to reload leaves a file that reads
     "current" in front of a cached definition still carrying the destructive
-    ``ExecStopPost``. Every later caller then skips the refresh and the pod's HOME
-    is deleted from a stop hook. Unlinking on failure keeps the on-disk state
+    ``ExecStopPost``. :func:`start_pod` then skips its refresh and boots the pod
+    under that cached definition, whose hook deletes the pod's HOME on any
+    systemd-initiated stop — including the stop half of a ``Restart=``, which no
+    ``down`` gate is in the path of. Unlinking on failure keeps the on-disk state
     honest, so the next call re-renders and retries.
 
     Returns ``None`` on success, or the failing ``daemon-reload`` result.
@@ -798,7 +838,11 @@ def orphan_homes(cfg: PodConfig) -> list[str]:
     :func:`cleanup_home`'s re-validation via ``kirocrew pod down <name>``.
     """
     try:
-        entries = [p for p in cfg.pod_root.iterdir() if p.is_dir()]
+        # never follow a symlink: a link under pod_root can point at a LIVE
+        # pod's HOME (or anywhere), and everything downstream of this
+        # enumeration treats the NAME as the directory it will judge and
+        # delete. A real pod HOME is always created as a plain directory.
+        entries = [p for p in cfg.pod_root.iterdir() if p.is_dir() and not p.is_symlink()]
     except OSError:
         return []
     live = active_names(cfg)
@@ -832,11 +876,11 @@ def install_backend(cfg: PodConfig) -> tuple[str, subprocess.CompletedProcess | 
     dispatch layer — two different documented behaviours.
 
     Routed through :func:`_write_and_load_unit` so this path upholds the same
-    invariant the lifecycle paths do: a unit file left on disk has been loaded. A
-    reload that fails here used to leave a hookless file behind, which made
-    ``unit_is_current`` report "current" while systemd still ran the old
-    ``ExecStopPost`` — so a later ``down`` skipped its refresh and deleted the
-    pod's HOME from that hook.
+    invariant the lifecycle paths do: a unit file left on disk has been loaded.
+    A hookless file left behind by a failed reload would make
+    ``unit_is_current`` report "current" while systemd still runs the old
+    ``ExecStopPost`` — so :func:`start_pod` would skip its refresh and boot the
+    pod under a definition that deletes its HOME from a stop hook.
     """
     require_backend()
     if IS_MACOS:
@@ -1009,6 +1053,12 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         or (k.endswith("_TOKEN") and not k.startswith("AWS_"))
     ]:
         env.pop(key, None)
+    # Cross-plane guard: a gateway-descended caller inherits the LIVE
+    # gateway's KIROCREW_BOUND_PORT (dashboard.server._export_bound_port).
+    # Inside a pod env it would name the wrong plane — the pod's own
+    # KIROCREW_PORT above is the target — so drop it unconditionally rather
+    # than rely on resolution precedence alone.
+    env.pop("KIROCREW_BOUND_PORT", None)
     return env
 
 
@@ -1058,13 +1108,41 @@ def cleanup_home(cfg: PodConfig, name: str) -> int:
         print(f"refusing pod cleanup for invalid instance name {name!r}")
         return 2
     root = cfg.pod_root.resolve()
-    target = (cfg.pod_root / name).resolve()
+    unresolved = cfg.pod_root / name
+    # Refuse to delete THROUGH a symlink: resolving first lets a link planted
+    # under pod_root pass the containment check below while the tree it names
+    # lives elsewhere — including another, live pod's HOME. A real pod HOME is
+    # always created as a plain directory, so a link here is never ours to follow.
+    if unresolved.is_symlink():
+        print(f"refusing pod cleanup: {unresolved} is a symlink, not a pod HOME")
+        return 2
+    target = unresolved.resolve()
     if target == root or target.parent != root:
         print(f"refusing pod cleanup: {target} is not a pod dir under {root}")
         return 2
-    shutil.rmtree(target, ignore_errors=True)
-    if not target.exists():
+    # Delete by the UNRESOLVED name, never the resolved target: between the
+    # symlink pre-check above and this call the entry can be swapped for a
+    # symlink (check-to-use race), and rmtree on the RESOLVED path would then
+    # delete the live sibling the link points at. rmtree itself refuses a
+    # top-level symlink, so deleting by name makes the swap harmless — nothing
+    # is removed and the survivor check below reports the failure.
+    shutil.rmtree(unresolved, ignore_errors=True)
+    # Verify by the ENTRY itself, never the resolved target: an entry swapped
+    # to a DANGLING symlink during the delete makes rmtree refuse silently
+    # (suppressed by ignore_errors), and the resolved target of a dangling
+    # link does not exist — so a target-existence check would report a clean
+    # reclaim while the link remains as residue that orphan_homes (which
+    # skips symlinks) can never surface again.
+    if not os.path.lexists(unresolved):
         return 0
+    if unresolved.is_symlink():
+        # Swapped to a symlink mid-delete: rmtree refused it (correctly), and
+        # the link itself is the residue — name it rather than the target.
+        print(
+            f"pod cleanup did not remove {unresolved}: the entry is now a "
+            "symlink, which teardown refuses to follow — remove it by hand"
+        )
+        return 1
     survivors = _surviving_entries(target)
     print(
         f"pod cleanup did not fully remove {target}: still present "
@@ -1173,7 +1251,7 @@ def pod_context(cfg: PodConfig, name: str) -> tuple[Path, dict[str, str]]:
 #                    `chat --tui` branches straight into `_tui` (cli.py:1818), so
 #                    excluding only `tui` left the same hole open. Every OTHER
 #                    client verb (`status`, `logout`, and the credential verb) goes
-#                    through `cli_server.resolve_client_port`, which DOES honour
+#                    through `port_resolution.resolve_client_port`, which DOES honour
 #                    `KIROCREW_PORT` — so this hazard is confined to `_tui`.
 #   logs           — `cli_server._logs_cmd` runs `journalctl -u <SERVICE_NAME>`,
 #                    the HOST service unit, so inside a pod it would show the LIVE
@@ -1244,7 +1322,6 @@ def require_pod_safe_verb(argv: list[str], name: str) -> None:
     verb = argv[0] if argv else ""
     if verb in _POD_SAFE_VERBS:
         return
-    hint = ""
     if verb in _POD_EQUIVALENT:
         hint = f" Use `{_POD_EQUIVALENT[verb].format(name=name)}` instead."
     elif verb.startswith("-"):

@@ -1,11 +1,50 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { afterAll, describe, it, expect, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { render, screen, act, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
-import App, { calculateTopbarSearchLayout } from '../App'
+import App from '../App'
 import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
 import { openActivityPanel, sseSubagentQueued } from '../store/chatSlice'
 import SegmentedControl from '../components/SegmentedControl'
+import { ApiError } from '../api/client'
 import { safeSetItem } from '../utils/safeStorage'
+
+/** A failure `POST /api/chat/slots/{slot}/agent` really can return today. */
+const REAL_FAILURE = 'invalid agent name'
+
+/** Chrome the side tracks never get: the header's own `pl-2 pr-3` (20px) plus the
+ *  two 12px track gaps. Subtracted before reasoning about a group's width —
+ *  leaving the padding out is what first put the width factor 2vw too high. */
+const TOPBAR_GAPS = 44
+
+/** `clamp(240px, 22vw, 480px)` evaluated in JS. One definition, because three
+ *  assertions below reason about it and three copies would drift apart. The
+ *  literal it mirrors is pinned by the track-contract test. */
+const searchWidth = (w: number) => Math.min(480, Math.max(240, w * 0.22))
+
+/** The top-bar layout is a stylesheet contract (see `.topbar` in index.css):
+ *  jsdom applies no CSS, so these read the rule text rather than computed style,
+ *  which would pass against an empty rule. */
+function topbarCss(): string {
+  return readFileSync(join(__dirname, '..', 'index.css'), 'utf8')
+}
+/** The three declared tracks of the header grid, whitespace-normalised. */
+function topbarTracks(): { sides: string[]; search: string } {
+  const rule = topbarCss().match(/\.topbar\{[^}]*\}/)?.[0] ?? ''
+  const cols = rule.match(/grid-template-columns:([^;}]+)/)?.[1].trim() ?? ''
+  // Split on top-level spaces only: clamp()/minmax() contain spaces of their own.
+  const parts: string[] = []
+  let depth = 0
+  let cur = ''
+  for (const ch of cols) {
+    if (ch === '(') depth++
+    if (ch === ')') depth--
+    if (ch === ' ' && depth === 0) { if (cur) parts.push(cur); cur = '' } else cur += ch
+  }
+  if (cur) parts.push(cur)
+  return { sides: [parts[0], parts[2]], search: parts[1] }
+}
 
 // Mock all page components to isolate routing
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
@@ -26,7 +65,7 @@ vi.mock('../api/client', () => ({
     chatSlots: vi.fn().mockResolvedValue([]),
     notifications: vi.fn().mockResolvedValue({ notifications: [] }),
     status: vi.fn().mockResolvedValue({ uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 }),
-    sessionsUsage: vi.fn().mockResolvedValue({ usage: { credits_used: 3044, credits_covered: 3044, credits_overage: 0, credits_plan: 10000, resets: '2026-07-01', plan: 'KIRO POWER', cost_usd: 0, overage_rate: '0.04' } }),
+    sessionsUsage: vi.fn().mockResolvedValue({ usage: { credits_used: 3044, credits_covered: 3044, credits_overage: 0, credits_plan: 10000, resets: '2026-07-01', plan: 'KIRO POWER', cost_usd: 0, overage_rate: '0.04', bonus_credits: [{ name: 'Launch bonus', used: 250, total: 1000, days_left: 30 }], email: 'owner@example.com', account_type: 'Social' } }),
     listApps: vi.fn().mockResolvedValue([]),
     system: vi.fn().mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 }),
     chatSlotAgent: vi.fn().mockResolvedValue({}),
@@ -178,6 +217,19 @@ describe('App routing', () => {
       return api
     }
 
+    afterAll(async () => {
+      // Restore the default fully-onboarded mock so subsequent describe blocks
+      // don't inherit a first-run state that renders the Privacy chapter.
+      const { api } = await import('../api/client')
+      vi.mocked(api.themeBoot).mockResolvedValue({
+        mode: '',
+        color: '',
+        onboarded: true,
+        import_onboarded: true,
+        privacy_acked: true,
+      } as never)
+    })
+
     it('opens after Import setup and gates the Customize chapter', async () => {
       await freshFirstRun()
       // Nothing to import: the import chapter completes itself, and Privacy is
@@ -322,6 +374,16 @@ describe('App routing', () => {
   it('renders chat page at /chat', () => {
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByTestId('chat-page')).toBeInTheDocument()
+  })
+
+  it('sizes the app shell in dvh so mobile browser chrome cannot cover the bottom row', () => {
+    renderWithProviders(<App />, { route: '/chat' })
+    // happy-dom does no layout, so the utility pair itself is pinned: h-dvh
+    // tracks the visible viewport where dvh is supported, h-screen (100vh,
+    // which extends under collapsible mobile browser UI) is the fallback.
+    const shell = screen.getByTestId('dashboard-shell').closest('.h-screen')
+    expect(shell).not.toBeNull()
+    expect(shell!.className).toContain('supports-[height:100dvh]:h-dvh')
   })
 
   it('redirects /agents to the Agent Capabilities panel', () => {
@@ -691,10 +753,101 @@ describe('App routing', () => {
     expect(screen.getByRole('dialog', { name: 'Search everywhere' })).toBeInTheDocument()
   })
 
-  it('reserves the larger topbar cluster before showing the centered search', () => {
-    expect(calculateTopbarSearchLayout(330, 180, 1200)).toEqual({ gutter: 342, visible: true })
-    expect(calculateTopbarSearchLayout(180, 505, 1570)).toEqual({ gutter: 517, visible: true })
-    expect(calculateTopbarSearchLayout(330, 180, 900)).toEqual({ gutter: 342, visible: false })
+  it('renders the search trigger in the header centre track, not as a positioned overlay', () => {
+    renderWithProviders(<App />, { route: '/chat' })
+    const trigger = screen.getByRole('button', { name: 'Search sessions, files, and commands' })
+    // The trigger is a flow item now: it fills its grid track (`w-full`) and
+    // carries no positioning of its own. The previous implementation centred it
+    // on `50vw` with a JS-measured inline width, which is what forced it to
+    // reserve `max(left, right)` on BOTH sides and drop itself once that
+    // mirrored gutter fell under a floor.
+    expect(trigger).toHaveClass('w-full')
+    expect(trigger).not.toHaveClass('absolute')
+    expect(trigger.style.left).toBe('')
+    expect(trigger.style.width).toBe('')
+    // Header children, in order: left group · trigger · actions group. The
+    // three-track grid depends on that being exactly three in-flow children.
+    const header = trigger.parentElement!
+    const flow = [...header.children].filter(el => !el.className.includes('absolute'))
+    expect(flow[0]).toHaveClass('tb-left')
+    expect(flow[1]).toBe(trigger)
+    expect(flow[2]).toHaveClass('tb-right')
+  })
+
+  it('sizes the top-bar search from the window alone, with equal side tracks', () => {
+    // The layout lives in the stylesheet, so the contract is asserted there:
+    // jsdom applies no CSS, and a computed-style assertion would pass against
+    // an empty rule. Equal side tracks are what make the search exactly
+    // window-centred without measuring anything.
+    const { search, sides } = topbarTracks()
+    expect(search).toBe('clamp(240px, 22vw, 480px)')
+    expect(sides).toEqual(['minmax(0,1fr)', 'minmax(0,1fr)'])
+  })
+
+  it('leaves every desktop width room for the actions group icons-only form', () => {
+    // The invariant that replaced the per-track floor: the side tracks are pure
+    // remainder, so the search width function is the only thing standing between
+    // a narrow window and a clipped actions group. 139px is the measured
+    // icons-only width of that group (capture/topbar-search-variants.tsx).
+    const ICONS_ONLY = 139
+    for (let w = 768; w <= 3840; w += 8) {
+      const perSide = (w - searchWidth(w) - TOPBAR_GAPS) / 2
+      expect(perSide).toBeGreaterThanOrEqual(ICONS_ONLY)
+    }
+  })
+
+  it('keeps the live readouts at the modal desktop widths', () => {
+    // The point of the width function, and the reason it is 22vw rather than
+    // something roomier: the widest readout tier measures 518px and its rung
+    // fires at 530px, so the side track has to clear 531 or the numbers are
+    // evicted. The layout this replaces showed full readouts at these widths, so
+    // evicting them would be a regression traded for a bigger inert trigger.
+    const READOUT_RUNG = 530
+    for (const w of [1440, 1600, 1920, 2560]) {
+      const perSide = (w - searchWidth(w) - TOPBAR_GAPS) / 2
+      expect(perSide).toBeGreaterThan(READOUT_RUNG)
+    }
+  })
+
+  it('never makes the search wider than the mirrored-gutter layout above 1376px', () => {
+    // "Equal or narrower" is the constraint on this redesign: the space reclaimed
+    // from the mirrored gutter goes to the side groups, not into a bigger
+    // trigger. That holds from 1376px up, where the old geometry's own box was
+    // still growing.
+    //
+    // The exception is the 1304-1370 band, asserted separately below: there the
+    // old layout had already been squeezed to its 240px floor (one pixel narrower
+    // and it unmounted the trigger entirely), so "narrower than old" would mean
+    // capping the new box at 240 up to 1370 -- a ~17vw factor that would hand the
+    // side groups far more room than their content can use.
+    const oldWidth = (w: number) => {
+      const gutter = Math.ceil(Math.max(187, 520)) + 12   // measured clusters
+      return Math.max(240, Math.min(Math.round(w / 3) - 40, w - gutter * 2))
+    }
+    for (let w = 1376; w <= 3840; w += 8) {
+      expect(searchWidth(w)).toBeLessThanOrEqual(oldWidth(w))
+    }
+  })
+
+  it('stays within the old floor-to-cap envelope in the band where the old box was pinned', () => {
+    // 1304 (the old layout's visibility threshold) to ~1370 (where the two cross).
+    // The old box was pinned at 240 across the whole band; the new one grows from
+    // 287 to 301, so it is wider -- bounded, and against a box the old design was
+    // about to drop rather than one it was rendering comfortably.
+    for (const w of [1304, 1336, 1368]) {
+      expect(searchWidth(w)).toBeLessThanOrEqual(301)
+    }
+  })
+
+  it('gives each side group its own size-query container and container-keyed rungs', () => {
+    // Each group re-lays-out against the width IT was handed, which a viewport
+    // media query cannot know: the actions group's content varies with the usage
+    // pill, resource posture and registered extension segments.
+    const css = topbarCss()
+    expect(css).toMatch(/\.tb-left,\s*\.tb-right\{[^}]*container-type:\s*inline-size/)
+    for (const rung of ['tb-drop-metrics', 'tb-drop-usage', 'tb-drop-feedback', 'tb-narrow-only']) {
+      expect(css).toMatch(new RegExp(`@container \\([^)]+\\)\\{\\s*\\.${rung}\\{`))
+    }
   })
 
   it('resizes the sidebar and main body together with a quick shell transition', () => {
@@ -909,6 +1062,41 @@ describe('App routing', () => {
   })
 })
 
+describe('mobile nav drawer insets', () => {
+  /** The drawer's className, read from source: it only renders below 768px and
+   *  jsdom applies no CSS, so a rendered assertion here would either need the
+   *  whole mobile shell stood up or would pass against an empty rule. */
+  function mobileDrawerClasses(): string[] {
+    const src = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8')
+    const drawer = src.slice(src.indexOf('key="mobile-nav-drawer"'))
+    const cls = drawer.match(/className="([^"]+)"/)?.[1] ?? ''
+    expect(cls, 'expected to find the mobile nav drawer className').not.toBe('')
+    return cls.split(/\s+/)
+  }
+
+  it('insets all four sides equally', () => {
+    // The drawer is `fixed` to the VIEWPORT, not placed in the grid row below
+    // the topbar the way the desktop rail is, so it owns its own top offset.
+    // Without it the card's rounded top edge sits flat against the screen while
+    // the other three sides float — see the reported defect.
+    const classes = mobileDrawerClasses()
+    expect(classes).toContain('mx-2')
+    expect(classes).toContain('mt-2')
+    expect(classes).toContain('mb-2')
+    expect(classes).not.toContain('mt-0')
+  })
+
+  it('spans the viewport height so both margins resolve', () => {
+    // `top-0 bottom-0` with a margin on each end resolves the height to
+    // viewport-16px. Dropping either anchor would make the margins inert (auto
+    // height) and re-open the flush-top defect from the other direction.
+    const classes = mobileDrawerClasses()
+    expect(classes).toContain('fixed')
+    expect(classes).toContain('top-0')
+    expect(classes).toContain('bottom-0')
+  })
+})
+
 describe('TopbarMetrics widget', () => {
   it('shows only the Activity toggle button when metricsOpen is not set', () => {
     localStorage.removeItem('mc-topbar-metrics')
@@ -989,6 +1177,68 @@ describe('onCycleAgent keyboard shortcut', () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
     })
     expect(api.chatSlotAgent).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['forward', 'A', 'KeyA', 'reviewer'],
+    ['backward', 'Z', 'KeyZ', 'oracle'],
+  ])('surfaces an agent-switch API failure when cycling %s', async (_direction, key, code, expectedAgent) => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new ApiError(400, REAL_FAILURE, JSON.stringify({ error: REAL_FAILURE })),
+    )
+    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: true, agent: 'kirocrew' }] })
+    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+    renderWithProviders(<App />, { route: '/chat' })
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key, code, altKey: true, shiftKey: true, bubbles: true }))
+    })
+
+    expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', expectedAgent)
+    const noticeText = await screen.findByText(
+      REAL_FAILURE,
+    )
+    expect(noticeText.closest('[role="status"]')).not.toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByText(
+      REAL_FAILURE,
+    )).not.toBeInTheDocument()
+  })
+
+  it('restarts the six-second expiry after a repeated failure', async () => {
+    const { api } = await import('../api/client')
+    const { store } = await import('../store')
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const failure = new ApiError(400, REAL_FAILURE, JSON.stringify({ error: REAL_FAILURE }))
+      ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockRejectedValue(failure)
+      store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: true, agent: 'kirocrew' }] })
+      store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
+      renderWithProviders(<App />, { route: '/chat' })
+
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
+        await Promise.resolve()
+      })
+      const copy = REAL_FAILURE
+      expect(screen.getByText(copy)).toBeInTheDocument()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
+        await Promise.resolve()
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(screen.getByText(copy)).toBeInTheDocument()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(4500) })
+      expect(screen.queryByText(copy)).not.toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+      ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockResolvedValue({})
+    }
   })
 })
 
@@ -1229,7 +1479,7 @@ describe('Kiro credits pill', () => {
   it('renders used/limit and percentage once loaded', async () => {
     renderWithProviders(<App />, { route: '/chat' })
     // default mock: 3044 total used of 10000 = 30%
-    const pill = await screen.findByTitle(/Kiro credits: 3,044 \/ 10,000 \(30%\)/)
+    const pill = await screen.findByTitle('Kiro credit usage')
     expect(pill).toBeInTheDocument()
   })
 
@@ -1240,15 +1490,21 @@ describe('Kiro credits pill', () => {
     } as never)
     renderWithProviders(<App />, { route: '/chat' })
     // credits_used=10500 total / 10000 plan = 105% (500 over plan)
-    expect(await screen.findByTitle(/Kiro credits: 10,500 \/ 10,000 \(105%\)/)).toBeInTheDocument()
+    expect(await screen.findByTitle('Kiro credit usage')).toBeInTheDocument()
   })
 
   it('opens a details modal with breakdown rows when clicked', async () => {
     renderWithProviders(<App />, { route: '/chat' })
-    const pill = await screen.findByTitle(/Kiro credits: 3,044/)
+    const pill = await screen.findByTitle('Kiro credit usage')
     fireEvent.click(pill)
+    expect(await screen.findByRole('dialog', { name: 'Kiro Account' })).toBeInTheDocument()
+    expect(await screen.findByText('owner@example.com')).toBeInTheDocument()
+    expect(screen.getByText(/Signed in with Social login/)).toBeInTheDocument()
     expect(await screen.findByText('KIRO POWER')).toBeInTheDocument()
-    expect(screen.getByText('2026-07-01')).toBeInTheDocument()
+    expect(screen.getByText(/Resets/)).toBeInTheDocument()
+    expect(screen.getByText(/Remaining credit balance: 6,956/)).toBeInTheDocument()
+    expect(screen.getByText('Launch bonus')).toBeInTheDocument()
+    expect(screen.getByText(/Remaining credit balance: 750/)).toBeInTheDocument()
     expect(screen.getByText('Overage used')).toBeInTheDocument()
     expect(screen.getByText(/across chat, agents, MCP/)).toBeInTheDocument()
   })
@@ -1269,12 +1525,7 @@ describe('Kiro credits pill — edge cases', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const loadingPill = await screen.findByTitle(/Kiro credit usage/)
     fireEvent.click(loadingPill)
-    const loadingMsg = await screen.findByText(/Checking usage/)
-    expect(loadingMsg).toBeInTheDocument()
-    // The whole message is wrapped in one <span> so the flex row renders it as
-    // flowing prose instead of fragmenting each text run into its own column.
-    expect(loadingMsg.tagName).toBe('SPAN')
-    expect(loadingMsg.querySelector('code')?.textContent).toBe('kiro-cli /usage')
+    expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
   })
 
   it('defaults covered/overage to 0 and renders sub-1000 values without K suffix', async () => {
@@ -1282,7 +1533,7 @@ describe('Kiro credits pill — edge cases', () => {
     // only credits_plan present -> credits_used falls back to 0
     vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: { credits_plan: 500 } } as never)
     renderWithProviders(<App />, { route: '/chat' })
-    const pill = await screen.findByTitle(/Kiro credits: 0 \/ 500 \(0%\)/)
+    const pill = await screen.findByTitle('Kiro credit usage')
     expect(pill).toHaveTextContent('0/500') // sub-1000 -> no "K" formatting
     fireEvent.click(pill)
     expect(await screen.findByText('0 credits')).toBeInTheDocument() // Overage used row
@@ -1292,7 +1543,7 @@ describe('Kiro credits pill — edge cases', () => {
     const { api } = await import('../api/client')
     vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: { credits_plan: 0, credits_covered: 0 } } as never)
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByTitle(/Kiro credits: 0 \/ 0 \(0%\)/)).toBeInTheDocument()
+    expect(await screen.findByTitle('Kiro credit usage')).toBeInTheDocument()
   })
 
   it('falls back to an empty object when the response has no usage key', async () => {
@@ -1305,11 +1556,16 @@ describe('Kiro credits pill — edge cases', () => {
 
   it('closes the modal on Escape', async () => {
     renderWithProviders(<App />, { route: '/chat' })
-    const pill = await screen.findByTitle(/Kiro credits: 3,044/)
+    const pill = await screen.findByTitle('Kiro credit usage')
+    // Focus the pill first, as a real click does: focus restore is `Modal`'s
+    // generic behaviour (it returns focus to whatever was focused when the
+    // dialog opened), not a per-call-site `ref.focus()` in App.
+    pill.focus()
     fireEvent.click(pill)
     expect(await screen.findByText('Overage used')).toBeInTheDocument()
     act(() => { fireEvent.keyDown(window, { key: 'Escape' }) })
     await waitFor(() => expect(screen.queryByText('Overage used')).not.toBeInTheDocument())
+    await waitFor(() => expect(pill).toHaveFocus())
   })
 
   it('hides the pill entirely when usage is unavailable (non-Kiro provider)', async () => {
@@ -1318,7 +1574,7 @@ describe('Kiro credits pill — edge cases', () => {
     vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { available: false } } as never)
     renderWithProviders(<App />, { route: '/chat' })
     await waitFor(() => expect(screen.queryByTitle(/Kiro credit usage/)).not.toBeInTheDocument())
-    expect(screen.queryByTitle(/Kiro credits:/)).not.toBeInTheDocument()
+    expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument()
   })
 
   it('auto-closes the modal if usage resolves to unavailable while it is open', async () => {
@@ -1328,9 +1584,9 @@ describe('Kiro credits pill — edge cases', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const pill = await screen.findByTitle(/Kiro credit usage/)
     fireEvent.click(pill)
-    expect(await screen.findByText(/Checking usage/)).toBeInTheDocument()
+    expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
     await act(async () => { resolveUsage({ usage: { available: false } }); await Promise.resolve() })
-    await waitFor(() => expect(screen.queryByText(/Checking usage/)).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument())
   })
 
   it('never renders NaN when credit fields arrive non-finite', async () => {
@@ -1339,7 +1595,7 @@ describe('Kiro credits pill — edge cases', () => {
     renderWithProviders(<App />, { route: '/chat' })
     // Non-finite plan is rejected by the Number.isFinite guard, so the loaded
     // pill (which would otherwise show "NaN / NaN") never appears.
-    await waitFor(() => expect(screen.queryByTitle(/Kiro credits:/)).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument())
     expect(screen.queryByText(/NaN/)).not.toBeInTheDocument()
   })
 })

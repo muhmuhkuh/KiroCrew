@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import model_registry
-from kiro_crew.config.loader import DASHBOARD_PORT, config_dir
+from kiro_crew.config.loader import config_dir
 from kiro_crew.cron import (
     CronJob,
     CronService,
@@ -41,6 +41,7 @@ from kiro_crew.mcp_core import _resolve_session_key
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import _AGENT_DENIED_ENV_KEYS
 from kiro_crew.security import (
     _SENSITIVE_HOME_DIRS,
@@ -450,6 +451,8 @@ def _audit_governance_deny(session_key: str, tool_name: str, scope: str, decisio
     trail. Never raises (audit must not wedge the deny path).
     """
     try:
+        # Resolved from ``kiro_crew.sel`` at call time, not through the
+        # module-level binding, so a substituted SEL factory is observed.
         from kiro_crew.sel import sel
 
         sel().log_governance_decision(
@@ -1111,6 +1114,14 @@ def _list_tools() -> list[dict[str, Any]]:
                         "Defaults: 30s for scripts, 300s for commands. "
                         "Set higher for long-running tasks.",
                     },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Per-wake execution budget in seconds "
+                        "(1..86400; the asyncio deadline for one run of this "
+                        "job, default 1800). Distinct from 'timeout', which "
+                        "bounds only script/command subprocesses. Raise it for "
+                        "agents whose single wake legitimately outgrows 30 min.",
+                    },
                 },
                 "required": ["name"],
             },
@@ -1126,6 +1137,20 @@ def _list_tools() -> list[dict[str, Any]]:
                     "message": {"type": "string", "description": "New message"},
                     "cron_expr": {"type": "string", "description": "New cron expression"},
                     "every": {"type": "integer", "description": "New interval in seconds (min 60)"},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Script/command subprocess timeout in "
+                        "seconds (0..86400; 0 = defaults: 30s script, 300s "
+                        "command).",
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Per-wake execution budget in seconds "
+                        "(1..86400; the asyncio deadline for one run of this "
+                        "job, default 1800). Distinct from 'timeout', which "
+                        "bounds only script/command subprocesses. Raise it for "
+                        "jobs whose single run legitimately outgrows 30 min.",
+                    },
                     "agent": {"type": "string", "description": "New agent name"},
                     "channel": {"type": "string", "description": "New channel ID"},
                     "thread_ts": {
@@ -1301,6 +1326,8 @@ def _render_cron_list_full(jobs: list[Any]) -> str:
             j.last_status == "ok"
             and (j.script or j.command)
             and j.last_result
+            # Registries written before result_produced existed persist a literal
+            # "ok" sentinel, which would render as though it were real output.
             and j.last_result != "ok"
         ):
             san_res = _sanitize(j.last_result)[:_RESULT_PREVIEW_LEN]
@@ -1428,6 +1455,31 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
     )
 
 
+def _check_cron_job_ownership(svc: "CronService", job_id: str) -> str | None:
+    """Return an error string if the caller doesn't own this job, else None."""
+    session_key = _resolve_session_key()
+    is_cli = os.environ.get("KIROCREW_CLI", "") == "1"
+    if is_cli:
+        return None  # CLI admin bypass
+    if not session_key:
+        return None  # No session context (single-user local mode) — allow
+    job = svc.get_job(job_id)
+    if not job:
+        return f"Job not found: {job_id}"
+    if job.session_key != session_key:
+        try:
+            sel().log_tool_invocation(
+                session_key=session_key,
+                tool_name=f"cron:{job_id}",
+                outcome="denied",
+                error="cross-session ownership check failed",
+            )
+        except Exception:
+            pass
+        return f"Error: job not found: {job_id}"  # Anti-enumeration + Error: prefix
+    return None
+
+
 def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     """Execute a cron tool (post-validation)."""
     svc = CronService(base_dir=config_dir())
@@ -1438,6 +1490,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         jobs = svc.list_jobs(include_disabled=True)
         if not jobs:
             return "No cron jobs."
+        # Ownership filter: non-CLI callers see only their own jobs
+        session_key = _resolve_session_key()
+        is_cli = os.environ.get("KIROCREW_CLI", "") == "1"
+        if not is_cli and session_key:
+            jobs = [j for j in jobs if j.session_key == session_key]
+            if not jobs:
+                return "No cron jobs."
         # Drill-in: ids filter forces full bodies for matching jobs only.
         if ids_filter:
             id_set = set(ids_filter)
@@ -1543,6 +1602,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         hide_in_chat = args.get("hide_in_chat")
         strict_schedule = args.get("strict_schedule")
         timeout_val = args.get("timeout", 0)
+        timeout_secs_val = args.get("timeout_secs", 0)
         try:
             job = svc.add_job(
                 name=n,
@@ -1569,6 +1629,7 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 session_key=session_key,
                 minimal_context=minimal_context if isinstance(minimal_context, bool) else False,
                 timeout=timeout_val or 0,
+                timeout_secs=timeout_secs_val or 0,
             )
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
@@ -1586,6 +1647,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "cron_update":
         jid = args["job_id"]
+        # Ownership check
+        own_err = _check_cron_job_ownership(svc, jid)
+        if own_err:
+            return own_err
         kwargs: dict[str, Any] = {}
         for key in ("name", "message"):
             if key in args and args[key]:
@@ -1646,6 +1711,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             kwargs["every_secs"] = args["every"]
         if "timeout" in args:
             kwargs["timeout"] = args["timeout"]
+        if "timeout_secs" in args:
+            kwargs["timeout_secs"] = args["timeout_secs"]
         if not kwargs:
             return "Error: no fields to update"
         try:
@@ -1668,6 +1735,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "cron_remove":
         jid = args["job_id"]
+        # Ownership check
+        own_err = _check_cron_job_ownership(svc, jid)
+        if own_err:
+            return own_err
         try:
             removed = svc.remove_job(jid)
         except CronStoreBusy:
@@ -1722,6 +1793,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "cron_pause":
         jid = args["job_id"]
+        # Ownership check
+        own_err = _check_cron_job_ownership(svc, jid)
+        if own_err:
+            return own_err
         try:
             paused = svc.enable_job(jid, enabled=False)
         except CronStoreBusy:
@@ -1732,6 +1807,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "cron_resume":
         jid = args["job_id"]
+        # Ownership check
+        own_err = _check_cron_job_ownership(svc, jid)
+        if own_err:
+            return own_err
         try:
             resumed = svc.enable_job(jid, enabled=True)
         except CronStoreBusy:
@@ -1742,7 +1821,16 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
 
     if name == "cron_trigger":
         jid = args["job_id"]
-        port = DASHBOARD_PORT
+        # Ownership check
+        own_err = _check_cron_job_ownership(svc, jid)
+        if own_err:
+            return own_err
+        # Resolve through the gateway-side serving resolver, not DASHBOARD_PORT and
+        # not the client resolver: DASHBOARD_PORT reads KIROCREW_PORT only, and the
+        # client resolver reads it FIRST -- both give 5476 on a --port auto gateway,
+        # a SIBLING. resolve_serving_port prefers the bound port, so the credential
+        # is paired to the instance actually serving and the job runs here.
+        port = resolve_serving_port()
         secret_path = config_dir() / ".local_secret"
         ok, msg = trigger_cron_job(jid, port, secret_path)
         sel().log_api_access(

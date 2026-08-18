@@ -11,7 +11,7 @@ Usage:
     from kiro_crew.cron_script import Skip, Done
 
     def run(ctx):
-        data = ctx.call_tool("kirocrew-core", "browse_search", {"query": "..."})
+        data = ctx.call_tool("kirocrew-core", "local_knowledge_search", {"query": "..."})
         if not ready(data):
             raise Skip()  # silent, retry next tick
         ctx.notify("Done: " + summary)
@@ -39,11 +39,13 @@ from kiro_crew import platform_compat
 from kiro_crew.config.loader import config_dir, read_local_secret
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import (
     _AGENT_DENIED_ENV_KEYS,
     SandboxUnavailableError,
     cgroup_scope_argv,
-    resource_limit_preexec,
+    popen_limited,
+    run_limited,
     wrap_argv,
 )
 from kiro_crew.security import is_sensitive_path, redact
@@ -246,7 +248,14 @@ class ScriptContext:
     _secret: str = ""
 
     def __post_init__(self) -> None:
-        self._port = int(os.environ.get("KIROCREW_PORT", "5476"))
+        # The parent injects the port it minted the credential for. Preferring it
+        # keeps credential and dial target from one resolution; KIROCREW_PORT is the
+        # fallback for a directly-constructed context and is 5476 on a --port auto
+        # gateway, which is a SIBLING rather than this instance.
+        self._port = int(
+            os.environ.pop("_KIROCREW_DIAL_PORT", "")
+            or os.environ.get("KIROCREW_PORT", "5476")
+        )
         # Secret injected via temp file (not inherited env) to prevent privilege escalation.
         # Pop env var and unlink file immediately so fn(ctx) cannot access the secret directly.
         secret_file = os.environ.pop("_KIROCREW_SECRET_FILE", "")
@@ -369,13 +378,12 @@ class McpToolClient:
             mode="w+", prefix="mcp-stderr-", suffix=".log", delete=False
         )
         try:
-            self._proc = subprocess.Popen(
+            self._proc = popen_limited(
                 sandboxed_argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr_file,
                 text=True,
-                preexec_fn=resource_limit_preexec(),
             )
         except Exception:
             self._stderr_file.close()
@@ -548,17 +556,46 @@ def resolve_script_path(script_path: str) -> tuple[str, str]:
     return str(file_path), func_name
 
 
-def _resolve_internal_secret() -> str:
+def _resolve_internal_secret(port: int) -> str:
     """Internal secret for ScriptContext HTTP calls (e.g. notify -> /api/send-message).
 
-    The gateway generates its secret at startup and writes it to
-    ``config_dir()/.local_secret``; the ``KIROCREW_INTERNAL_SECRET`` env var is
-    normally unset, so fall back to the file via the shared
-    ``config.loader.read_local_secret`` helper (single home for that read).
-    Without this the sandbox sends an empty ``X-Internal-Secret`` and every
-    code-cron notify gets HTTP 403.
+    The gateway generates its secret at startup and publishes it per listener as
+    ``run/gateway-<port>.secret`` (with ``config_dir()/.local_secret`` as the
+    home-wide fallback); the ``KIROCREW_INTERNAL_SECRET`` env var is normally unset,
+    so fall back to the file via the shared ``config.loader.read_local_secret``
+    helper (single home for that read). Without this the sandbox sends an empty
+    ``X-Internal-Secret`` and every code-cron notify gets HTTP 403.
+
+    Takes the ALREADY-RESOLVED dial port rather than resolving its own. The caller
+    resolves the port ONCE and passes the same value here and into
+    ``_KIROCREW_DIAL_PORT``. Resolving twice -- once for the credential, once for the
+    child -- is a TOCTOU: a ``--port auto`` gateway that binds between the two calls
+    would mint the credential for one port and tell the child to dial another, and
+    the mismatched credential 403s the callback. One resolution makes that
+    unrepresentable, which is what the ``_KIROCREW_DIAL_PORT`` mechanism promised.
     """
-    return os.environ.get("KIROCREW_INTERNAL_SECRET", "") or read_local_secret()
+    env_secret = os.environ.get("KIROCREW_INTERNAL_SECRET", "")
+    if env_secret:
+        return env_secret
+    return read_local_secret(port)
+
+
+def _resolve_dial_port() -> int:
+    """The ONE port this cron dials, used for both the credential and the child.
+
+    The parent mints the credential and the child sends it, so a second independent
+    resolution in the child is exactly how the two diverge: ``ScriptContext`` reads
+    ``KIROCREW_PORT``, which is 5476 on a ``--port auto`` gateway, while the parent
+    would have minted for the real ephemeral port -- credential for one gateway,
+    request to another. One resolution, injected as ``_KIROCREW_DIAL_PORT``, makes
+    that mismatch unrepresentable.
+
+    Delegates to :func:`resolve_serving_port`, the shared gateway-side resolver that
+    prefers ``KIROCREW_BOUND_PORT`` over an inherited ``KIROCREW_PORT`` -- the cron
+    scheduler runs inside the gateway, so the bound port is ground truth and a
+    sibling-naming ``KIROCREW_PORT`` must not win.
+    """
+    return resolve_serving_port()
 
 
 def run_script_sandboxed(
@@ -607,6 +644,11 @@ def run_script_sandboxed(
 
     fd, launcher_path = tempfile.mkstemp(suffix=".py", prefix="kirocrew_cron_")
     sandbox_cleanup: str | None = None
+    # Resolve the dial port ONCE: the credential written below and the
+    # _KIROCREW_DIAL_PORT the child dials must come from the same resolution, or a
+    # --port auto bind between two resolutions would pair a credential with the
+    # wrong port and 403 the callback.
+    dial_port = _resolve_dial_port()
     # Write secret to temp file for ScriptContext (scrubbed from env)
     secret_fd, secret_path = tempfile.mkstemp(prefix="kirocrew_secret_")
     try:
@@ -624,7 +666,7 @@ def run_script_sandboxed(
             # unlinks the secret + launcher (otherwise the fd leaks and temp
             # files persist).
             platform_compat.restrict_to_owner(secret_path)
-            os.write(secret_fd, _resolve_internal_secret().encode())
+            os.write(secret_fd, _resolve_internal_secret(dial_port).encode())
         finally:
             os.close(secret_fd)
         try:
@@ -639,12 +681,14 @@ def run_script_sandboxed(
         # are never inherited; the internal secret is passed via the 0600 file.
         clean_env = _clean_cron_env()
         clean_env["_KIROCREW_SECRET_FILE"] = secret_path
+        # The child must dial the gateway the credential above was minted for:
+        # same dial_port, resolved once above, not a second resolution here.
+        clean_env["_KIROCREW_DIAL_PORT"] = str(dial_port)
 
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
-        proc = subprocess.Popen(
+        proc = popen_limited(
             sandboxed_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=clean_env, start_new_session=True,
-            preexec_fn=resource_limit_preexec(),
         )
         _register_proc(job_id, proc)
         try:
@@ -654,7 +698,7 @@ def run_script_sandboxed(
                 # Popen.communicate does not kill the child on timeout
                 # (unlike subprocess.run) — clean up before re-raising.
                 _kill_proc_group(proc)
-                proc.communicate()
+                proc.communicate(timeout=5)
                 raise
         finally:
             cancelled = _unregister_proc(job_id, proc)
@@ -773,16 +817,15 @@ def _shell_is_posix_strict(shell: str) -> bool:
         # Same discipline as every other sandbox-routed spawn in this module
         # (test_every_routed_spawn_applies_resource_limits / _cgroup_scope): the
         # probe is a child process, so it observes the same fork-bomb / RSS
-        # ceilings as a real command cron. resource_limit_preexec is POSIX-only
-        # and returns None on Windows (harmless).
+        # ceilings as a real command cron. run_limited applies them after exec,
+        # and is a no-op on Windows where there are no POSIX rlimits.
         argv = cgroup_scope_argv(argv)
-        proc = subprocess.run(
+        proc = run_limited(
             argv,
             capture_output=True,
             text=True,
             timeout=5,
             env=_clean_cron_env(),
-            preexec_fn=resource_limit_preexec() if platform_compat.IS_POSIX else None,
         )
         result = proc.returncode == 0 and proc.stdout.strip() == "x.{a,a}"
     except (OSError, subprocess.SubprocessError, SandboxUnavailableError):
@@ -838,10 +881,9 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
         sandboxed_argv, sandbox_cleanup = wrap_argv(argv, mode="cc")
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         clean_env = _clean_cron_env()
-        proc = subprocess.Popen(
+        proc = popen_limited(
             sandboxed_argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=clean_env, start_new_session=True,
-            preexec_fn=resource_limit_preexec(),
         )
         if job_id:
             _register_proc(job_id, proc)
@@ -851,7 +893,7 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
                 output, stderr_out = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill_proc_group(proc)
-                proc.communicate()
+                proc.communicate(timeout=5)
                 return {"status": "error", "output": f"❌ Command timed out after {timeout}s", "exit_code": -1}
         finally:
             if job_id:

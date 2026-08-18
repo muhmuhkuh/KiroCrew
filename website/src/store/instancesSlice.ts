@@ -56,6 +56,13 @@ export interface HostModel {
    *  instance-switch chord: in a plain browser those chords are reserved for
    *  browser tab switching, so the pane must not bind (or advertise) them. */
   electron: boolean
+  /** The crews the parent has pinned into header chips, by id (`__local__` for
+   *  the local dashboard). Relayed so the embedded bar shows the same chips as
+   *  the local bar instead of reading its own cross-origin-iframe localStorage,
+   *  which the parent's toggle can never reach. An embedded toggle posts
+   *  `mc-set-crew-pin` back up so the set stays one shared value across every
+   *  pane. A plain array because postMessage cannot carry a Set. */
+  pinnedCrews: string[]
 }
 
 interface InstancesState {

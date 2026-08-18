@@ -38,7 +38,7 @@ The dashboard provides a `/artifacts` library page for browse/search and a
 |---|---|---|
 | `slug` | string | URL-safe handle, derived from `name` if not given |
 | `name` | string | Human-readable display name |
-| `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
+| `kind` | enum | `widget`, `html`, `markdown`, `svg`, `json`, `text`, `webapp`, `image` — inferred on save when the caller omits it (see [Kind inference](#kind-inference)) |
 | `source` | enum | `chat` (default), `cron`, `subagent`, `manual`, `import` |
 | `pinned` | bool | "Starred" — user-curated keep flag (default `false`). Drives the Artifacts page **Starred** view. Metadata-only; toggling does NOT bump `version`. |
 | `auto_registered` | bool | `true` when the store created this record automatically from a chat-emitted `<mcwidget>` (see [Widget auto-registration](#widget-auto-registration)) rather than from an explicit save. Sweepable by the retention pass while unpinned; tolerant-loaded (pre-existing artifacts default `false`, so they are never swept). |
@@ -215,7 +215,9 @@ each row carries an `available` flag so the FE can hint install-on-first-use for
 a not-yet-installed but installable destination. Governance: `publish_sync` has NO internal gate and `push_version` is
 ungated, so the two egress-arming routes go through
 `_publish_governance_denied` (fail-closed `capabilities.publish ∩
-destinations:<provider>`) BEFORE dispatch — `overwrite-remote` on the resolved
+destinations:<provider>`, a module-local alias for the shared
+`publish_governance.publish_denied_reason` — the same decision the public-web
+deploy path uses, see `governance.md`) BEFORE dispatch — `overwrite-remote` on the resolved
 `publication.provider`, and `clone` on the routed provider (a clone sets
 `auto_sync=True`, arming every future snapshot push). The four remote comment
 WRITE routes (post / reply / review / delete) are outbound egress too, so each
@@ -242,6 +244,42 @@ provider's first page are reachable rather than silently truncated.
 - `/artifacts/<slug>` — full-screen render of the current artifact in a
   sandboxed iframe (same security model as inline `<mcwidget>`), with a
   version dropdown
+
+### Publish panel (`PublishHub`) — reading a publish outcome
+
+`PublishHub` posts to the row's declared `endpoint` and must recognize **two**
+response shapes, because two different routes answer that POST:
+
+- `{url}` / `{public_url}` — the deploy shape (`POST /api/deploy/deploy`).
+- a serialized artifact carrying a `publication` block — what `POST
+  /api/artifacts/{slug}/publish` returns, which is where an app provider lands
+  when it hands the confirmed publish to the core route (the supported way to
+  reuse the core's single publish authorization + audit trail rather than
+  growing a second one). The link, when the destination exposes one, is
+  `publication.view_url`.
+
+`readPublishOutcome` is that reader, and it returns an *outcome*, not a url:
+
+- success is signalled by the return SHAPE, never inferred from a non-empty url
+  — a destination may publish successfully and expose no browsable link, and
+  conflating the two rendered a succeeded publish as the error branch with an
+  undefined message (a bare red icon and no text);
+- an `error` field wins over anything else in the same body;
+- `publication: null` (an unpublished artifact) is not success;
+- anything unrecognized is reported as a NAMED error (`unexpected_response`)
+  rather than an empty one.
+
+**HTTP 200 is not success on the artifact shape.** `publish_sync.publish()`
+treats the version push as best-effort: its re-publish branch runs
+`push_version(force=True)`, reads `refreshed.publication.last_error`, persists it
+and returns normally — so the route answers 200 with a publication whose remote
+content is stale. A non-empty (non-whitespace) `last_error` is therefore an error
+outcome carrying the provider's own already-redacted message; whitespace-only
+stays success, because the core writes `""` to clear the field.
+
+The public-exposure warning and the blocking `PublicPublishAckModal` are
+unchanged and unconditional — every destination gets both, on the clean path and
+on a scan override.
 
 ## Widget auto-registration
 
@@ -881,3 +919,102 @@ Separately, the **reaper path** (the in-account reaper Lambda or
 and performs the same cleanup on a schedule. The reaper runs with the user's
 own credentials in-account and handles the case where the gateway is unreachable
 or the user did not explicitly destroy before TTL expiry.
+
+## Image Artifacts (`kind="image"`)
+
+An `image` artifact is a **raster picture**, not text. Its bytes live in a binary
+sidecar beside `meta.json` and are served by a dedicated endpoint; the textual
+`current.html` exists but stays **empty**, and `content` in every API response is
+`""`. Consumers must therefore never render an image artifact through the text or
+widget paths — `ArtifactBodyImage` handles it, bypassing both Monaco and the
+sandboxed iframe.
+
+SVG is deliberately **not** an image artifact: it is markup, stored as
+`kind="svg"` text and rendered through the sanitizing `SvgViewer`. Serving
+agent-authored SVG as an image would reintroduce a same-origin script vector.
+
+### Storage layout
+
+```
+~/.kiro/crew/artifacts/
+└── <slug>/
+    ├── meta.json        includes the `image` block below
+    ├── current.html     present but EMPTY (bytes are not text)
+    ├── asset.<ext>      the raster bytes (png|jpg|webp|gif|bmp)
+    └── versions/
+        └── v1.html      empty, mirroring current.html
+```
+
+The sidecar's extension is derived **from the allowlisted mime**, never from the
+stored `ext` field, on every read (see [Security](#security)). `delete` removes
+the whole artifact directory, so the sidecar needs no separate cleanup.
+
+### `image` metadata schema
+
+Tolerant-loaded: every field is optional so an older or hand-edited record still
+opens, and each consumer degrades gracefully.
+
+| Field | Type | Description |
+|---|---|---|
+| `mime` | string | One of `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`. Anything else is rejected on create **and** refused on read. |
+| `ext` | string | Sidecar extension as written. Informational only — reads re-derive it from `mime`. |
+| `size_bytes` | int | Byte length of the sidecar. |
+| `width` / `height` | int | Natural pixel size, sniffed from the file header with the stdlib only (no Pillow). `null` when unmeasurable — dimensions are a rendering nicety, not a gate. |
+| `sha256` | string | Hex digest of the bytes. |
+| `original_filename` | string | Basename of the source file; names the download. **LLM-derived** → redacted in `_serialize`. |
+| `alt` | string | Accessible description, from the markdown alt text. **LLM-derived** → redacted in `_serialize`. |
+
+### Asset endpoint
+
+`GET /api/artifacts/{slug}/asset` — returns the raw bytes with the sniffed
+`Content-Type`, so an `<img src=…>` can point straight at it and the artifact
+JSON never carries base64.
+
+- **Authenticated** like every other artifact route; unauthenticated requests get
+  403. No restricted-session gate applies (it is a read) and no `referenced`
+  breadcrumb is recorded (an asset fetch is a sub-resource of a detail view that
+  was already counted).
+- `Cache-Control: private, max-age=31536000, immutable` — `private` because the
+  bytes are behind token auth and a shared proxy must never serve a cached copy
+  to an unauthenticated requester.
+- 404 when the slug does not resolve, is not an image artifact, its sidecar is
+  missing, or its mime is not in the allowlist.
+- The read is offloaded with `asyncio.to_thread`: the sidecar may be up to
+  `MAX_CONTENT_BYTES` and a synchronous read would stall every other gateway
+  task, the liveness heartbeat included.
+
+### Auto-registration from chat (`kiro_crew.image_artifacts`)
+
+Finalized assistant messages are scanned for **local** markdown image references
+and each one is registered, copying the bytes immediately so temp-file cleanup
+cannot strip them.
+
+- **Identity.** Slugs are derived deterministically from `(message_ts, index)`
+  via the widget-slug contract, where `index` counts **every** image match in the
+  message including skipped ones — so an image's ordinal is stable regardless of
+  which siblings were skipped. A replayed message is therefore idempotent and
+  never clobbers an artifact the user has since edited.
+- **Destination parsing.** Balanced-paren walk, so `screenshot(1).png` survives;
+  `<...>` destinations are unwrapped so a path containing spaces survives;
+  backslashes are treated as escapes **only** before markdown-significant
+  characters, so a native Windows path (`C:\Users\me\shot.png`) survives; alt
+  text accepts escaped brackets (`![Revenue \[Q1\]](…)`) and is unescaped for
+  display.
+- **Skipped:** remote/`data:`/protocol-relative URLs (never fetched), relative
+  paths, unsupported extensions, sensitive paths, and restricted/incognito
+  sessions.
+- **Budgets (per message):** at most `MAX_IMAGES_PER_MESSAGE` (12) images and
+  `MAX_IMAGE_BYTES_PER_MESSAGE` (64 MiB) of copied bytes. Counted over
+  *eligible* images rather than successful writes, so a replay cannot walk past
+  the cap one batch at a time. Pruning runs after the loop, so without these a
+  single message could fill the disk.
+- **Retention.** Auto-registered images are `auto_registered=True` and unpinned,
+  so they ride the **same** count-based sweep as auto-registered widgets
+  (`prune_auto_widgets(keep=MAX_AUTO_WIDGET_ARTIFACTS)`) — the predicate is
+  kind-agnostic. Images and widgets therefore share one budget; pinning
+  ("Save permanently"), filing, tagging, or commenting exempts a record.
+- **Never raises.** A failure to register a chat image is a lost convenience, not
+  a reason to fail the turn that produced it; per-image failures are logged and
+  skipped individually. Dispatch uses `asyncio.to_thread` rather than the shared
+  subprocess pool, so a wedged teardown worker cannot hold registration until
+  after the source file is gone.

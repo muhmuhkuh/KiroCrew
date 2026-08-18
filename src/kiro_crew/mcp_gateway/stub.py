@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.executors import subprocess_executor
@@ -299,6 +299,16 @@ def _binary_version(command: str) -> str:
         return "unknown"
 
 
+def binary_fingerprint(command: str) -> str:
+    """Public alias of :func:`_binary_version`.
+
+    The shareability cache keys on the same token the pool does, so an in-place
+    binary upgrade invalidates both. One implementation, two consumers — a second
+    copy would drift and let one of them keep a stale identity.
+    """
+    return _binary_version(command)
+
+
 def _resolve_channel_id(cli_value: Optional[str]) -> Optional[str]:
     """``--channel-id`` wins; else ``KIROCREW_CHANNEL_ID`` env; else None."""
     return cli_value or os.environ.get("KIROCREW_CHANNEL_ID") or None
@@ -344,8 +354,12 @@ def _build_caller_block(channel_id: Optional[str]) -> dict[str, str]:
     both ends of the wire in agreement. If the key is still unknown at register
     (claim hasn't happened yet), the recaller loop repairs it later."""
     session_key = CallerContext.from_env().session_key
+    # Diagnostic identity only — the OS user. USERNAME is the Windows spelling
+    # of USER; check both so this dimension is not empty on one platform.
+    # (A ``KIROCREW_PRINCIPAL`` override existed historically but nothing ever
+    # set it — Kiro Crew is single-operator, so it was deleted.)
     principal = (
-        os.environ.get("KIROCREW_PRINCIPAL") or os.environ.get("USER") or ""
+        os.environ.get("USER") or os.environ.get("USERNAME") or ""
     )
     if session_key.startswith("cron:"):
         session_type = "cron"
@@ -389,14 +403,6 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         work_dir = str(args.work_dir)
 
     caller = _build_caller_block(channel_id)
-    # USERNAME is the Windows spelling of USER; check both so this diagnostic
-    # dimension is not empty on one platform.
-    user_identity = (
-        caller["principal_id"]
-        or os.environ.get("USER", "")
-        or os.environ.get("USERNAME", "")
-        or "unknown"
-    )
 
     return {
         "type": "register",
@@ -426,7 +432,15 @@ def build_register_payload(args: argparse.Namespace) -> dict:
         # per-connection backend exist without making every key
         # connection-private.
         "poolable": bool(args.poolable),
-        "user_identity": user_identity,
+        # Wire-compat ballast, NOT a pool dimension: an adopted daemon that
+        # outlived a package upgrade (the manager adopts anything answering
+        # ``pong`` with no version handshake — see gatewayd's capability
+        # comment) still runs a ``PoolKey.from_register`` that hard-requires
+        # ``user_identity``. Omitting the key would make that daemon reject
+        # every new stub's register as malformed, silently un-pooling the
+        # whole install until the daemon restarts. A current daemon ignores
+        # the key. Safe to drop once no pre-#3604 daemon can be adopted.
+        "user_identity": caller["principal_id"] or "unknown",
         "channel_id": channel_id,
         "config_snapshot_hash": _CONFIG_SNAPSHOT_PLACEHOLDER,
         "caller": caller,
@@ -915,6 +929,14 @@ def _fallback_log_path() -> Path:
     return _crew_home() / "logs" / "stub_fallback.jsonl"
 
 
+# Rotate the fallback log once it exceeds this size, keeping ONE previous
+# generation (``.jsonl.1``). The log grew unbounded before (467 KB in 15 h on
+# one degraded host, issue #3495); a 1 MiB cap bounds total disk use at ~2 MiB
+# while keeping enough history for the gateway's per-server fallback-rate
+# aggregation (see ``gatewayd`` stats).
+_FALLBACK_LOG_MAX_BYTES = 1024 * 1024
+
+
 def log_fallback(
     reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
 ) -> None:
@@ -936,10 +958,104 @@ def log_fallback(
             "channel_id": args.channel_id or "",
             "target_command": args.target_command,
         }
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        # Rotation is guarded by a NON-BLOCKING try-lock on a sibling lock
+        # file: only the holder rotates, so two stubs hitting the size cap
+        # together can no longer both rotate (the second would replace ``.1``
+        # with the first's fresh live file, discarding a generation). A loser
+        # appends without rotating — never waits, so no log_fallback call can
+        # stall its stub's event loop — and the next writer rotates. Worst
+        # case the live file overshoots the cap by a few racing records.
+        lock_fd = os.open(
+            log_path.with_suffix(".jsonl.lock"), os.O_CREAT | os.O_RDWR, 0o600
+        )
+        locked = False
+        try:
+            locked = platform_compat.try_acquire_lock(lock_fd, exclusive=True)
+            if locked:
+                try:
+                    if log_path.stat().st_size >= _FALLBACK_LOG_MAX_BYTES:
+                        os.replace(log_path, log_path.with_suffix(".jsonl.1"))
+                except OSError:
+                    # Missing file (fresh boot) or a Windows sharing violation
+                    # (another process holds the log open, so the rename is
+                    # rejected). Rotation is best-effort; the append below must
+                    # still happen — letting this propagate to the outer
+                    # handler would silently DROP the record.
+                    pass
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        finally:
+            if locked:
+                platform_compat.release_lock(lock_fd)
+            os.close(lock_fd)
     except OSError:
         pass
+
+
+# Sliding window for fallback aggregation: long enough to catch a slow drip
+# (tens per hour), short enough that a fixed incident ages out of the count.
+_FALLBACK_COUNT_WINDOW_SECS = 24 * 3600.0
+
+
+def fallback_counts() -> dict[str, Any]:
+    """Aggregate the fallback audit log into per-server counts.
+
+    Reads the live log plus the one rotated generation (see
+    ``_FALLBACK_LOG_MAX_BYTES``) and counts records whose ``ts`` falls within
+    the last ``_FALLBACK_COUNT_WINDOW_SECS``. This is the reader the log never
+    had: degradations accrued with no signal anywhere. gatewayd folds the
+    result into its ``stats`` reply, making the per-server fallback rate
+    queryable from the gateway control socket instead of the operator having
+    to read a process tree.
+
+    Returns ``{"window_secs": ..., "total": n, "by_server": {name: n},
+    "by_reason": {reason: n}}``. Never raises — an unreadable or torn log
+    yields the counts of whatever parsed.
+    """
+    cutoff = time.time() - _FALLBACK_COUNT_WINDOW_SECS
+    total = 0
+    by_server: dict[str, int] = {}
+    by_reason: dict[str, int] = {}
+    live = _fallback_log_path()
+    for path in (live.with_suffix(".jsonl.1"), live):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # torn tail line from a racing writer
+                    if not isinstance(rec, dict):
+                        continue
+                    ts = rec.get("ts")
+                    if not isinstance(ts, (int, float)) or ts < cutoff:
+                        continue
+                    total += 1
+                    server = str(rec.get("server") or rec.get("pool_label") or "?")
+                    by_server[server] = by_server.get(server, 0) + 1
+                    reason = str(rec.get("reason") or "?")
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+        except OSError:
+            continue
+    return {
+        "window_secs": _FALLBACK_COUNT_WINDOW_SECS,
+        "total": total,
+        "by_server": by_server,
+        "by_reason": by_reason,
+    }
+
+
+async def alog_fallback(
+    reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
+) -> None:
+    """Run :func:`log_fallback` in a worker thread.
+
+    The async bridge calls this before every terminal fallback: the write is
+    plain blocking file I/O (open/append, plus the best-effort rotation), so
+    it runs off the event loop, and awaiting it guarantees the record is on
+    disk before the caller proceeds to ``fallback_exec`` (which replaces the
+    process image and would otherwise race the write)."""
+    await asyncio.to_thread(log_fallback, reason, stub_uuid, pool_label, args)
 
 
 def fallback_exec(args: argparse.Namespace) -> None:
@@ -1099,12 +1215,12 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             timeout=_HANDSHAKE_TIMEOUT_SECS,
         )
     except asyncio.TimeoutError:
-        log_fallback("handshake_timeout", payload["stub_uuid"], pool_label, args)
+        await alog_fallback("handshake_timeout", payload["stub_uuid"], pool_label, args)
         logger.warning("handshake timed out; falling back pool=%s", pool_label)
         fallback_exec(args)
         return 1  # unreachable
     except FallbackRequestedError as exc:
-        log_fallback(exc.reason, payload["stub_uuid"], pool_label, args)
+        await alog_fallback(exc.reason, payload["stub_uuid"], pool_label, args)
         logger.warning("handshake failed (%s); falling back pool=%s", exc.reason, pool_label)
         fallback_exec(args)
         return 1  # unreachable
@@ -1125,7 +1241,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     # daemon pools it, which is what it wanted.
     if must_degrade_unshareable(bool(args.poolable), _caps):
         reason = "gateway does not honour the poolable field"
-        log_fallback(reason, payload["stub_uuid"], pool_label, args)
+        await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
         logger.warning(
             "handshake: gateway did not advertise poolable_ack and this server is "
             "not shareable; falling back to a per-session exec rather than risk "
@@ -1154,7 +1270,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             # Gateway unreachable / wedged mid-pre-flight — same posture as a
             # connect failure: fall back to a direct per-session exec.
             await _safe_close(writer)
-            log_fallback(
+            await alog_fallback(
                 f"ensure_backend_io:{type(exc).__name__}",
                 payload["stub_uuid"], pool_label, args,
             )
@@ -1184,7 +1300,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
                 if isinstance(ready, dict) else "ensure_backend_closed"
             )
             await _safe_close(writer)
-            log_fallback(reason, payload["stub_uuid"], pool_label, args)
+            await alog_fallback(reason, payload["stub_uuid"], pool_label, args)
             logger.warning("gateway fallback-rejected ensure_backend (%s); falling back pool=%s", reason, pool_label)
             fallback_exec(args)
             return 1  # unreachable
@@ -1265,7 +1381,7 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             # is already being abandoned. Exiting still closes stdout, which is
             # what tells kiro-cli this server is done.
             logger.warning("could not emit liveness error frames pool=%s", pool_label)
-        log_fallback("bridge_liveness_dead", stub_uuid, pool_label, args)
+        await alog_fallback("bridge_liveness_dead", stub_uuid, pool_label, args)
         logger.warning(
             "bridge peer stopped answering pings; failed %d outstanding call(s) "
             "pool=%s",

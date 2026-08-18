@@ -1,7 +1,15 @@
 import { describe, it, expect } from 'vitest'
 import { categoryFor, categoryCounts } from '../components/appstore/categories'
 import { gradientFor } from '../components/appstore/gradient'
-import { sourceLabel, isVerified, normalizeRegistryApp, type RegistryApp } from '../components/appstore/types'
+import {
+  sourceLabel,
+  isVerified,
+  normalizeRegistryApp,
+  normalizeInstalledApp,
+  normalizeInstalledApps,
+  type InstalledApp,
+  type RegistryApp,
+} from '../components/appstore/types'
 import { pickFeatured } from '../pages/AppsPage'
 
 const app = (over: Partial<RegistryApp>): RegistryApp => ({
@@ -153,22 +161,31 @@ describe('server-computed trust fields (issue #580)', () => {
 
   it('sourceLabel prefers the server provenance field', () => {
     expect(sourceLabel({ provenance: 'builtin' })).toBe('Built-in')
-    expect(sourceLabel({ provenance: 'core', origin: 'builtin' })).toBe('Kiro Crew registry')
+    expect(sourceLabel({ provenance: 'official', origin: 'builtin' })).toBe('Kiro Crew registry')
     expect(sourceLabel({ provenance: 'external', _registry: 'labs' })).toBe('labs')
+  })
+
+  it('sourceLabel still accepts the pre-migration "core" spelling', () => {
+    // A newer client can meet an older gateway, which emits 'core' for the same
+    // claim 'official' now carries. Dropping the alias would silently fall the
+    // row through to the origin-based legacy arm.
+    expect(sourceLabel({ provenance: 'core', origin: 'builtin' })).toBe('Kiro Crew registry')
+    expect(sourceLabel({ provenance: 'core' })).toBe('Kiro Crew registry')
   })
 
   it('sourceLabel keeps the _registry name even with a smuggled provenance', () => {
     // Same older-gateway smuggling window: a tagged row is external by
-    // construction, so provenance:"core" from index content cannot relabel it.
+    // construction, so provenance:"official" from index content cannot relabel it.
+    expect(sourceLabel({ provenance: 'official', _registry: 'evil' })).toBe('evil')
     expect(sourceLabel({ provenance: 'core', _registry: 'evil' })).toBe('evil')
   })
 
   it('pickFeatured excludes provenance:"external" rows from curator flags', () => {
     const apps = [
       app({ name: 'external-shouty', featured: 1, provenance: 'external', _registry: 'evil' }),
-      app({ name: 'core-app', featured: 2, provenance: 'core' }),
+      app({ name: 'official-app', featured: 2, provenance: 'official' }),
     ]
-    expect(pickFeatured(apps)[0].name).toBe('core-app')
+    expect(pickFeatured(apps)[0].name).toBe('official-app')
   })
 
   it('pickFeatured excludes external rows signalled by EITHER field', () => {
@@ -229,11 +246,161 @@ describe('normalizeRegistryApp', () => {
   })
 })
 
+describe('normalizeInstalledApp', () => {
+  it('supplies a manifest and its lists for a record that has none', () => {
+    // /api/apps mirrors on-disk records, so a hand-written or older app can
+    // arrive with no manifest at all. Every render site indexes these lists.
+    const out = normalizeInstalledApp({ name: 'bare', version: '1.0.0' } as unknown as InstalledApp)
+    expect(out.manifest).toBeTruthy()
+    expect(out.manifest.agents).toEqual([])
+    expect(out.manifest.skills).toEqual([])
+    expect(out.manifest.sops).toEqual([])
+    expect(out.manifest.crons).toEqual([])
+    expect(out.manifest.tags).toEqual([])
+    expect(out.manifest.jobFamilies).toEqual([])
+    expect(out.manifest.screenshots).toEqual([])
+    expect(out.manifest.highlights).toEqual([])
+    // The reads the Apps page and the detail page make, without a gate.
+    expect(() => out.manifest.agents.map(a => a.split('/').pop()).join(', ')).not.toThrow()
+    expect(() => out.manifest.crons.map(c => c.name).join(', ')).not.toThrow()
+  })
+
+  it('keeps published list contents and every non-list manifest field', () => {
+    const out = normalizeInstalledApp({
+      name: 'real',
+      manifest: {
+        displayName: 'Real', agents: ['agents/a.json'], crons: [{ name: 'nightly' }],
+        ui: { pages: [{ route: '/apps/real', label: 'Real', icon: 'Box' }] },
+      },
+    } as unknown as InstalledApp)
+    expect(out.manifest.agents).toEqual(['agents/a.json'])
+    expect(out.manifest.crons).toEqual([{ name: 'nightly' }])
+    expect(out.manifest.displayName).toBe('Real')
+    expect(out.manifest.ui?.pages?.[0]?.route).toBe('/apps/real')
+  })
+
+  it('coerces mistyped lists and drops members it cannot render', () => {
+    const out = normalizeInstalledApp({
+      name: 'weird',
+      manifest: { agents: 'agents/a.json', skills: ['s.md', 7, null], crons: [{ name: 'ok' }, {}, null] },
+    } as unknown as InstalledApp)
+    expect(out.manifest.agents).toEqual([])
+    expect(out.manifest.skills).toEqual(['s.md'])
+    // A cron is only ever rendered by name, so a nameless entry is dropped
+    // rather than shown as a blank row.
+    expect(out.manifest.crons).toEqual([{ name: 'ok' }])
+  })
+
+  it('preserves fields callers carry beyond InstalledApp', () => {
+    const out = normalizeInstalledApp({ name: 'x', managed: true, _newVersion: '2.0.0' } as unknown as InstalledApp)
+    expect((out as unknown as { managed: boolean }).managed).toBe(true)
+    expect((out as unknown as { _newVersion: string })._newVersion).toBe('2.0.0')
+  })
+
+  it('passes a non-object payload through instead of inventing a record', () => {
+    // getApp() rejects on 404, but a caller that swallows the failure must not
+    // be handed a synthetic app that looks installed.
+    expect(normalizeInstalledApp(null as unknown as InstalledApp)).toBeNull()
+    expect(normalizeInstalledApps(null as unknown as InstalledApp[])).toBeNull()
+  })
+
+  it('normalizes every row of a list payload', () => {
+    const out = normalizeInstalledApps([{ name: 'a' }, { name: 'b' }] as unknown as InstalledApp[])
+    expect(out.map(a => a.manifest.agents)).toEqual([[], []])
+  })
+})
+
 describe('categoryFor — malformed tags cannot crash the storefront', () => {
   it('tolerates non-array and non-string tags', () => {
     expect(categoryFor('github' as unknown)).toBe('Other')
     expect(categoryFor([7, null, undefined] as unknown)).toBe('Other')
     expect(categoryFor([null, 'github'] as unknown)).toBe('Developer Tools')
     expect(() => categoryCounts([{ tags: 'nope' }, { tags: [1, 2] }])).not.toThrow()
+  })
+})
+
+describe('normalizeInstalledApp', () => {
+  const installed = (over: Record<string, unknown> = {}, manifest: Record<string, unknown> = {}): InstalledApp =>
+    ({
+      name: 'zzq-app', version: '1.0.0', displayName: 'Zzq App', enabled: true,
+      installedAt: '2026-08-01T00:00:00Z',
+      manifest: {
+        name: 'zzq-app', version: '1.0.0', displayName: 'Zzq App',
+        description: 'd', author: 'a', ...manifest,
+      },
+      ...over,
+    } as unknown as InstalledApp)
+
+  it('defaults every optional manifest collection to an array', () => {
+    const out = normalizeInstalledApp(installed())
+    expect(out.manifest.agents).toEqual([])
+    expect(out.manifest.skills).toEqual([])
+    expect(out.manifest.sops).toEqual([])
+    expect(out.manifest.crons).toEqual([])
+    expect(out.manifest.tags).toEqual([])
+    expect(out.manifest.jobFamilies).toEqual([])
+    expect(out.manifest.ui?.pages).toEqual([])
+  })
+
+  it('survives a record with no manifest at all (the drifted-assertion crash class)', () => {
+    const out = normalizeInstalledApp({ name: 'bare' } as unknown as InstalledApp)
+    expect(out.manifest.name).toBe('bare')
+    expect(out.manifest.displayName).toBe('bare')
+    expect(out.manifest.description).toBe('')
+    expect(out.manifest.author).toBe('')
+    expect(out.manifest.agents).toEqual([])
+    expect(out.manifest.ui?.pages).toEqual([])
+    // Enumerating a normalized manifest collection cannot throw.
+    expect(() => (out.manifest.agents ?? []).map(a => a.toLowerCase())).not.toThrow()
+  })
+
+  it('coerces mistyped collections and drops malformed members', () => {
+    const out = normalizeInstalledApp(installed({}, {
+      agents: 'not-an-array',
+      skills: ['ok', 7, null],
+      crons: [{ name: 'tick' }, { nope: true }, null, 'raw'],
+      tags: { 0: 'x' },
+    }))
+    expect(out.manifest.agents).toEqual([])
+    expect(out.manifest.skills).toEqual(['ok'])
+    expect(out.manifest.crons).toEqual([{ name: 'tick' }])
+    expect(out.manifest.tags).toEqual([])
+  })
+
+  it('keeps ui.entry and extra page keys while coercing pages', () => {
+    const out = normalizeInstalledApp(installed({}, {
+      ui: {
+        entry: 'main.js',
+        pages: [
+          { route: '/apps/zzq', label: 'Zzq', icon: 'bot', iconUrl: 'icon.svg' },
+          { label: 'no-route' },
+          null,
+        ],
+      },
+    }))
+    expect(out.manifest.ui?.entry).toBe('main.js')
+    expect(out.manifest.ui?.pages).toEqual([
+      { route: '/apps/zzq', label: 'Zzq', icon: 'bot', iconUrl: 'icon.svg' },
+    ])
+  })
+
+  it('does not invent a ui entry for an app without one', () => {
+    const out = normalizeInstalledApp(installed())
+    // hasUI/AppHost routing read entry truthiness; normalization must not
+    // change navigation eligibility, only make the pages read safe.
+    expect(out.manifest.ui?.entry).toBeUndefined()
+  })
+
+  it('fills required display strings from mistyped values', () => {
+    const out = normalizeInstalledApp(installed(
+      { displayName: 42, version: null },
+      { displayName: undefined, version: undefined, description: null, author: 9 },
+    ))
+    expect(out.displayName).toBe('zzq-app')
+    expect(out.version).toBe('0.0.0')
+    expect(out.manifest.displayName).toBe('zzq-app')
+    expect(out.manifest.version).toBe('0.0.0')
+    expect(out.manifest.description).toBe('')
+    expect(out.manifest.author).toBe('')
   })
 })

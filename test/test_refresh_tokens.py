@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -516,6 +517,39 @@ def test_tr_u_17_persistence_file_mode_0600(tmp_path: Path):
     )
     # Mode is 0o600 (owner read+write only)
     assert state_file.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="injects the failure via platform_compat.os.chmod, which only "
+    "restrict_to_owner's POSIX branch calls (Windows shells out to icacls)",
+)
+def test_a_failed_lockdown_still_persists_the_reuse_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A lockdown failure must not cost us the consumed-jti record.
+
+    _persist passes restrict_on_error="warn" deliberately. Letting the OSError
+    propagate would hit _persist's own outer OSError handler, which logs and
+    returns WITHOUT writing -- so a read-only filesystem would silently drop the
+    record and reuse detection would fail to fire for that jti after a restart
+    (RFC-6819 5.2.2.3). A state file another local user can read is the lesser
+    harm, so the write proceeds and warns.
+    """
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+
+    def _boom(*a, **kw):
+        raise OSError("chmod denied (read-only filesystem)")
+
+    monkeypatch.setattr("kiro_crew.platform_compat.os.chmod", _boom)
+    mgr.mark_consumed(
+        "jti1", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+
+    # Published despite the failed lockdown, and the record survives a reload.
+    assert state_file.exists()
+    assert RefreshStateManager(state_path=state_file).is_consumed("jti1") is True
 
 
 def test_tr_i_17_corrupted_state_file_starts_empty(tmp_path: Path):
@@ -1443,21 +1477,29 @@ def test_tr_u_35_bump_persist_failure_leaves_counter_unchanged(
     assert rg.current_revocation_gen() == 3
 
 
-def test_tr_u_36_empty_counter_file_fails_closed(tmp_path: Path, monkeypatch):
-    """An existing-but-empty counter file is unreadable, not gen 0.
+@pytest.mark.parametrize("contents", ["", "not-an-integer"])
+def test_tr_u_36_unreadable_counter_file_logs_recovery(
+    tmp_path: Path, monkeypatch, caplog, contents: str
+):
+    """An empty or malformed counter is unreadable and explains recovery.
 
-    A write torn by process termination leaves an empty file; interpreting it
-    as 0 would resurrect every revoked session on the next boot. The loader
-    reports it unreadable and validators reject until the state is repaired
-    (or the next successful bump atomically replaces it).
+    Interpreting either form as 0 would resurrect every revoked session on the
+    next boot. The loader reports it unreadable, explains the reset cost, and
+    validators reject until the state is repaired.
     """
     import kiro_crew.dashboard.revocation_gen as rg
 
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
-    (tmp_path / rg._REVOCATION_FILE).write_text("", encoding="utf-8")
+    counter = tmp_path / rg._REVOCATION_FILE
+    counter.write_text(contents, encoding="utf-8")
     monkeypatch.setattr(rg, "_gen", None)
 
-    assert rg._load_revocation_gen_or_none() is None
+    with caplog.at_level("WARNING", logger=rg.__name__):
+        assert rg._load_revocation_gen_or_none() is None
+
+    assert str(counter) in caplog.text
+    assert "delete only" in caplog.text
+    assert "re-enables unexpired sessions revoked by kirocrew logout" in caplog.text
 
     token, _cid, _jti, _exp = generate_refresh_token("alice")  # mint degrades to gen 0
     valid, _, reason, _, _, _ = validate_refresh_token(token)

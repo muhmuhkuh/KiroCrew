@@ -329,3 +329,48 @@ export type MainView = 'reviews' | 'learning' | 'settings'
 /** Which list the middle column shows: the active repo's PRs, or the threads. */
 export type ListTab = 'pulls' | 'reviews'
 export type RailSection = 'repos' | 'reviews' | 'learning' | 'settings'
+
+// --- Follow-up sessions ------------------------------------------------------
+
+/** One exchange from a review discussed before follow-ups became sessions. */
+export interface ChatTurn {
+  /** 'user' | 'reviewer' — widened to string because it is worker-written JSON
+   *  crossing a trust boundary, and an unknown role must render as unknown
+   *  rather than crash the panel. */
+  role: string
+  text: string
+  /** The reviewer's reasoning for this answer. Empty when it did not think aloud. */
+  thinking: string
+  /** Titles of tools it ran while answering. */
+  tools: string[]
+  /** Tools it was NOT allowed to run. Non-empty means the answer is degraded. */
+  refusals: string[]
+  ts: number
+}
+
+export interface ChatState {
+  run_id: string
+  change_id: string
+  /** Stored exchanges from before follow-ups became chat sessions. */
+  turns: ChatTurn[]
+  /** Whether opening a follow-up would restore the reviewer's own context. False
+   *  means the session transcript is gone or was never kept, and a session opened
+   *  anyway would answer without knowing what was reviewed. */
+  resumable: boolean
+  /** Why not, when `resumable` is false. */
+  reason: string
+  /** The chat session a follow-up on this review uses. */
+  slot_key: string
+  /** Whether that session already exists, so the panel offers to continue the
+   *  conversation instead of inviting the user to start one they already had. */
+  followup_open: boolean
+}
+
+/** What the follow-up endpoint hands back for the slot the caller then creates. */
+export interface FollowupStart {
+  ok: boolean
+  slot_key: string
+  agent: string
+  folder_id: string
+  title: string
+}

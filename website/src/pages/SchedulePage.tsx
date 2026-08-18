@@ -1,10 +1,11 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
 import Clickable from '../components/Clickable'
-import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow } from 'lucide-react'
+import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download } from 'lucide-react'
 import { api } from '../api/client'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { PageHeader, Card, Btn, SendBtn, Badge, SearchInput, EmptyState, FilteredEmpty, Skeleton, Input } from '../components/ui'
+import { CodeBlock } from '../components/CodeBlock'
 import SegmentedControl from '../components/SegmentedControl'
 import WeekGrid from '../components/WeekGrid'
 import TimezoneSelect from '../components/TimezoneSelect'
@@ -15,6 +16,7 @@ import InfoTip from '../components/InfoTip'
 import type { CronJob } from '../types'
 import { useAgents } from '../hooks/useAgents'
 import { useCronActions } from '../hooks/useCronActions'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import { useAppSelector } from '../store'
 import { SaveCreateLabel } from '../utils/cronUtils'
 import { useSortableTable } from '../hooks/useSortableTable'
@@ -313,6 +315,18 @@ export default function SchedulePage() {
   useEffect(() => { if (refreshTrigger > 0) { load(); refreshFolders() } }, [refreshTrigger, load, refreshFolders])
 
   const { running, actionError, setActionError, runNow, openInChat, cancelling, cancelRun } = useCronActions(load)
+  // Measured overflow state for the jobs table's scroller — drives the fade cue
+  // at the pinned Actions column's edge. Measured, not breakpoint-inferred: the
+  // table overflows whenever the CONTAINER is narrower than its min-width,
+  // which a resizable nav rail can cause at any viewport size.
+  const [attachJobsScroller, jobsTableEdges] = useScrollEdges<HTMLElement>()
+  // Stable wrapper, like the hook's own callback ref: an inline arrow would be
+  // a new function every render, and React detaches/reattaches a changed ref —
+  // each detach writes edge state, which re-renders, which loops.
+  const attachJobsTable = useCallback(
+    (el: HTMLTableElement | null) => attachJobsScroller(el?.parentElement ?? null),
+    [attachJobsScroller],
+  )
 
   // ── Cron Folder handlers (depend on load) ──
   const handleNewFolder = useCallback(async (moveTo?: boolean): Promise<string | undefined> => {
@@ -502,7 +516,7 @@ export default function SchedulePage() {
             />
           }
         />
-        <div className={`flex-1 overflow-y-auto px-6 min-h-0 ${showEmptyState ? 'pb-2' : 'pb-8'}`}>
+        <div className={`flex-1 overflow-y-auto px-3 sm:px-6 min-h-0 ${showEmptyState ? 'pb-2' : 'pb-8'}`}>
           {loadError ? (
             <div className="flex flex-col items-center justify-center py-20 text-center">
               <p className="text-danger text-sm mb-3">{loadError}</p>
@@ -511,7 +525,7 @@ export default function SchedulePage() {
           ) : loading ? (
             <div className="flex items-center justify-center py-20"><Skeleton className="h-6 w-32 rounded" /></div>
           ) : jobs.length === 0 && !creating ? (
-            <div className="flex flex-col h-full min-h-0">
+            <div className="flex flex-col sm:h-full min-h-0">
               {cronFolders.length > 0 && (
                 <div className="mb-4">
                   {cronFolders.map(f => (
@@ -525,7 +539,7 @@ export default function SchedulePage() {
                   ))}
                 </div>
               )}
-              <div className="flex-1 flex flex-col items-center justify-center text-center min-h-0 py-8">
+              <div className="sm:flex-1 flex flex-col items-center sm:justify-center text-center min-h-0 py-4 sm:py-8">
                 <CalendarClock className="w-16 h-16 text-muted/20 mb-4" strokeWidth={1} aria-hidden="true" />
                 <div className="text-muted text-sm font-medium">{i18nT('pages.schedulePage.no_scheduled_jobs_yet')}</div>
                 <p className="text-sm text-muted max-w-[360px] mb-5 mt-2">{i18nT('pages.schedulePage.schedule_recurring_tasks_to_run_automatically_ch')}</p>
@@ -542,8 +556,8 @@ export default function SchedulePage() {
                   create flow pre-filled. Only FEATURED presets surface here so
                   the empty state stays compact as the full catalog grows — the
                   rest live in the "Browse all templates" gallery. */}
-              <div className="w-full shrink-0 pt-6">
-                <div className="flex items-center justify-between gap-3 mb-3">
+              <div className="w-full shrink-0 pt-4 sm:pt-6">
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                   <div className="text-left text-[12px] font-medium uppercase tracking-[.04em] text-muted">{i18nT('pages.schedulePage.start_from_a_pre_made_schedule')}</div>
                   <Btn onClick={() => setGalleryOpen(true)}>
                     <span className="flex items-center gap-1.5"><LayoutGrid size={14} aria-hidden="true" /> {i18nT('pages.schedulePage.browse_all_templates')}</span>
@@ -580,7 +594,7 @@ export default function SchedulePage() {
               is nothing to filter or select in the other two. */}
           <div className="mb-3 flex flex-wrap items-center gap-2">
             {jobsView === 'list' && (<>
-              <div className="flex-1 min-w-[200px]"><SearchInput placeholder={i18nT('pages.schedulePage.filter_jobs')} value={cronFilter} onChange={e => setCronFilter(e.target.value)} /></div>
+              <div className="flex-1 min-w-[140px] sm:min-w-[200px]"><SearchInput placeholder={i18nT('pages.schedulePage.filter_jobs')} value={cronFilter} onChange={e => setCronFilter(e.target.value)} /></div>
               {selectedIds.size > 0 && (
                 <div className="flex items-center gap-2 shrink-0">
                   <span className="text-[13px] text-muted whitespace-nowrap">{selectedIds.size} {i18nT('pages.schedulePage.selected')}</span>
@@ -645,7 +659,7 @@ export default function SchedulePage() {
                 CardTitle: the page header already names this surface, and the
                 view switcher next to it says which of the three views is on —
                 a "Jobs" heading between them would restate both. */}
-            <Card className="p-3 mb-0">
+            <Card className="p-3 mb-0 overflow-x-auto">
             {actionError?.id === 'batch-move' && (
               <div className="px-3 py-1.5 mb-2 rounded-md bg-danger/5 border border-danger/20">
                 <span className="text-danger text-[12px]">{actionError.msg}</span>
@@ -657,8 +671,35 @@ export default function SchedulePage() {
                 Actions column walks off the right edge — which is what happened
                 once cells stopped wrapping. Fixed layout makes horizontal
                 overflow structurally impossible: over-long values truncate with
-                a tooltip instead of pushing their neighbours. */}
-            <Table className="table-fixed">
+                a tooltip instead of pushing their neighbours.
+
+                Every column carries a px width EXCEPT Message, which is the sole
+                residual: it is the one column whose value has no natural length,
+                so it should absorb every pixel the viewport has spare. Two rules
+                keep that from turning into a collapse, both pinned by
+                `SchedulePage.columnContract.test.ts`:
+
+                - No PERCENTAGE widths. A percentage column grows with the table,
+                  so it takes a share of exactly the width the residual column
+                  needs. With the previous 15%/13%/12% the residual was
+                  `0.6 × width − 540px`, i.e. ZERO at the table's own 900px
+                  min-width — and a fixed layout does not shrink content to fit,
+                  it overlaps the next cell. That is what put the Message chevron
+                  and preview on top of the Status badge at phone widths, and on a
+                  1280px desktop with the nav rail open (measured 0px there too).
+                - `min-w` covers the nine px columns (940px, border-box, so the
+                  `p-2`/`px-2` is inside each) PLUS a 180px floor for Message —
+                  enough for the 14px chevron and a one-line preview. A narrower
+                  container scrolls the table, which is honest; voiding a column
+                  silently is not. */}
+            <div className="relative">
+            {/* The scroller is the shadcn Table's own wrapper (the table's
+                parentElement — `relative w-full overflow-x-auto` in
+                ui/table.tsx); `sticky right-0` on the Actions cells resolves
+                against it, so the overflow measurement must read the same box.
+                `className` stays the FIRST attribute: the columnContract test
+                anchors on the literal `<Table className="table-fixed` opener. */}
+            <Table className="table-fixed min-w-[1120px]" ref={attachJobsTable}>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="w-[36px] px-2 text-center">
@@ -673,9 +714,9 @@ export default function SchedulePage() {
                     />
                   </TableHead>
                   <TableHead className="w-[68px]">{i18nT('pages.schedulePage.id')}</TableHead>
-                  <SortableTableHead label={i18nT('pages.schedulePage.name')} sortKey="name" sort={schedSort} onToggle={toggleSchedSort} className="w-[15%]" />
-                  <TableHead className="w-[13%]">{i18nT('pages.schedulePage.type')}</TableHead>
-                  <SortableTableHead label={i18nT('pages.schedulePage.schedule')} sortKey="schedule" sort={schedSort} onToggle={toggleSchedSort} className="w-[12%]" />
+                  <SortableTableHead label={i18nT('pages.schedulePage.name')} sortKey="name" sort={schedSort} onToggle={toggleSchedSort} className="w-[160px]" />
+                  <TableHead className="w-[116px]">{i18nT('pages.schedulePage.type')}</TableHead>
+                  <SortableTableHead label={i18nT('pages.schedulePage.schedule')} sortKey="schedule" sort={schedSort} onToggle={toggleSchedSort} className="w-[124px]" />
                   <TableHead>{i18nT('pages.schedulePage.message')}</TableHead>
                   <SortableTableHead label={i18nT('pages.schedulePage.status')} sortKey="status" sort={schedSort} onToggle={toggleSchedSort} className="w-[86px]" />
                   <SortableTableHead label={i18nT('pages.schedulePage.last_run')} sortKey="lastRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[82px]" />
@@ -686,8 +727,23 @@ export default function SchedulePage() {
                       controls (Run/Cancel, Delete, the ⋯ menu) measure 176px, and
                       the 12px shortfall was being hidden by the shadcn wrapper's
                       overflow-x-auto — i.e. a horizontal scrollbar, which this
-                      table must never need. */}
-                  <TableHead className="w-[176px]">{i18nT('pages.schedulePage.actions')}</TableHead>
+                      table must never need.
+
+                      `sticky right-0`: Actions is the last of ten columns, so in
+                      a container narrower than the table's min-width it starts
+                      past the scroll edge and every Run/Delete costs a horizontal
+                      scroll. Pinning it to the scrollport's right edge keeps row
+                      actions reachable while the other columns scroll under it —
+                      which is why the cell needs an OPAQUE `bg-card` (the Card's
+                      own surface): the default cell background is transparent and
+                      the scrolling columns would show through. Sticky changes
+                      paint position, not column width, so the `w-[176px]`
+                      contract above still holds. The pinned edge carries no
+                      static border: the seam cue is the measured gradient
+                      painted after the table, shown only while the scroller
+                      actually hides columns, so a full-width desktop table is
+                      byte-identical to the unpinned rendering at rest. */}
+                  <TableHead className="sticky right-0 w-[176px] bg-card">{i18nT('pages.schedulePage.actions')}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>{jobs.length === 0
@@ -729,7 +785,7 @@ export default function SchedulePage() {
                       </TableRow>
                     )}
                     {!isCollapsed && group.jobs.map(j => (
-              <TableRow key={j.id} className={`cursor-pointer ${selected?.id === j.id ? 'bg-accent-subtle' : ''} ${selectedIds.has(j.id) ? 'bg-accent-subtle/60' : ''}`} onClick={() => openDetail(j)}>
+              <TableRow key={j.id} className={`group/jobrow cursor-pointer ${selected?.id === j.id ? 'bg-accent-subtle' : ''} ${selectedIds.has(j.id) ? 'bg-accent-subtle/60' : ''}`} onClick={() => openDetail(j)}>
                 <TableCell className="px-2 text-center" onClick={e => e.stopPropagation()}>
                   <input
                     type="checkbox"
@@ -759,18 +815,36 @@ export default function SchedulePage() {
                 <TableCell className="text-muted">{fmtAgo(j.last_run_ts)}</TableCell>
                 <TableCell className="text-muted" title={j.next_run_ts ? fmtDateTimeNumeric(j.next_run_ts) : ''}>{fmtIn(j.next_run_ts)}</TableCell>
                 {/* Two controls plus the overflow menu. Anything wider than this
-                    is what pushed the column off screen; see CronRowActions. */}
-                <TableCell className="whitespace-nowrap" onClick={e => e.stopPropagation()}>
+                    is what pushed the column off screen; see CronRowActions.
+                    Pinned like the header cell above, on an OPAQUE `bg-card`.
+                    The row's hover/selected tints live on the <tr>, which the
+                    opaque base would hide, so the overlay div re-applies the
+                    SAME tokens above the base and below the controls (`-z-10`
+                    inside the stacking context every sticky cell creates):
+                    `--accent-subtle` is translucent, so composited over
+                    `bg-card` it matches the rest of the row exactly. */}
+                <TableCell className="sticky right-0 whitespace-nowrap bg-card" onClick={e => e.stopPropagation()}>
+                  <div aria-hidden className={`absolute inset-0 -z-10 transition-colors group-hover/jobrow:bg-bg-hover ${selected?.id === j.id ? 'bg-accent-subtle' : ''} ${selectedIds.has(j.id) ? 'bg-accent-subtle/60' : ''}`} />
                   <div className="flex items-center gap-1.5">
                     {j.is_running
                       ? <span title={i18nT('pages.schedulePage.cancel_running_execution')}><Btn danger onClick={() => cancelRun(j.id)} disabled={cancelling.has(j.id)}>{cancelling.has(j.id) ? '...' : i18nT('pages.schedulePage.cancel')}</Btn></span>
                       : <span title={j.enabled ? i18nT('pages.schedulePage.run_now_2') : i18nT('pages.schedulePage.resume_to_run')}><Btn onClick={() => runNow(j.id)} disabled={!j.enabled || running.has(j.id)}>{running.has(j.id) ? '...' : i18nT('pages.schedulePage.run')}</Btn></span>}
+                    {/* The armed state must explain itself IN THE LABEL: the
+                        `title` tooltip below is hover-only, so on touch it does
+                        not exist, and a bare "Confirm" gives a phone user no
+                        statement of what the second tap will destroy (#4120).
+                        The tooltip stays as a redundant pointer affordance.
+                        The visible text is also the accessible name — no
+                        aria-label, which would override the label a sighted
+                        user reads and break WCAG 2.5.3 (Label in Name); the
+                        row context names the job. Same convention as
+                        ChatInput's Continue/Send buttons. */}
                     <Btn
                       danger
                       disabled={deletingId === j.id}
                       title={confirmDeleteId === j.id ? i18nT('pages.schedulePage.click_again_to_confirm') : i18nT('pages.schedulePage.delete_job')}
                       onClick={() => confirmDeleteId === j.id ? deleteJob(j.id) : armDelete(j.id)}
-                    >{deletingId === j.id ? '...' : confirmDeleteId === j.id ? i18nT('pages.schedulePage.confirm') : i18nT('pages.schedulePage.delete')}</Btn>
+                    >{deletingId === j.id ? '...' : confirmDeleteId === j.id ? i18nT('pages.schedulePage.confirm_delete_job') : i18nT('pages.schedulePage.delete')}</Btn>
                     <CronRowActions
                       job={j}
                       folders={cronFolders}
@@ -792,6 +866,20 @@ export default function SchedulePage() {
                   )
                 })
               })()}</TableBody></Table>
+            {/* Seam cue for the pinned Actions column, same measured treatment
+                as the strips that already ship it (SessionRefStrip, FollowUpBar,
+                SidePanelLayout): a gradient says columns continue beneath the
+                pinned cell, because the opaque base otherwise hard-clips its
+                neighbour mid-word with no sign the table scrolls. Anchored to
+                the non-scrolling wrapper (a child of the scroller would travel
+                with the content) at the pinned column's left edge, and painted
+                ONLY while the scroller actually hides columns — a full-width
+                table shows nothing. `from-card` blends the clipped content into
+                the pinned cell's own surface. */}
+            {jobsTableEdges.right && (
+              <div aria-hidden="true" data-testid="jobs-table-cue-right" className="pointer-events-none absolute right-[176px] top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />
+            )}
+            </div>
             </Card>
             </>)}
           </>)}
@@ -906,6 +994,83 @@ export default function SchedulePage() {
 }
 
 /**
+ * Collapsed-by-default source view for a script cron's callable.
+ *
+ * Collapsed so the detail dialog does not grow taller for every job, and the
+ * source is fetched lazily on first expand (React Query holds `enabled: false`
+ * until then), so opening the dialog costs no extra request. The backend
+ * derives the file path from the job's own stored `script` field — the job id
+ * is the only input this component sends.
+ */
+function ScriptSourcePanel({ jobId }: { jobId: string }) {
+  const [open, setOpen] = useState(false)
+  const { data, isPending, isError, error } = useQuery({
+    queryKey: ['cronScript', jobId],
+    queryFn: async () => (await api.cronScript(jobId)) as CronScriptSource,
+    enabled: open,
+    // The file on disk can change between expands (scripts are agent-editable),
+    // and the app-wide default is staleTime: Infinity — opt this query out so
+    // re-expanding always refetches the current source.
+    staleTime: 0,
+  })
+  const download = useCallback(() => {
+    if (!data) return
+    const blob = new Blob([data.source], { type: 'text/x-python' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = data.file || 'script.py'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }, [data])
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Clickable
+        className="flex items-center gap-1 w-fit text-[12px] text-muted font-medium hover:text-text cursor-pointer"
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+      >
+        <ChevronRight size={14} className={`lucide-inline transition-transform ${open ? 'rotate-90' : ''}`} aria-hidden="true" />
+        {i18nT('pages.schedulePage.script_source')}
+      </Clickable>
+      {open && isPending && <Skeleton className="h-16 rounded-xl" />}
+      {open && isError && (
+        <div className="text-danger text-[13px]">
+          {error instanceof Error && error.message ? error.message : i18nT('pages.schedulePage.script_source_failed')}
+        </div>
+      )}
+      {open && data && (
+        <>
+          <CodeBlock
+            code={data.source}
+            lang="python"
+            complete
+            headerActions={
+              <Btn
+                className="p-1 border-0 rounded text-muted hover:text-text hover:bg-bg-hover"
+                onClick={download}
+                title={i18nT('pages.schedulePage.script_source_download')}
+                aria-label={i18nT('pages.schedulePage.script_source_download')}
+              >
+                <Download size={13} className="lucide-inline" aria-hidden="true" />
+              </Btn>
+            }
+          />
+          {data.truncated && (
+            <div className="text-[12px] text-muted">{i18nT('pages.schedulePage.script_source_truncated')}</div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Shape of GET /api/crons/{id}/script. */
+type CronScriptSource = { source: string; file: string; function: string; truncated: boolean }
+
+/**
  * Job detail / create view, rendered as a shadcn (Radix) dialog.
  *
  * Was a resizable side panel pinned to the right of the job list. The dialog
@@ -973,6 +1138,7 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, on
             )}
             <JobForm job={job} prefill={prefill} agents={agents} defaultAgent={defaultAgent} onSaved={onSaved} layout="vertical" externalSubmit submitRef={submitRef} onSavingChange={setSaving} />
             {panelError && <div className="text-danger text-[13px]">{panelError}</div>}
+            {job?.script && <ScriptSourcePanel jobId={job.id} />}
             {job?.script && (job.last_result || job.last_error) && (
               <div className="flex flex-col gap-1.5">
                 <div className="text-[12px] text-muted font-medium">{job.last_error ? i18nT('pages.schedulePage.last_error') : i18nT('pages.schedulePage.last_output')}</div>

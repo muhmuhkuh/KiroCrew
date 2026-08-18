@@ -40,6 +40,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import format_schedule
+from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.dashboard.handlers import get_update_info
 from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS, parse_duration
 from kiro_crew.executors import subprocess_executor
@@ -55,6 +56,7 @@ from kiro_crew.security import (
     should_record_observe_history,
 )
 from kiro_crew.sel import sel
+from kiro_crew.session import unlink_queued_temp_paths
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.allowlist import prompt_track_channel, send_dashboard_link
 from kiro_crew.slack.blocks import (
@@ -88,7 +90,7 @@ from kiro_crew.slack.sessions_view import (
     _SESSION_KIND_TASKRUNNER,
     _SESSIONS_DEFAULT_LIMIT,
     _build_sessions_blocks,
-    _collect_recent_sessions,
+    _collect_recent_sessions_off_loop,
 )
 from kiro_crew.slack.transport_dispatch import handle_message_transport
 from kiro_crew.stats import Stats
@@ -144,7 +146,10 @@ def _on_tracked_done(task: asyncio.Task[object]) -> None:
 def _get_skills_loader() -> SkillsLoader:
     global _skills_loader  # noqa: PLW0603
     if _skills_loader is None:
-        _skills_loader = SkillsLoader()
+        # Listing only: the gateway startup already ran the builtin sync (in a
+        # worker thread). Re-syncing here would put its filesystem work on the
+        # event loop that renders the Slack Home tab.
+        _skills_loader = SkillsLoader(install_builtins=False)
     return _skills_loader
 
 
@@ -163,6 +168,30 @@ _MAX_SEEN = 5000
 
 # prevent GC of fire-and-forget tasks (Python event loop holds weak refs)
 _background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+
+#: How many Home Tab session collections may run at once. Every
+#: ``app_home_opened`` from an allowed user schedules its own publish, and the
+#: collector reads up to ``per_kind * 10`` transcripts on worker threads. Those
+#: threads are the process-wide default executor, shared with history appends,
+#: cron store writes and session storage, so an unbounded fan-out of tab opens
+#: makes unrelated ``asyncio.to_thread`` callers queue behind multi-MB reads.
+#: One at a time is what the collector had before it was offloaded, when running
+#: on the loop serialized it by accident; this keeps that bound on purpose.
+_HOME_TAB_COLLECT_CONCURRENCY = 1
+_home_tab_collect_sem: asyncio.Semaphore | None = None
+
+
+def _home_tab_collect_gate() -> asyncio.Semaphore:
+    """The collector gate, created on the loop that first needs it.
+
+    Built lazily rather than at import: a module-level ``asyncio.Semaphore``
+    binds to whatever loop happens to be current when the module loads, and the
+    gateway's loop is not running yet at that point.
+    """
+    global _home_tab_collect_sem
+    if _home_tab_collect_sem is None:
+        _home_tab_collect_sem = asyncio.Semaphore(_HOME_TAB_COLLECT_CONCURRENCY)
+    return _home_tab_collect_sem
 
 
 class SeenCache:
@@ -269,12 +298,12 @@ async def _handle_agent(
     if args:
         name = args.strip().split()[0]
         if name.lower() in ("off", "default"):
-            _set_default_agent("")
+            await run_config_write(_set_default_agent, "")
             await respond("🔄 Reset to default agent.")
             return
         resolved = _resolve_agent_name(name)
         if resolved:
-            _set_default_agent(resolved)
+            await run_config_write(_set_default_agent, resolved)
             await respond(f"🔄 Switched to agent: *{resolved}*")
             return
         await respond(f"❌ Unknown agent `{name}`. Pick one below:")
@@ -602,7 +631,7 @@ async def _handle_sessions(
     # pattern: capture the exception, redact-then-truncate the message,
     # and emit an ``error=`` audit field.
     try:
-        rows = _collect_recent_sessions(
+        rows = await _collect_recent_sessions_off_loop(
             orch.sessions if orch is not None else None,
             limit=_SESSIONS_DEFAULT_LIMIT,
         )
@@ -1092,11 +1121,15 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
                 except (AttributeError, TypeError):
                     per_kind = _HOME_TAB_SESSIONS_PER_KIND
                 # Single directory scan for both kinds; partition + cap in memory.
-                all_rows = _collect_recent_sessions(
-                    sess_mgr,
-                    limit=per_kind * 10,
-                    kind=(_SESSION_KIND_DASHBOARD, _SESSION_KIND_TASKRUNNER),
-                )
+                # Gated so a burst of tab opens cannot put N of these scans in
+                # the shared executor at once; the rest of the publish, which is
+                # Slack API calls, stays unserialized.
+                async with _home_tab_collect_gate():
+                    all_rows = await _collect_recent_sessions_off_loop(
+                        sess_mgr,
+                        limit=per_kind * 10,
+                        kind=(_SESSION_KIND_DASHBOARD, _SESSION_KIND_TASKRUNNER),
+                    )
                 sel().log_api_access(
                     caller=user_id,
                     operation="slack.home_tab_sessions_data_access",
@@ -1189,17 +1222,23 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
             if isinstance(all_vs, list):
                 total_lessons = len(all_vs)
                 # get_lessons() returns ORDER BY updated_at DESC (most recent first).
+                # Deferred import: ``vector_memory`` pulls snowballstemmer plus
+                # the optional numpy/faiss imports, and this renderer is the
+                # module's only use of it, on an owner-command path.
+                from kiro_crew.vector_memory import _lesson_display_text
+
                 for entry in all_vs[:5]:
                     try:
                         parsed = json.loads(entry["value_json"])
-                        rule = (
-                            parsed.get("rule", str(parsed))
-                            if isinstance(parsed, dict)
-                            else str(parsed)
-                        )
-                        lesson_lines.append(
-                            f"• {redact_credentials(redact_exfiltration_urls(rule)[0])[0][:100]}"
-                        )
+                        # Rendered text for either storage shape, so a
+                        # mapping-shaped row keeps its NOT-clause instead of
+                        # showing rule-only (or a dict repr).  Credential
+                        # redaction runs on the FULL display text (rule +
+                        # negative combined) before truncation, so embedded
+                        # secrets in either field are replaced.
+                        rule = _lesson_display_text(parsed) or str(parsed)
+                        safe = redact_credentials(redact_exfiltration_urls(rule)[0])[0]
+                        lesson_lines.append(f"• {safe[:100]}")
                     except Exception:
                         logger.debug("Skipping malformed lesson entry", exc_info=True)
                 vs_ok = True
@@ -1511,6 +1550,11 @@ async def _handle_message_deleted(orch: GatewayOrchestrator, event: dict) -> Non
             _filtered = [item for item in _pq if item[0] != deleted_ts]
             if len(_filtered) < len(_pq):
                 was_queued = True
+                # Dropped entries never reach _dispatch_queued's cleanup, so
+                # their temp files must be unlinked here or they leak.
+                for item in _pq:
+                    if item[0] == deleted_ts:
+                        unlink_queued_temp_paths(item[2])
                 if _filtered:
                     orch._pending_queue[_del_session_key] = _filtered
                 else:
@@ -1624,11 +1668,7 @@ async def _dispatch_queued(
         # turn's text could still resolve its image paths (see _route_message).
         # Unlink them now that the turn has consumed them — in finally so a
         # raising turn can't leak the temp files.
-        for _p in kwargs.get("image_temp_paths") or []:
-            try:
-                os.unlink(_p)
-            except OSError:
-                pass
+        unlink_queued_temp_paths(kwargs)
 
 
 # Maximum characters to recover from block extraction (DoS guard).
@@ -2277,7 +2317,10 @@ async def _route_message(
         active_task = orch._session_tasks.pop(session_key, None)
         if has_session or active_task:
             orch.sessions.clear_queue(session_key)
-            orch._pending_queue.pop(session_key, None)
+            # Dropped pending (pre-session) entries never reach
+            # _dispatch_queued's cleanup, so unlink their temp files here.
+            for _item in orch._pending_queue.pop(session_key, None) or []:
+                unlink_queued_temp_paths(_item[2])
 
             # Post ephemeral "Stopping…" block with Kill Now button
             if orch.slack:

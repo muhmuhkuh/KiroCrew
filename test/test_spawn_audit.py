@@ -33,9 +33,10 @@ groups, none of which is the finding's agent-influenced-spawn vector:
 * Internal process management (read our own ppid; enumerate/kill our own
   managed/orphaned processes) and system-metrics probes (fixed sysctl/ps/etc).
 * Trusted-side gateway/MCP-backend spawns (``mcp_gateway`` — MCP backends sit
-  on the trusted side of the sandbox boundary by design) and the Playwright
-  proxy the finding explicitly excludes (inherits the already-sandboxed
-  kiro-cli parent).
+  on the trusted side of the sandbox boundary by design) and the Playwright CLI
+  toolchain spawns in ``browser_cli`` (fixed argv, operator-triggered install;
+  the agent's own browser commands are shell tool calls gated by the approval
+  path, not spawns we make).
 * Operator-configured state sync (``sync/*`` — git/s3/rsync/litestream
   push/pull against an operator-set remote) and app-registry package install
   of an operator-installed package.
@@ -46,6 +47,19 @@ operator-configured rather than agent-selected in the finding's sense):
 ``apps/builtins/code_reviewer/git.py`` git against a locally-checked-out CR
 repo, and ``sync/*`` push/pull. Routing these would also need their real-git
 unit tests to tolerate the sandbox wrapper.
+
+The Design Tweak builtin (``apps/builtins/design_tweak/backend/server.py``)
+adds three spawns in the same non-agent-selected categories:
+``_lsof_fields`` (fixed-argv ``lsof`` on numeric pids the backend discovered —
+a system probe like the sysctl/ps ones above), ``_h_pick_folder`` (fixed-argv
+``osascript`` running a hardcoded AppleScript for the macOS folder picker — a
+desktop-UI spawn), and ``_start_dev_proc`` (the user's OWN registered project
+dev server: cwd is the user-selected project dir and the argv is that project's
+package-manager dev script — operator/user-configured, reached only via the
+HMAC-signed gateway proxy, not agent-prompt-selected). ``_start_dev_proc`` is
+directly analogous to ``code_reviewer/git.py`` and is a follow-up sandbox-routing
+candidate; routing a long-lived dev server would need the resource/filesystem
+wrapper not to starve it.
 """
 
 from __future__ import annotations
@@ -73,7 +87,7 @@ _SPAWN_BASES = {"subprocess", "asyncio"}
 # Spawn helpers called as a BARE NAME rather than ``module.attr`` -- they are
 # imported directly, so the receiver check above cannot see them. Without this
 # the audit goes blind the moment a call site moves to the wrapper.
-_SPAWN_NAMES = {"create_subprocess_limited"}
+_SPAWN_NAMES = {"create_subprocess_limited", "run_limited", "popen_limited"}
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
 # routed through the sandbox chokepoint. ``_prepare_sandboxed_spawn`` is the
@@ -93,14 +107,23 @@ _ROUTED_TOKENS = (
 # fixed-argv internal probes (no agent-influenced child) are exempted in
 # ``PREEXEC_EXEMPT`` below.
 #
-# ``create_subprocess_limited`` is the preferred form: it delivers the same
-# limits AFTER exec via the spawn shim instead of in a fork child of this
-# threaded gateway. The two ``*_preexec`` names remain valid only for the
-# synchronous spawns that have not moved yet.
+# ``create_subprocess_limited`` (async) and ``run_limited`` / ``popen_limited``
+# (sync) are the preferred forms: they deliver the same limits AFTER exec via the
+# spawn shim instead of in a fork child of this threaded gateway. The two
+# ``*_preexec`` names remain valid for the wrappers' own no-shim fallbacks and
+# the terminal's pre-resolved ioctl callback.
+#
+# Every token is matched as a CALL (trailing paren) rather than a bare name: the
+# check scans the enclosing function's raw source, docstrings and comments
+# included, so a bare-name match lets prose like "routed through run_limited"
+# satisfy the gate while the actual spawn silently reverts to a bare
+# ``subprocess.run`` (verified by mutation before the parens were added).
 _PREEXEC_TOKENS = (
-    "create_subprocess_limited",
-    "resource_limit_preexec",
-    "session_host_preexec",
+    "create_subprocess_limited(",
+    "run_limited(",
+    "popen_limited(",
+    "resource_limit_preexec()",
+    "session_host_preexec(",
 )
 
 # Routed functions exempt from the resource-limit requirement: the enclosing
@@ -171,6 +194,16 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # version into versions.txt. The binary name is a module constant; a
         # resource ceiling / sandbox adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
+        # KAS auth callback token fetch (--auth=acp-callback): a single fixed
+        # argv ``[<kiro-cli>, "chat", "_", "get-kas-token"]`` with a 20s timeout,
+        # no shell and no agent-influenced arguments — the subcommand tail is a
+        # module constant and the binary is the same kiro-cli Crew already spawns
+        # as its agent runtime (``resolve_kiro_cli``). Deliberately NOT
+        # sandbox-routed: kiro-cli must reach its OWN auth/token store to mint the
+        # KAS access token (same reason ``gh`` is not routed), which a sandbox
+        # would hide and break the callback. The child is SIGKILLed on timeout or
+        # task cancellation, so it never orphans.
+        "acp/kas_auth.py::resolve_kas_access_token",
         # Tailnet origin derivation + forwarded-peer whois (RFC:
         # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
         # "status", "--json"]`` or ``["<tailscale>", "whois", "--json",
@@ -512,6 +545,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         #     body (--input -), never argv.
         # No binary or cwd is agent-selected.
         "apps/builtins/issue_radar/backend/gitlab_client.py::_glab_run",
+        "apps/builtins/design_tweak/backend/server.py::_h_pick_folder",
+        "apps/builtins/design_tweak/backend/server.py::_lsof_fields",
+        "apps/builtins/design_tweak/backend/server.py::_start_dev_proc",
         "apps/builtins/workflows/server.py::handle_run",
         # _start_run's worker spawns argv that is ALWAYS pre-wrapped by its
         # callers through sandboxed_spawn_argv (sync wraps each step with
@@ -541,18 +577,31 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # save (off the event loop) or the `kirocrew browse setup` CLI. Fixed
         # argv of trusted node-toolchain tools resolved via find_node_tool
         # (npm/npx/node) plus the ``playwright install <engine>`` subcommand,
-        # where ``engine`` is validated against the fixed BROWSER_ENGINES
-        # allowlist before it can reach argv — never free agent input. Mirrors
-        # cli.py::_ensure_node / env.py::_run below, which shell the same
-        # node/ensure-node toolchain and are benign for the same reason.
-        # ``_npx_cache_playwright_roots`` runs the fixed ``npm config get cache``.
-        "browser/setup.py::_npx_cache_playwright_roots",
-        "browser/setup.py::_resolve_playwright_core_cli",
-        "browser/setup.py::_run",
+        # ``browser_cli`` spawns the Playwright CLI toolchain on fixed argv that
+        # the AGENT never contributes to, which is what makes them benign here:
+        #   * ``install.py::_run`` runs the three install steps
+        #     (``npm install -g @playwright/cli@latest``,
+        #     ``playwright-cli install-browser``, ``playwright-cli install
+        #     --skills agents --global``). Every token is a constant in our code
+        #     and the only trigger is the operator pressing Install in Settings.
+        #     Sandboxing it would be wrong, not merely unnecessary: the install
+        #     needs the real npm registry and writes the global prefix.
+        #   * ``view.py::_spawn`` runs ``playwright-cli show --port <n>`` where
+        #     the port comes from our own bind probe, and the host is the
+        #     hardcoded loopback constant.
+        # ``view.py::stop`` spawns nothing: it reaps its own child's process
+        # group rather than issuing a global ``show --kill``, which would take
+        # an operator's independent session down with ours.
+        # The agent's OWN browser commands are not spawned by us at all -- it
+        # runs them as ordinary shell tool calls, which the approval path gates
+        # (see chat_runner._is_browser_cli_command).
+        "browser_cli/install.py::_run",
+        "browser_cli/view.py::_spawn",
         "cli.py::_consolidate_cmd",
         "cli.py::_ensure_node",
         "cli.py::_node_ok",
         "cli.py::main",
+        "cli_chat.py::_run_chat",
         "cli_chat.py::_tui",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``), here used only to drive the now-async
@@ -562,8 +611,25 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # ``asyncio.run`` sites below (cli_doctor.py::_doctor, workflows
         # server.py::handle_run).
         "cli_commands.py::_cleanup_app_crons_from_scheduler",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``), used to drive the async
+        # ``register_app_crons_with_service`` coroutine from the loop-less CLI
+        # enable path — the exact enable-direction mirror of
+        # ``_cleanup_app_crons_from_scheduler`` above. No child process is
+        # created; the sole input is the operator-typed app name.
+        "cli_commands.py::_register_app_crons_to_scheduler",
         "cli_doctor.py::_doctor",
         "cli_doctor.py::_doctor_mcp_tools",
+        # NOT a subprocess spawn here: the AST heuristic matches ``asyncio.run``
+        # (attr ``run`` on base ``asyncio``), used only to drive the async KAS
+        # token probe from the synchronous doctor. The actual child process is
+        # spawned inside ``acp/kas_auth.py::resolve_kas_access_token``, which is
+        # allowlisted separately above (kiro-cli reaching its own token store).
+        "cli_doctor.py::_report_kas_backend",
+        # ``systemctl is-active <unit>`` probes for the memory-pressure
+        # preparedness check: argv is hardcoded (systemd-oomd/earlyoom unit
+        # names), no agent influence, 5s-capped, read-only query.
+        "cli_doctor.py::_detect_userspace_oom_killer",
         # Read-only diagnostic: `loginctl show-user <user> -p Linger --value`,
         # a fixed argv whose only variable is the invoking account name taken
         # from $USER/$LOGNAME (never agent-supplied). Same class as
@@ -593,6 +659,13 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # imports none of the AX/capture modules (asserted in
         # test_computer_use_overlay.py::test_the_renderer_never_reaches_into_the_ax_or_capture_surface).
         "computer_use/overlay.py::_spawn",
+        # NOT subprocess spawns: the AST heuristic matches ``asyncio.run``
+        # (attribute ``run`` on base ``asyncio``). Both sites drive an in-process
+        # coroutine from the loop-less CLI entry point; the network I/O is
+        # aiohttp in the same process and no child is created. Same
+        # classification as the other ``asyncio.run`` sites in this list.
+        "connections/l0_probe.py::_run_record",
+        "connections/l0_probe.py::main",
         "cloud/source.py::_git_tracked_files",
         "cloud/source.py::_tracked_tree_is_dirty",
         "cloud/source.py::_use_git_archive",
@@ -627,7 +700,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "dashboard/handlers/core.py::_unusable",
         "dashboard/handlers/core.py::api_stt_install",
         "dashboard/handlers/files.py::_run",
-        "dashboard/handlers/files.py::api_reveal_path",
         "dashboard/handlers/files.py::api_screenshot",
         "dashboard/handlers/files.py::api_upload",
         "dashboard/handlers/knowledge.py::_run_folder_dialog",
@@ -676,12 +748,10 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "instances/token_mint.py::mint_remote_token",
         "instances/token_mint.py::run_remote_kirocrew",
         "mcp_core.py::_get_ppid",
-        "mcp_discovery.py::sync_to_agent_config",
         "mcp_gateway/backend.py::spawn_backend",
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",
-        "mcp_playwright_proxy.py::run_proxy",
         # Read-only `git config` / `git ls-remote --get-url` resolving which
         # remote the update would fetch from, for the `updates.source` pin. Fixed
         # list-argv (no shell=True), no agent input: the branch lands mid-key
@@ -690,12 +760,20 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # `--`. Must NOT be sandboxed: it reads the real checkout's git metadata.
         "platform/update_governance.py::_git",
         "mcp_shared.py::_get_ppid",
+        # File-manager launchers for the dashboard's reveal action. The
+        # command is an absolute literal resolved in this module (never a bare
+        # argv name, so an agent-writable PATH entry cannot supply it), the
+        # spawn gets a PATH pinned to the trusted system directories, and the
+        # only caller-supplied element is the path being revealed — which is
+        # passed as a later argv element, never as the command.
+        "platform_compat.py::open_with_default_app",
         "platform_compat.py::_current_user_sid",
         "platform_compat.py::_posix_process_parent_map",
         "platform_compat.py::find_listening_pids",
         "platform_compat.py::find_python_interpreter",
         "platform_compat.py::kill_pid",
         "platform_compat.py::kill_process_tree",
+        "platform_compat.py::reveal_in_file_manager",
         "platform_compat.py::process_command_line",
         # Same class as process_command_line: a read-only process-attribute query
         # (``ps -o uid=`` / ``/proc/<pid>`` stat) in the platform leaf module,
@@ -727,11 +805,31 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "pod/runtime.py::recent_journal",
         "sandbox.py::_probe_sandbox_exec",
         "sandbox.py::_ssh_supports_accept_new",
+        # The aggregate slice-ceiling apply: `systemctl --user set-property
+        # --runtime kirocrew-agents.slice MemoryMax=<N>M MemorySwapMax=0
+        # TasksMax=<N>`. Argv is a fixed verb plus module-constant unit name;
+        # the only variable tokens are integers derived from config/sysconf
+        # (type-checked, junk falls back to defaults) — not agent-influenced.
+        # Runs once at gateway startup, not from an agent turn. Sandboxing it
+        # would be circular: it constructs the cgroup boundary agent spawns
+        # are confined by.
+        "sandbox.py::ensure_agents_slice_limits",
+        # The agent-slice MemoryHigh reconciler. Fixed argv: `systemctl --user
+        # set-property --runtime kirocrew-agents.slice MemoryHigh=<value>`, where
+        # the binary is resolved with shutil.which (never a caller-supplied PATH)
+        # and <value> is derived from host RAM, never from agent input.
+        # Sandboxing it would also be circular: it CONFIGURES the cgroup
+        # containment that agent spawns are wrapped in.
+        "sandbox.py::_ensure_agent_slice_memory_high",
         # The chokepoint wrapper itself. It spawns whatever argv it is handed, so
         # it cannot route on its own behalf — its CALLERS are the ones this audit
         # holds to sandboxed_spawn_argv / wrap_argv, and they still appear here
         # individually because _SPAWN_NAMES collects bare-name calls to it.
         "sandbox.py::create_subprocess_limited",
+        # The synchronous siblings of the above, same reasoning: they wrap an argv
+        # they are handed and cannot route on its behalf.
+        "sandbox.py::run_limited",
+        "sandbox.py::popen_limited",
         # The AppArmor profile installer. All three spawn FIXED, operator-facing
         # tooling with no agent-influenced input: `apparmor_parser --version`,
         # `apparmor_parser -Q --skip-cache <temp profile this module generated>`.
@@ -753,8 +851,27 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "session_pid.py::find_orphan_mcp_candidates",
         "session_pid.py::kill_orphan_mcps",
         "slack/gateway.py::_auto_apply_update",
+        # Wheel/cli.sh auto-update: runs the signed installer command
+        # (composed locally from a validated channel name and https-pinned
+        # artifact base, never from feed data). The child is the cli.sh
+        # installer, which performs its own RSA-SHA256 signature verification.
+        # NOT sandbox-routed because the installer must write to the managed
+        # venv and symlink ~/.local/bin/kirocrew.
+        "slack/gateway.py::_auto_apply_wheel_update",
+        # Pluggable update provider: CommandProvider runs operator-configured
+        # shell commands from security_policy.json or config.json (sensitive
+        # home dirs the agent cannot write). The check command probes for a
+        # newer version; the apply command performs the update. Both are
+        # operator-authored, not agent-influenced. NOT sandbox-routed because
+        # the command must reach the host's package manager / registry.
+        "platform/update_provider.py::check",
+        "platform/update_provider.py::apply",
         "slack/gateway.py::_check_missing_deps",
-        "slack/gateway.py::_init_services",
+        # The kiro-cli version probe, extracted from _init_services (issue
+        # #3051). Fixed argv ("kiro-cli --version"), no agent-influenced
+        # input; sandboxing the probe would be circular for the same reason
+        # as the other boot-time self-checks above.
+        "slack/gateway.py::_warn_if_kiro_cli_outdated",
         "testing/harness.py::spawn_feature_gateway",
         # Apple on-device speech (macOS only). None of these takes an agent-authored
         # command: the argv is a fixed toolchain path, the helper Kiro Crew itself

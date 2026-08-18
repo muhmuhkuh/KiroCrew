@@ -35,7 +35,9 @@ in the **same commit** when you change what it documents.
 | the security model as a whole, threat boundaries | [security-deep-dive](docs/architecture/security-deep-dive.md) |
 | `computer_use/` | [computer-use](docs/system-specs/modules/computer-use.md) |
 | `acp/`, kiro-cli transport, providers | [acp-client](docs/system-specs/modules/acp-client.md) + [providers](docs/system-specs/modules/providers.md) |
+| adding or adapting an agent harness (BYO, KAS, claude seam) | [harness-parity](docs/system-specs/modules/harness-parity.md) (invariants) + [harness-parity-gate](docs/ci/harness-parity-gate.md) (CI) |
 | sessions, slots, session keys, PIDs | [session](docs/system-specs/modules/session.md) + [history](docs/system-specs/modules/history.md) |
+| session summaries, the chat summary panel, intent extraction | [session-summary](docs/system-specs/modules/session-summary.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
@@ -48,7 +50,7 @@ in the **same commit** when you change what it documents.
 | themes | [themes](docs/system-specs/modules/themes.md) + [theming-contract](website/docs/theming-contract.md) |
 | anything under `website/` | [`website/AGENTS.md`](website/AGENTS.md) |
 | user-facing strings, dates, numbers, sort order | [i18n-catalog](website/docs/i18n-catalog.md) (authoring) + [i18n-gates](docs/ci/i18n-gates.md) (CI) |
-| tests: flakes, speed, fixtures, sharding | [testing-conventions](docs/system-specs/common/testing-conventions.md) |
+| tests: flakes, speed, fixtures, sharding, side effects, conftest isolation | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill |
 | browser E2E | [e2e-gate](docs/ci/e2e-gate.md) |
 | CI, PR flow, review gates | [ci-and-reviews](docs/ci/ci-and-reviews.md) + [CONTRIBUTING.md](CONTRIBUTING.md) |
 | constants, magic numbers, where a limit lives | [code-style](docs/system-specs/common/code-style.md) |
@@ -78,7 +80,10 @@ This repo is the de-Amazoned public fork of an internal package. Never re-add:
 - **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to
   `acp` and kiro-cli is REQUIRED. Keep the dormant `ACP_BACKEND_CLAUDE` /
   `_is_claude` seam in `acp/client.py` so an internal companion can re-register
-  Claude Code; do NOT re-add the public registration glue.
+  Claude Code; do NOT re-add the public registration glue. A harness added at
+  `agent.acp_backend` is a different question and is governed by
+  [Harness parity](#harness-parity-kiro-is-first-class-the-rest-are-adapted) —
+  adapted, never a second `agent.provider` value.
 - **OSS-flipped defaults:** always-on in-process embeddings, Piper TTS by default,
   a default-open Slack enterprise gate, lazy STT extras.
 - **Fork UX divergences:** the Channels app is hidden from the App Store and the
@@ -148,6 +153,50 @@ Never hardcode a model id (`claude-*`, `opus*`, `sonnet*`, `haiku*`, `gpt-*`,
 `code-review.yml` fails on a newly added hardcoded model literal outside
 `model_registry*`, the config schema, and tests.
 
+## Harness parity: Kiro is first-class, the rest are adapted
+
+Never express "this is the Kiro harness" as the ABSENCE of another harness. Kiro
+Crew drives one first-class harness — `kiro-cli` (`ACP_BACKEND_KIRO`, spelled
+`""`) — and adapts the others (the dormant `ACP_BACKEND_CLAUDE` seam, KAS, and
+any bring-your-own harness). A negative test like `not is_claude_backend` reads
+correctly with two harnesses and then silently hands the third a capability, a
+sandbox waiver, or a session label nobody granted it — and it fails toward the
+permissive answer, so nothing goes red until an operator who never opted into
+that harness pays for it.
+
+- **An added harness ADAPTS, it does not widen.** It may only fit itself to the
+  seams the Kiro harness already runs through: no new conditional, required
+  argument, awaited step, or failure mode on the Kiro path, and no collapsing a
+  per-harness literal (spawn argv, `PROTOCOL_VERSION`, client capabilities) into
+  one form every harness accepts. A harness that cannot land without changing the
+  Kiro path does not land yet.
+- **Identity is positive.** `is_kiro_backend` / `== ACP_BACKEND_KIRO`, or
+  membership in a named `ACP_BACKENDS_*` set in `acp/types.py`. Never a bare
+  string literal, an inequality, or a negation.
+- **Capabilities are opt-in membership sets** (`ACP_BACKENDS_SESSION_SHARING`,
+  `ACP_BACKENDS_STEER`, `ACP_BACKENDS_INTERNAL_SANDBOX`), and every harness's
+  membership is an explicit decision. `is_kiro_cli` is the one that fails OPEN:
+  it makes `sandbox.wrap_argv` SKIP Kiro Crew's own seatbelt in favour of the
+  harness's internal sandbox, so granting it to a harness without one leaves the
+  agent process unconfined.
+- **Kiro is the floor.** `agent.acp_backend` defaults to `ACP_BACKEND_KIRO` and
+  it is in `ACP_BACKENDS_SELECTABLE` unconditionally; an unusable persisted value
+  degrades there with a logged reason (`_normalize_acp_backend`) instead of
+  raising. A harness is selected at `acp_backend` — `agent.provider` stays
+  `enum=["acp"]`.
+- **Registration is additive at the seam** — `platform/interfaces.py`'s
+  `ProviderRegistry`, a v1 addition with no `CONTRACT_VERSION` bump. A new
+  provider capability lands on the `LLMProvider` ABC with a safe default, never
+  as a `hasattr` probe on the Kiro path.
+- Invariant ids, and the test pinning each, are in
+  [harness-parity](docs/system-specs/modules/harness-parity.md). Cite them bare
+  (`H7`) in code comments and review findings.
+
+`scripts/check_harness_parity.py` fails on a newly added negative identity test
+under `src/kiro_crew/` (run it locally with
+`HARNESS_BASE_REF=origin/main python3 scripts/check_harness_parity.py`); the
+judgment half is the `harness-parity` rule in `AUTOSDE.yaml`.
+
 ## Specification management
 
 - MUST read the relevant spec under `docs/system-specs/modules/` before changing
@@ -206,9 +255,39 @@ Gates you will trip:
 Never fix a flake with a rerun, a longer `sleep`, or a weakened assertion. Read
 [testing-conventions](docs/system-specs/common/testing-conventions.md) § Determinism
 for the five flake classes and the one correct fix for each. In particular, a timing
-test that asserts algorithmic **complexity** must bound the doubling RATIO, not an
-absolute duration: CI enables coverage on 3.12 only, and that multiplier made one shard
-fail on 3.12 and pass on 3.10 at the same commit.
+test that asserts algorithmic **complexity** must assert the shape, not a duration —
+deterministically where the code has structure to observe (pin the linear path, require
+an identical invocation trace when the input doubles), and by a generously-bounded
+doubling ratio only where it does not: absolute ceilings split by Python version (CI
+enables coverage on 3.12 only), and tight timed ratios false-red on shared runners.
+
+**A test must not touch the operator's machine, and the floor you stand on is not the
+same in every testpath.** `testpaths` collects three trees, and only `test/` gets
+`test/conftest.py`; the ~108 test modules under `src/kiro_crew/apps/builtins/*/tests/`
+see the **rootdir** `conftest.py`, plus that app's own `tests/conftest.py` where one
+exists (three of the eight apps ship one). So the rootdir conftest carries the
+host floor: `KIROCREW_HOME` pinned per test, the import-time `~/.kiro` bindings pinned
+(that directory is kiro-cli's own home, shared with the real installed agent, and a
+separate isolation axis from the data home), the SEL default dir pinned session-wide,
+`tempfile`'s base redirected with residue reported, and the checkout failed on residue.
+Before adding isolation, decide which floor it belongs to; before writing a test, read
+the [writing-tests skill](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md).
+Two traps are worth naming here because neither is visible when reading the test:
+
+- **A child process inherits pytest's CWD, the repo root**, so a spawn that may create a
+  file needs `cwd=` under `tmp_path` — and the assertion must be scoped to where that
+  child actually ran, not to where you hoped it wrote.
+- **A singleton with a daemon thread beats every filesystem cleanup.** It captures the
+  directory the first caller resolved and re-creates it after a test's own teardown
+  deleted it, so the fix is a session-scoped directory owned by no test, never tidier
+  cleanup.
+- **A stub is not a stop: SPY on a `shutdown`/`close`/`stop` and delegate.** A stub that
+  only records leaves the thing running for the whole worker. Replacing the metrics
+  provider's `shutdown` left an OpenTelemetry exporter thread alive, and because that SDK
+  reinstalls it in every fork child via `os.register_at_fork`, the sandbox probe's child
+  became multithreaded — `unshare(CLONE_NEWUSER)` implies `CLONE_THREAD` and fails EINVAL
+  there, which was cached as "this host has no sandbox backend" and failed every later
+  sandboxed spawn closed. 19 red tests, none of them a metrics test.
 
 ## Code style
 

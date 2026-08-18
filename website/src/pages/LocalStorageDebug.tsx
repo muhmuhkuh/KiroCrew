@@ -18,6 +18,7 @@ interface StorageGroup {
 
 const PREFIX_PATTERNS: [RegExp, string][] = [
   [/^vc_heights_/, 'vc_heights_*'],
+  [/^vc_anchor_/, 'vc_anchor_'],
   [/^kirocrew:touched-files:/, 'kirocrew:touched-files:*'],
   [/^mc-cmt-read:/, 'mc-cmt-read:*'],
   [/^mimir-tasks:/, 'mimir-tasks:*'],
@@ -106,7 +107,9 @@ export default function LocalStorageDebug() {
     let removed = 0
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const k = localStorage.key(i)
-      if (k && k.startsWith('vc_heights_')) { localStorage.removeItem(k); removed++ }
+      if (k && (k.startsWith('vc_heights_') || k.startsWith('vc_anchor_'))) {
+        localStorage.removeItem(k); removed++
+      }
     }
     refresh()
     return removed
@@ -115,7 +118,10 @@ export default function LocalStorageDebug() {
   return (
     <div className="space-y-4">
       {/* ── Usage Overview ── */}
-      <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2">{i18nT('pages.localStorageDebug.usage')}</h4>
+      {/* `first:mt-0`: these headings separate one section from the previous
+        * one, but the leading heading has only the pane above it, and the pane
+        * already owns the gap under the tab strip. */}
+      <h4 className="text-sm font-semibold text-text-strong mt-4 mb-2 first:mt-0">{i18nT('pages.localStorageDebug.usage')}</h4>
       <div className="card-glow border border-border bg-card rounded-lg p-5 mb-4 shadow-sm">
         <div className="flex items-center justify-between mb-3">
           <div>

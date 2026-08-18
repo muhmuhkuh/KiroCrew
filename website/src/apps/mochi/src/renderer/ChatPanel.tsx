@@ -36,7 +36,9 @@ import { familyGrantIsDistinct, trustBasePattern, truncateCommandLabel } from '.
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
-import { rehypeSanitize } from '../../../../components/MarkdownRenderer'
+import { rehypeSanitize, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
+import { mdImageDestToPath } from '../../../../utils/fileTokens'
+import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
 import type { ApprovalRequest, ChatMessage } from '../shared/types'
 import { applyTheme, type ThemeId } from '../shared/themes'
 import { PINNED_PANEL_WIDTH } from '../shared/constants'
@@ -55,6 +57,7 @@ import { MochiCodeBlock } from '../../panel/MochiCodeBlock'
 import { reportStat } from '../../panel/panelBridge'
 import { i18nT } from '../../../../i18n/t'
 import { i18next } from '../../../../i18n'
+import { electronPlatform, isElectron } from '../../../../lib/electron'
 import { moodLabel, stateLabel } from '../../i18nKeys'
 
 /**
@@ -214,7 +217,9 @@ const PinnedChip: React.FC<{
 
   const handleClick = () => {
     api?.markPinnedSeen?.(pin.path)
-    api?.previewFile?.(pin.path)
+    // Preview is a shell-bridge capability; in a browser tab the click can
+    // only mark the pin seen, not open the OS previewer.
+    if (isElectron) api?.previewFile?.(pin.path)
     onMarkSeen?.(pin.path)
   }
 
@@ -223,27 +228,31 @@ const PinnedChip: React.FC<{
     api?.unpinFile?.(pin.path)
   }
 
-  return (
-    <Clickable
-      onClick={handleClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      title={pin.path}
-      style={{
-        display: 'flex',
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: 6,
-        padding: '5px 8px',
-        borderRadius: 8,
-        cursor: 'pointer',
-        background: hovered ? 'rgba(255,255,255,0.07)' : 'transparent',
-        transition: 'background 0.15s ease',
-        position: 'relative',
-        opacity: isDeleted ? 0.35 : 1,
-        flexShrink: 0,
-      }}
-    >
+  // The row is a click target only while the click has a visible payoff:
+  // opening the OS previewer (shell only), or clearing an unseen-update dot
+  // (HTTP-backed, works everywhere). Otherwise it renders inert — same
+  // treatment as the inline file chip — so a browser tab never shows a
+  // live-looking control that silently does nothing. Hover still reveals the
+  // unpin button, which is its own control and works everywhere.
+  const clickable = isElectron || (isUpdated && !isDeleted)
+
+  const chipStyle: React.CSSProperties = {
+    display: 'flex',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    padding: '5px 8px',
+    borderRadius: 8,
+    cursor: clickable ? 'pointer' : 'default',
+    background: clickable && hovered ? 'rgba(255,255,255,0.07)' : 'transparent',
+    transition: 'background 0.15s ease',
+    position: 'relative',
+    opacity: isDeleted ? 0.35 : 1,
+    flexShrink: 0,
+  }
+
+  const body = (
+    <>
       {/* Colored file icon */}
       <File size={14} color={isDeleted ? 'var(--text-muted)' : extColor} style={{ flexShrink: 0 }} />
 
@@ -302,6 +311,31 @@ const PinnedChip: React.FC<{
           <X size={12} />
         </button>
       )}
+    </>
+  )
+
+  if (!clickable) {
+    return (
+      <div
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        title={pin.path}
+        style={chipStyle}
+      >
+        {body}
+      </div>
+    )
+  }
+
+  return (
+    <Clickable
+      onClick={handleClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      title={pin.path}
+      style={chipStyle}
+    >
+      {body}
     </Clickable>
   )
 }
@@ -1596,7 +1630,7 @@ function fixStreamingFences(s: string): string {
   return s
 }
 
-const MD_REMARK = [remarkGfm]
+const MD_REMARK = [remarkGfm, remarkVerbatimUnknownTags]
 /**
  * Raw HTML must be ADMITTED, then SANITIZED — in that order.
  *
@@ -1690,6 +1724,16 @@ function isLocalFilePath(src: unknown): src is string {
 const FileChip: React.FC<{ path: string }> = ({ path: filePath }) => {
   const parts = filePath.split('/')
   const short = parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : parts.slice(-2).join('/')
+  // The SHELL's platform, not the gateway's: `revealFile` is an IPC send Mochi's
+  // Electron main process handles, so that host owns which application opens. A
+  // browser tab has no shell to report one — and no shell to reveal anything
+  // either — so it takes the generic wording.
+  const hostPlatform = classifyPlatform(electronPlatform())
+  const revealLabel = hostPlatform === 'darwin'
+    ? i18nT('apps.mochi.chatPanel.open_in_finder')
+    : hostPlatform === 'windows'
+      ? i18nT('apps.mochi.chatPanel.open_in_file_explorer')
+      : i18nT('apps.mochi.chatPanel.show_in_file_manager')
   return (
     <span style={{
       display: 'inline-flex', alignItems: 'center', gap: 4,
@@ -1698,29 +1742,42 @@ const FileChip: React.FC<{ path: string }> = ({ path: filePath }) => {
       fontSize: 11, lineHeight: 1.3, verticalAlign: 'middle',
     }}>
       <File size={11} color="var(--text-muted)" />
-      <span style={{ color: 'var(--text)', cursor: 'pointer', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-        title={filePath}
-        role="button"
-        tabIndex={0}
-        onClick={() => api?.previewFile?.(filePath)}
-        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); api?.previewFile?.(filePath) } }}
-      >{short}</span>
-      <button onClick={() => api?.previewFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.preview')} aria-label={i18nT('apps.mochi.chatPanel.preview')} style={{
-        background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
-        color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
-        transition: 'color 0.15s',
-      }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
-        onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
-      ><Eye size={11} /></button>
-      <button onClick={() => api?.revealFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.reveal_in_finder')} aria-label={i18nT('apps.mochi.chatPanel.reveal_in_finder')} style={{
-        background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
-        color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
-        transition: 'color 0.15s',
-      }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
-        onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
-      ><Folder size={11} /></button>
+      {/* Preview and reveal both delegate to the shell bridge (window.mochi),
+          published only by the Electron preload — in a browser tab the calls
+          are silent no-ops, so the dead controls are withheld rather than
+          rendered. Inside the shell the reveal label names that host's own file
+          manager, since the shell is what performs the reveal. */}
+      {isElectron ? (
+        <>
+          <span style={{ color: 'var(--text)', cursor: 'pointer', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            title={filePath}
+            role="button"
+            tabIndex={0}
+            onClick={() => api?.previewFile?.(filePath)}
+            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); api?.previewFile?.(filePath) } }}
+          >{short}</span>
+          <button onClick={() => api?.previewFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.preview')} aria-label={i18nT('apps.mochi.chatPanel.preview')} style={{
+            background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
+            color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
+            transition: 'color 0.15s',
+          }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
+            onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
+          ><Eye size={11} /></button>
+          <button onClick={() => api?.revealFile?.(filePath)} title={revealLabel} aria-label={revealLabel} style={{
+            background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
+            color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
+            transition: 'color 0.15s',
+          }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
+            onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
+          ><Folder size={11} /></button>
+        </>
+      ) : (
+        <span style={{ color: 'var(--text)', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+          title={filePath}
+        >{short}</span>
+      )}
     </span>
   )
 }
@@ -1952,10 +2009,14 @@ const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => v
             {isUser
               ? <span style={{ whiteSpace: 'pre-wrap' }}>
                   {text.split(/\n/).map((line, i) => {
-                    // Detect markdown image syntax: ![...](path)
+                    // Detect markdown image syntax: ![...](path). The path may
+                    // be mdImageDest's `<…>`-wrapped form (attachmentLines in
+                    // composerDrop routes uploads through it) — resolve it with
+                    // the shared wrap-aware inverse; unwrapped legacy paths
+                    // are preserved verbatim (issue #3497).
                     const mdImgMatch = line.match(/^!\[[^\]]*\]\((.+)\)$/)
                     if (mdImgMatch) {
-                      return <LocalImage key={i} path={mdImgMatch[1]} onClickImage={onImageClick} />
+                      return <LocalImage key={i} path={mdImageDestToPath(mdImgMatch[1])} onClickImage={onImageClick} />
                     }
                     // Detect bare image file paths — line starts with / and ends with image extension.
                     const trimmed = line.trim()

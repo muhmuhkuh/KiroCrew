@@ -10,6 +10,8 @@ rather than a pool of per-worker ``AcpClient`` processes. Design:
   * **One session per task** — each dispatch (gate / deep / follow-up / post)
     gets its own ``AcpSessionHandle`` (distinct ``sessionId``), ``destroy()``ed on
     completion, so one review never leaks context into another. No process respawn.
+    A review asked to stay resumable keeps only its TRANSCRIPT (see
+    ``sage_lib/followup.py``); the session itself is terminated like any other.
   * **Bounded concurrency** — a semaphore of width ``review.max_concurrent``
     (default 5, ceiling ``MAX_CONCURRENT_CEIL`` = 30) caps in-flight sessions.
     Because it is a single process, raising concurrency (e.g. to review all open
@@ -75,7 +77,7 @@ try:  # SEL audit — the runtime layer has no audit_source, so the pool emits i
 except Exception:  # pragma: no cover - standalone / test fallback
     _sel = None  # type: ignore[assignment]
 
-from sage_lib import store  # noqa: E402
+from sage_lib import followup, store  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -439,11 +441,21 @@ class ReviewPool:
         await self._holder.end_batch()
 
     async def send(self, task: str, timeout: float = DEFAULT_TASK_TIMEOUT,
-                   on_activity: Callable[[str, int], None] | None = None) -> str:
+                   on_activity: Callable[[str, int], None] | None = None,
+                   keep_session_key: str | None = None) -> str:
         """Run one review task on its own session of the shared runtime and return
         the final assistant text. Auto-approves every tool permission (the reviewer
-        runs the `gh` CLI + shell) and emits a per-tool SEL audit. The session is
-        always ``destroy()``ed on completion so its context never leaks."""
+        runs the `gh` CLI + shell) and emits a per-tool SEL audit.
+
+        The session is always ``destroy()``ed on completion, so its context never
+        stays resident. ``keep_session_key`` additionally makes the review
+        RESUMABLE: on a healthy turn the handle is marked ``keep_transcript`` — so
+        the session is still terminated on kiro-cli and its RSS reclaimed, but its
+        transcript survives on disk — and a descriptor naming that transcript is
+        recorded under the run (see ``sage_lib/followup.py``). A failed record is
+        not a review failure: the review result is returned unchanged and the only
+        loss is the ability to ask about it later.
+        """
         if self._closed:
             raise RuntimeError("ReviewPool is shut down")
         async with self._sema:
@@ -505,6 +517,11 @@ class ReviewPool:
                 if _is_abnormal_stop(stop_reason):
                     raise RuntimeError(
                         f"review turn ended abnormally (stop_reason={stop_reason!r})")
+                # Keep the transcript AFTER the health gate above: a session whose
+                # turn died has no findings to be asked about, and recording it
+                # would leave a file nothing will ever load.
+                if keep_session_key:
+                    self._keep_resumable(handle, keep_session_key)
                 return "".join(parts)
             finally:
                 if handle is not None:
@@ -512,6 +529,29 @@ class ReviewPool:
                         await handle.destroy()
                     except Exception:
                         logger.debug("session destroy error", exc_info=True)
+
+    def _keep_resumable(self, handle: object, key: str) -> None:
+        """Mark this session's transcript to survive teardown and record it.
+
+        ``keep_transcript`` is set BEFORE the descriptor is written: if the write
+        fails the file is merely orphaned (and aged out by the follow-up pruner),
+        whereas the reverse order can point a descriptor at a transcript that
+        ``destroy()`` has already unlinked.
+        """
+        sid = str(getattr(handle, "session_id", "") or "")
+        if not sid:
+            return
+        run_id, _, change_id = key.partition(":")
+        if not run_id or not change_id:
+            return
+        try:
+            handle.keep_transcript = True  # type: ignore[attr-defined]
+            followup.write_descriptor(
+                run_id, change_id, sid=sid, agent=self._agent,
+                cwd=self._work_dir or "")
+        except Exception:
+            logger.debug("could not keep the review session resumable",
+                         exc_info=True)
 
     async def _audit_tool(self, handle: object, ev: object, *,
                           request_id: object = None,
@@ -624,13 +664,15 @@ def make_sync_dispatch(
     switch can react deterministically."""
 
     def dispatch(task: str, timeout: float = default_timeout,
-                 on_activity: Callable[[str, int], None] | None = None) -> dict:
+                 on_activity: Callable[[str, int], None] | None = None,
+                 keep_session_key: str | None = None) -> dict:
         try:
             # The callback fires on the gateway loop's thread while the driver's
             # worker thread blocks here; the progress writer it feeds is lock-
             # guarded and copy-on-write, so that crossing is safe.
             fut = asyncio.run_coroutine_threadsafe(
-                pool.send(task, timeout=timeout, on_activity=on_activity), loop)
+                pool.send(task, timeout=timeout, on_activity=on_activity,
+                          keep_session_key=keep_session_key), loop)
             # Give the bridge a little headroom past the task timeout so the
             # pool's own timeout fires first with a cleaner error.
             out = fut.result(timeout=timeout + 60)

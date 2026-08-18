@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from hypothesis import given, settings
@@ -15,6 +16,10 @@ from kiro_crew.apps.manifest import (
     Dependencies,
     SetupConfig,
 )
+from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +73,46 @@ class TestValidation:
         m = AppManifest.from_dict(_valid_manifest(name="Not_Kebab"))
         errors = m.validate()
         assert any("kebab-case" in e for e in errors)
+
+    def test_reserved_name_rejected(self):
+        """The system.* notification namespace stays un-shadowable."""
+        m = AppManifest.from_dict(_valid_manifest(name="system"))
+        errors = m.validate()
+        assert any("reserved" in e for e in errors)
+
+    @pytest.mark.parametrize("name", sorted(WINDOWS_DEVICE_STEMS))
+    def test_every_windows_device_stem_is_rejected(self, name):
+        """The whole documented device-name set, not just the stems that happen
+        to fail on one build. An app name is a persistent published identity, so
+        admitting a stem is a one-way door while over-refusing is freely
+        relaxable."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("not portable" in e for e in errors), (name, errors)
+
+    def test_device_stem_vocabulary_is_not_duplicated(self):
+        """One definition, shared with the git-branch grammar. Two copies of a
+        22-name set drift, and the branch rule is the precedent this follows."""
+        from kiro_crew.apps.manifest import UNPORTABLE_APP_NAMES
+
+        assert UNPORTABLE_APP_NAMES is WINDOWS_DEVICE_STEMS
+
+    @pytest.mark.parametrize("name", ["null-app", "console", "com10", "lpt10", "connect"])
+    def test_names_merely_resembling_a_device_stay_valid(self, name):
+        """The rule matches the exact stem. ``com10``/``lpt10`` are outside the
+        reserved 1-9 range and the rest are ordinary words."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        assert m.validate() == []
+
+    @pytest.mark.parametrize("name", ["demo\n", "nul\n", "system\n", "demo\r\n", "demo\n\n"])
+    def test_a_trailing_newline_cannot_slip_through(self, name):
+        """``$`` also matches before a trailing newline, so a ``$``-anchored
+        grammar admits ``"demo\\n"`` — and worse, ``"nul\\n"`` and ``"system\\n"``
+        evade the reserved-name checks that run after it, because those compare
+        against the exact string. ``KEBAB_RE`` is anchored with ``\\Z``."""
+        m = AppManifest.from_dict(_valid_manifest(name=name))
+        errors = m.validate()
+        assert any("kebab-case" in e for e in errors), (name, errors)
 
     def test_invalid_version_format(self):
         m = AppManifest.from_dict(_valid_manifest(version="not-semver"))
@@ -666,11 +711,10 @@ class TestDependencies:
         silent, so the useful thing to pin is the general property.
         """
         import json
-        from pathlib import Path
 
         from kiro_crew.apps.manifest import AppManifest
 
-        builtins = Path("src/kiro_crew/apps/builtins")
+        builtins = _REPO_ROOT / "src/kiro_crew/apps/builtins"
         for app_json in sorted(builtins.glob("*/app.json")):
             raw = json.loads(app_json.read_text(encoding="utf-8"))
             declared = raw.get("dependencies") or {}
@@ -940,7 +984,6 @@ class TestRequiresDesktopApp:
 
     def test_mochi_builtin_declares_it(self):
         """Mochi is the first consumer: its panel needs the Electron shell."""
-        from pathlib import Path
 
         import kiro_crew.apps.builtins as builtins_pkg
 
@@ -975,3 +1018,64 @@ class TestRequiresDesktopApp:
         from kiro_crew.apps.manifest import PlatformConfig
 
         assert PlatformConfig().supports_platform("win32") is False
+
+
+class TestScalarGrantDoesNotBecomeAWildcard:
+    """A list-valued grant given a JSON SCALAR must deny, not be coerced.
+
+    `[str(x) for x in value]` over a STRING iterates its characters, so a manifest
+    that wrote a bare string where a list belongs was handed the tokens those
+    characters spell -- including the wildcards each of these fields honours:
+
+      exposeToApps  `"*"`         -> ["*"] -> every sibling app may observe my slots
+      events        `"*"`         -> ["*"] -> the whole WS scope vocabulary
+      api           `"/api/chat"` -> ["/", "a", ...] and `app_token_path_allowed`
+                                     matches the prefix "/" against every path
+      mcpTools      `"*"`         -> ["*"]
+
+    Same defect class as `bool("false")` on the boolean grants above, and the same
+    direction of fix: an unexpected value withholds the grant.
+    """
+
+    def test_scalar_star_never_yields_the_wildcard(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        for field in ("exposeToApps", "events", "api", "mcpTools"):
+            perms = Permissions.from_dict({field: "*"})
+            assert getattr(perms, field) == [], (
+                f"{field}: a scalar must not be exploded into a wildcard"
+            )
+
+    def test_scalar_path_never_yields_a_match_everything_prefix(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        assert Permissions.from_dict({"api": "/api/chat"}).api == []
+
+    def test_other_scalar_shapes_also_deny(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        for value in (True, 1, {"a": "b"}, None):
+            assert Permissions.from_dict({"exposeToApps": value}).exposeToApps == []
+
+    def test_a_real_list_still_works(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        perms = Permissions.from_dict(
+            {
+                "exposeToApps": ["mochi", "", "workflows"],
+                "events": ["slots:own", "notification"],
+                "api": ["/api/chat", "/api/ws"],
+                "mcpTools": ["cron_add"],
+            }
+        )
+        # Falsy entries are still dropped; everything else is preserved verbatim.
+        assert perms.exposeToApps == ["mochi", "workflows"]
+        assert perms.events == ["slots:own", "notification"]
+        assert perms.api == ["/api/chat", "/api/ws"]
+        assert perms.mcpTools == ["cron_add"]
+
+    def test_the_wildcard_still_works_when_declared_as_a_list(self):
+        from kiro_crew.apps.manifest import Permissions
+
+        assert Permissions.from_dict({"exposeToApps": ["*"]}).exposeToApps == ["*"]
+        assert Permissions.from_dict({"events": ["*"]}).events == ["*"]

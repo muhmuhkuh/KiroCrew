@@ -21,6 +21,7 @@ const model = (over: Partial<HostModel> = {}): HostModel => ({
   self: null,
   macInset: false,
   electron: true,
+  pinnedCrews: [],
   ...over,
 })
 
@@ -41,8 +42,9 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
 
     // Local + the relayed instance tab both render.
-    expect(screen.getByRole('tab', { name: /Local/ })).toBeTruthy()
-    const cloud = screen.getByRole('tab', { name: /Cloud One/ })
+    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    expect(screen.getByRole('menuitemradio', { name: /Local/ })).toBeTruthy()
+    const cloud = screen.getByRole('menuitemradio', { name: /Cloud One/ })
     expect(cloud).toBeTruthy()
 
     await userEvent.click(cloud)
@@ -51,7 +53,8 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       '*',
     )
 
-    await userEvent.click(screen.getByRole('tab', { name: /Local/ }))
+    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await userEvent.click(screen.getByRole('menuitemradio', { name: /Local/ }))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-switch-instance', id: null }),
       '*',
@@ -63,7 +66,49 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       instances: { warm: {}, activeId: null, mru: [], unread: {}, host: null },
     })
     const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    expect(container.querySelector('[role="tablist"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Remote crews"]')).toBeNull()
+  })
+
+  it('honors the relayed pin set: a pinned crew renders as a chip beside the dropdown', async () => {
+    const store = createTestStore({
+      instances: {
+        warm: {}, activeId: null, mru: [], unread: {},
+        // Local is active, so the pinned crew is the one that gets a chip.
+        host: model({ activeId: null, pinnedCrews: ['cd-1'] }),
+      },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    // The chip row exists and holds the pinned crew. The dropdown stays — it is
+    // the trailing chevron that reaches every OTHER crew.
+    const row = screen.getByTestId('crew-chip-row')
+    expect(row.textContent).toMatch(/Cloud One/)
+    expect(screen.getByRole('button', { name: /Switch crew/i })).toBeTruthy()
+  })
+
+  it('renders no chip row when the parent relays an empty pin set', () => {
+    const store = createTestStore({
+      instances: { warm: {}, activeId: null, mru: [], unread: {}, host: model({ activeId: null }) },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    expect(screen.queryByTestId('crew-chip-row')).toBeNull()
+  })
+
+  it('relays a pin toggle up to the parent instead of writing its own store', async () => {
+    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore({
+      instances: { warm: {}, activeId: null, mru: [], unread: {}, host: model({ activeId: null }) },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+
+    // A pane cannot write the parent's preference store from its own iframe
+    // realm, so pinning here must travel up as a message rather than persist
+    // locally — otherwise the pane would drift from every other bar.
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
+    await userEvent.click(await screen.findByTestId('crew-pin-cd-1'))
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'mc-set-crew-pin', id: 'cd-1' }),
+      '*',
+    )
   })
 })
 

@@ -34,12 +34,15 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Awaitable, Callable
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from aiohttp import web
 
 from kiro_crew import hooks, model_registry
+from kiro_crew.apps.manager import is_app_enabled
 
 logger = logging.getLogger("kirocrew.app.code-review-sage")
 
@@ -57,6 +60,7 @@ if str(_APP_ROOT) not in sys.path:
 from sage_lib import (  # noqa: E402,E501
     adapters,
     discovery,
+    followup,
     learning,
     pipeline,
     report,
@@ -2003,6 +2007,290 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
                               "running": True})
 
 
+# --- follow-up sessions -----------------------------------------------------
+# A finished review can be asked about later. Its session transcript is kept (see
+# ``sage_lib/followup.py``) and a follow-up RESUMES it as an ordinary chat
+# session, so the reviewer's own reasoning comes back cold from disk and the
+# conversation from then on is a normal session: it survives restarts, is filed in
+# the sidebar, and its tool use runs through the dashboard's approval pipeline.
+#
+# This app's part is deliberately small — validate, seed the resume, and hand back
+# what the slot needs. Creating the slot itself stays with the dashboard's own
+# endpoint so slot policy (agent binding, workspace, title redaction, ownership)
+# has exactly one implementation.
+
+# How often kept transcripts are aged out. They are the largest thing this app
+# leaves on disk and a closed tab reports nothing, so this cannot be lazy.
+_FOLLOWUP_SWEEP_INTERVAL = 3600.0
+
+
+def _chat_params(run_id: str, change_id: str) -> str:
+    """Validate the pair identifying a review. Returns an error code, or ""."""
+    if not run_id or not change_id:
+        return "chat_params_required"
+    return ""
+
+
+_ChatHandler = Callable[[web.Request], Awaitable[web.Response]]
+
+
+def _require_enabled(handler: _ChatHandler) -> _ChatHandler:
+    """Deny when the app is disabled.
+
+    Routes are registered once at gateway startup, so a disabled app's endpoints
+    stay reachable — the platform's convention is that handlers check enabled
+    state themselves. Without this a disabled app could still start a session on
+    a reviewer's context, which no teardown hook can retroactively prevent for a
+    request already in flight.
+
+    ``is_app_enabled`` reads ``installed.json`` synchronously, so it runs off the
+    event loop. Deny-by-default: an unreadable state file disables the surface
+    rather than opening it.
+    """
+
+    @wraps(handler)
+    async def _wrapped(request: web.Request) -> web.Response:
+        if not await asyncio.to_thread(is_app_enabled, "code-review-sage"):
+            return web.json_response(
+                {"code": "app_disabled",
+                 "error": "code-review-sage is disabled"}, status=403)
+        return await handler(request)
+
+    return _wrapped
+
+
+@_require_enabled
+async def _handle_chat_get(request: web.Request) -> web.Response:
+    """GET .../chat?run_id=&change_id= — stored history plus follow-up readiness.
+
+    200 even with nothing to show: "this review was never discussed" is a normal
+    state for the panel, not an error.
+    """
+    run_id = (request.query.get("run_id") or "").strip()
+    change_id = (request.query.get("change_id") or "").strip()
+    bad = _chat_params(run_id, change_id)
+    if bad:
+        return web.json_response(
+            {"code": bad, "error": "missing run_id or change_id"}, status=400)
+    turns = await asyncio.to_thread(
+        followup.read_transcript, run_id, change_id)
+    async with _LOCK:
+        run = _find_run(run_id)
+        run_live = run is not None and _is_live(run)
+    desc, reason = await asyncio.to_thread(
+        followup.resumable, run_id, change_id)
+    # A run still in flight is not offerable even with a descriptor on disk: its
+    # first pass may be superseded by a second, which retires that descriptor and
+    # leaves an already-open conversation pointing at findings the run replaced.
+    if run_live:
+        desc, reason = None, followup.ERR_RUN_LIVE
+    slot_key = followup.slot_key(run_id, change_id)
+    return web.json_response({
+        "run_id": run_id,
+        "change_id": change_id,
+        "turns": turns,
+        # Whether a follow-up would restore the reviewer's own context. Told to
+        # the UI so it can explain why the button is absent instead of offering
+        # one that opens a session which knows nothing about the review.
+        "resumable": desc is not None,
+        "reason": reason,
+        "slot_key": slot_key,
+        # Whether that session already exists. Without it the panel invites a
+        # returning user to "open" a conversation they already had, with no trace
+        # of it -- which reads as the review having lost it.
+        "followup_open": bool(desc is not None
+                              and _followup_session_exists(slot_key)),
+    })
+
+
+def _followup_session_exists(slot_key: str) -> bool:
+    """Whether a chat session for this review is actually in the sidebar.
+
+    Read from the SLOT, never from the session map. The two are independent and
+    the map deliberately outlives the slot: closing a tab pops it from the slot
+    table but keeps its mapping so a later resume can reload the conversation. So
+    a mapping proves a session once existed, not that one exists now -- and this
+    answer decides whether the panel offers to continue a conversation or to
+    create it, which in turn decides whether the slot is handed a title and a
+    folder. Deriving it from the map made a closed session read as open, so the
+    recreate that followed omitted both and landed unfiled under the placeholder
+    title.
+
+    Reads the slot table directly because the dashboard exposes no read-only
+    existence check; absent state (tests, a bare app) answers False, which is the
+    safe direction -- it offers to create, and creating is idempotent.
+    """
+    slots = getattr(_APP_STATE.get("state"), "_slots", None)
+    if not isinstance(slots, dict):
+        return False
+    return slot_key in slots
+
+
+async def _ensure_followup_folder(state: Any) -> str:
+    """Find-or-create the folder follow-up sessions are filed under.
+
+    Through ``mutate_folders`` so find-then-create is one transaction: two tabs
+    starting a follow-up at the same moment would otherwise each miss the other's
+    folder and build a duplicate. Idempotent — an existing folder is adopted and
+    nothing is written.
+    """
+    def _create_or_adopt(folders: list[dict]) -> tuple[bool, str]:
+        for f in folders:
+            if str(f.get("name", "")).strip() != followup.FOLDER_NAME:
+                continue
+            # Re-engaging the folder clears `hidden`, matching the folder CRUD
+            # handler's own unhide-on-assign rule.
+            if f.get("hidden"):
+                f["hidden"] = False
+                return True, str(f.get("id", ""))
+            return False, str(f.get("id", ""))
+        folder = {
+            "id": uuid.uuid4().hex[:12],
+            "name": followup.FOLDER_NAME,
+            "order": len(folders),
+            "collapsed": False,
+            "hidden": False,
+            "parent_id": "",
+            "project_dir": "",
+        }
+        folders.append(folder)
+        return True, str(folder["id"])
+
+    try:
+        return str(await state.mutate_folders(_create_or_adopt))
+    except Exception:  # noqa: BLE001 - filing is a nicety, the session is not
+        logger.warning("code-review-sage: follow-up folder write failed",
+                       exc_info=True)
+        return ""
+
+
+def _change_title(run_id: str, change_id: str) -> str:
+    """The reviewed pull request's title, or "" when it cannot be read."""
+    try:
+        rec = results.read_result(change_id, None, run_id) or {}
+        return store.redact_text(str(rec.get("title") or ""))
+    except Exception:  # pragma: no cover - a title is cosmetic
+        logger.debug("code-review-sage: could not read change title",
+                     exc_info=True)
+        return ""
+
+
+@_require_enabled
+async def _handle_followup_start(request: web.Request) -> web.Response:
+    """POST .../followup {run_id, change_id} — prepare a session on this review.
+
+    Returns what the caller hands to ``POST /api/chat/slots``: the derived slot
+    key, the agent the review ran as, the folder to file it in, and a title. The
+    resume itself is already armed when this returns, so the slot's first turn
+    loads the reviewer's transcript.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    run_id = str(body.get("run_id") or "").strip()
+    change_id = str(body.get("change_id") or "").strip()
+    bad = _chat_params(run_id, change_id)
+    if bad:
+        return web.json_response(
+            {"code": bad, "error": "missing run_id or change_id"}, status=400)
+    async with _LOCK:
+        run = _find_run(run_id)
+        run_known = run is not None
+        run_live = run is not None and _is_live(run)
+    if not run_known:
+        return web.json_response(
+            {"code": followup.ERR_RUN_GONE,
+             "error": "the review this belongs to was deleted"}, status=409)
+    if run_live:
+        # A first pass can be superseded by a second one in the same run, and that
+        # retires the descriptor. Opening now would hand the user a conversation
+        # whose findings the run then replaces, with nothing saying so.
+        return web.json_response(
+            {"code": followup.ERR_RUN_LIVE,
+             "error": "this review is still running"}, status=409)
+
+    desc, reason = await asyncio.to_thread(
+        followup.resumable, run_id, change_id)
+    if desc is None:
+        # Literal-status returns rather than one computed `status=`: the
+        # error-code contract gate cannot statically verify a site whose status is
+        # a variable, so a dynamic status reads as non-compliant even when the
+        # body carries a `code`.
+        if reason == followup.ERR_TRANSCRIPT_GONE:
+            return web.json_response(
+                {"code": followup.ERR_TRANSCRIPT_GONE,
+                 "error": "the reviewer's session is no longer on disk"},
+                status=409)
+        return web.json_response(
+            {"code": followup.ERR_NO_DESCRIPTOR,
+             "error": "this review did not keep a resumable session"},
+            status=409)
+
+    state = _APP_STATE.get("state")
+    sessions = getattr(state, "sessions", None)
+    if sessions is None or not hasattr(sessions, "seed_conversation"):
+        return web.json_response(
+            {"code": "followup_unavailable",
+             "error": "sessions are not available in this context"}, status=503)
+
+    slot_key = followup.slot_key(run_id, change_id)
+    # The session-map key a dashboard slot resolves its resume from. Seeded before
+    # the slot exists on purpose: the key is derived, so the mapping can be armed
+    # first and the slot's very first turn already resumes.
+    session_key = f"dashboard:{slot_key}"
+    # A slot that already carries a mapping is left alone. Re-seeding would point
+    # a follow-up conversation back at the review's own starting transcript and
+    # discard everything discussed since.
+    mapped = await asyncio.to_thread(sessions.resumable_sid, session_key)
+    if not mapped:
+        await asyncio.to_thread(
+            sessions.seed_conversation, session_key, desc["sid"],
+            provider=desc["provider"], cwd=desc["cwd"])
+        # Read back rather than trust the write: the session map self-prunes an
+        # entry whose files are gone, so this doubles as the last check that the
+        # transcript is still there. Refusing here is the point — a slot created
+        # without a mapping resumes nothing and then answers anyway, with no idea
+        # what was reviewed.
+        mapped = await asyncio.to_thread(sessions.resumable_sid, session_key)
+    if not mapped:
+        return web.json_response(
+            {"code": followup.ERR_TRANSCRIPT_GONE,
+             "error": "the reviewer's session is no longer on disk"}, status=409)
+
+    folder_id = ""
+    if hasattr(state, "mutate_folders"):
+        folder_id = await _ensure_followup_folder(state)
+    title = followup.slot_title(
+        change_id, await asyncio.to_thread(_change_title, run_id, change_id))
+    return web.json_response({
+        "ok": True,
+        "slot_key": slot_key,
+        "agent": desc["agent"],
+        "folder_id": folder_id,
+        "title": title,
+    })
+
+
+async def _followup_sweep_loop() -> None:
+    """Age out kept transcripts forever, so they cannot accumulate unbounded."""
+    while True:
+        try:
+            await asyncio.sleep(_FOLLOWUP_SWEEP_INTERVAL)
+            dropped = await asyncio.to_thread(followup.prune)
+            if dropped:
+                logger.info(
+                    "code-review-sage: dropped %d idle review transcript(s)",
+                    dropped)
+        except asyncio.CancelledError:  # pragma: no cover - shutdown
+            raise
+        except Exception:  # pragma: no cover - never let the sweeper die
+            logger.debug("code-review-sage: transcript sweep failed",
+                         exc_info=True)
+
+
 def register_routes(app: web.Application) -> None:
     """Register the deterministic review routes on the gateway app."""
     # Self-heal: ensure the data layout (dirs + config.json with resolved_paths)
@@ -2035,6 +2323,13 @@ def register_routes(app: web.Application) -> None:
             logger.debug("code-review-sage: orphan reap failed", exc_info=True)
 
     app.on_startup.append(_reap_on_startup)
+
+    async def _start_followup_sweeper(_app: web.Application) -> None:
+        task = asyncio.create_task(_followup_sweep_loop())
+        _TASKS.add(task)
+        task.add_done_callback(_TASKS.discard)
+
+    app.on_startup.append(_start_followup_sweeper)
     # Cache the dashboard state so a finished run can push a bell notification
     # from a background task (no request in scope there). Absent in tests that
     # register routes on a bare app — every read site treats it as optional.
@@ -2044,6 +2339,9 @@ def register_routes(app: web.Application) -> None:
             _APP_STATE["state"] = state
     except Exception:  # pragma: no cover - defensive
         pass
+    app.router.add_get("/api/apps/code-review-sage/chat", _handle_chat_get)
+    app.router.add_post("/api/apps/code-review-sage/followup",
+                        _handle_followup_start)
     app.router.add_post("/api/apps/code-review-sage/review", _handle_review)
     app.router.add_post("/api/apps/code-review-sage/review-repo", _handle_review_repo)
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)

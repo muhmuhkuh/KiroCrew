@@ -210,6 +210,14 @@ class TestSubprocessRegistry:
             "kiro_crew.cron_script.wrap_argv", side_effect=lambda argv, mode: (argv, None)
         ), patch(
             "kiro_crew.cron_script.cgroup_scope_argv", side_effect=lambda argv: argv
+        ), patch(
+            # The shell probe (_resolve_command_shell) also calls wrap_argv to
+            # sandbox-route its POSIX-strict test. On macOS where /bin/sh is bash
+            # the probe fails (SandboxUnavailableError or brace-expansion detected)
+            # and returns None, aborting before the subprocess is spawned. Patch
+            # the resolver to return a known-good shell so the registry/cancel
+            # mechanics under test can actually run.
+            "kiro_crew.cron_script._resolve_command_shell", return_value="/bin/sh"
         ):
             t = threading.Thread(target=_run)
             t.start()
@@ -220,9 +228,20 @@ class TestSubprocessRegistry:
             assert "cancelme" in _RUNNING_PROCS
             started = time.time()
             assert kill_running_process("cancelme") is True
-            t.join(timeout=10)
-        assert not t.is_alive()
-        assert time.time() - started < 10  # died well before the 30s sleep
+            # Poll for thread death (same pattern as the registration wait
+            # above) instead of one fixed-budget join: an instantaneous
+            # is_alive() read behind a single join can report a still-dying
+            # thread on a loaded runner even when SIGTERM worked. The 20s
+            # deadline stays comfortably below the child's 30s sleep, so
+            # passing still proves death-by-cancellation, not natural expiry.
+            deadline = started + 20
+            while time.time() < deadline and t.is_alive():
+                t.join(timeout=0.1)
+        assert not t.is_alive(), "thread still alive 20s after SIGTERM"
+        # 25, not 20: the final join may return ~0.1s past the poll deadline
+        # with the thread already dead; the headroom keeps that success from
+        # failing here while staying well below the 30s natural expiry.
+        assert time.time() - started < 25  # died well before the 30s sleep
         assert result["status"] == "cancelled"
         assert "cancelme" not in _RUNNING_PROCS
         assert "cancelme" not in _CANCELLED_PROC_JOBS  # flag consumed

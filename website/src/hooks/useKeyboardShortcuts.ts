@@ -1,8 +1,9 @@
 import { useEffect, useCallback, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useAppDispatch, useAppSelector } from '../store'
+import { useAppDispatch, useAppStore } from '../store'
 import { switchSlot, deleteSlot, openActivityToTab } from '../store/chatSlice'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
+import { queryComposer } from '../pages/chat/composerFocus'
 import { reportSeamCollision } from '../apps/seamCollision'
 import { i18nT } from '../i18n/t'
 
@@ -449,9 +450,7 @@ interface UseKeyboardShortcutsOpts {
 export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
-  const slots = useAppSelector(s => s.dashboard.slots)
-  const activeSlot = useAppSelector(s => s.chat.activeSlot)
-  const slotHistory = useAppSelector(s => s.chat.slotHistory)
+  const appStore = useAppStore()
   const mruIndexRef = useRef(-1)
   // Set true right after a char-producing Alt shortcut (Alt+`) fires inside a
   // text field. On macOS those combos are dead keys (Option+` = grave accent),
@@ -498,6 +497,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
   const handler = useCallback((e: KeyboardEvent) => {
     const tag = (e.target as HTMLElement)?.tagName
     const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable
+    // Read at keypress time; subscribing re-renders the root on every slots frame.
+    const { dashboard: { slots }, chat: { activeSlot, slotHistory } } = appStore.getState()
 
     // On Mac (when Ctrl+digit mode enabled), Ctrl+digit switches chats.
     // Check for that first, before the Alt-based gate.
@@ -610,7 +611,11 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     // Alt+Enter: Focus text input — works even from other inputs
     if (code === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Message input"]')?.focus()
+      // Synchronous and unguarded on purpose: no state change precedes this, so
+      // there is no next-frame commit to wait for, and a pressed keyboard
+      // shortcut proves a keyboard exists — the helper's touch-device skip
+      // would wrongly no-op it.
+      queryComposer()?.focus()
       return
     }
 
@@ -685,7 +690,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       navigate(panelMap[code])
       return
     }
-  }, [dispatch, navigate, slots, activeSlot, slotHistory, onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, disabled, enabled, ctrlDigits])
+  }, [dispatch, navigate, appStore, onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, disabled, enabled, ctrlDigits])
 
   useEffect(() => {
     document.addEventListener('keydown', handler)

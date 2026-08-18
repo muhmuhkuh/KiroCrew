@@ -64,7 +64,7 @@ export function SubagentDeliveryProgress({ count }: { count: number }) {
   if (count <= 0) return null
   return (
     <div
-      className="mx-auto w-full px-5"
+      className="mx-auto w-full px-4"
       style={{ maxWidth: 'var(--mc-content-width, 900px)' }}
       data-testid="subagent-delivery-progress"
     >
@@ -127,10 +127,10 @@ function EditInput({ initial, onCommit, onCancel }: {
           else if (e.key === 'Escape') { e.preventDefault(); cancel() }
         }}
         onBlur={commit}
-        className="flex-1 min-w-0 bg-white/20 text-warn-fg placeholder:text-warn-fg/50 rounded px-1.5 py-0.5 text-[13px] outline-none border border-white/30 focus:border-white/60"
+        className="flex-1 min-w-0 bg-[var(--bg)] text-[var(--text)] placeholder:text-[var(--muted)] rounded px-1.5 py-0.5 text-[13px] outline-none border border-[var(--border)] focus:border-[var(--accent)]"
         aria-label={i18nT('components.queueStack.edit_queued_message')}
       />
-      <button className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors text-white"
+      <button className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors text-[var(--text)]"
         title={i18nT('components.queueStack.save')} aria-label={i18nT('components.queueStack.save_edit')}
         // mousedown commits before the input's blur can fire with the same value.
         onMouseDown={e => { e.preventDefault(); e.stopPropagation() }}
@@ -222,7 +222,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
   }
 
   return (
-    <div className="px-5 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 0 }}>
+    <div className="px-4 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 0 }}>
       <motion.div
         className="relative cursor-pointer"
         animate={{ height: targetHeight }}
@@ -324,7 +324,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       {onReorder && expanded && messages.length > 1 && (
                         <>
                           <button
-                            className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+                            className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
                             title={i18nT('components.queueStack.run_sooner')}
                             aria-label={i18nT('components.queueStack.run_sooner')}
                             disabled={i === 0}
@@ -333,7 +333,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                             <ArrowDown size={13} />
                           </button>
                           <button
-                            className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
+                            className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
                             title={i18nT('components.queueStack.run_later')}
                             aria-label={i18nT('components.queueStack.run_later')}
                             disabled={i === messages.length - 1}
@@ -345,7 +345,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       )}
                       {onEdit && showActions && (
                         <button
-                          className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.edit_queued_message')}
                           aria-label={i18nT('components.queueStack.edit_queued_message')}
                           disabled={isPending}
@@ -356,7 +356,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       )}
                       {onInterrupt && showActions && (
                         <button
-                          className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors text-white disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors text-[var(--text)] disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.interrupt_current_turn_and_send_this_now')}
                           aria-label={i18nT('components.queueStack.send_now')}
                           disabled={isPending}
@@ -367,7 +367,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
                       )}
                       {onCancel && showActions && (
                         <button
-                          className="shrink-0 p-0.5 rounded hover:bg-white/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                           title={i18nT('components.queueStack.cancel_and_move_back_to_input')}
                           aria-label={i18nT('components.queueStack.cancel_queued_message')}
                           disabled={isPending}

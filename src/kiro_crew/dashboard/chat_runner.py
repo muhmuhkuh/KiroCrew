@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import re
+import shlex
 import stat as stat_module
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
 
 from kiro_crew import mcp_apps_render, model_registry, session_directive
 from kiro_crew.acp.client import (
@@ -39,6 +41,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.agent_discovery import warm_project_agent_names
 from kiro_crew.autonudge import get_instance
+from kiro_crew.browser_cli import install as browser_cli_install
 from kiro_crew.config.loader import (
     KiroCrewConfig,
     data_home,
@@ -60,6 +63,7 @@ from kiro_crew.context_management import (
     validate_plan_format,
 )
 from kiro_crew.dashboard.chat_persistence import _build_history_prefix, save_slot_off_loop
+from kiro_crew.dashboard.chat_summary import generate_session_summary
 from kiro_crew.dashboard.chat_title import (
     _extract_and_redact_plan_metadata,
     _maybe_auto_title,
@@ -91,7 +95,9 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     expire_slack_options,
     is_system_injection_item,
+    mirror_is_paused,
     remember_slack_options,
+    slack_mirror_is_paused,
     slot_history_key,
 )
 from kiro_crew.dashboard.handlers import (
@@ -104,6 +110,7 @@ from kiro_crew.dashboard.handlers.usage import (
     persist_token_record_async,
     read_context_tokens,
     read_effective_agent,
+    read_effective_model,
 )
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.dashboard.state import (
@@ -145,14 +152,17 @@ from kiro_crew.hooks import (
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_STOP,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
+    TOOL_ALLOW,
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
+    ToolHookResult,
     _normalize_tool_name,
     _tool_matches,
     fire_tool_hooks,
     safe_read_file,
     validate_file_path,
 )
+from kiro_crew.image_artifacts import register_images_off_loop
 from kiro_crew.llm_helpers import (
     TRANSIENT_RETRIES,
     PromptBusyExhaustedError,
@@ -162,6 +172,7 @@ from kiro_crew.llm_helpers import (
     transient_retry_delay,
 )
 from kiro_crew.mcp_discovery import kirocrew_managed_names
+from kiro_crew.members import record_activity
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
 from kiro_crew.messaging.renderer import chunk_text
@@ -183,9 +194,9 @@ from kiro_crew.providers.base import (
 )
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import (
-    _EXFIL_PATTERNS,
     StreamRedactor,
     is_sensitive_path,
+    oauth_url_contains_credential,
     redact_credentials,
     redact_exfiltration_urls,
 )
@@ -210,6 +221,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     RecoveryPayload,
     is_synthetic_payload_item,
     is_synthetic_recovery_item,
+    mint_options_token,
     payload_for_replay,
 )
 
@@ -258,16 +270,34 @@ def drain_pending_context(slot: "_ChatSlot") -> str:
     return "\n".join(ctx_parts) + "\n" if ctx_parts else ""
 
 
-def _turn_outcome(stop_reason: str | None) -> str:
+def _turn_outcome(stop_reason: str | None, *, exhausted: bool = False) -> str:
     """Map an EVENT_COMPLETE stop_reason to a low-cardinality turn outcome.
 
     Single source of truth shared by the ``kirocrew.turn.duration`` emit in
     ``_run_chat`` and its unit test, so the mapping can't silently drift from
     what the test asserts (tests must exercise real production logic).
+
+    The two watchdog stop reasons are distinct outcomes, not ``error``: a
+    stall-recovery turn is re-driven in place (its budget/outcome is tracked
+    by ``kirocrew.watchdog.recovery.outcome``), so folding it into ``error``
+    would make the fault rate count every recovered stall as a fault AND hide
+    the stall population the watchdog work exists to measure. Checked BEFORE
+    the ``timeout`` substring so a stall never misclassifies.
+
+    ``exhausted`` marks a stall turn whose recovery budget is already spent
+    (the caller reads the slot budgets the stop-reason branches maintain):
+    the slot dies with "start a new chat", so the turn labels
+    ``stall_exhausted`` — a terminal fault to the aggregator — keeping the
+    recovered-stall exclusion from hiding dead sessions while ``fault_rate``
+    stays a single-series computation.
     """
     s = stop_reason or ""
     if s in ("", "end_turn", "stop", "completed"):
         return "ok"
+    if s == STOP_REASON_TOOL_STALL or s == STOP_REASON_STALE_RECOVER:
+        if exhausted:
+            return "stall_exhausted"
+        return "tool_stall" if s == STOP_REASON_TOOL_STALL else "stale_recover"
     if "timeout" in s:
         return "timeout"
     return "error"
@@ -279,6 +309,7 @@ def _emit_turn_metric(
     slot_key: str,
     *,
     elapsed_ms: int | float | None = None,
+    exhausted: bool = False,
 ) -> None:
     """Emit kirocrew.turn.duration (best-effort).
 
@@ -309,7 +340,7 @@ def _emit_turn_metric(
     value = duration_ms or elapsed_ms
     if not value:
         return
-    attrs: dict = {"outcome": _turn_outcome(stop_reason)}
+    attrs: dict = {"outcome": _turn_outcome(stop_reason, exhausted=exhausted)}
     try:
         source = infer_use_case(slot_key)
         if source:
@@ -320,6 +351,37 @@ def _emit_turn_metric(
         get_recorder().histogram("kirocrew.turn.duration", value, unit="ms", attrs=attrs)
     except Exception:
         logger.debug("turn metric emit failed", exc_info=True)
+
+
+def _emit_recovery_outcome(mechanism: str, outcome: str, attempts: int) -> None:
+    """Emit kirocrew.watchdog.recovery.outcome (best-effort).
+
+    One counter point per RESOLVED recovery cycle, derived from the per-slot
+    retry budgets the stop-reason branches already maintain
+    (``slot._stale_recovery_retries`` / ``slot._tool_stall_retries``):
+
+    - ``outcome=recovered`` — a synthetic recovery turn completed ``ok`` while
+      a budget was armed (emitted at the budget-reset block, which is the one
+      place a completed cycle and its attempt count coexist).
+    - ``outcome=exhausted`` — the budget hit its cap and the slot surfaced
+      "start a new chat" (emitted in the stall branches themselves).
+
+    ``attempt_bucket`` is the attempt count clamped to the budget cap (1-3) —
+    a closed enum per the metrics/schema.py cardinality rule, mirroring the
+    CLI's ``attempt_number_bucket`` precedent. Single source of truth shared
+    with its unit test so the mapping cannot silently drift.
+    """
+    try:
+        get_recorder().counter(
+            "kirocrew.watchdog.recovery.outcome",
+            attrs={
+                "mechanism": mechanism,
+                "outcome": outcome,
+                "attempt_bucket": max(1, min(int(attempts), 3)),
+            },
+        )
+    except Exception:
+        logger.debug("recovery outcome metric emit failed", exc_info=True)
 
 
 def _pre_tool_hooks_should_block(pre_hook_results: Any) -> bool:
@@ -651,6 +713,12 @@ POISONED_SESSION_CYCLES = 2
 _POISON_CANARY_PROMPT = "Reply with the single word OK."
 _POISON_CANARY_TIMEOUT_SECS = 30.0
 
+# Cap the backend-echoed reason interpolated into the "Compaction failed"
+# notice. The notice is a one-line receipt in the transcript, so an unbounded
+# provider string (a stack trace, an echoed payload) would scroll the
+# conversation away instead of explaining it.
+_COMPACT_FAIL_REASON_MAX_CHARS = 300
+
 
 def _truncate_snapshot(content: str) -> str:
     """Cap content at _MAX_SNAPSHOT chars, appending a marker if truncated.
@@ -944,6 +1012,7 @@ def _attach_turn_stats(
     credits: float,
     cost_usd: float,
     turn_boundary: int = 0,
+    model: str = "",
 ) -> None:
     """Attach per-turn stats to the last assistant message's meta.
 
@@ -953,8 +1022,11 @@ def _attach_turn_stats(
 
     ``elapsed_ms`` is the turn wall clock (or the provider-reported duration
     when available); ``credits`` is kiro-cli's per-turn ``meteringUsage`` sum;
-    ``cost_usd`` is claude_code's API-reported cost. Zero fields are omitted so
-    the frontend renders only what the provider actually bills in.
+    ``cost_usd`` is claude_code's API-reported cost. ``model`` is the id the
+    backend actually served this turn (``read_effective_model``) — on the
+    ``auto`` path this is the disclosure of what auto resolved to, on a pinned
+    session it is confirmation. Zero/empty fields are omitted so the frontend
+    renders only what the provider actually reported.
 
     ``turn_boundary`` is ``len(slot.messages)`` captured at turn start: only
     messages appended DURING this turn are candidates. Without it, an
@@ -970,6 +1042,8 @@ def _attach_turn_stats(
         stats["credits"] = round(credits, 4)
     if cost_usd > 0:
         stats["cost_usd"] = round(cost_usd, 6)
+    if model:
+        stats["model"] = model
     boundary = max(0, turn_boundary)
     for m in reversed(slot.messages[boundary:]):
         if m.get("role") == "assistant":
@@ -989,100 +1063,6 @@ def _redact_acp_string(s: str) -> str:
     s, _ = redact_credentials(s)
     s, _ = redact_exfiltration_urls(s)
     return s
-
-
-# Query params that are a normal, expected part of an OAuth 2.0 / OIDC
-# consent URL (incl. PKCE).  Their values are high-entropy by design
-# (``state``, ``code_challenge``, ``nonce`` …) and must NOT be treated as
-# leaked credentials — otherwise every real GitHub/Google sign-in URL is
-# rejected.  Anything *outside* this set is still scanned for real secrets.
-_OAUTH_QUERY_PARAMS = frozenset(
-    {
-        # RFC 6749 / OIDC core
-        "client_id",
-        "redirect_uri",
-        "response_type",
-        "response_mode",
-        "scope",
-        "state",
-        "nonce",
-        "code_challenge",
-        "code_challenge_method",
-        "prompt",
-        "login_hint",
-        "access_type",
-        "audience",
-        "resource",
-        "display",
-        "id_token_hint",
-        "max_age",
-        "ui_locales",
-        "acr_values",
-        "request_uri",
-        # Provider-specific but standard & benign (GitHub: login/allow_signup;
-        # Microsoft: domain_hint; Slack: user_scope/team).  Kept in sync with the
-        # legit-URL corpus in test/test_mcp_oauth_banner.py.
-        "login",
-        "allow_signup",
-        "domain_hint",
-        "user_scope",
-        "team",
-    }
-)
-
-
-# Unambiguous credential signatures that NEVER legitimately appear inside an
-# OAuth/OIDC opaque token (state, code_challenge, …). Unlike _EXFIL_PATTERNS,
-# this set excludes the generic base64-blob / heavy-URL-encoding heuristics
-# (which match a real high-entropy PKCE value), so it is safe to apply even to
-# the exempted OAuth params: a real sign-in URL never carries an AWS key, Slack
-# token, or PEM/SSH private-key header in a query value, but a malicious MCP
-# server smuggling a credential out through state= would be caught.
-_OAUTH_PARAM_CREDENTIAL_RE = re.compile(
-    r"(?:"
-    r"(?:AKIA|ASIA)[A-Z0-9]{16}"  # AWS access key ID
-    r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
-    r"|BEGIN[\s+%](?:RSA|DSA|EC|OPENSSH)[\s+%]PRIVATE[\s+%]KEY"  # private key header
-    r"|xox[bpas]-[0-9a-zA-Z-]+"  # Slack token
-    r")",
-    re.IGNORECASE,
-)
-
-
-def _oauth_url_contains_credential(url: str) -> bool:
-    """True if the URL embeds an *actual* credential or secret.
-
-    Legitimate OAuth consent URLs carry high-entropy params (``state``,
-    ``code_challenge``, ``client_id``) and are frequently >200 chars — so we
-    deliberately do NOT apply the generic long-query exfiltration heuristic
-    here (that rule exists to catch data being smuggled out in query strings,
-    and would reject every real OAuth URL).  Instead we reject only when a
-    genuine credential pattern is present: any AWS key / Slack token / private
-    key (``redact_credentials``), the full exfil heuristic on a NON-OAuth query
-    param, or an unambiguous credential signature even inside a recognized OAuth
-    param (a real OAuth opaque token never contains an AWS/Slack/PEM secret).
-    """
-    if not url:
-        return False
-    # Hard reject: an actual embedded credential anywhere in the URL.
-    _, hit_cred = redact_credentials(url)
-    if hit_cred:
-        return True
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return True  # unparseable → refuse to render
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        if key in _OAUTH_QUERY_PARAMS:
-            # High-entropy OAuth/PKCE values are allowed, but a hard credential
-            # signature smuggled into an OAuth param is still exfil — reject it.
-            if _OAUTH_PARAM_CREDENTIAL_RE.search(value):
-                return True
-            continue
-        # Non-OAuth param (or path): apply the full exfil heuristic.
-        if _EXFIL_PATTERNS.search(value):
-            return True
-    return False
 
 
 def _emit_mcp_oauth_request(
@@ -1127,23 +1107,38 @@ def _emit_mcp_oauth_request(
             },
         )
         return
-    if _oauth_url_contains_credential(oauth_url):
-        # Legitimate OAuth consent URLs carry state/code_challenge/client_id —
-        # never AKIA*/Bearer/etc.  Surface this so the user can ask the server
-        # owner to fix it instead of just seeing nothing happen.
+    if oauth_url_contains_credential(oauth_url):
+        # Two distinct causes reach this branch and the user cannot tell them
+        # apart from the banner alone:
+        #   1. A genuinely bogus URL — legitimate OAuth consent URLs carry
+        #      state/code_challenge/client_id, never AKIA*/Bearer/etc.
+        #   2. A legitimate consent URL at an endpoint outside
+        #      ``_OAUTH_AUTHORIZATION_ENDPOINTS``. The PKCE entropy carve-out
+        #      applies only at an approved (host, path), so an unlisted
+        #      self-hosted IdP has its ``code_challenge`` scanned as a bare
+        #      secret and fails closed.
+        # Case 2 has a remedy (the ``oauth_endpoints.json`` operator keystone,
+        # see security._load_operator_oauth_endpoints) but it is agent-fenced
+        # with no dashboard writer, so naming it here is the only way the user
+        # learns it exists. Without this the failure reads as unfixable.
         logger.warning(
             "ACP: rejecting MCP OAuth URL with credential/exfil pattern for %s",
             server_name or "(unknown)",
         )
         slot.append(
             "mcp_oauth",
-            f"🚫 {label} sent an authentication URL containing a credential pattern (rejected).",
+            f"🚫 {label} sent an authentication URL containing a credential "
+            "pattern (rejected). If this is a self-hosted or otherwise "
+            "unlisted identity provider, its authorization endpoint may need "
+            "adding to oauth_endpoints.json in the Kiro Crew data home; "
+            "otherwise ask the server owner to fix the URL.",
             "msg msg-warn",
             meta={
                 "server_name": safe_name,
                 "failed": True,
                 "rejected_url": True,
                 "error": "URL contained credential or exfiltration pattern",
+                "remedy": "oauth_endpoints.json",
             },
         )
         return
@@ -1291,9 +1286,10 @@ def _mark_mcp_oauth_completed(
     # NOT preserve realistic `oauth_url`s: it calls `redact_exfiltration_urls`,
     # whose query-length (>=200) and base64-blob heuristics blank a real Google OIDC
     # or GitHub PKCE consent URL. (Measured: those two are blanked; only a short URL
-    # survives.) The emit-path gate `_oauth_url_contains_credential` deliberately
-    # exempts OAuth params from exactly those heuristics — its docstring notes they
-    # "would reject every real OAuth URL".
+    # survives.) The emit-path gate `security.oauth_url_contains_credential`
+    # deliberately exempts OAuth params from exactly those heuristics — it is
+    # "the sole path allowed to exempt standard OAuth entropy from the generic
+    # URL heuristics" (its docstring).
     #
     # That is harmless HERE only because `oauth_url` is dead data by this point:
     # every path through this function sets `completed` or `failed`, and
@@ -1392,12 +1388,34 @@ def _mask_quoted_separators(text: str) -> tuple[str, dict[str, str]]:
     tracking single/double quote state and swap any ``| & ; \\n`` that is quoted
     for a unique placeholder, restoring it inside each segment before matching.
     Returns ``(masked_text, restore_map)``.
+
+    Quote tracking MUST honor backslash escapes, because getting this wrong is a
+    segmentation bypass rather than a cosmetic error. ``type 'foo'\\'; cmd``
+    closes its quote at the second ``'``, so the ``\\'`` that follows is a literal
+    apostrophe OUTSIDE quotes and the ``;`` is a real separator the shell acts
+    on. Reading that ``\\'`` as an opening quote instead makes the rest of the
+    line look quoted, the ``;`` gets masked, the whole line reads as one segment,
+    and an appended command rides in behind whatever the first segment was
+    allowed to do.
+
+    A backslash escapes the next character everywhere EXCEPT inside single
+    quotes, where the shell treats it literally — the same rule
+    :func:`_unquoted_shell_hazard` applies, and for the same reason.
     """
     out: list[str] = []
     restore: dict[str, str] = {}
     quote: str | None = None
+    escaped = False
     n = 0
     for ch in text:
+        if escaped:
+            escaped = False
+            out.append(ch)
+            continue
+        if ch == "\\" and quote != "'":
+            escaped = True
+            out.append(ch)
+            continue
         if quote:
             if ch == quote:
                 quote = None
@@ -1800,15 +1818,17 @@ def _safe_native_crew_debug_title(title: str) -> str:
     return safe
 
 
-def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
-    """Return the matched pattern if tool_title matches any trusted pattern.
+def _split_command_segments(tool_title: str) -> tuple[str, list[str]] | None:
+    """Split a shell tool title into its unquoted command segments.
 
-    For piped/chained commands, splits into segments and checks each
-    independently — ALL segments must match for the command to be trusted.
-    Returns comma-joined matched patterns for audit provenance.
+    Returns ``(normalized_title, segments)``. Returns ``None`` — which every
+    caller MUST treat as "deny" — when the command contains substitution
+    (``$(...)``, backticks, process substitution), because no amount of
+    per-segment matching can reach inside a sub-command.
 
-    Deny-by-default for commands containing command substitution ($(...),
-    backticks, process substitution) — fnmatch cannot reach sub-commands.
+    Extracted so that every command-keyed approval path shares ONE splitter:
+    a second, independently written shell splitter is exactly how a bypass
+    gets introduced (quoted separators, masked redirects, backgrounding).
     """
     normalized = _normalize_tool_name(tool_title)
     if _CMD_SUBSTITUTION_RE.search(normalized):
@@ -1842,6 +1862,23 @@ def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
             if ph in restored:
                 restored = restored.replace(ph, ch)
         segments.append(restored)
+    return normalized, segments
+
+
+def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
+    """Return the matched pattern if tool_title matches any trusted pattern.
+
+    For piped/chained commands, splits into segments and checks each
+    independently — ALL segments must match for the command to be trusted.
+    Returns comma-joined matched patterns for audit provenance.
+
+    Deny-by-default for commands containing command substitution ($(...),
+    backticks, process substitution) — fnmatch cannot reach sub-commands.
+    """
+    split = _split_command_segments(tool_title)
+    if split is None:
+        return None
+    normalized, segments = split
     if len(segments) > 1:
         matched_patterns = []
         for seg in segments:
@@ -1858,6 +1895,435 @@ def _matches_trusted_pattern(tool_title: str, patterns: set[str]) -> str | None:
         if _tool_matches(pattern, tool_title) or _tool_matches(pattern, normalized):
             return pattern
     return None
+
+
+_BROWSER_CLI_BIN = "playwright-cli"
+
+# Verbs whose entire effect stays INSIDE the browser page/session. These are
+# auto-approved when the Playwright CLI is installed (presence-as-consent), so
+# that ordinary browsing does not prompt on every step.
+#
+# This is an ALLOWLIST, not a denylist, so a verb added by a future CLI release
+# is denied until it is reviewed and listed — fail-closed, not fail-open.
+_BROWSER_CLI_PAGE_VERBS = frozenset(
+    {
+        # Core / lifecycle. `close` is deliberately absent -- see the
+        # exclusion note below. `detach` stays: it releases the session
+        # without taking the operator's window with it.
+        "open", "attach", "detach", "goto", "resize",
+        # Interaction
+        "type", "click", "dblclick", "fill", "drag", "drop", "hover",
+        "select", "check", "uncheck",
+        # Reading the page
+        "snapshot", "find", "generate-locator", "highlight",
+        # Dialogs
+        "dialog-accept", "dialog-dismiss",
+        # Navigation
+        "go-back", "go-forward", "reload",
+        # Keyboard / mouse
+        "press", "keydown", "keyup",
+        "mousemove", "mousedown", "mouseup", "mousewheel",
+        # Capture (writes only into the service's own output dir)
+        "screenshot", "pdf",
+        # Tabs. `tab-close` is absent for the same reason as `close`.
+        "tab-list", "tab-new", "tab-select",
+        # Read-only request metadata: route-list prints the mock table
+        # (pattern strings, no URLs) and config-print prints the session's
+        # launch configuration.
+        "route-list",
+        # DevTools / diagnostics
+        "console", "tracing-start", "tracing-stop",
+        "video-stop", "video-chapter", "video-show-actions",
+        "video-hide-actions",
+        "show", "pause-at", "resume", "step-over",
+        # Session management. The listing only; `close-all` / `kill-all`
+        # are absent -- they are the widest-blast-radius verbs the CLI has.
+        "list",
+    }
+)
+
+# Auto-approvable ONLY in their bare form, because a positional argument turns
+# them into an arbitrary-local-path WRITE. Bare, both write inside the output
+# dir that ``browser_cli.snapshots`` points the CLI at.
+_BROWSER_CLI_BARE_ONLY_VERBS = frozenset({"video-start"})
+
+# Deliberately absent from every set above, so they keep interactive approval:
+#   eval / run-code      — run attacker-authored code in an authenticated page;
+#                          with fetch() that is a complete exfiltration path.
+#   upload               — sends an arbitrary LOCAL file to the current page.
+#   state-load           — reads an arbitrary local path and injects the cookies
+#                          it finds into the live session.
+#   install / install-browser — mutate the machine; installation is the
+#                          dashboard's job (Settings > Browser), not the agent's.
+#   cookie-list / cookie-get, localstorage-list / -get,
+#   sessionstorage-list / -get  — RETURN the session credential itself. These
+#                          were auto-approved in a first version on the reasoning
+#                          that their effect stays "inside the page"; that
+#                          conflates blast radius with sensitivity. The effect of
+#                          a read is the VALUE it prints into the agent's
+#                          context, and for these verbs that value is the login.
+#   requests / network   — print the URL of every request. A URL can BE the
+#                          credential: a presigned S3 URL or a magic-link carries
+#                          the secret in the path or query string, so listing
+#                          URLs prints a credential into context the same way
+#                          cookie-list does.
+#   request / request-headers / request-body, response-headers / response-body
+#                        — print a request's headers verbatim, i.e. its
+#                          Authorization and Cookie values.
+#   close / tab-close / close-all / kill-all
+#                        — `attach` points the CLI at the operator's OWN browser,
+#                          holding their live logins and their open tabs, so these
+#                          take that window (or every session at once) down and
+#                          unsaved work with it. Nothing recovers it. The agent
+#                          prompt already says never to close an attached browser,
+#                          but prose the model is asked to honor is advice, not a
+#                          control, and the gate cannot see whether a session is
+#                          attached or CLI-owned — so it fails closed. `detach`
+#                          stays approved: it releases the session and leaves the
+#                          window alone, which is what cleanup actually needs.
+#   config-print         — prints the session's launch configuration, and the
+#                          documented way to constrain this browser is a proxy
+#                          set through `launchOptions.proxy.server`, whose value
+#                          carries the proxy credential. So the verb that reads
+#                          "harmless settings dump" prints a secret on exactly
+#                          the setup this design recommends.
+#   state-save           — serialises the WHOLE storage state, cookies included,
+#                          to a file the agent can then read with its own file
+#                          tools. Bare-form no longer helps: the file is the
+#                          credential.
+#   delete-data          — with `attach`, the CLI operates the operator's REAL
+#                          logged-in browser. `delete-data` destroys session
+#                          state (cookies, storage, cache) nothing recovers —
+#                          equivalent to the user clicking "Clear all site data"
+#                          on every origin the browser knows.
+#   cookie-set / cookie-delete / cookie-clear,
+#   localstorage-set / localstorage-delete / localstorage-clear,
+#   sessionstorage-set / sessionstorage-delete / sessionstorage-clear
+#                        — `attach` means the operator's REAL browser. The -set
+#                          verbs are session fixation (inject a controlled
+#                          credential the attacker can reuse); the -delete and
+#                          -clear verbs destroy operator login state nothing
+#                          recovers. Both directions reach outside "inside the
+#                          page" once the page IS the operator's live session.
+#   route / unroute / network-state-set
+#                        — a route intercepts requests and returns forged
+#                          responses. The agent reads the page (via `snapshot`),
+#                          so a route lets an injected agent control what the
+#                          NEXT read returns — fabricating confirmation of an
+#                          action that never happened or hiding an error the
+#                          operator should see. `unroute` removes a route the
+#                          operator set intentionally. `network-state-set`
+#                          toggles offline mode, severing the page from its
+#                          server — a denial-of-service on the operator's
+#                          browsing.
+# A prompt-injected agent must not be able to convert "browsing is allowed"
+# into arbitrary code execution, arbitrary local reads, or arbitrary writes.
+# Auto-approval must never become a local-machine primitive: the effect of a
+# read is the VALUE it prints into the agent's context, and that value
+# determines whether the verb is safe — not whether the verb's blast radius
+# stays "inside the page".
+
+
+# Flags that carry no local-filesystem path and no code. An ALLOWLIST for the
+# same fail-closed reason as the verb list. It is load-bearing rather than
+# cosmetic: the CLI takes an output path as `--filename=<name>`, so a path can
+# arrive as a FLAG and not only as a positional argument. Skipping unrecognized
+# flags on the way to the verb would therefore auto-approve an arbitrary local
+# WRITE. Anything not listed here falls through to interactive approval --
+# notably:
+#   --filename  MEASURED: the value is resolved against the CLI invocation's
+#               CWD, *not* against PLAYWRIGHT_MCP_OUTPUT_DIR (that variable only
+#               governs auto-generated names). So even a bare
+#               `--filename=README.md` overwrites a file in the user's repo, and
+#               there is no "safe" spelling of it to allow. The un-named form
+#               (`playwright-cli screenshot`) IS auto-approved and writes into
+#               the service's own directory, printing the path -- so the capture
+#               loop keeps working without this flag.
+#   --profile / --config  name a local path to READ.
+_BROWSER_CLI_SAFE_FLAGS = frozenset(
+    {
+        # MEASURED against the installed CLI: `-s=`, `--s=` and `--session=`
+        # are all accepted and all name the same session. Only `-s` was listed,
+        # so the named-session form this repo's own prompt.md tells the agent to
+        # use (`--s=chrome`) fell through to interactive approval on EVERY
+        # command after `attach` -- the documented primary workflow.
+        "-s", "--s", "--session",
+        "--json", "--raw", "--help", "--version",
+        "--headed", "--browser", "--persistent",
+        "--extension", "--cdp", "--endpoint",
+        "--domain", "--hide",
+        # Shape-only capture options: they change the image, not its location.
+        "--type", "--full-page", "--hires",
+    }
+)
+
+
+_BROWSER_CLI_SESSION_FLAGS = frozenset({"-s", "--s", "--session"})
+# A leading URI scheme, e.g. `https:`, `file:`, `view-source:`.
+_URI_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
+
+
+# Names that reach the local machine without naming an address. Refusing
+# loopback ADDRESSES is not sufficient on its own: `localhost` and anything under
+# the reserved `.localhost` suffix (RFC 6761) resolve to loopback by name.
+_LOOPBACK_HOST_NAMES = frozenset({"localhost"})
+
+# The longest a DNS name may be, per RFC 1035.
+_MAX_DNS_NAME_LEN = 253
+
+# A host this gate is willing to treat as a DNS name. The decisive rule is that
+# the FINAL label starts with an ASCII letter, which is what separates a real
+# name from an address a browser will decode: every alternate spelling of an IPv4
+# address ends in a numeric or ``0x`` label -- decimal (`2852039166`), hex
+# (`0xa9fea9fe`), octal-dotted (`0251.0376.0251.0376`), the dotted mixtures, and
+# short forms like `127.1`. One rule refuses them all without enumerating the
+# encodings. A host that matches nothing here (a percent-encoded authority, a
+# non-ASCII IDN label) is not classified and so falls through to interactive
+# approval, which is the correct direction to fail.
+_DNS_HOST_RE = re.compile(r"(?:[^\s./\\:@\[\]]+\.)*[^\W\d_][^\s./\\:@\[\]]*", re.ASCII)
+
+
+def _is_remote_navigable_host(host: str) -> bool:
+    """Whether http(s) navigation to *host* may be auto-approved.
+
+    Refused, so that navigation there costs one interactive approval:
+
+    * **Every local control plane.** Kiro Crew's own dashboard is served over
+      loopback, and the approval mode, trust settings and YOLO switch all live on
+      it -- so an auto-approved ``goto`` plus auto-approved clicks would let the
+      agent widen its own ceiling with no human in the loop. The rule is the
+      whole loopback range and the loopback names rather than one port number:
+      the dashboard's port is only known at runtime (a pod gets its own), and
+      "never auto-drive a local admin UI" covers the dashboard, pods, and
+      anything else the operator happens to run on the host under one rule.
+      ``0.0.0.0`` / ``::`` are refused with it, because a listener bound to the
+      unspecified address is reachable that way too.
+    * **Link-local**, where cloud instance metadata and its credentials live: a
+      ``goto`` followed by an auto-approved ``snapshot`` would print an instance
+      role's credentials into the agent's context.
+    * **Private** (RFC 1918: 10/8, 172.16/12, 192.168/16), **CGNAT/shared**
+      (100.64/10), and **all other non-globally-routable addresses** including
+      multicast, reserved/future-use, documentation, and benchmarking ranges.
+      A ``goto http://10.0.0.5/admin`` followed by an auto-approved ``snapshot``
+      prints internal infrastructure responses into the agent's context -- the
+      same SSRF vector as link-local, aimed at internal services rather than
+      the metadata endpoint.
+
+    Ranges are tested by ``ipaddress``' own ``is_global`` property (True only
+    for globally-routable addresses), applied to both the address itself and
+    any embedded IPv4 (``ipv4_mapped``, ``sixtofour``). ``is_global`` subsumes
+    loopback, link-local, unspecified, private, CGNAT/shared, multicast,
+    reserved, documentation, and benchmarking ranges in one predicate, without
+    hand-rolled CIDRs.
+
+    DNS names are NOT resolved. Resolving inside the approval predicate is a
+    blocking network call on the hot path AND a DNS-rebinding TOCTOU: a name can
+    answer a public address at approval time then resolve to a private one when
+    the browser re-resolves milliseconds later. The residual risk (a public name
+    pointing at a private address) is accepted; browser-side network policy is
+    the correct mitigation layer for that class.
+
+    Ordinary public http(s) browsing is unaffected and stays auto-approved.
+    """
+    lowered = host.lower().rstrip(".")
+    if not lowered:
+        return False
+    if lowered in _LOOPBACK_HOST_NAMES or lowered.endswith(".localhost"):
+        return False
+    try:
+        addr: Any = ipaddress.ip_address(lowered)
+    except ValueError:
+        # Not an address literal, so it can only be a name -- and only when it
+        # actually looks like one. See `_DNS_HOST_RE`.
+        if len(lowered) > _MAX_DNS_NAME_LEN:
+            return False
+        return _DNS_HOST_RE.fullmatch(lowered) is not None
+    candidates = [addr]
+    for embedding in ("ipv4_mapped", "sixtofour"):
+        embedded = getattr(addr, embedding, None)
+        if embedded is not None:
+            candidates.append(embedded)
+    return all(c.is_global for c in candidates)
+
+
+def _is_safe_browser_cli_argument(arg: str) -> bool:
+    """Whether a page verb's positional argument is safe to auto-approve.
+
+    A positional that is not URI-shaped is ordinary page input -- an element ref,
+    a key name, literal text -- and passes. A URI-shaped one passes only as plain
+    http(s) to a host :func:`_is_remote_navigable_host` accepts; every other
+    shape falls through to interactive approval, because a non-http scheme is not
+    "a page action" at all:
+
+    * ``file:`` reads local disk into the page, and the next ``snapshot`` prints
+      it into the agent's context -- an arbitrary local file read.
+    * ``data:`` and ``javascript:`` inject script into the page.
+    * ``view-source:`` does both.
+
+    So the rule matches the one used for flags: recognized shape or refuse.
+    """
+    m = _URI_SCHEME_RE.match(arg)
+    if m is None:
+        return True  # not URI-shaped: an element ref, a key name, literal text
+    if m.group(1).lower() not in ("http", "https"):
+        return False
+    # Refuse before parsing anything a browser and `urlsplit` read DIFFERENTLY.
+    # `urlsplit` follows RFC 3986; a browser follows the WHATWG URL spec, and
+    # where they disagree the browser's answer is the one that gets navigated:
+    #
+    #   * a backslash is a path separator in a special scheme, so
+    #     `http://<target>\@innocuous/` ends its authority at the backslash and
+    #     navigates to <target> -- while `urlsplit` reads everything before the
+    #     last `@` as userinfo and reports `innocuous` as the host, which is the
+    #     value this guard would have checked.
+    #   * tab, CR and LF are STRIPPED from a URL before parsing, so they can be
+    #     inserted mid-host to break up a literal the guard would recognize.
+    #
+    # There is no safe spelling of either inside an http(s) URL a page actually
+    # needs, so an argument carrying one costs an approval prompt rather than
+    # being reconciled between two parsers.
+    if "\\" in arg or any(ch in arg for ch in ("\t", "\n", "\r")):
+        return False
+    try:
+        host = urllib.parse.urlsplit(arg).hostname
+    except ValueError:
+        return False  # unparseable authority -- cannot reason about it
+    if not host:
+        return False
+    return _is_remote_navigable_host(host)
+
+
+# A plain session label: no separators, no traversal, no leading dash.
+_SESSION_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
+def _unquoted_shell_hazard(text: str) -> str | None:
+    """Name the first shell construct in *text* the CLI never sees, or ``None``.
+
+    Load-bearing for approval, not cosmetic: every construct here is performed by
+    the SHELL before the command runs, so the verb and flag allowlists cannot see
+    it. They inspect the tokens they are handed; the shell decides what those
+    tokens become.
+
+    * **Redirection.** An otherwise-approved ``playwright-cli snapshot`` with
+      ``> somefile`` appended CREATES OR TRUNCATES that file. The segment splitter
+      does not cut on ``>``, so ``>`` and the path arrive as ordinary positionals
+      and the whole thing reads as "snapshot with two extra arguments".
+    * **Expansion.** ``open "${PATH:+file:///etc/passwd}"`` is not URI-shaped when
+      the guard sees it, so it passes as ordinary page input — and the shell then
+      expands it into a ``file://`` URL, making the next ``snapshot`` an arbitrary
+      local file read. ``$VAR`` and backticks are the same mechanism, and so is
+      brace expansion: ``{file:///etc/passwd,}`` expands to that URL with no
+      variable and no substitution involved. A leading ``~`` expands to a home
+      directory the same way.
+
+    Globbing (``*``, ``?``, ``[]``) is deliberately NOT treated as a hazard, and
+    the asymmetry is the point: brace and tilde expansion ALWAYS rewrite the
+    token, while an unmatched glob is left literal by the shell — and refusing
+    ``?`` would deny every URL carrying a query string, which is most of them.
+    A glob that does match names a local file, and no auto-approved verb takes a
+    local path as a positional.
+
+    One quote-aware walker serves all of it, because a second shell parser is how
+    a bypass gets introduced. Quote rules are the shell's own: single quotes make
+    everything literal, so ``type 'price is $5'`` and ``click "div > span"`` are
+    legitimate arguments and stay approved; a backslash escapes the next
+    character everywhere except inside single quotes.
+    """
+    quote: str | None = None
+    escaped = False
+    at_word_start = True
+    for ch in text:
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and quote != "'":
+            escaped = True
+            continue
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            continue
+        # Double quotes suppress word splitting and globbing but NOT parameter or
+        # command substitution, so `$` and a backtick stay dangerous inside them.
+        if ch in ("$", "`"):
+            return "expansion"
+        if ch in ("{", "}"):
+            return "brace-expansion"
+        if quote == '"':
+            if ch == '"':
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch in "><":
+            return "redirection"
+        if ch == "~" and at_word_start:
+            return "tilde-expansion"
+        at_word_start = ch.isspace()
+    return None
+
+
+def _is_browser_cli_command(tool_title: str) -> bool:
+    """True when EVERY segment of a shell command is an auto-approvable
+    ``playwright-cli`` page-scoped verb.
+
+    Matched against the REAL command recovered from ``tool_input`` — never the
+    model-authored title, which an injected agent controls and could forge.
+    Reuses :func:`_split_command_segments`, so command substitution and quoted
+    separators are handled by the one hardened splitter.
+    """
+    split = _split_command_segments(tool_title)
+    if split is None:
+        return False
+    _, segments = split
+    if not segments:
+        return False
+    for seg in segments:
+        # BEFORE tokenizing: redirection and expansion are the shell's work, not
+        # the CLI's, so no amount of verb checking can make them safe.
+        if _unquoted_shell_hazard(seg) is not None:
+            return False
+        try:
+            tokens = shlex.split(seg)
+        except ValueError:
+            return False  # unbalanced quotes — cannot reason about it
+        if len(tokens) < 2 or tokens[0] != _BROWSER_CLI_BIN:
+            return False
+        # Separate flags from positionals. Every flag must be recognized as
+        # path-free and code-free; an UNKNOWN flag denies the whole command
+        # rather than being skipped over on the way to the verb.
+        positionals: list[str] = []
+        for tok in tokens[1:]:
+            if tok.startswith("-"):
+                name, _, value = tok.partition("=")
+                if name not in _BROWSER_CLI_SAFE_FLAGS:
+                    return False
+                # A session name becomes a directory under the CLI's own data
+                # dir, so a traversal-shaped value writes outside it. Restrict it
+                # to a plain label. This also closes the same hole on the
+                # pre-existing `-s`, which never validated its value.
+                if name in _BROWSER_CLI_SESSION_FLAGS and not _SESSION_NAME_RE.fullmatch(value):
+                    return False
+            else:
+                positionals.append(tok)
+        if not positionals:
+            return False
+        verb = positionals[0]
+        if verb in _BROWSER_CLI_PAGE_VERBS:
+            # Positionals carry the navigation target, so they are validated
+            # like flags are -- see `_is_safe_browser_cli_argument`.
+            if not all(_is_safe_browser_cli_argument(a) for a in positionals[1:]):
+                return False
+            continue
+        # Bare only: MEASURED, an output name is resolved against the CLI's CWD,
+        # so any argument here is an arbitrary local write. Bare, both write into
+        # the service's own directory.
+        if verb in _BROWSER_CLI_BARE_ONLY_VERBS and len(positionals) == 1:
+            continue
+        return False
+    return True
 
 
 def _extract_base_command(tool_title: str) -> str:
@@ -2000,6 +2466,11 @@ async def _deliver_auth_error_to_slack(
     slack_client = getattr(state, "slack_client", None)
     if slack_client is None:
         return
+    # A disconnected thread is muted for turn output, and an auth failure IS turn
+    # output. The dashboard renders the same error, which is where a user who just
+    # disconnected the thread is working.
+    if slack_mirror_is_paused(state, session_key):
+        return
     thread_ts = getattr(slot, "_slack_thread_ts", "")
     channel_id = getattr(slot, "_slack_channel", "")
     if (not thread_ts or not channel_id) and sessions is not None:
@@ -2028,6 +2499,11 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     token). Best-effort: a delivery failure never disrupts the dashboard turn.
     """
     if not assistant_text:
+        return
+    # Disconnected: the binding is retained so a reply there still resolves here,
+    # but turn output stops. Asked before resolving so a muted channel costs no
+    # transport lookup.
+    if mirror_is_paused(state, session_key):
         return
     target = _resolve_mirror_target(state, session_key)
     if target is None:
@@ -2067,6 +2543,11 @@ async def _deliver_cross_surface_user_message(
     streaming mirror; the caller guards out slash commands and recovery turns.
     """
     if not user_message:
+        return
+    # Same gate as the reply leg: these are the two sites that carry turn output,
+    # and a disconnect silences both or the remote conversation reads as a
+    # question with no answer.
+    if mirror_is_paused(state, session_key):
         return
     target = _resolve_mirror_target(state, session_key)
     if target is None:
@@ -2229,7 +2710,7 @@ def _schedule_widget_registration(
     keys off the SAME ``slot.is_restricted`` signal, so the two agree by
     construction.
     """
-    if not text or "<mcwidget" not in text:
+    if not text:
         return
     if getattr(slot, "is_restricted", False):
         return
@@ -2243,9 +2724,19 @@ def _schedule_widget_registration(
     # unlike ``_collect_session_docs``). WidgetFrame's fallback create also sends
     # the bare key, so this keeps auto-registered and star-created artifacts in
     # the same bucket — the one the tab can actually see.
-    task = asyncio.create_task(register_widgets_off_loop(text, message_ts, slot.key))
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
+    #
+    # Two independent registration passes ride the same restricted-session gate
+    # and off-loop dispatch: <mcwidget> bodies (inline HTML) and local markdown
+    # images (bytes copied off disk). The cheap substring pre-checks keep a
+    # plain prose segment from scheduling either task.
+    if "<mcwidget" in text:
+        task = asyncio.create_task(register_widgets_off_loop(text, message_ts, slot.key))
+        state._background_tasks.add(task)
+        task.add_done_callback(state._background_tasks.discard)
+    if "![" in text:
+        image_task = asyncio.create_task(register_images_off_loop(text, message_ts, slot.key))
+        state._background_tasks.add(image_task)
+        image_task.add_done_callback(state._background_tasks.discard)
 
 
 def _expand_prompt_mention(
@@ -2565,11 +3056,17 @@ async def _eager_spawn(
             # switches don't — the snapshot covers them all uniformly.
             _bound = (slot.agent, slot.model, slot.project, slot.reasoning_effort)
             kiro_agent: str | None = None
+            # Canonical crew identity for watchdog overrides. Seeded from the
+            # slot, replaced by the resolver's alias below: an EMPTY slot runs
+            # the DEFAULT crew (resolve_agent_bindings step 2), whose overrides
+            # would be discarded by passing "" here.
+            crew_alias = slot.agent or ""
             agent_model = ""
             try:
                 cfg = KiroCrewConfig.load()
                 bindings = resolve_agent_bindings(cfg, slot.agent or None)
                 kiro_agent = bindings.kiro_agent
+                crew_alias = bindings.resolved_alias
                 agent_model = normalize_agent_model(bindings.model)
             except Exception:
                 logger.warning(
@@ -2588,6 +3085,12 @@ async def _eager_spawn(
                 _, is_new, resumed = await sessions.get_or_create(
                     session_key,
                     agent=kiro_agent or slot.agent or None,
+                    # Canonical crew identity — the resolver's alias, which
+                    # covers the default crew on an empty slot; plumbed to the
+                    # session so per-agent watchdog windows never depend on a
+                    # cross-namespace name match. "" is authoritative: no
+                    # alias applied, so no override applies.
+                    crew_agent=crew_alias,
                     model=slot.model or agent_model or None,
                     cwd=slot.project or None,
                     speculative=True,
@@ -2959,14 +3462,38 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     cron_label = match.group(1) if match else "cron"
     cron_label, _ = redact_exfiltration_urls(cron_label)
     cron_label, _ = redact_credentials(cron_label)
+    # Structured completion facts stamped at enqueue time (gateway _subagent_done)
+    # ride through to the row so the card reads them instead of re-parsing the
+    # header prose. Only a single, un-merged system injection carries
+    # them: a merge concatenates several entries under one synthetic header, for
+    # which per-entry facts are meaningless — subagent completions never merge
+    # (they drain one at a time and break any user-message merge), so this only
+    # fires on the shape it was computed for.
+    _row_meta = consumed[0].get("meta") if (is_subagent and len(consumed) == 1) else None
+    # When synthesis is pending, mark the completion so the frontend can collapse
+    # the per-completion assistant response that follows (it will be restated by
+    # the synthesis turn).
+    if is_subagent and slot._pending_synthesis and isinstance(_row_meta, dict):
+        _row_meta = {**_row_meta, "synthesisPending": True}
+    if is_subagent:
+        row_role = "subagent"
+    elif is_cron or is_recovery:
+        row_role = "inject"
+    else:
+        row_role = "user"
+    if is_cron:
+        # A cron row's `cls` slot carries a JSON payload, not a CSS class name:
+        # `cronLabel` is structured data the frontend reads off the row.
+        row_cls = json.dumps({"cronLabel": cron_label})
+    elif is_recovery:
+        row_cls = "msg msg-inject"
+    else:
+        row_cls = "msg msg-u"
     slot.append(
-        "subagent" if is_subagent else "inject" if (is_cron or is_recovery) else "user",
+        row_role,
         next_msg,
-        (
-            json.dumps({"cronLabel": cron_label})
-            if is_cron
-            else "msg msg-inject" if is_recovery else "msg msg-u"
-        ),
+        row_cls,
+        meta=_row_meta if isinstance(_row_meta, dict) else None,
     )
 
     task = spawn_guarded_turn(
@@ -3064,6 +3591,13 @@ def _finish_queue_cycle(state: DashboardState, slot: _ChatSlot) -> None:
         state._background_tasks.add(refresh_task)
         refresh_task.add_done_callback(state._background_tasks.discard)
 
+    # Intent summary for the chat summary panel. Self-guarding: the common case
+    # (feature disabled) returns before any work, and an unchanged transcript is
+    # served from the sidecar cache without a model call.
+    summary_task = asyncio.create_task(generate_session_summary(state, slot))
+    state._background_tasks.add(summary_task)
+    summary_task.add_done_callback(state._background_tasks.discard)
+
 
 def _emit_ttft_metric(t0: float, session_key: str, *, is_new: bool, resumed: bool) -> None:
     """Emit the user-message → first-visible-token latency histogram.
@@ -3075,8 +3609,9 @@ def _emit_ttft_metric(t0: float, session_key: str, *, is_new: bool, resumed: boo
     read side by side.
     """
     try:
-        # circular import: metrics.provider -> config.loader -> ... (same
-        # reason _emit_kiro_startup_metric imports lazily).
+        # Re-read at call time even though the module also imports it at the
+        # top: the rebind is what lets a test patching
+        # ``kiro_crew.metrics.provider.get_recorder`` reach this emit.
         from kiro_crew.metrics.provider import get_recorder
 
         get_recorder().histogram(
@@ -3556,6 +4091,29 @@ async def _run_chat(
     if _prompt_depth == 0:
         await expire_slack_options(state, session_key)
 
+    # Publish the identity of the turn this call is about to run. From here down
+    # the local `session_key` is what the turn acquires, audits and releases,
+    # while `slot.linked_session_key` stays mutable underneath it: a cron
+    # injection binds an existing slot with no `running` gate, so a turn that
+    # started on `dashboard:<slot>` can find the slot routed at `cron:<id>`
+    # before it ends. A cancel that re-derived the key would then address a
+    # session this turn never ran on, so the cancel routes read this instead.
+    #
+    # Placed at the same boundary as the OPTIONS expiry above, and for the same
+    # reason: `/goal`, a `/prompts` listing or error, and a blocked slash command
+    # all return without starting an agent turn, so none of them owns a turn
+    # identity. `/prompts get` re-enters at `_prompt_depth=1`, and it is that
+    # depth-1 call which reaches the machinery below while its depth-0 wrapper
+    # returns above — so keying on the BOUNDARY is what puts the identity on the
+    # invocation that actually runs the turn. Keying on `_prompt_depth == 0`
+    # would put it on the wrapper instead.
+    #
+    # BELOW the expiry, not above it: that await is the only thing between the
+    # boundary and the try, so installing after it means every exit that can
+    # happen while the identity is live reaches the teardown that retires it.
+    # Only plain assignments separate this line from the try.
+    slot._active_turn_session_key = session_key
+
     _acquired = False
     _mirror_stream_ts: str = ""
     _mirror_chan: str | None = ""
@@ -3583,6 +4141,11 @@ async def _run_chat(
         # guards (`is_claude_backend`, the advertised list) rather than trusting a
         # provider name that could not be read.
         provider_name = ""
+        # Canonical crew identity for watchdog overrides — same seeding rule
+        # as the eager-spawn path (the two must agree): slot value until the
+        # resolver supplies its alias, which covers the default crew on an
+        # empty slot.
+        crew_alias = slot.agent or ""
         try:
             cfg = KiroCrewConfig.load()
             provider_name = cfg.agent.provider
@@ -3593,6 +4156,7 @@ async def _run_chat(
             await warm_project_agent_names(slot.project)
             bindings = resolve_agent_bindings(cfg, slot.agent or None, slot.project or None)
             kiro_agent = bindings.kiro_agent
+            crew_alias = bindings.resolved_alias
             memory_store = bindings.memory_store_name
             agent_model = normalize_agent_model(bindings.model)
         except Exception:
@@ -3609,15 +4173,48 @@ async def _run_chat(
         client, is_new, resumed = await state.sessions.get_or_create(
             session_key,
             agent=kiro_agent or slot.agent or None,
+            # Same canonical crew identity as the eager-spawn path — the two
+            # must agree or an eager session and its real first turn would
+            # carry different watchdog windows.
+            crew_agent=crew_alias,
             model=slot.model or agent_model or None,
             cwd=slot.project or None,
             reasoning_effort_override=slot.reasoning_effort or None,
         )
         _acquired = True
+        # Member activity pointer — once per SESSION, not per turn: the log
+        # answers "which sessions did this member take part in", so a per-turn
+        # append would inflate every count taken from it. `slot.agent` is the
+        # member the human picked; `kiro_agent` is the template it resolved to,
+        # and only the member identity is recorded.
+        #
+        # Offloaded: this opens and appends to a file, and `_run_chat` shares the
+        # single gateway event loop with every other session — matching the
+        # to_thread offloads used for the other file IO in this function.
+        # record_activity is total, so no guard is needed here.
+        if is_new and slot.agent:
+            await asyncio.to_thread(
+                record_activity,
+                slot.agent,
+                session_key,
+                slot.memory_mode or "",
+                project=slot.project or "",
+                via="chat",
+                dedupe_session=True,
+            )
         # Publish the live inner AcpClient onto the slot so a concurrent request
         # (the dashboard steer handler) can reach the running session's client
         # to inject a mid-turn steer. Cleared in the finally below.
         slot._acp_client = getattr(client, "client", None)
+        # This consumer implements the low-fidelity child downgrade (the
+        # interactive card) — opt in so the handle-level fail-close gate
+        # yields those events here instead of rejecting them itself.
+        # setattr: the LLMProvider interface doesn't declare the attribute;
+        # AcpSessionProvider forwards it to the handle, other providers ignore.
+        try:
+            setattr(client, "child_fidelity_aware", True)
+        except Exception:  # pragma: no cover - providers without the attr
+            pass
         # Companion steer handle: lets the steer handler cut the current text
         # segment at the steer boundary (see _steer_segment_cut). Same
         # lifecycle as _acp_client.
@@ -4014,6 +4611,7 @@ async def _run_chat(
                 memory_store=memory_store,
                 compressed_history=compressed,
                 mode=slot.mode,
+                ponytail_mode=slot.ponytail,
                 blocks_reads=slot.blocks_reads,
                 provider_type=cfg.agent.provider,
                 runtime_source="dashboard",
@@ -4155,7 +4753,16 @@ async def _run_chat(
         # ANSWER to the thread that asked: gating the whole setup leaves
         # `_mirror_thread` empty, the reply leg downstream silently no-ops, and the
         # question already sitting on Slack is never answered at all.
-        if state.slack_client and not is_slash:
+        # A DISCONNECTED thread stops here and nowhere else: `_mirror_thread` and
+        # `_mirror_chan` stay empty, which is what silences the echo, the tool
+        # stream, the assistant reply and the stream teardown together. Disconnect
+        # is the user saying "not into this conversation", which applies to the
+        # answer as much as to the echo — so it is one gate, not four.
+        if (
+            state.slack_client
+            and not is_slash
+            and not slack_mirror_is_paused(state, session_key)
+        ):
             _mirror_thread, _mirror_chan = state.sessions.get_slack_link(session_key)
             if _mirror_thread and _mirror_chan:
                 try:
@@ -4181,6 +4788,12 @@ async def _run_chat(
             await _deliver_cross_surface_user_message(state, session_key, _user_msg_for_mirror)
 
         _stop_reason = ""
+        # Cleared at turn START so post-turn consumers never read the PREVIOUS
+        # turn's value: a turn that dies before EVENT_COMPLETE (ACP crash, auth
+        # expiry, transport drop) never reaches the assignment below, and a
+        # stale "end_turn" from the last successful turn would make the failed
+        # turn look cleanly finished (e.g. to the session-summary gate).
+        slot._last_stop_reason = ""
         # Tool-stall metadata forwarded by the ACP watchdog on its terminal
         # event (title / redacted command / evidence) — feeds the dedicated
         # tool-stall recovery nudge below.
@@ -4199,6 +4812,7 @@ async def _run_chat(
         _turn_elapsed_ms = 0
         _turn_credits = 0.0
         _turn_cost_usd = 0.0
+        _turn_model = ""
         _turn_msg_boundary = len(slot.messages)
 
         # Lease-dispatch race gate: this session's semaphore lease
@@ -4473,6 +5087,11 @@ async def _run_chat(
                         _kind_upd, _ = redact_exfiltration_urls(event.tool_kind)
                         _kind_upd, _ = redact_credentials(_kind_upd)
                     _input_upd = _redact_tool_field(event.tool_input) if event.tool_input else ""
+                    _purpose_upd = (
+                        _redact_tool_field(event.tool_purpose, limit=_MAX_TOOL_PURPOSE)
+                        if event.tool_purpose
+                        else ""
+                    )
                     # Snapshot file BEFORE the write tool actually executes.
                     # Initial tool_call had empty rawInput so no snapshot was
                     # taken there; this is the first event with the file path.
@@ -4502,6 +5121,12 @@ async def _run_chat(
                             # capability signal as the initial tool_call.
                             "is_shell": event.is_shell,
                             "is_update": True,
+                            # Omitted rather than sent empty: consumers merge a
+                            # refinement field-by-field and read an absent
+                            # `purpose` as "keep what the initial tool_call
+                            # supplied", so an empty value would blank a good
+                            # purpose (the session list's running-status line).
+                            **({"purpose": _purpose_upd} if _purpose_upd else {}),
                         },
                     )
                     # Update the audit log so the SEL trail captures the
@@ -4525,6 +5150,13 @@ async def _run_chat(
                     _meta_patch: dict[str, str] = {}
                     if _input_upd:
                         _meta_patch["input"] = _input_upd
+                    # A refinement is the only event carrying the purpose when the
+                    # initial tool_call streamed an empty rawInput, so the patch has
+                    # to reach the PERSISTED meta too: _tool_meta() wrote "" there,
+                    # and the reloaded transcript reads meta.purpose (ToolCallLine),
+                    # so a live-only fix would lose the purpose on the next reload.
+                    if _purpose_upd:
+                        _meta_patch["purpose"] = _purpose_upd
                     _patched = False
                     _patched_content: str | None = None
                     for m in reversed(slot.messages):
@@ -4653,21 +5285,48 @@ async def _run_chat(
                     else:
                         _dir_args = session_directive.decode(_out, _dir_tool)
                         if _dir_args is None and event.tool_final:
-                            # The gate already AUTHENTICATED this as a directive
-                            # tool via the canonical _meta identity, and this is
-                            # the FINAL frame — so a marker that does not decode
-                            # means the effect is being dropped outright. Never
-                            # let that be silent: this exact silence can hide a
-                            # rawOutput-envelope escaping bug.
-                            # Mid-stream frames legitimately decode to None and
-                            # are excluded by the tool_final guard.
-                            logger.warning(
-                                "session-directive decode FAILED for %r "
-                                "(tool_call_id=%s, out_len=%d) — effect dropped",
-                                _dir_tool,
-                                event.tool_call_id,
-                                len(_out or ""),
-                            )
+                            if session_directive.is_refusal(_out):
+                                # encode() refused to emit a marker because the
+                                # VALIDATED payload exceeded the delivery limit.
+                                # Nothing was applied and the result text already
+                                # told the model so, so this is the by-design
+                                # loud failure — it must not fire the warning
+                                # below, which exists to surface a lost marker.
+                                logger.info(
+                                    "session-directive REFUSED for %r "
+                                    "(tool_call_id=%s): payload over the %d-char "
+                                    "delivery limit; nothing applied",
+                                    _dir_tool,
+                                    event.tool_call_id,
+                                    session_directive.MAX_DIRECTIVE_CHARS,
+                                )
+                                # SINGLE-CONSUME + strip: a refusal is terminal,
+                                # so release the mapping and cache the
+                                # marker-free text for any later frame carrying
+                                # this same tool_call_id (which no longer
+                                # resolves _dir_tool).
+                                _pending_dir_tool.pop(event.tool_call_id, None)
+                                _out = _redact_tool_field(
+                                    session_directive.strip_marker(_out)
+                                )
+                                _dir_consumed_out[event.tool_call_id] = _out
+                            else:
+                                # The gate already AUTHENTICATED this as a
+                                # directive tool via the canonical _meta
+                                # identity, and this is the FINAL frame — so a
+                                # marker that does not decode means the effect is
+                                # being dropped outright. Never let that be
+                                # silent: this exact silence can hide a
+                                # rawOutput-envelope escaping bug.
+                                # Mid-stream frames legitimately decode to None
+                                # and are excluded by the tool_final guard.
+                                logger.warning(
+                                    "session-directive decode FAILED for %r "
+                                    "(tool_call_id=%s, out_len=%d) — effect dropped",
+                                    _dir_tool,
+                                    event.tool_call_id,
+                                    len(_out or ""),
+                                )
                         if _dir_args is not None:
                             # SINGLE-CONSUME (see the native branch above): drop
                             # the mapping BEFORE applying, so a second result
@@ -4760,6 +5419,29 @@ async def _run_chat(
                     _flush_segment(state, slot, assistant_text)
                     assistant_text = ""
                 _pre_tool_hooks_fired = False
+                # Backend-subagent request whose SECURITY context is absent
+                # (structured params missing, or shell with no recoverable
+                # command — see AcpEvent.child_low_fidelity): every
+                # auto-approve gate below is skipped for it, falling through
+                # to the interactive card. A child WITH full context takes the
+                # same branches as the main agent (mode parity).
+                _child_low_fidelity = event.child_low_fidelity
+                # DISPLAY-ONLY warning for the interactive card: the human
+                # must know the title is ALL there is (the params the gates
+                # would verify are absent, so the displayed text is
+                # agent-authored and unverifiable). Computed HERE — outside
+                # the context-builder block — so the card is labeled whenever
+                # the fidelity guards are active, including hosts with no
+                # context builder. Never written into event.title: the
+                # TrustDropdown derives its learned patterns from the title,
+                # and a mutated title would store junk pattern entries for
+                # exactly the requests that need the clearest presentation.
+                _child_lf_warning = (
+                    "⚠️ UNVERIFIED child request (security context "
+                    "missing — title is agent-authored): "
+                    if _child_low_fidelity
+                    else ""
+                )
                 if state.context_builder:
                     # Pass the raw shell command (not just the display title)
                     # so the security gate evaluates what actually executes.
@@ -4826,6 +5508,24 @@ async def _run_chat(
                         # fragments, paths, or credentials.
                         _refusal_reasons.append((_deny_title, _deny_msg))
                         continue
+                    if _child_low_fidelity:
+                        # Backend-subagent origin whose tool_call frames never
+                        # reached us (cache miss): command bytes are absent, so
+                        # every gate below would judge the LLM-authored title
+                        # alone. Fail closed past all auto-approve paths — the
+                        # request falls through to the interactive card (which
+                        # carries the _child_lf_warning display prefix). When
+                        # the child's session/update frames WERE routed (the
+                        # normal case), tool_input carries the real command
+                        # bytes and the child takes the exact same mode
+                        # branches as the main agent below.
+                        if tool_result.action == TOOL_AUTO_APPROVE:
+                            logger.info(
+                                "downgrading auto-approve to interactive card for "
+                                "low-fidelity subagent permission request (child=%s)",
+                                event.sub_session_id,
+                            )
+                            tool_result = ToolHookResult(action=TOOL_ALLOW)
                     if tool_result.action == TOOL_AUTO_APPROVE:
                         try:
                             validated_tool = _validate_tool_name(
@@ -4937,7 +5637,9 @@ async def _run_chat(
                 # parent turn. Deny-by-default (CWE-1188): with no active crew this
                 # predicate is False no matter the trust flags, so the tool falls
                 # through to the normal interactive/trust gate below.
-                if _native_crew_should_auto_approve(_native_tracker, state, slot):
+                if _native_crew_should_auto_approve(
+                    _native_tracker, state, slot
+                ) and not _child_low_fidelity:
                     logger.debug(
                         "Native crew auto-approve: %r (request_id=%s)",
                         _safe_native_crew_debug_title(event.title),
@@ -4977,7 +5679,7 @@ async def _run_chat(
                 # use event.title as it IS the provider-controlled tool name.
                 # When tool_input exists but isn't recognized as bash, skip pattern
                 # matching entirely (deny-by-default).
-                if slot._trusted_patterns:
+                if slot._trusted_patterns and not _child_low_fidelity:
                     _tp_cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                     if _tp_cmd:
                         _tp_check_title = f"Running: {_tp_cmd}"
@@ -5046,6 +5748,75 @@ async def _run_chat(
                             metadata={"reason": "trusted_pattern", "pattern": matched},
                         )
                         continue
+                # Browser CLI: auto-approve page-scoped `playwright-cli` verbs so
+                # that browsing does not prompt on every step. Placed AFTER the
+                # user's own trusted patterns (a user grant still wins and is
+                # logged as such) and, like that branch, keyed on the REAL command
+                # from tool_input — never event.title, which the model authors.
+                # Consent is the install itself: the binary is only on PATH
+                # because the user (or this dashboard, at their click) put it
+                # there. Verbs that escape the page — arbitrary code, arbitrary
+                # local reads/writes, installers — are excluded by allowlist and
+                # still prompt.
+                # `is_shell` is REQUIRED, not belt-and-braces:
+                # `_extract_bash_command` reads the `command` field out of ANY
+                # tool_input JSON and falls back to the raw input, so without this
+                # gate a non-shell tool that happens to carry a `command` field
+                # (cron_add, which can schedule a shell command) would be
+                # auto-approved here — turning "browsing is allowed" into
+                # "creating a durable scheduled job is allowed".
+                _bc_cmd = (
+                    _extract_bash_command(event.tool_input)
+                    if (event.is_shell and event.tool_input and not _child_low_fidelity)
+                    else ""
+                )
+                _bc_ok = False
+                if _bc_cmd and _is_browser_cli_command(f"Running: {_bc_cmd}"):
+                    # Presence IS the consent signal, so verify it rather than
+                    # assuming it: with no binary on PATH the user never opted in,
+                    # and a `playwright-cli` call is anomalous enough to prompt.
+                    # In a thread: `available()` -> `cli_path()` ->
+                    # `find_node_tool` -> `node_bin_dirs()`, which globs and stats
+                    # every version-manager root (mise alone contributes ~18 dirs
+                    # on a developer box). The repo already treats that call as
+                    # must-not-run-on-the-loop -- see the BLOCKING note on
+                    # `dev_fleet/server.py`'s own use of it. On the loop it stalls
+                    # every other dashboard request and the heartbeat.
+                    _bc_ok = await asyncio.to_thread(browser_cli_install.available)
+                if _bc_ok:
+                    try:
+                        validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
+                    except ValueError as e:
+                        await client.reject_tool(event.request_id)
+                        _safe = _redact_display_text(event.title)
+                        slot.append("tool", f"🚫 {_safe} (invalid: {e})", "msg msg-tool")
+                        sel().log_tool_invocation(
+                            session_key=session_key,
+                            agent=slot.agent or "kirocrew",
+                            source="dashboard",
+                            tool_name=_safe,
+                            tool_kind=event.tool_kind,
+                            outcome="rejected",
+                            request_id=event.request_id,
+                            metadata={"reason": "invalid_tool_name", "pattern": "browser_cli"},
+                        )
+                        continue
+                    await client.approve_tool(event.request_id)
+                    _tool_title = _broadcast_auto_tool(state, slot, event)
+                    _tool_title, _ = redact_exfiltration_urls(_tool_title)
+                    _tool_title, _ = redact_credentials(_tool_title)
+                    slot.append("tool", f"🔧 {_tool_title}", "msg msg-tool")
+                    sel().log_tool_invocation(
+                        session_key=session_key,
+                        agent=slot.agent or "kirocrew",
+                        source="dashboard",
+                        tool_name=_tool_title,
+                        tool_kind=event.tool_kind,
+                        outcome="auto_approved",
+                        request_id=event.request_id,
+                        metadata={"reason": "browser_cli"},
+                    )
+                    continue
                 # Trust-reads: auto-approve read-only bash commands
                 # Detect bash tools by tool_input content (title is human-readable)
                 cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
@@ -5055,7 +5826,13 @@ async def _run_chat(
                 # a scope check is not a pure read — it retires a lapsed grant and
                 # logs that, which must happen once per event, not twice.
                 slot_trusted = _slot_is_trusted(slot)
-                if slot._trust_reads and not slot_trusted and not yolo_active and cmd:
+                if (
+                    slot._trust_reads
+                    and not slot_trusted
+                    and not yolo_active
+                    and cmd
+                    and not _child_low_fidelity
+                ):
                     if is_read_only_bash(cmd):
                         try:
                             validated_tool = _validate_tool_name(
@@ -5090,8 +5867,13 @@ async def _run_chat(
                             metadata={"reason": "trust_reads"},
                         )
                         continue
-                # Trust mode (per-slot) or YOLO mode (global) — auto-approve
-                if slot_trusted or yolo_active:
+                # Trust mode (per-slot) or YOLO mode (global) — auto-approve.
+                # Low-fidelity child events (backend subagents whose command
+                # bytes never reached the caches) are excluded from every
+                # auto-approve path and fall through to the interactive card;
+                # children WITH cached bytes take these branches exactly like
+                # the main agent (mode parity).
+                if (slot_trusted or yolo_active) and not _child_low_fidelity:
                     try:
                         validated_tool = _validate_tool_name(event.title, is_shell=event.is_shell)
                     except ValueError as e:
@@ -5187,7 +5969,10 @@ async def _run_chat(
                 cmd = _extract_bash_command(event.tool_input) if event.tool_input else ""
                 if cmd:
                     perm_meta["is_read_only"] = "1" if is_read_only_bash(cmd) else ""
-                # Pre-compute pattern fields for the TrustDropdown
+                # Pre-compute pattern fields for the TrustDropdown.
+                # NOTE: derived from the UN-annotated event.title — the
+                # _child_lf_warning prefix is applied to the DISPLAY text
+                # only, so learned trust patterns keep meaning tool identity.
                 _safe_title, _ = redact_exfiltration_urls(event.title)
                 _safe_title, _ = redact_credentials(_safe_title)
                 perm_meta["tool_title"] = _safe_title
@@ -5201,7 +5986,7 @@ async def _run_chat(
                 perm_meta["base_command"] = _base
                 slot.append(
                     "permission",
-                    _safe_title,
+                    f"{_child_lf_warning}{_safe_title}" if _child_lf_warning else _safe_title,
                     json.dumps(perm_meta),
                 )
                 loop = asyncio.get_running_loop()
@@ -5225,6 +6010,11 @@ async def _run_chat(
                     and slot._slack_channel
                     and slot._slack_thread_ts
                     and state.slack_client
+                    # An approval prompt is turn output too, and it asks for a
+                    # decision. Posting one into a thread the user disconnected
+                    # would solicit an answer where they are no longer looking;
+                    # the dashboard carries the same prompt.
+                    and not slack_mirror_is_paused(state, session_key)
                 ):
                     try:
                         _slack_approval_ts = await post_linked_approval(
@@ -5233,7 +6023,7 @@ async def _run_chat(
                             slot._slack_thread_ts,
                             event.request_id,
                             session_key,
-                            event.title,
+                            f"{_child_lf_warning}{event.title}" if _child_lf_warning else event.title,
                             event.tool_input or "",
                         )
                         if _slack_approval_ts is None:
@@ -5365,7 +6155,12 @@ async def _run_chat(
                         slot._dirty = True
                         state.broadcast_ws(
                             "approval_resolved",
-                            {"id": str(event.request_id), "approved": _approved},
+                            {
+                                "id": str(event.request_id),
+                                "approved": _approved,
+                                # Keys the frame for the slot-scoped WS gate.
+                                "slot": slot.key,
+                            },
                         )
                         state.push_slots_update()
                     # Clean up the Slack prompt: remove the registry entry and
@@ -5580,6 +6375,20 @@ async def _run_chat(
                 _sid = event.sub_session_id
                 if _sid in _native_tracker and event.tool_call_id:
                     _native_tc_card[event.tool_call_id] = f"native:{_redact_tool_field(_sid)}"
+                # Permission-rejection notices (the handle's own "⛔ …" lines,
+                # e.g. drain-time rejects yielded at turn start) arrive BEFORE
+                # any subagent_list populates the per-turn tracker — dropping
+                # them here would leave the user watching a child tool fail
+                # with no explanation. When the card cannot exist yet, persist
+                # the explanation as a slot notice instead.
+                if (
+                    _sid not in _native_tracker
+                    and event.text
+                    and event.text.startswith("⛔")
+                ):
+                    _txt, _ = redact_exfiltration_urls(event.text)
+                    _txt, _ = redact_credentials(_txt)
+                    slot.append("notice", _txt, "msg msg-info")
                 # Some kiro-cli builds also stream the sub-agent's own text via
                 # agent_message_chunk on this channel — surface it on the card.
                 if _sid in _native_tracker and event.text:
@@ -5610,6 +6419,12 @@ async def _run_chat(
                     _turn_cost_usd = float(_u.cost_usd or 0.0)
                 except (TypeError, ValueError):
                     _turn_elapsed_ms = int((time.monotonic() - _turn_t0) * 1000)
+                # Resolved model for the footer: the id the backend actually
+                # served this turn. read_effective_model prefers
+                # _resolved_model_id over _model, skips the "auto" sentinel,
+                # and never raises — an unresolved auto turn stays "" and the
+                # footer omits the field rather than guessing.
+                _turn_model = read_effective_model(client)
                 if _u.input_tokens or _u.output_tokens or _u.credits:
                     try:
                         _provider_name = cfg.agent.provider  # type: ignore[possibly-undefined]
@@ -5659,13 +6474,32 @@ async def _run_chat(
                 # elapsed_ms carries the wall clock computed above because acp
                 # leaves usage.duration_ms at 0 — without it this histogram is
                 # never emitted for the default backend.
+                # ``exhausted`` mirrors the stop-reason branches below: the
+                # recovery-outcome exclusion from fault_rate is earned only by
+                # a turn that is actually re-driven in place, so a stall takes
+                # the terminal stall_exhausted label when its 3-attempt budget
+                # is already spent ("Session stuck") OR when it is a NESTED
+                # turn (depth > 0), which the branches below never re-queue —
+                # it dies with "please retry", a user-visible fault that must
+                # reach fault_rate.
+                if event.stop_reason == STOP_REASON_STALE_RECOVER:
+                    _turn_exhausted = _prompt_depth > 0 or slot._stale_recovery_retries >= 3
+                elif event.stop_reason == STOP_REASON_TOOL_STALL:
+                    _turn_exhausted = _prompt_depth > 0 or slot._tool_stall_retries >= 3
+                else:
+                    _turn_exhausted = False
                 _emit_turn_metric(
                     event.usage.duration_ms,
                     event.stop_reason,
                     slot.key,
                     elapsed_ms=_turn_elapsed_ms,
+                    exhausted=_turn_exhausted,
                 )
                 _stop_reason = event.stop_reason
+                # Recorded on the slot so post-turn consumers reached later
+                # (which do not receive the event) can tell a turn that really
+                # finished from one cut short by a timeout, cancel or stall.
+                slot._last_stop_reason = _stop_reason or ""
                 if _stop_reason == STOP_REASON_TOOL_STALL:
                     _stall_tool_title = event.title
                     _stall_command = event.tool_input
@@ -5719,6 +6553,18 @@ async def _run_chat(
                 )
                 _emit_stale("⟳ Recovering a stalled turn…")
             elif slot._stale_recovery_retries >= 3:
+                # Budget exhausted — terminal for this slot until a turn
+                # actually completes. The budget is deliberately NOT reset
+                # here: zeroing it would re-arm a fresh 3-attempt recovery
+                # cycle on the next stall of a permanently wedged slot
+                # (recover→exhaust looping forever). Telemetry dedup is the
+                # emitted flag's job instead: emit exhausted once per cycle,
+                # and the flag also blocks a later "recovered" mis-emit.
+                if not slot._stale_recovery_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "stale_recover", "exhausted", slot._stale_recovery_retries
+                    )
+                    slot._stale_recovery_exhausted_emitted = True
                 _emit_stale("Session stuck — please start a new chat.")
             else:
                 # depth>0 (nested turn) with budget remaining: reset the session
@@ -5765,6 +6611,15 @@ async def _run_chat(
                 )
                 _emit_stall("⟳ Tool appeared stalled — recovering…")
             elif slot._tool_stall_retries >= 3:
+                # Budget exhausted — mirrors the stale_recover branch above:
+                # budget left alone (a wedged slot must not re-enter a fresh
+                # recovery cycle); the emitted flag dedups the metric and
+                # blocks a later "recovered" mis-emit.
+                if not slot._tool_stall_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "tool_stall", "exhausted", slot._tool_stall_retries
+                    )
+                    slot._tool_stall_exhausted_emitted = True
                 _emit_stall("Session stuck — please start a new chat.")
             else:
                 _emit_stall("⟳ Tool appeared stalled — please retry.")
@@ -5853,7 +6708,30 @@ async def _run_chat(
                         else "✅ Conversation compacted."
                     )
                 elif compaction_result["type"] == "failed":
-                    msg = "❌ Compaction failed."
+                    # The provider ships the reason on `failed` too, and every
+                    # other surface already tells the user what it was — Slack,
+                    # Telegram, Discord, and this dashboard's own AUTO-compact
+                    # notice (see chat_utils._compaction_notice_text). Dropping
+                    # it here left the one path a user takes deliberately as the
+                    # only one that says nothing, so a `/compact` that fails
+                    # because the conversation is too large is indistinguishable
+                    # from one that failed because the backend was unreachable —
+                    # and the user's next move differs in those two cases.
+                    #
+                    # Redacted with the same pair as the completed branch above:
+                    # the text is backend-echoed, so it is not trusted to be
+                    # free of credentials or exfiltration URLs even though the
+                    # provider already redacts once at its own boundary.
+                    error, _ = redact_credentials(compaction_result.get("summary", ""))
+                    error, _ = redact_exfiltration_urls(error)
+                    error = error.strip()
+                    if len(error) > _COMPACT_FAIL_REASON_MAX_CHARS:
+                        # A notice is a one-line receipt, not a log: a provider
+                        # that echoes a wall of text (a stack trace, a dumped
+                        # payload) would otherwise push the whole transcript out
+                        # of the reader's view.
+                        error = error[:_COMPACT_FAIL_REASON_MAX_CHARS].rstrip() + "…"
+                    msg = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
                 else:
                     msg = "⚠️ Compaction timed out."
                 _append_compaction_notice(state, slot, msg)
@@ -6059,6 +6937,7 @@ async def _run_chat(
                 _turn_credits,
                 _turn_cost_usd,
                 turn_boundary=_turn_msg_boundary,
+                model=_turn_model,
             )
             # Attach accumulated file changes to last assistant message before persist
             _flush_file_changes(slot)
@@ -6070,11 +6949,33 @@ async def _run_chat(
             # every counter: an empty re-queue is NOT a successful turn, so it must
             # not reset the pipe-death/busy budgets (otherwise an empty interleaved
             # between transient failures would extend the intended 3-retry budget).
+            #
+            # A non-zero stall budget reaching this reset on an OK turn is a
+            # COMPLETED recovery cycle: the stall branches return early, so the
+            # only way here with an armed budget is the synthetic recovery turn
+            # finishing cleanly. Emit outcome=recovered with the attempt count
+            # read BEFORE the reset (the exhausted counterpart lives in the
+            # stall branches). Gated on the ok outcome so a user cancelling the
+            # recovery turn is never counted as a successful recovery.
+            if _turn_outcome(_stop_reason) == "ok":
+                # An armed budget whose cycle already emitted "exhausted" is
+                # not a recovery — the flag blocks the mis-emit (the budget is
+                # no longer zeroed at exhaustion, so it can reach here armed).
+                if slot._stale_recovery_retries > 0 and not slot._stale_recovery_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "stale_recover", "recovered", slot._stale_recovery_retries
+                    )
+                if slot._tool_stall_retries > 0 and not slot._tool_stall_exhausted_emitted:
+                    _emit_recovery_outcome(
+                        "tool_stall", "recovered", slot._tool_stall_retries
+                    )
             slot._empty_response_retries = 0
             slot._prompt_busy_retries = 0
             slot._acp_pipe_death_retries = 0
             slot._stale_recovery_retries = 0
             slot._tool_stall_retries = 0
+            slot._stale_recovery_exhausted_emitted = False
+            slot._tool_stall_exhausted_emitted = False
             slot._transient_5xx_retries = 0
             # NOTE: the poisoned-conversation streak/one-shot
             # (_prestream_exhausted_cycles / _poisoned_reset_used) are NOT
@@ -6188,7 +7089,16 @@ async def _run_chat(
                     # question clickable forever. build_options_blocks already
                     # redacts each choice through redact_for_display, so nothing
                     # extra is needed here.
-                    _mirror_blocks = build_options_blocks(_mirror_options)
+                    # The asker is THIS session, named explicitly. Resolving it
+                    # from the thread would name whoever owns the thread at mint
+                    # time, so a relink landing mid-turn would stamp the control
+                    # with a conversation that never asked the question.
+                    _mirror_token = await asyncio.to_thread(
+                        mint_options_token, state, session_key
+                    )
+                    _mirror_blocks = build_options_blocks(
+                        _mirror_options, staleness_token=_mirror_token
+                    )
                     # The thread's owner BEFORE the post. A relink landing while
                     # post_blocks is in flight moves the conversation to another
                     # session, and a control recorded under the key this turn
@@ -6820,6 +7730,15 @@ async def _run_chat(
         # Same lifecycle for the segment-cut handle: a late steer must not
         # flush into a finished turn's (already-flushed) locals.
         slot._steer_segment_cut = None
+        # Same lifecycle for the child-fidelity opt-in latched at turn start:
+        # it is THIS consumer's promise to render the low-fidelity downgrade
+        # card. Leaving it set would let a later, fidelity-UNAWARE consumer of
+        # the same provider/handle inherit the opt-in and silently disable the
+        # handle-level fail-close choke point.
+        try:
+            setattr(client, "child_fidelity_aware", False)
+        except Exception:
+            pass
         # Ensure file changes always surface, even on cancel/error. Wrapped so
         # a raise here cannot skip the re-arm below and re-introduce the orphan
         # bug this fix prevents.
@@ -6906,6 +7825,23 @@ async def _run_chat(
                 # so a reset that failed or was cancelled still hands back the
                 # permit rather than stranding the session.
                 state.sessions.release(session_key)
+            # This turn's identity dies WITH its session, and inside the same
+            # finally for the same reason the release is: the reset above can be
+            # cancelled, and CancelledError derives from BaseException, so a
+            # clear placed after this block is simply skipped and the slot keeps
+            # advertising a turn that is gone.
+            #
+            # It must also land before `_start_next_queued_turn` further down
+            # can install the SUCCESSOR's key — a clear after that would wipe a
+            # live turn's identity and drop the cancel routes back to mutable
+            # routing. Compare-and-clear keeps that true if the ordering is ever
+            # rearranged: only the turn that installed a key may retire it.
+            #
+            # Outside the `_acquired` guard: the identity is published before
+            # the permit is taken, so a cold start that never acquired one still
+            # has something to retire.
+            if slot._active_turn_session_key == session_key:
+                slot._active_turn_session_key = ""
         # End-of-turn fallback: catches set_project calls that fired mid-turn,
         # after the start-of-turn consume already ran. Guarded because a raise
         # here would skip the steer requeue and queue drain below, silently

@@ -13,10 +13,12 @@ import SimpleSelect from '../components/SimpleSelect'
 import CrewAvatar from '../components/CrewAvatar'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import InfoTip from '../components/InfoTip'
+import ListDetailBack from '../components/ListDetailBack'
 import { useProvider } from '../providers'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useListDetailView } from '../hooks/useListDetailView'
 import { fmtPercent } from '../i18n/format'
 import { formatCost } from '../utils/formatCost'
 
@@ -195,11 +197,91 @@ interface SessionsUsage {
   credits_overage?: number | null
   cost_usd?: number | null
   overage_rate?: number | string | null
+  email?: string
+  account?: string
+  account_type?: string
+}
+
+/** Mask an account email down to a recognizable-but-not-readable form.
+ *
+ * The Agents page is a common screen-share surface, so the full address is not
+ * rendered: the first local-part character plus the domain is enough to confirm
+ * WHICH account is signed in, which is the only question this row answers.
+ * Returns null for input that cannot be masked, so callers omit the row rather
+ * than showing a placeholder that reads as a real value.
+ */
+export function maskAccountEmail(raw: string | undefined): string | null {
+  const value = (raw || '').trim()
+  if (!value) return null
+  const at = value.lastIndexOf('@')
+  // Nothing before the '@' means there is no local-part character to keep, so
+  // there is no recognizable-but-masked form to show at all.
+  if (at === 0) return null
+  // No domain to anchor on (whoami reported a bare handle): mask all but the
+  // first character rather than leaking the whole string.
+  if (at < 0) return `${value[0]}•••`
+  return `${value[0]}•••${value.slice(at)}`
+}
+
+/** Render guard for a provider-supplied label that may or may not be an address.
+ *
+ * Masks anything address-shaped and passes everything else through unchanged, so
+ * a label's own semantics decide nothing about whether an address can reach the
+ * DOM. Returns null for an empty value so callers omit the row or segment.
+ */
+export function addressSafeLabel(raw: string | undefined): string | null {
+  const value = (raw || '').trim()
+  if (!value) return null
+  return value.includes('@') ? maskAccountEmail(value) : value
+}
+
+/** Localized label for the auth-type enum `whoami` reports.
+ *
+ * `account_type` arrives as a code identifier (`IamIdentityCenter`, `BuilderId`,
+ * `Social`). The top-bar credit modal already maps these to localized prose, so
+ * the same keys are reused here — otherwise one surface shows a camelCase
+ * identifier while the other shows prose for the same account. An unrecognized
+ * value falls through to the address guard, since a value outside the known set
+ * is not covered by the field's contract.
+ */
+export function authTypeLabel(raw: string | undefined): string | null {
+  switch (raw) {
+    case 'IamIdentityCenter':
+      return i18nT('app.iam_identity_center')
+    case 'BuilderId':
+      return i18nT('app.builder_id')
+    case 'Social':
+      return i18nT('app.social_login')
+    default:
+      return addressSafeLabel(raw)
+  }
+}
+
+/** The Account row's display value, preferring the email over the profile name.
+ *
+ * `usage.account` is the org profile's display name straight from the provider
+ * (`profileName` / `profileDisplayName`), i.e. an arbitrary server-supplied
+ * label — and orgs do name profiles after a person's address. Routing it through
+ * the same guard is what stops a profile name being a way around the masking the
+ * email path applies.
+ */
+export function accountDisplayValue(usage: Pick<SessionsUsage, 'email' | 'account'>): string | null {
+  return maskAccountEmail(usage.email) || addressSafeLabel(usage.account)
 }
 
 /** Plan credits and spend for the current billing period. */
 function ProviderUsageCard({ usage }: { usage: SessionsUsage }) {
   const provider = useProvider()
+  // The backend attaches identity only when it can tie the signed-in account to
+  // the one these credits are billed to. The API path gates that merge on a
+  // matching profile ARN; the text-scrape path establishes it instead by
+  // resolving whoami adjacently to the scrape. Neither always succeeds, so an
+  // absent account is a legitimate steady state, not an error to retry.
+  const account = accountDisplayValue(usage)
+  // `account_type` is a code identifier from whoami, mapped to localized prose so
+  // this row reads the same as the credit modal. The mapper address-guards any
+  // value outside the known enum.
+  const authType = authTypeLabel(usage.account_type)
   return (
     <Card>
       <div className="flex items-center justify-between mb-4">
@@ -209,6 +291,25 @@ function ProviderUsageCard({ usage }: { usage: SessionsUsage }) {
           {usage.resets && <span className="text-[12px] text-muted">{i18nT('pages.agentsPage.resets')} {usage.resets}</span>}
         </div>
       </div>
+      <dl className="mb-4 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[13px]">
+        <dt className="text-muted">{i18nT('pages.agentsPage.harness')}</dt>
+        <dd className="text-text-strong font-medium">
+          {provider.displayName}
+          {authType && <span className="text-muted font-normal"> · {authType}</span>}
+        </dd>
+        <dt className="text-muted">{i18nT('pages.agentsPage.account')}</dt>
+        <dd
+          className={account ? 'text-text-strong font-mono min-w-0 truncate' : 'text-muted'}
+          title={account || undefined}
+        >
+          {account || (
+            <span className="inline-flex items-center gap-1.5">
+              {i18nT('pages.agentsPage.account_not_reported')}
+              <InfoTip text={i18nT('pages.agentsPage.account_not_reported_help')} />
+            </span>
+          )}
+        </dd>
+      </dl>
       {usage.credits_used != null && usage.credits_plan != null && (() => {
         const creditsUsed = usage.credits_used as number
         const creditsPlan = usage.credits_plan as number
@@ -329,6 +430,8 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   const defaultAgent = defaultAgentData ?? ''
 
   const [selectedAgent, setSelectedAgent] = useState<AgentDetail | null>(null)
+  // Narrow viewport shows one pane at a time; a desktop shows both.
+  const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
   const [tab, setTab] = useState<DetailTab>('overview')
   const [filter, setFilter] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -358,7 +461,17 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   })
   const deleteAgentMut = useMutation({
     mutationFn: (name: string) => api.agentDelete(name),
-    onSuccess: (_r, name) => { if (selectedAgent?.name === name) setSelectedAgent(null); setDeleteError(null); refetchInstalled() },
+    // Deleting the agent you were looking at must also leave its detail pane.
+    // On a phone the panes are exclusive, so clearing the selection alone left
+    // `detailOpen` true with nothing selected: the placeholder branch renders
+    // without the Back control (that lives in the `selectedAgent` branch) and
+    // the roster — including its filter — is inside the hidden list pane, so
+    // there was no in-page way back.
+    onSuccess: (_r, name) => {
+      if (selectedAgent?.name === name) { setSelectedAgent(null); closeDetail() }
+      setDeleteError(null)
+      refetchInstalled()
+    },
     /*  The handler — not this page — is the authority on references: it checks
      *  the fallback and crew bindings under the same config lock the writers
      *  take, so it refuses (409) races this cached snapshot cannot see. Show its
@@ -389,6 +502,10 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
 
   const select = async (a: InstalledAgent) => {
     const seq = ++selectSeq.current
+    // Drill into the detail before awaiting: while narrow the detail pane
+    // replaces the list, so waiting for the fetch would leave the tap with no
+    // visible effect for as long as it takes.
+    openDetail()
     // Synchronous, not effect-deferred: arming is destructive, so it must be
     // dropped the moment a different template is asked for.
     setConfirmDelete(false)
@@ -531,7 +648,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
   return (
     <>
       {!embedded && <PageHeader title={i18nT('pages.agentsPage.agent_templates')} subtitle={i18nT('pages.agentsPage.what_a_crew_starts_from_its_model_skills_tools_mc')} />}
-      <div className={`${embedded ? '' : 'px-6 pb-8'} overflow-y-auto flex-1 min-h-0`}>
+      <div className={`${embedded ? '' : 'px-4 md:px-6 pb-8'} overflow-y-auto flex-1 min-h-0`}>
         {/* Which template a session boots from when nothing names one — CLI
             chat, a chat-channel thread, a warm-pool process. A dashboard chat
             goes through a crew and never reads this, so the bar says what the
@@ -581,9 +698,12 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
           /* Inspector: a scrollable roster on the left, the selected template's
              full spec on the right. Sized against the viewport rather than a
              fixed pixel height so a tall window shows more of a prompt or a
-             denied-command list instead of scrolling it inside a short box. */
-          <div className="card-glow border border-border bg-card rounded-lg mb-4 animate-rise shadow-sm transition-all overflow-hidden flex h-[62vh] min-h-[420px] max-h-[760px]">
-            <div className="w-[288px] shrink-0 border-r border-border flex flex-col bg-bg-accent">
+             denied-command list instead of scrolling it inside a short box.
+             `svh` (chrome showing) not `vh` (chrome retracted), or on a phone —
+             where this is the only visible pane — the bottom runs under the
+             address bar. Identical on a desktop; `vh` stays as the fallback. */
+          <div className="card-glow border border-border bg-card rounded-lg mb-4 animate-rise shadow-sm transition-all overflow-hidden flex h-[62vh] supports-[height:100svh]:h-[62svh] min-h-[420px] max-h-[760px]">
+            {showList && <div className={`${isMobile ? 'w-full border-r-0' : 'w-[288px] border-r'} shrink-0 border-border flex flex-col bg-bg-accent`}>
               <div className="p-2.5 border-b border-border">
                 <SearchInput
                   className="w-full"
@@ -627,12 +747,13 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                   </div>
                 )}
               </div>
-            </div>
+            </div>}
 
-            <div className="flex-1 min-w-0 flex flex-col">
+            {showDetail && <div className="flex-1 min-w-0 flex flex-col">
               {selectedAgent ? (<>
                 <div className="px-4 pt-3.5 border-b border-border">
                   <div className="flex items-center gap-2 flex-wrap">
+                    {isMobile && <ListDetailBack label={i18nT('pages.agentsPage.installed_agents')} onBack={closeDetail} />}
                     <span className="text-[15px] font-mono font-bold text-text-strong">{selectedAgent.name}</span>
                     {listed?.source && <SourceBadge source={listed.source} />}
                     {defaultAgent === selectedAgent.name && (
@@ -721,7 +842,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
                           // eslint-disable-next-line jsx-a11y/no-static-element-interactions
                           <div ref={modelDropRef} tabIndex={-1} onKeyDown={onModelListKeyDown} className="fixed z-[9999] bg-card border border-border rounded-lg shadow-lg min-w-[260px] max-w-[340px] max-h-[320px] flex flex-col overflow-hidden animate-slide-up" style={(() => { const r = modelBtnRef.current!.getBoundingClientRect(); const dropH = 320; const top = r.bottom + 4 + dropH > window.innerHeight ? r.top - dropH - 4 : r.bottom + 4; const left = Math.max(8, Math.min(r.left, window.innerWidth - 348)); return { top, left } })()}>
                             <div className="p-2 border-b border-border">
-                              <Input ref={modelInputRef} type="text" aria-label={i18nT('pages.agentsPage.filter_models')} placeholder={i18nT('pages.agentsPage.type_to_filter')} value={modelFilter} onChange={e => setModelFilter(e.target.value)} className="w-full px-2 py-1 text-[13px] font-mono" />
+                              <Input ref={modelInputRef} type="text" aria-label={i18nT('pages.agentsPage.filter_models')} placeholder={i18nT('pages.agentsPage.type_to_filter')} value={modelFilter} onChange={e => setModelFilter(e.target.value)} className="w-full px-2 py-1 text-[13px]" />
                             </div>
                             <div role="listbox" aria-label={i18nT('pages.agentsPage.model_list')} className="overflow-y-auto flex-1 min-h-0">
                               <ModelDropdownList models={filteredModels} activeModel={modelLabel(selectedAgent.model)} onSelect={name => { const val = name === 'auto' ? '' : name; patchModelMut.mutate({ name: selectedAgent.name, model: val }); setModelDropOpen(false) }} />
@@ -863,7 +984,7 @@ export default function AgentsPage({ embedded }: { embedded?: boolean } = {}) {
               </>) : (
                 <div className="flex items-center justify-center h-full text-muted text-[13px]">{i18nT('pages.agentsPage.select_an_agent_to_view_details')}</div>
               )}
-            </div>
+            </div>}
           </div>
         )}
 
