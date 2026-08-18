@@ -131,3 +131,29 @@ Registration touchpoints (all four required):
    harness, tests, or auth (the reward-hacking guard).
 5. **Do-not-pollute gate** — host state hashed before/after; nonzero diff blocks.
 6. **Second independent reproduce** before a PR is drafted.
+
+## GitLab port (addendum — see GITLAB_SUPPORT.md for the full design)
+
+The port adds GitLab as a second code host without touching the spine's
+target-agnostic core. Five GitHub couplings were generalized:
+
+1. **Host acceptance** — `backend/clone_setup.py` now dispatches on the target URL
+   (github.com, or any GitLab host on `dashboard.gitlab_hosts`), deriving and
+   persisting `provider` + `host` at setup.
+2. **PR recipe** — `GitHubPRRecipe` became the shared host-agnostic base; the new
+   `profiles/gitlab_repo/pr_recipe.py` overrides only the CLI (`glab mr create
+   --draft`), MR URL extraction, and host routing (`GITLAB_HOST` pinned, token
+   withheld for self-managed).
+3. **Profile registry** — `profiles/__init__.py` dispatches on `provider`;
+   `gitlab_repo/` is a thin subclass reusing the GitHub assembler with the MR
+   recipe swapped in.
+4. **Routes/config** — a recipe factory drafts by provider; `provider`/`host` move
+   only through `setup-clone`; `pr_watchers` publishes MRs via `glab mr update
+   --ready` and teaches the watcher glab verbs.
+5. **Frontend/docs** — the commit/MR link builder and the connect form are
+   provider-aware; the manifest, README and MANUAL recognize both hosts.
+
+Reused rather than re-implemented: `source_providers` (provider-neutral PR/MR
+reader) and `issue_radar.gitlab_client` (the security-critical GitLab URL parser +
+host allowlist) — the same glab trust model the rest of the app already uses.
+
