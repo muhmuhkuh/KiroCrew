@@ -10,7 +10,10 @@ Direction of dependency is ``slack -> messaging`` (allowed): the neutral
 
 Security note: :meth:`SlackTransport.authorize` is **deny-by-default** and
 owner-only. An unconfigured transport (empty ``allowed_users``) authorizes
-nobody, and bot-authored events are dropped before authorization.
+nobody. Bot-authored events are dropped unless their ``bot_id`` positively
+matches the ``trusted_bot_ids`` allow-list (empty by default, so an
+unconfigured transport drops every bot), mirroring the Socket Mode drop site
+in ``slack/events.py`` so the two inbound paths agree.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+from kiro_crew.messaging.tables import TABLE_POLICY_OFF
 from kiro_crew.messaging.transport import (
     InboundMessage,
     MessagingTransport,
@@ -25,6 +29,7 @@ from kiro_crew.messaging.transport import (
 )
 from kiro_crew.sel import sel
 from kiro_crew.slack.client import SlackClientOps
+from kiro_crew.slack.enterprise import validated_self_bot_id
 from kiro_crew.slack.format import SLACK_MSG_LIMIT
 
 # A dispatch callback consumes a normalized, already-authorized message and
@@ -42,9 +47,18 @@ SLACK_CAPABILITIES = TransportCapabilities(
     edit=True,
     reactions=True,
     files_inbound=True,  # slack/files.py -> messaging/attachments.py ingestion
-    files_outbound=True,  # /api/slack/upload-file external-upload flow
+    # Read by SlackRenderer._uploads_enabled before it extracts local image
+    # references out of a sealed reply and uploads them (slack/files.py ->
+    # files_upload_v2). It is the flag the capability ledger defines, not the
+    # dashboard's /api/slack/upload-file route, which is a human upload flow no
+    # renderer consults: declaring the flag for that route is what made this a
+    # mislabel. Flipping it to False makes the renderer keep printing the
+    # markdown path, which is the honest degradation, never a silent drop.
+    files_outbound=True,
     rich_blocks=True,
     threads=True,
+    # Slack's established format pipeline already flattens tables byte-for-byte.
+    table_mode=TABLE_POLICY_OFF,
     max_message_chars=SLACK_MSG_LIMIT,
     # 10 = the platform cap on a checkboxes element's options[] — the widget
     # Slack actually renders for [OPTIONS:]. The previous 5 was copied from
@@ -65,12 +79,16 @@ class SlackTransport(MessagingTransport):
         client: SlackClientOps,
         *,
         allowed_users: Iterable[str] = (),
+        trusted_bot_ids: Iterable[str] = (),
         dispatch: DispatchFn | None = None,
     ) -> None:
         self._client = client
         # Deny-by-default: copy into a frozenset so the allow-list cannot be
         # mutated out from under an in-flight authorization decision.
         self._allowed_users: frozenset[str] = frozenset(allowed_users)
+        # Second allow-list, for peer bots (slack.trusted_bot_ids). Same
+        # frozen-snapshot rationale; empty default drops every bot event.
+        self._trusted_bot_ids: frozenset[str] = frozenset(trusted_bot_ids)
         self._dispatch = dispatch
         # Single source of truth (the renderer imports this same object).
         self.capabilities = SLACK_CAPABILITIES
@@ -109,6 +127,27 @@ class SlackTransport(MessagingTransport):
             )
         return out
 
+    # -- Outbound authorization --------------------------------------------
+    def may_send_to(
+        self, conversation_id: str, thread_id: str | None = None, *, principal: str = ""
+    ) -> bool:
+        """Never consulted -- permits, and says why.
+
+        An override with a reason rather than an inherited default, so a reader
+        does not have to infer this transport's stance. The shared send ladder
+        (``chat_runner._resolve_channel_target``) returns early for
+        ``SLACK_NAMESPACE`` before any transport call: Slack's proactive traffic
+        goes through the gateway's own client and streaming path, which is not
+        registered in ``channel_transports``. Nothing routes here, so there is no
+        decision this method can enforce.
+
+        It could not answer anyway: a Slack link persists a **channel** id
+        (``D…``/``C…``) while the roster holds user ids, so the same
+        conversation-id-is-not-a-principal problem applies. Slack's own proactive
+        paths do their allow-list checks at their own call sites.
+        """
+        return bool(conversation_id)
+
     # -- Inbound adapter ----------------------------------------------------
     def authorize(self, msg: InboundMessage) -> bool:
         """Owner-only, deny-by-default. Empty allow-list authorizes nobody."""
@@ -125,27 +164,79 @@ class SlackTransport(MessagingTransport):
         return allowed
 
     async def receive(self, raw_envelope: Any) -> None:
-        """ack -> drop bots -> normalize -> authorize -> dispatch.
+        """ack -> trusted-bot gate -> normalize -> authorize -> dispatch.
 
-        Drops anything not authored by an allowed human; only an authorized,
-        normalized message reaches the dispatch callback.
+        Drops anything not authored by an allowed human or an allow-listed
+        peer bot; only an authorized, normalized message reaches the
+        dispatch callback.
         """
         event = raw_envelope.get("event", raw_envelope) if isinstance(raw_envelope, dict) else None
         if not isinstance(event, dict):
             return
-        # Drop bot-authored events before authorization (defense in depth:
-        # a bot id is never in the owner-only allow-list anyway).
-        if event.get("bot_id") or event.get("subtype") == "bot_message":
+        # A bot-authored event is admitted ONLY on a positive match of its
+        # bot_id against the trusted_bot_ids allow-list (deny-by-default:
+        # the empty default drops every bot-authored event). That second
+        # allow-list exists precisely to admit bot ids, which the owner-only
+        # user allow-list never contains. Mirrors the Socket Mode drop site
+        # (slack/events.py) so the two inbound paths agree:
+        # - The gateway's own bot id is never trusted even when listed --
+        #   admitting it would make every reply re-enter as fresh input,
+        #   a self-reply loop.
+        # - An unverified self identity (startup auth.test unavailable)
+        #   admits no bots: a configured trust feature whose self-exclusion
+        #   cannot be applied fails closed and trusts nobody.
+        # - The trust decision runs BEFORE the subtype filter because a
+        #   bot-authored message commonly carries subtype == "bot_message":
+        #   an untrusted denial must be audited (not silently
+        #   subtype-dropped), and a trusted bot's bot_message must not be
+        #   eaten by the subtype gate below.
+        # Loop bounding (the per-thread trusted-bot turn cap) is the
+        # dispatch layer's job; this transport decides admissibility only.
+        bot_id = event.get("bot_id") or ""
+        self_bot_id = validated_self_bot_id()
+        from_trusted_bot = (
+            bool(bot_id)
+            and bool(self_bot_id)
+            and bot_id != self_bot_id
+            and bot_id in self._trusted_bot_ids
+        )
+        if bot_id and not from_trusted_bot:
+            if bot_id == self_bot_id and bot_id in self._trusted_bot_ids:
+                deny_error = "own_bot_id_never_trusted"
+            elif not self_bot_id and bot_id in self._trusted_bot_ids:
+                deny_error = "trusted_bot_requires_verified_self_id"
+            else:
+                deny_error = "untrusted_bot"
+            sel().log_api_access(
+                caller=bot_id,
+                operation="slack_transport.receive",
+                outcome="denied",
+                source="slack",
+                error=deny_error,
+            )
+            return
+        if event.get("subtype") == "bot_message" and not from_trusted_bot:
             return
         msg = InboundMessage(
             channel_type="slack",
-            user_id=event.get("user") or "",
+            user_id=event.get("user") or (bot_id if from_trusted_bot else ""),
             conversation_id=event.get("channel") or "",
             text=event.get("text") or "",
             thread_id=event.get("thread_ts") or event.get("ts"),
             is_mention=bool(event.get("is_mention")),
         )
-        if not self.authorize(msg):
+        if from_trusted_bot:
+            # The positive allow-list match IS the bot's authorization (a
+            # bot id is never in the owner-only allow-list); audit the
+            # admission so the decision basis stays traceable.
+            sel().log_api_access(
+                caller=msg.user_id,
+                operation="slack_transport.receive",
+                outcome="allowed",
+                source="slack",
+                resources="trusted_bot",
+            )
+        elif not self.authorize(msg):
             return
         if self._dispatch is not None:
             await self._dispatch(msg)

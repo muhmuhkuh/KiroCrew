@@ -21,20 +21,19 @@ caller can usefully retry one and not the other.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from functools import wraps
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from kiro_crew.apps.builtins.crew_companion.hooks import get_appearances, get_store
-from kiro_crew.apps.builtins.crew_companion.pack_transfer import (
+from kiro_crew.appearance_packs.transfer import (
     export_bundle,
     fetch_petdex_pet,
     import_bundle,
     save_sprite_pack,
 )
+from kiro_crew.apps.builtins.crew_companion.hooks import get_appearances, get_store
 from kiro_crew.apps.manager import is_app_enabled
 
 logger = logging.getLogger(__name__)
@@ -120,7 +119,7 @@ async def _body(request: web.Request) -> dict[str, Any]:
     """Parse a JSON object body, treating anything else as empty."""
     try:
         parsed = await request.json()
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 

@@ -22,6 +22,7 @@ const model = (over: Partial<HostModel> = {}): HostModel => ({
   macInset: false,
   electron: true,
   pinnedCrews: [],
+  stableOrder: false,
   ...over,
 })
 
@@ -42,7 +43,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
 
     // Local + the relayed instance tab both render.
-    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /Switch instance/i }))
     expect(screen.getByRole('menuitemradio', { name: /Local/ })).toBeTruthy()
     const cloud = screen.getByRole('menuitemradio', { name: /Cloud One/ })
     expect(cloud).toBeTruthy()
@@ -53,7 +54,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       '*',
     )
 
-    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    await userEvent.click(await screen.findByRole('button', { name: /Switch instance/i }))
     await userEvent.click(screen.getByRole('menuitemradio', { name: /Local/ }))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-switch-instance', id: null }),
@@ -66,7 +67,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
       instances: { warm: {}, activeId: null, mru: [], unread: {}, host: null },
     })
     const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
-    expect(container.querySelector('[aria-label="Remote crews"]')).toBeNull()
+    expect(container.querySelector('[aria-label="Remote instances"]')).toBeNull()
   })
 
   it('honors the relayed pin set: a pinned crew renders as a chip beside the dropdown', async () => {
@@ -82,7 +83,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     // the trailing chevron that reaches every OTHER crew.
     const row = screen.getByTestId('crew-chip-row')
     expect(row.textContent).toMatch(/Cloud One/)
-    expect(screen.getByRole('button', { name: /Switch crew/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Switch instance/i })).toBeTruthy()
   })
 
   it('renders no chip row when the parent relays an empty pin set', () => {
@@ -91,6 +92,88 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     })
     renderWithProviders(<InstanceTabBar variant="inline" />, { store })
     expect(screen.queryByTestId('crew-chip-row')).toBeNull()
+  })
+
+  it('offers the stable-order toggle and reflects the relayed value', async () => {
+    // The preference is relayed through the host model (`stableOrder`), so the
+    // embedded switcher shows the same control the local bar does, pre-checked to
+    // the parent's value rather than reading its own cross-origin localStorage.
+    const store = createTestStore({
+      instances: {
+        warm: {}, activeId: null, mru: [], unread: {},
+        host: model({ activeId: null, stableOrder: true }),
+      },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    const toggle = await screen.findByTestId('crew-stable-order-toggle')
+    expect(toggle).toBeTruthy()
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('withholds the stable-order toggle from a host that predates the relay', async () => {
+    // Version skew, host side: an older parent omits `stableOrder` from its model
+    // AND has no `mc-set-stable-order` handler. Offering the toggle there would
+    // let the user click a checkbox that can never change state, so absence
+    // (parsed to `null`) both orders by the pre-relay default and hides it.
+    const store = createTestStore({
+      instances: {
+        warm: {}, activeId: null, mru: [], unread: {},
+        host: model({ activeId: null, stableOrder: null }),
+      },
+    })
+    const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await screen.findByRole('menuitemradio', { name: /Cloud One/ })
+    expect(screen.queryByTestId('crew-stable-order-toggle')).toBeNull()
+    // Ordering falls back to the pre-relay default: the active crew still leads.
+    expect(container.querySelector('.tb-crew-active-chip')).not.toBeNull()
+  })
+
+  it('relays a stable-order toggle up to the parent instead of writing its own store', async () => {
+    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore({
+      instances: {
+        warm: {}, activeId: null, mru: [], unread: {},
+        // Relayed value is off, so flipping it must post `on: true` up. Like the
+        // pin, the pane cannot persist the parent-owned preference locally.
+        host: model({ activeId: null, stableOrder: false }),
+      },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+
+    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
+    await userEvent.click(await screen.findByTestId('crew-stable-order-toggle'))
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'mc-set-stable-order', on: true }),
+      '*',
+    )
+  })
+
+  it('does NOT pull the active pinned crew to a leading chip when stable-order is relayed on', () => {
+    // The exact runtime scenario the relay must fix: a CONNECTED remote crew is
+    // the active pane, it is pinned, and the parent relays stableOrder=true. The
+    // active crew must be highlighted in place inside the chip row, never hoisted
+    // to a leading `tb-crew-active-chip` — that hoist is the reorder-on-switch.
+    const store = createTestStore({
+      instances: {
+        warm: {}, activeId: null, mru: [], unread: {},
+        host: model({ activeId: 'cd-1', pinnedCrews: ['cd-1'], stableOrder: true }),
+      },
+    })
+    const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    expect(container.querySelector('.tb-crew-active-chip')).toBeNull()
+  })
+
+  it('DOES lead with the active crew when stable-order is relayed off (proves the mechanism)', () => {
+    const store = createTestStore({
+      instances: {
+        warm: {}, activeId: null, mru: [], unread: {},
+        host: model({ activeId: 'cd-1', pinnedCrews: ['cd-1'], stableOrder: false }),
+      },
+    })
+    const { container } = renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    expect(container.querySelector('.tb-crew-active-chip')).not.toBeNull()
   })
 
   it('relays a pin toggle up to the parent instead of writing its own store', async () => {
@@ -103,7 +186,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     // A pane cannot write the parent's preference store from its own iframe
     // realm, so pinning here must travel up as a message rather than persist
     // locally — otherwise the pane would drift from every other bar.
-    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
+    await userEvent.click(screen.getByRole('button', { name: /Switch instance/i }))
     await userEvent.click(await screen.findByTestId('crew-pin-cd-1'))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-set-crew-pin', id: 'cd-1' }),
@@ -126,12 +209,13 @@ describe('EmbeddedHostBridge (option B relay)', () => {
       window.dispatchEvent(
         new MessageEvent('message', {
           source: window.parent,
-          data: { type: 'mc-host-model', ...model({ macInset: true, self: { state: 'connected' } }) },
+          data: { type: 'mc-host-model', ...model({ macInset: true, self: { state: 'connected' }, stableOrder: true }) },
         }),
       )
     })
     await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
     expect(store.getState().instances.host?.macInset).toBe(true)
+    expect(store.getState().instances.host?.stableOrder).toBe(true)
     expect(document.documentElement.classList.contains('embedded-mac-inset')).toBe(true)
   })
 
@@ -146,5 +230,151 @@ describe('EmbeddedHostBridge (option B relay)', () => {
       )
     })
     expect(store.getState().instances.host).toBeNull()
+  })
+
+  it('keeps the pane\'s own focus mode when an older host sends a model without the field', async () => {
+    // Version skew, host side: an older host omits `focusMode` from its model
+    // AND ignores the pane's echoed `mc-set-focus-mode`. Coercing that absence
+    // to `false` would snap a user-toggled pane back off on every host
+    // re-broadcast. Absence must read as "no opinion"; a host that DOES send
+    // the field is still adopted.
+    const { focusModeEnabled, setFocusModeEnabled, __resetFocusMode } = await import('../hooks/useFocusMode')
+    __resetFocusMode()
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+    try {
+      setFocusModeEnabled(true, { echo: false })
+
+      // Old host: model carries no focusMode — the pane's toggle survives.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model() },
+        }))
+      })
+      await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
+      expect(focusModeEnabled()).toBe(true)
+
+      // New host: an explicit false IS an opinion and is adopted.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model({ focusMode: false }) },
+        }))
+      })
+      await waitFor(() => expect(focusModeEnabled()).toBe(false))
+    } finally {
+      __resetFocusMode()
+    }
+  })
+
+  it('records a missing stableOrder as null rather than false', async () => {
+    // The pane must be able to tell "host says off" from "host never sent it":
+    // only the latter means the host has no mc-set-stable-order handler, and the
+    // bar keys the toggle's visibility off exactly that distinction.
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<EmbeddedHostBridge />, { store })
+
+    const { stableOrder: _omitted, ...withoutStableOrder } = model()
+    act(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        source: window.parent,
+        data: { type: 'mc-host-model', ...withoutStableOrder },
+      }))
+    })
+    await waitFor(() => expect(store.getState().instances.host?.tabs).toHaveLength(1))
+    expect(store.getState().instances.host?.stableOrder).toBeNull()
+
+    // An explicit false IS an opinion and is preserved as false.
+    act(() => {
+      window.dispatchEvent(new MessageEvent('message', {
+        source: window.parent,
+        data: { type: 'mc-host-model', ...model({ stableOrder: false }) },
+      }))
+    })
+    await waitFor(() => expect(store.getState().instances.host?.stableOrder).toBe(false))
+  })
+
+  it('stops re-announcing on the distinct ack, but NOT on a plain host model', () => {
+    // The root fix: a single announce loses the mount/reload race where the
+    // parent's listener isn't wired yet, stranding the parent's loading overlay.
+    // A received host model is NOT the ack: the parent broadcasts its model to
+    // every warm pane on any input change, independent of the readiness
+    // handshake, so a spontaneous broadcast can race past a dropped announce, and
+    // a late announce re-marking readiness after the parent gave the pane up would
+    // suppress its Retry panel. Only the distinct `mc-embedded-ack` stops the
+    // retries. Fake timers exercise the schedule instantly — no real wait.
+    vi.useFakeTimers()
+    try {
+      const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+      const readyCount = () =>
+        post.mock.calls.filter(c => (c[0] as { type?: string })?.type === 'mc-embedded-ready').length
+      const store = createTestStore()
+      renderWithProviders(<EmbeddedHostBridge />, { store })
+
+      // Announced once synchronously on mount.
+      expect(readyCount()).toBe(1)
+      // First backoff step (250ms) re-announces because no ack has arrived.
+      act(() => { vi.advanceTimersByTime(300) })
+      expect(readyCount()).toBe(2)
+
+      // A host model arrives — ingested, but it does NOT cancel the retries.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model() },
+        }))
+      })
+      expect(store.getState().instances.host?.tabs).toHaveLength(1)
+      act(() => { vi.advanceTimersByTime(600) })
+      expect(readyCount()).toBe(3) // still climbing — the model was not an ack
+
+      // The distinct ack lands: every outstanding retry is cancelled.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-embedded-ack', v: 1 },
+        }))
+      })
+      // Advance well past the whole schedule — no further announcements fire.
+      act(() => { vi.advanceTimersByTime(60_000) })
+      expect(readyCount()).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('caps re-announcements when the parent never acks (finite, no infinite loop)', () => {
+    // The other half of the directive: bounded, not endless. With no ack ever,
+    // the schedule (initial + HANDSHAKE_RETRY_DELAYS_MS) tops out and goes quiet,
+    // so the pane falls through to the parent's error panel instead of re-posting
+    // forever. 6 = 1 immediate + 5 backoff steps. A host model in the meantime
+    // must not be mistaken for an ack, so it does not shorten the schedule.
+    vi.useFakeTimers()
+    try {
+      const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+      const readyCount = () =>
+        post.mock.calls.filter(c => (c[0] as { type?: string })?.type === 'mc-embedded-ready').length
+      const store = createTestStore()
+      renderWithProviders(<EmbeddedHostBridge />, { store })
+
+      // A broadcast model arrives but never an ack — retries run to the cap.
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model() },
+        }))
+      })
+      // Drain the whole backoff (cumulative ~7.75s) and then some.
+      act(() => { vi.advanceTimersByTime(10_000) })
+      expect(readyCount()).toBe(6)
+      // Far past the schedule: it stays capped rather than climbing.
+      act(() => { vi.advanceTimersByTime(120_000) })
+      expect(readyCount()).toBe(6)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

@@ -15,10 +15,12 @@ import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
+from kiro_crew.dashboard.token_auth import parse_duration
+from kiro_crew.messaging.commands import parse_dashboard_ttl
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -30,9 +32,11 @@ from kiro_crew.messaging.renderer import (
     TEXT_CHUNK,
     TOOL_CALL,
     OutputEvent,
+    session_provenance_tag,
 )
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.session import _opt_out_key
+from kiro_crew.session import BACKGROUND_KEY, _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 from kiro_crew.telegram.client import (
     TELEGRAM_CHUNK_LIMIT,
@@ -48,11 +52,10 @@ from kiro_crew.telegram.commands import (
     ConversationState,
     bot_command_payload,
     build_help_text,
-    format_ttl,
     is_bare_mid_turn_override,
     parse_command,
     parse_command_argument,
-    parse_dashboard_ttl,
+    parse_dashboard_argument,
     parse_mid_turn_override,
 )
 from kiro_crew.telegram.renderer import (
@@ -69,7 +72,6 @@ from kiro_crew.telegram.renderer import (
     _split_markdown_bounded,
     _split_markdown_table_aware,
     _split_table_rows,
-    _split_text,
     _strip_steering,
     build_inline_keyboard,
 )
@@ -111,6 +113,12 @@ class FakeClient:
         self.deleted: list[int] = []
         #: When True, send_rich_message reports failure (server lacks the API).
         self.rich_fails = False
+        #: (files, thread, silent) per multipart upload call.
+        self.media_sent: list[tuple[Any, Any, bool]] = []
+        #: When True, the upload reports failure so recovery can be observed.
+        self.media_fails = False
+        #: disable_notification per send_message call (parallel to `sent`).
+        self.send_silent: list[bool] = []
 
     async def send_typing(self, chat_id: int, *, message_thread_id: Any = None) -> None:
         self.typing_threads.append(message_thread_id)
@@ -138,13 +146,30 @@ class FakeClient:
         retry_plain: bool = True,
         reply_to_message_id: Any = None,
         message_thread_id: Any = None,
+        disable_notification: bool = False,
     ) -> int:
         await asyncio.sleep(0)  # yield like a real network await (exposes races)
         self._mid += 1
         self.sent.append((text, reply_markup))
         self.reply_targets.append(reply_to_message_id)
         self.send_threads.append(message_thread_id)
+        self.send_silent.append(disable_notification)
         return self._mid
+
+    async def send_media_group(
+        self,
+        chat_id: int,
+        photos: Any,
+        *,
+        message_thread_id: Any = None,
+        disable_notification: bool = False,
+    ) -> list[int]:
+        await asyncio.sleep(0)
+        self.media_sent.append((list(photos), message_thread_id, disable_notification))
+        if self.media_fails:
+            return []
+        self._mid += 1
+        return [self._mid]
 
     async def edit_message(
         self,
@@ -176,6 +201,7 @@ class FakeClient:
         reply_markup: Any = None,
         message_thread_id: Any = None,
         disable_notification: bool = False,
+        reply_to_message_id: Any = None,
     ) -> Any:
         await asyncio.sleep(0)  # yield like a real network await
         if self.rich_fails:
@@ -183,6 +209,10 @@ class FakeClient:
         self._mid += 1
         self.rich_silent.append(disable_notification)
         self.rich_sent.append((markdown, reply_markup, message_thread_id))
+        # Recorded on the SAME list as sendMessage's, because the assertion callers
+        # care about is "did the turn's first outbound quote the question", and
+        # which of the two methods opened the turn is an implementation detail.
+        self.reply_targets.append(reply_to_message_id)
         return self._mid
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
@@ -273,6 +303,8 @@ class FakeSessions:
     def __init__(self, raise_on_get: bool = False) -> None:
         self.released: list[str] = []
         self.acquired: list[str] = []
+        #: Acquires of the shared BACKGROUND session (auto-title, one-liners).
+        self.background: list[str] = []
         self.destroyed: list[str] = []
         self.discarded: list[str] = []
         self.successes: list[str] = []
@@ -280,11 +312,16 @@ class FakeSessions:
         self.last_agent: Any = None
         self.last_model: Any = None
         self.raise_on_get = raise_on_get
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self._busy = False
         self._has = True
         self.queued: list = []
         self._gp = FakeProvider()
         self.mirror_links: dict[str, Any] = {}
+        self.inbound_keys: set[str] = set()
         self.mirror_opt_outs: set[str] = set()
         self.batch_depth = 0
         self.batched_writes: list[bool] = []
@@ -293,11 +330,26 @@ class FakeSessions:
     async def get_or_create(
         self, key: str, *, agent: Any = None, channel_id: Any = None, model: Any = None
     ) -> Any:
+        # The shared BACKGROUND session is not a turn, and recording it in the
+        # turn-scoped fields makes every turn test read as if two turns ran: the
+        # auto-title task takes it fire-and-forget right after the answer lands, so
+        # `last_agent` and `acquired` would show the background acquire instead of
+        # the one under test. Kept on its own list so a test that wants to see the
+        # background turn still can.
+        if key == BACKGROUND_KEY:
+            self.background.append(key)
+            return FakeProvider(), True, False
         self.last_agent = agent
         self.last_model = model
         if self.raise_on_get:
             raise RuntimeError("cold-start failed")
         return FakeProvider(), True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel: str) -> None:
         return None
@@ -312,6 +364,11 @@ class FakeSessions:
         return 10.0
 
     def release(self, key: str) -> None:
+        # Background releases go on their own list, for the same reason as the
+        # acquire in get_or_create: they are not this turn's.
+        if key == BACKGROUND_KEY:
+            self.background.append(f"release:{key}")
+            return
         self.released.append(key)
 
     def get_provider(self, key: str) -> Any:
@@ -327,13 +384,32 @@ class FakeSessions:
         return -1
 
     def set_mirror_link(
-        self, key: str, link: Any, *, reason: str = UNBIND_REASON_UNSPECIFIED
+        self,
+        key: str,
+        link: Any,
+        *,
+        accepts_inbound: bool = False,
+        reason: str = UNBIND_REASON_UNSPECIFIED,
     ) -> None:
         self.batched_writes.append(self.batch_depth > 0)
         self.mirror_links[key] = link
+        if accepts_inbound:
+            self.inbound_keys.add(key)
+        else:
+            self.inbound_keys.discard(key)
 
     def get_mirror_link(self, key: str) -> Any:
         return self.mirror_links.get(key)
+
+    def find_mirror_sessions(self, link: Any, *, inbound_only: bool = False) -> list[str]:
+        return [
+            key
+            for key, candidate in self.mirror_links.items()
+            if candidate == link and (not inbound_only or key in self.inbound_keys)
+        ]
+
+    async def aflush(self) -> None:
+        return None
 
     @contextmanager
     def batched_save(self) -> Any:
@@ -355,6 +431,7 @@ class FakeSessions:
 
     def clear_mirror_link(self, key: str, *, reason: str = UNBIND_REASON_UNSPECIFIED) -> bool:
         self.batched_writes.append(self.batch_depth > 0)
+        self.inbound_keys.discard(key)
         return self.mirror_links.pop(key, None) is not None
 
     def clear_mirror_links_at(
@@ -362,6 +439,7 @@ class FakeSessions:
     ) -> list[str]:
         cleared = [key for key, candidate in self.mirror_links.items() if candidate == link]
         for key in cleared:
+            self.inbound_keys.discard(key)
             self.mirror_links.pop(key, None)
         return cleared
 
@@ -379,6 +457,9 @@ class FakeSessions:
 
     def has_session(self, key: str) -> bool:
         return self._has
+
+    def channel_key_for_stem(self, stem: str) -> str:
+        return ""
 
     async def try_acquire(self, key: str) -> bool:
         # Mirror the real atomic acquire-if-idle: refuse if a turn holds the
@@ -405,8 +486,13 @@ class _FakeHooks:
 class FakeCtx:
     def __init__(self) -> None:
         self.hooks = _FakeHooks()
+        #: Every build_message call's kwargs, so a test can assert what the channel
+        #: told the context builder — `blocks_reads`, `user_display_name`,
+        #: `runtime_source` are only observable here.
+        self.build_calls: list[dict[str, Any]] = []
 
     def build_message(self, text: str, is_new: bool, key: str, **kw: Any) -> Any:
+        self.build_calls.append({"text": text, "is_new": is_new, "key": key, **kw})
         return text, None
 
 
@@ -417,12 +503,16 @@ def _cfg(
     allow_forum: bool = False,
     allowed_forum_chat_ids: list | None = None,
     dm_scope: str = "per-channel-peer",
+    show_thinking: bool = False,
+    forum_activation: str = "always",
 ) -> Any:
     return SimpleNamespace(
         telegram=SimpleNamespace(
             soft_threshold_pct=soft,
             allow_forum=allow_forum,
             allowed_forum_chat_ids=allowed_forum_chat_ids or [],
+            show_thinking=show_thinking,
+            forum_activation=forum_activation,
         ),
         agent=SimpleNamespace(default_agent=default_agent),
         messaging=SimpleNamespace(
@@ -442,6 +532,7 @@ def _dispatcher(
     allow_forum: bool = False,
     allowed_forum_chat_ids: list | None = None,
     dm_scope: str = "per-channel-peer",
+    forum_activation: str = "always",
 ) -> tuple[TelegramDispatcher, FakeClient, FakeSessions]:
     sess = FakeSessions(raise_on_get=raise_on_get)
     d = TelegramDispatcher(
@@ -452,6 +543,7 @@ def _dispatcher(
             allow_forum=allow_forum,
             allowed_forum_chat_ids=allowed_forum_chat_ids,
             dm_scope=dm_scope,
+            forum_activation=forum_activation,
         ),
         allowed_user_ids=allowed,
         agent=None,
@@ -563,6 +655,7 @@ class TestBotMentionSuffix:
 
     def test_parse_command_with_mention_and_trailing_args(self) -> None:
         assert parse_command("/yolo@KiroCrewBot on", "KiroCrewBot") == "yolo"
+        assert parse_command("/session@KiroCrewBot launch", "KiroCrewBot") == "sessions"
 
     def test_parse_command_mention_is_case_insensitive(self) -> None:
         assert parse_command("/NEW@KiroCrewBot", "kirocrewbot") == "new"
@@ -621,42 +714,44 @@ class TestBotMentionSuffix:
 
 
 class TestParseDashboardTtl:
+    """Telegram's half of ``/kirocrew dashboard [<ttl>]`` is the WORD COUNT.
+
+    The TTL vocabulary, the default and the formatter are channel-neutral and live
+    in ``messaging/commands.py`` (pinned in ``test_messaging_commands.py``); what
+    stays here is that the argument starts after BOTH command tokens, and that the
+    composition the dispatcher performs still resolves every duration the way it
+    did when one function did both jobs.
+    """
+
+    def _ttl(self, text: str) -> int:
+        return parse_dashboard_ttl(parse_dashboard_argument(text), parse_duration=parse_duration)
+
     def test_default_ttl(self) -> None:
         """Default is 1 hour when no TTL specified."""
-        assert parse_dashboard_ttl("/kirocrew dashboard") == 3600
+        assert self._ttl("/kirocrew dashboard") == 3600
 
     def test_hours(self) -> None:
-        assert parse_dashboard_ttl("/kirocrew dashboard 2h") == 7200
-        assert parse_dashboard_ttl("/kirocrew dashboard 5H") == 18000
+        assert self._ttl("/kirocrew dashboard 2h") == 7200
+        assert self._ttl("/kirocrew dashboard 5H") == 18000
 
     def test_minutes(self) -> None:
-        assert parse_dashboard_ttl("/kirocrew dashboard 30m") == 1800
-        assert parse_dashboard_ttl("/kirocrew dashboard 90M") == 5400
+        assert self._ttl("/kirocrew dashboard 30m") == 1800
+        assert self._ttl("/kirocrew dashboard 90M") == 5400
 
     def test_invalid_ttl_uses_default(self) -> None:
         """Invalid TTL format falls back to 1 hour."""
-        assert parse_dashboard_ttl("/kirocrew dashboard xyz") == 3600
-        assert parse_dashboard_ttl("/kirocrew dashboard") == 3600
+        assert self._ttl("/kirocrew dashboard xyz") == 3600
+        assert self._ttl("/kirocrew dashboard") == 3600
 
-
-class TestFormatTtl:
-    def test_exact_hours(self) -> None:
-        assert format_ttl(3600) == "1h"
-        assert format_ttl(7200) == "2h"
-
-    def test_minutes_only(self) -> None:
-        assert format_ttl(1800) == "30m"
-        assert format_ttl(60) == "1m"
-
-    def test_mixed_never_truncates(self) -> None:
-        """90m must NOT display as '1h' -- the link lives 1.5h."""
-        assert format_ttl(5400) == "1h 30m"
-        assert format_ttl(3660) == "1h 1m"
-
-    def test_sub_minute_floors_to_zero_minutes(self) -> None:
-        # parse_duration never yields <60s, but the formatter stays total.
-        assert format_ttl(0) == "0m"
-        assert format_ttl(59) == "0m"
+    def test_the_argument_starts_after_both_command_tokens(self) -> None:
+        # A channel whose dashboard command is ONE token must not inherit this
+        # offset, which is why the shared parser takes the argument, not the text.
+        assert parse_dashboard_argument("/kirocrew dashboard 2h") == "2h"
+        # Telegram's clients append @BotUsername to a slash command in any chat
+        # with more than one participant, which must not shift the argument.
+        assert parse_dashboard_argument("/kirocrew@KiroCrewBot dashboard 2h") == "2h"
+        assert parse_dashboard_argument("/kirocrew dashboard") == ""
+        assert parse_dashboard_argument("/kirocrew") == ""
 
 
 class TestCommandCatalogue:
@@ -748,18 +843,26 @@ class TestConversationState:
 
 
 class TestSplitText:
+    """Retargeted at ``_split_markdown``, the only entry point left.
+
+    The channel-local ``_split_text`` was removed with the backtick-parity
+    rebalancer it fed; ``_split_markdown`` now delegates to the shared
+    ``split_markdown_safe``. These cases carry over unchanged because they cover
+    fence-free text, where the shared splitter uses the same cut ladder.
+    """
+
     def test_short_text_single_chunk(self) -> None:
-        assert _split_text("hello", TELEGRAM_CHUNK_LIMIT) == ["hello"]
+        assert _split_markdown("hello", TELEGRAM_CHUNK_LIMIT) == ["hello"]
 
     def test_long_text_chunks_within_limit(self) -> None:
         text = "\n\n".join("para " + "x" * 500 for _ in range(20))
-        chunks = _split_text(text, TELEGRAM_CHUNK_LIMIT)
+        chunks = _split_markdown(text, TELEGRAM_CHUNK_LIMIT)
         assert len(chunks) > 1
         assert all(len(c) <= TELEGRAM_CHUNK_LIMIT for c in chunks)
 
     def test_no_content_lost_when_hard_split(self) -> None:
         text = "y" * (TELEGRAM_CHUNK_LIMIT * 2 + 100)  # no break points
-        chunks = _split_text(text, TELEGRAM_CHUNK_LIMIT)
+        chunks = _split_markdown(text, TELEGRAM_CHUNK_LIMIT)
         assert all(len(c) <= TELEGRAM_CHUNK_LIMIT for c in chunks)
         assert "".join(chunks) == text
 
@@ -1109,20 +1212,26 @@ class TestRenderedBudget:
 
 
 class TestInlineKeyboard:
-    def test_none_when_no_options(self) -> None:
-        assert build_inline_keyboard([]) is None
+    _SESSION_KEY = "telegram:kirocrew:direct:7"
 
-    def test_callback_data_is_index_only_and_byte_safe(self) -> None:
-        # Multi-byte (CJK) labels must not blow the 64-byte callback_data cap.
-        kb = build_inline_keyboard(["开始实现 Tier 0 的完整方案很长的选项文字", "B"])
+    def test_none_when_no_options(self) -> None:
+        assert build_inline_keyboard([], self._SESSION_KEY) is None
+
+    def test_callback_data_is_session_tagged_and_byte_safe(self) -> None:
+        # Multi-byte (CJK) labels never enter callback_data. The compact digest
+        # binds each index to the session that posted it while staying below the
+        # Bot API's 64-byte ceiling.
+        kb = build_inline_keyboard(
+            ["开始实现 Tier 0 的完整方案很长的选项文字", "B"], self._SESSION_KEY
+        )
         assert kb is not None
-        for row in kb["inline_keyboard"]:
-            for btn in row:
-                assert btn["callback_data"].startswith("opt:")
-                assert len(btn["callback_data"].encode("utf-8")) <= 64
+        tag = session_provenance_tag(self._SESSION_KEY)
+        data = [btn["callback_data"] for row in kb["inline_keyboard"] for btn in row]
+        assert data == [f"opt:0:{tag}", f"opt:1:{tag}"]
+        assert all(len(value.encode("utf-8")) <= 64 for value in data)
 
     def test_two_buttons_per_row(self) -> None:
-        kb = build_inline_keyboard(["a", "b", "c"])
+        kb = build_inline_keyboard(["a", "b", "c"], self._SESSION_KEY)
         assert kb is not None
         assert len(kb["inline_keyboard"][0]) == 2
         assert len(kb["inline_keyboard"][1]) == 1
@@ -1238,6 +1347,37 @@ class TestTransportReceive:
 
 
 class TestRenderer:
+    def test_the_approval_prompt_names_the_tool_the_request_is_about(self) -> None:
+        # `_last_tool` is the last tool_call the renderer saw and is never
+        # cleared, so a permission arriving without its own titled tool_call
+        # would ask the operator to approve the PREVIOUS tool.
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_tool_call("t1", "fs_read")
+            await r.on_prompt_choice([], request_id="rq1", tool_title="execute_bash")
+
+        asyncio.run(_go())
+        prompt = cli.sent[-1][0]
+        assert "execute_bash" in prompt
+        assert "fs_read" not in prompt
+
+    def test_the_approval_prompt_falls_back_to_the_last_tool(self) -> None:
+        # Non-vacuity: without a title on the event the remembered name is still
+        # better than "this tool", so the fallback must survive.
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.on_tool_call("t1", "fs_read")
+            await r.on_prompt_choice([], request_id="rq2")
+
+        asyncio.run(_go())
+        assert "fs_read" in cli.sent[-1][0]
+
     def test_a_streamed_table_reply_still_goes_out_as_a_rich_message(self) -> None:
         # THE regression this feature exists to prevent. A normal agent reply
         # streams, so _stream_live has already sent a plaintext bubble and set
@@ -1467,12 +1607,12 @@ class TestRenderer:
         # while each table adds <pre></pre> overhead to the wrapped form.
         one = "| a | b |\n| - | - |\n| 1 | 2 |\n\n"
         text = one * (r._limit() // len(one) - 1)
-        assert len(_seal_table_fallback(text)) > r._rendered_limit(), (
-            "precondition: the wrapped form must overflow for this to test anything"
-        )
-        assert len(_md_to_telegram_html(text)) <= r._rendered_limit(), (
-            "precondition: the plain render must fit"
-        )
+        assert (
+            len(_seal_table_fallback(text)) > r._rendered_limit()
+        ), "precondition: the wrapped form must overflow for this to test anything"
+        assert (
+            len(_md_to_telegram_html(text)) <= r._rendered_limit()
+        ), "precondition: the plain render must fit"
 
         async def _go() -> None:
             await r.on_turn_start()
@@ -1563,9 +1703,9 @@ class TestRenderer:
         ]
         for text in cases:
             out = _seal_table_fallback(text)
-            assert out == _md_to_telegram_html(text), (
-                f"a fenced segment must render whole, unsplit: {text!r}"
-            )
+            assert out == _md_to_telegram_html(
+                text
+            ), f"a fenced segment must render whole, unsplit: {text!r}"
 
     def test_the_degraded_path_still_aligns_tables_with_no_fence_present(self) -> None:
         # The no-split rule must not disable the feature for ordinary replies.
@@ -1646,7 +1786,10 @@ class TestRenderer:
         final_kb = cli.final_markup()
         assert final_text == "Hello. Pick."  # [OPTIONS:] stripped
         labels = [b["text"] for row in final_kb["inline_keyboard"] for b in row]
+        data = [b["callback_data"] for row in final_kb["inline_keyboard"] for b in row]
+        tag = session_provenance_tag("telegram:1:0")
         assert labels == ["A", "B"]
+        assert data == [f"opt:0:{tag}", f"opt:1:{tag}"]
 
     def test_streams_live_via_send_then_edit(self) -> None:
         # Edit-streaming (OpenClaw-style): send one real message, then edit it in
@@ -1805,7 +1948,10 @@ class TestRenderer:
 
         markups = [m for _, m in cli.sent if m] + [m for _, _, m in cli.edits if m]
         labels = [b["text"] for row in markups[0]["inline_keyboard"] for b in row]
+        data = [b["callback_data"] for row in markups[0]["inline_keyboard"] for b in row]
+        tag = session_provenance_tag("telegram:1:0")
         assert labels == ["Alpha", "Bravo", "Charlie"]
+        assert data == [f"opt:{index}:{tag}" for index in range(3)]
         visible = "\n".join([t for t, _ in cli.sent] + [t for _, t, _ in cli.edits])
         assert "[OPTIONS" not in visible
         assert "[STEERING" not in visible
@@ -2121,9 +2267,9 @@ class TestTableAwareSplitting:
         cli = FakeClient()
         r = self._renderer(cli)
         table = self._table(120)
-        assert r._limit() < len(table) <= r._rich_limit(), (
-            "precondition: overflows the HTML budget, fits the rich budget"
-        )
+        assert (
+            r._limit() < len(table) <= r._rich_limit()
+        ), "precondition: overflows the HTML budget, fits the rich budget"
 
         async def _go() -> None:
             await r.on_turn_start()
@@ -2370,15 +2516,52 @@ class TestApprovalDecider:
     def test_resolve_pending(self) -> None:
         async def _go() -> bool:
             d = TelegramApprovalDecider(session_key="telegram:1:0")
+            TelegramApprovalDecider.arm("telegram:1:0:rq7", "n1")
             task = asyncio.ensure_future(d(SimpleNamespace(request_id="rq7")))
             await asyncio.sleep(0.02)
-            TelegramApprovalDecider.resolve_global("telegram:1:0:rq7", True)
+            TelegramApprovalDecider.resolve_global("telegram:1:0:rq7", True, nonce="n1")
             return await task
 
         assert asyncio.run(_go()) is True
 
     def test_resolve_unknown_key_returns_false(self) -> None:
-        assert TelegramApprovalDecider.resolve_global("no-such-key", True) is False
+        assert TelegramApprovalDecider.resolve_global("no-such-key", True, nonce="n1") is False
+
+    def test_a_stale_keyboard_cannot_approve_a_live_prompt(self) -> None:
+        """Request ids restart at 1 per provider process.
+
+        So a button left in a Telegram chat from a previous run names an id that is
+        live again for a DIFFERENT tool. The nonce is what refuses it.
+        """
+
+        async def _go() -> bool:
+            d = TelegramApprovalDecider(session_key="telegram:1:0")
+            TelegramApprovalDecider.arm("telegram:1:0:rq7", "fresh")
+            task = asyncio.ensure_future(d(SimpleNamespace(request_id="rq7")))
+            await asyncio.sleep(0.02)
+            stale = TelegramApprovalDecider.resolve_global(
+                "telegram:1:0:rq7", True, nonce="from-a-previous-run"
+            )
+            assert stale is False, "a stale press must resolve nothing"
+            # The prompt is still waiting: the stale press neither approved nor
+            # consumed it.
+            TelegramApprovalDecider.resolve_global("telegram:1:0:rq7", False, nonce="fresh")
+            return await task
+
+        assert asyncio.run(_go()) is False
+
+    def test_an_unarmed_prompt_fails_closed(self) -> None:
+        """No nonce armed means no widget this process minted, so nothing to answer."""
+
+        async def _go() -> bool:
+            d = TelegramApprovalDecider(session_key="telegram:1:0")
+            task = asyncio.ensure_future(d(SimpleNamespace(request_id="rq8")))
+            await asyncio.sleep(0.02)
+            assert TelegramApprovalDecider.resolve_global("telegram:1:0:rq8", True) is False
+            TelegramApprovalDecider._REGISTRY["telegram:1:0:rq8"].set_result(False)
+            return await task
+
+        assert asyncio.run(_go()) is False
 
 
 # ── transport_dispatch.py: turn + callback routing ─────────────────────────
@@ -2441,13 +2624,17 @@ class TestDispatcher:
             key = TelegramApprovalDecider.key(d._session_key(("direct", "7")), "rq1")
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             TelegramApprovalDecider._REGISTRY[key] = fut
+            # The nonce the renderer would have minted for this prompt; the press
+            # must carry it or resolution refuses it as stale.
+            nonce = "n1"
+            TelegramApprovalDecider.arm(key, nonce)
             try:
                 cb = SimpleNamespace(
                     callback_query_id="q1",
                     user_id=7,
                     chat_id=7,
                     message_id=100,
-                    data="a:rq1:1",
+                    data=f"a:rq1:{nonce}:1",
                     label="",
                     chat_type="private",
                 )
@@ -2475,13 +2662,14 @@ class TestDispatcher:
             key = TelegramApprovalDecider.key(d._session_key(("direct", "7")), "rq1")
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             TelegramApprovalDecider._REGISTRY[key] = fut
+            TelegramApprovalDecider.arm(key, "n1")
             try:
                 cb = SimpleNamespace(
                     callback_query_id="q1",
                     user_id=7,
                     chat_id=7,
                     message_id=100,
-                    data="a:rq1:0",  # reject (flag 0)
+                    data="a:rq1:n1:0",  # reject (flag 0)
                     label="",
                     chat_type="private",
                 )
@@ -2512,6 +2700,101 @@ class TestDispatcher:
         assert cli.final_text() == "Answer: hello world"
         assert sess.successes == ["telegram:kirocrew:direct:7"]
         assert sess.released == ["telegram:kirocrew:direct:7"]
+        # Pins that the pre-dispatch closing gate is consulted on the normal
+        # path, so it cannot be dropped or renamed into a no-op unnoticed.
+        assert sess.begin_turns == 1
+
+    def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(self) -> None:
+        """The lease-dispatch race gate.
+
+        ``get_or_create`` guards the CLAIM, but the turn only opens at
+        ``driver.run``, and the context build between them is wide enough for a
+        gateway restart to land in. Opening a turn then registers it behind the
+        drain snapshot ``close_all`` has already taken, so it is killed
+        mid-flight holding its native lock and reaches the user as an empty
+        response instead of this channel's notice.
+        """
+        d, cli, sess = _dispatcher({7})
+        # get_or_create deliberately ignores `closing`, so the CLAIM still
+        # succeeds here. That is the race being pinned: a refused claim was
+        # always handled, an accepted claim whose DISPATCH loses was not.
+        sess.closing = True
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="hello world"
+                )
+            )
+
+        asyncio.run(_go())
+
+        assert "Answer: hello world" not in (
+            cli.final_text() or ""
+        ), "the turn must not open behind close_all's drain snapshot"
+        assert sess.begin_turns == 1
+        # A restart is neither a success nor a session fault: charging it to the
+        # circuit breaker would count toward resetting a session that never
+        # misbehaved.
+        assert sess.successes == []
+        assert sess.failures == []
+        # Refused is not leaked -- the session-keyed semaphore still comes back.
+        assert sess.released == ["telegram:kirocrew:direct:7"]
+
+    def test_a_shutdown_refusal_is_spooled_for_a_persistent_session(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The durable inbound spool (#2217) receives the refused message."""
+        from kiro_crew.messaging import inbound_spool as S
+
+        monkeypatch.setattr(S, "data_home", lambda: tmp_path)
+        d, _cli, sess = _dispatcher({7})
+        sess.closing = True
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="keep me"
+                )
+            )
+
+        asyncio.run(_go())
+
+        spool = tmp_path / "inbound-spool" / "refused.jsonl"
+        assert spool.exists() and "keep me" in spool.read_text(encoding="utf-8")
+
+    def test_a_shutdown_refusal_is_not_spooled_for_a_restricted_session(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """``/incognito`` is a promise that nothing persists, and the spool is a file.
+
+        RED-BEFORE: without the restricted-session gate at the refusal point the
+        private message is written verbatim to ``refused.jsonl``. The same
+        predicate that gates the durable-history write gates this one.
+        """
+        from kiro_crew.messaging import inbound_spool as S
+
+        monkeypatch.setattr(S, "data_home", lambda: tmp_path)
+        d, _cli, sess = _dispatcher({7})
+        sess.closing = True
+
+        async def _restricted(_key: str) -> bool:
+            return True
+
+        monkeypatch.setattr(d, "_session_restricted", _restricted)
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="my secret"
+                )
+            )
+
+        asyncio.run(_go())
+
+        spool = tmp_path / "inbound-spool" / "refused.jsonl"
+        assert not spool.exists(), "an incognito message was persisted to the spool"
+        assert sess.released == ["telegram:kirocrew:direct:7"], "the refusal must still release"
 
     def test_agent_resolves_to_kirocrew_when_unset(self) -> None:
         # agent=None + empty default_agent must fall back to "kirocrew" so the
@@ -2681,6 +2964,47 @@ class TestDispatcher:
         assert sess.released == ["telegram:kirocrew:direct:7"]  # and released it in finally
         assert any("Compact" in s[0] for s in cli.sent) or any("Compact" in e[1] for e in cli.edits)
 
+    def test_compact_declined_on_auto_managed_backend(self) -> None:
+        # A backend that cannot serve /compact gets the informational reply and
+        # compact() is NEVER dispatched (#8156).
+        d, cli, sess = _dispatcher({7})
+        calls: list[int] = []
+
+        async def _compact(context: str = "") -> None:
+            calls.append(1)
+
+        sess._gp.compact = _compact
+        sess._gp.manual_compact_unsupported_backend = "kas"
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="/compact"
+                )
+            )
+
+        asyncio.run(_go())
+        visible = " ".join([text for text, _ in cli.sent] + [text for _, text, _ in cli.edits])
+        assert "manages compaction automatically" in visible
+        assert calls == []
+        assert sess.released == ["telegram:kirocrew:direct:7"]  # semaphore still handed back
+
+    def test_compact_none_capability_preserves_dispatch(self) -> None:
+        # The ABC's None (supported) default keeps the existing dispatch.
+        d, cli, sess = _dispatcher({7})
+        sess._gp.manual_compact_unsupported_backend = None
+
+        async def _go() -> None:
+            await d.handle_message(
+                InboundMessage(
+                    channel_type="telegram", user_id="7", conversation_id="7", text="/compact"
+                )
+            )
+
+        asyncio.run(_go())
+        visible = " ".join([text for text, _ in cli.sent] + [text for _, text, _ in cli.edits])
+        assert "Context compacted" in visible
+
     def test_compact_summary_body_is_not_sent(self) -> None:
         d, cli, sess = _dispatcher({7})
 
@@ -2725,20 +3049,24 @@ class TestDispatcher:
         )
         assert sess.destroyed == [] and sess.discarded == []  # healthy session preserved
 
-    def test_callback_option_echoes_choice_and_redispatches(self) -> None:
-        d, cli, sess = _dispatcher({7})
-        cb = SimpleNamespace(
+    @staticmethod
+    def _option_callback(data: str, label: str = "Say Hi") -> Any:
+        return SimpleNamespace(
             callback_query_id="q1",
             user_id=7,
             chat_id=7,
             message_id=99,
-            data="opt:0",
-            label="Say Hi",
+            data=data,
+            label=label,
             chat_type="private",
         )
 
+    def test_callback_option_echoes_choice_and_redispatches(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        tag = session_provenance_tag(d._session_key(("direct", "7")))
+
         async def _go() -> None:
-            await d.on_callback(cb)  # type: ignore[arg-type]
+            await d.on_callback(self._option_callback(f"opt:0:{tag}"))  # type: ignore[arg-type]
 
         asyncio.run(_go())
         # Tapping an option retires the keyboard on the original message WITHOUT
@@ -2748,6 +3076,101 @@ class TestDispatcher:
         assert all(mid != 99 for mid, _, _ in cli.edits)  # original text never clobbered
         assert "Say Hi" in cli.sent[0][0]  # choice echoed as its own block first
         assert cli.final_text() == "Answer: Say Hi"  # answer streamed as a NEW message
+        assert sess.successes == ["telegram:kirocrew:direct:7"]
+
+    def test_callback_option_label_is_literal_not_a_command(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        route = ("direct", "7")
+        tag = session_provenance_tag(d._session_key(route))
+        before = d._conv.current_gen(route)
+
+        asyncio.run(
+            d.on_callback(  # type: ignore[arg-type]
+                self._option_callback(f"opt:0:{tag}", label="/new")
+            )
+        )
+
+        assert d._conv.current_gen(route) == before
+        assert sess.successes == ["telegram:kirocrew:direct:7"]
+        assert not any("New conversation started" in text for text, _ in cli.sent)
+        assert "Answer: /new" in (cli.final_text() or "")
+
+    def test_untagged_option_press_is_refused_fail_closed(self) -> None:
+        d, cli, sess = _dispatcher({7})
+
+        asyncio.run(d.on_callback(self._option_callback("opt:0")))  # type: ignore[arg-type]
+
+        assert cli.markup_edits[-1] == (99, {"inline_keyboard": []})
+        assert any("predate" in text for text, _ in cli.sent)
+        assert not any("Say Hi" in text for text, _ in cli.sent)
+        assert sess.successes == [] and sess.queued == [] and sess._gp.steered == []
+
+    def test_pre_new_option_press_is_refused_before_busy_path(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        route = ("direct", "7")
+        old_tag = session_provenance_tag(d._session_key(route))
+        asyncio.run(d.handle_message(_dm("/new")))
+        cli.sent.clear()
+        sess._busy = True
+
+        asyncio.run(
+            d.on_callback(  # type: ignore[arg-type]
+                self._option_callback(f"opt:0:{old_tag}", label="Choice A")
+            )
+        )
+
+        assert any("moved away" in text for text, _ in cli.sent)
+        assert not any("busy" in text.lower() for text, _ in cli.sent)
+        assert sess.successes == [] and sess.queued == [] and sess._gp.steered == []
+
+    def test_option_press_after_agent_switch_is_refused(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        route = ("direct", "7")
+        old_tag = session_provenance_tag(d._session_key(route))
+        d._agent_pref[route] = "research-agent"
+
+        asyncio.run(
+            d.on_callback(  # type: ignore[arg-type]
+                self._option_callback(f"opt:0:{old_tag}", label="Choice A")
+            )
+        )
+
+        assert any("moved away" in text for text, _ in cli.sent)
+        assert sess.successes == []
+
+    def test_tagged_option_press_is_revalidated_after_idle_rotation(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        route = ("direct", "7")
+        tag = session_provenance_tag(d._session_key(route))
+
+        def _rotate_now(*_args: Any, **_kwargs: Any) -> bool:
+            d._conv.bump_gen(route)
+            return True
+
+        d._conv.maybe_rotate = _rotate_now  # type: ignore[method-assign]
+
+        asyncio.run(
+            d.on_callback(  # type: ignore[arg-type]
+                self._option_callback(f"opt:0:{tag}", label="Choice A")
+            )
+        )
+
+        assert any("moved away" in text for text, _ in cli.sent)
+        assert sess.successes == []
+
+    def test_valid_tagged_option_press_while_busy_is_not_queued_or_steered(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        tag = session_provenance_tag(d._session_key(("direct", "7")))
+        sess._busy = True
+
+        asyncio.run(
+            d.on_callback(  # type: ignore[arg-type]
+                self._option_callback(f"opt:0:{tag}", label="Choice A")
+            )
+        )
+
+        assert any("busy" in text.lower() and "NOT applied" in text for text, _ in cli.sent)
+        assert sess.successes == [] and sess.queued == [] and sess._gp.steered == []
 
     def test_callback_approval_resolves_decider(self) -> None:
         d, cli, _ = _dispatcher({7})
@@ -2756,12 +3179,13 @@ class TestDispatcher:
             key = TelegramApprovalDecider.key(d._session_key(("direct", "7")), "rq9")
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             TelegramApprovalDecider._REGISTRY[key] = fut
+            TelegramApprovalDecider.arm(key, "n1")
             cb = SimpleNamespace(
                 callback_query_id="q2",
                 user_id=7,
                 chat_id=7,
                 message_id=100,
-                data="a:rq9:1",
+                data="a:rq9:n1:1",
                 label="",
                 chat_type="private",
             )
@@ -2933,10 +3357,14 @@ class TestTelegramMidTurn:
 
         cap = IngestLimits().max_attachments
         d, cli, sess = _dispatcher({7})
-        album_a = [{"file_id": f"a{i}", "file_name": f"a{i}.jpg",
-                    "mime_type": "image/jpeg"} for i in range(cap)]
-        album_b = [{"file_id": f"b{i}", "file_name": f"b{i}.jpg",
-                    "mime_type": "image/jpeg"} for i in range(cap)]
+        album_a = [
+            {"file_id": f"a{i}", "file_name": f"a{i}.jpg", "mime_type": "image/jpeg"}
+            for i in range(cap)
+        ]
+        album_b = [
+            {"file_id": f"b{i}", "file_name": f"b{i}.jpg", "mime_type": "image/jpeg"}
+            for i in range(cap)
+        ]
         # Two albums already sitting in the queue when the turn ends.
         sess.queued = [
             (str(1), "album A", {"attachments": album_a}),
@@ -2975,9 +3403,9 @@ class TestTelegramMidTurn:
         )
         first_text, _ = seen[0]
         second_text, _ = seen[1]
-        assert "album A" in first_text and "album B" not in first_text, (
-            "album B must be deferred whole, not partially merged"
-        )
+        assert (
+            "album A" in first_text and "album B" not in first_text
+        ), "album B must be deferred whole, not partially merged"
         assert "album B" in second_text, "album B must drain in the second turn"
         assert not sess.queued, "the queue must be empty once the pump finishes"
 
@@ -2991,9 +3419,14 @@ class TestTelegramMidTurn:
         """
         d, cli, sess = _dispatcher({7})
         photos = [{"file_id": "p1", "file_name": "a.jpg", "mime_type": "image/jpeg"}]
-        before_gen = d._conv.current_gen(d._route_key(
-            chat_type="private", user_id=7, chat_id=7, thread=None,
-        ))
+        before_gen = d._conv.current_gen(
+            d._route_key(
+                chat_type="private",
+                user_id=7,
+                chat_id=7,
+                thread=None,
+            )
+        )
 
         async def _go() -> None:
             await d.handle_message(
@@ -3013,9 +3446,9 @@ class TestTelegramMidTurn:
             "/new as an attachment caption must NOT start a new conversation -- "
             "that path returns before ingestion and drops the photo"
         )
-        assert not any("New conversation started" in t for t, _ in cli.sent), (
-            "the command confirmation must not be sent for an attachment caption"
-        )
+        assert not any(
+            "New conversation started" in t for t, _ in cli.sent
+        ), "the command confirmation must not be sent for an attachment caption"
 
     def test_bare_directive_caption_on_attachment_is_content_not_a_command(
         self,
@@ -3288,10 +3721,18 @@ class TestTelegramMidTurn:
         assert sess.queued == []  # pending queue cleared
         assert any("Stopped" in t for t, _ in cli.sent)
 
-    def test_concurrent_queue_adds_share_one_receipt(self) -> None:
+    def test_concurrent_queue_adds_share_one_receipt(self, monkeypatch: Any) -> None:
         d, cli, sess = _dispatcher({7})
         sess._busy = True
         d.cfg.messaging.queue_mode = "queue"
+        # This test starts four first-use inbound checks concurrently. Keep the
+        # receipt race isolated from governance's deliberately fail-closed lazy
+        # profile load: otherwise whichever checks arrive while the first load is
+        # in progress are denied before they ever reach the receipt queue.
+        monkeypatch.setattr(
+            "kiro_crew.telegram.transport_dispatch.channel_inbound_permitted",
+            AsyncMock(return_value=True),
+        )
 
         async def _go() -> None:
             await asyncio.gather(
@@ -3511,9 +3952,7 @@ class TestAutomaticOriginMirror:
     def _turn(d: Any, uid: str = "7", text: str = "hi") -> None:
         asyncio.run(
             d.handle_message(
-                InboundMessage(
-                    channel_type="telegram", user_id=uid, conversation_id=uid, text=text
-                )
+                InboundMessage(channel_type="telegram", user_id=uid, conversation_id=uid, text=text)
             )
         )
 
@@ -3527,9 +3966,7 @@ class TestAutomaticOriginMirror:
         # The bind shares _origin_mirror_link with /link, so a forum turn must
         # carry the Topic id — a General-scoped binding would thread dashboard
         # replies into the wrong place.
-        d, _cli, sess = _dispatcher(
-            {7}, allow_forum=True, allowed_forum_chat_ids=[-1001234567890]
-        )
+        d, _cli, sess = _dispatcher({7}, allow_forum=True, allowed_forum_chat_ids=[-1001234567890])
         asyncio.run(
             d.handle_message(
                 TelegramInboundMessage(
@@ -3603,9 +4040,7 @@ class TestAutomaticOriginMirror:
         key = d._session_key(("direct", "7"))
         sess.mirror_links[key] = ChannelLink("slack", channel_id="telegram:7")
         self._turn(d)
-        assert sess.mirror_links[key] == ChannelLink(
-            "telegram", channel_id="7", thread_id=None
-        )
+        assert sess.mirror_links[key] == ChannelLink("telegram", channel_id="7", thread_id=None)
 
     def test_the_refusal_survives_a_generation_rotation(self) -> None:
         # /new and the configured idle/daily reset rotate the :genN suffix. Keyed
@@ -4143,13 +4578,14 @@ class TestForumCallbackGate:
     group. DM callbacks are unchanged (covered by TestDispatcher)."""
 
     @staticmethod
-    def _opt_cb() -> Any:
+    def _opt_cb(tag: str = "") -> Any:
+        data = f"opt:0:{tag}" if tag else "opt:0"
         return SimpleNamespace(
             callback_query_id="qf",
             user_id=7,
             chat_id=-1001234567890,
             message_id=50,
-            data="opt:0",
+            data=data,
             label="Say Hi",
             chat_type="supergroup",
             message_thread_id=5,
@@ -4157,7 +4593,8 @@ class TestForumCallbackGate:
 
     def test_forum_callback_processed_when_allowlisted(self) -> None:
         d, cli, sess = _dispatcher({7}, allow_forum=True, allowed_forum_chat_ids=[-1001234567890])
-        asyncio.run(d.on_callback(self._opt_cb()))  # type: ignore[arg-type]
+        tag = session_provenance_tag(d._session_key(("forum", "-1001234567890:5")))
+        asyncio.run(d.on_callback(self._opt_cb(tag)))  # type: ignore[arg-type]
         # Acked, and the [OPTIONS:] choice re-dispatched under the FORUM key.
         assert cli.answered == ["qf"]
         assert sess.successes == ["telegram:kirocrew:forum:-1001234567890:5"]
@@ -4201,13 +4638,14 @@ class TestForumCallbackGate:
             key = TelegramApprovalDecider.key(d._session_key(("forum", "-1001234567890:5")), "rqF")
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             TelegramApprovalDecider._REGISTRY[key] = fut
+            TelegramApprovalDecider.arm(key, "n1")
             try:
                 cb = SimpleNamespace(
                     callback_query_id="qF",
                     user_id=7,
                     chat_id=-1001234567890,
                     message_id=60,
-                    data="a:rqF:1",
+                    data="a:rqF:n1:1",
                     label="",
                     chat_type="supergroup",
                     message_thread_id=5,
@@ -4228,13 +4666,17 @@ class TestForumCallbackGate:
             key = TelegramApprovalDecider.key(d._session_key(("forum", "-1001234567890:5")), "rqF")
             fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             TelegramApprovalDecider._REGISTRY[key] = fut
+            # The nonce the renderer would have minted for this prompt; the press
+            # must carry it or resolution refuses it as stale.
+            nonce = "n1"
+            TelegramApprovalDecider.arm(key, nonce)
             try:
                 cb = SimpleNamespace(
                     callback_query_id="qF",
                     user_id=7,
                     chat_id=-1001234567890,
                     message_id=61,
-                    data="a:rqF:1",
+                    data=f"a:rqF:{nonce}:1",
                     label="",
                     chat_type="supergroup",
                     message_thread_id=5,
@@ -4491,13 +4933,13 @@ class TestUserSafeFailureReason:
 
     def test_empty_message_returns_none(self) -> None:
         assert _user_safe_failure_reason(AcpError("   \n ", transient=False)) is None
+
+
 # ── /yolo + /model (transport_dispatch.py) ─────────────────────────────────
 
 
 def _dm(text: str, uid: str = "7") -> InboundMessage:
-    return InboundMessage(
-        channel_type="telegram", user_id=uid, conversation_id=uid, text=text
-    )
+    return InboundMessage(channel_type="telegram", user_id=uid, conversation_id=uid, text=text)
 
 
 def _press(data: str, *, message_id: int = 101, uid: int = 7, label: str = "") -> Any:
@@ -4549,7 +4991,7 @@ class TestYoloCommand:
             self._reset()
 
     def test_off_on_a_lapsed_grant_closes_the_renew_grace_window(self) -> None:
-        """"/yolo off" must revoke a grant whose TTL already elapsed.
+        """ "/yolo off" must revoke a grant whose TTL already elapsed.
 
         ``deactivate()`` zeroes the past deadline, and that is what shuts the
         5-minute renew grace window. Skipping the call for a lapsed grant left
@@ -4803,3 +5245,75 @@ class TestSetMyCommands:
         assert {"command": "model", "description": "Choose the model from a list"} in sent[0][1][
             "commands"
         ]
+
+
+# ── context thresholds ───────────────────────────────────────────────────
+
+
+class TestContextThresholdNotices:
+    def test_soft_threshold_nudges(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        sess.check_context_usage = lambda key, provider: 85.0  # >= soft (80)
+
+        asyncio.run(d._maybe_notice(7, ("direct", "7"), "key", object()))
+
+        assert any("/compact" in s[0] for s in cli.sent)
+
+    def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
+        # The nudge advises /compact, which this backend refuses — it compacts
+        # on its own, so there is nothing for the user to act on (#8156).
+        d, cli, sess = _dispatcher({7})
+        sess.check_context_usage = lambda key, provider: 85.0
+        provider = SimpleNamespace(manual_compact_unsupported_backend="kas")
+
+        asyncio.run(d._maybe_notice(7, ("direct", "7"), "key", provider))
+
+        assert cli.sent == []
+
+    def test_below_soft_threshold_stays_silent(self) -> None:
+        d, cli, sess = _dispatcher({7})
+        sess.check_context_usage = lambda key, provider: 10.0
+
+        asyncio.run(d._maybe_notice(7, ("direct", "7"), "key", object()))
+
+        assert cli.sent == []
+
+
+class TestClientClose:
+    def test_close_closes_session_even_when_task_died_with_a_bug(self) -> None:
+        """A polling task already dead from an uncaught, non-CancelledError
+        exception makes ``task.cancel()`` a no-op, and re-``await``ing it
+        re-raises that exception -- which must not skip the session close
+        (issue #4627)."""
+
+        class _FakeSession:
+            def __init__(self) -> None:
+                self.closed = False
+                self.close_calls = 0
+
+            async def close(self) -> None:
+                self.close_calls += 1
+                self.closed = True
+
+        async def _run() -> None:
+            client = TelegramClient(token="t")
+            session = _FakeSession()
+            client._session = session  # type: ignore[assignment]
+
+            async def _buggy_loop() -> None:
+                raise ValueError("malformed update")
+
+            client._task = asyncio.create_task(_buggy_loop())
+            await asyncio.sleep(0)  # let the task actually finish before close()
+
+            try:
+                await client.close()
+                raise AssertionError("close() must propagate the task's exception")
+            except ValueError as exc:
+                assert "malformed update" in str(exc)
+
+            assert client._task is None
+            assert session.close_calls == 1
+            assert client._session is None
+
+        asyncio.run(_run())

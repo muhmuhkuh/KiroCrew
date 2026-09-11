@@ -8,15 +8,20 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from test_discord import MultipartFake
 
 from kiro_crew.config.paths import config_dir
-from kiro_crew.discord import resume_expectation
-from kiro_crew.discord.client import DiscordInteraction
+from kiro_crew.discord import session_resume
+from kiro_crew.discord.client import DISCORD_CHUNK_LIMIT, DiscordInteraction
 from kiro_crew.discord.commands import parse_command, parse_command_argument
+from kiro_crew.discord.renderer import session_provenance_tag
 from kiro_crew.discord.transport_dispatch import DiscordDispatcher
+from kiro_crew.messaging import resume_expectation
+from kiro_crew.messaging import session_resume as session_resume_core
 from kiro_crew.messaging.link import UNBIND_REASON_UNSPECIFIED, ChannelLink
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 
@@ -25,7 +30,7 @@ def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
 
 
-class _Client:
+class _Client(MultipartFake):
     def __init__(self) -> None:
         self.sent: list[tuple[str, Any]] = []
         self.edits: list[tuple[str, str, Any]] = []
@@ -80,7 +85,7 @@ class _Client:
 
 
 class _Provider:
-    supports_steer = False
+    supports_steer, cwd = False, str(Path.cwd())
 
     async def stream(self, message: str):
         from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
@@ -111,6 +116,10 @@ class _Sessions:
 
     def __init__(self) -> None:
         self.mirror_links: dict[str, ChannelLink] = {}
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.flushed: list[dict] = []
         self.flush_error: Exception | None = None
         self.origin_links: dict[str, ChannelLink] = {}
@@ -218,6 +227,16 @@ class _Sessions:
         self.last_agent = kwargs.get("agent")
         return self.provider, getattr(self, "is_new_result", False), True
 
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate.
+
+        ``closing`` mirrors SessionManager._closing so this refuses the dispatch
+        the way the real gate does once close_all has run.
+        """
+        self.begin_turns = getattr(self, "begin_turns", 0) + 1
+        if getattr(self, "closing", False):
+            raise SessionClosingError("SessionManager is closing")
+
     async def set_channel(self, key: str, channel: str) -> None:
         self.set_channel_calls = getattr(self, "set_channel_calls", [])
         self.set_channel_calls.append((key, channel))
@@ -279,7 +298,7 @@ class _ConversationLog:
             raw_key = str(row.get("key") or "")
             canonical = raw_key
             while canonical.startswith("dashboard_"):
-                canonical = canonical[len("dashboard_"):]
+                canonical = canonical[len("dashboard_") :]
             canonical = f"dashboard:{canonical}" if canonical else raw_key
             body = " ".join(
                 str(msg.get("content") or "")
@@ -305,7 +324,9 @@ class _ConversationLog:
             rows = [row for row in rows if row.get("role") in roles]
         return rows[-max_messages:]
 
-    def append(self, key: str, role: str, content: str, agent: str | None = None) -> None:
+    def append(
+        self, key: str, role: str, content: str, agent: str | None = None, mid: str | None = None
+    ) -> None:
         self.messages.setdefault(key, []).append({"role": role, "content": content})
 
     def set_title(self, key: str, title: str) -> None:
@@ -373,7 +394,9 @@ def _message(text: str, channel_id: str = "c1", thread_id: str = "") -> InboundM
     )
 
 
-def _interaction(custom_id: str, message_id: str, channel_id: str = "c1") -> DiscordInteraction:
+def _interaction(
+    custom_id: str, message_id: str, channel_id: str = "c1", label: str = ""
+) -> DiscordInteraction:
     return DiscordInteraction(
         interaction_id="i1",
         interaction_token="tok",
@@ -381,7 +404,7 @@ def _interaction(custom_id: str, message_id: str, channel_id: str = "c1") -> Dis
         user_id="u1",
         message_id=message_id,
         custom_id=custom_id,
-        label="",
+        label=label,
         guild_id="",
     )
 
@@ -552,7 +575,7 @@ async def test_sessions_no_match_is_explicit() -> None:
     assert "No dashboard sessions matched `missing topic`" in text
     assert "Try fewer words" in text
     assert "`!sessions`" in text
-    assert dispatcher._session_pickers == {}
+    assert len(dispatcher._session_pickers) == 0
 
 
 @pytest.mark.asyncio
@@ -659,24 +682,36 @@ async def test_binding_claimed_during_header_edit_is_not_overwritten() -> None:
 
 @pytest.mark.asyncio
 async def test_resumed_turn_lands_in_live_dashboard_window() -> None:
-    """A resumed turn must enter the OPEN slot's window, not just disk.
-
-    The dashboard save writes meta + frozen prefix + its own window + foreign
-    tail. A disk-only append made before a later dashboard turn is therefore
-    re-serialized AFTER it and the transcript reads back out of order. Landing
-    the turn in the live window keeps it inside the region the save
-    re-serializes. Mirrors dashboard/cron_inject.py.
-    """
+    """A resumed turn is projected user-first without a new user-row broadcast."""
     log = _log()
     log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
     dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    durable: list[tuple[str, str, str]] = []
+
+    def _append_if_absent(
+        key: str,
+        role: str,
+        content: str,
+        *,
+        agent: str | None = None,
+        mid: str | None = None,
+    ) -> None:
+        durable.append((role, content, mid or ""))
+
+    log.append_if_absent = _append_if_absent  # type: ignore[attr-defined]
 
     class _Slot:
         def __init__(self) -> None:
-            self.messages: list[tuple[str, str]] = []
+            self.messages: list[dict[str, Any]] = []
+            self.broadcasts: list[tuple[str, bool]] = []
+            self.is_restricted = False
 
-        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> None:
-            self.messages.append((role, content))
+        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> dict[str, Any]:
+            mid = f"m-{len(self.messages) + 1:016x}"
+            row = {"role": role, "content": content, "meta": {"mid": mid}}
+            self.messages.append(row)
+            self.broadcasts.append((role, bool(kw.get("broadcast_user"))))
+            return row
 
     class _State:
         def __init__(self) -> None:
@@ -695,13 +730,93 @@ async def test_resumed_turn_lands_in_live_dashboard_window() -> None:
     await dispatcher.handle_message(_message("!sessions"))
     custom_id, message_id = _picker_button(client)
     await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    pushes_before_turn = state.pushes
     await dispatcher.handle_message(_message("continue here"))
 
     assert sessions.last_key == "dashboard:chat-1"
-    roles = [r for r, _ in state.slot.messages]
-    assert roles == ["user", "assistant"], state.slot.messages
-    assert state.slot.messages[0][1] == "continue here"
-    assert state.pushes >= 1
+    assert [(row["role"], row["content"]) for row in state.slot.messages] == [
+        ("user", "continue here"),
+        ("assistant", "Answer: continue here"),
+    ]
+    assert state.slot.broadcasts == [("user", False), ("assistant", False)]
+    assert durable == [
+        ("user", "continue here", "m-0000000000000001"),
+        ("assistant", "Answer: continue here", "m-0000000000000002"),
+    ]
+    assert state.pushes == pushes_before_turn + 1
+
+
+@pytest.mark.asyncio
+async def test_restricted_resumed_turn_is_neither_projected_nor_persisted() -> None:
+    """Discord had the same two-writer leak as Telegram.
+
+    A resumed ``dashboard:`` key gets its privacy mode from the dashboard slot.
+    Without the caller-side gate Discord projected the turn into that slot (making
+    it dirty for a later flush) and also appended it directly to durable history.
+    Neither path may see content for an incognito or temporary session.
+    """
+    log = _log()
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    durable_before = list(log.messages["dashboard:chat-1"])
+    persist_calls: list[str] = []
+    real_persist = dispatcher._persist_turn
+
+    def _persist(*args: Any, **kwargs: Any) -> None:
+        persist_calls.append(str(args[0]))
+        real_persist(*args, **kwargs)
+
+    dispatcher._persist_turn = _persist  # type: ignore[method-assign]
+
+    class _RestrictedSlot:
+        is_restricted = True
+
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> dict[str, Any]:
+            row = {"role": role, "content": content, "meta": {"mid": f"m-{len(self.messages)}"}}
+            self.messages.append(row)
+            return row
+
+    class _State:
+        def __init__(self) -> None:
+            self.slot = _RestrictedSlot()
+
+        def get_slot(self, name: str) -> Any:
+            return self.slot if name == "chat-1" else None
+
+        def push_slots_update(self) -> None:
+            raise AssertionError("a restricted turn must not dirty or push its slot")
+
+    state = _State()
+    dispatcher._session_resume.dashboard_state = state
+
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    await dispatcher.handle_message(_message("private continuation"))
+
+    assert sessions.last_key == "dashboard:chat-1"
+    assert state.slot.messages == []
+    assert persist_calls == []
+    assert log.messages["dashboard:chat-1"] == durable_before
+
+
+@pytest.mark.asyncio
+async def test_discord_restricted_decision_allows_unknown_but_denies_live_slot() -> None:
+    """Cold ordinary resumes keep history; an affirmative live restriction wins."""
+    dispatcher, _, _ = _dispatcher({"u1"}, _log())
+
+    dispatcher._session_resume.dashboard_state = SimpleNamespace(
+        sessions=None, get_slot=lambda _name: SimpleNamespace(is_restricted=True)
+    )
+    assert await dispatcher._session_restricted("dashboard:chat-1") is True
+
+    dispatcher._session_resume.dashboard_state = SimpleNamespace(
+        sessions=None, get_slot=lambda _name: None
+    )
+    assert await dispatcher._session_restricted("dashboard:missing") is False
 
 
 @pytest.mark.asyncio
@@ -717,7 +832,11 @@ async def test_mirrored_turn_persists_idempotently() -> None:
 
     class _State:
         def get_slot(self, name: str) -> Any:
-            return type("S", (), {"append": lambda *a, **k: None})()
+            return type(
+                "S",
+                (),
+                {"append": lambda *a, **k: None, "is_restricted": False},
+            )()
 
         def push_slots_update(self) -> None:
             return None
@@ -821,6 +940,7 @@ async def test_resume_evidence_is_durable_before_the_success_banner(banner_lands
             if not banner_lands:
                 return False
         return await real_edit(channel_id, message_id, text, components=components)
+
     client.edit_message = _crash_boundary_edit  # type: ignore[method-assign]
     await dispatcher.on_interaction(_interaction(custom_id, message_id))
     assert seen and seen[0] is not None, "success banner shown before evidence was durable"
@@ -864,6 +984,96 @@ async def test_resume_replay_sanitizes_internal_protocol() -> None:
     assert "OBJECTIVE" not in visible and "USER GUIDANCE" not in visible
     assert "internal guidance" not in visible and "legacy internal body" not in visible
     assert "STEERING" not in visible and "internal steer" not in visible
+
+
+@pytest.mark.asyncio
+async def test_resume_replay_previews_long_markdown_without_breaking_a_fence() -> None:
+    """A replayed transcript entry is shortened at a boundary the grammar accepts.
+
+    A blind character slice lands inside the fenced code block and Discord then
+    renders everything after it as literal backticks instead of code, so the one
+    message meant to give the user context arrives unreadable. Taking the shared
+    splitter's FIRST chunk shortens at a boundary instead: every chunk but the
+    last is sealed, so the block the cut opened is closed.
+    """
+    body = "```python\n" + "x = 1\n" * 800 + "```\n"
+    log = _log()
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": body}]
+    dispatcher, client, _ = _dispatcher({"u1"}, log)
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+
+    replayed = [text for text, _ in client.sent if "x = 1" in text]
+    assert len(replayed) == 1, replayed  # still ONE message per transcript entry
+    preview = replayed[0]
+    assert len(preview) <= DISCORD_CHUNK_LIMIT, len(preview)
+    assert preview.count("```") % 2 == 0, preview[-40:]  # the block is closed
+    assert preview.endswith(session_resume._REPLAY_TRUNCATED)  # and says so
+    # The icon sits on its own line, so the opener still starts a line.
+    assert preview.startswith("🤖\n```python\n")
+
+
+@pytest.mark.asyncio
+async def test_resume_replay_omits_a_fence_that_cannot_fit_safely() -> None:
+    """An extreme opener cannot fit together with its synthetic closer.
+
+    Sending that sealed chunk anyway lets Discord's client-side cap remove the
+    closer and truncation marker. The replay keeps the canonical transcript
+    intact and emits only the explicit marker for this pathological preview.
+    """
+    opener = "`" * 1001
+    body = opener + "\n" + ("x" * 1800) + "\n"
+    log = _log()
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": body}]
+    dispatcher, client, _ = _dispatcher({"u1"}, log)
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+
+    replayed = [text for text, _ in client.sent if session_resume._REPLAY_TRUNCATED in text]
+    assert replayed == [f"🤖\n{session_resume._REPLAY_TRUNCATED}"]
+    assert len(replayed[0]) <= DISCORD_CHUNK_LIMIT
+    assert opener not in replayed[0]
+
+
+@pytest.mark.asyncio
+async def test_resume_replay_bounds_and_offloads_the_splitter_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transcript-sized pathological line is bounded and split off-loop."""
+    probes: list[str] = []
+    offloads: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+
+    def _capture(probe: str, limit: int, *, reserve: int = 0) -> list[str]:
+        probes.append(probe)
+        return ["safe preview"]
+
+    async def _offload(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        offloads.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(session_resume, "split_markdown_safe", _capture)
+    monkeypatch.setattr(session_resume.asyncio, "to_thread", _offload)
+
+    preview = await session_resume._replay_preview(
+        "`" * 1_000_000,
+        session_resume._REPLAY_TEXT_LIMIT,
+        reserve=session_resume._REPLAY_RESERVE,
+    )
+
+    assert len(probes) == 1
+    assert len(probes[0]) <= session_resume._REPLAY_TEXT_LIMIT * 2
+    assert offloads == [
+        (
+            _capture,
+            (probes[0], session_resume._REPLAY_TEXT_LIMIT),
+            {"reserve": session_resume._REPLAY_RESERVE},
+        )
+    ]
+    assert preview == "safe preview" + session_resume._REPLAY_TRUNCATED
 
 
 @pytest.mark.asyncio
@@ -983,7 +1193,7 @@ async def test_picker_refuses_outside_a_dm() -> None:
 
     await dispatcher.handle_message(_message("!sessions", thread_id="t9"))
 
-    assert dispatcher._session_pickers == {}
+    assert len(dispatcher._session_pickers) == 0
     assert sessions.mirror_links == {}
     assert any("direct message" in text for text, _ in client.sent)
 
@@ -1066,13 +1276,250 @@ async def test_resumed_session_without_recorded_agent_falls_back() -> None:
     assert sessions.last_agent == "kirocrew"
 
 
+async def _bind_to_chat1(
+    dispatcher: DiscordDispatcher, client: _Client, log: _ConversationLog
+) -> None:
+    """Bind DM c1 to dashboard:chat-1 through the real picker flow."""
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-1"
+
+
 @pytest.mark.asyncio
-async def test_stale_picker_fails_closed() -> None:
+async def test_option_press_routes_into_resumed_session() -> None:
+    """An [OPTIONS:] press on a bound DM is the RESUMED session's turn content.
+
+    The press re-dispatches with ``interpret_commands=False`` because the label is
+    model-authored text that must never execute as a command — but that flag must
+    not also skip resume routing. The buttons were rendered on the bound session's
+    own reply (and carry its provenance tag), so the choice belongs to that
+    session. Before the fix the press ran in the native DM session: the click
+    answered a question nobody asked there, while the bound session kept waiting
+    for its answer (live incident 2026-08-30: a merge-approach choice for the
+    bound session green-lit the native session's parked debug plan instead).
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+
+    tag = session_provenance_tag("dashboard:chat-1")
+    await dispatcher.on_interaction(_interaction(f"opt:0:{tag}", "m-opts", label="Ship option (a)"))
+
+    assert sessions.last_key == "dashboard:chat-1"
+    # The label reached the session as literal turn content, commands off.
+    assert any(t.startswith("> Ship option (a)") for t, _ in client.sent)
+
+
+@pytest.mark.asyncio
+async def test_untagged_press_is_refused_fail_closed() -> None:
+    """A pre-provenance button (bare ``opt:<i>``) is refused, never routed.
+
+    Discord replays old components indefinitely, so an untagged press can never
+    prove which session it belongs to — and routing it by current binding is
+    exactly the cross-session injection this fix exists to stop (server review
+    round 1, span 405abadda748: the legacy pass-through never ages out, so it
+    was the same hole with a different door). Fail closed with a type-it-instead
+    notice; no echo, no turn anywhere.
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+
+    await dispatcher.on_interaction(_interaction("opt:0", "m-opts", label="Ship option (a)"))
+
+    assert any("predate" in t for t, _ in client.sent)
+    assert not any(t.startswith("> Ship option (a)") for t, _ in client.sent)
+    assert sessions.last_key == ""  # no turn ran anywhere
+
+
+@pytest.mark.asyncio
+async def test_tagged_press_is_revalidated_after_idle_rotation() -> None:
+    """Idle/daily rotation between the gate and the turn invalidates the tag.
+
+    ``maybe_rotate`` can bump the native generation AFTER the pre-busy gate
+    passed, so the turn would run under a key the tag never named. The gate is
+    re-run against the FINAL key after rotation — the same invariant ``!new``
+    enforces, applied to the reset nobody typed.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+    scope = dispatcher._scope_id("u1")
+
+    def _rotate_now(*args: object, **kwargs: object) -> None:
+        dispatcher._conv.bump_gen(scope)
+
+    dispatcher._conv.maybe_rotate = _rotate_now  # type: ignore[method-assign]
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{tag}", "m-opts", label="Choice A"))
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert sessions.last_key == ""  # the rotated generation never ran the press
+
+
+@pytest.mark.asyncio
+async def test_stale_tagged_press_after_rebind_is_refused() -> None:
+    """A button minted by session A, pressed after the DM was rebound to B, refuses.
+
+    Discord replays old components indefinitely: A's reply keeps its live buttons
+    after ``!unlink`` + ``!sessions`` rebinds the DM to B. Routing alone would send
+    the press into B — injecting A's model-authored choice into an unrelated
+    transcript, the GPT round-1 blocker. The provenance tag makes the press valid
+    only while the conversation still targets the session that posted it.
+    """
+    log = _log_with_titles("Alpha plan", "Beta plan")
+    log.messages["dashboard:chat-0"] = [{"role": "assistant", "content": "prior a"}]
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior b"}]
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+
+    # Bind A (chat-0) through the real picker, as the incident did.
+    await dispatcher.handle_message(_message("!sessions Alpha"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-0"
+    stale_tag = session_provenance_tag("dashboard:chat-0")
+
+    # Rebind to B (chat-1): unlink, then pick again.
+    await dispatcher.handle_message(_message("!unlink"))
+    await dispatcher.handle_message(_message("!sessions Beta"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-1"
+    sessions.last_key = ""
+
+    await dispatcher.on_interaction(
+        _interaction(f"opt:0:{stale_tag}", "m-old-opts", label="Ship option (a)")
+    )
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert sessions.last_key == ""  # no turn ran in B, in A, or natively
+
+
+@pytest.mark.asyncio
+async def test_press_tagged_for_pre_new_conversation_is_refused() -> None:
+    """``!new`` invalidates the previous conversation's buttons.
+
+    The native key embeds the generation, so a press carrying the pre-``!new``
+    tag no longer matches — honest, since the conversation that asked the
+    question is over. Before the tag the press ran silently in the fresh
+    generation, answering a question it never asked.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    old_tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+
+    await dispatcher.handle_message(_message("!new"))
+    assert dispatcher.current_session_key("u1") != ""
+    sessions.last_key = ""
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{old_tag}", "m-opts", label="Choice A"))
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert sessions.last_key == ""
+
+
+@pytest.mark.asyncio
+async def test_stale_press_against_busy_target_is_refused_not_queued() -> None:
+    """The provenance gate precedes the busy check — pinned as ordering.
+
+    A stale press must be refused BEFORE ``is_busy`` runs: the busy path either
+    queues (native) or posts the busy refusal (resumed), and a queued stale
+    press would be drained and replayed WITHOUT its tag, executing unchecked
+    later. It also must not leak whether the current target is mid-turn.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    old_tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+    await dispatcher.handle_message(_message("!new"))
+    sessions.last_key = ""
+    sessions.is_busy = lambda key: True  # type: ignore[method-assign]
+    enqueued: list = []
+    sessions.enqueue = lambda *a, **k: enqueued.append(a)  # type: ignore[attr-defined]
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{old_tag}", "m-opts", label="Choice A"))
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert not any("busy" in t for t, _ in client.sent)
+    assert enqueued == []
+    assert sessions.last_key == ""
+
+
+@pytest.mark.asyncio
+async def test_valid_tagged_press_against_busy_target_is_refused_not_queued_or_steered() -> None:
+    """A VALID press whose target is mid-turn refuses — it never enters the queue.
+
+    ``_handle_busy`` enqueues bare text (or steers it mid-turn), and the drain
+    replays queued text WITHOUT the provenance tag — so a ``!new`` or idle
+    rotation between enqueue and drain would execute the model-authored choice
+    in a conversation the tag never named (server review round 2, span
+    405abadda748). The busy path is therefore unreachable for any tagged press.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+    sessions.is_busy = lambda key: True  # type: ignore[method-assign]
+    enqueued: list = []
+    sessions.enqueue = lambda *a, **k: enqueued.append(a)  # type: ignore[attr-defined]
+    steered: list = []
+    sessions.steer = lambda *a, **k: steered.append(a)  # type: ignore[attr-defined]
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{tag}", "m-opts", label="Choice A"))
+
+    assert any("busy" in t and "NOT applied" in t for t, _ in client.sent)
+    assert enqueued == [] and steered == []
+    assert sessions.last_key == ""  # no turn ran anywhere
+
+
+@pytest.mark.asyncio
+async def test_option_press_after_binding_destroyed_is_refused_not_native() -> None:
+    """A press whose binding died mid-flight gets the Detached refusal.
+
+    The refusal is the honest outcome routing already produces for a typed
+    message; the press must not fall back to a silent native turn, which is the
+    exact misroute the routing gate exists to stop.
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+    stale_tag = session_provenance_tag("dashboard:chat-1")
+    # The binding dies out from under the DM (a housekeeping clear, not !unlink).
+    sessions.clear_mirror_link("dashboard:chat-1")
+
+    await dispatcher.on_interaction(
+        _interaction(f"opt:0:{stale_tag}", "m-opts", label="Ship option (a)")
+    )
+
+    assert any("Detached" in t for t, _ in client.sent)
+    assert sessions.last_key == ""  # no turn ran anywhere
+
+
+@pytest.mark.asyncio
+async def test_synthetic_dispatch_without_origin_tag_keeps_native_affinity() -> None:
+    """Untagged synthetic turns keep the legacy skip: native session, no routing.
+
+    Queue drains replay messages the native session accepted while busy, and
+    AutoNudge fires target the native key their loop rotation-checked — routing
+    either into a binding created later would run them in a session that never
+    queued or armed them. This pins that ``interpret_commands=False`` with no
+    ``origin_tag`` still means "skip routing" for those callers.
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+
+    await dispatcher.handle_message(_message("nudge cycle text"), interpret_commands=False)
+
+    assert sessions.last_key != "dashboard:chat-1"
+    assert sessions.last_key.startswith("discord")
+
+
+@pytest.mark.asyncio
+async def test_stale_picker_fails_closed(monkeypatch) -> None:
     dispatcher, client, sessions = _dispatcher({"u1"}, _log())
     await dispatcher.handle_message(_message("!sessions"))
     custom_id, message_id = _picker_button(client)
-    for picker in dispatcher._session_pickers.values():
-        picker.created_at -= 301
+    # Expire by moving the TTL, not by reaching into a registry entry: the constant is
+    # the contract, and a test that ages private state passes even if the TTL stops
+    # being consulted.
+    monkeypatch.setattr(session_resume_core, "PICKER_TTL_SECS", -1)
 
     await dispatcher.on_interaction(_interaction(custom_id, message_id))
 
@@ -1146,7 +1593,7 @@ async def test_choice_refusal_for_outbound_mirror_names_unlink() -> None:
     # And the instruction is followable: the sweep frees the location, after
     # which the conflict check no longer refuses.
     sessions.clear_mirror_links_at(ChannelLink(channel_type="discord", channel_id="c1"))
-    conflict = dispatcher._session_resume._binding_conflict(
+    conflict = dispatcher._session_resume._binder.binding_conflict(
         "dashboard:chat-1",
         "chat one",
         ChannelLink(channel_type="discord", channel_id="c1"),
@@ -1235,7 +1682,7 @@ async def test_new_leaves_resumed_session_and_advances_native_generation() -> No
 def _store_path() -> Path:
     trust = config_dir() / resume_expectation._TRUST_SUBDIR
     trust.mkdir(parents=True, exist_ok=True)
-    return trust / resume_expectation._FILENAME
+    return trust / resume_expectation.store_filename("discord")
 
 
 def _gate_send(client, marker: str, during) -> list[str]:
@@ -1247,6 +1694,7 @@ def _gate_send(client, marker: str, during) -> list[str]:
             fired.append(text)
             await during()
         return await real_send(channel_id, text, **kwargs)
+
     client.send_message = _send  # type: ignore[method-assign]
     return fired
 
@@ -1340,18 +1788,19 @@ class TestDashboardConnectedConversationResumes:
         for occupant in ("dashboard:chat-7", "dashboard:chat-8"):
             sessions.mirror_links[occupant] = loc
             sessions.inbound_keys.add(occupant)
-        assert dispatcher._session_resume.resumed_session("c1") is None, (
-            "setup no longer produces the ambiguous state this test needs"
-        )
+        assert (
+            dispatcher._session_resume.resumed_session("c1") is None
+        ), "setup no longer produces the ambiguous state this test needs"
 
         await dispatcher.handle_message(_message("!link"))
 
-        assert any("`!unlink`" in text for text, _ in client.sent), (
-            f"the refusal was not reported to the channel: {client.sent}"
-        )
-        assert set(sessions.mirror_links) == {"dashboard:chat-7", "dashboard:chat-8"}, (
-            "an occupant was displaced, or the link was written anyway"
-        )
+        assert any(
+            "`!unlink`" in text for text, _ in client.sent
+        ), f"the refusal was not reported to the channel: {client.sent}"
+        assert set(sessions.mirror_links) == {
+            "dashboard:chat-7",
+            "dashboard:chat-8",
+        }, "an occupant was displaced, or the link was written anyway"
 
     @pytest.mark.asyncio
     async def test_two_outbound_mirrors_are_still_allowed(self) -> None:
@@ -1375,6 +1824,7 @@ class TestBindingLostUnderTheConversation:
         async def _retire_after_durability(channel_id: str, version: int):
             assert link not in sessions.flushed[-1].values()
             return await real_retire(channel_id, version)
+
         store.retire_if = _retire_after_durability  # type: ignore[method-assign]
         sessions.clear_mirror_links_at(link)
         sessions.last_key = ""
@@ -1389,7 +1839,9 @@ class TestBindingLostUnderTheConversation:
     @pytest.mark.asyncio
     async def test_a_synthetic_nudge_bypasses_detach_routing(self) -> None:
         dispatcher, client, sessions = _dispatcher({"u1"}, _log("Launch plan"))
-        await dispatcher._session_resume._expectations.record("c1", "dashboard:chat-1", "Launch plan")
+        await dispatcher._session_resume._expectations.record(
+            "c1", "dashboard:chat-1", "Launch plan"
+        )
         nudge = _message("[auto-nudge cycle 1]\ncheck")
         await dispatcher.handle_message(nudge, interpret_commands=False)
         assert not any("Detached" in text for text, _ in client.sent)
@@ -1413,6 +1865,7 @@ class TestBindingLostUnderTheConversation:
         async def _observe_retire(channel_id: str, version: int):
             durable_first.append(bool(sessions.flushed))
             return await real_retire(channel_id, version)
+
         store.retire_if = _observe_retire  # type: ignore[method-assign]
         await dispatcher.handle_message(_message("!unlink"))
         link = dispatcher._session_resume.link_for("c1")
@@ -1432,6 +1885,7 @@ class TestBindingLostUnderTheConversation:
             await real_aflush()
             sessions.mirror_links["dashboard:chat-1"] = link
             sessions.inbound_keys.add("dashboard:chat-1")
+
         sessions.aflush = _rebind_same_key_during_aflush  # type: ignore[method-assign]
         await dispatcher.handle_message(_message("!unlink"))
         expected = await store.get("c1")
@@ -1443,6 +1897,17 @@ class TestBindingLostUnderTheConversation:
 
     @pytest.mark.asyncio
     async def test_releasing_an_unrecorded_binding_leaves_evidence_before_mutation(self) -> None:
+        """A failed release records evidence first, then changes NOTHING -- live map too.
+
+        The in-memory clear happens before the flush, so a flush failure used to leave the
+        binding gone in this process while the command reported failure. Two things were
+        wrong with that pair: the very next message was refused with "Detached: no longer
+        linked" moments after being told the unlink did not happen, and the map on disk
+        still held the binding, so a restart revived it and split one history in two -- the
+        exact harm the sibling test names. The release now rolls the clear back, so the
+        report, the live map and the persisted map all agree and the conversation carries
+        on where the user was told it would.
+        """
         dispatcher, client, sessions = _dispatcher({"u1"}, _log("Launch plan"))
         link = ChannelLink(channel_type="discord", channel_id="c1")
         # A dashboard-created binding that never carried a message: no record exists.
@@ -1453,9 +1918,10 @@ class TestBindingLostUnderTheConversation:
         assert any("NOT completed" in text for text, _ in client.sent)
         expected = await store.get("c1")
         assert expected is not None and not expected.retired, "mutated without durable evidence"
+        assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-1"
         await dispatcher.handle_message(_message("where did we land?"))
-        assert sessions.last_key == "", f"the message ran at all: {sessions.last_key}"
-        assert any("Detached" in text for text, _ in client.sent)
+        assert sessions.last_key == "dashboard:chat-1", "the resumed session must carry on"
+        assert not any("Detached" in text for text, _ in client.sent)
 
     @pytest.mark.parametrize("recorded", [False, True], ids=["bare", "recorded"])
     @pytest.mark.asyncio
@@ -1472,6 +1938,7 @@ class TestBindingLostUnderTheConversation:
             if recorded:
                 await store.record(channel_id, "dashboard:chat-2", "Pricing review")
             return applied
+
         store.retire_if = _rebind  # type: ignore[method-assign]
         await resume.leave_resumed_session("c1")
         current = await store.get("c1")
@@ -1514,7 +1981,9 @@ class TestBindingLostUnderTheConversation:
         await dispatcher.handle_message(_message("carry on"))
         assert sessions.last_key == "dashboard:chat-1"
 
-    @pytest.mark.parametrize("command, refused", [
+    @pytest.mark.parametrize(
+        "command, refused",
+        [
             pytest.param("!compact", True, id="compact"),
             pytest.param("!stop", True, id="stop"),
             pytest.param("!link", True, id="link"),
@@ -1522,7 +1991,8 @@ class TestBindingLostUnderTheConversation:
             pytest.param("!new", False, id="new-leaves"),
             pytest.param("!unlink", False, id="unlink-leaves"),
             pytest.param("!help", False, id="help-inert"),
-    ])
+        ],
+    )
     @pytest.mark.asyncio
     async def test_session_targeting_commands_are_refused_before_they_act(
         self, command, refused
@@ -1563,9 +2033,9 @@ class TestBindingLostUnderTheConversation:
         elsewhere = ChannelLink(channel_type="discord", channel_id="c2")
         sessions.mirror_links["dashboard:elsewhere"] = elsewhere
         await dispatcher.handle_message(_message(leave_command))
-        assert not dispatcher._session_resume.resolve_inbound("c1").ambiguous, (
-            f"{leave_command} left ambiguous bindings: {sessions.mirror_links}"
-        )
+        assert not dispatcher._session_resume.resolve_inbound(
+            "c1"
+        ).ambiguous, f"{leave_command} left ambiguous bindings: {sessions.mirror_links}"
         assert sessions.mirror_links["dashboard:elsewhere"] == elsewhere, "cleared c2"
         await dispatcher.handle_message(_message("after leaving"))
         assert sessions.last_key == dispatcher._session_key("u1"), client.sent[-1][0]
@@ -1606,7 +2076,8 @@ class TestBindingLostUnderTheConversation:
 
         monkeypatch.setitem(
             dispatcher.handle_message.__globals__,
-            "channel_inbound_permitted", _governance,
+            "channel_inbound_permitted",
+            _governance,
         )
         siblings: list[asyncio.Task[None]] = []
         detached_sends = 0
@@ -1617,16 +2088,19 @@ class TestBindingLostUnderTheConversation:
             if "Detached" in text:
                 detached_sends += 1
                 if detached_sends == 1:
-                    siblings.append(asyncio.create_task(
-                        dispatcher.handle_message(_message("second"))))
+                    siblings.append(
+                        asyncio.create_task(dispatcher.handle_message(_message("second")))
+                    )
                     await asyncio.sleep(0)
                     assert len(dispatcher._routing_locks["c1"][1]) == 2
-                    siblings.append(asyncio.create_task(
-                        dispatcher.handle_message(_message("third"))))
+                    siblings.append(
+                        asyncio.create_task(dispatcher.handle_message(_message("third")))
+                    )
                     await asyncio.wait_for(third_in_governance.wait(), timeout=1)
                 elif detached_sends == 2:
                     release_third.set()
             return await real_send(channel_id, text, **kwargs)
+
         client.send_message = _gate_waiters  # type: ignore[method-assign]
         await dispatcher.handle_message(_message("first"))
         assert len(siblings) == 2
@@ -1650,7 +2124,8 @@ class TestBindingLostUnderTheConversation:
         dispatcher, client, sessions = _dispatcher({"u1"}, _log("Launch plan"))
         monkeypatch.setitem(
             dispatcher.handle_message.__globals__,
-            "channel_inbound_permitted", client.is_thread_channel,
+            "channel_inbound_permitted",
+            client.is_thread_channel,
         )
         store = dispatcher._session_resume._expectations
         for channel in ("c1", "c2"):
@@ -1676,6 +2151,7 @@ class TestBindingLostUnderTheConversation:
                 finally:
                     c2_routed.set()
             return await real_send(channel_id, text, **kwargs)
+
         dispatcher._session_resume.route = _signal_when_c2_routes  # type: ignore[method-assign]
         client.send_message = _park_first_send_until_c2_routes  # type: ignore[method-assign]
         await asyncio.gather(
@@ -1694,10 +2170,11 @@ class TestExpectationStoreInvariants:
         self, monkeypatch
     ) -> None:
         from kiro_crew.security import is_sensitive_path
+
         restricted: list[str] = []
         pc = resume_expectation.platform_compat
         monkeypatch.setattr(pc, "restrict_to_owner", restricted.append)
-        store = resume_expectation.ResumeExpectations()
+        store = resume_expectation.ResumeExpectations("discord")
         await store.record("c1", "dashboard:chat-1", "Launch plan")
         assert restricted, "the record was written without restricting it to its owner"
         path = store._loaded_from
@@ -1710,7 +2187,9 @@ class TestExpectationStoreInvariants:
     # Read inbound and written from the picker, both ON the loop, so the recorded
     # threads are the real filesystem helpers' -- not one mocked call.
     @pytest.mark.asyncio
-    async def test_every_store_filesystem_helper_runs_off_the_loop_thread(self, monkeypatch) -> None:
+    async def test_every_store_filesystem_helper_runs_off_the_loop_thread(
+        self, monkeypatch
+    ) -> None:
         threads: list[int] = []
         for name in ("_resolve", "_write"):
             real = getattr(resume_expectation, name)
@@ -1720,7 +2199,7 @@ class TestExpectationStoreInvariants:
                 return _real(*args, **kwargs)
 
             monkeypatch.setattr(resume_expectation, name, _record)
-        store = resume_expectation.ResumeExpectations()
+        store = resume_expectation.ResumeExpectations("discord")
         loop_thread = threading.get_ident()
         await store.record("c1", "dashboard:chat-1", "Launch plan")
         current = await store.get("c1")
@@ -1739,12 +2218,12 @@ class TestExpectationStoreInvariants:
 
     @pytest.mark.asyncio
     async def test_concurrent_records_do_not_lose_each_other(self) -> None:
-        store = resume_expectation.ResumeExpectations()
+        store = resume_expectation.ResumeExpectations("discord")
         await asyncio.gather(
             store.record("c1", "dashboard:chat-1", "One"),
             store.record("c2", "dashboard:chat-2", "Two"),
         )
-        reloaded = resume_expectation.ResumeExpectations()
+        reloaded = resume_expectation.ResumeExpectations("discord")
         for channel, key in (("c1", "dashboard:chat-1"), ("c2", "dashboard:chat-2")):
             record = await reloaded.get(channel)
             assert record is not None and record.key == key, f"{channel} was lost"
@@ -1766,6 +2245,7 @@ class TestRoutingUnderConcurrentRebinding:
             # The dashboard releasing the conversation mid-decision.
             sessions.clear_mirror_links_at(link)
             return record
+
         store.get = _unlink_during_get  # type: ignore[method-assign]
         await dispatcher.handle_message(_message("what did we decide?"))
         assert sessions.last_key != native, "the message ran natively with no warning"
@@ -1775,10 +2255,20 @@ class TestRoutingUnderConcurrentRebinding:
     @pytest.mark.parametrize(
         "notice, rebind_key, rebind_title, survivor",
         [
-            pytest.param("Detached", "dashboard:chat-1", "Pricing review",
-                         "dashboard:chat-1", id="picker-bind-vs-stale-clear"),
-            pytest.param("Now linked to", "dashboard:chat-2", "Budget",
-                         "dashboard:chat-2", id="third-rebind-vs-stale-adopt"),
+            pytest.param(
+                "Detached",
+                "dashboard:chat-1",
+                "Pricing review",
+                "dashboard:chat-1",
+                id="picker-bind-vs-stale-clear",
+            ),
+            pytest.param(
+                "Now linked to",
+                "dashboard:chat-2",
+                "Budget",
+                "dashboard:chat-2",
+                id="third-rebind-vs-stale-adopt",
+            ),
         ],
     )
     @pytest.mark.asyncio
@@ -1802,16 +2292,18 @@ class TestRoutingUnderConcurrentRebinding:
                     "c1", rebind_key, rebind_title
                 )
             return await real_send(channel_id, text, **kwargs)
+
         client.send_message = _rebind_inside_send  # type: ignore[method-assign]
         await dispatcher.handle_message(_message("what did we decide?"))
         assert fired, "the race never fired -- the test proves nothing"
         current = await dispatcher._session_resume._expectations.get("c1")
-        assert current is not None and current.key == survivor and not current.retired, (
-            "the stale settle overwrote the record written during the send"
-        )
+        assert (
+            current is not None and current.key == survivor and not current.retired
+        ), "the stale settle overwrote the record written during the send"
 
     @pytest.mark.parametrize(
-        "text", ["hello", "!compact", "!stop", "!link"],
+        "text",
+        ["hello", "!compact", "!stop", "!link"],
         ids=["message", "compact", "stop", "link"],
     )
     @pytest.mark.asyncio
@@ -1828,12 +2320,13 @@ class TestRoutingUnderConcurrentRebinding:
             decision = await real_route(channel_id)
             resume.resolve_inbound = _forbidden  # type: ignore[method-assign]
             return decision
+
         resume.route = _route_then_seal  # type: ignore[method-assign]
         await dispatcher.handle_message(_message(text))
         targeted = [key for _verb, key in sessions.targeted]
-        assert all(k == "dashboard:chat-1" for k in targeted), (
-            f"{text} acted on {targeted} instead of the decided session"
-        )
+        assert all(
+            k == "dashboard:chat-1" for k in targeted
+        ), f"{text} acted on {targeted} instead of the decided session"
         if text == "hello":
             assert sessions.last_key == "dashboard:chat-1"
 
@@ -1851,6 +2344,7 @@ class TestRoutingUnderConcurrentRebinding:
             if rebound:
                 sessions.set_mirror_link("dashboard:chat-9", link, accepts_inbound=True)
             return "Launch plan"
+
         resume._title_of = _move_during_title  # type: ignore[method-assign]
         await dispatcher.handle_message(_message("what did we decide?"))
         assert sessions.last_key == "", f"the message ran at all: {sessions.last_key}"
@@ -1875,7 +2369,7 @@ class TestPersistenceFailureIsFailClosed:
 
     @pytest.mark.asyncio
     async def test_the_store_raises_instead_of_reporting_a_lost_write(self, monkeypatch) -> None:
-        store = resume_expectation.ResumeExpectations()
+        store = resume_expectation.ResumeExpectations("discord")
         self._break_writes(monkeypatch)
         with pytest.raises(resume_expectation.ExpectationStoreError):
             await store.record("c1", "dashboard:chat-0", "Launch plan")
@@ -1932,9 +2426,9 @@ class TestPersistenceFailureIsFailClosed:
         edits = [text for _mid, text, _c in client.edits]
         if mode == "claim-lost":
             assert any("Another session just connected" in t for t in edits), edits
-            assert not any("Couldn't save" in t for t in edits), (
-                f"a claim race was reported as a storage failure: {edits}"
-            )
+            assert not any(
+                "Couldn't save" in t for t in edits
+            ), f"a claim race was reported as a storage failure: {edits}"
             return
         assert any("NOT resumed" in t for t in edits), edits
 
@@ -1947,30 +2441,38 @@ class TestPersistenceFailureIsFailClosed:
 
         await dispatcher.handle_message(_message("what did we decide?"))
         await dispatcher.handle_message(_message("again"))
-        assert len([t for t, _ in client.sent if "Detached" in t]) == 2, (
-            "the unpersisted settle was treated as done"
-        )
+        assert (
+            len([t for t, _ in client.sent if "Detached" in t]) == 2
+        ), "the unpersisted settle was treated as done"
         assert sessions.last_key == "", "a refused message ran"
 
-    @pytest.mark.parametrize("payload, loads", [
-            pytest.param('{"c1": {"key": "dashboard:chat-0", "title": "T", "version": 3}}',
-                         True, id="well-formed-row"),
-            pytest.param('{"c1": {"key": "dashboard:chat-0", "title": "T"}}', False,
-                         id="row-missing-version"),
+    @pytest.mark.parametrize(
+        "payload, loads",
+        [
+            pytest.param(
+                '{"c1": {"key": "dashboard:chat-0", "title": "T", "version": 3}}',
+                True,
+                id="well-formed-row",
+            ),
+            pytest.param(
+                '{"c1": {"key": "dashboard:chat-0", "title": "T"}}', False, id="row-missing-version"
+            ),
             pytest.param("{not json", False, id="malformed-json"),
             pytest.param('["c1"]', False, id="wrong-toplevel-shape"),
             pytest.param('{"c1": {"title": "T"}}', False, id="row-missing-key"),
-            pytest.param('{"c1": {"key": "k", "version": "x"}}', False,
-                         id="non-numeric-version"),
+            pytest.param('{"c1": {"key": "k", "version": "x"}}', False, id="non-numeric-version"),
             pytest.param('{"c1": {"key": "k", "version": true}}', False, id="boolean-version"),
-            pytest.param('{"c1": {"key": "k", "version": 1, "retired": "yes"}}',
-                         False, id="non-boolean-retired"),
+            pytest.param(
+                '{"c1": {"key": "k", "version": 1, "retired": "yes"}}',
+                False,
+                id="non-boolean-retired",
+            ),
             pytest.param('{"c1": {"key": "k", "version": "1"}}', False, id="string-version"),
             pytest.param('{"c1": {"key": "k", "version": 1.25}}', False, id="fractional-version"),
             pytest.param(b"\xff\xfe{}", False, id="invalid-utf8-bytes"),
-            pytest.param('{"c1": {"key": "k", "version": 1e999}}', False,
-                         id="infinite-version"),
-    ])
+            pytest.param('{"c1": {"key": "k", "version": 1e999}}', False, id="infinite-version"),
+        ],
+    )
     @pytest.mark.asyncio
     async def test_a_store_that_cannot_be_trusted_is_not_an_empty_store(
         self, payload, loads
@@ -1979,7 +2481,7 @@ class TestPersistenceFailureIsFailClosed:
         natively -- this bug's fail-open form."""
         path = _store_path()
         path.write_bytes(payload) if isinstance(payload, bytes) else path.write_text(payload)
-        store = resume_expectation.ResumeExpectations()
+        store = resume_expectation.ResumeExpectations("discord")
         if loads:
             record = await store.get("c1")
             assert record is not None and record.version == 3
@@ -1991,12 +2493,15 @@ class TestPersistenceFailureIsFailClosed:
 class TestSettlementReconcilesLiveState:
     """Settlement reconciles dashboard rebinds that do not bump store versions."""
 
-    @pytest.mark.parametrize("rebind_keys, expect_second_runs", [
+    @pytest.mark.parametrize(
+        "rebind_keys, expect_second_runs",
+        [
             pytest.param(["dashboard:chat-1"], False, id="different-key"),
             pytest.param(["dashboard:chat-0"], True, id="same-key"),
             pytest.param([], True, id="absent"),
             pytest.param(["dashboard:chat-1", "dashboard:chat-2"], False, id="ambiguous"),
-    ])
+        ],
+    )
     @pytest.mark.asyncio
     async def test_an_owner_arriving_during_the_send_is_never_entered_silently(
         self, rebind_keys, expect_second_runs
@@ -2020,9 +2525,9 @@ class TestSettlementReconcilesLiveState:
         if expect_second_runs:
             assert sessions.last_key != "", "the resend was refused with nothing pending"
         else:
-            assert sessions.last_key == "", (
-                f"the resend entered {sessions.last_key} without a notice"
-            )
+            assert (
+                sessions.last_key == ""
+            ), f"the resend entered {sessions.last_key} without a notice"
             assert "NOT processed" in client.sent[-1][0], client.sent[-1][0]
 
     @pytest.mark.asyncio
@@ -2044,15 +2549,15 @@ class TestSettlementReconcilesLiveState:
         moved = _gate_send(client, "Now linked to", _move_again)
         await dispatcher.handle_message(_message("carry on"))
         assert moved, "the race never fired -- the test proves nothing"
-        assert await dispatcher._session_resume._expectations.get("c1") == before, (
-            "adopted a session whose notice no longer described the live state"
-        )
+        assert (
+            await dispatcher._session_resume._expectations.get("c1") == before
+        ), "adopted a session whose notice no longer described the live state"
         sessions.last_key = ""
         await dispatcher.handle_message(_message("resending"))
         assert sessions.last_key == "", "the resend entered the third owner in silence"
-        assert "Launch plan" in client.sent[-1][0], (
-            f"the notice named a link the user was never in: {client.sent[-1][0]}"
-        )
+        assert (
+            "Launch plan" in client.sent[-1][0]
+        ), f"the notice named a link the user was never in: {client.sent[-1][0]}"
 
     @pytest.mark.parametrize("mode", ["bare", "same-key", "recorded", "adopt-fails"])
     @pytest.mark.asyncio
@@ -2075,6 +2580,7 @@ class TestSettlementReconcilesLiveState:
             if mode == "recorded":
                 await store.record("c1", "dashboard:chat-1", "Pricing review")
             raced.append("c1")
+
         sessions.aflush = _rebind_during_aflush  # type: ignore[method-assign]
         if mode == "adopt-fails":
             real_write = resume_expectation.atomic_write

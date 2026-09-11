@@ -16,6 +16,24 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+# ``SLACK_NAMESPACE`` and ``CHANNEL_SESSION_NAMESPACES`` are RE-EXPORTED from
+# ``kiro_crew.constants``, which is their canonical home, because the roster has
+# readers on both sides of an import cycle. This module is itself stdlib-only, but
+# importing a name FROM it executes ``messaging/__init__.py`` first, which pulls in
+# ``driver`` -> ``acp`` -> ``hooks``; since ``hooks`` -> ``webhooks`` ->
+# ``validation`` is already an edge, a reader like ``validation`` would get a
+# partially-initialized ``hooks``. Readers inside ``messaging`` and its dependents
+# keep importing from here; readers outside it read ``constants`` directly.
+#
+# The semantics are documented at the definition. Summary: every session-key prefix
+# a conversation started OUTSIDE the dashboard can carry, excluding the non-channel
+# namespaces (``dashboard:``, ``cron:``, ``hook:``, ``subagent:``, ``channel:``).
+# ``autonudge._CHANNEL_KEY_PREFIXES`` is a SEPARATE hand-kept copy, not a narrower
+# one -- both hold the same 11 namespaces today. It answers a different question
+# (does this key SHAPE belong to a channel rather than a dashboard slot), so do not
+# assume the two have diverged, and do not assume they are kept in step either.
+from kiro_crew.constants import CHANNEL_SESSION_NAMESPACES, SLACK_NAMESPACE
+
 logger = logging.getLogger(__name__)
 
 #: Slack ts format: ``"{epoch_seconds}.{microseconds}"`` -- pure digits + one dot.
@@ -26,33 +44,6 @@ logger = logging.getLogger(__name__)
 #: conversation), so the input is not guaranteed to be a real timestamp. A real
 #: ts is 10 digits + 6; 20 each leaves an order of magnitude of headroom.
 _SLACK_TS_RE = re.compile(r"\d{1,20}\.\d{1,20}")
-
-SLACK_NAMESPACE = "slack"
-
-#: Session-key namespaces owned by a messaging channel, i.e. every prefix a
-#: conversation started OUTSIDE the dashboard can carry. Slack keys are
-#: ``slack:<thread_ts>``; every other transport uses
-#: ``{channel}:{agent}:{chatType}:{user}[:genN]`` (see
-#: :func:`build_dm_session_key`), plus the ``unified:`` bucket that
-#: ``dm_scope="unified"`` collapses direct DMs into.
-#:
-#: Deliberately excludes the non-channel namespaces that also contain a colon
-#: (``dashboard:``, ``cron:``, ``hook:``, ``subagent:``, ``channel:``) — those
-#: are surfaced by their own owners, not by the channel-session reconciler.
-#:
-#: NOTE: ``autonudge._CHANNEL_KEY_PREFIXES`` is a deliberately NARROWER set —
-#: only the transports that support unattended nudge fires. Do not merge them.
-CHANNEL_SESSION_NAMESPACES: tuple[str, ...] = (
-    SLACK_NAMESPACE,
-    "discord",
-    "telegram",
-    "whatsapp",
-    "webex",
-    "wecom",
-    "teams",
-    "weixin",
-    "unified",
-)
 
 #: Both separators a namespace can be followed by. A live session key uses ``:``;
 #: ``ConversationLog.list_sessions()`` reports the persisted FILENAME STEM, where
@@ -114,6 +105,14 @@ _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
     ("secretary", "secretary"),
     ("side", "side"),
     ("wf-pool", "workflow_pool"),
+    ("wf-author", "workflow_author"),
+    # A workflow STAGE's own session (``wf:<run_id>:<n>``, built by
+    # ``workflows/agent_exec.py``). Listed after the two ``wf-*`` namespaces
+    # above and matched by ``_in_namespace`` on ``wf:``/``wf_`` only, so it
+    # cannot absorb them. Without it every workflow turn reads as ``other``,
+    # pooled with genuinely unrecognised key shapes — which is the one reading
+    # this label set exists to keep separate.
+    ("wf", "workflow"),
     # ``channel:`` is a namespace of its own (reply-token-bound sends), distinct
     # from the per-transport namespaces above.
     ("channel", "channel"),
@@ -123,6 +122,12 @@ _TELEMETRY_LOCAL_PREFIXES: tuple[tuple[str, str], ...] = (
 _TELEMETRY_EXACT_KEYS: dict[str, str] = {
     "_bg": "background",
     "_hb": "heartbeat",
+    # The CLI chat session's fixed key. Present so this function is a strict
+    # SUPERSET of the labels ``validation.infer_use_case`` produced: the turn
+    # histogram switched to this helper to gain the background surfaces, and
+    # losing "cli" in the trade would have renamed an existing series to
+    # "other" — a silent break dressed as a widening.
+    "cli_chat": "cli",
 }
 
 #: A bare dashboard chat-slot key (``chat-12-1785445181``). The token row store
@@ -168,6 +173,13 @@ def telemetry_channel_of(key: str | None) -> str:
             return label
     if _TELEMETRY_CHAT_SLOT_RE.match(key):
         return "dashboard"
+    # A BARE Slack thread_ts key, via the module's own predicate rather than a
+    # fourth spelling of that shape. The rest of the system already treats such a
+    # key as Slack (``canonical_key`` namespaces it), so labelling it ``other``
+    # here would have contradicted them — and Slack is a live surface, so that
+    # would have renamed a real series.
+    if is_legacy_slack_key(key):
+        return SLACK_NAMESPACE
     return "other"
 
 
@@ -235,6 +247,13 @@ UNBIND_REASON_SESSION_DESTROYED = "session_destroyed"
 # rather than its cause.
 UNBIND_REASON_ENTRY_DELETED = "entry_deleted"
 
+# ``SessionMap.prune`` collected the entry as stale: its native session file is
+# gone and the entry held nothing that had to outlive it. Distinct from
+# ``entry_deleted`` because nobody asked for this one — it is the map's own
+# garbage collection, so a binding appearing under this reason says the STALE
+# predicate let a live conversation through rather than that a caller removed it.
+UNBIND_REASON_PRUNED_STALE = "pruned_stale"
+
 #: The closed vocabulary. A reason outside this set is normalized to
 #: ``unspecified`` at the map's choke point, so it can neither fragment the audit
 #: trail nor reach the channel notice's phrasing map as a miss.
@@ -246,6 +265,7 @@ UNBIND_REASONS: frozenset[str] = frozenset(
         UNBIND_REASON_ORIGIN_REBIND,
         UNBIND_REASON_SESSION_DESTROYED,
         UNBIND_REASON_ENTRY_DELETED,
+        UNBIND_REASON_PRUNED_STALE,
     }
 )
 
@@ -353,7 +373,7 @@ def legacy_key(key: str) -> str | None:
     """Return the bare ``thread_ts`` for a ``slack:<thread>`` key, else None."""
     prefix = f"{SLACK_NAMESPACE}:"
     if key.startswith(prefix):
-        rest = key[len(prefix):]
+        rest = key[len(prefix) :]
         if is_legacy_slack_key(rest):
             return rest
     return None
@@ -507,6 +527,63 @@ def release_conversation_location(
     if cleared == 1:
         return "✅ Unlinked.", swept
     return "This conversation wasn't linked.", swept
+
+
+def rebind_conversation_location(
+    sessions: Any,
+    *,
+    key: str,
+    location: ChannelLink,
+    unlink_command: str,
+) -> str:
+    """Re-bind a conversation as its own mirror LOCATION and shape the link reply.
+
+    The in-channel ``/link``, and the exact counterpart of
+    :func:`release_conversation_location`: that one frees the location and returns
+    the unlink reply, this one claims it and returns the link reply. Mirroring is
+    automatic (:func:`bind_origin_mirror` re-asserts it on every turn), so this is
+    the WITHDRAWAL of a previous unlink rather than the only way to turn it on --
+    which makes clearing the opt-out the load-bearing half, since rebinding
+    without it is undone by the next automatic bind check.
+
+    *location* must be the channel's single definition of "this conversation", the
+    same value handed to :func:`bind_origin_mirror` and
+    :func:`release_conversation_location`, because the release matches an occupied
+    location by VALUE. *unlink_command* is how the channel spells its own unlink
+    in chat (``/unlink``, ``` `!unlink` ```), the only per-channel part of the
+    reply.
+
+    One write for the whole sequence: each of these mutations would otherwise
+    rewrite the entire session map, stalling the event loop three times for what
+    is one user-visible action.
+
+    **The claim goes FIRST inside the batch.** ``batched_save`` writes on the way
+    out even when the block raises, so a refusal raised after the opt-out
+    withdrawal would PERSIST that withdrawal for a link that never happened --
+    silently turning mirroring back on. ``set_mirror_link`` refuses before it
+    mutates anything, so ordering it first leaves the batch clean and nothing is
+    written.
+
+    Raises ``ConversationOwnershipConflict`` (by that type, from
+    ``session_map``) when an inbound-committed occupant holds the location. It is
+    deliberately NOT caught here: a channel whose transport declares
+    ``supports_session_resume`` has a conversation-specific instruction to give
+    the user, and a channel that cannot reach the state should not carry a
+    handler for it.
+    """
+    with sessions.batched_save():
+        sessions.set_mirror_link(key, location, reason=UNBIND_REASON_ORIGIN_REBIND)
+        sessions.set_mirror_opt_out(key, False)
+        # Drop any pre-unification row so a stale binding cannot outlive the
+        # rebind (reads prefer the channel key, but a leftover row would still
+        # answer a clear).
+        sessions.clear_mirror_link(
+            legacy_dashboard_mirror_key(key), reason=UNBIND_REASON_ORIGIN_REBIND
+        )
+    return (
+        "✅ Linked. Replies from the dashboard for this conversation will also "
+        f"show up here. Send {unlink_command} to stop."
+    )
 
 
 def _is_unrouted_slack_placeholder(link: ChannelLink) -> bool:

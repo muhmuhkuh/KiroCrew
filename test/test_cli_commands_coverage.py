@@ -16,9 +16,11 @@ Follows the style already established by ``test_cli.py`` (``argparse.Namespace``
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
 import json
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,9 +29,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew import cli_commands as cc
+from kiro_crew import sel as sel_mod
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, WorkspaceConfig
 from kiro_crew.cron import CronSchedule
 from kiro_crew.eval.scenario import AssertionType
+from kiro_crew.security import BUILTIN_DENIED_RULES
+from kiro_crew.vector_memory import LessonWriteOutcome, LessonWriteResult
 
 # ── helpers ──
 
@@ -38,7 +43,9 @@ def _ns(**kw: Any) -> argparse.Namespace:
     return argparse.Namespace(**kw)
 
 
-def _http_error(code: int, body: bytes | None = None, reason: str = "Boom") -> urllib.error.HTTPError:
+def _http_error(
+    code: int, body: bytes | None = None, reason: str = "Boom"
+) -> urllib.error.HTTPError:
     """Build an ``HTTPError`` whose ``.read()`` yields *body*."""
     fp = io.BytesIO(body if body is not None else b"")
     return urllib.error.HTTPError("http://localhost/x", code, reason, {}, fp)  # type: ignore[arg-type]
@@ -87,19 +94,42 @@ def _cfg_with(
     return cfg
 
 
+def _seed_doc_file(tmp_path: Path, cfg: KiroCrewConfig) -> Path:
+    """Materialize *cfg* as a real config.json for the locked-delta writers.
+
+    The CLI CRUD commands no longer mutate the loaded snapshot and ``save()``
+    it -- they write a delta on the document read inside the sidecar flock
+    (#4767 round 7), so tests that check persistence must seed and read the
+    FILE, not the in-memory dataclass.
+    """
+    doc = {
+        "workspaces": {n: dataclasses.asdict(w) for n, w in cfg.workspaces.items()},
+        "agents": {n: dataclasses.asdict(a) for n, a in cfg.agents.items()},
+        "agent": {"default_agent": cfg.default_agent},
+    }
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps(doc), encoding="utf-8")
+    return p
+
+
+def _read_doc(p: Path) -> dict:
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
 # ── _internal_secret / _format_schedule ──
 
 
 class TestSmallHelpers:
     def test_internal_secret_reads_file(self, tmp_path: Path) -> None:
         (tmp_path / ".local_secret").write_text("  s3cr3t\n", encoding="utf-8")
-        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._internal_secret() == "s3cr3t"
+        with patch("kiro_crew.cli_commands.read_local_secret", return_value="s3cr3t") as read:
+            assert cc._internal_secret(6123) == "s3cr3t"
+        read.assert_called_once_with(6123)
 
     def test_internal_secret_missing_file_is_empty(self, tmp_path: Path) -> None:
         """A missing secret must yield "" so the server answers 403, not a crash."""
-        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._internal_secret() == ""
+        with patch("kiro_crew.cli_commands.read_local_secret", return_value=""):
+            assert cc._internal_secret(6123) == ""
 
     def test_format_schedule_non_schedule_falls_back_to_str(self) -> None:
         assert cc._format_schedule("weekly-ish") == "weekly-ish"
@@ -153,8 +183,12 @@ class TestWorkspaceDirGuard:
 
 
 class TestSpawnCli:
-    def test_list_prints_agents_with_status_glyphs(self, capsys: pytest.CaptureFixture[str]) -> None:
-        payload = {"agents": [{"id": "a1", "task": "do x", "done": True}, {"id": "a2", "task": "y"}]}
+    def test_list_prints_agents_with_status_glyphs(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        payload = {
+            "agents": [{"id": "a1", "task": "do x", "done": True}, {"id": "a2", "task": "y"}]
+        }
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value="s"),
             patch("kiro_crew.cli_commands.loopback_urlopen", return_value=_FakeResponse(payload)),
@@ -166,7 +200,10 @@ class TestSpawnCli:
     def test_list_empty_says_so(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", return_value=_FakeResponse({"agents": []})),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen",
+                return_value=_FakeResponse({"agents": []}),
+            ),
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
         assert "No subagents." in capsys.readouterr().out
@@ -189,7 +226,9 @@ class TestSpawnCli:
     ) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", side_effect=_http_error(503, b"<html>")),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen", side_effect=_http_error(503, b"<html>")
+            ),
             pytest.raises(SystemExit),
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
@@ -200,7 +239,10 @@ class TestSpawnCli:
     ) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", side_effect=urllib.error.URLError("refused")),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen",
+                side_effect=urllib.error.URLError("refused"),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             cc._spawn(_ns(spawn_action="list", port=4321))
@@ -344,9 +386,7 @@ class TestAppCli:
         out = capsys.readouterr().out
         assert "one" in out and "enabled" in out and "two" in out and "disabled" in out
 
-    def test_enable_success_counts_registrations(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_enable_success_counts_registrations(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch("kiro_crew.cli_commands.enable_app", return_value=_result(True, message="on")),
             patch(
@@ -379,6 +419,30 @@ class TestAppCli:
         dereg.assert_called_once_with("demo")
         assert "off" in capsys.readouterr().out
 
+    def test_disable_flips_the_flag_before_deregistering(self) -> None:
+        """Order is a security control, not cosmetics (#5726 review).
+
+        A running gateway is a DIFFERENT process: it watches this app's backend and
+        re-registers its MCP servers and agents on a health recovery, gated on the
+        enabled flag it reads from installed.json. Deregistering first leaves a window
+        where that flag still says enabled and the resources are already gone — a
+        recovery landing there puts them back for the app being disabled.
+        """
+        order: list[str] = []
+        with (
+            patch("kiro_crew.cli_commands._cleanup_app_crons_from_scheduler"),
+            patch(
+                "kiro_crew.cli_commands.deregister_app",
+                side_effect=lambda n: order.append("deregister"),
+            ),
+            patch(
+                "kiro_crew.cli_commands.disable_app",
+                side_effect=lambda n: order.append("disable") or _result(True, message="off"),
+            ),
+        ):
+            cc._handle_app(_ns(app_action="disable", name="demo"))
+        assert order == ["disable", "deregister"], order
+
     def test_disable_failure_exits_1(self) -> None:
         with (
             patch("kiro_crew.cli_commands._cleanup_app_crons_from_scheduler"),
@@ -398,9 +462,7 @@ class TestAppCli:
         with (
             patch("kiro_crew.cli_commands._cleanup_app_crons_from_scheduler"),
             patch("kiro_crew.cli_commands.deregister_app"),
-            patch(
-                "kiro_crew.cli_commands.uninstall_app", return_value=_result(True)
-            ) as uninstall,
+            patch("kiro_crew.cli_commands.uninstall_app", return_value=_result(True)) as uninstall,
         ):
             cc._handle_app(_ns(app_action="uninstall", name="demo", purge_data=purge))
         uninstall.assert_called_once_with("demo", keep_data=expect_keep_data)
@@ -423,8 +485,45 @@ class TestAppCli:
     def test_dev_off_restores_caching(self, capsys: pytest.CaptureFixture[str]) -> None:
         with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
             cc._handle_app(_ns(app_action="dev", name="demo", off=True))
-        setter.assert_called_once_with("demo", False)
+        setter.assert_called_once_with("demo", False, confirm_out_of_install_root=False)
         assert "dev mode off" in capsys.readouterr().out
+
+    def test_dev_confirmation_refusal_reaches_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The refusal's own text (which names the CLI flag) is printed as-is."""
+        refusal = {
+            "error": "needs confirmation: run `kirocrew app dev demo --confirm-out-of-install-root`",
+            "code": "dev_mode_out_of_install_confirmation_required",
+        }
+        with (
+            patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value=refusal) as setter,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=False, confirm_out_of_install_root=False)
+            )
+        assert exc.value.code == 1
+        assert "--confirm-out-of-install-root" in capsys.readouterr().err
+        setter.assert_called_once_with("demo", True, confirm_out_of_install_root=False)
+
+    def test_dev_confirm_flag_is_forwarded(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=False, confirm_out_of_install_root=True)
+            )
+        setter.assert_called_once_with("demo", True, confirm_out_of_install_root=True)
+
+    def test_dev_confirm_flag_with_off_warns(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The flag only applies to enabling — an ignored flag must say so,
+        not exit 0 looking like a confirmed grant."""
+        with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=True, confirm_out_of_install_root=True)
+            )
+        err = capsys.readouterr().err
+        assert "no effect with --off" in err
+        setter.assert_called_once_with("demo", False, confirm_out_of_install_root=True)
 
     def test_dev_error_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -496,8 +595,12 @@ class TestAppCli:
 class TestRunAppMcpServer:
     def test_missing_module_exits_1_on_stderr(self, capsys: pytest.CaptureFixture[str]) -> None:
         """stdout is the JSON-RPC channel -- diagnostics must go to stderr."""
+        target = "kiro_crew.apps.builtins.my_app.mcp_server"
         with (
-            patch("importlib.import_module", side_effect=ImportError("nope")),
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(f"No module named {target!r}", name=target),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             cc._run_app_mcp_server("my-app")
@@ -505,6 +608,44 @@ class TestRunAppMcpServer:
         assert exc.value.code == 1
         assert captured.out == ""
         assert "my-app" in captured.err
+
+    def test_missing_parent_package_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A ModuleNotFoundError naming a PARENT package of the target is the
+        target being unimportable -- same clean refusal."""
+        parent = "kiro_crew.apps.builtins.my_app"
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(f"No module named {parent!r}", name=parent),
+            ),
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._run_app_mcp_server("my-app")
+        assert exc.value.code == 1
+        assert "my-app" in capsys.readouterr().err
+
+    def test_missing_dependency_inside_module_propagates(self) -> None:
+        """A dependency missing INSIDE mcp_server.py is a real defect: it must
+        keep its traceback, not exit with a misleading 'has no MCP server'."""
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(
+                    "No module named 'some_missing_dep'", name="some_missing_dep"
+                ),
+            ),
+            pytest.raises(ModuleNotFoundError, match="some_missing_dep"),
+        ):
+            cc._run_app_mcp_server("my-app")
+
+    def test_nameless_import_error_propagates(self) -> None:
+        """An ImportError that names no module cannot be attributed to the
+        target -- it must propagate."""
+        with (
+            patch("importlib.import_module", side_effect=ModuleNotFoundError("boom")),
+            pytest.raises(ModuleNotFoundError, match="boom"),
+        ):
+            cc._run_app_mcp_server("my-app")
 
     def test_module_without_runner_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -588,9 +729,15 @@ class TestAgentCli:
         out = capsys.readouterr().out
         assert "default *" in out and "other" in out and "alt" in out
 
-    def test_create_persists_new_agent(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_create_persists_new_agent(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         cfg = _cfg_with(agents={})
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(
                 _ns(
                     agent_action="create",
@@ -600,9 +747,9 @@ class TestAgentCli:
                     memory_store="ms",
                 )
             )
-        assert cfg.agents["new"].kiro_agent == "ka"
-        assert cfg.agents["new"].workspace == "ws"
-        cfg.save.assert_called_once()  # type: ignore[attr-defined]
+        doc = _read_doc(cfg_path)
+        assert doc["agents"]["new"]["kiro_agent"] == "ka"
+        assert doc["agents"]["new"]["workspace"] == "ws"
         assert "Created agent: new" in capsys.readouterr().out
 
     def test_create_duplicate_exits_1_without_saving(
@@ -626,11 +773,15 @@ class TestAgentCli:
         cfg.save.assert_not_called()  # type: ignore[attr-defined]
         assert "already exists" in capsys.readouterr().err
 
-    def test_update_applies_only_provided_fields(self) -> None:
+    def test_update_applies_only_provided_fields(self, tmp_path: Path) -> None:
         cfg = _cfg_with(
             agents={"a": KiroCrewAgentConfig(kiro_agent="old", workspace="ws0", memory_store="m0")}
         )
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(
                 _ns(
                     agent_action="update",
@@ -640,13 +791,18 @@ class TestAgentCli:
                     memory_store=None,
                 )
             )
-        assert cfg.agents["a"].kiro_agent == "new"
-        assert cfg.agents["a"].workspace == "ws0"
-        assert cfg.agents["a"].memory_store == "m0"
+        agent = _read_doc(cfg_path)["agents"]["a"]
+        assert agent["kiro_agent"] == "new"
+        assert agent["workspace"] == "ws0"
+        assert agent["memory_store"] == "m0"
 
-    def test_update_all_fields(self) -> None:
+    def test_update_all_fields(self, tmp_path: Path) -> None:
         cfg = _cfg_with(agents={"a": KiroCrewAgentConfig()})
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(
                 _ns(
                     agent_action="update",
@@ -656,8 +812,12 @@ class TestAgentCli:
                     memory_store="m",
                 )
             )
-        agent = cfg.agents["a"]
-        assert (agent.kiro_agent, agent.workspace, agent.memory_store) == ("k", "w", "m")
+        agent = _read_doc(cfg_path)["agents"]["a"]
+        assert (agent["kiro_agent"], agent["workspace"], agent["memory_store"]) == (
+            "k",
+            "w",
+            "m",
+        )
 
     def test_update_missing_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         cfg = _cfg_with(agents={})
@@ -677,13 +837,19 @@ class TestAgentCli:
         assert exc.value.code == 1
         assert "not found" in capsys.readouterr().err
 
-    def test_delete_removes_non_default(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_delete_removes_non_default(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         cfg = _cfg_with(
             agents={"default": KiroCrewAgentConfig(), "spare": KiroCrewAgentConfig()},
         )
-        with patch.object(KiroCrewConfig, "load", return_value=cfg):
+        cfg_path = _seed_doc_file(tmp_path, cfg)
+        with (
+            patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
+        ):
             cc._handle_agent(_ns(agent_action="delete", name="spare"))
-        assert "spare" not in cfg.agents
+        assert "spare" not in _read_doc(cfg_path)["agents"]
         assert "Deleted agent: spare" in capsys.readouterr().out
 
     def test_delete_default_is_refused(self, capsys: pytest.CaptureFixture[str]) -> None:
@@ -742,16 +908,18 @@ class TestWorkspaceCopyFrom:
         (src / "memory").mkdir(parents=True)
         (src / "memory" / "notes.md").write_text("hi", encoding="utf-8")
         cfg = self._base()
+        cfg_path = _seed_doc_file(tmp_path, cfg)
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
             patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
             patch("kiro_crew.cli_commands.sel"),
         ):
             cc._handle_workspace(
                 _ns(workspace_action="create", name="copy1", dir=None, copy_from="src")
             )
         assert (tmp_path / "workspace-copy1" / "memory" / "notes.md").read_text() == "hi"
-        assert cfg.workspaces["copy1"].dir == "workspace-copy1"
+        assert _read_doc(cfg_path)["workspaces"]["copy1"]["dir"] == "workspace-copy1"
         assert "Created workspace: copy1" in capsys.readouterr().out
 
     def test_copy_from_skips_sensitive_entries(self, tmp_path: Path) -> None:
@@ -810,15 +978,17 @@ class TestWorkspaceCopyFrom:
     def test_copy_from_missing_source_dir_still_registers(self, tmp_path: Path) -> None:
         """A source workspace with no directory on disk is a config-only copy."""
         cfg = self._base()
+        cfg_path = _seed_doc_file(tmp_path, cfg)
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
             patch.object(KiroCrewConfig, "load", return_value=cfg),
+            patch("kiro_crew.config.loader.config_path", return_value=cfg_path),
             patch("kiro_crew.cli_commands.sel"),
         ):
             cc._handle_workspace(
                 _ns(workspace_action="create", name="copy3", dir=None, copy_from="src")
             )
-        assert "copy3" in cfg.workspaces
+        assert "copy3" in _read_doc(cfg_path)["workspaces"]
         assert not (tmp_path / "workspace-copy3").exists()
 
 
@@ -896,6 +1066,48 @@ class TestSecurityCli:
             cc._security(_ns(sec_action="events", limit=5))
         assert "No security events recorded." in capsys.readouterr().out
 
+    def test_events_passes_the_time_window_through(self) -> None:
+        """``-n`` alone cannot express "the last two hours" (issue #4843)."""
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = []
+            cc._security(
+                _ns(sec_action="events", limit=5, since="2026-08-21T00:00:00Z", until="2h")
+            )
+        kwargs = sel.return_value.recent.call_args.kwargs
+        assert kwargs["since"] == datetime(2026, 8, 21, tzinfo=timezone.utc)
+        assert kwargs["until"] is not None and kwargs["until"].tzinfo is not None
+
+    def test_events_rejects_an_unreadable_time(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A typo must not read as "no events in that window"."""
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            with pytest.raises(SystemExit) as exc:
+                cc._security(_ns(sec_action="events", limit=5, since="yesterdayish"))
+        assert exc.value.code == 2
+        assert "cannot read" in capsys.readouterr().out
+        sel.return_value.recent.assert_not_called()
+
+    def test_events_rejects_an_inverted_window(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            with pytest.raises(SystemExit) as exc:
+                cc._security(
+                    _ns(
+                        sec_action="events",
+                        limit=5,
+                        since="2026-08-21T10:00:00Z",
+                        until="2026-08-21T09:00:00Z",
+                    )
+                )
+        assert exc.value.code == 2
+        assert "--since must be earlier than --until" in capsys.readouterr().out
+        sel.return_value.recent.assert_not_called()
+
+    def test_events_names_the_window_when_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = []
+            cc._security(_ns(sec_action="events", limit=5, since="2026-08-21T00:00:00Z"))
+        out = capsys.readouterr().out
+        assert "No security events recorded in [2026-08-21T00:00:00+00:00, now)." in out
+
     def test_events_renders_error_and_downstream(self, capsys: pytest.CaptureFixture[str]) -> None:
         events = [
             {
@@ -916,18 +1128,42 @@ class TestSecurityCli:
         assert "cron.add → allowed" in out and "error: boom" in out and "slack" in out
 
     @pytest.mark.parametrize(
-        ("total", "valid", "expected"),
+        ("total", "valid", "verifiable", "expected"),
         [
-            (0, 0, "No security events to verify."),
-            (3, 3, "HMAC chain intact"),
-            (3, 1, "HMAC chain COMPROMISED"),
+            (0, 0, True, "No security events to verify."),
+            (3, 3, True, "HMAC chain intact"),
+            (3, 1, True, "HMAC chain COMPROMISED"),
+            (
+                5,
+                5,
+                False,
+                "Audit history UNVERIFIABLE: segment directory refused to pin",
+            ),
+            (0, 0, False, "Audit history UNVERIFIABLE"),
+            (
+                5,
+                3,
+                False,
+                "the live log shows tampered entries: 3/5 entries valid",
+            ),
         ],
     )
     def test_verify_reports_chain_state(
-        self, total: int, valid: int, expected: str, capsys: pytest.CaptureFixture[str]
+        self,
+        total: int,
+        valid: int,
+        verifiable: bool,
+        expected: str,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
+        outcome = sel_mod.SelVerification(
+            total=total,
+            valid=valid,
+            history_verifiable=verifiable,
+            reason="" if verifiable else "segment directory refused to pin (planted link?)",
+        )
         with patch("kiro_crew.cli_commands.sel") as sel:
-            sel.return_value.verify_integrity.return_value = (total, valid)
+            sel.return_value.verify_integrity.return_value = outcome
             cc._security(_ns(sec_action="verify"))
         assert expected in capsys.readouterr().out
 
@@ -946,6 +1182,58 @@ def _fake_ceiling() -> Any:
         boot=SimpleNamespace(require_sandbox=True, allow_terminal=False, fail_closed=True),
         controls={"capabilities.telemetry": "off"},
     )
+
+
+class TestParseTimeSelector:
+    """``--since``/``--until`` input handling for ``security events``."""
+
+    def test_empty_means_no_bound(self) -> None:
+        assert cc.parse_time_selector("") is None
+        assert cc.parse_time_selector("   ") is None
+
+    @pytest.mark.parametrize(
+        ("text", "secs"),
+        [("45s", 45), ("30m", 1800), ("2h", 7200), ("7d", 604800), ("1w", 604800 * 1)],
+    )
+    def test_relative_age_counts_back_from_now(self, text: str, secs: int) -> None:
+        now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+        assert cc.parse_time_selector(text, now=now) == now - timedelta(seconds=secs)
+
+    def test_relative_age_is_case_insensitive(self) -> None:
+        now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+        assert cc.parse_time_selector("2H", now=now) == cc.parse_time_selector("2h", now=now)
+
+    def test_iso_instant_with_z_suffix(self) -> None:
+        # fromisoformat only accepts "Z" from 3.11; the package supports 3.10.
+        assert cc.parse_time_selector("2026-08-21T04:00:00Z") == datetime(
+            2026, 8, 21, 4, tzinfo=timezone.utc
+        )
+
+    def test_bare_date_is_read_as_utc(self) -> None:
+        """The audit log is written in UTC.
+
+        Reading a bare date as local time would silently shift the window by the
+        host's offset, so a window that looks right returns the wrong records.
+        """
+        assert cc.parse_time_selector("2026-08-21") == datetime(2026, 8, 21, tzinfo=timezone.utc)
+
+    def test_offset_is_normalized_to_utc(self) -> None:
+        assert cc.parse_time_selector("2026-08-21T10:00:00+02:00") == datetime(
+            2026, 8, 21, 8, tzinfo=timezone.utc
+        )
+
+    def test_unreadable_input_raises_with_the_accepted_forms(self) -> None:
+        with pytest.raises(ValueError, match="relative age"):
+            cc.parse_time_selector("last tuesday")
+
+    def test_an_absurd_but_well_formed_age_raises_instead_of_overflowing(self) -> None:
+        """``timedelta`` overflows before the subtraction.
+
+        Uncaught, that is an OverflowError traceback and exit 1 from a bad flag
+        value -- the CLI must still refuse it as input (exit 2) with guidance.
+        """
+        with pytest.raises(ValueError, match="too far in the past"):
+            cc.parse_time_selector("999999999999999999w")
 
 
 class TestPolicyCli:
@@ -975,18 +1263,30 @@ class TestPolicyCli:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Regression for #3454: an agent's only prior discovery mechanism for
-        the 139 built-in denied-command rules was to attempt one and be
-        refused. `policy show` must surface them even on a standalone
-        (non-enterprise) install, which is the common case the early-return
-        branch serves."""
+        the built-in denied-command rules was to attempt one and be refused.
+        `policy show` must surface them even on a standalone (non-enterprise)
+        install, which is the common case the early-return branch serves.
+
+        The totals are DERIVED from the catalog rather than spelled out: the
+        printer itself derives them, so a literal here would only duplicate
+        the explicit count assertion in ``test_denied_commands_security.py``
+        and rot on every rule that gets added (it did -- the docstring said
+        139 while the catalog held 140)."""
+        by_category: dict[str, int] = {}
+        for rule in BUILTIN_DENIED_RULES:
+            by_category[rule.category] = by_category.get(rule.category, 0) + 1
+        biggest, biggest_n = max(by_category.items(), key=lambda kv: kv[1])
         with patch(
             "kiro_crew.platform.context.current_context",
             return_value=SimpleNamespace(governance=None),
         ):
             cc._policy(_ns(policy_action="show"))
         out = capsys.readouterr().out
-        assert "commands.denied: 139 rules in 10 categories" in out
-        assert "aws-destructive(47)" in out
+        assert (
+            f"commands.denied: {len(BUILTIN_DENIED_RULES)} rules "
+            f"in {len(by_category)} categories"
+        ) in out
+        assert f"{biggest}({biggest_n})" in out
         # Counts only by default -- rule ids are the --ids opt-in.
         assert "aws-destructive-ec2-terminate-instances" not in out
 
@@ -1000,9 +1300,7 @@ class TestPolicyCli:
             cc._policy(_ns(policy_action="show"))
         assert "commands.denied:" in capsys.readouterr().out
 
-    def test_show_ids_lists_rule_ids_per_category(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_show_ids_lists_rule_ids_per_category(self, capsys: pytest.CaptureFixture[str]) -> None:
         # Named --ids, not --verbose: the top-level parser already defines
         # --verbose/-v as an int `count` (log level); a same-named store_true
         # on this subparser would collide via argparse's parent/subparser
@@ -1068,9 +1366,7 @@ class TestPolicyCli:
         assert "bad.json: INVALID→deny-all" in out
         assert "some profiles failed validation" in out
 
-    def test_explain_unknown_scope_lists_catalog(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_explain_unknown_scope_lists_catalog(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch(
                 "kiro_crew.platform.context.current_context",
@@ -1094,9 +1390,7 @@ class TestPolicyCli:
         out = capsys.readouterr().out
         assert "Unknown scope" in out and "capabilities.telemetry" in out
 
-    def test_explain_known_scope_prints_verdicts(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_explain_known_scope_prints_verdicts(self, capsys: pytest.CaptureFixture[str]) -> None:
         decision = SimpleNamespace(
             permitted=False, rule="deny", layer="policy", reason="pinned off"
         )
@@ -1174,9 +1468,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=None
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=None),
         ):
             cc._policy(_ns(policy_action="profile", name="ghost"))
         assert "No profile named 'ghost'" in capsys.readouterr().out
@@ -1193,9 +1485,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof),
         ):
             cc._policy(_ns(policy_action="profile", name="team"))
         out = capsys.readouterr().out
@@ -1209,9 +1499,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof),
         ):
             cc._policy(_ns(policy_action="profile", name="empty"))
         out = capsys.readouterr().out
@@ -1254,21 +1542,53 @@ class _LearnHarness:
 class TestLearnCli:
     def test_add_prefers_vector_store(self, capsys: pytest.CaptureFixture[str]) -> None:
         with _LearnHarness() as h:
-            h.vs.write_lesson.return_value = True
+            h.vs.write_lesson.return_value = LessonWriteResult(LessonWriteOutcome.INSERTED)
             cc._learn(_ns(learn_action="add", rule="do x", category="tool", negative="not y"))
         h.vs.write_lesson.assert_called_once_with("do x", "tool", "not y")
         h.jsonl.save.assert_not_called()
         h.vs.close.assert_called_once()
         assert "Saved: do x (not y) [tool]" in capsys.readouterr().out
 
-    def test_add_falls_back_to_jsonl_store(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_add_does_not_write_jsonl_when_the_store_declines(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """This replaces a test that PINNED the defect (issue #2325).
+
+        It asserted the JSONL fallback fires whenever the vector store returns a
+        falsy value -- which is most often "the lesson is already stored exactly as
+        submitted". So the old contract was: write a duplicate record for a lesson
+        that was fine, and print "Saved:" when nothing needed saving. The declining
+        outcomes are now distinguished, and none of them routes to the other store.
+        """
         with _LearnHarness() as h:
-            h.vs.write_lesson.return_value = False
+            h.vs.write_lesson.return_value = LessonWriteResult(LessonWriteOutcome.UNCHANGED)
             cc._learn(_ns(learn_action="add", rule="do x", category="knowledge", negative=None))
-        h.jsonl.save_or_enrich.assert_called_once()
-        saved = h.jsonl.save_or_enrich.call_args[0][0]
-        assert saved.rule == "do x" and saved.category == "knowledge"
-        assert "Saved: do x [knowledge]" in capsys.readouterr().out
+        h.jsonl.save_or_enrich.assert_not_called()
+        h.jsonl.save.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Already stored, nothing written: do x" in out
+        # The store keeps the stored category on a re-submit, so echoing the submitted
+        # one would show a value it may not hold.
+        assert "[knowledge]" not in out
+
+    def test_add_refusal_exits_non_zero_without_writing_jsonl(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A refusal stored nothing anywhere, so the command must fail loudly.
+
+        Routing it to the JSONL store was the sharper half of the defect: that store
+        validates no content, so a value the vector store rejected landed there and
+        the context builder reads it whenever the vector store holds no lessons.
+        """
+        with _LearnHarness() as h:
+            h.vs.write_lesson.return_value = LessonWriteResult(
+                LessonWriteOutcome.REFUSED, "injection_blocked"
+            )
+            with pytest.raises(SystemExit) as exc:
+                cc._learn(_ns(learn_action="add", rule="do x", category="knowledge", negative=None))
+        assert exc.value.code == 1
+        h.jsonl.save_or_enrich.assert_not_called()
+        assert "NOT saved" in capsys.readouterr().err
 
     def test_list_from_vector_store(self, capsys: pytest.CaptureFixture[str]) -> None:
         with _LearnHarness() as h:
@@ -1410,6 +1730,34 @@ class TestMemoryCli:
         assert "Semantic: 3 active, 1 deleted" in out
         assert "Embedded: 7/7" in out
         assert "FAISS accelerator: 10 vectors indexed" in out
+
+    def test_stats_reports_read_volume_labelled_as_this_process(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The CLI builds its own store, so the totals must not read as lifetime."""
+        with _MemHarness() as h:
+            h.store.memory_stats.return_value = {
+                "semantic_active": 3,
+                "semantic_deleted": 0,
+                "episodic_active": 7,
+                "episodic_deleted": 0,
+                "faiss_index_size": 0,
+                "events_count": 4,
+                "embedded_count": 7,
+                "faiss_available": False,
+            }
+            h.store.read_counters.return_value = {
+                "statements_executed": 9,
+                "rows_read": 40,
+                "semantic_rows_read": 12,
+                "semantic_full_scans": 2,
+                "episodic_rows_read": 21,
+                "episodic_full_scans": 3,
+            }
+            cc._memory_cmd(_ns(mem_action="stats"))
+        out = capsys.readouterr().out
+        assert "Reads (this process): 40 rows over 9 statements" in out
+        assert "population scans: semantic 2 (12 rows), episodic 3 (21 rows)" in out
 
     def test_stats_without_faiss_reports_fallback_not_zero_vectors(
         self, capsys: pytest.CaptureFixture[str]
@@ -1591,6 +1939,244 @@ class TestArtifactCli:
                 )
             )
         assert "Saved: slug=new version=1" in capsys.readouterr().out
+
+    def test_save_warns_when_the_slug_was_suffixed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `save` has no --slug, so a colliding name silently lands a NEW
+        # artifact at a suffixed slug while the canonical one keeps its old
+        # content. The warning has to name both the taken slug and the verb
+        # that versions in place.
+        with _ArtifactHarness(
+            [
+                _FakeResponse(
+                    {
+                        "slug": "run-summary-2",
+                        "version": 1,
+                        "slug_collided_with": "run-summary",
+                    }
+                )
+            ]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Run Summary",
+                    content="corrected",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=run-summary-2 version=1" in captured.out
+        assert "run-summary" in captured.err
+        assert "kirocrew artifact update run-summary" in captured.err
+
+    def test_save_is_silent_when_the_slug_was_free(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with _ArtifactHarness([_FakeResponse({"slug": "fresh", "version": 1})]):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Fresh",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=fresh version=1" in captured.out
+        assert captured.err == ""
+
+    def test_save_forwards_an_explicit_slug(self) -> None:
+        with _ArtifactHarness([_FakeResponse({"slug": "chosen", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Chosen",
+                    slug="chosen-by-hand",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        assert body["slug"] == "chosen-by-hand"
+
+    def test_save_forwards_an_empty_explicit_slug(self) -> None:
+        # "" is a slug the caller named, not a request to derive one. Filtering it
+        # out would silently route an explicit save into the derive-and-suffix
+        # branch — the exact asymmetry this flag exists to close.
+        with _ArtifactHarness([_FakeResponse({"slug": "x", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Empty Slug",
+                    slug="",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        assert "slug" in body
+        assert body["slug"] == ""
+
+    def test_save_with_an_empty_slug_surfaces_the_refusal(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Forwarding "" is only worth anything if the refusal reaches the caller.
+        # The store rejects it via _validate_slug and the handler answers 400, so
+        # it arrives on the CLI's existing error path — no new error surface.
+        err = _http_error(
+            400,
+            json.dumps({"error": "invalid slug '': must match ^[a-z0-9]..."}).encode(),
+        )
+        with _ArtifactHarness([err]), pytest.raises(SystemExit) as exc:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Empty Slug",
+                    slug="",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "invalid slug" in captured.err
+        assert captured.out == ""
+
+    def test_save_omits_the_slug_key_when_none_was_given(self) -> None:
+        # An ABSENT flag must send no key at all. Forwarding it as "" would hand
+        # the store a slug it refuses, so every plain `save` would start failing;
+        # only an explicitly-passed value may reach the request body.
+        with _ArtifactHarness([_FakeResponse({"slug": "derived", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Derived",
+                    slug=None,
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        # Positive control: this is the save request body, so the absence below
+        # is a fact about the field and not about a request that never went out.
+        assert body["name"] == "Derived"
+        assert "slug" not in body
+
+    def test_save_with_a_taken_slug_reports_the_conflict(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The store refuses an explicit slug rather than suffixing it, so the
+        # handler answers 409. It has to reach the caller as the named condition
+        # and a non-zero exit, never a traceback.
+        err = _http_error(409, json.dumps({"error": "artifact already exists: taken"}).encode())
+        with _ArtifactHarness([err]), pytest.raises(SystemExit) as exc:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Taken",
+                    slug="taken",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "artifact already exists: taken" in captured.err
+        assert captured.out == ""
+
+    def test_save_with_an_explicit_slug_emits_no_suffix_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The warning advises `artifact update`, which is wrong guidance for a
+        # caller who named the slug: they get a 409, never a rename. The CLI must
+        # therefore key it on the server's field alone and not on the flag being
+        # set. The server half — an explicit slug reporting no collision — is
+        # pinned in test_artifacts_handlers.py.
+        with _ArtifactHarness([_FakeResponse({"slug": "chosen-by-hand", "version": 1})]):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Run Summary",
+                    slug="chosen-by-hand",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=chosen-by-hand version=1" in captured.out
+        assert captured.err == ""
+
+    def test_save_relays_the_theme_contrast_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The gateway computes the verdict (same relay pattern as
+        # slug_collided_with); the CLI must surface it — this direct-POST
+        # path is the one the motivating incident traveled, which the
+        # MCP-layer hint alone never covered.
+        with _ArtifactHarness(
+            [_FakeResponse({"slug": "perf", "version": 1, "theme_contrast_warning": True})]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Perf",
+                    content='<div style="color:#111">x</div>',
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=perf version=1" in captured.out
+        assert "theme variables" in captured.err
+
+    def test_update_relays_the_theme_contrast_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with _ArtifactHarness(
+            [_FakeResponse({"slug": "perf", "version": 2, "theme_contrast_warning": True})]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="update",
+                    slug="perf",
+                    content='<body style="background:#fffbe6">x</body>',
+                    content_file=None,
+                    name=None,
+                    description=None,
+                    tags=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Updated: slug=perf version=2" in captured.out
+        assert "theme variables" in captured.err
 
     def test_save_reads_content_file(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -2152,3 +2738,50 @@ class TestRunEval:
             await cc._run_eval(_ns(all_scenarios=False, scenarios=None, judge=True))
         h.judge.judge_turn.assert_not_awaited()
         assert turn.assertion_results[0][1] is False
+
+
+class TestDevConfirmFlagNoAbbreviation:
+    """The dev subparser must reject flag abbreviations (#7169 review).
+
+    The builtin agent deny rule for `--confirm-out-of-install-root` matches
+    the flag's LITERAL text, but argparse's default `allow_abbrev=True` would
+    accept `--confirm` (or `--c`) as the same flag — an agent shell could then
+    supply the operator attestation in a spelling the rule never sees. The
+    `dev` subparser is built with `allow_abbrev=False`, so only the exact
+    flag parses and the substring rule stays sufficient.
+    """
+
+    def test_abbreviated_confirm_flag_is_rejected(self, capsys) -> None:
+        import sys
+        from unittest.mock import patch
+
+        for abbrev in ("--confirm", "--confirm-out-of-install-roo", "--c"):
+            argv = ["kirocrew", "app", "dev", "demo", abbrev]
+            with (
+                patch.object(sys, "argv", argv),
+                patch("kiro_crew.cli_commands._handle_app") as handler,
+            ):
+                from kiro_crew.cli import main
+
+                with pytest.raises(SystemExit) as exc:
+                    main()
+                assert exc.value.code == 2, f"{abbrev} did not exit 2"
+                handler.assert_not_called()
+            err = capsys.readouterr().err
+            assert "unrecognized arguments" in err, f"{abbrev}: {err!r}"
+
+    def test_literal_confirm_flag_still_parses(self) -> None:
+        import sys
+        from unittest.mock import patch
+
+        argv = ["kirocrew", "app", "dev", "demo", "--confirm-out-of-install-root"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("kiro_crew.cli_commands._handle_app") as handler,
+        ):
+            from kiro_crew.cli import main
+
+            main()
+            ns = handler.call_args[0][0]
+            assert ns.confirm_out_of_install_root is True
+            assert ns.off is False

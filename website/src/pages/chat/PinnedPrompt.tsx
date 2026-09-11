@@ -14,6 +14,16 @@ interface PinnedPromptProps {
    * whole content was an image pins as an empty card.
    */
   images: string[]
+  /**
+   * True when `fullText` carries content the preview cannot show at all, so the
+   * expand affordance must mount regardless of clamping.
+   *
+   * A pinned nudge is the case: its preview is a short "cycle N" label that never
+   * clamps and it has no images, so neither of the gates below would fire and the
+   * instruction body would be unreachable — the same dead end images already have
+   * an exemption for.
+   */
+  bodyBeyondPreview?: boolean
   /** px to translate up so the incoming prompt pushes this banner out of view. */
   pushUp: number
   /** Measured card height, used to shrink the backing band as the card is pushed. */
@@ -48,25 +58,44 @@ const MORPH_MS = 150
 const MORPH_EASE = 'cubic-bezier(0.2,0,0,1)'
 
 /**
+ * Frame for the prompt's image thumbnails: a solid `bg-muted` plate showing
+ * through the image's own padding. Two things a ring cannot do here:
+ *   - `ring-inset` is painted BELOW an `<img>`'s replaced content, so on an
+ *     opaque image it never shows at all; a 1px outset ring in the border tone
+ *     was measured too faint on the dark card (UX review on #9538: "a black
+ *     square on a dark box that I nearly missed", "looks broken"). The plate is
+ *     a mid-grey in both themes, so a dark screenshot separates from a dark
+ *     card and a white one from a white card regardless of the border tokens.
+ *   - Padding renders the background AROUND the content, so the plate is a
+ *     real frame, not a shadow that an opaque bitmap can cover.
+ * The frame is inside the element's box (sizes below already include it), so
+ * the card's pixel parity with the bubble is untouched.
+ */
+const THUMB_FRAME = 'bg-muted forced-colors:border'
+
+/**
  * The most recent prompt that has scrolled fully behind the band, pinned under
  * the session title.
  *
  * The card is a pixel-for-pixel copy of the user bubble's own box — same
- * `px-4 mx-auto` content column, right-aligned, `max-w-[550px]`, `px-4 py-1.5
- * rounded-xl bg-card text-sm` with an inner `my-1.5 leading-relaxed` paragraph —
+ * `px-4 mx-auto` content column, right-aligned, `max-w-[550px]`, `px-4 py-2
+ * rounded-xl bg-card text-sm` with an inner `my-1 leading-6` paragraph —
  * because the transcript row it represents is hidden while it is pinned (see
  * ChatPage's row `visibility`). For a one-line prompt the two are the same size
  * at the same place at the moment of hand-off, so the bubble appears to stop
  * travelling and stick rather than being replaced. A taller prompt hands over
  * once its bottom edge reaches the band's bottom (`pinHandoffY`), i.e. once it is
- * completely covered by the band, so the swap still happens out of sight. Keep
+ * completely covered by the band, so the swap still happens out of sight. The
+ * box also carries the bubble's `user-bubble` theme hook, so a theme that tints
+ * the bubble (kiro-light) tints the card identically and the swap stays
+ * invisible there too. Keep
  * these values in sync with `UserMessage`'s `bubble` and with `MD_COMPONENTS.p`
  * in MarkdownRenderer.
  *
  * Deliberate details that protect that equality:
  *   - No `border`. The bubble has none, so a 1px border made the card 2px taller
  *     and shifted its text 1px off the edge — the box visibly changed size as it
- *     pinned. The visible edge is an INSET RING (`ring-1 ring-inset`) instead: it
+ *     pinned. The visible edge is an INSET RING (`ring-1 ring-inset forced-colors:border`) instead: it
  *     is painted as a box-shadow, so it reads as a 1px border at zero layout
  *     cost. Do not swap it back to `border-*`.
  *     Pair it with `shadow-sm`, NOT `shadow-md`: the `--shadow-md` token carries
@@ -97,7 +126,7 @@ const MORPH_EASE = 'cubic-bezier(0.2,0,0,1)'
  *     image used to pin as a blank card.
  */
 export default function PinnedPrompt({
-  text, fullText, images, pushUp, bannerH, expanded, onToggleExpanded, onJump, cardRef, onCollapsedHeight,
+  text, fullText, images, bodyBeyondPreview, pushUp, bannerH, expanded, onToggleExpanded, onJump, cardRef, onCollapsedHeight,
 }: PinnedPromptProps) {
   const textRef = useRef<HTMLParagraphElement | null>(null)
   const boxRef = useRef<HTMLDivElement | null>(null)
@@ -201,7 +230,7 @@ export default function PinnedPrompt({
   // exists to preserve. Widening the box is not a concern in that case: parity with
   // the bubble is already unattainable for a prompt whose bubble is a full-size
   // image, and a clamped prompt has by definition already hit its max width.
-  const showChevron = clamped || images.length > 0 || expanded
+  const showChevron = clamped || images.length > 0 || bodyBeyondPreview || expanded
 
   return (
     <div
@@ -237,21 +266,22 @@ export default function PinnedPrompt({
         className="pointer-events-auto max-w-[550px] min-w-0"
         style={{ transform: `translateY(${-pushUp}px)`, willChange: 'transform' }}
       >
-        <div ref={boxRef} className="flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 ring-inset ring-border shadow-sm px-4 py-1.5 text-sm">
+        <div ref={boxRef} className="user-bubble flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 ring-inset forced-colors:border ring-border shadow-sm px-4 py-2 text-sm">
           <button
             type="button"
             onClick={onJump}
-            title={i18nT('pages.chat.pinnedPrompt.jump_to_this_prompt')}
+            title={i18nT('pages.chat.pinnedPrompt.jump_to_this_turn')}
             className="min-w-0 flex-1 bg-transparent border-none p-0 m-0 text-left cursor-pointer"
           >
             {/* Expanded: images get their own strip at readable size, outside the
                 scrollable <p> so they stay put while long text scrolls. */}
             {expanded && shown.length > 0 && (
-              <span className="flex flex-wrap gap-1.5 my-1.5">
+              <span className="flex flex-wrap gap-2 my-1">
                 {shown.map(src => (
+                  // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
                   <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
                     onError={() => markFailed(src)}
-                    className="h-20 w-auto max-w-[160px] rounded object-cover ring-1 ring-inset ring-border" />
+                    className={`h-20 w-auto max-w-[160px] rounded object-cover p-0.5 ${THUMB_FRAME}`} />
                 ))}
               </span>
             )}
@@ -260,13 +290,13 @@ export default function PinnedPrompt({
                 completely — the strip is skipped and `fullText` is '' — so the
                 chevron's reward would be a blank box. */}
             {expanded && !fullText && images.length > 0 && shown.length === 0 && (
-              <span className="flex my-1.5">
+              <span className="flex my-1">
                 <ImageOff size={28} aria-hidden className="text-muted" />
               </span>
             )}
             <p
               ref={textRef}
-              className={`my-1.5 leading-relaxed ${expanded ? 'whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto' : 'overflow-hidden'}`}
+              className={`my-1 leading-6 ${expanded ? 'whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto' : 'overflow-hidden'}`}
               style={expanded ? { overflowWrap: 'anywhere' } : {
                 // Tailwind ships `line-clamp-<n>` only for a literal n, and the
                 // line count is shared with the geometry module — so set the clamp
@@ -293,9 +323,10 @@ export default function PinnedPrompt({
                   full-size image, and the taller card only moves the hand-off line
                   DOWN (see PINNED_PREVIEW_LINES). */}
               {!expanded && shown.map(src => (
+                // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
                 <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
                   onError={() => markFailed(src)}
-                  className={`inline-block align-middle mr-1.5 rounded-sm object-cover ring-1 ring-inset ring-border ${
+                  className={`inline-block align-middle mr-1.5 rounded-sm object-cover p-px ${THUMB_FRAME} ${
                     text ? 'h-[1.4em] w-[1.4em]' : 'h-[2.8em] w-[3.6em]'}`} />
               ))}
               {/* Every image 404'd (deleted/moved file) AND there is no text: hiding
@@ -315,9 +346,9 @@ export default function PinnedPrompt({
               aria-label={expanded
                 ? i18nT('pages.chat.pinnedPrompt.collapse_pinned_prompt')
                 : i18nT('pages.chat.pinnedPrompt.expand_pinned_prompt')}
-              /* my-1.5 + one line box mirrors the paragraph's own metrics, so the
+              /* my-1 + one line box mirrors the paragraph's own metrics, so the
                  icon centres on the first line and adds no height to the card. */
-              className="shrink-0 my-1.5 h-[1.625em] flex items-center bg-transparent border-none p-0 m-0 text-muted hover:text-text transition-colors cursor-pointer"
+              className="shrink-0 my-1 h-6 flex items-center bg-transparent border-none p-0 m-0 text-muted hover:text-text transition-colors cursor-pointer"
             >
               <ChevronDown
                 size={16}

@@ -17,6 +17,17 @@ import pytest
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.dashboard.chat_runner import _eager_spawn, schedule_eager_spawn
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.session import FirstTurnState
+
+
+@pytest.fixture(autouse=True)
+def _isolate_armed_registry():
+    """Every successful ``_eager_spawn`` registers in the module-global
+    ``_armed_prefetches``; clear it around every test so registrations made
+    by one test can never trigger a spurious over-cap eviction in another."""
+    chat_runner._armed_prefetches.clear()
+    yield
+    chat_runner._armed_prefetches.clear()
 
 
 def _mock_state(slot: _ChatSlot) -> DashboardState:
@@ -175,7 +186,7 @@ class TestEagerSpawn:
         state = _mock_state(slot)
         with patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)):
             await _eager_spawn(state, slot)
-        state.sessions.reset.assert_awaited_once_with("dashboard:t1")
+        state.sessions.reset.assert_awaited_once_with("dashboard:t1", skip_if_busy=True)
         assert slot._pending_reset_history_key is None
         state.sessions.get_or_create.assert_awaited_once()
 
@@ -365,12 +376,12 @@ class TestSpeculativeGetOrCreate:
         key = "dashboard:eager-x"
         _, is_new, resumed = await mgr.get_or_create(key, speculative=True)
         mgr.release(key)
-        assert mgr._sessions[key].is_new is True  # still armed
+        assert mgr._sessions[key].first_turn is FirstTurnState.FRESH  # still armed
         # Real first turn claims via the fast path and consumes.
         _, was_new, _ = await mgr.get_or_create(key)
         mgr.release(key)
         assert was_new is True
-        assert mgr._sessions[key].is_new is False
+        assert mgr._sessions[key].first_turn is FirstTurnState.NOTHING_ARMED
         # A second real turn is not new.
         _, was_new2, _ = await mgr.get_or_create(key)
         mgr.release(key)
@@ -388,7 +399,7 @@ class TestSpeculativeGetOrCreate:
         mgr.release(key)
         await mgr.get_or_create(key, speculative=True)  # fast path, speculative
         mgr.release(key)
-        assert mgr._sessions[key].is_new is True
+        assert mgr._sessions[key].first_turn is FirstTurnState.FRESH
 
     @pytest.mark.asyncio
     async def test_speculative_refuses_resumable_key(self, cfg, tmp_path, monkeypatch):
@@ -444,7 +455,9 @@ class TestSpeculativeGetOrCreate:
         # won-race (or fast) path. The REAL caller must end with the flag.
         _, real_is_new, _ = results["real"]
         assert real_is_new is True
-        assert mgr._sessions[key].is_new is False  # consumed by the real turn
+        assert (
+            mgr._sessions[key].first_turn is FirstTurnState.NOTHING_ARMED
+        )  # consumed by the real turn
 
     @pytest.mark.asyncio
     async def test_cancelled_waiting_claimant_does_not_destroy_the_flag(self, cfg):
@@ -471,8 +484,8 @@ class TestSpeculativeGetOrCreate:
         with pytest.raises(asyncio.CancelledError):
             await waiter
         mgr.release(key)  # eager creator finishes
-        # The cancelled waiter must not have consumed the flag.
-        assert mgr._sessions[key].is_new is True
+        # The cancelled waiter must not have consumed the observation.
+        assert mgr._sessions[key].first_turn is FirstTurnState.FRESH
         _, was_new, _ = await mgr.get_or_create(key)
         mgr.release(key)
         assert was_new is True
@@ -493,13 +506,19 @@ class TestProjectSetWiring:
         state._slots = {slot.key: slot}
         state.push_slots_update = MagicMock()
         state.conversation_log = None  # instance attr; spec= does not provide it
+        # The switch handler re-probes the live session in a no-await window
+        # before the teardown (state.sessions.get_provider); sessions is an
+        # instance attr spec= does not synthesize. None = no live session, so
+        # the re-probe passes and the committed switch proceeds.
+        state.sessions = MagicMock()
+        state.sessions.get_provider = MagicMock(return_value=None)
         app = web.Application()
         app["state"] = state
         app.router.add_post("/api/chat/slots/{slot}/agent", api_chat_slot_agent)
         with (
             patch(
-                "kiro_crew.dashboard.chat_handlers._reset_slot_session",
-                new=AsyncMock(),
+                "kiro_crew.dashboard.chat_handlers._reset_slot_session_or_warn",
+                new=AsyncMock(return_value=True),
             ),
             patch("kiro_crew.dashboard.chat_handlers.save_slot_off_loop", new=AsyncMock()),
             patch("kiro_crew.dashboard.chat_handlers.schedule_eager_spawn") as sched,
@@ -563,7 +582,7 @@ class TestProjectSetWiring:
 
 class TestSpeculativeResumeHandover:
     """Resume prefetch: the speculative_resume opt-in and the one-shot
-    resumed_armed handover, on the real get_or_create paths."""
+    RESUMED first-turn handover, on the real get_or_create paths."""
 
     @pytest.fixture
     def cfg(self):
@@ -613,7 +632,9 @@ class TestSpeculativeResumeHandover:
         _, is_new, _ = await mgr.get_or_create(key, speculative=True, speculative_resume=True)
         mgr.release(key)
         assert is_new is True
-        assert mgr._sessions[key].is_new is True  # still armed for the real turn
+        # Still armed for the real turn — and armed as RESUMED, since the
+        # load restored the transcript.
+        assert mgr._sessions[key].first_turn is FirstTurnState.RESUMED
 
     @pytest.mark.asyncio
     async def test_resumed_observation_armed_and_consumed_by_real_claimant(
@@ -654,13 +675,13 @@ class TestSpeculativeResumeHandover:
         mgr.release(key)
         assert (is_new, resumed) == (True, True)
         sess = mgr._sessions[key]
-        assert sess.is_new is True and sess.resumed_armed is True
+        assert sess.first_turn is FirstTurnState.RESUMED
 
         # Real first turn: receives BOTH observations and consumes them.
         _, was_new, was_resumed = await mgr.get_or_create(key)
         mgr.release(key)
         assert (was_new, was_resumed) == (True, True)
-        assert sess.is_new is False and sess.resumed_armed is False
+        assert sess.first_turn is FirstTurnState.NOTHING_ARMED
 
         # Second real turn: nothing armed.
         _, was_new2, was_resumed2 = await mgr.get_or_create(key)
@@ -677,12 +698,11 @@ class TestSpeculativeResumeHandover:
         key = "dashboard:prefetch-c"
         await mgr.get_or_create(key, speculative=True)
         mgr.release(key)
-        mgr._sessions[key].resumed_armed = True  # as a resume prefetch would set
+        mgr._sessions[key].first_turn = FirstTurnState.RESUMED  # as a resume prefetch would set
         _, is_new, resumed = await mgr.get_or_create(key, speculative=True)
         mgr.release(key)
         assert (is_new, resumed) == (True, True)
-        assert mgr._sessions[key].is_new is True
-        assert mgr._sessions[key].resumed_armed is True
+        assert mgr._sessions[key].first_turn is FirstTurnState.RESUMED
 
     @pytest.mark.asyncio
     async def test_fresh_speculative_create_does_not_arm_resumed(self, cfg):
@@ -694,7 +714,37 @@ class TestSpeculativeResumeHandover:
         key = "dashboard:prefetch-d"
         await mgr.get_or_create(key, speculative=True)
         mgr.release(key)
-        assert mgr._sessions[key].resumed_armed is False
+        # Armed for the real turn, but as FRESH — not a resume it never did.
+        assert mgr._sessions[key].first_turn is FirstTurnState.FRESH
+
+
+class TestIllegalFirstTurnStateUnrepresentable:
+    """The refactor's justification: the old ``is_new``/``resumed_armed``
+    boolean pair's fourth combination — a resume marker armed on an
+    already-claimed session (``is_new=False, resumed_armed=True``), which
+    would silently skip history injection — must have no spelling in the
+    single-field shape."""
+
+    def test_no_state_derives_to_claimed_but_resumed(self) -> None:
+        """Every representable state satisfies the invariant the boolean pair
+        enforced by convention only: resumed implies armed (is_new)."""
+        for state in FirstTurnState:
+            assert not (state.resumed and not state.is_new), (
+                f"{state!r} derives to (is_new=False, resumed=True) — the "
+                "illegal combination the enum exists to make unrepresentable"
+            )
+
+    def test_the_boolean_pair_has_no_spelling_left(self) -> None:
+        """The old fields are gone from ``_Session``: with one field there is
+        no second marker to desynchronize, and the old constructor kwargs are
+        rejected rather than silently accepted."""
+        from kiro_crew.session import _Session
+
+        sess = _Session(provider=AsyncMock())
+        assert not hasattr(sess, "is_new")
+        assert not hasattr(sess, "resumed_armed")
+        with pytest.raises(TypeError):
+            _Session(provider=AsyncMock(), is_new=False, resumed_armed=True)  # type: ignore[call-arg]
 
 
 class TestRemoveIfUnclaimed:
@@ -901,6 +951,83 @@ class TestArmedPrefetchCap:
             await chat_runner._cap_armed_prefetches(sessions, f"dashboard:k{i}")
         sessions.remove_if_unclaimed.assert_awaited_once_with("dashboard:k0")
         assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE
+
+
+class TestFreshSpawnPopulationCap:
+    """FRESH eager sessions count against the live-population cap.
+
+    The cap machinery above only bounds what registers into it. Before this
+    wiring, only the resumed-prefetch path registered, so sequential fresh
+    signals (slot create, agent/project set) stacked one live-but-unclaimed
+    agent process per slot — each with its own MCP servers — until the idle
+    sweep, unbounded by the spawn semaphore (which gates concurrency, not
+    population).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_debounce(self, monkeypatch):
+        monkeypatch.setattr(chat_runner, "_EAGER_SPAWN_DEBOUNCE_SECS", 0)
+
+    @pytest.mark.asyncio
+    async def test_fresh_spawn_registers_in_live_population(self):
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        bindings = MagicMock()
+        bindings.kiro_agent = "kirocrew"
+        bindings.model = ""
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)),
+            patch.object(chat_runner, "resolve_agent_bindings", return_value=bindings),
+        ):
+            await _eager_spawn(state, slot)
+        key = state.sessions.get_or_create.await_args.args[0]
+        assert key in chat_runner._armed_prefetches
+
+    @pytest.mark.asyncio
+    async def test_fresh_spawns_beyond_cap_evict_the_oldest_unclaimed(self):
+        shared_sessions = MagicMock()
+        shared_sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+        shared_sessions.release = MagicMock()
+        shared_sessions.reset = AsyncMock()
+        shared_sessions.remove = AsyncMock()
+        shared_sessions.remove_if_unclaimed = AsyncMock(return_value=True)
+        bindings = MagicMock()
+        bindings.kiro_agent = "kirocrew"
+        bindings.model = ""
+        keys: list[str] = []
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)),
+            patch.object(chat_runner, "resolve_agent_bindings", return_value=bindings),
+        ):
+            for i in range(chat_runner._RESUME_PREFETCH_MAX_LIVE + 1):
+                slot = _ChatSlot(f"t{i}")
+                state = _mock_state(slot)
+                state.sessions = shared_sessions
+                await _eager_spawn(state, slot)
+                keys.append(shared_sessions.get_or_create.await_args.args[0])
+        shared_sessions.remove_if_unclaimed.assert_awaited_once_with(keys[0])
+        assert keys[0] not in chat_runner._armed_prefetches
+        assert len(chat_runner._armed_prefetches) == chat_runner._RESUME_PREFETCH_MAX_LIVE
+
+    @pytest.mark.asyncio
+    async def test_lost_race_does_not_enter_the_population(self):
+        """is_new=False means a real creator owns that session — it must not
+        enter unclaimed accounting where an eviction attempt would target it
+        (the conditional remove makes that attempt a no-op, but the registry
+        slot it burns would let a genuinely unclaimed session survive over
+        the cap)."""
+        slot = _ChatSlot("t1")
+        state = _mock_state(slot)
+        state.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
+        bindings = MagicMock()
+        bindings.kiro_agent = "kirocrew"
+        bindings.model = ""
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)),
+            patch.object(chat_runner, "resolve_agent_bindings", return_value=bindings),
+        ):
+            await _eager_spawn(state, slot)
+        assert not chat_runner._armed_prefetches
 
 
 class TestResumableHint:

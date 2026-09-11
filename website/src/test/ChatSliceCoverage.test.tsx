@@ -29,7 +29,6 @@ import chatReducer, {
   editQueuedMessage,
   fetchHistory,
   hydrateSlotMessages,
-  isStopEvent,
   loadOlderMessages,
   markSubagentApproving,
   mcpAppKey,
@@ -40,6 +39,7 @@ import chatReducer, {
   reorderQueuedMessages,
   requestStop,
   resolveQuestionCard,
+  resumeFromHistory,
   retireStatelessQuestion,
   selectComposerBusy,
   selectContinuable,
@@ -77,6 +77,7 @@ import chatReducer, {
   switchSlot,
   warmSlotCache,
 } from '../store/chatSlice'
+import { isStopEvent } from '../lib/stopEvent'
 import dashboardReducer, { sseSlots } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import instancesReducer from '../store/instancesSlice'
@@ -1003,7 +1004,60 @@ describe('chatSlice thunks', () => {
     await store.dispatch(fetchHistory(true))
     expect(chat(store).history.map(s => s.key)).toEqual(['s1', 's2'])
     expect(chat(store).historyOffset).toBe(2)
-    expect(apiMock.sessions).toHaveBeenLastCalledWith(30, 1)
+    expect(apiMock.sessions).toHaveBeenLastCalledWith(30, 1, false, true)
+  })
+
+  it('asks the server to exclude sessions already open as tabs', async () => {
+    // Older sessions is the complement of the tab list above it. The exclusion
+    // has to happen server-side: historyOffset advances by the row count
+    // received, so dropping rows on the client desynchronises paging.
+    apiMock.sessions.mockResolvedValueOnce({ sessions: [], has_more: false })
+    const store = makeStore()
+    await store.dispatch(fetchHistory(false))
+    expect(apiMock.sessions).toHaveBeenLastCalledWith(30, 0, false, true)
+  })
+
+  it('drops the resumed row from history so the pane stops listing it', async () => {
+    // Resuming turns the row into an open tab, so it leaves the complement.
+    // Keyed on meta.arg.key (the transcript name history is indexed by), not on
+    // payload.key (the slot key the resume returned).
+    apiMock.sessions.mockResolvedValueOnce({
+      sessions: [{ key: 'dashboard_chat-1' }, { key: 'dashboard_chat-2' }],
+      has_more: false,
+    })
+    const store = makeStore()
+    await store.dispatch(fetchHistory(false))
+    expect(chat(store).history.map(s => s.key)).toEqual(['dashboard_chat-1', 'dashboard_chat-2'])
+
+    store.dispatch({
+      type: resumeFromHistory.fulfilled.type,
+      payload: { ok: true, key: 'chat-1', messages: [], hasMore: false, total: 0 },
+      meta: { arg: { key: 'dashboard_chat-1', title: 'Some session' } },
+    })
+    expect(chat(store).history.map(s => s.key)).toEqual(['dashboard_chat-2'])
+    // historyOffset counts rows consumed from the SERVER's list, and the server
+    // drops the resumed row too. Holding the old offset would ask for a window
+    // one past the end of a list that just shrank, skipping an unseen row.
+    expect(chat(store).historyOffset).toBe(1)
+  })
+
+  it('leaves the offset alone when the resumed row was not in the pane', async () => {
+    // A resume from a search hit or the command palette filters nothing here, so
+    // the server's list is unchanged from this client's point of view.
+    apiMock.sessions.mockResolvedValueOnce({
+      sessions: [{ key: 'dashboard_chat-1' }, { key: 'dashboard_chat-2' }],
+      has_more: true,
+    })
+    const store = makeStore()
+    await store.dispatch(fetchHistory(false))
+
+    store.dispatch({
+      type: resumeFromHistory.fulfilled.type,
+      payload: { ok: true, key: 'chat-9', messages: [], hasMore: false, total: 0 },
+      meta: { arg: { key: 'dashboard_chat-9', title: 'Never listed here' } },
+    })
+    expect(chat(store).history).toHaveLength(2)
+    expect(chat(store).historyOffset).toBe(2)
   })
 
   it('ignores a refresh or a warm that raced an active-slot change', async () => {
@@ -1073,7 +1127,7 @@ describe('chatSlice thunks', () => {
     store.dispatch(sseToolActivity({ slot: 'front', tool: 'grep', kind: 'tool', purpose: '', input_preview: '' }))
 
     await store.dispatch(switchSlot('back'))
-    expect(chat(store).activityTab).toBe('files')
+    expect(chat(store).activityTab).toBe('changes')
     expect(chat(store).activityOpen).toBe(false)
     expect(chat(store).toolLog).toEqual([])
 
@@ -1112,6 +1166,94 @@ describe('chatSlice thunks', () => {
     expect(chat(store).stopPressedAt.front).toBe(0)
   })
 
+  /* A Stop press the backend answers with `not running` proves the tab's busy
+   * view was stale: a member DM thread (never the active slot) had kept its
+   * Stop button after a `_done` that never reached it, and every press came
+   * back as this no-op with nothing visible happening (#9547). The answer
+   * settles the client's own run state on whichever path holds it. */
+  it('settles a background slot idle when the backend answers a Stop with not running', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true, info: 'not running', already_stopping: false })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    // A chunk frame for a slot that is NOT active marks it streaming in slotRun.
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'wor', seq: 1 }))
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+
+    await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(apiMock.stopChatSlot).toHaveBeenCalledWith('member-a')
+    expect(chat(store).slotRun['member-a']?.state).toBe('idle')
+    // The active mirror belongs to another slot and is untouched.
+    expect(chat(store).activeSlot).toBe('front')
+  })
+
+  it('settles the active slot when its Stop is answered with not running', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true, info: 'not running', already_stopping: false })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'front', role: 'chunk', content: 'wor', seq: 1 }))
+    expect(chat(store).slotState).toBe('streaming')
+
+    await store.dispatch(requestStop({ slotId: 'front', force: false }))
+    expect(chat(store).slotState).toBe('idle')
+    expect(chat(store).slotRunning).toBe(false)
+    expect(chat(store).slotStopping).toBe(false)
+  })
+
+  it('leaves the run state alone when the backend reports a stop already in progress', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true, info: 'stop already in progress', already_stopping: true })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'wor', seq: 1 }))
+    await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+  })
+
+  it('a not-running reply that lands after a NEWER turn started does not idle that turn', async () => {
+    // The reply is delayed until a user frame (a cron/channel injection) has
+    // started a new turn on the slot; the stale answer must be ignored.
+    let release: (v: unknown) => void = () => {}
+    apiMock.stopChatSlot.mockImplementationOnce(() => new Promise((r) => { release = r }))
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'a', seq: 1 }))
+    const pending = store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    // New turn begins while the request is in flight.
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: '_done', content: '' }))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'user', content: 'cron says hi', meta: { mid: 'm-new' } }))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'b', seq: 1 }))
+    release({ ok: true, info: 'not running', already_stopping: false })
+    await pending
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+  })
+
+  it('reports a failed stop request instead of swallowing it', async () => {
+    apiMock.stopChatSlot.mockRejectedValueOnce(new Error('offline'))
+    const store = makeStore()
+    const res = await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(requestStop.fulfilled.match(res)).toBe(true)
+    expect(res.payload).toEqual({ error: 'offline' })
+    // The press stamp is cleared so a retry is not debounced away.
+    expect(chat(store).stopPressedAt['member-a']).toBe(0)
+  })
+
+  it('reports a 2xx refusal (ok:false) as a failed stop', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: false, error: 'could not reach the crew running this session to stop it', code: 'remote_stop_unreachable' })
+    const store = makeStore()
+    const res = await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    expect(res.payload).toEqual({ error: 'could not reach the crew running this session to stop it' })
+    expect(chat(store).stopPressedAt['member-a']).toBe(0)
+  })
+
+  it('leaves the run state alone when a real stop is accepted', async () => {
+    apiMock.stopChatSlot.mockResolvedValueOnce({ ok: true })
+    const store = makeStore()
+    store.dispatch(setActiveSlot('front'))
+    store.dispatch(sseChatMessage({ slot: 'member-a', role: 'chunk', content: 'wor', seq: 1 }))
+    await store.dispatch(requestStop({ slotId: 'member-a', force: false }))
+    // Turn end is owned by the `_done` frame the cancel will produce.
+    expect(chat(store).slotRun['member-a']?.state).toBe('streaming')
+  })
+
   it('keeps the user where they are when a create resolves after they moved', async () => {
     apiMock.createChatSlot.mockImplementation(async () => {
       // The user switches away while the POST is in flight.
@@ -1123,6 +1265,16 @@ describe('chatSlice thunks', () => {
     await store.dispatch(createSlot({ agent: 'kirocrew' }))
     expect(chat(store).creatingSlot).toBe(false)
     expect(chat(store).activeSlot).toBe('elsewhere')
+  })
+
+  it('carries a caller-supplied title on the create request', async () => {
+    // The server pins a title given at create time, locking the background
+    // auto-titler out, and the create broadcast already carries it. A later
+    // rename would paint a generated title first and can fail silently.
+    apiMock.createChatSlot.mockResolvedValue({ key: 'titled-slot' })
+    const store = makeStore()
+    await store.dispatch(createSlot({ folder_id: 'f1', title: '#4237 · a readable name' }))
+    expect(apiMock.createChatSlot.mock.calls[0][5]).toBe('#4237 · a readable name')
   })
 
   it('registers a background create without stealing focus', async () => {
@@ -1144,6 +1296,36 @@ describe('chatSlice thunks', () => {
     const result = await store.dispatch(createSlot({ activate: false, project: '/tmp/wt' }))
     expect(result.type).toBe('chat/createSlot/rejected')
     expect(apiMock.deleteChatSlot).toHaveBeenCalledWith('bg-slot')
+    expect(chat(store).creatingSlot).toBe(false)
+  })
+
+  // An activated create must not publish the slot until the server has
+  // recorded the project: anything observing the optimistic slot earlier
+  // (a roster fetch keyed to it, a turn sent into it) would run against the
+  // default checkout, and a roster cached under the optimistic (slot, project)
+  // identity would never refetch.
+  it('scopes an activated create before publishing the slot', async () => {
+    apiMock.createChatSlot.mockResolvedValue({ key: 'fg-slot' })
+    apiMock.deleteChatSlot.mockResolvedValue({})
+    const store = makeStore()
+    apiMock.chatSlotProject.mockImplementation(async () => {
+      expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('fg-slot')
+      return {}
+    })
+    await store.dispatch(createSlot({ project: '/tmp/wt' }))
+    expect(apiMock.chatSlotProject).toHaveBeenCalledWith('fg-slot', '/tmp/wt')
+    expect(root(store).dashboard.slots.map(s => s.key)).toContain('fg-slot')
+  })
+
+  it('deletes an unscoped activated session rather than publishing it', async () => {
+    apiMock.createChatSlot.mockResolvedValue({ key: 'fg-slot' })
+    apiMock.chatSlotProject.mockRejectedValue(new Error('scope failed'))
+    apiMock.deleteChatSlot.mockResolvedValue({})
+    const store = makeStore()
+    const result = await store.dispatch(createSlot({ project: '/tmp/wt' }))
+    expect(result.type).toBe('chat/createSlot/rejected')
+    expect(apiMock.deleteChatSlot).toHaveBeenCalledWith('fg-slot')
+    expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('fg-slot')
     expect(chat(store).creatingSlot).toBe(false)
   })
 
@@ -1178,7 +1360,7 @@ describe('chatSlice thunks', () => {
     await Promise.resolve()
 
     // The peer's transcript is still in flight...
-    expect(apiMock.chatSlotDetail).toHaveBeenCalledWith('peer')
+    expect(apiMock.chatSlotDetail).toHaveBeenCalledWith('peer', expect.any(Number))
     // ...yet the tab is already gone and focus already moved.
     expect(root(store).dashboard.slots.map(s => s.key)).not.toContain('doomed')
     expect(chat(store).activeSlot).toBe('peer')

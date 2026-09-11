@@ -22,7 +22,7 @@ import shutil
 import signal
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,19 +32,24 @@ import aiohttp
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.env import (
+    MCP_PATH_HINT,
     denied_spec_env_keys,
+    describe_search_path,
     emit_env,
+    mcp_search_path,
     sanitize_spec_env,
     spec_env_path,
     spec_path_key,
 )
 from kiro_crew.hooks import safe_read_file
+from kiro_crew.mcp_grant import grant_observed
 from kiro_crew.mcp_provenance import ABSENT, resolve_write
 from kiro_crew.mcp_utils import kiro_entry_client_id, kiro_entry_scopes, mcp_server_alias
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
     sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -116,16 +121,46 @@ _PROBE_TTL_SECS = 1800
 _unresolvable_warned: set[tuple[str, str]] = set()
 
 
-def _warn_unresolvable_once(name: str, command: str) -> None:
-    """WARNING on first sight of an unresolvable command, DEBUG thereafter."""
+def _unresolved_error(command: str, search_path: str = "") -> str:
+    """The dashboard-facing string for a command that resolved nowhere.
+
+    Names the count of directories searched, because ``command not found`` alone
+    does not distinguish the two causes a reader can act on: the binary is not
+    installed, or it is installed somewhere the search path does not cover. The
+    full directory list goes to the log (:func:`_warn_unresolvable_once`) rather
+    than here -- this string renders in a fixed-width dashboard cell.
+    """
+    if not search_path:
+        return f"command not found: {command}"
+    count = len([d for d in search_path.split(os.pathsep) if d])
+    return (
+        f"command not found: {command} — not in any of the {count} directories "
+        "searched (see the gateway log for the list)"
+    )
+
+
+def _warn_unresolvable_once(name: str, command: str, search_path: str = "") -> None:
+    """WARNING on first sight of an unresolvable command, DEBUG thereafter.
+
+    *search_path* is the PATH actually searched; naming its directories is what
+    lets a reader tell "this install location is not covered" from "this binary
+    does not exist" without reading the source.
+    """
     key = (name, command)
+    searched = f" ({describe_search_path(search_path)})" if search_path else ""
     if key in _unresolvable_warned:
         logger.debug(
             "MCP probe [%s]: command still not found: %s (already reported)", name, command
         )
         return
     _unresolvable_warned.add(key)
-    logger.warning("MCP probe failed [%s]: command not found: %s", name, command)
+    logger.warning(
+        "MCP probe failed [%s]: command not found: %s%s; %s",
+        name,
+        command,
+        searched,
+        MCP_PATH_HINT,
+    )
 
 
 #: Servers whose probe has already reported a missing sandbox backend. Keyed by
@@ -352,6 +387,12 @@ class _ProbeResult:
     # UI can render "as of <time>". Two clocks, one write, no drift.
     probed_at_wall: float = 0.0
     probe_mode: str = "handshake"
+    # Authorization evidence from the probe response. Cached alongside the status
+    # because the panel is served from this cache for the whole TTL — a badge that
+    # only distinguished sign-in state on the one uncached read would spend almost
+    # all of its life showing the vaguer wording.
+    auth_challenge: bool = False
+    auth_grant_present: bool | None = None
 
 
 # Module-level probe cache: server name → result
@@ -403,16 +444,18 @@ def _cache_probe(server: McpServerInfo) -> None:
     _probe_cache[server.name] = _ProbeResult(
         status=server.status,
         tools=list(server.tools),
-        error=redact_mcp_error(server.error, server.headers),
-        probed_at=time.monotonic(),
-        capabilities=(
-            dict(server.capabilities) if isinstance(server.capabilities, dict) else None
+        error=redact_mcp_error(
+            server.error, server.redaction_headers, server.resolved_header_values or ()
         ),
+        probed_at=time.monotonic(),
+        capabilities=(dict(server.capabilities) if isinstance(server.capabilities, dict) else None),
         protocol_version=server.protocol_version,
         server_info=dict(server.server_info),
         tool_annotations=[dict(a) for a in server.tool_annotations],
         probed_at_wall=server.probed_at,
         probe_mode=server.probe_mode,
+        auth_challenge=server.auth_challenge,
+        auth_grant_present=server.auth_grant_present,
     )
 
 
@@ -450,9 +493,7 @@ def _mcp_credential_token_pattern(value: str) -> str:
         try:
             # "%(?:25)*XX" per byte: a literal %XX, or the same escape with its
             # percent sign re-encoded one or more times (%25XX, %2525XX, ...).
-            alternatives.append(
-                "".join(f"%(?:25)*{byte:02X}" for byte in char.encode("utf-8"))
-            )
+            alternatives.append("".join(f"%(?:25)*{byte:02X}" for byte in char.encode("utf-8")))
         except UnicodeEncodeError:
             # A lone surrogate (JSON permits unpaired \uD800 escapes) has no
             # UTF-8 spelling; keep the literal alternative so building the
@@ -473,14 +514,10 @@ def redact_mcp_headers(headers: object) -> dict[str, str]:
     """
     if not isinstance(headers, dict):
         return {}
-    return {
-        name: MCP_REDACTED_HEADER_VALUE
-        for name in headers
-        if isinstance(name, str)
-    }
+    return {name: MCP_REDACTED_HEADER_VALUE for name in headers if isinstance(name, str)}
 
 
-def redact_mcp_error(error: object, headers: object) -> str:
+def redact_mcp_error(error: object, headers: object, extra_values: Iterable[str] = ()) -> str:
     """Scrub credential material from a probe error before it leaves the backend.
 
     Two layers, so every consumer (``to_dict``, the probe cache, the probe
@@ -519,10 +556,22 @@ def redact_mcp_error(error: object, headers: object) -> str:
         if match:
             credential = match.group(1).strip()
             if len(credential) >= _MCP_CREDENTIAL_SUFFIX_MIN_LENGTH:
-                needs_boundary = (
-                    len(credential) < _MCP_CREDENTIAL_UNANCHORED_MIN_LENGTH
-                )
+                needs_boundary = len(credential) < _MCP_CREDENTIAL_UNANCHORED_MIN_LENGTH
                 values.setdefault(credential, needs_boundary)
+
+    # Individually resolved placeholder values (see _expand_header_placeholders):
+    # a PARTIALLY expanded header sends `<resolved>${MISSING}`, so neither the
+    # full sent value nor the Authorization suffix matches a server echoing only
+    # the resolved fragment. Same length regimes as credential suffixes: below
+    # the minimum no boundary rule separates the value from prose words, so it
+    # is skipped rather than corrupting unrelated text.
+    for raw_extra in extra_values:
+        if not isinstance(raw_extra, str):
+            continue
+        extra = raw_extra.strip()
+        if len(extra) < _MCP_CREDENTIAL_SUFFIX_MIN_LENGTH:
+            continue
+        values.setdefault(extra, len(extra) < _MCP_CREDENTIAL_UNANCHORED_MIN_LENGTH)
 
     if not values:
         return error
@@ -558,6 +607,19 @@ class McpServerInfo:
     env: dict[str, str] = field(default_factory=dict)
     url: str = ""
     headers: dict[str, str] = field(default_factory=dict)
+    # The header map the probe actually SENT: config values with ${VAR}/${env:VAR}
+    # references resolved (see :func:`_expand_header_placeholders`). ``None``
+    # until a remote probe runs. Redaction keys on these — an error echoing the
+    # RESOLVED secret carries bytes the configured map never held, and
+    # ``redact_mcp_error``'s layer-2 scrubber matches exact values. Never
+    # serialized: ``to_dict``'s headers block goes through ``redact_mcp_headers``,
+    # which is name-keyed and value-independent.
+    sent_headers: dict[str, str] | None = None
+    # Every placeholder value the probe's expansion resolved, individually —
+    # the extra_values leg of the redact_mcp_error scrub set. A partially
+    # expanded header's sent value would not match a server echoing only the
+    # resolved fragment. Never serialized.
+    resolved_header_values: list[str] | None = None
     # Remote-only OAuth hints carried verbatim to the runtime, which owns the
     # authorization exchange. Kiro Crew never enforces scopes and never registers
     # a client — it only refuses to lose these fields while syncing.
@@ -605,11 +667,38 @@ class McpServerInfo:
     # API payload so a badge can say WHEN it was true — the caches legitimately
     # serve results up to their TTL, and an undated "Online" reads as "now".
     probed_at: float = 0.0
+    # -- authorization state (remote probes only) ---------------------------
+    # True when the probe response carried a recognisable OAuth challenge, False
+    # when it did not. False is genuinely "not known to need OAuth" and not "does
+    # not need it": a server can refuse a tokenless probe without saying why.
+    #
+    # A boolean rather than the scheme name because that is all any consumer asks.
+    # The challenge's scope list and RFC 9728 metadata URL are parsed (they are
+    # what makes the challenge recognisable) but deliberately not carried: nothing
+    # renders them, and an exported field with no reader is surface without a
+    # purpose.
+    auth_challenge: bool = False
+    # Whether the runtime holds a grant for this url: True/False are observations,
+    # None means the lookup could not answer. Only meaningful alongside
+    # ``auth_challenge``; see :func:`_runtime_grant_present`.
+    auth_grant_present: bool | None = None
 
     @property
     def is_remote(self) -> bool:
         """True for Streamable HTTP servers (url-based, no command)."""
         return bool(self.url) and not self.command
+
+    @property
+    def redaction_headers(self) -> dict[str, str]:
+        """The value set a probe error could echo, for ``redact_mcp_error``.
+
+        The headers actually sent when the probe expanded references, else the
+        configured map. The sent map is the COMPLETE scrub set: any configured
+        value that differs post-expansion never left the process unexpanded,
+        so a remote server can only echo the resolved spelling — and a value
+        the expansion left alone is byte-identical in both maps.
+        """
+        return self.headers if self.sent_headers is None else self.sent_headers
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -618,7 +707,9 @@ class McpServerInfo:
             "args": self.args or [],
             "status": self.status,
             "tools": self.tools,
-            "error": redact_mcp_error(self.error, self.headers),
+            "error": redact_mcp_error(
+                self.error, self.redaction_headers, self.resolved_header_values or ()
+            ),
             "source": self.source,
             "presence": dict(self.presence),
             "probeMode": self.probe_mode,
@@ -639,6 +730,18 @@ class McpServerInfo:
                 d["scopes"] = list(self.scopes)
             if self.client_id:
                 d["clientId"] = self.client_id
+            # Gated on ``auth_challenge`` being set, so an absent key means "this
+            # probe learned nothing about authorization" and a present
+            # ``authGrantPresent`` is always a real observation. A client that
+            # cannot tell those apart would render "sign-in required" for every
+            # unprobed remote row.
+            if self.auth_challenge:
+                d["authChallenge"] = True
+                # Omitted when the lookup could not answer, so a client never sees
+                # "couldn't observe" as "observed absent" -- absence renders as the
+                # safe wording, a false would name an action.
+                if self.auth_grant_present is not None:
+                    d["authGrantPresent"] = self.auth_grant_present
         if self.disabled_tools:
             d["disabledTools"] = self.disabled_tools
         if self.disabled:
@@ -680,17 +783,27 @@ def _load_agent_config(*, user_home: Path | None = None) -> dict[str, Any]:
 
     # Installed agent config (always check for mcpServers)
     from kiro_crew.agent import AGENT_FILENAME  # circular import: agent imports mcp_discovery
+    from kiro_crew.agent_discovery import _read_agent_spec
 
     installed = (
         (user_home / ".kiro" / "agents") if user_home else kiro_agents_dir()
     ) / AGENT_FILENAME
     if installed.is_file():
-        try:
-            loaded = json.loads(installed.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                configs.append(loaded)
-        except (json.JSONDecodeError, OSError):
-            pass
+        # The agents dir is user-writable and shared with other tools, so this
+        # goes through the hardened agent-spec reader (size cap,
+        # sensitive-symlink screen, non-object rejection, SEL denial event)
+        # rather than a bare read_text + json.loads. It also closes a hole the
+        # old ``except`` could not: ``encoding="utf-8"`` on a non-UTF-8 spec
+        # raises UnicodeDecodeError, a ValueError rather than an OSError or a
+        # JSONDecodeError, so it escaped this handler entirely. ``None``
+        # degrades as absent, exactly as the swallowed exceptions did.
+        loaded = _read_agent_spec(
+            installed,
+            operation="mcp_discovery_agent_config",
+            source="unknown",
+        )
+        if loaded is not None:
+            configs.append(loaded)
 
     if not configs:
         return {}
@@ -861,6 +974,7 @@ _MANAGED_SERVER_SUBCOMMANDS = {
     "kirocrew-cron": "mcp-cron",
     "kirocrew-computer": "mcp-computer",
     "kirocrew-dashboard": "mcp-dashboard",
+    "kirocrew-work": "mcp-work",
 }
 _MANAGED_SERVER_NAMES = set(_MANAGED_SERVER_SUBCOMMANDS)
 
@@ -872,7 +986,80 @@ _MANAGED_SERVER_TOOL_MODULES = {
     "kirocrew-cron": "kiro_crew.mcp_cron",
     "kirocrew-computer": "kiro_crew.mcp_computer",
     "kirocrew-dashboard": "kiro_crew.mcp_dashboard",
+    "kirocrew-work": "kiro_crew.mcp_work",
 }
+
+
+#: Managed servers that advertise ``kirocrew.caller-identity`` AND are safe to
+#: classify shareable -- the ones consuming the per-call caller block gatewayd
+#: injects instead of reading identity from their own process, whose behaviour
+#: for a caller the gateway CANNOT name is also pooling-safe (refusal, or a
+#: correctly separated namespace). A name absent from this set reads as
+#: session-bound: either it does not consume the block at all, or it is in
+#: ``_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD`` below.
+#:
+#: A NAME SET rather than a runtime read of each module's own constant. Reading the
+#: constant means ``importlib.import_module`` on the request path, which executes
+#: package code the gateway does not otherwise run -- the package directory is
+#: writable by the same uid the agent runs as, so on an editable checkout every
+#: MCP-servers request becomes an execution point for whatever was written there.
+#: The sibling in-process tool read accepts that cost only on the fallback path
+#: where the sandbox could not have confined a spawn anyway; a classification
+#: consulted on every render must not widen it to hosts where the sandbox works.
+#:
+#: The drift this trades for is already covered:
+#: ``test/test_mcp_managed_caller_identity.py`` drives each server's real serve
+#: entry point and asserts this set matches the ``advertise_caller_identity``
+#: argument actually handed to the shim. That check imports the modules in the
+#: TEST process, where running package code is the point rather than a hazard.
+_MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
+    {"kirocrew-core", "kirocrew-cron", "kirocrew-dashboard", "kirocrew-work"}
+)
+
+#: Managed servers that ADVERTISE the capability but are deliberately withheld
+#: from ``_MANAGED_SERVERS_CALLER_AWARE`` — advertising is necessary for the
+#: not-session-bound classification but not sufficient. ``kirocrew-computer``
+#: consumes the injected caller block (its pooled attribution is correct for
+#: every caller the gateway can name), but a caller the gateway CANNOT name
+#: proceeds under ``unresolved:<pid>`` by product decision — and unnamed is the
+#: NORMAL case on macOS, the only platform with a computer-use driver.
+#:
+#: #5322 gave those unnamed callers a per-CONNECTION nonce, so on a CURRENT
+#: gateway they no longer collapse onto one ``SnapshotIndex`` namespace. The
+#: entry stays because that is not the whole precondition. This set feeds
+#: ``managed_server_is_session_bound``, which feeds the shareability verdict,
+#: which ``mcp_gateway/seed.py`` turns into a CONFIG WRITE (``recommend_share``
+#: -> ``apply_seed``): promoting a name here can switch sharing ON for an
+#: operator who never chose it. And the daemon that would then serve those
+#: shared frames is not necessarily the one this code shipped with —
+#: ``mcp_gateway/manager.py`` ADOPTS whatever healthy daemon already holds the
+#: socket, so a gatewayd that outlived a package upgrade keeps running and
+#: injects no nonce (which is exactly why ``REGISTERED_CAPABILITIES`` exists).
+#: Promotion therefore has to wait until a nonce-blind gateway cannot serve a
+#: POOLED computer backend at all — negotiated, not assumed. Tracked as the
+#: #5322 follow-up.
+#:
+#: Contrast ``kirocrew-dashboard``, which refuses an unidentified caller and is
+#: therefore safe to classify shareable regardless of the daemon's generation.
+#: ``test_mcp_managed_caller_identity.py`` pins this so the entry can neither
+#: silently persist past its reason nor silently widen.
+_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD: frozenset[str] = frozenset({"kirocrew-computer"})
+
+
+def managed_server_is_session_bound(name: str) -> bool:
+    """True when *name* is one of ours AND resolves identity from its process.
+
+    The shareability assessment needs this WITHOUT a handshake: on a host where
+    the probe cannot spawn (any Windows host, macOS >= 26) there is no
+    ``initialize`` response to read the capability from, and before the first
+    probe cycle there is none yet either.
+
+    False for anything not managed by Kiro Crew: a third-party server's identity
+    handling is not knowable from here, which is what the pre-flight measures.
+    """
+    if name not in _MANAGED_SERVER_NAMES:
+        return False
+    return name not in _MANAGED_SERVERS_CALLER_AWARE
 
 
 def _managed_tools_in_process(name: str) -> list[str] | None:
@@ -930,9 +1117,11 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
 
     Delegates to :func:`kiro_crew.agent._kirocrew_mcp_invocation`, the single
     source of truth for the managed invocation. That handles every layout:
-    a standalone ``bin/kirocrew`` (POSIX) / ``Scripts\\kirocrew.exe`` (Windows)
-    console script when one resolves, and otherwise the
-    ``<interpreter> -m kiro_crew <sub>`` fallback. Both ``command`` AND ``args``
+    a standalone ``bin/kirocrew`` (POSIX) / ``Scripts\\kirocrew.exe`` (Windows
+    pip install) console script when one resolves, the Windows bundle's
+    ``bin\\kirocrew.cmd`` shim (unwrapped to ``<root>\\python.exe -P -s -m
+    kiro_crew <sub>``), and otherwise the ``<interpreter> -m kiro_crew <sub>``
+    fallback. Both ``command`` AND ``args``
     are rewritten — the fallback needs ``["-m", "kiro_crew", <sub>]``, so
     re-resolving the command alone (the old behavior) silently dropped the args
     and spawned a bare ``kirocrew`` that isn't on PATH (Windows: ``command not
@@ -1078,6 +1267,19 @@ def list_servers() -> list[McpServerInfo]:
                 info = _server_from_spec(name, spec, "mcp.json")
                 info.disabled = True
                 servers[name] = info
+            elif spec.get("disabled") and name not in servers and name in disabled_in_agent:
+                # Switched off from the dashboard: ``/api/mcp/toggle`` writes
+                # ``disabled: true`` into the scope that holds the server AND
+                # onto the agent entry — the agent-side marker is what stops a
+                # running kiro-cli session's server. Step 1 skipped that agent
+                # entry, so without this arm the row would vanish the moment the
+                # user disabled it, leaving nothing to re-enable from. The row is
+                # built from the agent entry, which holds the full spec: the
+                # scope's copy may be the bare ``{"disabled": true}`` stub the
+                # toggle creates for a server it found nowhere else.
+                info = _server_from_spec(name, agent_cfg["mcpServers"][name], "agent")
+                info.disabled = True
+                servers[name] = info
 
             # Per-tool disables: first-scope-wins.  Use "disabledTools" in
             # spec (key presence) rather than truthiness so an explicit
@@ -1174,6 +1376,14 @@ def list_servers() -> list[McpServerInfo]:
         s.error = error
         s.probed_at = probed_at
         s.probe_mode = probe_mode
+        # Read through ``probe_metadata`` rather than widening ``_get_cached``'s
+        # tuple, and taken even from an expired entry: a server that demanded
+        # OAuth an hour ago still demands it, so the wording should not regress
+        # to the vaguer form the moment the TTL lapses.
+        cached = probe_metadata(s.name)
+        if cached is not None:
+            s.auth_challenge = cached.auth_challenge
+            s.auth_grant_present = cached.auth_grant_present
 
     return list(servers.values())
 
@@ -1202,6 +1412,70 @@ async def _read_jsonrpc_response(resp: aiohttp.ClientResponse) -> dict:
     return await resp.json()
 
 
+def _expand_header_placeholders(
+    headers: Mapping[str, str],
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve ``${VAR}`` / ``${env:VAR}`` references in remote-probe header values.
+
+    A static header whose value carries a runtime reference is a documented
+    form (docs/reference/kiro-cli/mcp/configuration.md) that kiro-cli expands
+    at session runtime. Sending the reference as literal text gets the server's
+    correct rejection reported as a failing row — with advice to delete a
+    header that works in every session (issue #9206).
+
+    Delegates to the mcp_gateway rewriter's declared-env expander — same regex,
+    same credential-filtered source view (``is_secret_env_key`` /
+    ``is_credential_env_key`` / ``scrub_agent_denied_env`` names are misses),
+    same "unresolved stays literal" kiro-cli parity — rather than duplicating
+    the policy here: two copies of a credential filter is the drift
+    ``is_secret_env_key``'s own docstring warns against. The import is
+    function-local because ``mcp_gateway.preflight`` / ``evaluate`` import this
+    module at module scope; keeping the rewriter off this module's import graph
+    avoids handing every consumer that never probes the rewriter's imports.
+
+    Returns ``(expanded_headers, resolved_values)``. The second element is
+    every placeholder value that actually resolved, INDIVIDUALLY: a partially
+    expanded value like ``${TOKEN}${MISSING}`` sends ``<resolved>${MISSING}``,
+    so a scrub set keyed on whole sent values would miss a server echoing only
+    the resolved fragment. Each resolved value therefore joins the
+    ``redact_mcp_error`` scrub set on its own (see its ``extra_values``).
+    """
+    from kiro_crew.mcp_gateway.rewriter import (
+        _ENV_VAR_PLACEHOLDER,
+        _expand_env_placeholders,
+        _placeholder_source_env,
+    )
+
+    source = _placeholder_source_env()
+    expanded: dict[str, str] = {}
+    resolved: list[str] = []
+    for name, value in headers.items():
+        if isinstance(value, str):
+            for match in _ENV_VAR_PLACEHOLDER.finditer(value):
+                # The same lookup _expand_env_placeholders performs against the
+                # same source view; a miss stays literal and contributes no
+                # scrub entry (the literal is not a secret).
+                hit = source.get(match.group(1))
+                if hit is not None:
+                    resolved.append(hit)
+            expanded[name] = _expand_env_placeholders(value, source=source)
+        else:
+            expanded[name] = value
+    return expanded, resolved
+
+
+def _header_reference_unresolved(value: object) -> bool:
+    """True when a header value still carries a ``${VAR}`` reference.
+
+    After :func:`_expand_header_placeholders` this means the variable was
+    missing or credential-filtered — either way nothing was dereferenced, so
+    the value is not a credential anything supplied.
+    """
+    from kiro_crew.mcp_gateway.rewriter import _ENV_VAR_PLACEHOLDER
+
+    return isinstance(value, str) and _ENV_VAR_PLACEHOLDER.search(value) is not None
+
+
 def _needs_authorization(
     status_code: int, resp_headers: Mapping[str, str], sent_headers: Mapping[str, str]
 ) -> bool:
@@ -1213,8 +1487,15 @@ def _needs_authorization(
 
     A static ``Authorization`` header in the config is a different case: the
     caller supplied a credential and it was rejected, which is a real error.
+    That premise requires a credential to actually have been supplied — an
+    Authorization value still carrying an unresolved ``${VAR}`` reference
+    (a missing or credential-filtered variable, sent as literal text) supplied
+    nothing, so it does not suppress ``needs_auth``.
     """
-    if any(k.lower() == "authorization" for k in sent_headers):
+    if any(
+        k.lower() == "authorization" and not _header_reference_unresolved(v)
+        for k, v in sent_headers.items()
+    ):
         return False
     if status_code == 401:
         return True
@@ -1223,11 +1504,103 @@ def _needs_authorization(
     return False
 
 
+# A challenge comes from an endpoint that has not authenticated anything yet, so
+# every bound here is on untrusted input.
+_MAX_CHALLENGE_LEN = 2048
+_CHALLENGE_PARAM_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*"([^"]*)"')
+
+
+def _is_bearer_challenge(header_value: str) -> bool:
+    """Whether a ``WWW-Authenticate`` value is a recognisable OAuth challenge.
+
+    A predicate rather than the parsed parts, because recognising the challenge is
+    the whole job: the scope list and the metadata URL are the evidence that this
+    IS one, and nothing downstream renders either. Deliberately not a general RFC
+    9110 auth-param parser — a challenge naming another scheme, or one whose params
+    are unquoted, reads as "not a challenge" and the caller falls back to the
+    status code alone.
+
+    ``resource_metadata`` counts only when it is https. The value is the server's
+    own claim about itself (RFC 9728 §5.1), and an http or javascript URL arriving
+    from an unauthenticated endpoint is not evidence of anything.
+
+    Total by construction: a probe must never fail because of the shape of a
+    header, so anything that is not a string is simply not a challenge.
+    """
+    if not isinstance(header_value, str) or not header_value:
+        return False
+    if len(header_value) > _MAX_CHALLENGE_LEN:
+        return False
+    challenge_parts = header_value.lstrip().split(None, 1)
+    if len(challenge_parts) != 2 or challenge_parts[0].lower() != "bearer":
+        return False
+    params = {k.lower(): v for k, v in _CHALLENGE_PARAM_RE.findall(header_value)}
+    if params.get("resource_metadata", "").lower().startswith("https://"):
+        return True
+    return bool(params.get("scope", "").split())
+
+
+async def _runtime_grant_present(mcp_url: str, name: str) -> bool | None:
+    """Whether the kiro-cli runtime holds an OAuth grant for ``mcp_url``.
+
+    Three-valued on purpose. ``True``/``False`` are observations; **``None`` means
+    the question could not be answered**, and the caller must not let that reach
+    the payload as ``False``. The distinction is load-bearing: "no grant held" is
+    what makes "Sign-in required" honest, so a cache home that cannot be read at
+    all — a permission error, a broken mount — degrades to ``None``, and absence
+    from the payload renders as the safe "Not verified" instead.
+
+    ``None`` does NOT cover artifact-layout drift, and it is worth being exact
+    about that. If kiro-cli re-keys the paths this mirrors, the stat succeeds
+    against a path that simply is not there, so ``grant_presence`` returns
+    ``False`` and an already-authorized server reads "Sign-in required". That row
+    does NOT recover on its own, and a maintainer must not deprioritize the drift
+    on the assumption that it does: a second sign-in mints artifacts under the
+    NEW key while this keeps stat-ing the old one, so the row goes on asking for
+    a sign-in until this mirror is corrected. The recorded-hash tests pin the
+    mirror only against itself, so such a change would not fail in-repo either —
+    catching it needs an observation of an artifact kiro-cli actually wrote.
+
+    The three-valued answer comes from :func:`mcp_grant.grant_presence`, which the
+    persisted connection view resolves through as well -- one spelling of "present,
+    absent, or unknowable", so the two surfaces cannot disagree about the same
+    artifacts, and neither can lose the middle answer.
+
+    The probe holds no token of its own (Kiro Crew stores no credentials), so the
+    runtime's own artifacts are the only evidence available, and they are stat-ed
+    for presence, never read. ``mcp_grant`` is a leaf module for exactly that
+    reason: the derivation is shared with the mint rather than copied, and it
+    carries none of the agent or ACP graph, so this is an ordinary module-scope
+    import with nothing deferred to request time.
+
+    ``name`` is what gets logged, never ``mcp_url``: a user-added endpoint can
+    carry a credential in its userinfo or query string, and this runs for any URL
+    someone typed, not just a vetted one.
+    """
+    # ``audit_absence``: this caller reads once and renders the answer either way,
+    # so an ABSENT grant is acted on just as much as a held one -- it is what turns
+    # the row into "Sign-in required". The mint's polling watcher keeps the
+    # default, where only the acted-on TRUE is recorded.
+    present = await grant_observed(mcp_url, audit_absence=True)
+    if present is None:
+        # ``name``, never ``mcp_url``: a user-added endpoint can carry a credential
+        # in its userinfo or query string, and this line lands in gateway.log.
+        logger.debug("MCP probe [%s]: grant presence unreadable", name)
+    return present
+
+
 async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
     """Probe a remote Streamable HTTP MCP server via POST."""
     server.status = "probing"
     server.probed_at = time.time()
     server.probe_mode = "handshake"
+    # Each probe is the sole authority for its own authorization evidence, so it
+    # starts from zero. ``list_servers`` rehydrates these from the NAME-keyed probe
+    # cache before a re-probe, so a row whose url was edited would otherwise
+    # inherit the previous endpoint's challenge and keep reporting "Sign-in
+    # required" for a server that never asked for one.
+    server.auth_challenge = False
+    server.auth_grant_present = None
     try:
         init_body = {
             "jsonrpc": "2.0",
@@ -1239,8 +1612,15 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
                 "clientInfo": {"name": "kirocrew-probe", "version": "1.0.0"},
             },
         }
+        # Resolve ${VAR}/${env:VAR} references in header VALUES so the probe
+        # presents the same credential the session runtime presents. Stored on
+        # the row because redaction must key on the values that actually left
+        # the process (see McpServerInfo.redaction_headers).
+        server.sent_headers, server.resolved_header_values = _expand_header_placeholders(
+            server.headers
+        )
         hdrs = {
-            **server.headers,
+            **server.sent_headers,
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
@@ -1249,7 +1629,14 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(server.url, json=init_body, headers=hdrs) as resp:
                 if resp.status != 200:
-                    if _needs_authorization(resp.status, resp.headers, server.headers):
+                    # The CHALLENGE is recorded on both outcomes. A rejected
+                    # static credential is still an OAuth server, and that is
+                    # precisely the case where the user most needs to be told the
+                    # token they pasted is the wrong kind of credential.
+                    server.auth_challenge = _is_bearer_challenge(
+                        resp.headers.get("WWW-Authenticate", "")
+                    )
+                    if _needs_authorization(resp.status, resp.headers, server.sent_headers):
                         # A remote OAuth server answers a tokenless probe with
                         # 401 (or 403 + WWW-Authenticate). That is the expected
                         # reply, not a fault: the kiro-cli runtime holds the
@@ -1258,6 +1645,17 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
                         # report "needs_auth" instead of a misleading error.
                         server.status = "needs_auth"
                         server.error = ""
+                        # The GRANT, unlike the challenge, is looked up only on
+                        # this branch. Its sole reader gates on ``needs_auth``, so
+                        # on an error row the stat would run -- and
+                        # ``grant_observed`` could write a critical SEL event --
+                        # for an observation nothing reads, against that helper's
+                        # own rule that the access owing a trail is the one a
+                        # caller ACTS on.
+                        if server.auth_challenge:
+                            server.auth_grant_present = await _runtime_grant_present(
+                                server.url, server.name
+                            )
                     else:
                         server.status = "error"
                         server.error = f"HTTP {resp.status}"
@@ -1324,9 +1722,7 @@ async def _probe_remote(server: McpServerInfo) -> McpServerInfo:
                     _cache_probe(server)
                     return server
                 server.tools = [
-                    name
-                    for t in tools_data
-                    if isinstance(t, dict) and (name := t.get("name", ""))
+                    name for t in tools_data if isinstance(t, dict) and (name := t.get("name", ""))
                 ]
 
         server.status = "ok"
@@ -1478,6 +1874,10 @@ async def probe_server(
         return server
 
     server.status = "probing"
+    # The PATH the spawn will actually search, bound before the try so the
+    # FileNotFoundError handler can name the searched directories regardless of
+    # how far the attempt got.
+    effective_path = ""
     # Stamped at probe START so the early error returns below (which skip the
     # cache) still carry an honest "when": the probe DID run at this time.
     # _cache_probe overwrites it with completion time on the paths it covers.
@@ -1488,6 +1888,7 @@ async def probe_server(
     server.probe_mode = "handshake"
     proc = None
     sandbox_cleanup: str | None = None
+    probe_tmp: "Path | None" = None
     try:
         env = dict(os.environ)
         # The same expression backs command resolution and the PATH emitted into
@@ -1501,24 +1902,28 @@ async def probe_server(
         # "PATH" here would probe with a different path than the session gets.
         _path_key = spec_path_key(server.env)
         _declared_path = server.env.get(_path_key, "") if _path_key else ""
-        env["PATH"] = spec_env_path(_declared_path if isinstance(_declared_path, str) else "")
+        env["PATH"] = mcp_search_path(_declared_path if isinstance(_declared_path, str) else "")
         # The declared env is untrusted config text applied to the environment
         # the SANDBOX LAUNCHER starts under, so loader/interpreter injection
         # keys must not pass through — they would execute before confinement
         # exists. See env.sanitize_spec_env; _note_denied_env explains a
         # resulting failure to the dashboard reader.
-        env.update(
-            sanitize_spec_env(
-                (k, v) for k, v in server.env.items() if k != _path_key
-            )
-        )
+        env.update(sanitize_spec_env((k, v) for k, v in server.env.items() if k != _path_key))
 
         # Resolve command to absolute path using the merged env PATH
-        resolved = shutil.which(server.command, path=env.get("PATH"))
+        effective_path = env.get("PATH") or ""
+        # A command carrying a directory component is not PATH-searched:
+        # ``shutil.which`` looks it up directly and ignores ``path=``. Reporting
+        # ``effective_path`` for it would name directories that were never
+        # consulted, inverting the not-installed/installed-elsewhere distinction
+        # the search-path report exists to draw -- so the report gets "" while
+        # the lookup below still uses the real PATH.
+        reported_path = "" if os.path.dirname(server.command) else effective_path
+        resolved = shutil.which(server.command, path=effective_path)
         if not resolved:
             server.status = "error"
-            server.error = f"command not found: {server.command}"
-            _warn_unresolvable_once(server.name, server.command)
+            server.error = _unresolved_error(server.command, reported_path)
+            _warn_unresolvable_once(server.name, server.command, reported_path)
             return server
 
         # The command resolved, so forget any prior "not found" report — keyed on
@@ -1544,28 +1949,126 @@ async def probe_server(
         # start?" probe runs for real instead of fail-closing. Third-party
         # probes (and any customized managed command/args/env) pass False and
         # keep the full fail-close + opt-in behavior.
-        wrapped_argv, env, sandbox_cleanup = sandboxed_spawn_argv(
+        # Probe temp containment (#5064): each probe gets its OWN private dir
+        # under the managed root, cleaned in this function's finally -- unlike
+        # a backend, a probe knows exactly when its lifecycle ends, so no
+        # shared directory and no sweep race exist. Lazily imported
+        # (mcp_gateway.preflight imports this module, so a module-level import
+        # would cycle), created off-loop, and fail-open: a probe must run even
+        # when containment cannot be set up.
+        #
+        # Allocated BEFORE the sandbox wrap (#8653): the managed root lives at
+        # ``<data home>/run/mcp-tmp``, inside the runtime parent the sandbox
+        # seals read-only, so the wrap must know the directory to carve its
+        # write access out of that seal. Allocating after the wrap handed the
+        # child a ``TMPDIR`` it could not write -- a Bun-packaged server then
+        # failed the probe with "Cannot find the native Koffi module" because
+        # it could not extract its native module. The allocation failure path
+        # stays fail-open (probe runs with inherited temp, no carve-out), and
+        # the outer ``finally`` sweeps the dir even when the wrap itself
+        # raises.
+        #
+        # Mirrors the backend chokepoint: a spec-DECLARED temp wins -- the
+        # operator pointed this server at chosen storage, and overriding it
+        # would trade litter for ENOSPC on the data-home volume. Checked
+        # case-insensitively (Windows env keys are case-insensitive and the
+        # sanitized spec preserves the author's spelling).
+        _declared_temp_upper = {
+            key.upper() for key in (server.env or {}) if key.upper() in ("TMPDIR", "TMP", "TEMP")
+        }
+        probe_scratch: "Path | None" = None
+        if not _declared_temp_upper:
+            try:
+                from kiro_crew.mcp_gateway.backend_tmp import (
+                    allocate_probe_tmp,
+                    probe_child_scratch,
+                )
+
+                probe_tmp = await asyncio.to_thread(allocate_probe_tmp)
+                # The child gets a SCRATCH SUBDIR, never the allocation root:
+                # the root holds the ``.owner`` reclamation record, and the
+                # write carve-out below must not put that record inside the
+                # child's writable window (see probe_child_scratch).
+                probe_scratch = await asyncio.to_thread(probe_child_scratch, probe_tmp)
+            except Exception:
+                logger.debug("probe temp containment unavailable", exc_info=True)
+                if probe_tmp is not None and probe_scratch is None:
+                    # The allocation exists but its child-facing half does
+                    # not: reclaim now. Ownerless-or-provisional dirs are
+                    # deliberately never deleted by the sweeps until
+                    # owner-dead+idle, and no probe pid will ever be recorded
+                    # for this one.
+                    from kiro_crew.mcp_gateway.backend_tmp import sweep_backend_tmp
+
+                    await asyncio.to_thread(sweep_backend_tmp, probe_tmp)
+                    probe_tmp = None
+        wrapped_argv, env, sandbox_cleanup = await sandboxed_spawn_argv_async(
             [resolved, *(server.args or [])],
             mode="standard",
             env=env,
             strip_python_env=True,
+            extra_writable_dirs=((str(probe_scratch),) if probe_scratch is not None else ()),
             first_party_fixed_argv=_is_first_party_managed_argv(
                 server.name, server.command, server.args or [], server.env or {}
             ),
+            _prepare=sandboxed_spawn_argv,
         )
-        proc = await create_subprocess_limited(
-            *wrapped_argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            limit=1024 * 1024,  # 1 MB — some MCP servers return large responses
-            # POSIX: setsid so the probe owns a dedicated process group and
-            # teardown can killpg launcher grandchildren (a leader-only kill
-            # leaked ``npx @playwright/mcp`` -> node trees). Windows: silently
-            # ignored (mirrors AcpRuntime / AcpClient._spawn).
-            start_new_session=platform_compat.IS_POSIX,
-        )
+        try:
+            if probe_scratch is not None:
+                from kiro_crew.mcp_gateway.backend_tmp import tmp_env
+
+                # Merged AFTER the wrap so the managed triple lands on the
+                # SCRUBBED env the child actually receives.
+                env = {**env, **tmp_env(probe_scratch)}
+            elif _declared_temp_upper:
+                # Yielding alone is not enough: ambient temp keys are still in
+                # ``env`` and ``tempfile`` consults TMPDIR before TMP, so a
+                # spec declaring only TMP would silently write through the
+                # inherited ambient TMPDIR. Strip the canonical keys the spec
+                # did NOT declare (mirrors the backend chokepoint).
+                env = {
+                    key: value
+                    for key, value in env.items()
+                    if not (key in ("TMPDIR", "TMP", "TEMP") and key not in _declared_temp_upper)
+                }
+        except Exception:
+            logger.debug("probe temp containment unavailable", exc_info=True)
+        try:
+            proc = await create_subprocess_limited(
+                *wrapped_argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                limit=1024 * 1024,  # 1 MB — some MCP servers return large responses
+                # POSIX: setsid so the probe owns a dedicated process group and
+                # teardown can killpg launcher grandchildren (a leader-only kill
+                # leaked ``npx @playwright/mcp`` -> node trees). Windows: silently
+                # ignored (mirrors AcpRuntime / AcpClient._spawn).
+                start_new_session=platform_compat.IS_POSIX,
+            )
+        except BaseException:
+            # Spawn failed: the probe never existed, so reclaim its fresh dir
+            # here and now -- ownerless-or-provisional dirs are deliberately
+            # never deleted by the sweeps, making this the ONLY reclamation
+            # point for it (mirrors spawn_backend's failure path).
+            if probe_tmp is not None:
+                from kiro_crew.mcp_gateway.backend_tmp import sweep_backend_tmp
+
+                await asyncio.to_thread(sweep_backend_tmp, probe_tmp)
+            raise
+        if probe_tmp is not None:
+            # Re-record the owner as the PROBE's pid. The provisional owner
+            # written at allocation is THIS gateway process, which stays alive
+            # indefinitely -- on the Windows path (finally-sweep deferred) the
+            # daemon sweep would then retain the dir forever, accumulating one
+            # per probe. The probe pid dies with the probe, so owner-dead+idle
+            # reclamation works there. Off-loop, fail-open (record_owner
+            # swallows OSError; a stale provisional owner then keeps the dir
+            # until this gateway exits, bounded by gateway lifetime).
+            from kiro_crew.mcp_gateway.backend_tmp import record_owner
+
+            await asyncio.to_thread(record_owner, probe_tmp, proc.pid)
 
         # Send initialize request
         init_req = (
@@ -1577,9 +2080,11 @@ async def probe_server(
                     "params": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {},
-                        "clientInfo": dict(client_info)
-                        if client_info
-                        else {"name": "kirocrew-probe", "version": "1.0.0"},
+                        "clientInfo": (
+                            dict(client_info)
+                            if client_info
+                            else {"name": "kirocrew-probe", "version": "1.0.0"}
+                        ),
                     },
                 }
             )
@@ -1723,8 +2228,15 @@ async def probe_server(
         )
     except FileNotFoundError:
         server.status = "error"
-        server.error = f"command not found: {server.command}"
-        _warn_unresolvable_once(server.name, server.command)
+        # Report the search path only for a bare command: a directory-qualified
+        # one is looked up directly by shutil.which, not PATH-searched, so naming
+        # ``effective_path`` would cite directories never consulted. Recomputed
+        # here (not read from ``reported_path``) because this handler can fire
+        # before the try-body binds it, just as ``effective_path`` is bound
+        # before the try for exactly that reason.
+        _reported = "" if os.path.dirname(server.command) else effective_path
+        server.error = _unresolved_error(server.command, _reported)
+        _warn_unresolvable_once(server.name, server.command, _reported)
     except SandboxUnavailableError as exc:
         # The PROBE could not run — this says nothing about the server, and the
         # two must not be reported alike. Ahead of the generic clause, which would
@@ -1882,10 +2394,43 @@ async def probe_server(
                 except (ProcessLookupError, OSError):
                     logger.debug(
                         "Probe tree reap failed for %s (pid %s)",
-                        server.name, probe_pid, exc_info=True,
+                        server.name,
+                        probe_pid,
+                        exc_info=True,
                     )
         if sandbox_cleanup:
             Path(sandbox_cleanup).unlink(missing_ok=True)
+        if probe_tmp is not None:
+            if platform_compat.IS_POSIX:
+                # POSIX: the probe's dedicated process GROUP was reaped above
+                # (killpg is tree-faithful), so its private temp dir dies with
+                # it. Off-loop, fail-open (a failed cleanup is picked up by
+                # the daemon sweep once the dir is owner-dead and idle).
+                try:
+                    from kiro_crew.mcp_gateway.backend_tmp import sweep_backend_tmp
+
+                    await asyncio.to_thread(sweep_backend_tmp, probe_tmp)
+                except Exception:
+                    logger.debug("probe temp cleanup failed", exc_info=True)
+            else:
+                # Windows: taskkill /T walks PPID links and can miss a child
+                # whose wrapper already exited, so tree death is UNPROVABLE
+                # here. Deleting THIS dir now could remove temp storage under
+                # a live survivor -- instead run the root-wide dual-condition
+                # sweep (owner dead AND 1h+ whole-tree idle) from THIS
+                # process: it reclaims prior probes' dead dirs while never
+                # touching the fresh one (its tree is seconds old). Running
+                # it here, not only in the mcp-tmp daemon, matters because a
+                # topology with no stub servers never starts that daemon --
+                # probes must not depend on it for reclamation. Concurrent
+                # with a daemon sweep it is benign: both sides lstat-recheck
+                # and rmtree(ignore_errors=True).
+                try:
+                    from kiro_crew.mcp_gateway.backend_tmp import sweep_all_backend_tmp
+
+                    await asyncio.to_thread(sweep_all_backend_tmp)
+                except Exception:
+                    logger.debug("probe-side backend-tmp sweep failed", exc_info=True)
 
     # A probe run under a SYNTHETIC identity must not become the cached truth:
     # the per-name cache is what ``GET /api/mcp`` renders, and a pre-flight's
@@ -1995,7 +2540,11 @@ def _commands_diverged(source_cmd: str, agent_cmd: str) -> bool:
     # Two RESOLVED paths for one binary, differing only in separator flavour or
     # case (``C:\tools\srv.exe`` vs ``C:/Tools/SRV.exe``). Windows itself treats
     # those as the same file, so comparing the strings re-syncs forever.
-    if platform_compat.IS_WINDOWS and _names_a_location(source_cmd) and _names_a_location(agent_cmd):
+    if (
+        platform_compat.IS_WINDOWS
+        and _names_a_location(source_cmd)
+        and _names_a_location(agent_cmd)
+    ):
         if ntpath.normcase(ntpath.normpath(source_cmd)) == ntpath.normcase(
             ntpath.normpath(agent_cmd)
         ):
@@ -2268,9 +2817,7 @@ def kirocrew_managed_names() -> set[str]:
     """
     by_source = _load_mcp_json_by_source()
     return {
-        name
-        for name, spec in by_source.get(SCOPE_KIROCREW, {}).items()
-        if isinstance(spec, dict)
+        name for name, spec in by_source.get(SCOPE_KIROCREW, {}).items() if isinstance(spec, dict)
     }
 
 

@@ -2,7 +2,9 @@
 
 Session files: ~/.kiro/crew/sessions/{safe_key}.jsonl
 Each entry tracks provenance (source_thread, source_user) for citation.
-Files auto-rotate at 512KB, keeping last 200 lines.
+Appends through ``ConversationLog.append`` auto-rotate at 10MB, keeping up to 200
+lines within that byte cap. The dashboard whole-file save does not rotate, so a
+transcript written only through it is bounded by its message window instead.
 """
 
 from __future__ import annotations
@@ -17,45 +19,134 @@ import os
 import re
 import threading
 import time as _time
-from collections import OrderedDict
-from collections.abc import Callable, Container, Iterator
+import uuid
+from collections.abc import Callable, Container, Iterator, Sequence
+from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
+from typing import Any, Literal, overload
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
-from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.frontmatter import SKILL_UPDATE, frontmatter_value
-from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect, stream_and_collect_json
-from kiro_crew.messaging.link import legacy_key
-from kiro_crew.preview_text import strip_markdown_preview
+from kiro_crew.executors import run_in_embed_pool  # noqa: F401 - facade re-export
+from kiro_crew.frontmatter import (  # noqa: F401 - facade re-exports
+    SKILL_UPDATE,
+    frontmatter_value,
+)
+from kiro_crew.history_cache import (
+    _METADATA_CACHE_MAX,
+    _TRANSCRIPT_CACHE_MAX,
+    HistoryCacheCoordinator,
+    _FileChangeCacheEntry,
+    _LRUCache,
+    _SearchTextCache,
+)
+from kiro_crew.history_consolidation import (  # noqa: F401 - facade re-exports
+    _CONSOLIDATION_BACKOFF_BASE_SECS,
+    _CONSOLIDATION_BACKOFF_MAX_SECS,
+    _CONSOLIDATION_MAX_ATTEMPTS,
+    _CONSOLIDATION_META_KEYS,
+    _CONSOLIDATION_REFUSED,
+    _CONSOLIDATION_THRESHOLD,
+    _PLACEHOLDER_BODIES,
+    _SENSITIVE_TOOL_PATTERNS,
+    _SKILL_DETECTION_WINDOW,
+    _TOOL_ROLES,
+    AttemptedSpan,
+    HistoryConsolidator,
+    _ConsolidationNotDispatched,
+    _ConsolidationRefusedSentinel,
+    _count_tool_call_messages,
+    _fmt_message,
+    _frontmatter_value,
+    _is_plausible_memory_file,
+    _merge_trigger_lists,
+    _session_touched_sensitive,
+    _strip_code_fence,
+    _strip_skill_frontmatter,
+)
+from kiro_crew.history_projection import (
+    SessionMetadataProjection,
+    TranscriptReadProjection,
+)
+from kiro_crew.history_rewrite import HistoryRewriteCoordinator
+from kiro_crew.history_search import (  # noqa: F401 - facade re-exports
+    _CJK_CHAR_WEIGHT,
+    _FORGE_CHAIN_ONLY_WORDS,
+    _FORGE_LEAD_PUNCT,
+    _FORGE_MR_WORDS,
+    _FORGE_REF_WEIGHT,
+    _FORGE_REF_WORDS,
+    _FORGE_REQUEST_WORDS,
+    _FORGE_SIGIL_RE,
+    _FORGE_TRAIL_PUNCT,
+    _FORGE_TYPE_WORDS,
+    _FORGE_URL_RE,
+    _FORGE_URL_REPO_RE,
+    _FORGE_WORD_NUM_RE,
+    _PHRASE_BOOST,
+    _RECENCY_HALF_WEIGHT_DAYS,
+    _RECENCY_MAX_BOOST,
+    _SEARCH_FOLD_BUDGET_BYTES,
+    _SEARCH_MAX_FORGE_REFS,
+    _SEARCH_MAX_SCORING_EXTRAS,
+    _SEARCH_SCAN_WINDOW,
+    _SEARCH_SNIPPET_BUDGET_BYTES,
+    _TITLE_BOOST,
+    SEARCH_MAX_TOKENS,
+    SEARCH_MIN_CHARS,
+    SearchNeedle,
+    SessionCatalogProjection,
+    _forge_lead_in,
+    _forge_spellings,
+    _forge_type_suffix,
+    _ForgeRef,
+    _is_cjk_char,
+    _lead_names_a_type,
+    _lead_names_merge_request,
+    _parse_forge_ref,
+    _script_runs,
+    count_needle,
+    needles_match_text,
+    parse_search_query,
+    snippet_needles,
+)
+from kiro_crew.llm_helpers import (  # noqa: F401 - facade re-exports
+    ToolApprovalPolicy,
+    background_turn,
+    stream_and_collect,
+    stream_and_collect_json,
+)
+from kiro_crew.messaging.link import canonical_key, legacy_key
+from kiro_crew.preview_text import (
+    strip_markdown_preview,  # noqa: F401 - facade re-export
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.sel import sel
-from kiro_crew.session import BACKGROUND_KEY
-from kiro_crew.skills import AUTO_SKILL_MAX_PROCEDURE_CHARS, AutoSkillProvenance
-from kiro_crew.skills_dedupe import (
+from kiro_crew.sel import sel  # noqa: F401 - facade re-export
+from kiro_crew.skills import (  # noqa: F401 - facade re-export
+    AUTO_SKILL_MAX_PROCEDURE_CHARS,
+    AutoSkillProvenance,
+)
+from kiro_crew.skills_dedupe import (  # noqa: F401 - facade re-exports
     VERDICT_DUP,
     VERDICT_NEW,
     VERDICT_UPDATE,
     metadata_dedupe_verdict,
 )
-from kiro_crew.skills_script_validator import validate_skill_script
-from kiro_crew.vector_memory_constants import (
+from kiro_crew.skills_script_validator import (
+    validate_skill_script,  # noqa: F401 - facade re-export
+)
+from kiro_crew.vector_memory_constants import (  # noqa: F401 - facade re-exports
     _MAX_EPISODIC_PER_CONSOLIDATION,
     _MAX_LESSONS_PER_CONSOLIDATION,
     _MAX_SEMANTIC_PER_CONSOLIDATION,
 )
 
-if TYPE_CHECKING:
-    from kiro_crew.learn import LessonStore
-    from kiro_crew.memory import MemoryStore
-    from kiro_crew.session import SessionManager
-    from kiro_crew.skills import SkillsLoader
-    from kiro_crew.vector_memory import VectorMemoryStore
-
 logger = logging.getLogger(__name__)
+
+HistoryConsolidator.__module__ = __name__
+AttemptedSpan.__module__ = __name__
 
 SESSIONS_DIR_NAME = "sessions"
 ARCHIVE_DIR_NAME = "archive"
@@ -65,83 +156,6 @@ ARCHIVE_RETENTION_DAYS = 7
 # because session keys legitimately contain dots (a Slack thread_ts), which would
 # make a right-most-dot parse attribute a segment to the wrong session.
 ARCHIVE_SEGMENT_DELIMITER = "__"
-_CONSOLIDATION_THRESHOLD = 30  # preferences/projects update threshold (messages)
-
-
-# Returned by _consolidate when its retry-eligibility gate refuses the span.
-# Distinct from None (a pass that ran, or found nothing to do) so callers'
-# done-callbacks can tell a refusal from a completed pass: a refusal must not
-# advance their bookkeeping (offsets, throttles) as if the window had been
-# processed, and raising instead would log a routine backoff as a task failure.
-class _ConsolidationRefusedSentinel:
-    __slots__ = ()
-
-
-_CONSOLIDATION_REFUSED = _ConsolidationRefusedSentinel()
-# Persistent retry accounting for history consolidation. A pass spends a billed
-# LLM turn BEFORE it can write the durable "consolidated" marker, so any failure
-# in between leaves the span unconsolidated — and every entry point (the 60s
-# idle sweep, session-expiry sweeps, the dashboard trigger) then re-spends that
-# turn, forever, because the only thing suppressing a repeat is an in-memory
-# throttle that a failure skips and a restart forgets. Attempts are therefore
-# counted in the transcript's metadata line (durable, per span) and gated behind
-# exponential backoff up to a hard cap. At the cap the span is abandoned with
-# the marker written anyway: losing one memory pass costs one summary, while
-# retrying forever costs an LLM turn per heartbeat tick indefinitely.
-_CONSOLIDATION_MAX_ATTEMPTS = 5
-_CONSOLIDATION_BACKOFF_BASE_SECS = 900.0  # 15 min, doubling per failed attempt
-_CONSOLIDATION_BACKOFF_MAX_SECS = 86400.0  # 24 h ceiling on a single wait
-# Every metadata field the accounting owns, so the marker's success path can drop
-# the whole set in one place and a rebuilding writer can name it as foreign.
-_CONSOLIDATION_META_KEYS: frozenset[str] = frozenset(
-    {
-        "consolidation_attempts",
-        "consolidation_retry_at",
-        "consolidation_env_failures",
-        "consolidation_attempts_generation",
-        "consolidation_attempts_offset",
-        "consolidation_attempts_count",
-    }
-)
-
-
-class AttemptedSpan(NamedTuple):
-    """The span identity a consolidation turn actually covered.
-
-    All three fields come from ONE atomic
-    :meth:`ConversationLog.snapshot_for_consolidation` taken BEFORE the turn:
-    where the span starts (*generation*, *offset*) and how far it reaches
-    (*total*). They travel together because the accounting's whole guarantee is
-    that a charged attempt is stamped with the span it measured — mixing a
-    snapshot value with one re-read after the turn stamps content that was never
-    attempted, and the cap then either outlives its span (stranding messages
-    forever) or releases early (re-billing indefinitely).
-
-    Re-reading the metadata line at failure time is the specific mistake this
-    type exists to prevent. A rotation or a marker-resetting rewrite DURING the
-    turn moves all three, so a post-turn read stamps the counter with the NEW
-    span's identity while the count it carries was charged against the old one.
-    At the cap that leaves the post-rotation messages capped without ever having
-    been attempted, and because their generation and offset already match the
-    stamp no later append can release them.
-    """
-
-    #: Transcript message total the turn covered — the snapshot's total, not the
-    #: file's size afterwards. Named ``total`` rather than ``count`` because a
-    #: ``NamedTuple`` field called ``count`` would shadow ``tuple.count``.
-    total: int
-    #: ``rotation_generation`` at the snapshot.
-    generation: int
-    #: ``last_consolidated`` at the snapshot — where the attempted span begins.
-    offset: int
-
-
-# Skill detection judges a wider window than the incremental history tail: a
-# reusable procedure usually spans the whole session, not just the slice since
-# the last consolidation, so a tail-only view systematically misses skills in
-# any session consolidated more than once. Bound the window so pathologically
-# long sessions stay cost-safe.
-_SKILL_DETECTION_WINDOW = 200
 
 # The keys :meth:`ConversationLog.compact` is authoritative for; every other field
 # on the metadata line is another layer's and is carried through.
@@ -165,13 +179,31 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "agent",
         "model",
         "reasoning_effort",
+        "autocompact_pct",
         "ponytail",
         "mode",
         "workspace",
         "project",
+        # Remote-execution binding: owned by the slot, so clearing it in memory
+        # clears it on disk. Left unowned, a rebind or an unbind would be undone
+        # on the next save by the carried-forward copy.
+        "executor",
+        "instance_id",
+        "remote_slot",
+        # In-flight relay marker: the slot save writes it only while a relay is
+        # running and omits it once the turn ends. Absence therefore means "not
+        # in flight" and must clear the on-disk value — left unowned, the `true`
+        # written at relay start is carried forward past a clean completion, so
+        # every later restart would append a false "interrupted" row.
+        "relay_in_flight",
         "folder_id",
         "app",
         "artifact",
+        # Durable copy of the slot's held /note lines (issue #4093). Owned, not
+        # monotonic: the hold is written while notes are held and must be
+        # CLEARED by absence once the flush delivers them — carried forward
+        # instead, a restart would re-deliver a note the user already saw.
+        "deferred_notes",
         "pinned",
         "color_index",
         "color_hex",
@@ -182,6 +214,78 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "tab_id",
     }
 )
+
+# The subset of :data:`SLOT_OWNED_META_KEYS` a ROWS-ONLY slot save still owns.
+#
+# A save that must persist a slot's messages onto a transcript whose metadata line
+# describes a DIFFERENT live slot cannot use the whole ownership claim above: the
+# rebuild would revert the other slot's title, folder, tags or pin. Such a save
+# preserves every slot-owned field the line already carries and keeps authority
+# over only these — the file's identity and accounting, which every writer
+# maintains and which the save carries forward from disk anyway.
+#
+# ``closed``/``closed_at`` are NOT here, even though the write is open-shaped and
+# the whole claim above would erase them. On a line another slot published, a
+# ``closed`` flag is that holder's own DISMISSAL, and the two mistakes cost
+# differently. Erasing a dismissal the holder just committed resurfaces a tab the
+# user put away and re-arms the channel reconciler on it, with the holder already
+# popped so nothing rewrites the flag. Leaving a stale flag in place instead costs
+# nothing durable: the live holder owns these keys on its own next full save.
+#
+# The one path that DOES clear a stale flag from outside the holder is the resume
+# route, and it only clears one it can prove predates its own boundary
+# (``clear_closed(..., only_if_closed_before=...)``, compared inside the store's
+# lock) — precisely because an unconditional clear "reopens a replacement the user
+# closed". A rows-only save carries no such boundary, so it defers, the same way
+# every other field on another writer's line does.
+#
+# Narrowing this far is only correct against ANOTHER slot's line, so the save
+# establishes that first (from the line's ``tab_id``) and falls back to the full
+# claim otherwise. Applied to a slot's own line it would strand that slot's
+# uncommitted metadata instead of protecting anyone's — and that fallback is where
+# an open-shaped write still clears a stale ``closed``, because a line this slot
+# published carries no other holder's dismissal to lose.
+ROWS_ONLY_OWNED_META_KEYS: frozenset[str] = frozenset({"_type", "created_at", "last_consolidated"})
+
+# The keys a ROWS-ONLY slot save must DROP from its rebuild so the on-disk values
+# are carried back verbatim.
+#
+# Named here in full rather than derived at the call site as
+# ``SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS``, because that difference
+# under-approximates: the slot save also writes fields that DESCRIBE an owned one
+# without being owned themselves (absence must not erase them, so they are
+# deliberately outside the ownership claim and survive via
+# :func:`carry_unowned_metadata`). Deferring the described field while keeping the
+# describing one commits a line that matches NEITHER slot — worse than either,
+# because each half is separately valid and nothing downstream can detect the
+# mismatch. ``title_origin`` and ``title_refresh_mark`` are the title's provenance
+# and its background-refresh budget: read back beside another slot's title they
+# either unlock the refresh on a name a user typed by hand or lock a generated name
+# out of refresh permanently. They travel WITH the title, so they are deferred with
+# it.
+#
+# ``created_by`` and ``origin`` are the same shape and the highest-consequence
+# instance of it, because what they describe is AUTHORIZATION rather than
+# presentation. ``created_by`` is the attribution the member ownership boundary in
+# session-control reads, and it is meaningless without the ``mode`` that is deferred
+# beside it — a member ``mode`` from the live holder read next to a different
+# principal's ``created_by`` names an owner who never opened this session.
+# ``origin`` must round-trip with ``app``, also deferred: split, a tab reads back as
+# one holder's slot kind wearing the other's app binding, which is what decides
+# ``slots:user`` visibility and the unattended approval window. Both are attributes
+# of the SLOT, not facts about the conversation, so on a transcript with a live
+# holder the holder's are the true ones. Deferring them also fails CLOSED where the
+# line carries none: an absent ``created_by`` denies rather than grants, and an
+# absent ``origin`` restores to the empty sentinel the rehydrate paths already treat
+# that way.
+#
+# What is left out is left out deliberately: ``auto_tagged``, ``human_seen``,
+# ``channel_origin`` and ``channel_folder_filed`` are MONOTONE once-flags about the
+# CONVERSATION, set and never cleared, so a shared transcript's two writers cannot
+# disagree about them in a way that outlives the pair.
+ROWS_ONLY_DEFERRED_META_KEYS: frozenset[str] = (
+    SLOT_OWNED_META_KEYS - ROWS_ONLY_OWNED_META_KEYS
+) | frozenset({"title_origin", "title_refresh_mark", "created_by", "origin"})
 
 
 def carry_unowned_metadata(
@@ -231,82 +335,7 @@ def carry_unowned_metadata(
     return rebuilt
 
 
-def _fmt_message(m: dict) -> str:
-    """Render one transcript message for a consolidation / skill-detection prompt."""
-    tools = f" [tools: {', '.join(m['tools'])}]" if m.get("tools") else ""
-    return f"[{m.get('ts', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}"
-
-
-# Normalized placeholder bodies a model emits instead of a real file body.
-# Compared after lowercasing and stripping surrounding whitespace/punctuation,
-# so e.g. "Unchanged.", "(no changes)" and "N/A" all normalize into this set.
-_PLACEHOLDER_BODIES = frozenset(
-    {
-        "unchanged",
-        "no change",
-        "no changes",
-        "no change needed",
-        "no changes needed",
-        "no changes required",
-        "no update",
-        "no updates",
-        "no update needed",
-        "no updates needed",
-        "nothing changed",
-        "nothing to update",
-        "nothing to change",
-        "none",
-        "n/a",
-        "na",
-        "empty",
-        "same",
-        "same as before",
-        "as before",
-        "see above",
-        "content unchanged",
-        "file unchanged",
-    }
-)
-
-
-def _is_plausible_memory_file(content: str, header: str) -> bool:
-    """Gate a consolidation ``*_update`` value before it overwrites a memory file.
-
-    The consolidation prompt asks for the COMPLETE updated file, but a model
-    sometimes answers with a protocol word instead — the literal string
-    ``unchanged``, ``(empty)``, ``no changes needed`` and similar. Writing that
-    placeholder destroys the file, and because the next consolidation prompt
-    embeds the file's current content verbatim, the placeholder then reads as a
-    valid example body and gets echoed into the other memory file on every
-    subsequent pass — a self-reinforcing loop that keeps both files destroyed
-    until a human rebuilds them.
-
-    Two gates:
-
-    1. The first line must be exactly the markdown header the prompt mandates
-       (not merely a prefix — ``# User Preferences (unchanged)`` is not a file).
-    2. The body below the header must not normalize into a known placeholder
-       word/phrase. Markdown emphasis wrapping (``**unchanged**``,
-       ``_unchanged_``, ``~~unchanged~~``) is stripped before the comparison so
-       a decorated placeholder cannot bypass the set. An EMPTY body after the
-       exact header is accepted: it is the legitimate COMPLETE file when the
-       last entry is deleted (e.g. the final project goes inactive), and
-       rejecting it would pin the stale entry in persistent memory forever.
-       There is deliberately no size floor either — a legitimate memory file
-       can be a single tiny bullet (``- Vim``), and rejecting it here would
-       silently lose the learned preference while the consolidation marker
-       advances past it.
-    """
-    first_line, _, body = content.strip().partition("\n")
-    if first_line.strip() != header:
-        return False
-    normalized = body.strip().lower().strip(" \t\"'`*_~.,!()[]")
-    if normalized in _PLACEHOLDER_BODIES:
-        return False
-    return True
-
-
-_SESSION_MAX_BYTES = 2 * 1024 * 1024  # 2MB
+_SESSION_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 _SESSION_KEEP_LINES = 200
 # Bounded cross-process lock acquisition. The per-session sidecar ``flock`` is
 # acquired on the hot ``append`` path, which some transports (Telegram/WeCom/
@@ -334,19 +363,6 @@ _SESSION_KEEP_LINES = 200
 # don't.
 _FLOCK_ACQUIRE_TIMEOUT_S = 10.0
 _FLOCK_POLL_INTERVAL_S = 0.05
-
-
-class _ConsolidationNotDispatched(Exception):
-    """A consolidation prompt never reached the provider.
-
-    Distinguishes "we could not send the turn" (no session manager; kiro-cli
-    missing, not logged in, or failing to start) from "the turn ran and returned
-    nothing useful". Only the latter costs money, so only the latter may consume
-    the attempt budget that abandons a span — charging an unsent turn would let a
-    broken host mark messages consolidated that no LLM has ever read. Raised
-    rather than reported as a flag beside the result so a caller cannot silently
-    drop the distinction.
-    """
 
 
 class HistoryLockTimeout(TimeoutError):
@@ -513,7 +529,7 @@ def _check_on_loop_persist_discipline(key: str) -> None:
 
 
 def append_off_loop(
-    conversation_log: "ConversationLog",
+    conversation_log: ConversationLog,
     key: str,
     role: str,
     content: str,
@@ -551,7 +567,7 @@ def append_off_loop(
             logger.warning("append_off_loop: inline append failed key=%s", key, exc_info=True)
         return
 
-    def _report(fut: "asyncio.Future[None]") -> None:
+    def _report(fut: asyncio.Future[None]) -> None:
         exc = fut.exception()
         if exc is not None:
             logger.warning("append_off_loop: offloaded append failed key=%s: %r", key, exc)
@@ -559,14 +575,82 @@ def append_off_loop(
     loop.run_in_executor(None, _do).add_done_callback(_report)
 
 
+def append_rows_if_absent_off_loop(
+    conversation_log: ConversationLog,
+    key: str,
+    rows: Sequence[tuple[str, str, str, str | None]],
+    *,
+    agent: str | None = None,
+) -> Any:
+    """Persist SEVERAL rows of one turn as one indivisible off-loop write.
+
+    :func:`append_if_absent_off_loop` dispatches each row as its own executor
+    task, so a caller writing a prompt+result PAIR hands two worker threads two
+    independent writes: they can land out of order, and one can fail while the
+    other succeeds. The transcript then replays a run whose rows are reversed or
+    half-present, and no timestamp ordering repairs it because each row's ``ts``
+    is correct on its own.
+
+    This routes the whole group through ONE task holding
+    :meth:`ConversationLog.atomic_appends`, whose contract names this hazard as
+    the companion a multi-append caller needs precisely BECAUSE it moved the
+    write off the loop. ``_locked`` is reentrant per key per thread, so the
+    per-row locks inside ``append_if_absent`` reuse the hold rather than
+    deadlocking on it.
+
+    *rows* is an ordered sequence of ``(role, content, cls, mid)``; they are
+    appended in that order. Each row keeps ``append_if_absent``'s idempotence,
+    so a row the periodic slot save already serialized is skipped individually
+    without dropping its siblings.
+
+    Returns the executor future, or None when the write already happened inline
+    (no running loop). Best-effort like its siblings: a lock timeout or I/O
+    error only skips the durable replay copy the slot already carries.
+    """
+
+    def _do() -> None:
+        with conversation_log.atomic_appends(key):
+            for role, content, cls, mid in rows:
+                conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None:
+        try:
+            _do()
+        except Exception:  # noqa: BLE001 - best-effort durable copy
+            logger.warning(
+                "append_rows_if_absent_off_loop: inline append failed key=%s",
+                key,
+                exc_info=True,
+            )
+        return None
+
+    def _report(fut: asyncio.Future[None]) -> None:
+        exc = fut.exception()
+        if exc is not None:
+            logger.warning(
+                "append_rows_if_absent_off_loop: offloaded append failed key=%s: %r",
+                key,
+                exc,
+            )
+
+    fut = loop.run_in_executor(None, _do)
+    fut.add_done_callback(_report)
+    return fut
+
+
 def append_if_absent_off_loop(
-    conversation_log: "ConversationLog",
+    conversation_log: ConversationLog,
     key: str,
     role: str,
     content: str,
     *,
     agent: str | None = None,
     cls: str = "",
+    mid: str | None = None,
 ) -> Any:
     """Idempotent, loop-safe variant of :func:`append_off_loop`.
 
@@ -587,7 +671,7 @@ def append_if_absent_off_loop(
     """
 
     def _do() -> None:
-        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls)
+        conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
 
     try:
         loop = asyncio.get_running_loop()
@@ -604,7 +688,7 @@ def append_if_absent_off_loop(
             )
         return None
 
-    def _report(fut: "asyncio.Future[None]") -> None:
+    def _report(fut: asyncio.Future[None]) -> None:
         exc = fut.exception()
         if exc is not None:
             logger.warning(
@@ -622,7 +706,7 @@ def append_if_absent_off_loop(
 
 
 def update_metadata_off_loop(
-    conversation_log: "ConversationLog",
+    conversation_log: ConversationLog,
     key: str,
     fields: dict,
 ) -> None:
@@ -668,7 +752,7 @@ def update_metadata_off_loop(
             )
         return
 
-    def _report(fut: "asyncio.Future[None]") -> None:
+    def _report(fut: asyncio.Future[None]) -> None:
         exc = fut.exception()
         if exc is not None:
             logger.warning(
@@ -679,239 +763,6 @@ def update_metadata_off_loop(
 
     loop.run_in_executor(None, _do).add_done_callback(_report)
 
-
-SEARCH_MIN_CHARS = 2  # shortest query string that triggers backend search
-SEARCH_MAX_TOKENS = 12  # distinct REQUIRED needles per query — see parse_search_query
-_SEARCH_MAX_SCORING_EXTRAS = 12  # distinct scoring-only needles (CJK bigrams) per query
-_TITLE_BOOST = 10  # field-boost multiplier for title matches in search_sessions
-_PHRASE_BOOST = 4  # extra weight per exact whole-query hit in a multi-word search
-_SEARCH_SCAN_WINDOW = 500  # cap files scanned per search to bound I/O
-# Recency boost bounds for search_sessions: a session modified now scores
-# ×(1 + _RECENCY_MAX_BOOST); the extra weight halves every
-# _RECENCY_HALF_WEIGHT_DAYS of age and decays toward ×1.0 — never a penalty
-# that could bury an old exact match, only a bounded tiebreaker toward
-# recent work. 1.5 is sized to the canonical complaint: a year-old session
-# matching TWICE must lose to today's session matching once (2 hits × ~1.11
-# aged boost ≈ 2.2 < 1 hit × 2.5 fresh ceiling), while a decisively better
-# old match (3+ hits) still wins — a 1.0 ceiling left the stated 2:1 case
-# unfixed.
-_RECENCY_MAX_BOOST = 1.5
-_RECENCY_HALF_WEIGHT_DAYS = 30.0
-# Weight of a single CJK character needle that came from a longer run. Individual
-# han/kana/hangul characters are extremely common (a function character like "的"
-# can appear hundreds of times in one transcript), so counting them at full weight
-# would let character noise drown out the bigram adjacency signal that actually
-# ranks CJK results. They still gate the AND match at full strength — the weight
-# only dampens their contribution to the relevance score.
-_CJK_CHAR_WEIGHT = 0.25
-
-
-def _is_cjk_char(ch: str) -> bool:
-    """True for characters that written Chinese/Japanese/Korean does not space-separate.
-
-    Whitespace tokenization silently degrades for these scripts — a whole CJK
-    clause arrives as ONE "token" — so :func:`parse_search_query` segments runs
-    of them instead. The ranges cover the Han ideograph blocks (unified,
-    extension A, the astral extensions, compatibility) and the kana blocks:
-    Chinese and Japanese are written without spaces, which is the named defect.
-    Deliberately NOT Hangul — modern Korean IS space-separated, so its words
-    already arrive as ordinary whitespace tokens and the substring rule serves
-    them; segmenting them would change Korean ranking to fix a failure nobody
-    has reported. Likewise not full-width forms, punctuation, or symbols.
-    """
-    cp = ord(ch)
-    return (
-        0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
-        or 0x3400 <= cp <= 0x4DBF  # CJK Extension A
-        or 0x20000 <= cp <= 0x2EBEF  # CJK Extensions B..F (astral)
-        or 0xF900 <= cp <= 0xFAFF  # CJK Compatibility Ideographs
-        or 0x3040 <= cp <= 0x30FF  # Hiragana + Katakana
-        or 0x31F0 <= cp <= 0x31FF  # Katakana Phonetic Extensions
-    )
-
-
-class SearchNeedle(NamedTuple):
-    """One substring a session search scans for.
-
-    ``required=True`` needles form the AND gate — a session missing one (in
-    both title and content) is disqualified. ``required=False`` needles only
-    contribute to the relevance score. ``weight`` scales each occurrence's
-    contribution to that score.
-    """
-
-    text: str
-    weight: float
-    required: bool
-
-
-def _script_runs(token: str) -> Iterator[tuple[str, bool]]:
-    """Yield ``(run, is_cjk)`` maximal same-script runs of *token*, in order."""
-    start = 0
-    cur = _is_cjk_char(token[0])
-    for i in range(1, len(token)):
-        nxt = _is_cjk_char(token[i])
-        if nxt != cur:
-            yield token[start:i], cur
-            start, cur = i, nxt
-    yield token[start:], cur
-
-
-def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
-    """Return ``(needles, phrase, adjacency_floor)`` for a search *query*, casefolded.
-
-    ``phrase`` is the whole normalized query. ``needles`` are derived from the
-    DISTINCT whitespace-separated terms in first-seen order; every caller that
-    matches (:meth:`ConversationLog.search_sessions`) or locates
-    (:func:`snippet_needles` for the snippet builders) query text derives from
-    this one parse so the halves of a query cannot drift apart.
-
-    Non-CJK terms become one required, weight-1.0 needle each — the classic
-    substring-AND behavior (``"cont"`` hits ``"contention"``). A run of CJK
-    characters cannot keep that rule: CJK text is written without spaces, so
-    requiring the run verbatim demands the user's exact sentence and a
-    multi-word query like ``"修复内存泄漏"`` would only ever match transcripts
-    containing that literal string. Each CJK run therefore expands to:
-
-    * its individual characters as REQUIRED needles at :data:`_CJK_CHAR_WEIGHT`
-      — maximal recall, since a document discussing all the query's words
-      contains all of its characters regardless of word order; and
-    * its overlapping character bigrams as ADJACENCY needles at weight 1.0 —
-      the standard dictionary-free CJK adjacency signal. They are not
-      individually required, but when a query carries any, a session must hit
-      AT LEAST ONE to qualify (see :meth:`ConversationLog.search_sessions`):
-      individual han/kana characters are so common that a pure character
-      scatter is noise, so the adjacency floor keeps the character gate's
-      recall (words apart still match — each word IS a bigram hit) without
-      letting scatter-only sessions fill the result page. Each occurrence also
-      scores, so documents keeping more of the query adjacent rank higher.
-      A single-character run stays one required, weight-1.0 needle: it IS the
-      whole term.
-
-    Precision moves from the gate into the ranking, which is the module's
-    existing philosophy for the substring-prefix looseness on ASCII terms.
-
-    Bounds (both exist because **every needle costs one full scan** of a
-    session's text): required needles cap at :data:`SEARCH_MAX_TOKENS` and
-    scoring extras at :data:`_SEARCH_MAX_SCORING_EXTRAS`. Deduplication is free
-    correctness — a repeated term cannot change an AND match. Truncation in
-    EITHER set makes the query only LOOSER — fewer required terms, and a
-    truncated adjacency set additionally WAIVES the adjacency floor (the third
-    tuple element comes back ``False``), because enforcing "at least one bigram
-    hit" against a partial bigram set would EXCLUDE a session that matches only
-    a dropped bigram — turning a cost cap into a hidden gate for exactly the
-    long spaceless queries this parse exists to serve. Looser can admit extra
-    results but never hide a session that would have matched — the safe
-    direction when the alternative is a keystroke-driven search stalling for
-    seconds.
-
-    A whitespace-only query yields ``([], "", False)``; callers treat that as
-    "matches nothing" rather than "matches everything".
-    """
-    parts = query.casefold().split()
-    if not parts:
-        return ([], "", False)
-    phrase = " ".join(parts)
-    required: dict[str, float] = {}
-    extras: dict[str, float] = {}
-    for part in dict.fromkeys(parts):
-        for run, is_cjk in _script_runs(part):
-            if not is_cjk or len(run) == 1:
-                required.setdefault(run, 1.0)
-                continue
-            for ch in run:
-                required.setdefault(ch, _CJK_CHAR_WEIGHT)
-            for i in range(len(run) - 1):
-                extras.setdefault(run[i : i + 2], 1.0)
-    needles = [
-        SearchNeedle(text, weight, True)
-        for text, weight in list(required.items())[:SEARCH_MAX_TOKENS]
-    ]
-    needles.extend(
-        SearchNeedle(text, weight, False)
-        for text, weight in list(extras.items())[:_SEARCH_MAX_SCORING_EXTRAS]
-    )
-    adjacency_floor = 0 < len(extras) <= _SEARCH_MAX_SCORING_EXTRAS
-    return (needles, phrase, adjacency_floor)
-
-
-def snippet_needles(query: str) -> list[str]:
-    """Return *query*'s needles ordered for snippet centering, phrase first.
-
-    The snippet builders try needles in order and center the excerpt on the
-    first hit, so ordering is a display-quality decision: the exact phrase is
-    the most meaningful anchor, then full-weight needles (whole terms and CJK
-    bigrams) in first-seen order — preserving the pre-CJK behavior for ASCII
-    queries, where a predictable first-typed-term fallback is part of the
-    contract — and down-weighted lone CJK characters last, the anchor of last
-    resort. Returns ``[]`` for a whitespace-only query.
-    """
-    needles, phrase, _ = parse_search_query(query)
-    if not needles:
-        return []
-    # Stable sort on weight only: within a weight class the parse's insertion
-    # order (required terms first-seen, then bigrams) is the display order.
-    ordered = sorted(needles, key=lambda n: -n.weight)
-    out: list[str] = []
-    for text in (phrase, *(n.text for n in ordered)):
-        if text not in out:
-            out.append(text)
-    return out
-
-
-def needles_match_text(
-    needles: list[SearchNeedle], folded_text: str, adjacency_floor: bool = True
-) -> bool:
-    """True when *folded_text* satisfies the query gate that *needles* encode.
-
-    The single-string form of :meth:`ConversationLog.search_sessions`' match
-    rule, for callers that filter one text field (e.g. Discord session
-    resume's title-only fallback) and must not grow a second spelling of
-    tokenization: every REQUIRED needle must appear as a substring, and when
-    the query carries adjacency (bigram) needles at least one must hit — the
-    same adjacency floor that keeps character scatter out of content search.
-    Pass :func:`parse_search_query`'s ``adjacency_floor`` element: it is
-    ``False`` when the bigram set was truncated, which WAIVES the floor here
-    exactly as in ``search_sessions`` (a partial bigram set cannot prove
-    "no adjacency anywhere"). *folded_text* must already be casefolded
-    (needle texts are).
-    """
-    if not needles:
-        return False
-    adjacency_hit = False
-    has_adjacency = False
-    for needle in needles:
-        if needle.required:
-            if needle.text not in folded_text:
-                return False
-        else:
-            has_adjacency = True
-            if needle.text in folded_text:
-                adjacency_hit = True
-    return adjacency_hit or not has_adjacency or not adjacency_floor
-
-
-# Hard ceilings on the memory the two search memos may hold, in real retained
-# bytes as reported by ``str.__sizeof__`` — NOT in characters.
-#
-# ``len()`` is the wrong unit and dangerously so: CPython stores a ``str`` in the
-# narrowest width its contents allow, so one character is 1 byte for latin-1, 2
-# for the BMP, and 4 for astral planes. A ceiling of 160 MB counted in characters
-# retains 168 MB of ASCII, 336 MB of CJK, or 671 MB of emoji — and CJK is the
-# ordinary case for a non-English corpus, not a pathological one. The sizers
-# therefore call ``__sizeof__`` per string, and the snippet memo also charges for
-# its list container.
-#
-# Why bytes and not an entry count: a session is read up to
-# ``_SESSION_MAX_BYTES`` (2 MB), so ``_SEARCH_SCAN_WINDOW`` entries is anywhere
-# from a few MB to ~1 GB depending on the corpus. An entry count therefore
-# bounds nothing that matters; it only *looked* safe because real sessions are
-# small (a 171 MB / 230-session corpus folds to ~8 MB).
-#
-# The two are separate rather than one shared pool so a corpus that blows the
-# snippet budget cannot starve the fold, which is the one that keeps matching
-# off the critical path. Their sum is the ceiling to reason about.
-_SEARCH_FOLD_BUDGET_BYTES = 96 * 1024 * 1024
-_SEARCH_SNIPPET_BUDGET_BYTES = 64 * 1024 * 1024
 
 # Canonical set of memory_mode values that mark a session private — never
 # searchable/listable/summarizable. Single source of truth shared by the MCP
@@ -1178,6 +1029,35 @@ def metadata_now_iso() -> str:
     return datetime.now().astimezone().isoformat()
 
 
+def mint_row_mid() -> str:
+    """Mint a durable per-row delivery identity for a transcript row.
+
+    The ONE place the ``meta.mid`` format is spelled. ``_ChatSlot.append`` mints
+    the id for a row that enters a dashboard window, and the dashboard
+    dual-writers (``cron_inject``, ``workflow_inject``, ``crew_chat``) read it back
+    off that append to stamp their durable copy (``row_mid``). A writer with no
+    slot to mint from -- a channel dispatcher persisting a turn it ran on its own
+    session -- has to mint the id itself, and it must produce the SAME shape,
+    because the readers match on the value, not on who wrote it.
+
+    Why a channel row needs one AT WRITE TIME: the dashboard's merge keys on
+    ``meta.mid`` and nothing else. ``isRedeliveredMessage`` drops a redelivered row
+    by it, ``olderHeadAbovePage`` cuts the retained scrollback head at it, and
+    ``rowIdentities``/``tailNotInPage`` decide by it which prior rows a page already
+    carries -- and every one of those DECLINES rather than guesses when the id is
+    absent or has changed. A row persisted without one is re-minted by each surface
+    that materializes it (``channel_slots._rebuild_window`` /
+    ``refresh_channel_window``), so one logical row carries a different identity on
+    every pass, silently degrading all three at once.
+
+    Random rather than a per-key counter, for the reason ``_ChatSlot.append``
+    gives: a counter rebased after a restore can reissue an id a restored row
+    already holds, and a colliding id makes a client DROP a real message. A
+    random id has no such failure mode.
+    """
+    return f"m-{uuid.uuid4().hex[:16]}"
+
+
 def monotonic_transcript_ts(previous: str | None, now: datetime) -> str:
     """Stamp a transcript row so it sorts strictly AFTER *previous*.
 
@@ -1241,6 +1121,35 @@ def transcript_stem(key: str) -> str:
     alone would not find it.
     """
     return _safe_key(key)
+
+
+_TAB_ID_INDEX_STEM_PREFIX = "dashboard_chat-"
+_TAB_ID_INDEX_GLOB = f"{_TAB_ID_INDEX_STEM_PREFIX}*.jsonl"
+
+
+def _index_key_for_stem(stem: str) -> str:
+    """The key form :attr:`ConversationLog._tab_id_index` stores for *stem*.
+
+    One derivation shared by the index builder (which starts from a filename)
+    and the in-place updater (which starts from a session key), because a second
+    copy would drift the moment either side changed and the failure is silent:
+    the two spellings stop matching, so an updater's lookup misses an entry that
+    is really there.
+    """
+    return stem.replace("_", ":", 1)
+
+
+def can_hold_tab_id_index_entry(key: str) -> bool:
+    """True when *key*'s transcript is one :meth:`_rebuild_tab_id_index` scans.
+
+    The index is built by globbing :data:`_TAB_ID_INDEX_GLOB`, so a transcript
+    whose stem does not match can never appear in it -- a channel-keyed session
+    (``slack:<ts>`` and friends) writes ``slack_<ts>.jsonl``, which the glob
+    never returns. Saving such a transcript therefore cannot add, remove or
+    change any index entry, which is what makes a no-op the correct response to
+    one rather than an invalidation.
+    """
+    return transcript_stem(key).startswith(_TAB_ID_INDEX_STEM_PREFIX)
 
 
 def transcript_stems(key: str) -> tuple[str, ...]:
@@ -1326,15 +1235,6 @@ def latest_transcript_ts(*candidates: str | None) -> str | None:
     return best
 
 
-#: Default upper bound on the number of distinct session keys held in the
-#: in-memory transcript / metadata caches.  Unbounded ``dict`` caches grow one
-#: entry per session key touched and never evict — on a gateway serving
-#: thousands of sessions the parsed message lists (each up to ~200 messages /
-#: 2 MB of source JSONL) accumulate in RAM for the lifetime of the process.  A
-#: bounded LRU keeps hot sessions resident while giving the working set a
-#: deterministic ceiling.
-_TRANSCRIPT_CACHE_MAX = 256
-
 # Metadata reads retry briefly before reporting "no metadata": on Windows a
 # just-written session file can be transiently unopenable while an indexer or AV
 # scanner holds it (ERROR_SHARING_VIOLATION -> PermissionError). Those holds are
@@ -1342,252 +1242,6 @@ _TRANSCRIPT_CACHE_MAX = 256
 # restore) treats an empty result as "session never existed" and drops the tab.
 _METADATA_READ_ATTEMPTS = 3
 _METADATA_READ_RETRY_SECS = 0.02
-
-
-_V = TypeVar("_V")
-
-
-class _LRUCache(Generic[_V]):
-    """A tiny bounded LRU cache with a dict-compatible surface.
-
-    Backed by an :class:`collections.OrderedDict`; the most recently
-    accessed key is kept at the end and eviction pops from the front
-    (least-recently-used), so eviction order is fully deterministic for a
-    given access sequence. Supports the subset of the mapping protocol the
-    caller relies on (``get`` / ``__getitem__`` / ``__setitem__`` / ``pop`` /
-    ``__contains__`` / ``__len__`` / ``clear``). Both reads (``get`` /
-    ``__getitem__``) and writes mark a key as recently used.
-
-    ``maxsize <= 0`` disables bounding (behaves like an ordinary dict) so a
-    caller can opt out without a code-path split.
-
-    Thread safety: the same :class:`ConversationLog` instance is touched from
-    the event loop *and* from worker threads (``chat_persistence`` flush /
-    restore, ``chat_regenerate`` / ``chat_rewind`` via ``asyncio.to_thread``,
-    ``handlers/cron`` and ``slack/gateway`` off-loop ``read_messages`` calls).
-    Every method therefore takes ``self._lock`` so each is atomic and the
-    compound read-modify-write sequences (``move_to_end`` + index in ``get`` /
-    ``__getitem__``; the eviction ``len()`` + ``popitem`` loop in
-    ``__setitem__``) cannot interleave with a concurrent ``pop`` / ``clear``.
-    Without it a concurrent ``pop`` landing in the bytecode gap between a
-    successful ``move_to_end`` and the following index raised ``KeyError``
-    (crashing the request/background task) instead of returning the default.
-    The operations are tiny in-memory dict ops, so lock contention is
-    negligible. A plain :class:`threading.Lock` suffices — no method calls
-    another locked method, so the lock is never re-entered.
-    """
-
-    def __init__(self, maxsize: int = _TRANSCRIPT_CACHE_MAX) -> None:
-        self._maxsize = maxsize
-        self._data: "OrderedDict[str, _V]" = OrderedDict()
-        self._lock = threading.Lock()
-
-    def get(self, key: str, default: _V | None = None) -> _V | None:
-        with self._lock:
-            try:
-                self._data.move_to_end(key)
-            except KeyError:
-                return default
-            return self._data[key]
-
-    def __getitem__(self, key: str) -> _V:
-        with self._lock:
-            self._data.move_to_end(key)
-            return self._data[key]
-
-    def __setitem__(self, key: str, value: _V) -> None:
-        with self._lock:
-            self._data[key] = value
-            self._data.move_to_end(key)
-            # Evict least-recently-used entries until within the bound.
-            if self._maxsize > 0:
-                while len(self._data) > self._maxsize:
-                    self._data.popitem(last=False)
-
-    def pop(self, key: str, default: _V | None = None) -> _V | None:
-        with self._lock:
-            return self._data.pop(key, default)
-
-    def pop_prefix(self, prefix: str) -> None:
-        """Remove every entry whose (string) key starts with *prefix*.
-
-        Used to invalidate all cached ``recent()`` windows for one session key
-        (composite keys are ``"<key>\\x00<max>\\x00<roles>"``) without touching
-        other sessions' entries. Atomic under the lock.
-        """
-        with self._lock:
-            doomed = [k for k in self._data if isinstance(k, str) and k.startswith(prefix)]
-            for k in doomed:
-                del self._data[k]
-
-    def __contains__(self, key: object) -> bool:
-        with self._lock:
-            return key in self._data
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._data)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._data.clear()
-
-
-class _SearchTextCache(Generic[_V]):
-    """Byte-budgeted memo for the two derived corpora ``search_sessions`` needs.
-
-    Distinct from :class:`_LRUCache` because the access pattern is different in
-    the one way that decides an eviction policy. A search walks
-    ``_SEARCH_SCAN_WINDOW`` sessions **in the same recency order every query**,
-    so the working set is cyclic. Under LRU a cyclic scan larger than the cache
-    evicts each entry exactly one step before its next read: the hit rate does
-    not degrade, it collapses to zero, and it does so for the users with the
-    most sessions — the ones the memo exists for. ``_folded_cache`` was sized
-    ``max(cache_max, _SEARCH_SCAN_WINDOW)`` for precisely that reason.
-
-    An entry *count* is the wrong bound to carry that guarantee, though: 500
-    entries is 37 MB on one corpus and could be far more on another, because a
-    session is read up to ``_SESSION_MAX_BYTES``. The bound here is therefore
-    **bytes**, which is what actually has to fit in the gateway's RSS.
-
-    A byte budget reintroduces the cliff, so eviction is replaced by
-    **admission control**: when a new entry would exceed the budget it is simply
-    not stored, and the entries already held are kept. For a cyclic scan that
-    turns 0% into (whatever fraction fits)% — and because ``search_sessions``
-    walks most-recent-first, the fraction that stays cached is the most recently
-    active sessions, which is the half worth keeping. Existing entries are still
-    replaced in place on a content change (same key, new value), so a session
-    that is being written to never gets stuck on a stale value.
-
-    ``max_bytes <= 0`` disables the bound (behaves like a plain dict).
-
-    Thread safety mirrors :class:`_LRUCache`: one lock, every method atomic, no
-    method calls another locked method.
-    """
-
-    def __init__(self, max_bytes: int, sizer: Callable[[_V], int], label: str = "") -> None:
-        self._max_bytes = max_bytes
-        self._sizer = sizer
-        self._label = label
-        self._data: dict[str, _V] = {}
-        self._bytes = 0
-        self._admitted = 0
-        self._refused = 0
-        self._refused_since_prune = 0
-        self._warned = False
-        self._lock = threading.Lock()
-
-    def get(self, key: str, default: _V | None = None) -> _V | None:
-        with self._lock:
-            return self._data.get(key, default)
-
-    def __setitem__(self, key: str, value: _V) -> None:
-        cost = self._sizer(value)
-        with self._lock:
-            previous = self._data.get(key)
-            if previous is not None:
-                # Replacement, not growth: release the old cost first so a
-                # session that keeps being appended to cannot inflate the
-                # accounting or be refused admission for its own new value.
-                self._bytes -= self._sizer(previous)
-                del self._data[key]
-            if self._max_bytes > 0 and self._bytes + cost > self._max_bytes:
-                self._refused += 1
-                self._refused_since_prune += 1
-                warn = not self._warned
-                self._warned = True
-                if warn:
-                    # Say it once, at the moment the ceiling starts binding.
-                    # Without this the degradation is observable only under a
-                    # debugger, which makes "diagnosable" an empty claim.
-                    logger.warning(
-                        "search memo %s hit its %d MB ceiling (%d entries, %d "
-                        "admitted); sessions past it fall back to re-reading "
-                        "their file, so warm search will be slower on this "
-                        "corpus",
-                        self._label or "cache",
-                        self._max_bytes // (1024 * 1024),
-                        len(self._data),
-                        self._admitted,
-                    )
-                return
-            self._data[key] = value
-            self._bytes += cost
-            self._admitted += 1
-
-    def pop(self, key: str, default: _V | None = None) -> _V | None:
-        with self._lock:
-            if key in self._data:
-                value = self._data.pop(key)
-                self._bytes -= self._sizer(value)
-                return value
-            return default
-
-    def retain(self, live_keys: Container[str]) -> int:
-        """Drop every entry whose key is not in *live_keys*; return how many.
-
-        The release valve that keeps admission control from becoming a one-way
-        ratchet. Without it, a cache that fills freezes on whatever it happened
-        to hold first: entries that have since aged out of the scan window keep
-        their budget forever (only invalidation or a stat failure pops them),
-        while every newly created session is refused — so the newest and most
-        searched sessions become exactly the cold ones, and warm latency
-        regresses over process lifetime until a restart.
-
-        Safe against the LRU cliff this class exists to avoid, because it only
-        drops entries a search can no longer reach: ``search_sessions`` walks the
-        ``_SEARCH_SCAN_WINDOW`` most recent sessions, so anything outside that
-        window is dead weight by construction rather than an entry one step from
-        its next read.
-
-        Called only under pressure (see ``refused_since_prune``) so an
-        uncontended cache never pays for the scan.
-        """
-        with self._lock:
-            doomed = [k for k in self._data if k not in live_keys]
-            for k in doomed:
-                self._bytes -= self._sizer(self._data.pop(k))
-            self._refused_since_prune = 0
-            return len(doomed)
-
-    def refused_since_prune(self) -> int:
-        """Admissions turned away since the last :meth:`retain`.
-
-        Nonzero means the budget is binding right now, which is the signal to
-        spend a prune. Distinct from the cumulative ``refused`` in
-        :meth:`stats`, which never resets so it stays useful for diagnosis.
-        """
-        with self._lock:
-            return self._refused_since_prune
-
-    def __contains__(self, key: object) -> bool:
-        with self._lock:
-            return key in self._data
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._data)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._data.clear()
-            self._bytes = 0
-
-    def stats(self) -> dict[str, int]:
-        """Observability for the budget: how full it is and what it turned away.
-
-        ``refused`` rising while ``entries`` is flat is the signal that the
-        budget is smaller than the working set, i.e. that searches on this
-        corpus are paying the cold cost for the sessions that did not fit.
-        """
-        with self._lock:
-            return {
-                "entries": len(self._data),
-                "bytes": self._bytes,
-                "max_bytes": self._max_bytes,
-                "admitted": self._admitted,
-                "refused": self._refused,
-            }
 
 
 class ConversationLog:
@@ -1621,6 +1275,48 @@ class ConversationLog:
     _flock_state: dict[str, list[int]] = {}
     _flock_guard = threading.Lock()
 
+    # Monotonic count of cross-process flock RELEASES per lock_key, bumped
+    # under ``_flock_guard`` when a deferred release actually retires a held
+    # flock. Part of the unlocked-fill publish witness
+    # (:meth:`_flock_hold_witness`): "held now" at two instants does not prove
+    # the hold was CONTINUOUS — the flock could have been released and
+    # re-acquired between them with an external process's write in the gap,
+    # and ``os.open`` can recycle the fd number, so the fd alone cannot prove
+    # continuity either. An unchanged (fd, epoch) pair can: the epoch moves on
+    # every release, so equal pairs mean the same unbroken hold. Same growth
+    # class as ``_flock_state``.
+    _flock_epochs: dict[str, int] = {}
+
+    # Per-key invalidation generation, bumped by ``_invalidate_cache`` BEFORE
+    # it drops entries. The mtime guard alone cannot protect a cache FILL:
+    # housekeeping rewrites (compaction / rotation / metadata edits /
+    # mark_consolidated) restore the pre-write mtime via ``_restore_mtime``,
+    # so a fill that stats the file before such a rewrite and publishes after
+    # its invalidation would park pre-rewrite data under an mtime the file
+    # still has — undetectable for the life of the process. Fill paths
+    # snapshot the generation before their stat and publish only while it is
+    # unmoved (``_publish_if_current`` for the mtime-keyed memos; the unlocked
+    # ``_msg_cache`` fallback in ``_read_messages`` checks it inline alongside
+    # the flock-hold witness), discarding the fill otherwise. Class-level for
+    # the same reason
+    # ``_file_locks`` is: the writer whose lock hold forces a reader onto the
+    # unlocked fill may live on a DIFFERENT ``ConversationLog`` instance over
+    # the same directory, and its bump must be visible to that reader's
+    # snapshot. Keyed by ``(transcript dir, sanitized filename stem)`` — pure
+    # string math, so a snapshot costs no I/O, the dir component keeps
+    # distinct ``base_dir``s from sharing counters, and the stem (see
+    # ``_cache_gen``) makes the logical-key and ``path.stem`` spellings of one
+    # session share one counter. ``_cache_gens_guard`` is always innermost:
+    # taken under ``_file_lock`` (every writer invalidates while holding it),
+    # never the reverse, and never across I/O — so no read path waits on a
+    # writer's file operations. Grows one small int per (dir, spelling) ever
+    # invalidated in this process — a session can occupy up to two buckets
+    # (a legacy bare Slack stem plus its canonical spelling) — the same
+    # growth class as ``_file_locks``, and entries are never evicted because
+    # a missing entry must always mean "generation 0", not "forgotten bump".
+    _cache_gens: dict[tuple[str, str], int] = {}
+    _cache_gens_guard = threading.Lock()
+
     def __init__(
         self,
         base_dir: Path | None = None,
@@ -1633,8 +1329,20 @@ class ConversationLog:
         # parsed-transcript working set without limit. Eviction is
         # least-recently-used and deterministic; writes invalidate per-key via
         # _invalidate_cache so a stale entry can never outlive a file change.
-        self._msg_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
-        self._meta_cache: _LRUCache[tuple[float, dict]] = _LRUCache(cache_max)
+        self._msg_cache: _LRUCache[tuple[float, int, list[dict]]] = _LRUCache(cache_max)
+        #: ``(mtime, gen, meta)`` — like the search memos, entries record the
+        #: invalidation generation and a warm hit requires both fields to
+        #: match, so a preserved-mtime metadata edit through another
+        #: instance (whose pops cannot reach this cache) still unhits.
+        #:
+        #: Sized by ``_METADATA_CACHE_MAX``, NOT ``cache_max``: this memo holds one
+        #: parsed first line per session rather than a transcript window, and
+        #: ``list_sessions`` reads it in a whole-directory cyclic scan that an LRU
+        #: smaller than the corpus cannot hit. Same reasoning the search budgets
+        #: already use to decline that knob. Deliberately not overridable: a test
+        #: that needs a small bound assigns ``_meta_cache`` directly rather than
+        #: adding a constructor parameter no product caller uses.
+        self._meta_cache: _LRUCache[tuple[float, int, dict]] = _LRUCache(_METADATA_CACHE_MAX)
         #: Bounded, mtime-keyed LRU of formatted ``recent()`` windows keyed by
         #: (key, max_messages, roles). The tail-read fast path intentionally
         #: never warms ``_msg_cache`` (it returns a partial view), so a session
@@ -1644,8 +1352,21 @@ class ConversationLog:
         #: staleness (an append bumps the file mtime, so the entry is
         #: recomputed on the next call). Own ``_LRUCache`` → own internal lock.
         self._recent_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
-        #: Bounded, mtime-keyed memo of ``(mtime, doc_chars, casefolded_blob)``
-        #: per session, consumed only by :meth:`search_sessions`.
+        #: Bounded memo of lightweight message projections containing only
+        #: ``ts`` and ``meta.file_changes``. The Artifacts "All" view scans
+        #: every session, so routing it through ``_msg_cache`` retains the full
+        #: parsed transcript corpus. The file stamp includes inode and size in
+        #: addition to nanosecond mtime so rotations and atomic rewrites miss.
+        self._file_change_cache: _LRUCache[_FileChangeCacheEntry] = _LRUCache(cache_max)
+        #: Bounded memo of ``(mtime, gen, doc_chars, casefolded_blob)`` per
+        #: session, consumed only by :meth:`search_sessions`. ``gen`` is the
+        #: invalidation generation (:meth:`_cache_gen`) the entry was folded
+        #: under; a hit requires BOTH the mtime and the generation to match,
+        #: because ``_invalidate_cache``'s pops reach only their own
+        #: instance's caches while a preserved-mtime rewrite can be performed
+        #: through a different ``ConversationLog`` instance over the same
+        #: directory — the generation bump is what unhits such an entry where
+        #: the instance-local pop cannot.
         #:
         #: Folding is the dominant cost of a search: the substring count itself
         #: is cheap, but ``str.casefold`` over a whole corpus is not, and it
@@ -1660,10 +1381,10 @@ class ConversationLog:
         #: order; :class:`_SearchTextCache` keeps that guarantee by refusing
         #: admission instead of evicting, so the sessions that fit stay cached
         #: and the bound is now a real memory ceiling rather than a proxy for one.
-        self._folded_cache: _SearchTextCache[tuple[float, int, str]] = _SearchTextCache(
-            _SEARCH_FOLD_BUDGET_BYTES, lambda v: v[2].__sizeof__(), "fold"
+        self._folded_cache: _SearchTextCache[tuple[float, int, int, str]] = _SearchTextCache(
+            _SEARCH_FOLD_BUDGET_BYTES, lambda v: v[3].__sizeof__(), "fold"
         )
-        #: session key → (mtime, raw message texts) for snippet extraction.
+        #: session key → (mtime, gen, raw message texts) for snippet extraction.
         #:
         #: The fold above answers "does this session match"; this answers "show me
         #: the line". Without it every returned row re-opened its file and
@@ -1676,10 +1397,13 @@ class ConversationLog:
         #: Filled by :meth:`_build_folded`, which already materializes exactly
         #: this list to build the fold — so the second corpus costs one extra
         #: reference, never an extra read. Raw (not folded) because the snippet is
-        #: displayed to the user; the fold cannot be reused for it.
-        self._snippet_cache: _SearchTextCache[tuple[float, list[str]]] = _SearchTextCache(
+        #: displayed to the user; the fold cannot be reused for it. Carries the
+        #: same generation field as ``_folded_cache`` above, for the same
+        #: cross-instance reason: both memos are derived from the messages, so
+        #: they go stale at exactly the same moment.
+        self._snippet_cache: _SearchTextCache[tuple[float, int, list[str]]] = _SearchTextCache(
             _SEARCH_SNIPPET_BUDGET_BYTES,
-            lambda v: v[1].__sizeof__() + sum(t.__sizeof__() for t in v[1]),
+            lambda v: v[2].__sizeof__() + sum(t.__sizeof__() for t in v[2]),
             "snippet",
         )
         #: tab_id → [session keys] chain index. ``None`` means "stale, rebuild
@@ -1691,6 +1415,32 @@ class ConversationLog:
         #: event loop may mark it stale — an unsynchronized rebuild/read/clear
         #: produced a transient empty index or ``AttributeError``.
         self._tab_id_index: dict[str, list[str]] | None = None
+        #: session key → (mtime, tab_id) memo feeding the rebuild above.
+        #: Deliberately an unbounded plain dict, NOT an _LRUCache: the rebuild is
+        #: a cyclic scan over every dashboard file, and a bounded cache under a
+        #: cyclic scan larger than the bound has a 0% hit rate (see
+        #: _SearchTextCache's docstring). Values are 12-char ids, so 1k sessions
+        #: is tens of KB.
+        #:
+        #: TWO guards, and neither is sufficient alone. The explicit pop in
+        #: _invalidate_cache covers writes THROUGH this class from THIS instance:
+        #: those restore the pre-write mtime (_restore_mtime), so a stamp alone
+        #: would not see them. The stamp covers rewrites that never reach that
+        #: pop -- a hand-edited tab_id, or a write through ANOTHER instance,
+        #: whose pop lands on its own memo and leaves ours intact.
+        #:
+        #: The stamp is (st_mtime_ns, st_size, st_ino), all from one stat. Size
+        #: rides along because timestamp granularity is coarse (worse on
+        #: Windows). ns rather than float seconds, and st_ino as well, because
+        #: another instance's equal-length tab_id rewrite preserves mtime and
+        #: size both -- see the cross-instance test.
+        self._tab_id_by_key: dict[str, tuple[tuple[int, int, int], str]] = {}
+        #: Bumped by _invalidate_cache. The rebuild samples it before reading a
+        #: file's metadata and declines to memoize if it moved, so a store cannot
+        #: land after a concurrent writer's pop and resurrect a stale id.
+        #: _invalidate_cache deliberately does not take self._lock, so the
+        #: rebuild cannot exclude it.
+        self._tab_id_generation = 0
         #: Coarse instance lock protecting the lazily-built ``_tab_id_index``
         #: rebuild/read/clear. The message/metadata/recent LRUs are each
         #: internally locked; this guards the shared mutable state that lives
@@ -1701,6 +1451,15 @@ class ConversationLog:
         #: whole thing. Correctness-neutral — see
         #: :meth:`_read_tail_messages`.
         self._tail_reads = True
+        self._cache_coordinator = HistoryCacheCoordinator(
+            self,
+            safe_key=lambda key: _safe_key(key),
+            registry_owner=ConversationLog,
+        )
+        self._catalog_projection = SessionCatalogProjection(self)
+        self._read_projection = TranscriptReadProjection(self)
+        self._metadata_projection = SessionMetadataProjection(self)
+        self._rewrite_coordinator = HistoryRewriteCoordinator(self)
 
     def _file_lock(self, key: str) -> threading.RLock:
         """Return the process-wide reentrant lock guarding *key*'s session file.
@@ -1943,6 +1702,13 @@ class ConversationLog:
                     if st is None or st[0] != fd or st[1] != 0:
                         return  # reused or replaced — leave the flock in place
                     ConversationLog._flock_state.pop(lock_key, None)
+                    # The hold is over: advance the release epoch so an
+                    # unlocked fill's witness (:meth:`_flock_hold_witness`)
+                    # spanning this release can no longer claim a continuous
+                    # hold, even if a re-acquire lands on a recycled fd number.
+                    ConversationLog._flock_epochs[lock_key] = (
+                        ConversationLog._flock_epochs.get(lock_key, 0) + 1
+                    )
                 try:
                     platform_compat.release_lock(fd)
                 finally:
@@ -2003,21 +1769,43 @@ class ConversationLog:
             return None
         summary = data.get("summary")
         sig = self.session_mtime(key)
-        if sig is not None and data.get("sig") == sig and isinstance(summary, str):
+        if (
+            sig is not None
+            and data.get("sig") == sig
+            and data.get("gen", 0) == self.rotation_generation(key)
+            and isinstance(summary, str)
+        ):
             return summary
         return None
 
-    def set_cached_summary(self, key: str, summary: str, sig: float) -> None:
+    def set_cached_summary(
+        self, key: str, summary: str, sig: float, generation: int | None = None
+    ) -> None:
         """Persist a derived one-line *summary* to the sidecar cache.
 
         Keyed by the session file's mtime *sig* so a later append invalidates
         it. Atomic and side-effect-free with respect to the session JSONL —
         no read-modify-write, hence no data-loss race with a concurrent
         :meth:`append`.
+
+        *generation* is :meth:`rotation_generation` captured at the same moment
+        as *sig*, and must come from the caller for the same reason *sig* does:
+        summary generation holds no lock while the model call is in flight, and
+        a rewrite landing in that window preserves the mtime while advancing the
+        generation. Reading the generation HERE would stamp the new content's
+        identity onto the old summary and bless it as fresh — the exact
+        staleness the generation was added to catch. ``None`` reads it at write
+        time, which is only safe when no snapshot preceded the call.
         """
         atomic_write(
             self._summary_cache_path(key),
-            json.dumps({"sig": sig, "summary": summary}),
+            json.dumps(
+                {
+                    "sig": sig,
+                    "gen": (self.rotation_generation(key) if generation is None else generation),
+                    "summary": summary,
+                }
+            ),
         )
 
     def _intent_summary_cache_path(self, key: str) -> Path:
@@ -2048,6 +1836,8 @@ class ConversationLog:
         sig = self.session_mtime(key)
         if sig is None or data.get("sig") != sig:
             return None
+        if data.get("gen", 0) != self.rotation_generation(key):
+            return None
         return data
 
     def read_intent_summary(self, key: str) -> tuple[dict | None, bool]:
@@ -2068,9 +1858,16 @@ class ConversationLog:
         if not isinstance(data, dict) or not isinstance(data.get("intents"), list):
             return None, False
         sig = self.session_mtime(key)
-        return data, not (sig is not None and data.get("sig") == sig)
+        fresh = (
+            sig is not None
+            and data.get("sig") == sig
+            and data.get("gen", 0) == self.rotation_generation(key)
+        )
+        return data, not fresh
 
-    def set_cached_intent_summary(self, key: str, payload: dict, sig: float) -> bool:
+    def set_cached_intent_summary(
+        self, key: str, payload: dict, sig: float, generation: int | None = None
+    ) -> bool:
         """Persist a derived intent summary *payload* to its sidecar cache.
 
         Writes only the sidecar, never the session JSONL, so generating a
@@ -2096,15 +1893,28 @@ class ConversationLog:
             with self._locked(key):
                 if _safe_mtime(self._path(key)) != sig:
                     return False
+                current_generation = self.rotation_generation(key)
+                if generation is not None and current_generation != generation:
+                    # A rewrite landed while the model call was in flight. It
+                    # PRESERVED the mtime, so the check above cannot see it —
+                    # the generation is the only signal that the summary now
+                    # describes replaced content. Refuse for the same reason a
+                    # changed mtime is refused: storing it would record a known
+                    # stale payload as the latest word.
+                    return False
                 atomic_write(
                     self._intent_summary_cache_path(key),
-                    json.dumps({**payload, "sig": sig}),
+                    json.dumps(
+                        {
+                            **payload,
+                            "sig": sig,
+                            "gen": (current_generation if generation is None else generation),
+                        }
+                    ),
                 )
                 return True
         except HistoryLockTimeout:
-            logger.warning(
-                "set_cached_intent_summary: lock timeout, not writing key=%s", key
-            )
+            logger.warning("set_cached_intent_summary: lock timeout, not writing key=%s", key)
             return False
 
     def append(
@@ -2118,6 +1928,7 @@ class ConversationLog:
         agent: str | None = None,
         tab_id: str | None = None,
         cls: str = "",
+        mid: str | None = None,
     ) -> None:
         """Append a message with optional provenance to the session log.
 
@@ -2125,6 +1936,18 @@ class ConversationLog:
         carries one (``_ChatSlot.append``) but this durable copy had nowhere to
         put it, so any class-borne distinction silently vanished the moment a
         session's rows had to be replayed from disk after a restart.
+
+        *mid* persists the row's delivery identity as ``meta.mid`` — the SAME
+        field shape the dashboard slot save writes
+        (``chat_persistence._build_message_entry`` copies the window row's
+        ``meta`` dict to disk). A dual-writer that reflects a message in the
+        in-memory slot (``_ChatSlot.append``, which mints the id) AND persists
+        it here must pass that minted id, so both copies carry one identity and
+        the bounded-read reconciliation (``_append_unflushed_tail``'s
+        ``meta.mid`` walk) recognises the durable copy instead of treating the
+        window copy as still owed. Optional: a row appended without one carries
+        no ``meta`` at all, which is what pre-id transcripts hold — readers keep
+        their id-less fallback for exactly those rows.
 
         If the session file does not yet exist, it will be created with an
         initial metadata line.  When *agent* is supplied, the agent name is
@@ -2184,6 +2007,14 @@ class ConversationLog:
                 msg["source_thread"] = source_thread
             if source_user:
                 msg["source_user"] = source_user
+            if isinstance(mid, str) and mid:
+                # ``meta`` holding ``mid`` is the identity shape every reader of
+                # this file already matches on (the slot save writes it, the
+                # bounded-read walk consumes it); a second spelling would be
+                # invisible to both. Only a non-empty ``str`` counts, matching
+                # the read side — persisting any other shape would store an id
+                # the reader is structurally unable to honour.
+                msg["meta"] = {"mid": mid}
 
             # Session transcripts are intentionally local plaintext JSONL (the
             # documented storage format), not a credential/secret store.
@@ -2200,8 +2031,10 @@ class ConversationLog:
             if created_with_tab_id:
                 self.invalidate_tab_id_cache()
 
-            # Rotate if file exceeds size limit
-            self._maybe_rotate(path)
+            # Rotate if file exceeds size limit. Pass the logical key so the
+            # rotation's invalidation reaches every cache-key spelling; the
+            # file stem alone cannot recover it (sanitization is lossy).
+            self._maybe_rotate(path, key)
 
     def append_if_absent(
         self,
@@ -2212,11 +2045,14 @@ class ConversationLog:
         agent: str | None = None,
         tab_id: str | None = None,
         cls: str = "",
+        mid: str | None = None,
     ) -> bool:
         """Append a message only if an identical one is not already persisted.
 
-        Returns ``True`` if the message was written, ``False`` if a message
-        with the same ``(role, content)`` already exists on disk.
+        Returns ``True`` if the message was written, ``False`` if it is already
+        on disk — judged by ``(role, content)`` when the caller supplies no
+        *mid*, and by ``(role, content)`` plus the SAME ``meta.mid`` when it
+        does (see below).
 
         The disk check and the append run together under ``_locked`` so they
         are ATOMIC against a concurrent writer of the same session file — in
@@ -2230,7 +2066,19 @@ class ConversationLog:
         agent turns. This is the workflow-result / cron-result double-append
         race: the read-modify-write must be one locked critical section, not a
         separate unlocked existence check followed by a later append.
+
+        What counts as "already persisted" depends on whether the caller holds
+        an identity. Without *mid*, any row with the same ``(role, content)``
+        does — body equality is all an id-less writer can check. WITH *mid*,
+        only a body-equal row carrying the SAME ``meta.mid`` does: that row is
+        this very message, landed by the slot save or an earlier attempt of
+        this write. A body-equal row under another id (or none) is a DIFFERENT
+        occurrence that happens to repeat the text — an id-carrying twin of an
+        earlier injection, or a pre-id legacy row — and skipping on it would
+        drop THIS occurrence's only durable copy: the in-memory window is lost
+        on restart, so nothing would replay the newer message.
         """
+        supplied_mid = mid if isinstance(mid, str) and mid else None
         with self._locked(key):
             if self._path(key).exists():
                 # Compare against the form ``append`` actually stores: the
@@ -2239,96 +2087,53 @@ class ConversationLog:
                 # that contained a credential and would append it twice.
                 persisted = _redact_at_write_boundary(role, content)
                 for m in self._read_messages(key):
-                    if m.get("role") == role and m.get("content") == persisted:
+                    if m.get("role") != role or m.get("content") != persisted:
+                        continue
+                    if supplied_mid is None:
+                        return False
+                    m_meta = m.get("meta")
+                    if isinstance(m_meta, dict) and m_meta.get("mid") == supplied_mid:
                         return False
             # Reentrant: ``append`` re-enters ``_locked`` for the same key on
             # this thread (RLock + refcounted flock), so the write stays inside
-            # the critical section we already hold.
-            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls)
+            # the critical section we already hold. The skip paths above leave
+            # the persisted rows untouched — an id is never retrofitted onto a
+            # row already on disk.
+            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls, mid=mid)
             return True
 
     def recent(
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
-        """Return last *max_messages* entries as ``[{role, content}]``.
-
-        When *roles* is provided, only messages with matching roles are
-        counted toward the limit.  This filters out low-signal entries
-        (e.g. tool display titles) so the budget is spent on user and
-        assistant content.
-
-        When *exclude_last_n* > 0, drops that many trailing raw entries
-        BEFORE role filtering. Used by the dashboard to avoid re-injecting
-        the just-flushed current-turn user message as history when the
-        background flush wins the race against kiro-cli spawn.
-        """
-        # Recent-only access with no trailing exclusion can
-        # be served by reading just the TAIL of the file, skipping a full parse
-        # of a potentially 2 MB session log. Only taken on a cache miss (a fresh
-        # full-parse cache is already O(1) and is preferred). Returns None to
-        # signal "fall through to the full read" (missing file, or a full cache
-        # is fresh — in which case the full path is a cheap cache hit).
-        if exclude_last_n == 0 and self._tail_reads:
-            tail = self._recent_via_tail(key, max_messages, roles)
-            if tail is not None:
-                return tail
-        messages = self._read_messages(key)
-        if exclude_last_n > 0:
-            messages = messages[:-exclude_last_n]
-        if roles:
-            messages = [m for m in messages if m["role"] in roles]
-        return [{"role": m["role"], "content": m["content"]} for m in messages[-max_messages:]]
+        return self._read_projection.recent(key, max_messages, roles, exclude_last_n=exclude_last_n)
 
     def recent_chained(
         self,
         key: str,
         max_messages: int = 20,
-        roles: set[str] | None = None,
+        roles: AbstractSet[str] | None = None,
         *,
         exclude_last_n: int = 0,
     ) -> list[dict]:
-        """Like recent() but reads across all chained session files (same tab_id).
-
-        For long-lived sessions that span multiple session files (linked by
-        tab_id), this reads the full chain. Falls back to single-file read
-        for legacy sessions without a tab_id.
-
-        See :meth:`recent` for *exclude_last_n* semantics.
-        """
-        messages = self.read_messages_chained(key)
-        if exclude_last_n > 0:
-            messages = messages[:-exclude_last_n]
-        if roles:
-            messages = [m for m in messages if m["role"] in roles]
-        return [{"role": m["role"], "content": m["content"]} for m in messages[-max_messages:]]
+        return self._read_projection.recent_chained(
+            key, max_messages, roles, exclude_last_n=exclude_last_n
+        )
 
     def recent_with_provenance(
-        self, key: str, max_messages: int = 3, *, exclude_last_n: int = 0
+        self,
+        key: str,
+        max_messages: int = 3,
+        *,
+        exclude_last_n: int = 0,
     ) -> list[dict]:
-        """Return recent entries with source_thread provenance for cross-session citation.
-
-        See :meth:`recent` for *exclude_last_n* semantics.
-        """
-        messages = self._read_messages(key)
-        if exclude_last_n > 0:
-            messages = messages[:-exclude_last_n]
-        with_source = [m for m in messages if m.get("source_thread")]
-        result: list[dict] = []
-        for m in with_source[-max_messages:]:
-            snippet = m["content"][:150] + "…" if len(m["content"]) > 150 else m["content"]
-            result.append(
-                {
-                    "source_thread": m["source_thread"],
-                    "ts": m.get("ts", "?"),
-                    "snippet": snippet,
-                }
-            )
-        return result
+        return self._read_projection.recent_with_provenance(
+            key, max_messages, exclude_last_n=exclude_last_n
+        )
 
     def get_unconsolidated(self, key: str) -> tuple[list[dict], int]:
         """Return (messages_after_last_consolidated, total_message_count)."""
@@ -2520,7 +2325,15 @@ class ConversationLog:
             # (see _restore_mtime). Otherwise consolidation floats stale sessions
             # to the top of list_sessions on every gateway restart.
             _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+            # Invalidate while still holding the lock. Outside it there is a
+            # window where the file is already rewritten with its mtime
+            # restored but the generation has not moved, so a concurrent fold /
+            # snippet / metadata read passes both the mtime and the generation
+            # guard and memoizes pre-rewrite data. Every other preserved-mtime
+            # writer already invalidates inside its locked section;
+            # _invalidate_cache is pure in-memory work, so this adds no I/O
+            # under the cross-process flock.
+            self._invalidate_cache(key)
 
     def unconsolidated_count(self, key: str) -> int:
         """Count messages not yet processed by the consolidator."""
@@ -2602,9 +2415,7 @@ class ConversationLog:
             attempts = 0
         return max(0, attempts), retry_at
 
-    def _attempts_describe_current_span(
-        self, meta: dict, message_count: int | None
-    ) -> bool:
+    def _attempts_describe_current_span(self, meta: dict, message_count: int | None) -> bool:
         """True when the recorded attempts belong to the span in front of us now.
 
         A span is identified by where it starts AND how far it reaches: the
@@ -2813,1306 +2624,225 @@ class ConversationLog:
             )
         return failures, retry_at
 
-    def load_transcript(self, key: str) -> str:
-        """Load full session as formatted text for LLM summarization."""
-        messages = self._read_messages(key)
-        if not messages:
-            return ""
-        lines: list[str] = []
-        for m in messages:
-            role = m["role"].title()
-            lines.append(f"{role}: {m['content']}")
-        return "\n\n".join(lines)
-
     @staticmethod
     def _canonical_key(key: str) -> str:
-        """Collapse stacked ``dashboard_`` prefixes to a single one.
-
-        Files like ``dashboard_dashboard_chat-1-123`` are duplicates of
-        ``dashboard_chat-1-123`` caused by resume round-trips.  Return
-        the canonical (single-prefix) form so callers can deduplicate.
-        """
-        if not key.startswith("dashboard_"):
-            return key
-        stripped = key
-        while stripped.startswith("dashboard_"):
-            stripped = stripped[len("dashboard_") :]
-        return f"dashboard_{stripped}" if stripped else key
+        return SessionCatalogProjection._canonical_key(key)
 
     def list_sessions(self) -> list[dict]:
-        """Return metadata for all session files, newest first.
-
-        Deduplicates stacked ``dashboard_`` prefix files, keeping the
-        most recently modified version.  Uses mtime-based metadata cache
-        when available, falling back to reading only the first line for
-        title extraction.
-        """
-        sessions: list[dict] = []
-        if not self._dir.exists():
-            return sessions
-        # Deduplicate stacked dashboard_ prefixes by canonical key, keeping newer
-        by_canon: dict[str, dict] = {}
-        for path in self._dir.glob("*.jsonl"):
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            # Skip symlinks — these are handoff aliases pointing to the real session
-            if path.is_symlink():
-                continue
-            key = path.stem
-            meta: dict = {
-                "key": key,
-                "messages": max(1, int(stat.st_size / 200)),
-                "modified": stat.st_mtime,
-                "created": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            }
-            # Try metadata cache first (populated by _read_metadata calls)
-            cached_meta = self._meta_cache.get(key)
-            if cached_meta and cached_meta[0] == stat.st_mtime:
-                d = cached_meta[1]
-                if d.get("created_at"):
-                    meta["created"] = d["created_at"]
-                if d.get("title"):
-                    meta["title"] = d["title"]
-                if d.get("agent"):
-                    meta["agent"] = d["agent"]
-                meta["memory_mode"] = d.get("memory_mode", "persistent")
-                if d.get("folder_id"):
-                    meta["folder_id"] = d["folder_id"]
-            else:
-                # Read only the first line for metadata
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        first_line = f.readline().strip()
-                    if first_line:
-                        d = json.loads(first_line)
-                        if d.get("_type") == "metadata":
-                            if d.get("created_at"):
-                                meta["created"] = d["created_at"]
-                            if d.get("title"):
-                                meta["title"] = d["title"]
-                            if d.get("agent"):
-                                meta["agent"] = d["agent"]
-                            meta["memory_mode"] = d.get("memory_mode", "persistent")
-                            if d.get("folder_id"):
-                                meta["folder_id"] = d["folder_id"]
-                            self._meta_cache[key] = (stat.st_mtime, d)
-                except Exception:
-                    pass
-            # Ensure memory_mode is always present (old sessions lack it)
-            meta.setdefault("memory_mode", "persistent")
-            # Extract first user message as title fallback
-            if "title" not in meta:
-                msg_cached = self._msg_cache.get(key)
-                if msg_cached and msg_cached[0] == stat.st_mtime:
-                    for m in msg_cached[1]:
-                        if m.get("role") == "user" and m.get("content"):
-                            meta["title"] = m["content"][:80]
-                            break
-                else:
-                    try:
-                        with open(path, encoding="utf-8") as f:
-                            for i, ln in enumerate(f):
-                                if i > 20:
-                                    break
-                                ln = ln.strip()
-                                if not ln:
-                                    continue
-                                try:
-                                    d = json.loads(ln)
-                                except json.JSONDecodeError:
-                                    continue
-                                if d.get("role") == "user" and d.get("content"):
-                                    meta["title"] = d["content"][:80]
-                                    break
-                    except Exception:
-                        pass
-            if "title" not in meta:
-                meta["title"] = key
-            # Deduplicate: keep newer entry per canonical key
-            canon = self._canonical_key(key)
-            existing = by_canon.get(canon)
-            if existing is None or stat.st_mtime >= existing["modified"]:
-                by_canon[canon] = meta
-        sessions = list(by_canon.values())
-        sessions.sort(key=lambda s: s.get("modified", 0), reverse=True)
-        return sessions
+        return self._catalog_projection.list_sessions()
 
     def agent_usage(self) -> dict[str, tuple[int, float]]:
-        """Return ``{agent_name: (session_count, last_used_mtime)}`` per agent.
-
-        Built on top of :meth:`list_sessions` (not a fresh directory glob) so it
-        inherits that method's canonical-session dedup and symlink-skip — counts
-        are therefore per logical conversation, not per raw ``.jsonl`` file.
-        Sessions whose metadata never recorded an agent are ignored.
-        """
-        usage: dict[str, tuple[int, float]] = {}
-        for meta in self.list_sessions():
-            agent = meta.get("agent")
-            if not agent:
-                continue
-            count, last_used = usage.get(agent, (0, 0.0))
-            usage[agent] = (count + 1, max(last_used, meta.get("modified", 0.0)))
-        return usage
+        return self._catalog_projection.agent_usage()
 
     def search_sessions(self, query: str, limit: int = 50) -> list[dict]:
-        """Return session metadata for files whose message content matches *query*.
-
-        This is the ONE ranking every transcript-search consumer shares — the
-        dashboard history filter, the ``search_chat_history`` MCP tool, and
-        Discord session resume — so the recency weighting and CJK adjacency
-        floor below apply to all of them by design: "the best match for this
-        query" should not depend on which surface asked.
-
-        The query is parsed by :func:`parse_search_query` into needles, and a
-        session matches only when **every** REQUIRED needle appears somewhere in
-        its title or content — an AND over the whole document, not a single
-        whole-query substring. That is what makes a natural multi-word query
-        work: ``"ack contention hypotheses"`` finds a session discussing all
-        three, which a whole-phrase match missed because those exact words never
-        sit adjacent. A single-token query is unchanged by this — one token IS
-        the phrase. CJK terms gate on their individual characters (CJK text has
-        no spaces to split on, so the run itself would demand the user's exact
-        sentence), rank on their character bigrams, and require at least one
-        bigram hit (the adjacency floor) — see :func:`parse_search_query` for
-        the recall/precision split.
-
-        Each needle is matched case-insensitively as a SUBSTRING (so ``"cont"``
-        hits ``"contention"``, which keeps search-as-you-type responsive) using
-        full Unicode case folding via :meth:`str.casefold` (so e.g. German ``ß``
-        folds to ``ss``).  Matching only on parsed ``content`` avoids false
-        positives from JSON structural elements (e.g. the word ``"user"``
-        matching every ``"role": "user"`` line).
-
-        Ranking (higher is better)::
-
-            score = ((title_hits * _TITLE_BOOST)
-                  + (content_hits / sqrt(1 + doc_chars / 1024))) * recency
-
-        where ``*_hits`` sum the per-needle weighted counts, plus
-        ``_PHRASE_BOOST`` per occurrence of the exact whole query when it
-        carries more than a single needle. The phrase bonus rewards adjacency:
-        at comparable term frequency, the session containing the words TOGETHER
-        as typed ranks above one that merely mentions them far apart.  It is
-        deliberately a bonus and not an override — a session repeating one term
-        far more often still wins on raw term frequency, exactly as it already
-        did for a single-token query.  (Saturating term frequency, BM25-style,
-        would change that; it would also re-rank every existing single-token
-        query, so it is out of scope here.)
-
-        ``recency`` is a bounded multiplicative boost — ``1 +
-        _RECENCY_MAX_BOOST / (1 + age_days / _RECENCY_HALF_WEIGHT_DAYS)`` — so
-        at comparable relevance today's session outranks last year's, while a
-        decisively better old match still wins (the boost tops out at ×2.5 and
-        never drops below ×1).
-
-        Title matches get a strong field boost - titles are short and
-        intentional, so a hit there is strong evidence.  Content matches
-        are normalized by a sqrt length factor so a long session with a
-        casual mention doesn't outrank a short, focused one.  (Simpler
-        than BM25's ``(1-b) + b*(dl/avgdl)`` because we avoid the
-        two-pass scan needed for corpus stats.)  Sessions missing any
-        required needle are dropped.  Ties break by recency (existing
-        ``list_sessions`` order - newest first).  Caps results at *limit*.
-        Only the ``_SEARCH_SCAN_WINDOW`` most recent files are scored, so
-        I/O stays bounded even with hundreds of sessions.
-        """
-        if not query or limit <= 0 or not self._dir.exists():
-            return []
-        needles, phrase, adjacency_floor = parse_search_query(query)
-        if not needles:
-            # Whitespace-only query: no needles to require, so nothing can match.
-            # Returning [] keeps this from degenerating into "match everything",
-            # and skips reading every session file to reach that conclusion.
-            return []
-        required = [n for n in needles if n.required]
-        # True when the phrase carries more than the single needle does, so an
-        # exact-phrase bonus is meaningful. Not a token-count test: dedup
-        # collapses "a a" to one needle while its phrase is still two words, and
-        # a single CJK term expands to several needles while the phrase is what
-        # rewards its characters appearing together.
-        multi = [n.text for n in required] != [phrase]
-        now = _time.time()
-        # (score, -rank, meta, needs_snippet)
-        scored: list[tuple[float, int, dict, bool]] = []
-        window = self.list_sessions()[:_SEARCH_SCAN_WINDOW]
-        self._prune_search_memos({m["key"] for m in window})
-        for rank, meta in enumerate(window):
-            doc_chars, folded = self._folded_content(meta["key"])
-            title_folded = (meta.get("title") or "").casefold()
-            content_hits = 0.0
-            title_hits = 0.0
-            adjacency_hits = 0
-            disqualified = False
-            for needle in needles:
-                in_content = folded.count(needle.text) if folded else 0
-                in_title = title_folded.count(needle.text)
-                if needle.required and not in_content and not in_title:
-                    # AND semantics: one absent required needle disqualifies the
-                    # session, so stop counting the rest.
-                    disqualified = True
-                    break
-                if not needle.required:
-                    adjacency_hits += in_content + in_title
-                content_hits += in_content * needle.weight
-                title_hits += in_title * needle.weight
-            if disqualified or (not content_hits and not title_hits):
-                continue
-            if adjacency_floor and not adjacency_hits:
-                # Adjacency floor: a CJK query whose characters ALL appear but
-                # never once adjacently (no bigram hit anywhere) is a character
-                # scatter, not a word hit. Individual han/kana characters are
-                # common enough that ranking alone cannot keep such noise off a
-                # result page whose real hits number fewer than *limit* — so
-                # scatter-only sessions are excluded, not merely down-ranked. A
-                # document containing the query's words apart still qualifies:
-                # each word is itself a bigram hit. The parse WAIVES the floor
-                # (adjacency_floor=False) when its bigram set was truncated —
-                # judging "no adjacency anywhere" against a partial set would
-                # hide long-query matches (see parse_search_query).
-                continue
-            if multi:
-                # Reward the words appearing together, in order, as typed.
-                if folded:
-                    content_hits += folded.count(phrase) * _PHRASE_BOOST
-                title_hits += title_folded.count(phrase) * _PHRASE_BOOST
-            length_norm = math.sqrt(1 + doc_chars / 1024)
-            score = title_hits * _TITLE_BOOST + content_hits / length_norm
-            # Recency boost: multiplicative and bounded to (1.0, 2.5], so a
-            # fresh session with comparable relevance outranks a stale one, but
-            # an old session with a decisively better match still wins — the
-            # boost can at most double a score, never zero one out. Halves its
-            # extra weight every _RECENCY_HALF_WEIGHT_DAYS of age.
-            age_days = max(0.0, now - meta.get("modified", 0.0)) / 86400
-            score *= 1.0 + _RECENCY_MAX_BOOST / (1.0 + age_days / _RECENCY_HALF_WEIGHT_DAYS)
-            # Negate rank so a smaller (newer) rank wins ties after score desc sort.
-            scored.append((score, -rank, meta, content_hits > 0))
-        scored.sort(reverse=True)
-
-        # Snippets are attached AFTER the sort+slice, so the cost is proportional
-        # to the rows actually returned rather than to every session that
-        # matched. A snippet cannot come from the folded cache (it needs the
-        # original text, so offsets line up), so building one per match put a
-        # full re-read back on the hot path — dominating the query once the fold
-        # itself was memoized.
-        out: list[dict] = []
-        for _score, _rank, meta, needs_snippet in scored[:limit]:
-            snippet = self._content_snippet(meta["key"], query) if needs_snippet else ""
-            out.append({**meta, "snippet": snippet} if snippet else meta)
-        return out
+        return self._catalog_projection.search_sessions(query, limit)
 
     def _folded_content(self, key: str) -> tuple[int, str]:
-        """Return ``(doc_chars, casefolded_content)`` for *key*, memoized by mtime.
-
-        ``doc_chars`` counts the ORIGINAL (unfolded) characters, because it
-        feeds the length normalizer in :meth:`search_sessions` and folding can
-        change a string's length (``ß`` -> ``ss``).
-
-        The folded blob joins the messages' string ``content`` fields in file
-        order with ``\\x00``. That separator cannot appear in a user query, so
-        it prevents a match spanning two messages while still allowing one
-        ``count`` call over the whole session instead of one per message.
-
-        Returns ``(0, "")`` for a missing/unreadable file or a session with no
-        textual content. A read failure is deliberately NOT cached — see below.
-        """
-        path = self._path(key)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            self._folded_cache.pop(key, None)
-            self._snippet_cache.pop(key, None)
-            return (0, "")
-        cached = self._folded_cache.get(key)
-        if cached and cached[0] == mtime:
-            return (cached[1], cached[2])
-        # Cold: serialize against this key's writers for the whole
-        # stat -> read -> store sequence.
-        #
-        # The mtime guard cannot protect this window, because the housekeeping
-        # rewrites deliberately RESTORE the pre-write mtime (``_restore_mtime``,
-        # so compaction does not reorder ``list_sessions``). A fold that started
-        # before such a rewrite and stored after its ``_invalidate_cache`` would
-        # sit in the cache holding pre-rewrite text under a mtime the file still
-        # has — undetectable, so the newly saved messages would be missing from
-        # every later search for the life of the process.
-        #
-        # ``_file_lock`` is the same in-process RLock every writer takes first in
-        # ``_locked``, so holding it here orders this fold against append /
-        # rewrite / metadata edits for this key. It is acquired ONLY on the miss
-        # path: a warm search never contends, and two threads racing the same
-        # cold key fold once (the re-check below).
-        with self._file_lock(key):
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                self._folded_cache.pop(key, None)
-                self._snippet_cache.pop(key, None)
-                return (0, "")
-            cached = self._folded_cache.get(key)
-            if cached and cached[0] == mtime:
-                return (cached[1], cached[2])
-            built = self._build_folded(key, mtime)
-            if built is None:
-                # The read failed rather than finding no content. Caching that
-                # would be keyed by an mtime the file still has, so a session
-                # made transiently unopenable (fd exhaustion, or a Windows
-                # indexer / AV holding a just-written file — the same window
-                # ``_METADATA_READ_ATTEMPTS`` exists for) would stay
-                # unsearchable until something wrote to it again. Fail open:
-                # report empty for this query and retry on the next one.
-                return (0, "")
-            self._folded_cache[key] = (mtime, built[0], built[1])
-            return built
+        return self._catalog_projection._folded_content(key)
 
     def _prune_search_memos(self, live_keys: set[str]) -> None:
-        """Free budget held by sessions that have left the scan window.
+        self._catalog_projection._prune_search_memos(live_keys)
 
-        Only runs for a memo that is currently refusing admissions, so an
-        uncontended cache never pays the scan. Entries outside *live_keys* are
-        unreachable by any future search (it walks only the
-        ``_SEARCH_SCAN_WINDOW`` most recent sessions), so dropping them cannot
-        cost a hit — which is what makes this safe where an LRU eviction would
-        not be.
-
-        Called before the walk, so a refusal raised *during* a walk is released
-        on the NEXT query rather than that one: the prune needs the scan window,
-        which the walk computes. The lag is one query (~20 ms for a keystroke
-        caller) and self-clearing; what it prevents is budget staying pinned by
-        aged-out sessions for the life of the process.
-        """
-        for cache in (self._folded_cache, self._snippet_cache):
-            if cache.refused_since_prune():
-                cache.retain(live_keys)
-
-    def _build_folded(self, key: str, mtime: float) -> tuple[int, str] | None:
-        """Parse *key* and fold its content — the cache-miss half of
-        :meth:`_folded_content`.
-
-        Returns ``None`` when the file could not be read, which the caller must
-        distinguish from ``(0, "")`` (a session with no textual content): the
-        former must not be cached.
-
-        Reads the file via :meth:`_iter_message_texts` rather than going through
-        :meth:`_read_messages`, for two reasons.
-
-        Memory: that method memoizes the PARSED message dicts, and a search
-        touches every session in the scan window, so routing the fold through it
-        pins the whole corpus's parsed form in gateway RSS as a side effect of
-        searching. On a 136 MB / 125-session corpus that is ~330 MB of parsed
-        dicts versus ~37 MB for the folded strings this actually needs.
-
-        Correctness: ``_msg_cache`` is filled by callers that do not hold this
-        key's write lock, so an entry can be a pre-rewrite parse stored under a
-        restored (unchanged) mtime. Folding from it would launder that staleness
-        into the search cache, which the caller's lock cannot prevent. Reading
-        the file makes the fold a function of the file alone.
-
-        The caller holds ``_file_lock``, which orders this read against writers
-        in THIS process. A writer in another process holds only the cross-process
-        flock, so it can still interleave — but the caller stats BEFORE this read,
-        so such a write leaves the cached mtime older than the file's and the next
-        access re-folds. That case is self-healing, unlike the preserved-mtime
-        rewrite the lock exists for.
-
-        Separated from :meth:`_folded_content` so the memoization is observable:
-        a caller (or a test) can count how often the expensive fold actually
-        runs, independent of how many queries were served.
-        """
-        texts: list[str] = []
-        try:
-            texts = list(self._iter_message_texts(key))
-        except OSError:
-            return None
-        if not texts:
-            return (0, "")
-        # Hand the same list to the snippet memo. The caller has already stat'ed
-        # under ``_file_lock`` and passes that mtime, so both memos are keyed by
-        # one observation of the file and cannot disagree about which revision
-        # they hold. Storing here is why the second corpus costs no extra read.
-        self._snippet_cache[key] = (mtime, texts)
-        return (sum(len(t) for t in texts), "\x00".join(texts).casefold())
+    def _build_folded(self, key: str, mtime: float, gen: int) -> tuple[int, str] | None:
+        return self._catalog_projection._build_folded(key, mtime, gen)
 
     def _iter_message_texts(self, key: str) -> Iterator[str]:
-        """Yield each message's non-empty string ``content`` from *key*'s file.
+        return self._catalog_projection._iter_message_texts(key)
 
-        One definition of "what counts as searchable text in a session file",
-        shared by the fold and the snippet so their skip rules cannot drift apart
-        as the on-disk format evolves. Yields in file order; skips blank lines,
-        unparseable lines, non-object lines, and the metadata header.
-
-        A generator rather than a list so a caller can stop early — closing it
-        closes the file — which is what lets :meth:`_content_snippet` read only as
-        far as its first match. Propagates ``OSError``: callers distinguish "could
-        not read" from "no text", and that distinction is load-bearing (a read
-        failure must not be cached).
-        """
-        with open(self._path(key), encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                if not isinstance(data, dict) or data.get("_type") == "metadata":
-                    continue
-                content = data.get("content")
-                if isinstance(content, str) and content:
-                    yield content
-
-    #: Characters of context kept before / after a snippet's match.
-    _SNIPPET_LEAD = 40
-    _SNIPPET_TRAIL = 100
-    #: Hard cap on a returned snippet.
-    _SNIPPET_MAX = 200
+    _SNIPPET_LEAD = SessionCatalogProjection._SNIPPET_LEAD
+    _SNIPPET_TRAIL = SessionCatalogProjection._SNIPPET_TRAIL
+    _SNIPPET_MAX = SessionCatalogProjection._SNIPPET_MAX
 
     def _snippet_texts(self, key: str) -> Iterator[str]:
-        """Yield *key*'s message texts for snippet extraction, memo first.
-
-        Prefers ``_snippet_cache`` — filled by :meth:`_build_folded` from the same
-        read that produced the fold — and falls back to re-reading the file.
-
-        The memo is validated against the file's current mtime, so it degrades to
-        the file read rather than serving a stale snippet. That check is cheap
-        relative to the parse it avoids, and unlike the fold this path does NOT
-        need ``_file_lock``: a snippet is display-only, so the worst case for a
-        preserved-mtime rewrite racing here is one stale preview line, not a
-        session that stops matching. The fold — which decides whether a row
-        appears at all — keeps the lock.
-
-        Falls back for three reasons, all of which must stay non-fatal: the entry
-        was refused admission by the byte budget, the fold cached ``(0, "")`` for
-        a session with no text and so stored nothing, or the file changed since
-        the fold. Propagates ``OSError`` from the fallback read, which
-        :meth:`_content_snippet` already treats as "no snippet".
-        """
-        cached = self._snippet_cache.get(key)
-        if cached is not None:
-            try:
-                if cached[0] == self._path(key).stat().st_mtime:
-                    return iter(cached[1])
-            except OSError:
-                # Let the fallback read raise the OSError the caller handles,
-                # rather than deciding here what a vanished file means.
-                pass
-        return self._iter_message_texts(key)
+        return self._catalog_projection._snippet_texts(key)
 
     def _content_snippet(self, key: str, query: str) -> str:
-        """Return a match-centered window of *key*'s content around *query*.
-
-        Streams the file and stops at the FIRST matching message, so a query that
-        hits early reads only as far as the hit — rather than parsing the whole
-        transcript, which on the largest sessions dominated the query. Sharing
-        :meth:`_iter_message_texts` with the fold (instead of reading the file
-        directly) also keeps search from pinning a parsed transcript in
-        ``_msg_cache`` for every row it returns, and keeps the two halves of a
-        query agreeing on what counts as searchable text.
-
-        The window is confined to the matching message, which keeps a snippet from
-        reading as one sentence when it actually spans two — consistent with
-        :meth:`_folded_content`, where the ``\\x00`` join stops a match from
-        bridging messages in the first place.
-
-        Display-only and best effort: ``casefold`` is used for the search so it
-        agrees with the hit detection in :meth:`search_sessions` (``.lower()``
-        misses matches ``casefold`` finds, e.g. ``ß`` / ``İ``, which would yield
-        an empty snippet despite a nonzero hit count), but folding can change a
-        string's length, so the window may be off by a character or two.
-
-        For a multi-word query the exact phrase is tried first and each needle
-        is tried as a fallback (via :func:`snippet_needles`, highest-signal
-        first), mirroring :meth:`search_sessions`' AND-over-needles matching —
-        otherwise every session that matched on scattered words would come back
-        with no snippet at all. Needles are tried per message, so the first
-        MESSAGE containing any of them wins rather than the best needle overall;
-        that preserves the streaming early-exit above, and this string is
-        display-only.
-
-        Returns ``''`` when no needle is locatable in any single message, or
-        when the file cannot be read (display-only — never raises at the caller).
-        """
-        needles = snippet_needles(query)
-        if not needles:
-            return ""
-        try:
-            for text in self._snippet_texts(key):
-                folded = text.casefold()
-                for needle in needles:
-                    pos = folded.find(needle)
-                    if pos < 0:
-                        continue
-                    start = max(0, pos - self._SNIPPET_LEAD)
-                    end = min(len(text), pos + len(needle) + self._SNIPPET_TRAIL)
-                    frag = " ".join(text[start:end].split())
-                    prefix = "…" if start > 0 else ""
-                    suffix = "…" if end < len(text) else ""
-                    return (prefix + frag + suffix)[: self._SNIPPET_MAX]
-        except OSError:
-            return ""
-        return ""
+        return self._catalog_projection._content_snippet(key, query)
 
     def recent_from_source(
         self, source_prefix: str, exclude_key: str = "", max_messages: int = 20
     ) -> list[dict]:
-        """Return recent messages from sessions matching *source_prefix*.
-
-        Considers at most 50 matching files (newest mtime first) and stops after
-        5 have contributed messages. Each contributing file costs a 5-line head
-        read (to detect incognito/temporary sessions, which are skipped) plus a
-        bounded tail read via :meth:`_read_tail_messages` — never a full-file
-        read, which on large transcripts dominated the call.
-        """
-        if not self._dir.exists():
-            return []
-        safe_exclude = _safe_key(exclude_key) if exclude_key else ""
-        safe_prefix = _safe_key(source_prefix)
-        # Collect matching paths and sort by mtime (newest first)
-        paths: list[Path] = []
-        for path in self._dir.glob(f"{safe_prefix}*.jsonl"):
-            if safe_exclude and path.stem == safe_exclude:
-                continue
-            paths.append(path)
-        paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        candidates: list[dict] = []
-        included = 0
-        _max_scan = 50  # bound I/O even with many ephemeral sessions
-        for path in paths[:_max_scan]:
-            if included >= 5:
-                break
-            # The memory_mode marker lives in the metadata line at the head of the
-            # file, so only the head is read here; the messages come from the tail.
-            is_restricted = False
-            try:
-                with open(path, encoding="utf-8") as f:
-                    for _, line in zip(range(5), f):
-                        try:
-                            d = json.loads(line.strip())
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                        if d.get("_type") == "metadata" and is_incognito_transcript(
-                            d.get("memory_mode")
-                        ):
-                            is_restricted = True
-                            break
-            except OSError:
-                continue
-            if is_restricted:
-                continue
-            included += 1
-            candidates.extend(self._read_tail_messages(path, 50, None))
-        # Sort by timestamp and return most recent
-        candidates.sort(key=lambda m: m.get("ts", ""))
-        return [{"role": m["role"], "content": m["content"]} for m in candidates[-max_messages:]]
+        return self._read_projection.recent_from_source(source_prefix, exclude_key, max_messages)
 
     def read_messages(self, key: str) -> list[dict]:
-        """Public access to session messages.
+        return self._read_projection.read_messages(key)
 
-        The returned list may be the shared cached object (see
-        :meth:`_read_messages`); treat it as read-only and copy before
-        mutating.
-        """
-        return self._read_messages(key)
+    def read_file_change_messages(self, key: str) -> list[dict]:
+        return self._read_projection.read_file_change_messages(key)
 
     def read_messages_chained(self, key: str) -> list[dict]:
-        """Read messages from all session files sharing the same ``tab_id``.
+        return self._read_projection.read_messages_chained(key)
 
-        Returns messages from the current file only if no ``tab_id`` is set
-        (legacy sessions).  Otherwise finds all sibling files with the same
-        ``tab_id``, sorts chronologically, and concatenates their messages.
+    def read_messages_chained_full(self, key: str) -> list[dict]:
+        """Chained transcript INCLUDING each key's size-rotated archive head.
 
-        Uses a ``_tab_id_index`` cache (built lazily, invalidated on save)
-        to avoid scanning every file on each call.
+        The pagination/fork index space: `before` / `next_before` cursors from
+        the slot-detail handler address rows of THIS corpus. The plain
+        `read_messages_chained` stays the window/consolidation corpus — its
+        callers hold offsets (``_disk_older_count``, ``last_consolidated``)
+        counted against the un-archived files, which rotated rows must not shift.
         """
-        meta = self.get_metadata(key)
-        tid = meta.get("tab_id")
-        if not tid:
-            return self._read_messages(key)
-        # Guard the lazy build/read of the shared _tab_id_index: this method is
-        # reachable from worker threads (chat_persistence restore/save) while the
-        # event loop may mark the index stale via invalidate_tab_id_cache().
-        # Without the lock two threads could rebuild concurrently, or one could
-        # read a half-built index. Rebuild only when it is missing/stale
-        # (``None``); a freshly rebuilt index is AUTHORITATIVE, so a tid absent
-        # from it genuinely has no sibling files right now. We deliberately do
-        # NOT plant a permanent ``[]`` sentinel for a missing tid — the old
-        # sentinel suppressed every future rebuild, so a second session opened
-        # later under the same tab_id was never linked into the chain and its
-        # messages silently vanished from recent_chained. Snapshot the key list
-        # under the lock, then do the (potentially slow) per-file reads outside.
-        with self._lock:
-            if self._tab_id_index is None:
-                self._rebuild_tab_id_index()
-            index = self._tab_id_index or {}
-            keys = list(index.get(tid, []))
-        if not keys:
-            return self._read_messages(key)
-        all_msgs: list[dict] = []
-        for k in keys:
-            all_msgs.extend(self._read_messages(k))
-        return all_msgs or self._read_messages(key)
+        return self._read_projection.read_messages_chained_full(key)
+
+    def read_rotated_messages_chained(self, key: str) -> list[dict]:
+        return self._read_projection.read_rotated_messages_chained(key)
+
+    def chain_mid_rotation(self, key: str) -> bool:
+        """See ``HistoryReadProjection.chain_mid_rotation``."""
+        return self._read_projection.chain_mid_rotation(key)
 
     def _rebuild_tab_id_index(self) -> None:
-        """Scan all dashboard session files and build tab_id → [keys] mapping.
-
-        Caller MUST hold ``self._lock`` — this replaces the shared
-        ``_tab_id_index`` mapping.
-        """
-        index: dict[str, list[str]] = {}
-        for path in sorted(self._dir.glob("dashboard_chat-*.jsonl")):
-            try:
-                with path.open(encoding="utf-8") as f:
-                    first_line = f.readline()
-                m = json.loads(first_line)
-                tid = m.get("tab_id")
-                if tid:
-                    index.setdefault(tid, []).append(path.stem.replace("_", ":", 1))
-            except Exception:
-                continue
-        self._tab_id_index = index
+        self._read_projection._rebuild_tab_id_index()
 
     def invalidate_tab_id_cache(self) -> None:
-        """Mark the tab_id index stale so it is rebuilt on the next chained read.
+        self._read_projection.invalidate_tab_id_cache()
 
-        Sets the index to ``None`` (rather than ``.clear()``-ing it) so
-        read_messages_chained can distinguish "stale, must rebuild" from
-        "freshly built, tid legitimately absent" — the distinction the removed
-        ``[]`` sentinel used to get wrong. Guarded by ``self._lock`` so a
-        concurrent rebuild/read on a worker thread can't observe a half-updated
-        index.
-        """
-        with self._lock:
-            self._tab_id_index = None
+    def note_tab_id(self, key: str, tab_id: str | None) -> None:
+        self._read_projection.note_tab_id(key, tab_id)
 
-    def delete_session(self, key: str) -> bool:
-        """Delete a session file. Returns True if a file was removed.
+    @overload
+    def delete_session(self, key: str, *, skip_pinned: Literal[False] = ...) -> bool: ...
 
-        The existence check and unlink run under ``_locked`` so a concurrent
-        ``append`` / ``rewrite_session`` / ``update_metadata`` in this or any
-        other process cannot race the delete — otherwise a writer holding the
-        lock could complete its ``os.replace`` and resurrect the file we just
-        removed, or we could unlink the file out from under an open descriptor
-        and lose an acknowledged append. ``unlink(missing_ok=True)`` still
-        tolerates a concurrent deletion of the same session (the TOCTOU race
-        between our existence check and the unlink). On a wedged holder the lock
-        acquire raises ``HistoryLockTimeout``; we report "not removed" rather
-        than delete unlocked (the very clobber this lock prevents).
-        """
-        existed = False
-        try:
-            with self._locked(key):
-                path = self._path(key)
-                existed = path.exists()
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    return False
-                # Also remove the derived summary sidecar (.summaries/<key>.json)
-                # so a deleted session leaves no orphaned LLM-generated
-                # description on disk — delete_session is contractually a
-                # *permanent* removal. Best-effort: unlike the ``.lock`` sidecar
-                # below, the summary cache is not a mutex inode, so reaping it is
-                # safe, and a failure here must not fail the primary delete.
-                try:
-                    self._summary_cache_path(key).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                try:
-                    self._intent_summary_cache_path(key).unlink(missing_ok=True)
-                except OSError:
-                    pass
-        except HistoryLockTimeout:
-            logger.warning("delete_session: lock timeout, not deleting key=%s", key)
-            return False
-        if existed:
-            self._invalidate_cache(key)
-            self.invalidate_tab_id_cache()
-        # NB: we deliberately do NOT unlink the ``.lock`` sidecar here. The
-        # sidecar's *inode* is the cross-process mutex: ``_locked`` opens the
-        # path and ``flock``s the resulting fd. Reaping the file re-opens the
-        # exact inode race the lock exists to prevent — after this delete
-        # releases ``_locked``, a concurrent writer can recreate the session
-        # and acquire the surviving sidecar; unlinking it then lets a later
-        # acquirer create a *fresh* sidecar inode and lock that instead, so two
-        # processes hold "the lock" on different inodes and can clobber each
-        # other's writes (lost transcript update). A deleted session therefore
-        # leaves a bounded, zero-byte ``.lock`` trace on purpose; cross-process
-        # -safe reaping (under a separate directory-wide meta-lock that excludes
-        # all session-lock acquisition) is deferred as future work.
-        return existed
+    @overload
+    def delete_session(self, key: str, *, skip_pinned: Literal[True]) -> bool | None: ...
+
+    def delete_session(self, key: str, *, skip_pinned: bool = False) -> bool | None:
+        if skip_pinned:
+            return self._metadata_projection.delete_session(key, skip_pinned=True)
+        return self._metadata_projection.delete_session(key, skip_pinned=False)
 
     def set_title(self, key: str, title: str) -> None:
-        """Persist a title into the session's metadata line."""
-        self.update_metadata(key, {"title": title})
+        self._metadata_projection.set_title(key, title)
 
     def update_metadata(self, key: str, fields: dict) -> None:
-        """Merge *fields* into the session's metadata line and persist.
-
-        Serialized behind the cross-process lock so a concurrent append or
-        rewrite of the same session file — in this or any other process — can't
-        clobber this metadata edit (and vice versa).
-        """
-        with self._locked(key):
-            self._update_metadata_locked(key, fields)
-        # A tab_id change re-links this session into (or out of) a chain, so the
-        # cached tab_id→[keys] index is now stale. Invalidate OUTSIDE the lock
-        # (it only touches in-process state) so the next chained read rebuilds.
-        if "tab_id" in fields:
-            self.invalidate_tab_id_cache()
+        self._metadata_projection.update_metadata(key, fields)
 
     def update_metadata_if(
-        self, key: str, fields: dict, guard: Callable[[dict], bool]
+        self,
+        key: str,
+        fields: dict,
+        guard: Callable[[dict], bool],
     ) -> bool:
-        """Merge *fields* only if *guard* still accepts the on-disk metadata.
-
-        ``guard`` is evaluated INSIDE the cross-process lock, against the record
-        as it stands at write time. That is the difference from
-        :meth:`update_metadata`: a caller that decided to write based on a
-        snapshot taken earlier cannot land that write over a change another
-        writer made in the meantime, because the decision is re-made here rather
-        than trusted from before the lock was acquired. Taking the lock can
-        itself mean waiting, so "checked, then wrote" is not the same as "checked
-        at the moment of writing".
-
-        Returns whether the merge was applied, so a caller can tell a skipped
-        write from a completed one and avoid applying it in memory.
-
-        Fails CLOSED on an unreadable record. ``_read_metadata`` cannot tell
-        "genuinely empty" from "could not be read", and an empty dict satisfies
-        most guards — so consulting it would let a failed read look like a blank
-        record and authorise a write over a placement that is actually there.
-        """
-        with self._locked(key):
-            meta, readable = self._read_metadata_status(key)
-            if not readable:
-                return False
-            if not guard(meta):
-                return False
-            self._update_metadata_locked(key, fields)
-        if "tab_id" in fields:
-            self.invalidate_tab_id_cache()
-        return True
+        return self._metadata_projection.update_metadata_if(key, fields, guard)
 
     def _update_metadata_locked(self, key: str, fields: dict) -> None:
-        """Merge *fields* into the session's metadata line and persist.
-
-        Upsert semantics: if the session file does not exist yet (e.g. ``!ta
-        <agent> --clean`` is issued before the first message is logged), the
-        file is created with a fresh metadata line carrying *fields*.  Without
-        this, the selection would live only in the in-memory caches and be lost
-        on restart -- the session would silently resume under the default agent
-        with the default toolset.
-        """
-        path = self._path(key)
-        # A metadata-only edit (title/agent/folder/tab_id/pin) is not new
-        # conversation activity — preserve the pre-write mtime so it doesn't
-        # reorder list_sessions. None when the file is absent (upsert): a
-        # genuinely new session should get a natural mtime. See _restore_mtime.
-        prev_mtime = _safe_mtime(path)
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
-        # Parse the existing metadata line, or synthesize a fresh one when the
-        # file is absent/empty (the upsert case). A first line that exists but
-        # isn't valid metadata is left untouched -- we never clobber it.
-        if lines:
-            try:
-                meta = json.loads(lines[0])
-            except json.JSONDecodeError:
-                return
-            if meta.get("_type") != "metadata":
-                return
-        else:
-            self._dir.mkdir(parents=True, exist_ok=True)
-            meta = {
-                "_type": "metadata",
-                "created_at": metadata_now_iso(),
-                "last_consolidated": 0,
-            }
-            lines = [""]  # placeholder; replaced below
-
-        meta.update(fields)
-        lines[0] = json.dumps(meta) + "\n"
-        import os as _os
-        import tempfile as _tf
-
-        data = "".join(lines).encode("utf-8")
-        fd, tmp = _tf.mkstemp(dir=path.parent, suffix=".tmp")
-        try:
-            try:
-                _os.write(fd, data)
-                # Deliberately NO fsync here: this is a one-line metadata edit
-                # (title/agent/folder/tab_id/pin) held under the cross-process
-                # lock. os.replace() below is still crash-atomic (no torn file)
-                # without a flush; fsync would only add power-loss durability,
-                # which isn't worth blocking every other writer of this session
-                # for a disk flush. Metadata is cheaply re-derivable/re-editable.
-            finally:
-                _os.close(fd)
-            _os.replace(tmp, str(path))
-        except Exception:
-            try:
-                _os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+        self._metadata_projection._update_metadata_locked(key, fields)
 
     def mtime_of(self, key: str) -> float | None:
-        """Return the session file's mtime for *key*, or ``None`` when absent.
-
-        Cheap stat-only accessor for callers that need a file's last-write
-        instant without reading it — e.g. the channel-slot reconciler, which
-        uses it as the fallback close instant for a ``closed`` flag written
-        before ``closed_at`` stamps existed.
-        """
-        try:
-            return self._path(key).stat().st_mtime
-        except OSError:
-            return None
+        return self._metadata_projection.mtime_of(key)
 
     def clear_closed(self, key: str, *, only_if_closed_before: float | None = None) -> None:
-        """Remove the ``closed`` flag from a session's metadata line.
-
-        Serialized behind the cross-process ``_locked`` so a concurrent append /
-        rewrite / metadata edit — in this or any other process — can't clobber
-        this edit (and vice versa). ``update_metadata`` only merges keys, so a
-        dedicated remover is needed to drop ``closed`` when a session is resumed.
-        No-op when the file is absent, unparsable, not flagged, or its first line
-        isn't a metadata line. Housekeeping: the pre-write mtime is preserved so
-        resuming doesn't reorder ``list_sessions``.
-
-        *only_if_closed_before* makes the removal a compare-and-clear: the flag
-        is dropped only when its close instant (``closed_at`` stamp, else the
-        file's current mtime) is strictly older than the given epoch. Callers
-        acting on a metadata snapshot (the channel-slot reconciler) use this so
-        a ``closed`` written AFTER their snapshot — the user dismissing a tab
-        mid-pass, or a racing reconcile — survives: the check runs under the
-        same lock as the write, so there is no window between them.
-        """
-        path = self._path(key)
-        with self._locked(key):
-            if not path.exists():
-                return
-            prev_mtime = _safe_mtime(path)
-            lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-            if not lines:
-                return
-            try:
-                meta = json.loads(lines[0])
-            except json.JSONDecodeError:
-                return
-            if meta.get("_type") != "metadata" or "closed" not in meta:
-                return
-            if only_if_closed_before is not None:
-                raw = meta.get("closed_at")
-                close_time: float | None
-                try:
-                    close_time = float(raw) if raw is not None else None
-                except (TypeError, ValueError):
-                    close_time = None
-                if close_time is None:
-                    # Pre-stamp flag: the closing save is what last wrote the
-                    # file, so its mtime approximates the close instant.
-                    close_time = prev_mtime
-                if close_time is not None and close_time >= only_if_closed_before:
-                    return
-            meta.pop("closed", None)
-            meta.pop("closed_at", None)
-            lines[0] = json.dumps(meta) + "\n"
-            atomic_write(path, "".join(lines), fsync=False)
-            _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+        self._metadata_projection.clear_closed(key, only_if_closed_before=only_if_closed_before)
 
     def _read_messages(self, key: str) -> list[dict]:
-        """Read all non-metadata entries from a session JSONL file.
-
-        Uses mtime-based caching to avoid re-parsing unchanged files.
-
-        .. warning::
-            On a cache hit this returns the **shared cached list object by
-            identity** (see ``test_cache_hit_returns_same_object``) — the
-            memoization that makes repeated reads O(1). Callers MUST treat the
-            result as **immutable**: mutating it in place (append/pop/sort or
-            editing a contained dict) silently corrupts the cache for every
-            future reader, and — combined with cross-thread access — for other
-            threads iterating the same list concurrently. Slice or ``list(...)``
-            it before mutating. All current callers copy/slice; this contract
-            keeps that invariant explicit.
-        """
-        path = self._path(key)
-        # ── Warm path: LOCK-FREE, byte-for-byte the pre-fix behaviour ────────
-        # A hit whose stored mtime still matches the file is served with no
-        # lock at all. This matters beyond speed: ``_read_messages`` is reached
-        # ON the event loop (``api_session_detail``, and ``restore_open_slots_
-        # async`` which stays on-loop deliberately — see
-        # ``_pause_for_transient_retry``), while a WRITER holds this same RLock
-        # across its cross-process flock wait (up to ``_FLOCK_ACQUIRE_TIMEOUT_S``
-        # in ``_locked``). Taking the lock on every read would therefore let a
-        # writer stall the sole loop — chat, WebSockets and the liveness
-        # heartbeat — which is the ``no-blocking-call-on-event-loop`` hazard.
-        # The mtime guard is sufficient here: an mtime CHANGE is the only thing
-        # a hit has to notice, and a preserved-mtime rewrite (below) cannot
-        # invent a stale hit, it can only be raced while FILLING one.
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = None
-        if mtime is not None:
-            cached = self._msg_cache.get(key)
-            if cached and cached[0] == mtime:
-                return cached[1]
-        # ── Cold path: serialize the FILL against this key's writers ─────────
-        # The mtime guard cannot protect the fill window, because housekeeping
-        # rewrites deliberately RESTORE the pre-write mtime (``_restore_mtime``,
-        # so compaction does not reorder ``list_sessions``). A parse that
-        # started before such a rewrite and published after its
-        # ``_invalidate_cache`` would sit in the cache holding pre-rewrite
-        # messages under an mtime the file still has — undetectable, so the
-        # dashboard, session resume and the history tools would serve removed
-        # or replaced messages for the life of the process (issue #1835).
-        #
-        # ``_file_lock`` is the same in-process RLock every writer takes first
-        # in ``_locked``, so holding it across stat → read → publish orders the
-        # fill against append / rewrite / metadata edits for this key. Miss-only
-        # acquisition, plus the re-stat + re-check ``_read_messages_locked``
-        # already does at the top of its retry loop, is exactly the
-        # double-checked shape ``_folded_content`` uses for this identical race.
-        #
-        # An UNLOCKED fill (the bounded-acquire fallback) must not PUBLISH. It
-        # fires precisely when a writer holds the lock — i.e. exactly inside the
-        # window a rewrite can land in — so a parse it stored could be the
-        # pre-rewrite one, keyed by the mtime ``_restore_mtime`` puts back, which
-        # nothing can ever detect: that entry would serve removed messages for
-        # the life of the process, reintroducing the very bug this fix closes.
-        # Dropping it costs the next reader one re-parse and leaves the file the
-        # only source of truth.
-        with self._cache_fill_lock(key) as locked:
-            messages = self._read_messages_locked(key)
-            if not locked:
-                self._msg_cache.pop(key, None)
-            return messages
+        return self._read_projection._read_messages(key)
 
     @contextlib.contextmanager
     def _cache_fill_lock(self, key: str) -> Iterator[bool]:
-        """Best-effort hold of *key*'s writer RLock around a cache FILL.
+        with self._read_projection._cache_fill_lock(key) as locked:
+            yield locked
 
-        Yields ``True`` when the lock is held, ``False`` when it was skipped.
+    def _read_messages_locked(
+        self,
+        key: str,
+        *,
+        gen: int | None,
+        flock_witness: tuple[int, int] | None,
+    ) -> list[dict]:
+        return self._read_projection._read_messages_locked(
+            key, gen=gen, flock_witness=flock_witness
+        )
 
-        The acquire is bounded on BOTH paths, because a read must never be able
-        to wait without an upper bound: ON a running loop exactly ONE
-        non-blocking attempt (never sleep/poll the sole event loop, the same
-        discipline ``_locked`` applies to its flock), and off the loop a wait
-        capped at ``_FLOCK_ACQUIRE_TIMEOUT_S`` — the same ceiling a writer's
-        cross-process acquire uses, so the read path's worst case is bounded by
-        the writer's.
-
-        A failed acquire fills WITHOUT the lock. Degrading is safe in a way it
-        is not for a writer: an unlocked fill can at worst lose the race this
-        lock exists to close, i.e. fall back to the pre-fix behaviour for that
-        one read, whereas an unlocked WRITE could clobber a concurrent rewrite.
-        A stalled reader is the strictly worse outcome (on the loop the
-        LoopStallWatchdog kills the gateway; off it, a wedged holder would hang
-        the caller forever), so we take the rare stale read instead.
-
-        Reentrant by construction: a writer that reaches ``_read_messages``
-        while already inside ``_locked`` on this thread re-acquires the RLock it
-        owns, bounded attempt included.
-        """
-        lock = self._file_lock(key)
-        on_loop = True
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            on_loop = False
-        if on_loop:
-            held = lock.acquire(blocking=False)
-        else:
-            held = lock.acquire(timeout=_FLOCK_ACQUIRE_TIMEOUT_S)
-        if not held:
-            logger.debug(
-                "history: writer lock for %s still busy (%s); filling the "
-                "message cache unlocked rather than waiting unbounded",
-                key,
-                "event loop, single non-blocking attempt" if on_loop else "off-loop deadline",
-            )
-        try:
-            yield held
-        finally:
-            if held:
-                lock.release()
-
-    def _read_messages_locked(self, key: str) -> list[dict]:
-        """The cache-miss half of :meth:`_read_messages`.
-
-        Called under :meth:`_cache_fill_lock` (best-effort — see there). The
-        stat + cache check at the top of the retry loop is what makes the
-        caller's locking *double-checked*: two threads racing the same cold key
-        parse once, and a rewrite that landed between the caller's lock-free
-        probe and the acquire is seen here rather than overwritten.
-        """
-        path = self._path(key)
-        if not path.exists():
-            self._msg_cache.pop(key, None)
-            return []
-        # Retry transient read failures rather than reporting an empty session.
-        # This method is on the open-tab restore path
-        # (``read_messages_chained`` -> ``_rehydrate_slot_from_history``); on
-        # Windows a just-written transcript can be briefly unopenable while an
-        # indexer or AV scanner holds it (``ERROR_SHARING_VIOLATION`` ->
-        # ``PermissionError``, an ``OSError`` subclass). An unhandled OSError
-        # here propagates out of rehydrate and DROPS the tab, which is the
-        # intermittent ``restored == N-1`` (``assert 7 == 8``) failure on the
-        # Windows CI line. Mirror the retry ``_read_metadata`` already uses so
-        # the tab keeps its full history instead of vanishing. The old bare
-        # ``except OSError: return []`` on the stat silently yielded a
-        # history-less tab on the same fault; retrying first recovers it.
-        for attempt in range(_METADATA_READ_ATTEMPTS):
-            try:
-                mtime = path.stat().st_mtime
-                cached = self._msg_cache.get(key)
-                if cached and cached[0] == mtime:
-                    return cached[1]
-                with open(path, encoding="utf-8") as fh:
-                    raw = fh.read()
-            except FileNotFoundError:
-                # The transcript was deleted AFTER the exists() check above -- a
-                # concurrent delete_session racing this read. That is NOT a
-                # transient lock (retrying cannot bring the file back), and the
-                # correct answer is an empty read: it matches the exists()-miss
-                # branch above and the pre-PR stat() OSError branch. Letting it
-                # fall through to the generic OSError arm below -- which now
-                # re-raises on exhaustion -- would turn a benign race into an
-                # HTTP 500 in a caller like api_session_detail that reaches
-                # read_messages after its own exists() check (GPT review, PR
-                # #2052). Return [] immediately, dropping any stale cache entry;
-                # do not spend the retry budget on a file that is gone.
-                self._msg_cache.pop(key, None)
-                return []
-            except OSError:
-                if attempt + 1 < _METADATA_READ_ATTEMPTS:
-                    self._pause_for_transient_retry()
-                    continue
-                # Out of retries. Do NOT swallow to [] here. A persistent read
-                # failure is indistinguishable from a genuinely empty session,
-                # and on the restore path _rehydrate_slot_from_history would then
-                # register an EMPTY slot -- which restore_recent_sessions dedupes
-                # by key and skips, stranding the tab history-less for the whole
-                # session (GPT review, PR #2052). Re-raise instead so rehydrate
-                # rolls back its partial slot and the tab is DROPPED rather than
-                # registered empty -- recoverable on a later restore pass, most
-                # reliably the next restart once the holder has released the file
-                # (the same-startup restore_recent_sessions fallback only recovers
-                # it if the file is readable by then). That matches the
-                # "drop, don't register empty" outcome _read_metadata reaches by
-                # returning {} on exhaustion. It is also the pre-retry behaviour:
-                # the old unwrapped read_text() propagated this OSError with no
-                # retry, so callers already tolerate it -- the loop above just
-                # absorbs the transient case first.
-                logger.warning(
-                    "history: could not read messages for %s after %d attempts; "
-                    "re-raising so restore can retry",
-                    key,
-                    _METADATA_READ_ATTEMPTS,
-                    exc_info=True,
-                )
-                raise
-            messages: list[dict] = []
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if data.get("_type") == "metadata":
-                    continue
-                messages.append(data)
-            self._msg_cache[key] = (mtime, messages)
-            return messages
-        return []
-
-    #: Starting tail window (bytes) for :meth:`_read_tail_messages`. Sized to
-    #: comfortably cover a few dozen JSONL message lines in one read; grown
-    #: geometrically if it doesn't yield enough matching messages.
     _TAIL_MIN_BYTES = 8_192
-    #: Rough average serialized-message size used to pick an initial window
-    #: from ``max_messages`` so a large request opens a proportionally larger
-    #: window on the first read.
     _TAIL_AVG_MSG_BYTES = 512
-    #: Max window-doubling attempts before we accept whatever the window held
-    #: (it is always correct: the newest messages are always inside the tail).
     _TAIL_MAX_GROWTHS = 6
 
     def _recent_via_tail(
-        self, key: str, max_messages: int, roles: set[str] | None
+        self,
+        key: str,
+        max_messages: int,
+        roles: AbstractSet[str] | None,
     ) -> list[dict] | None:
-        """Return the formatted recent window via a tail read, or None to defer.
-
-        Returns None (caller falls through to the full-read path) when the file
-        is missing OR a fresh full-parse cache already exists — in both cases
-        the full path is at least as cheap and keeps the shared cache warm.
-        Otherwise returns the last *max_messages* entries (role-filtered) as
-        ``[{role, content}]``.
-
-        The formatted window is memoized in ``_recent_cache`` keyed by
-        (key, max_messages, roles) with the file mtime, so a session accessed
-        only via ``recent()`` — which never warms ``_msg_cache`` — is served
-        O(1) from memory on subsequent turns instead of re-opening and
-        re-parsing the file tail on every call. The mtime guard makes the
-        memo self-invalidating: an :meth:`append` bumps the file mtime, so the
-        stale entry misses and is recomputed. A fresh list of fresh dicts is
-        returned each call so callers can freely mutate the result without
-        corrupting the shared entry.
-        """
-        path = self._path(key)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return None  # missing/unreadable → let the full path return []
-        cached = self._msg_cache.get(key)
-        if cached and cached[0] == mtime:
-            return None  # fresh full cache → full path is a cheap O(1) hit
-        rc_key = self._recent_cache_key(key, max_messages, roles)
-        rc = self._recent_cache.get(rc_key)
-        if rc is not None and rc[0] == mtime:
-            return [dict(m) for m in rc[1]]  # memo hit — no disk I/O
-        tail = self._read_tail_messages(path, max_messages, roles)
-        formatted = [{"role": m["role"], "content": m["content"]} for m in tail]
-        self._recent_cache[rc_key] = (mtime, formatted)
-        return [dict(m) for m in formatted]
+        return self._read_projection._recent_via_tail(key, max_messages, roles)
 
     @staticmethod
-    def _recent_cache_key(key: str, max_messages: int, roles: set[str] | None) -> str:
-        """Build a stable ``_recent_cache`` key from the recent() parameters.
-
-        ``\\x00`` cannot appear in a session key, so it is an unambiguous field
-        separator; roles are sorted so ``{"user", "assistant"}`` and
-        ``{"assistant", "user"}`` collapse to the same entry.
-        """
-        roles_part = ",".join(sorted(roles)) if roles else ""
-        return f"{key}\x00{max_messages}\x00{roles_part}"
+    def _recent_cache_key(key: str, max_messages: int, roles: AbstractSet[str] | None) -> str:
+        return TranscriptReadProjection._recent_cache_key(key, max_messages, roles)
 
     def _read_tail_messages(
-        self, path: Path, max_messages: int, roles: set[str] | None
+        self,
+        path: Path,
+        max_messages: int,
+        roles: AbstractSet[str] | None,
     ) -> list[dict]:
-        """Read the last *max_messages* messages by seeking to the file tail.
-
-        Reads a bounded window from the END of the file and parses backwards,
-        growing the window geometrically until it holds at least *max_messages*
-        matching (role-filtered) messages or the window covers the whole file.
-        The newest messages always sit at EOF, so the returned slice is always
-        the true most-recent window — correctness is identical to a full parse
-        followed by ``[-max_messages:]``; only older lines beyond the window are
-        skipped, and those can never be part of the answer.
-
-        Metadata lines and lines that don't parse as JSON are ignored, matching
-        :meth:`_read_messages`. Never populates ``_msg_cache`` (the result is a
-        partial view, not the authoritative full list).
-        """
-        if max_messages <= 0:
-            return []
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return []
-        window = max(self._TAIL_MIN_BYTES, max_messages * self._TAIL_AVG_MSG_BYTES * 2)
-        messages: list[dict] = []
-        for _ in range(self._TAIL_MAX_GROWTHS):
-            covered = size <= window
-            try:
-                with open(path, "rb") as f:
-                    if not covered:
-                        f.seek(size - window)
-                        f.readline()  # discard the (likely partial) first line
-                    raw = f.read().decode("utf-8", errors="replace")
-            except OSError:
-                return []
-            messages = []
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if data.get("_type") == "metadata":
-                    continue
-                if roles and data.get("role") not in roles:
-                    continue
-                messages.append(data)
-            if covered or len(messages) >= max_messages:
-                break
-            window *= 4
-        return messages[-max_messages:]
+        return self._read_projection._read_tail_messages(path, max_messages, roles)
 
     def _last_row_ts(self, key: str) -> str | None:
-        """The ``ts`` of the last message row on disk for *key*, or ``None``.
-
-        Call this under :meth:`_locked`. The answer is only authoritative while
-        no other writer can append, and the cross-process flock that ``_locked``
-        takes is what makes that true for a subagent / cron / CLI writing the
-        same session file from another process. ``append`` skips this entirely
-        for a file it just created, which provably holds no rows yet.
-
-        Reuses :meth:`_read_tail_messages` rather than parsing the file, so this
-        stays a bounded read on a long transcript. That reader also grows its
-        window when the last line is larger than it, so a single long reply
-        cannot hide the row behind it.
-
-        Measured on a 1.6 MB / 400-row transcript this is ~48 us, against ~38 us
-        for the ``open`` + ``write`` the same critical section already performs
-        and ~2.4 ms for the whole-file read ``_maybe_rotate`` does when it
-        rotates -- 0.4% of an ``append`` call, which is ~11.8 ms end to end. A
-        remembered-tail cache was tried here and removed: it would have needed a
-        cheap stamp of the file's identity to know when to distrust itself, and
-        the only cheap ones (size, mtime) are exactly the coarse-resolution
-        signals this module now exists to stop trusting.
-        """
-        tail = self._read_tail_messages(self._path(key), 1, None)
-        if not tail:
-            return None
-        ts = tail[-1].get("ts")
-        return ts if isinstance(ts, str) and ts else None
+        return self._read_projection._last_row_ts(key)
 
     def last_row_ts(self, key: str) -> str | None:
-        """The ``ts`` of the last persisted message row for *key*, or ``None``.
+        return self._read_projection.last_row_ts(key)
 
-        The public form of :meth:`_last_row_ts`: it takes :meth:`_locked` itself,
-        so a caller outside this class gets a read that no concurrent append can
-        tear. Ordering derived from it survives a restart, because the value is a
-        field of the persisted row rather than a count of what a process happens
-        to hold in memory.
+    @staticmethod
+    def _cache_key_identities(key: str) -> tuple[str, ...]:
+        """Every cache-key spelling that can refer to *key*'s session.
 
-        BLOCKING. It performs file I/O, so an async caller must run it off the
-        event loop (``asyncio.to_thread``).
+        One session is addressable by its logical key, its sanitized filename
+        stem, and — for Slack threads — the pre-migration bare ``thread_ts``
+        in either role. The closure must be BIDIRECTIONAL: a writer told only
+        the bare legacy spelling (e.g. rotation deriving it from the file
+        name) must still reach the canonical spelling readers use, or its
+        invalidation is invisible to them. Pure string math, no I/O.
         """
-        with self._locked(key):
-            return self._last_row_ts(key)
+        idents = dict.fromkeys((key, *transcript_stems(key)))
+        canon = canonical_key(key)
+        if canon != key:
+            idents.update(dict.fromkeys((canon, *transcript_stems(canon))))
+        return tuple(idents)
+
+    def _flock_hold_witness(self, key: str) -> tuple[int, int] | None:
+        """Proof-of-hold snapshot of OUR cross-process flock for *key*'s file.
+
+        Returns ``(fd, release_epoch)`` when this process currently holds the
+        sidecar flock (``_flock_state.held == 1``), else ``None``. An unlocked
+        fill snapshots this before its stat and compares at publish time: an
+        equal pair proves the flock was held by this process CONTINUOUSLY
+        across the fill window, so no EXTERNAL process can have written the
+        file in that window — external writers block on the flock, and they
+        are the one writer class the in-process invalidation generation cannot
+        witness (their ``_invalidate_cache`` runs in their process, not ours).
+        Local writers write freely under our hold, and every local
+        preserved-mtime rewrite bumps the generation, so the generation check
+        covers them. ``None`` — including a local writer still WAITING on an
+        external process's flock — means the window cannot be proven
+        external-write-free and the fill must not publish.
+        """
+        lock_key = str(self._path(key))
+        with ConversationLog._flock_guard:
+            state = ConversationLog._flock_state.get(lock_key)
+            if state is None or state[2] != 1:
+                return None
+            return (state[0], ConversationLog._flock_epochs.get(lock_key, 0))
+
+    def _cache_gen(self, key: str) -> int:
+        return self._cache_coordinator._cache_gen(key)
+
+    def _bump_cache_gen(self, key: str, idents: tuple[str, ...]) -> None:
+        self._cache_coordinator._bump_cache_gen(key, idents)
+
+    def _publish_if_current(
+        self,
+        cache: _LRUCache[Any] | _SearchTextCache[Any],
+        entry_key: str,
+        value: Any,
+        *,
+        key: str,
+        gen: int,
+    ) -> None:
+        self._cache_coordinator._publish_if_current(cache, entry_key, value, key=key, gen=gen)
 
     def _invalidate_cache(self, key: str) -> None:
-        """Invalidate caches for a key after a write operation."""
-        self._msg_cache.pop(key, None)
-        self._meta_cache.pop(key, None)
-        # The folded search blob is derived from the messages, so it goes stale
-        # exactly when they do. Its own mtime guard is not enough here: the
-        # housekeeping rewrites below restore the pre-write mtime.
-        self._folded_cache.pop(key, None)
-        # Same reasoning for the snippet source: it is the raw form of what the
-        # fold is derived from, so it goes stale at exactly the same moment. Its
-        # own mtime check would miss the preserved-mtime rewrites below, and a
-        # missed invalidation here shows the user a preview line quoting text
-        # that is no longer in the session.
-        self._snippet_cache.pop(key, None)
-        # Also drop any memoized recent() windows for this key. Necessary
-        # because housekeeping rewrites (mark_consolidated/update_metadata/
-        # rewrite_session/rotation) restore the pre-write mtime via
-        # _restore_mtime, so the recent cache's mtime guard alone would let a
-        # stale window survive a content change.
-        self._recent_cache.pop_prefix(f"{key}\x00")
+        self._cache_coordinator._invalidate_cache(key)
 
     #: Bytes read from the end of a session file for the last-message preview.
     #: One tail block comfortably covers several trailing JSONL lines without
@@ -4121,2141 +2851,39 @@ class ConversationLog:
     #: Max characters returned in a last-message preview.
     _PREVIEW_MAX_CHARS = 120
 
-    def last_message_preview(self, key: str) -> str:
-        """Return a short preview of the session's last message ('' if none).
+    def last_message_preview(self, key: str, sanitize=None) -> str:
+        return self._read_projection.last_message_preview(key, sanitize=sanitize)
 
-        Reads only the tail of the JSONL file (bounded), scanning backwards
-        for the newest parseable message line — cheap even on large sessions.
-        Handles both plain-string ``content`` and structured list-form content
-        blocks (text extracted from ``{"type": "text"}`` / ``text`` fields).
-        If the initial tail window yields nothing parseable (a single trailing
-        line larger than the window), retries once with a 16× window before
-        giving up.
-        """
-        path = self._path(key)
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return ""
-        for window in (self._PREVIEW_TAIL_BYTES, self._PREVIEW_TAIL_BYTES * 16):
-            try:
-                with open(path, "rb") as f:
-                    if size > window:
-                        f.seek(size - window)
-                        f.readline()  # discard the (likely partial) first line
-                    tail = f.read().decode("utf-8", errors="replace")
-            except OSError:
-                return ""
-            for line in reversed(tail.splitlines()):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if data.get("_type") == "metadata":
-                    continue
-                text = self._content_text(data.get("content"))
-                if not text:
-                    continue
-                preview = strip_markdown_preview(text)
-                if not preview:
-                    continue
-                if len(preview) > self._PREVIEW_MAX_CHARS:
-                    preview = preview[: self._PREVIEW_MAX_CHARS].rstrip() + "…"
-                return preview
-            if size <= window:
-                break  # the window already covered the whole file — no retry
-        return ""
+    def last_message_info(self, key: str, sanitize=None) -> tuple[str, float]:
+        return self._read_projection.last_message_info(key, sanitize=sanitize)
 
     @staticmethod
     def _content_text(content: object) -> str:
-        """Best-effort plain text from a message ``content`` field.
-
-        Plain strings pass through; list-form content blocks (the structured
-        shape newer turns use) contribute their ``text`` fields in order.
-        Anything else yields ''.
-        """
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, str):
-                    parts.append(block)
-                elif isinstance(block, dict):
-                    t = block.get("text")
-                    if isinstance(t, str) and t.strip():
-                        parts.append(t)
-            return " ".join(p.strip() for p in parts if p.strip())
-        return ""
+        return TranscriptReadProjection._content_text(content)
 
     def get_metadata(self, key: str) -> dict:
-        """Return session metadata for *key*."""
-        return self._read_metadata(key)
+        return self._read_projection.get_metadata(key)
 
     def get_metadata_status(self, key: str) -> tuple[dict, bool]:
-        """Return ``(metadata, readable)`` for *key*.
-
-        ``readable`` is ``False`` only when the transcript exists but its
-        metadata line could not be read after
-        :data:`_METADATA_READ_ATTEMPTS` attempts. Every other empty result --
-        no transcript at all, an empty first line, an undecodable one -- is a
-        genuine answer and reports ``True``.
-
-        :meth:`get_metadata` cannot express that difference: it returns ``{}``
-        for both, and a caller that reads ``{}`` as "this session was never
-        persisted" will discard live state. Use this instead of
-        :meth:`get_metadata` wherever an empty result triggers something
-        destructive.
-        """
-        return self._read_metadata_status(key)
+        return self._read_projection.get_metadata_status(key)
 
     def _pause_for_transient_retry(self) -> None:
-        """Pause briefly before retrying a transient read, but ONLY off the loop.
-
-        Shared by :meth:`_read_metadata` and :meth:`_read_messages`. Both are
-        reached ON the event loop by ``restore_open_slots_async`` (which keeps
-        the whole restore on the loop deliberately: creating a slot broadcasts
-        through ``asyncio.Queue.put_nowait`` / ``Event.set``, neither
-        thread-safe). A kernel sleep there stops ``_loop_heartbeat`` from petting
-        the LoopStallWatchdog -- whose ``exit_after`` timer then kills the
-        gateway, the exact crash-loop the async restore exists to prevent. So
-        sleep only when NOT on a running loop; on the loop the retry is
-        immediate (a stat plus an open -- cheap enough to be worth taking).
-        """
-        on_loop = True
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            on_loop = False
-        if not on_loop:
-            _time.sleep(_METADATA_READ_RETRY_SECS)
+        self._read_projection._pause_for_transient_retry()
 
     def _read_metadata(self, key: str) -> dict:
-        """Read the metadata line (first line) from a session JSONL file.
-
-        Thin wrapper over :meth:`_read_metadata_status` that drops the
-        readability flag, so the many callers for whom "empty" and "unreadable"
-        are equivalent keep a plain ``dict`` return.
-        """
-        return self._read_metadata_status(key)[0]
+        return self._read_projection._read_metadata(key)
 
     def _read_metadata_status(self, key: str) -> tuple[dict, bool]:
-        """Read the metadata line, reporting whether the read itself succeeded.
-
-        Uses mtime-based caching to avoid re-reading unchanged files.
-
-        Returns ``({}, True)`` for a session that genuinely has no metadata and
-        ``({}, False)`` when the file exists but could not be read after
-        retries. The retry absorbs the common transient case; the flag exists
-        because absorbing it is not always possible, and at least one caller
-        does something destructive with a confident empty answer: the open-tab
-        restore treats ``{}`` as "never persisted" and drops the tab. Windows
-        makes this more than theoretical: a freshly written file can be briefly
-        unopenable while an indexer or AV scanner holds it
-        (``ERROR_SHARING_VIOLATION``), which surfaces as ``PermissionError`` --
-        an ``OSError`` subclass.
-        """
-        path = self._path(key)
-        if not path.exists():
-            self._meta_cache.pop(key, None)
-            return {}, True
-        for attempt in range(_METADATA_READ_ATTEMPTS):
-            try:
-                mtime = path.stat().st_mtime
-                cached = self._meta_cache.get(key)
-                if cached and cached[0] == mtime:
-                    return cached[1], True
-                # Read ONLY the first line. The previous form slurped the entire
-                # file via read_text() and then threw all but the first line away
-                # — on a 26 MB transcript that is ~10ms and ~26 MB of transient
-                # allocation to obtain a few hundred bytes (measured ~32x slower
-                # than readline()). Startup restore calls this once per tab, so
-                # the waste scaled with both tab count and transcript size,
-                # pushing the event loop toward the stall watchdog.
-                with open(path, encoding="utf-8") as fh:
-                    first = fh.readline().strip()
-            except OSError:
-                if attempt + 1 < _METADATA_READ_ATTEMPTS:
-                    # Pause before retrying (off-loop only -- see the helper).
-                    self._pause_for_transient_retry()
-                    continue
-                # Out of retries. Distinguish this from "no metadata" in the log
-                # so a dropped tab is traceable to its cause instead of looking
-                # like a session that was never written.
-                logger.warning(
-                    "history: could not read metadata for %s after %d attempts; "
-                    "reporting no metadata",
-                    key,
-                    _METADATA_READ_ATTEMPTS,
-                    exc_info=True,
-                )
-                return {}, False
-            if not first:
-                return {}, True
-            try:
-                data = json.loads(first)
-                # ``isinstance`` guard, not just the _type check: a first line
-                # that is valid JSON but not an OBJECT (``null``, a list, a bare
-                # string, a number) would make ``.get`` raise AttributeError
-                # rather than JSONDecodeError. That is a corrupt metadata line
-                # exactly like an undecodable one, so report it the same way --
-                # an empty dict that IS a genuine answer -- instead of throwing a
-                # non-OSError out of a read that callers treat as total.
-                meta = (
-                    data
-                    if isinstance(data, dict) and data.get("_type") == "metadata"
-                    else {}
-                )
-            except json.JSONDecodeError:
-                meta = {}
-            self._meta_cache[key] = (mtime, meta)
-            return meta, True
-        return {}, True
+        return self._read_projection._read_metadata_status(key)
 
     def sliding_window(self, key: str, keep_recent: int = 5) -> tuple[list[dict], list[dict]]:
-        """Split messages into (older, recent) for compaction.
-
-        *keep_recent* is the number of recent user/assistant pairs to retain.
-        Returns ``(older_messages, recent_messages)``.
-        """
-        messages = self._read_messages(key)
-        # keep_recent pairs = keep_recent * 2 individual messages
-        split = max(0, len(messages) - keep_recent * 2)
-        return messages[:split], messages[split:]
+        return self._read_projection.sliding_window(key, keep_recent)
 
     def rewrite_session(self, key: str, messages: list[dict]) -> None:
-        """Rewrite session JSONL with only the given messages."""
-        # Serialize the full rewrite against concurrent appends — in this or
-        # any other process — so a live session's writes aren't lost, and (via
-        # atomic_write below) so a crash can't truncate the transcript.
-        with self._locked(key):
-            self._rewrite_session_locked(key, messages)
+        self._rewrite_coordinator.rewrite_session(key, messages)
 
     def _rewrite_session_locked(self, key: str, messages: list[dict]) -> None:
-        path = self._path(key)
-        self._dir.mkdir(parents=True, exist_ok=True)
-        # Compaction is housekeeping, not new activity — preserve the pre-write
-        # mtime so it doesn't reorder list_sessions (see _restore_mtime).
-        prev_mtime = _safe_mtime(path)
-        # Archive only messages being dropped (old content minus what's being kept).
-        # Compare by normalized JSON (sort_keys) to be resilient to key ordering changes.
-        if path.exists():
-            old_lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-            if old_lines and '"_type"' in old_lines[0]:
-                old_lines = old_lines[1:]
-            kept_serialized = {json.dumps(m, sort_keys=True) for m in messages}
-            dropped = []
-            for ln in old_lines:
-                if not ln.strip():
-                    continue
-                try:
-                    normalized = json.dumps(json.loads(ln), sort_keys=True)
-                except (json.JSONDecodeError, ValueError):
-                    dropped.append(ln)  # corrupted line → archive it
-                    continue
-                if normalized not in kept_serialized:
-                    dropped.append(ln)
-            try:
-                _archive_lines(key, dropped, reason="compact", base=self._dir)
-            except Exception:
-                logger.warning("Failed to archive dropped lines for %s", key, exc_info=True)
-        # Rebuild only the fields compaction owns; everything else on the metadata
-        # line belongs to another layer (the rotation generation an in-flight
-        # consolidation checks, its retry accounting, the slot's title/agent/pin)
-        # and is carried through verbatim. Enumerating what to keep is how those
-        # fields got dropped in the first place.
-        orig_meta = self.get_metadata(key) or {}
-        meta = {
-            "_type": "metadata",
-            "created_at": orig_meta.get("created_at", metadata_now_iso()),
-            "last_consolidated": orig_meta.get("last_consolidated", 0),
-            "compacted_at": metadata_now_iso(),
-        }
-        carry_unowned_metadata(meta, orig_meta, _COMPACT_OWNED_META_KEYS)
-        lines = [json.dumps(meta) + "\n"]
-        for m in messages:
-            lines.append(json.dumps(m) + "\n")
-        atomic_write(path, "".join(lines))
-        _restore_mtime(path, prev_mtime)
-        self._invalidate_cache(key)
+        self._rewrite_coordinator._rewrite_session_locked(key, messages)
 
-    def _maybe_rotate(self, path: Path) -> None:
-        """Rotate a session file that exceeds the byte limit.
-
-        Keeps the metadata line plus at most ``_SESSION_KEEP_LINES`` trailing
-        messages. When a file is oversized because of a handful of very large
-        messages — i.e. it has ``<= _SESSION_KEEP_LINES`` lines but still blows
-        the byte budget — it now drops the OLDEST messages until it fits instead
-        of returning early. Previously the ``len(lines) <= _SESSION_KEEP_LINES``
-        guard let such a file grow without bound (a session of a few multi-MB
-        messages would never rotate), defeating the size cap entirely.
-
-        Callers hold the per-session lock (this is invoked from ``append`` under
-        ``_locked``); it does not acquire the lock itself.
-        """
-        try:
-            if path.stat().st_size <= _SESSION_MAX_BYTES:
-                return
-        except OSError:
-            return
-        # Rotation is triggered right after a genuine append; preserve that
-        # append's mtime rather than re-stamping to "now" (see _restore_mtime).
-        prev_mtime = _safe_mtime(path)
-        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
-        meta_line = lines[0] if lines and '"_type"' in lines[0] else ""
-        msg_lines = lines[1:] if meta_line else lines[:]
-        if not msg_lines:
-            return
-        meta_bytes = len(meta_line.encode("utf-8"))
-
-        def _kept_bytes(n: int) -> int:
-            return meta_bytes + sum(len(ln.encode("utf-8")) for ln in msg_lines[-n:])
-
-        # Start from the normal line cap, then shrink further while the retained
-        # tail still exceeds the byte budget — this is what lets a file with
-        # <= _SESSION_KEEP_LINES lines still rotate.
-        keep_count = min(_SESSION_KEEP_LINES, len(msg_lines))
-        while keep_count > 1 and _kept_bytes(keep_count) > _SESSION_MAX_BYTES:
-            keep_count -= 1
-        if keep_count >= len(msg_lines):
-            # Keeping every message would drop nothing — the file is oversized
-            # because of a single message larger than the whole budget, which we
-            # can't split. Leave it rather than pointlessly rewriting.
-            return
-
-        kept = msg_lines[-keep_count:]
-        dropped = msg_lines[:-keep_count]
-        try:
-            _archive_lines(path.stem, dropped, reason="rotate", base=self._dir)
-        except Exception:
-            logger.warning("Failed to archive rotated lines for %s", path.stem, exc_info=True)
-
-        # Reset last_consolidated since offsets are now invalid, and bump the
-        # rotation generation counter. Resetting the offset to 0 only protects
-        # the case where the file shrank BELOW a stale consolidation snapshot;
-        # a rotation that retains >= the snapshot offset leaves ``offset <=
-        # msg_count`` true while every surviving index has shifted by the number
-        # of dropped lines, so a stale offset written by a concurrent
-        # consolidator would silently mark never-consolidated retained messages
-        # as done. The monotonically-increasing generation lets
-        # ``mark_consolidated`` detect ANY rotation between snapshot and write,
-        # regardless of retained count (absent field == 0 for legacy files).
-        if meta_line:
-            try:
-                meta = json.loads(meta_line)
-                meta["last_consolidated"] = 0
-                meta["rotated_at"] = metadata_now_iso()
-                meta["rotation_generation"] = int(meta.get("rotation_generation", 0) or 0) + 1
-                meta_line = json.dumps(meta) + "\n"
-            except json.JSONDecodeError:
-                pass
-
-        content = meta_line + "".join(kept)
-        atomic_write(path, content)
-        _restore_mtime(path, prev_mtime)
-        # Invalidate cache — offsets changed
-        safe = path.stem
-        self._invalidate_cache(safe)
-        logger.info(
-            "Rotated session file %s (%d → %d lines)",
-            path.name,
-            len(lines),
-            len(kept) + (1 if meta_line else 0),
-        )
-
-
-# ── Module-level helpers for auto skill eligibility ──
-#
-# Kept at module level so they're trivially unit-testable without
-# instantiating HistoryConsolidator.
-
-# Canonical tool titles that indicate a read targeting a sensitive path.
-# Supplements is_sensitive_path() and is_sensitive_bash_command() which
-# handle the actual runtime blocking — this is a second-layer defense
-# that refuses to extract a skill if the session tried to access a
-# sensitive path, even when the attempt was denied at hook time.
-_SENSITIVE_TOOL_PATTERNS: tuple[str, ...] = (
-    ".aws/",
-    ".ssh/",
-    ".gnupg/",
-    ".gpg/",
-    ".docker/config",
-    ".kube/config",
-    ".npmrc",
-    ".pypirc",
-    ".netrc",
-    ".git-credentials",
-    # KiroCrew's own credential file. The data home moved to ~/.kiro/crew, so the
-    # LIVE secret is ~/.kiro/crew/.env; cover the pre-move legacy home too
-    # (substring match, so bare "/.env"-suffixed forms).
-    ".kiro/crew/.env",
-    ".kirocrew/.env",
-    "169.254.169.254",  # IMDS
-)
-
-
-_TOOL_ROLES: frozenset[str] = frozenset({"tool", "tool_call", "tool_result"})
-
-
-def _frontmatter_value(text: str | None, key: str) -> str:
-    """Return *key*'s frontmatter value from a SKILL.md body, or "".
-
-    Values resolve the way ``SkillsLoader._parse_frontmatter`` resolves them:
-    only a column-0 key is a field, and a bare block-scalar indicator
-    (``>``/``|``, optionally chomped) folds the indented lines that follow.
-    The auto-skill update path carries the live skill's ``description`` and
-    ``triggers`` through this reader into a staged candidate that overwrites
-    the live skill on approval — reading the indicator verbatim would collapse
-    a block-scalar description to ``""`` and inject a bogus ``>`` trigger on
-    that round-trip. The grammar (plus the leading-whitespace opener
-    tolerance, verbatim plain values, and first-duplicate-wins lookup) is
-    pinned as ``frontmatter.SKILL_UPDATE``.
-    """
-    if not text:
-        return ""
-    return frontmatter_value(text, key, SKILL_UPDATE)
-
-
-def _merge_trigger_lists(live: str, candidate: str, *, cap: int = 12) -> str:
-    """Union two comma-separated trigger lists, live first, case-insensitively
-    deduped and capped.
-
-    Triggers are the skill's ACTIVATION surface. An update proposes triggers for
-    the new requirement only, so replacing the live list would stop the skill
-    firing on every phrasing it already answered — a silent regression the diff
-    shows but nobody reads as a behavior change. Union instead, and cap so
-    repeated updates cannot grow the list without bound.
-    """
-    merged: list[str] = []
-    seen: set[str] = set()
-    for raw in (live or "").split(",") + (candidate or "").split(","):
-        t = re.sub(r"\s+", " ", raw).strip()
-        if not t:
-            continue
-        k = t.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        merged.append(t)
-        if len(merged) >= cap:
-            break
-    return ", ".join(merged)
-
-
-def _strip_skill_frontmatter(text: str | None) -> str:
-    """Return *text* with a leading ``---`` frontmatter block removed.
-
-    A skill body read off disk carries its frontmatter header; only the prose
-    below it may be fed to (or accepted from) the update-merge turn, because
-    ``stage_skill_candidate`` re-emits frontmatter of its own. Text without a
-    leading block is returned unchanged (stripped). A fence LOCATOR, not a
-    field parser — deliberately outside ``kiro_crew.frontmatter``; editing
-    its grammar means revisiting ``_frontmatter_value``'s dialect too.
-    """
-    if not text:
-        return ""
-    m = re.match(r"^\s*---\n.*?\n---\n?(.*)$", text, re.DOTALL)
-    return (m.group(1) if m else text).strip()
-
-
-def _strip_code_fence(text: str) -> str:
-    """Unwrap a single outer ```/```markdown fence, if the model emitted one."""
-    s = (text or "").strip()
-    if not s.startswith("```"):
-        return s
-    lines = s.split("\n")
-    if len(lines) < 2:
-        return s
-    body = lines[1:]
-    if body and body[-1].strip().startswith("```"):
-        body = body[:-1]
-    return "\n".join(body).strip()
-
-
-def _count_tool_call_messages(messages: list[dict]) -> int:
-    """Count messages that represent tool invocations under either schema.
-
-    Two recording formats exist:
-    - Legacy (Slack pipeline): assistant messages carry a ``tools`` list field.
-    - Dashboard pipeline: separate messages with ``role`` in {"tool", "tool_call",
-      "tool_result"} and the tool name embedded in ``content``.
-
-    A message matching EITHER condition counts once (no double-counting).
-    """
-    count = 0
-    for msg in messages:
-        tools = msg.get("tools")
-        if isinstance(tools, list) and tools:
-            count += 1
-        elif msg.get("role") in _TOOL_ROLES:
-            count += 1
-    return count
-
-
-def _session_touched_sensitive(messages: list[dict]) -> bool:
-    """Return True if any tool call in the session referenced a sensitive path.
-
-    Checks both recording schemas:
-    - Legacy: substring match over each entry in ``msg["tools"]`` list.
-    - Dashboard: substring match over ``content`` when ``role`` indicates a tool event.
-
-    Designed to be conservative — a false positive just means we skip
-    auto-creation for this session.
-    """
-    for msg in messages:
-        # Legacy schema: tools list on assistant messages
-        tools = msg.get("tools")
-        if isinstance(tools, list):
-            for tool in tools:
-                if not isinstance(tool, str):
-                    continue
-                lower = tool.lower()
-                for pattern in _SENSITIVE_TOOL_PATTERNS:
-                    if pattern in lower:
-                        return True
-        # Dashboard schema: role="tool" with tool info in content
-        if msg.get("role") in _TOOL_ROLES:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                lower = content.lower()
-                for pattern in _SENSITIVE_TOOL_PATTERNS:
-                    if pattern in lower:
-                        return True
-    return False
-
-
-class HistoryConsolidator:
-    """Summarize old messages into structured memory via LLM.
-
-    Two consolidation paths:
-    - Preferences/projects: triggered by message count (30 messages)
-    - Daily history: triggered by idle time (3h default) or end of day
-    """
-
-    def __init__(
-        self,
-        log: ConversationLog,
-        memory: MemoryStore,
-        sessions: SessionManager | None = None,
-        lesson_store: LessonStore | None = None,
-        history_idle_secs: float = 3 * 3600,
-        vector_store: "VectorMemoryStore | None" = None,
-        migrated: bool = False,
-        # ── Auto skill creation ──
-        # All-default so callers unaware of this feature continue to work.
-        skills_loader: "SkillsLoader | None" = None,
-        auto_skills_enabled: bool = False,
-        auto_refine_enabled: bool = False,
-        auto_min_tool_calls: int = 5,
-        auto_similarity_threshold: float = 0.85,
-        # ── Staged approval + lifecycle (v2) ──
-        approval_required: bool = True,
-        max_auto_skills: int = 100,
-        stale_after_days: int = 30,
-        archive_after_days: int = 90,
-        generate_scripts: bool = True,
-        judge_model: str = "",
-    ) -> None:
-        self._log = log
-        self._memory = memory
-        self._sessions = sessions
-        self._lesson_store = lesson_store
-        self._history_idle_secs = history_idle_secs
-        self._vector_store = vector_store
-        self._migrated = migrated
-        self._skills_loader = skills_loader
-        self._auto_skills_enabled = auto_skills_enabled
-        self._auto_refine_enabled = auto_refine_enabled
-        self._auto_min_tool_calls = auto_min_tool_calls
-        self._auto_similarity_threshold = auto_similarity_threshold
-        self._approval_required = approval_required
-        self._max_auto_skills = max_auto_skills
-        self._stale_after_days = stale_after_days
-        self._archive_after_days = archive_after_days
-        self._generate_scripts = generate_scripts
-        self._judge_model = judge_model
-        # Captured on the first _consolidate (the gateway loop) so the sync,
-        # thread-offloaded _process_auto_skills can bridge the async dedupe
-        # judge back onto the loop. Throttle guards the autonomous lifecycle.
-        self._event_loop: "asyncio.AbstractEventLoop | None" = None
-        self._last_lifecycle: float = 0.0
-        self._running: set[str] = set()
-        self._tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
-        # Track last activity per session for idle-based history consolidation
-        self._last_activity: dict[str, float] = {}
-        self._history_consolidated: dict[str, float] = {}  # key → last history consolidation time
-        # Separate offset for prefs-only consolidation (doesn't advance main offset)
-        self._prefs_offset: dict[str, int] = {}
-        # Session length at the last skill-detection pass, so an unchanged
-        # (rotation_generation, message_count) at the last skill-detection
-        # pass, so an unchanged session isn't re-judged on every history
-        # consolidation — while a rotation (which bumps the generation and
-        # swaps the window's content) still forces a fresh pass.
-        self._last_skillgen_marker: dict[str, tuple[int, int]] = {}
-
-    def retry_eligible(
-        self, key: str, now: float | None = None, message_count: int | None = None
-    ) -> bool:
-        """True when *key* may spend a billed consolidation turn right now.
-
-        Every automatic entry point consults this so a span whose consolidation
-        keeps failing backs off instead of re-billing an LLM turn on each sweep,
-        and _consolidate() itself enforces it as the final gate, so an entry
-        point without a pre-check of its own still cannot bypass the backoff.
-        A span at :data:`_CONSOLIDATION_MAX_ATTEMPTS` is refused: the abandon path
-        normally writes the marker (which also clears the accounting), so reaching
-        here at the cap means even that write failed, and refusing keeps a broken
-        span from spending forever.
-
-        That refusal covers the SPAN, not the session. The cap is scoped to the
-        content it measured, so a rotation or new messages release it with a fresh
-        bounded budget (see
-        :meth:`ConversationLog._attempts_describe_current_span`) — otherwise one
-        transient marker-write failure would stop this session from ever
-        consolidating again.
-
-        Costs one metadata-line read and NO transcript read: this runs on the
-        gateway event loop (heartbeat sweep, expiry, dashboard trigger), where a
-        synchronous full-file read would stall every other gateway task on a large
-        transcript. *message_count* is the transcript's current total, which every
-        automatic caller already holds from its own
-        :meth:`ConversationLog.consolidation_counts` call; omitting it skips the
-        extent test and keeps the cap.
-        """
-        attempts, retry_at = self._log.consolidation_retry_state(key, message_count)
-        if attempts >= _CONSOLIDATION_MAX_ATTEMPTS:
-            return False
-        return (_time.time() if now is None else now) >= retry_at
-
-    async def _note_failed_attempt(
-        self, key: str, span: AttemptedSpan, reason: str
-    ) -> None:
-        """Charge one attempt for a billed turn that never reached the marker.
-
-        Called only once the prompt has actually reached the provider, so a
-        pre-dispatch failure (no session manager, kiro-cli failing to start) and a
-        cheap pre-call failure (snapshot, metadata read) both keep their free
-        retry. At the attempt cap the durable marker is written anyway and the span
-        is abandoned with a warning: the alternative is re-billing this failure
-        indefinitely.
-
-        *span* is the pre-turn snapshot identity (see :class:`AttemptedSpan`), used
-        both to stamp the charge and to place the abandon marker — the same values
-        for both, so the marker cannot be written for a span other than the one the
-        cap was reached on.
-        """
-        try:
-            attempts, retry_at = await asyncio.to_thread(
-                self._log.record_consolidation_failure,
-                key,
-                _CONSOLIDATION_BACKOFF_BASE_SECS,
-                _CONSOLIDATION_BACKOFF_MAX_SECS,
-                span,
-            )
-        except Exception:
-            # Without a persisted count the sweep cannot back off, so say so
-            # loudly — but never let bookkeeping mask the original failure.
-            logger.warning(
-                "Could not persist consolidation retry state for %s", key, exc_info=True
-            )
-            return
-        if attempts < 1:
-            # The session was deleted mid-consolidation, so nothing was recorded
-            # and there is no span left to abandon.
-            return
-        if attempts < _CONSOLIDATION_MAX_ATTEMPTS:
-            logger.warning(
-                "Consolidation attempt %d/%d failed for %s (%s); "
-                "next attempt in %.0fs",
-                attempts,
-                _CONSOLIDATION_MAX_ATTEMPTS,
-                key,
-                reason,
-                max(0.0, retry_at - _time.time()),
-            )
-            return
-        logger.warning(
-            "Abandoning consolidation for %s after %d failed attempts (%s): "
-            "marking %d messages consolidated WITHOUT a memory pass, so this "
-            "span's history/preferences/lessons are not extracted",
-            key,
-            attempts,
-            reason,
-            span.total,
-        )
-        try:
-            await asyncio.to_thread(
-                self._log.mark_consolidated, key, span.total, span.generation
-            )
-        except Exception:
-            # The count stays at the cap, so retry_eligible() keeps refusing —
-            # the span stops spending even though the marker is missing.
-            logger.warning(
-                "Could not mark abandoned consolidation for %s", key, exc_info=True
-            )
-
-    async def _note_environment_failure(self, key: str, reason: str) -> None:
-        """Arm the backoff for a consolidation that never reached the provider.
-
-        Deliberately does NOT touch the attempt cap. A pre-dispatch failure spends
-        nothing, so abandoning the span over one would write the durable marker
-        over messages no LLM has ever read — losing a memory pass to a broken
-        kiro-cli install rather than to a genuinely unprocessable span. The
-        environment counter only widens the retry interval, so a permanently broken
-        host settles at the backoff ceiling instead of re-attempting every tick.
-        """
-        try:
-            failures, retry_at = await asyncio.to_thread(
-                self._log.record_consolidation_environment_failure,
-                key,
-                _CONSOLIDATION_BACKOFF_BASE_SECS,
-                _CONSOLIDATION_BACKOFF_MAX_SECS,
-            )
-        except Exception:
-            logger.warning(
-                "Could not persist consolidation environment backoff for %s",
-                key,
-                exc_info=True,
-            )
-            return
-        if failures < 1:
-            return
-        logger.warning(
-            "Consolidation for %s could not reach the LLM (%s; environment "
-            "failure #%d, nothing billed); retrying in %.0fs without consuming "
-            "the attempt budget",
-            key,
-            reason,
-            failures,
-            max(0.0, retry_at - _time.time()),
-        )
-
-    def maybe_consolidate(self, key: str) -> None:
-        """Fire preferences/projects consolidation if message threshold exceeded."""
-        self._last_activity[key] = _time.time()
-        if key in self._running:
-            return
-        total = len(self._log._read_messages(key))
-        prefs_off = self._prefs_offset.get(key, 0)
-        if total - prefs_off < _CONSOLIDATION_THRESHOLD:
-            return
-        # Cheap pre-check mirroring the other automatic entry points. This
-        # runs on every user turn, so during a backoff window every message
-        # past the threshold would otherwise schedule a task whose snapshot
-        # takes the per-file lock (the same one appends contend on) and reads
-        # the transcript, only to be refused by the gate inside _consolidate().
-        # retry_eligible costs one metadata-line read and no transcript read;
-        # the inner gate remains the enforcement backstop.
-        if not self.retry_eligible(key, message_count=total):
-            return
-        self._running.add(key)
-        t = asyncio.create_task(self._consolidate(key, include_history=False))
-        self._tasks.add(t)
-
-        def _on_done(fut: asyncio.Task, k: str = key, off: int = total) -> None:  # type: ignore[type-arg]
-            self._tasks.discard(fut)
-            if (
-                not fut.cancelled()
-                and fut.exception() is None
-                # A refusal ran no pass over the window. Advancing the offset
-                # anyway would mark the window consolidated, so once the
-                # backoff expires the threshold test skips it until a whole new
-                # threshold of messages accumulates — silently dropping its
-                # preference/project extraction.
-                and fut.result() is not _CONSOLIDATION_REFUSED
-            ):
-                self._prefs_offset[k] = off
-
-        t.add_done_callback(_on_done)
-
-    def check_idle_sessions(self) -> None:
-        """Check all tracked sessions for idle-based history consolidation."""
-        now = _time.time()
-        for key, last in list(self._last_activity.items()):
-            if now - last < self._history_idle_secs:
-                continue
-            total, unconsolidated = self._log.consolidation_counts(key)
-            if (
-                unconsolidated < 1
-                or now - self._history_consolidated.get(key, 0) < self._history_idle_secs
-                or key in self._running
-                # Durable backoff, checked last so it only costs a metadata read
-                # once the cheap conditions pass. The in-memory throttle above is
-                # set only when the task ends without an exception and is lost on
-                # restart, so it alone cannot stop a repeatedly failing span from
-                # re-billing an LLM turn every tick. *total* comes from the read
-                # above, so the check adds no transcript read on the loop.
-                or not self.retry_eligible(key, now, message_count=total)
-            ):
-                continue
-            self._running.add(key)
-            captured_now = now
-            t = asyncio.create_task(self._consolidate(key, include_history=True))
-            self._tasks.add(t)
-
-            def _on_idle_done(
-                fut: asyncio.Task,  # type: ignore[type-arg]
-                k: str = key,
-                ts: float = captured_now,
-            ) -> None:
-                self._tasks.discard(fut)
-                if (
-                    not fut.cancelled()
-                    and fut.exception() is None
-                    # A refusal is not a completed pass; setting the throttle
-                    # for it would delay the retry past the backoff deadline.
-                    and fut.result() is not _CONSOLIDATION_REFUSED
-                ):
-                    self._history_consolidated[k] = ts
-
-            t.add_done_callback(_on_idle_done)
-
-    def consolidate_session(self, key: str) -> None:
-        """Trigger history consolidation for *key* (fire-and-forget).
-
-        Used by session-end hooks (dashboard close, Slack end, idle expiry)
-        and the ``kirocrew consolidate`` CLI command.  Skips if the session
-        is already being consolidated, has no unconsolidated messages, or is
-        inside the durable consolidation retry backoff.
-
-        Safety: skill detection (_run_skill_detection) re-checks
-        _session_touched_sensitive() over its window before proposing anything,
-        so sensitive sessions never produce skills regardless of entry point.
-        """
-        if key in self._running:
-            return
-        total, unconsolidated = self._log.consolidation_counts(key)
-        if unconsolidated < 1:
-            return
-        # This path consults no time-based throttle at all — every session expiry
-        # for the same key fires a fresh consolidation — so the durable backoff
-        # stands between a repeatedly failing span and one billed LLM turn per
-        # expiry. Checked here (as well as inside _consolidate()) so the skip is
-        # logged before a task is ever scheduled.
-        if not self.retry_eligible(key, message_count=total):
-            logger.info(
-                "consolidate_session skipped for %s: consolidation retry backoff", key
-            )
-            return
-        # Short-circuit sensitive sessions before scheduling a task
-        messages = self._log._read_messages(key)
-        if _session_touched_sensitive(messages):
-            logger.info("consolidate_session skipped for %s: sensitive session", key)
-            return
-        self._running.add(key)
-        t = asyncio.create_task(self._consolidate(key, include_history=True))
-        self._tasks.add(t)
-
-        def _on_done(
-            fut: asyncio.Task,  # type: ignore[type-arg]
-            k: str = key,
-        ) -> None:
-            self._tasks.discard(fut)
-            self._running.discard(k)
-            if fut.cancelled():
-                return
-            exc = fut.exception()
-            if exc is None:
-                # A refusal is not a completed pass; leave the throttle unset.
-                if fut.result() is not _CONSOLIDATION_REFUSED:
-                    self._history_consolidated[k] = _time.time()
-            else:
-                logger.warning("consolidate_session failed for %s: %s", k, exc)
-
-        t.add_done_callback(_on_done)
-
-    async def consolidate_now(self, key: str) -> bool:
-        """Consolidate a session synchronously (blocking).
-
-        Unlike consolidate_session() which is fire-and-forget, this awaits
-        completion. Used by the CLI command.
-
-        Returns ``False`` when the consolidation retry backoff refused the
-        span — so the CLI can report the skip instead of a false success —
-        and ``True`` for every other completion (including the nothing-to-do
-        and sensitive-session skips, which were already reported as done).
-
-        Safety: defense-in-depth — the consolidation retry backoff is also
-        checked inside _consolidate(), and _run_skill_detection() re-checks
-        the sensitive-session guard over its own window.
-        """
-        if self._log.unconsolidated_count(key) < 1:
-            return True
-        messages = self._log._read_messages(key)
-        if _session_touched_sensitive(messages):
-            logger.info("consolidate_now skipped for %s: sensitive session", key)
-            return True
-        outcome = await self._consolidate(key, include_history=True)
-        return outcome is not _CONSOLIDATION_REFUSED
-
-    async def _consolidate(
-        self, key: str, include_history: bool = True
-    ) -> _ConsolidationRefusedSentinel | None:
-        """Run LLM consolidation for a session.
-
-        Returns :data:`_CONSOLIDATION_REFUSED` when the retry-eligibility gate
-        refuses the span; every other completion returns ``None``.
-        """
-        # Capture the gateway loop so the thread-offloaded _process_auto_skills
-        # can schedule the async dedupe judge back onto it.
-        self._event_loop = asyncio.get_running_loop()
-        # Flipped once the prompt actually reaches the provider, which is what
-        # makes a failure expensive: everything before that point is free to
-        # retry, everything after costs a turn that produced nothing durable.
-        billed = False
-        total = 0
-        generation_at_snapshot = 0
-        # The span identity any failure charge is stamped with. Rebuilt from the
-        # snapshot below; the zero value only ever reaches a charge if the snapshot
-        # itself raised, and that path is not billed.
-        attempted = AttemptedSpan(0, 0, 0)
-        try:
-            # Atomically snapshot the unconsolidated tail, the total message
-            # count (the absolute offset handed to mark_consolidated below), and
-            # the rotation generation under ONE lock hold. Reading them as
-            # separate calls let an append trigger a rotation between them,
-            # pairing a pre-rotation offset with a post-rotation generation —
-            # mark_consolidated would then see matching generations and apply
-            # the stale offset (retained-count fallback misses it too), silently
-            # dropping messages from extraction. Offloaded to a worker thread:
-            # _consolidate runs on the gateway event loop and _locked/file IO is
-            # blocking (same rationale as the mark_consolidated offload below).
-            (
-                unconsolidated,
-                total,
-                generation_at_snapshot,
-            ) = await asyncio.to_thread(self._log.snapshot_for_consolidation, key)
-            if not unconsolidated:
-                return None
-            # Retry-eligibility choke point: every entry point funnels through
-            # this function, so a span inside its durable backoff is refused
-            # here — before anything that can bill a provider turn — even if a
-            # caller carries no pre-check of its own (a future entry point, or
-            # a pre-check that raced the backoff being recorded). Callers keep
-            # their cheaper pre-checks as scheduling short-circuits and UX (the
-            # idle sweep's per-tick skip, maybe_consolidate's per-turn skip,
-            # the dashboard trigger's 429); this gate is the enforcement that
-            # holds when a new entry point forgets one. The count comes
-            # from the atomic snapshot above — the same consistent read the
-            # rest of this function uses — and retry_eligible costs one
-            # metadata-line read, so no second transcript read lands on the
-            # event loop. The refusal returns a sentinel rather than raising:
-            # the finally block still releases self._running and the callers'
-            # done-callbacks run normally (so the key is never stranded), while
-            # the sentinel lets those callbacks tell a refusal from a completed
-            # pass and leave their bookkeeping untouched.
-            if not self.retry_eligible(key, message_count=total):
-                logger.info(
-                    "_consolidate refused for %s: consolidation retry backoff", key
-                )
-                return _CONSOLIDATION_REFUSED
-            # Freeze the whole span identity from that one snapshot. The offset is
-            # derived rather than returned because the snapshot slices at it
-            # (``messages[offset:]``), so the subtraction is exact and comes from
-            # the same lock hold — no second read that a concurrent rotation could
-            # land between. A failure charge stamped with these values describes
-            # what the turn attempted even if the file changed underneath it.
-            attempted = AttemptedSpan(
-                total=total,
-                generation=generation_at_snapshot,
-                offset=total - len(unconsolidated),
-            )
-
-            # Resolve workspace-scoped memory from session metadata
-            meta = self._log.get_metadata(key)
-            ws_name = meta.get("workspace")
-            if ws_name:
-                from kiro_crew.context import ContextBuilder
-
-                memory = ContextBuilder.get_memory_for(ws_name)
-            else:
-                memory = self._memory
-
-            conversation = "\n".join(_fmt_message(m) for m in unconsolidated)
-
-            current_prefs = memory.read_preferences()
-            current_projects = memory.read_projects()
-
-            # Build prompt keys dynamically based on consolidation type
-            keys: list[str] = []
-            if include_history:
-                keys.append(
-                    '"history_entry": A concise paragraph (2-5 sentences) summarizing '
-                    "what happened. Use local time [YYYY-MM-DD HH:MM]. Focus on "
-                    "decisions, outcomes, facts. Use user's real name if known."
-                )
-
-            # Structured memory extraction (when vector store is available)
-            has_vector = self._vector_store is not None
-            if has_vector and self._vector_store is not None:
-                # Offload: the fetch serializes on the store's _db_lock (#1947),
-                # and this coroutine runs on the gateway event loop — a worker
-                # holding the lock (backfill's FAISS rebuild, reconcile's bulk
-                # UPDATEs) would otherwise block the whole loop here.
-                current_semantic = await asyncio.to_thread(self._vector_store.get_all_semantic)
-
-                def _prompt_value(e: dict) -> object:
-                    # A lesson row stores a mapping; the consolidation model
-                    # should read the rule prose, not a JSON envelope whose
-                    # field names dilute the instruction it is weighing.
-                    if str(e.get("key", "")).startswith("lesson."):
-                        from kiro_crew.vector_memory import _lesson_display_text
-
-                        try:
-                            decoded = json.loads(e["value_json"])
-                        except Exception:
-                            return e["value_json"]
-                        return _lesson_display_text(decoded) or e["value_json"]
-                    return e["value_json"]
-
-                semantic_json = (
-                    json.dumps(
-                        [
-                            {
-                                "key": e["key"],
-                                "value_json": _prompt_value(e),
-                                "confidence": e["confidence"],
-                            }
-                            for e in current_semantic
-                        ],
-                        indent=1,
-                    )
-                    if current_semantic
-                    else "[]"
-                )
-                keys.append(
-                    '"semantic": Array of structured facts to remember long-term. '
-                    'Each: {"key": "<dotted.key>", "value": <json_value>, "confidence": 0.0-1.0, '
-                    '"delete": false}. '
-                    "Rules: keys must start with pref.*, project.*, or user.* "
-                    "(e.g. pref.color, user.favorite_language, project.name). "
-                    "confidence 1.0 = user stated, 0.8-0.9 = clearly implied, <0.8 = uncertain (rejected). "
-                    "value must be a JSON primitive (string, number, boolean) — NOT objects or arrays. "
-                    "IMPORTANT: Check existing semantic memory above. If a key already covers "
-                    "the same topic, UPDATE that key instead of creating a new one. "
-                    "Do NOT create near-duplicate keys (e.g. project.x.approach AND project.x.refined). "
-                    'To DELETE a stale/invalidated key, set "delete": true (e.g. pet died → delete '
-                    "user.pet.name; project cancelled → delete project.x.status). "
-                    f"Max {_MAX_SEMANTIC_PER_CONSOLIDATION} items."
-                )
-                keys.append(
-                    '"episodic": Array of conversation fragments worth remembering. '
-                    'Each: {"text": "...", "tags": ["tag1"], "importance": 0.0-1.0}. '
-                    "Rules: text 10-2000 chars, factual. importance 0.9+ = critical, "
-                    "0.7-0.9 = useful, 0.5-0.7 = minor. Skip greetings/small talk. "
-                    f"Max {_MAX_EPISODIC_PER_CONSOLIDATION} items. "
-                    "IMPORTANT: Do NOT write simple key-value facts here that belong in semantic "
-                    "(e.g. 'Favorite color: blue'). Episodic is for events, decisions, and context "
-                    "— not for duplicating semantic facts."
-                )
-
-            # Markdown memory (backward compat when not migrated)
-            if not self._migrated:
-                keys.append(
-                    '"preferences_update": The COMPLETE updated preferences file, '
-                    "included ONLY if the file needs changes. Merge duplicates, keep "
-                    "only newest if contradicted, remove stale one-off observations. "
-                    "Keep '# User Preferences' header. If nothing changed, OMIT this "
-                    "key entirely — never echo the file back and never answer with a "
-                    "placeholder word like 'unchanged': the value overwrites the file, "
-                    "so when present it must be the full file body."
-                )
-                keys.append(
-                    '"projects_update": The COMPLETE updated projects file, included '
-                    "ONLY if the file needs changes. Only active projects, remove "
-                    "stale entries, update facts. Keep '# Active Projects' header. "
-                    "If nothing changed, OMIT this key entirely — never echo the file "
-                    "back and never answer with a placeholder word like 'unchanged': "
-                    "the value overwrites the file, so when present it must be the "
-                    "full file body."
-                )
-
-            if include_history:
-                keys.append(
-                    '"lessons": Array of corrections the user taught '
-                    '(e.g. "no, do X", "always Y", "never Z"). '
-                    'Each: {"rule": "...", "negative": "...", "category": "tool|preference|knowledge"}. '
-                    "Empty [] if no corrections. Skip general preferences. "
-                    f"Max {_MAX_LESSONS_PER_CONSOLIDATION} items. "
-                    "IMPORTANT: Only extract lessons that the user did NOT explicitly ask "
-                    "to remember (those are already saved via learn_add). Only extract "
-                    "implicit corrections the user made without saying 'remember'."
-                )
-
-            # ── Auto skill detection ──
-            # Skill detection runs as its OWN pass (below, after the memory
-            # writes) over a wider last-N window of the full session — not the
-            # incremental history tail — so a reusable procedure that spans the
-            # whole session is judged as a unit. It is therefore intentionally
-            # absent from this consolidation prompt's keys.
-
-            numbered = "\n\n".join(f"{i + 1}. {k}" for i, k in enumerate(keys))
-            prompt_parts = [
-                "You are a memory consolidation agent. Process this conversation "
-                f"and return a JSON object with these keys:\n\n{numbered}",
-            ]
-            if has_vector:
-                prompt_parts.append(f"\n\n## Current Semantic Memory\n{semantic_json}")
-            if not self._migrated:
-                prompt_parts.append(f"\n\n## Current Preferences\n{current_prefs or '(empty)'}")
-                prompt_parts.append(f"\n\n## Current Projects\n{current_projects or '(empty)'}")
-            prompt_parts.append(f"\n\n## Conversation to Process\n{conversation}")
-            prompt_parts.append("\n\nRespond with ONLY valid JSON, no markdown fences.")
-            prompt = "".join(prompt_parts)
-
-            try:
-                result = await self._call_llm(prompt)
-            except _ConsolidationNotDispatched as exc:
-                # Nothing was sent, so nothing was billed. Charging this to the
-                # attempt cap would let a handful of environment failures abandon
-                # the span — writing the durable marker over messages no LLM has
-                # ever read, which is the exact false-abandonment this accounting
-                # exists to prevent. Arm the backoff only, so a broken host retries
-                # on a widening interval instead of on every 60s tick.
-                if include_history:
-                    await self._note_environment_failure(key, str(exc))
-                return None
-            billed = True
-            if not result:
-                # The turn reached the provider and produced nothing usable, so it
-                # was spent while the marker below stays unwritten. Returning
-                # silently would look like success to the done-callbacks, setting
-                # the in-memory throttle while the durable count still says
-                # unconsolidated: the span re-bills a full turn every idle window,
-                # and immediately after every restart. Charge the attempt.
-                if include_history:
-                    await self._note_failed_attempt(
-                        key, attempted, "empty LLM result"
-                    )
-                return None
-
-            if entry := result.get("history_entry"):
-                # Offloaded to a worker thread: append_history takes a blocking
-                # advisory file lock (cross-process) and does synchronous file
-                # IO, and _consolidate runs on the event loop thread (fired via
-                # asyncio.create_task). Running it inline would let cross-process
-                # lock contention stall the whole gateway loop.
-                await run_in_embed_pool(memory.append_history, entry)
-                logger.info("Consolidated %d messages for %s", len(unconsolidated), key)
-
-            # Structured memory writes (Phase 2/3). Offloaded to a worker thread:
-            # _write_structured_memory embeds each item via a blocking urllib call
-            # to the in-process embedder, and _consolidate runs on the event loop thread (fired via
-            # asyncio.create_task). Running it inline stalls the whole gateway loop
-            # if the embedding endpoint is slow/hung (heartbeats, Slack, dashboard).
-            if self._vector_store:
-                await run_in_embed_pool(self._write_structured_memory, result, key)
-
-            # Markdown writes (backward compat — skip if migrated). Each value
-            # replaces the whole file, so a non-file answer (e.g. the literal
-            # word "unchanged") must be discarded, not written: once written it
-            # re-enters the next prompt as the file's current content and primes
-            # every later pass to repeat it (see _is_plausible_memory_file).
-            if not self._migrated:
-                if prefs := result.get("preferences_update"):
-                    if not _is_plausible_memory_file(prefs, "# User Preferences"):
-                        logger.warning(
-                            "Discarding implausible preferences_update from "
-                            "consolidation (missing '# User Preferences' header "
-                            "or placeholder body; %d chars)",
-                            len(prefs),
-                        )
-                    elif prefs.strip() != current_prefs.strip():
-                        memory.write_preferences(prefs)
-
-                if projects := result.get("projects_update"):
-                    if not _is_plausible_memory_file(projects, "# Active Projects"):
-                        logger.warning(
-                            "Discarding implausible projects_update from "
-                            "consolidation (missing '# Active Projects' header "
-                            "or placeholder body; %d chars)",
-                            len(projects),
-                        )
-                    elif projects.strip() != current_projects.strip():
-                        memory.write_projects(projects)
-
-            # Lesson extraction: _save_lessons calls write_lesson which embeds
-            # each rule (+ up to 5 lazy backfills) via blocking urllib to Ollama.
-            # Same rationale as _write_structured_memory above — must offload.
-            if (self._lesson_store or self._vector_store) and (
-                raw_lessons := result.get("lessons")
-            ):
-                await run_in_embed_pool(self._save_lessons, raw_lessons)
-
-            # Auto skill detection — a SEPARATE LLM pass over the full-session
-            # window (see _run_skill_detection), not the incremental tail. Runs
-            # only on history consolidation, guarded by flag + loader; failures
-            # are logged, never fatal.
-            if include_history and self._auto_skills_enabled and self._skills_loader is not None:
-                try:
-                    await self._run_skill_detection(key)
-                except Exception:
-                    logger.warning("Auto-skill detection failed for %s", key, exc_info=True)
-
-            # Autonomous lifecycle: age-based archival must run even when this
-            # pass created/approved no skill, otherwise skills never age out on
-            # their own (create/approve were the only triggers). Consolidation is
-            # the existing idle/periodic path; throttle to at most once/hour
-            # across all sessions so frequent consolidations don't rescan the set.
-            if self._skills_loader is not None and (_time.time() - self._last_lifecycle) > 3600:
-                self._last_lifecycle = _time.time()
-                try:
-                    await asyncio.to_thread(
-                        self._skills_loader.run_skill_lifecycle,
-                        max_auto_skills=self._max_auto_skills,
-                        stale_after_days=self._stale_after_days,
-                        archive_after_days=self._archive_after_days,
-                    )
-                except Exception:
-                    logger.debug("Periodic skill lifecycle pass failed", exc_info=True)
-
-            # Only advance the consolidated offset for history consolidation.
-            # Prefs-only consolidation uses a separate in-memory offset.
-            # mark_consolidated does a synchronous, fsync-backed rewrite of the
-            # whole transcript (up to a couple of MB) behind the per-file lock.
-            # _consolidate runs on the gateway event loop (fired via
-            # asyncio.create_task), so offload the blocking rewrite to a worker
-            # thread — otherwise a slow filesystem freezes the loop (heartbeats,
-            # Slack, dashboard). Same rationale as the offloads above.
-            if include_history:
-                await asyncio.to_thread(
-                    self._log.mark_consolidated,
-                    key,
-                    total,
-                    generation_at_snapshot,
-                )
-
-        except Exception:
-            logger.exception("Consolidation failed for %s", key)
-            # Anything raised between the LLM call and mark_consolidated (memory
-            # writes, lesson writes, the marker write itself) re-raises, so the
-            # idle sweep's done-callback never sets its throttle and all of its
-            # skip conditions are false again on the next 60s tick. Charging the
-            # attempt here is what converts that tight loop into backoff.
-            if billed and include_history:
-                await self._note_failed_attempt(
-                    key, attempted, "exception after the LLM call"
-                )
-            raise
-        finally:
-            self._running.discard(key)
-        return None
-
-    async def _run_skill_detection(self, key: str) -> None:
-        """Detect a reusable skill from the FULL session (bounded window).
-
-        Unlike history/semantic/lesson extraction — which correctly runs on the
-        incremental unconsolidated tail — skill detection judges the last
-        ``_SKILL_DETECTION_WINDOW`` messages of the WHOLE session, decoupled
-        from the consolidation offset. A reusable procedure usually spans a
-        session rather than the slice since the last consolidation, so a
-        tail-only view systematically misses skills in any session consolidated
-        more than once. The skill need only be demonstrated by PART of the
-        window; the pass does not have to cover the whole session.
-
-        Runs as its own LLM call so the consolidation prompt stays tail-scoped
-        (widening THAT prompt would re-summarize already-consolidated messages
-        into duplicate history/semantic entries). A per-session
-        (rotation_generation, count) guard skips re-running when nothing new has
-        been appended since the last pass, yet still forces a fresh pass after a
-        transcript rotation (which swaps the window's content); genuine repeats
-        are still caught by the dedupe verdict in ``_process_auto_skills``.
-        """
-        if self._skills_loader is None:
-            return
-        all_messages = await asyncio.to_thread(self._log._read_messages, key)
-        if not all_messages:
-            return
-        # Key the guard on (rotation generation, message count), NOT count
-        # alone. The transcript rotates at _SESSION_MAX_BYTES / _SESSION_KEEP_LINES:
-        # a rotation bumps rotation_generation and replaces the window with fresh
-        # messages even when the resulting count matches a prior value, so a
-        # count-only guard would wrongly treat a rotated session as unchanged and
-        # never propose its skill. Comparing the pair re-detects after any
-        # rotation while still skipping a genuinely unchanged session.
-        generation = await asyncio.to_thread(
-            lambda: int(self._log._read_metadata(key).get("rotation_generation", 0) or 0)
-        )
-        marker = (generation, len(all_messages))
-        if self._last_skillgen_marker.get(key) == marker:
-            return
-        window = all_messages[-_SKILL_DETECTION_WINDOW:]
-        if _count_tool_call_messages(window) < self._auto_min_tool_calls:
-            return
-        if _session_touched_sensitive(window):
-            return
-
-        scripts_field = ""
-        if self._generate_scripts:
-            scripts_field = (
-                ', "scripts": (optional array, part of THIS new_skill '
-                "object) ONLY when the procedure includes a "
-                "DETERMINISTIC, always-identical step sequence worth "
-                "running verbatim (a fixed command chain, a set API "
-                "sequence, a predictable file transform). Each item: "
-                '{"filename": "<name>.py", "language": "python", '
-                '"content": "<self-contained Python, no network to '
-                "unknown hosts, no credential access, no destructive "
-                'commands, <=4KB>"}. Python ONLY (must run on Windows). '
-                "Omit for judgment-based / context-dependent procedures. "
-                "Scripts always require human approval"
-            )
-        skill_keys = [
-            '"new_skill": Object or null. Return an object ONLY if this '
-            "session contained a non-trivial reusable multi-step procedure "
-            "that future sessions would benefit from (e.g. debugging a "
-            "specific class of error, running a multi-command sequence, "
-            "a research synthesis flow). The procedure may be demonstrated by "
-            "only PART of the excerpt below — you do NOT need to cover the whole "
-            "session, just capture the one reusable procedure it contains. Shape: "
-            '{"slug": "<kebab-case-4-to-60-chars>", '
-            '"description": "<=150 chars, starts with verb>", '
-            '"triggers": "<3-8 comma-separated keywords/phrases>", '
-            '"procedure_md": "<concise markdown body with '
-            "## When to use / ## Steps / ## Gotchas sections, "
-            '<=8000 chars>"' + scripts_field + "}. "
-            "Return null if the session was trivial, a single-shot answer, "
-            "a one-off failure with no reusable takeaway, or involved "
-            "sensitive paths. When a session plausibly contains a procedure "
-            "a future session could reuse, lean toward returning it — every "
-            "candidate is staged for human approval before it can activate, "
-            "so a borderline proposal is cheap while a miss is lost for good. "
-            "Do NOT include absolute paths, credentials, tokens, or user PII "
-            "in the procedure body."
-        ]
-        if self._auto_refine_enabled:
-            skill_keys.append(
-                '"refined_skill": Object or null. If an existing '
-                '"auto/..." skill was loaded during this session AND '
-                "the agent found a better procedure than the one "
-                "documented in that skill, return: "
-                '{"name": "auto/<existing-slug>", '
-                '"description": "<updated>", "triggers": "<updated>", '
-                '"procedure_md": "<refined markdown>"}. Return null '
-                "if nothing was refined. Do not fabricate refinements."
-            )
-        numbered = "\n\n".join(f"{i + 1}. {k}" for i, k in enumerate(skill_keys))
-        conversation = "\n".join(_fmt_message(m) for m in window)
-        prompt = (
-            "You are a skill-extraction agent. Review this session excerpt and "
-            "return a JSON object with these keys:\n\n"
-            + numbered
-            + "\n\n## Session excerpt\n"
-            + conversation
-            + "\n\nRespond with ONLY valid JSON, no markdown fences."
-        )
-        try:
-            result = await self._call_llm(prompt)
-        except _ConsolidationNotDispatched:
-            # Skill detection is best-effort and owns no retry accounting, so an
-            # unreachable provider is simply no detection this pass. The marker
-            # below is still recorded, matching the existing failed-turn path.
-            result = None
-        # Record the (generation, count) marker regardless of outcome so an
-        # unchanged session isn't re-evaluated on every subsequent
-        # consolidation, but a rotation still forces a fresh pass.
-        self._last_skillgen_marker[key] = marker
-        if not result:
-            return
-        # _event_loop was captured by our caller (_consolidate) so the
-        # thread-offloaded dedupe judge can marshal back onto the gateway loop.
-        await asyncio.to_thread(self._process_auto_skills, result, key)
-
-    def _save_lessons(self, raw: object) -> None:
-        """Save extracted lessons from consolidation result."""
-        if not isinstance(raw, list):
-            return
-
-        # Cap like semantic/episodic: each write_lesson can perform up to 6
-        # blocking embeds, so an uncapped LLM lessons array would occupy a
-        # worker thread for minutes.
-        if len(raw) > _MAX_LESSONS_PER_CONSOLIDATION:
-            logger.warning(
-                "Consolidation returned %d lessons; capping to %d",
-                len(raw),
-                _MAX_LESSONS_PER_CONSOLIDATION,
-            )
-            raw = raw[:_MAX_LESSONS_PER_CONSOLIDATION]
-
-        # Prefer vector store (dedup-aware) over JSONL
-        if self._vector_store:
-            count = 0
-            for item in raw:
-                if isinstance(item, dict) and item.get("rule"):
-                    ok = self._vector_store.write_lesson(
-                        rule=item["rule"],
-                        category=item.get("category", "knowledge"),
-                        negative=item.get("negative"),
-                        source="consolidation",
-                    )
-                    if ok:
-                        count += 1
-            if count:
-                logger.info("Extracted %d lesson(s) from chat (vector store)", count)
-            return
-
-        if not self._lesson_store:
-            return
-        from datetime import timezone as _tz
-
-        from kiro_crew.learn import Lesson
-
-        count = 0
-        for item in raw:
-            if isinstance(item, dict) and item.get("rule"):
-                self._lesson_store.save(
-                    Lesson(
-                        ts=datetime.now(tz=_tz.utc).isoformat(),
-                        rule=item["rule"],
-                        category=item.get("category", "knowledge"),
-                        negative=item.get("negative"),
-                    )
-                )
-                count += 1
-        if count:
-            logger.info("Extracted %d lesson(s) from chat", count)
-
-    def _write_structured_memory(self, result: dict, key: str) -> None:
-        """Write semantic + episodic entries from consolidation result."""
-        if not self._vector_store:
-            return
-        source = f"consolidation:{key}"
-
-        # Semantic entries
-        semantic_items = result.get("semantic")
-        if isinstance(semantic_items, list):
-            written = 0
-            deleted = 0
-            skipped = 0
-            refused = 0
-            for item in semantic_items[:_MAX_SEMANTIC_PER_CONSOLIDATION]:
-                if not isinstance(item, dict) or "key" not in item:
-                    continue
-                # Handle deletion of stale keys
-                if item.get("delete"):
-                    if self._vector_store.delete_semantic(item["key"], source):
-                        deleted += 1
-                    continue
-                if "value" not in item or item["value"] is None:
-                    # Counted and logged here because this path returns before set_semantic, so
-                    # the VALUE_EMPTY reject event never fires for the omission that motivated it.
-                    skipped += 1
-                    logger.warning(
-                        "Semantic consolidation skipped %r: item carries no value", item["key"]
-                    )
-                    continue
-                conf = float(item.get("confidence", 0.5))
-                # Confidence 1.0 means user explicitly stated it — escalate source
-                # so it can overwrite previous user_explicit entries
-                item_source = "user_explicit" if conf >= 1.0 else source
-                err = self._vector_store.set_semantic(
-                    key=item["key"],
-                    value=item["value"],
-                    confidence=conf,
-                    source=item_source,
-                )
-                if err is None:
-                    written += 1
-                else:
-                    # Counted apart from `skipped`: several reject causes reach here and only
-                    # VALUE_EMPTY is a missing value, so a shared label names the wrong cause.
-                    reject_code, _reason = err
-                    refused += 1
-                    logger.warning(
-                        "Semantic consolidation refused %r: %s", item["key"], reject_code.value
-                    )
-            if written or deleted or skipped or refused:
-                logger.info(
-                    "Semantic consolidation: %d written, %d deleted, %d skipped (no value), "
-                    "%d refused",
-                    written,
-                    deleted,
-                    skipped,
-                    refused,
-                )
-
-        # Episodic entries
-        episodic_items = result.get("episodic")
-        if isinstance(episodic_items, list):
-            written = 0
-            for item in episodic_items[:_MAX_EPISODIC_PER_CONSOLIDATION]:
-                if not isinstance(item, dict) or "text" not in item:
-                    continue
-                ep_ok = self._vector_store.write_episodic(
-                    text=item["text"],
-                    conversation_id=key,
-                    tags=item.get("tags", []),
-                    importance=float(item.get("importance", 0.5)),
-                    source=source,
-                )
-                if ep_ok:
-                    written += 1
-            if written:
-                logger.info("Wrote %d episodic entries from consolidation", written)
-
-    def _dedupe_candidate(
-        self, slug: str, description: str, triggers: str
-    ) -> "tuple[str, str | None]":
-        """Classify a candidate against existing auto-skills.
-
-        Returns ``(verdict, key)`` where ``verdict`` is one of ``VERDICT_NEW``
-        (stage as a new candidate), ``VERDICT_DUP`` (drop — pure re-detection),
-        or ``VERDICT_UPDATE`` (stage a pending update to ``key``). ``key`` is the
-        matched/target existing-skill key for DUP/UPDATE, else ``None``.
-
-        Primary: a single tri-state metadata-judge call comparing the candidate
-        against ALL existing auto-skills at once (bounded set, no embeddings).
-        Lexical ``find_similar`` runs as a fallback when the judge is unavailable
-        (no ``judge_model``, no captured event loop, or no existing skills) AND
-        as a safety net when the judge returns ``VERDICT_NEW`` — so a judge
-        *failure* (which fails open to "new") can't silently skip dedup and let
-        a near-identical skill through. A lexical hit is treated as a DUP.
-        """
-        loader = self._skills_loader
-        if loader is None:
-            return (VERDICT_NEW, None)
-        existing = list(loader.list_auto_skills())
-        # Include already-staged (pending) candidates so repeated sessions don't
-        # queue a duplicate of something still awaiting review (list_auto_skills
-        # only enumerates LIVE skills — .pending is pruned from discovery).
-        try:
-            for p in loader.list_pending_skills():
-                existing.append(
-                    {
-                        "key": f"auto/{p.get('slug', '')}",
-                        "description": p.get("description", ""),
-                        "triggers": p.get("triggers", ""),
-                    }
-                )
-        except Exception:
-            pass
-        loop = self._event_loop
-
-        def _lexical() -> "tuple[str, str | None]":
-            hit = loader.find_similar(description, threshold=self._auto_similarity_threshold)
-            return (VERDICT_DUP, hit) if hit else (VERDICT_NEW, None)
-
-        if self._judge_model and existing and loop is not None:
-
-            def _judge_fn(prompt: str) -> str:
-                try:
-                    fut = asyncio.run_coroutine_threadsafe(self._dedupe_judge(prompt), loop)
-                    return fut.result(timeout=60) or ""
-                except Exception:
-                    return ""
-
-            candidate = {
-                "key": f"auto/{slug}",
-                "description": description,
-                "triggers": triggers,
-            }
-            verdict, key = metadata_dedupe_verdict(candidate, existing, _judge_fn)
-            # VERDICT_NEW means "new" OR a judge error (the verdict API fails open
-            # to new). Either way, confirm with the cheap lexical check before
-            # concluding the candidate is unique.
-            if verdict == VERDICT_NEW:
-                return _lexical()
-            return (verdict, key)
-        return _lexical()
-
-    async def _dedupe_judge(self, prompt: str) -> str:
-        """One cheap metadata-dedupe judge turn on the shared background session.
-        Runs on that session's existing (lite / haiku-class) model — no per-turn
-        ``set_model`` switch, because the ``BACKGROUND_KEY`` session is shared
-        with consolidation and a switch would leak the judge model into later
-        turns when recycling doesn't fire. Fail-open (returns "" on any error)."""
-        if not self._sessions:
-            return ""
-        try:
-            client, _new, _resumed = await self._sessions.get_or_create(
-                BACKGROUND_KEY, agent="kirocrew-lite"
-            )
-            text = await stream_and_collect(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-            )
-            return text or ""
-        except Exception:
-            logger.debug("Skill dedupe judge failed", exc_info=True)
-            return ""
-        finally:
-            # get_or_create ACQUIRES the per-session semaphore — the caller MUST
-            # release it (mirror _call_llm), else the shared _bg session is held
-            # forever and the next consolidation turn deadlocks waiting for it.
-            try:
-                self._sessions.release(BACKGROUND_KEY)
-                await self._sessions.recycle_background()
-            except Exception:
-                logger.debug("Skill dedupe judge session release failed", exc_info=True)
-
-    async def _merge_skill_update(
-        self, live_body: str, description: str, triggers: str, procedure_md: str
-    ) -> "str | None":
-        """Merge an existing live skill body with a new candidate into ONE
-        updated markdown body — a single text turn on the shared background
-        session. Mirrors ``_dedupe_judge`` exactly (get_or_create / REJECT_ALL /
-        finally-release + recycle). Fail-open (returns ``None`` on any error) so
-        the caller can fall back to a plain replacement proposal."""
-        if not self._sessions:
-            return None
-        prompt = (
-            "You are updating an existing auto-generated agent skill with a newly "
-            "learned requirement. Merge the EXISTING skill body and the NEW "
-            "requirement into ONE updated markdown skill body — fold the new "
-            "requirement in, do NOT blindly replace the existing content. Keep "
-            "the '## When to use', '## Steps', and '## Gotchas' sections. Keep "
-            "the result under 8000 characters. Output ONLY the updated markdown "
-            "body — no preamble, no explanation, no code fences.\n\n"
-            f"EXISTING skill body:\n{live_body}\n\n"
-            f"NEW requirement — description: {description}\n"
-            f"NEW requirement — triggers: {triggers}\n"
-            f"NEW requirement — procedure:\n{procedure_md}\n"
-        )
-        try:
-            client, _new, _resumed = await self._sessions.get_or_create(
-                BACKGROUND_KEY, agent="kirocrew-lite"
-            )
-            text = await stream_and_collect(
-                client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-            )
-            return text or None
-        except Exception:
-            logger.debug("Skill update merge failed", exc_info=True)
-            return None
-        finally:
-            # get_or_create ACQUIRES the per-session semaphore — the caller MUST
-            # release it (mirror _dedupe_judge), else the shared _bg session is
-            # held forever and the next consolidation turn deadlocks.
-            try:
-                self._sessions.release(BACKGROUND_KEY)
-                await self._sessions.recycle_background()
-            except Exception:
-                logger.debug("Skill update merge session release failed", exc_info=True)
-
-    def _stage_skill_update(
-        self,
-        *,
-        key: str,
-        target_key: str,
-        description: str,
-        triggers: str,
-        procedure_md: str,
-        scripts: "list[dict] | None" = None,
-    ) -> None:
-        """Stage a pending UPDATE candidate for an existing auto-skill.
-
-        (a) read the target's current live body; (b) LLM-merge it with the new
-        requirement (bridged from this worker thread onto the captured loop,
-        90s, fail-open); (c) use the redacted merge as the proposed body, else
-        fall back to the candidate's own procedure (also on oversize); (d) stage
-        under ``<target-slug>-update`` with ``kind='update'`` metadata; (e) SEL
-        audit with outcome ``staged_update``."""
-        loader = self._skills_loader
-        if loader is None:
-            return
-
-        def _redact(text: object) -> str:
-            if not isinstance(text, str):
-                return ""
-            safe, _ = redact_exfiltration_urls(text)
-            safe, _ = redact_credentials(safe)
-            return safe
-
-        target_slug = target_key.split("/", 1)[-1]
-        # Capture the base version BEFORE reading the body it describes. The merge
-        # turn below can take up to 90s, and an approval landing in that window
-        # advances live — sampling the version afterwards would record the NEW
-        # version against a body merged from the OLD one, and
-        # ``approve_pending_update``'s staleness guard would then see base ==
-        # current and let the stale body overwrite the intervening update. Reading
-        # it first fails safe in the other direction: if live advances after this
-        # point the recorded base is behind, the guard fires, and the candidate is
-        # refused rather than silently applied.
-        try:
-            base_version = loader.get_auto_skill_version(target_key)
-        except Exception:
-            base_version = 1
-        try:
-            live_body = loader.read_auto_skill_body(target_key)
-        except Exception:
-            live_body = None
-        if not live_body:
-            # ``_dedupe_candidate`` deliberately includes already-PENDING
-            # candidates in the judge's ``existing`` set (so repeated sessions
-            # don't queue duplicates), which means the judge can answer
-            # ``UPDATE auto/<pending-slug>`` — a target that is not live.
-            # ``approve_pending_update`` requires a live target, so staging that
-            # would queue a candidate the user can never approve. Drop it
-            # instead, audited so the loss is visible.
-            logger.info("Skill update skipped: target '%s' is not a live auto skill", target_key)
-            sel().log_tool_invocation(
-                session_key=key,
-                tool_name="auto_skill_create",
-                tool_kind="skills",
-                outcome="rejected",
-                metadata={"target": target_key, "reason": "target_not_live"},
-            )
-            return
-        # ``read_auto_skill_body`` returns the FULL SKILL.md (frontmatter
-        # included). Only the prose body may be merged: ``stage_skill_candidate``
-        # re-wraps the result in its own frontmatter, so feeding the header in
-        # invites the merge to echo it back and nest a second ``---`` block
-        # inside the procedure.
-        # Redact before the merge prompt. The read path already refuses symlinks
-        # into credential storage, but a credential can also be typed straight
-        # INTO a skill body via the dashboard editor — that file legitimately
-        # lives in the skills tree, so no path guard catches it. The candidate's
-        # own description/triggers/procedure are redacted upstream; this was the
-        # one input reaching the model raw. (Redaction also runs on the merge
-        # OUTPUT, which is too late to protect the prompt.)
-        live_prose = _redact(_strip_skill_frontmatter(live_body))
-
-        merged: "str | None" = None
-        if live_prose and self._event_loop is not None:
-            try:
-                fut = asyncio.run_coroutine_threadsafe(
-                    self._merge_skill_update(live_prose, description, triggers, procedure_md),
-                    self._event_loop,
-                )
-                merged = fut.result(timeout=90)
-            except Exception:
-                merged = None
-
-        used_merge = False
-        body = procedure_md
-        if merged:
-            # Defensive sanitize: the prompt forbids fences/frontmatter, but a
-            # model may still emit them — strip both so the staged candidate's
-            # procedure is pure markdown prose.
-            red = _redact(_strip_skill_frontmatter(_strip_code_fence(merged)))
-            if red and len(red) <= AUTO_SKILL_MAX_PROCEDURE_CHARS:
-                body = red
-                used_merge = True
-
-        provenance = AutoSkillProvenance(session_key=key, created_at=AutoSkillProvenance.now_iso())
-        # The slug pattern caps at 64 chars, and our own generation prompt permits
-        # up to 60, so `<target>-update` can overflow and be REJECTED by staging —
-        # silently dropping the learning, because consolidation advances its
-        # message offset regardless of candidate outcome. Reserve room for
-        # "-update" (7) plus the "-2".."-50" collision suffix (3).
-        _update_slug = f"{target_slug[:54].rstrip('-')}-update"
-        # Approval writes the candidate's frontmatter over the live skill, so the
-        # candidate must carry the MERGED metadata, not just its own. The body is
-        # merged by the LLM turn above; description/triggers were not, and the
-        # candidate only proposes triggers for the NEW requirement — replacing the
-        # live list would stop the skill activating on everything it already
-        # answered. Union the triggers and keep the live description when the
-        # candidate did not supply one.
-        _live_triggers = _frontmatter_value(live_body, "triggers")
-        _live_description = _frontmatter_value(live_body, "description")
-        _staged_triggers = _merge_trigger_lists(_live_triggers, triggers)
-        _staged_description = description or _live_description
-        name = loader.stage_skill_candidate(
-            _update_slug,
-            description=_staged_description,
-            triggers=_staged_triggers,
-            procedure_md=body,
-            provenance=provenance,
-            scripts=scripts or None,
-            kind="update",
-            target=target_key,
-            base_version=base_version,
-        )
-        if name:
-            logger.info("Staged skill update %s (target %s) from session %s", name, target_key, key)
-            sel().log_tool_invocation(
-                session_key=key,
-                tool_name="auto_skill_create",
-                tool_kind="skills",
-                outcome="staged_update",
-                metadata={
-                    "name": name,
-                    "target": target_key,
-                    "base_version": base_version,
-                    "merged": used_merge,
-                },
-            )
-        else:
-            logger.info("Skill update staging rejected for target '%s'", target_key)
-            sel().log_tool_invocation(
-                session_key=key,
-                tool_name="auto_skill_create",
-                tool_kind="skills",
-                outcome="rejected",
-                metadata={"slug": _update_slug, "reason": "creation_failed"},
-            )
-
-    def _process_auto_skills(self, result: dict, key: str) -> None:
-        """Extract + write auto-generated skills from the consolidation result.
-
-        Handles both ``new_skill`` and ``refined_skill`` result keys.  Each
-        is validated, redacted via ``security.redact_*``, then deduped
-        against existing skills (for new creation) before being written
-        through ``SkillsLoader``.  Every successful write emits a SEL audit
-        event via ``sel().log_tool_invocation``.
-        """
-        if self._skills_loader is None:
-            return
-
-        def _redact(text: object) -> str:
-            """Run the same two-pass redaction used for Slack/dashboard output."""
-            if not isinstance(text, str):
-                return ""
-            safe, _ = redact_exfiltration_urls(text)
-            safe, _ = redact_credentials(safe)
-            return safe
-
-        # Create path
-        new_skill = result.get("new_skill")
-        if isinstance(new_skill, dict):
-            slug = str(new_skill.get("slug", "")).strip()
-            description = _redact(new_skill.get("description", ""))
-            triggers = _redact(new_skill.get("triggers", ""))
-            procedure_md = _redact(new_skill.get("procedure_md", ""))
-            # Extract + statically validate any generated scripts. Scripts are
-            # redacted, then each is checked by the always-on static validator;
-            # only individually-clean scripts survive. A script-bearing
-            # candidate ALWAYS routes to approval (never auto-published).
-            valid_scripts: list[dict] = []
-            scripts_supplied = False
-            if self._generate_scripts:
-                raw_scripts = new_skill.get("scripts")
-                if isinstance(raw_scripts, list) and raw_scripts:
-                    scripts_supplied = True
-                    for s in raw_scripts:
-                        if not isinstance(s, dict):
-                            continue
-                        fn = _redact(s.get("filename", "")).strip()
-                        body = _redact(s.get("content", ""))
-                        ok, _findings = validate_skill_script(fn, body)
-                        if ok:
-                            valid_scripts.append({"filename": fn, "content": body})
-                        else:
-                            logger.info(
-                                "Auto-skill script %r rejected by validator: %s",
-                                fn,
-                                "; ".join(_findings),
-                            )
-            if not (slug and description and procedure_md):
-                # Required fields missing (or stripped empty by redaction).
-                # Audit the rejection so operators can see that a create
-                # attempt happened but lacked the minimum inputs.
-                logger.info(
-                    "Auto-skill create skipped: empty slug/description/procedure "
-                    "after redaction (slug=%r)",
-                    slug,
-                )
-                sel().log_tool_invocation(
-                    session_key=key,
-                    tool_name="auto_skill_create",
-                    tool_kind="skills",
-                    outcome="rejected",
-                    metadata={
-                        "slug": slug or "(empty)",
-                        "reason": "empty_after_redaction",
-                    },
-                )
-            else:
-                verdict, target = self._dedupe_candidate(slug, description, triggers)
-                # ``_dedupe_candidate`` deliberately shows the judge already-PENDING
-                # candidates too (so repeat sessions don't queue duplicates), which
-                # means an UPDATE verdict can name a target that is not LIVE. Such a
-                # target cannot be updated — but the requirement is genuinely new
-                # relative to the live skill set, and consolidation advances its
-                # message offset regardless, so dropping it would lose the learning
-                # for good. Downgrade to a NEW candidate instead: it only overlaps
-                # another *proposal*, which the human reviews side by side anyway.
-                if verdict == VERDICT_UPDATE and target:
-                    try:
-                        _target_is_live = (
-                            self._skills_loader.read_auto_skill_body(target) is not None
-                        )
-                    except Exception:
-                        _target_is_live = False
-                    if not _target_is_live:
-                        logger.info(
-                            "Auto-skill UPDATE target '%s' is not live (pending candidate); "
-                            "staging '%s' as a new candidate instead of dropping it",
-                            target,
-                            slug,
-                        )
-                        verdict = VERDICT_NEW
-                if verdict == VERDICT_DUP:
-                    logger.info(
-                        "Auto-skill synthesis skipped: '%s' overlaps existing skill '%s'",
-                        slug,
-                        target,
-                    )
-                    sel().log_tool_invocation(
-                        session_key=key,
-                        tool_name="auto_skill_create",
-                        tool_kind="skills",
-                        outcome="rejected",
-                        metadata={
-                            "slug": slug,
-                            "reason": "similar_exists",
-                            "existing": target,
-                        },
-                    )
-                elif verdict == VERDICT_UPDATE and target:
-                    # Same skill, new requirements worth folding in — stage a
-                    # pending UPDATE candidate rather than dropping the learning.
-                    self._stage_skill_update(
-                        key=key,
-                        target_key=target,
-                        description=description,
-                        triggers=triggers,
-                        procedure_md=procedure_md,
-                        scripts=valid_scripts or None,
-                    )
-                else:
-                    provenance = AutoSkillProvenance(
-                        session_key=key,
-                        created_at=AutoSkillProvenance.now_iso(),
-                    )
-                    if self._approval_required or valid_scripts or scripts_supplied:
-                        # Stage for human review — nothing goes live unattended,
-                        # and any candidate that SUPPLIED scripts ALWAYS stages
-                        # (even if every script was rejected by the validator, so
-                        # a script-bearing candidate can never auto-publish as a
-                        # prose-only skill).
-                        name = self._skills_loader.stage_skill_candidate(
-                            slug,
-                            description=description,
-                            triggers=triggers,
-                            procedure_md=procedure_md,
-                            provenance=provenance,
-                            scripts=valid_scripts or None,
-                        )
-                        if name:
-                            logger.info("Staged skill candidate %s from session %s", name, key)
-                            sel().log_tool_invocation(
-                                session_key=key,
-                                tool_name="auto_skill_create",
-                                tool_kind="skills",
-                                outcome="staged",
-                                metadata={"name": name, "scripts": len(valid_scripts)},
-                            )
-                        else:
-                            logger.info("Skill staging rejected for slug '%s'", slug)
-                            sel().log_tool_invocation(
-                                session_key=key,
-                                tool_name="auto_skill_create",
-                                tool_kind="skills",
-                                outcome="rejected",
-                                metadata={"slug": slug, "reason": "creation_failed"},
-                            )
-                    else:
-                        name = self._skills_loader.create_auto_skill(
-                            slug,
-                            description=description,
-                            triggers=triggers,
-                            procedure_md=procedure_md,
-                            provenance=provenance,
-                        )
-                        if name:
-                            logger.info("Auto-created skill %s from session %s", name, key)
-                            sel().log_tool_invocation(
-                                session_key=key,
-                                tool_name="auto_skill_create",
-                                tool_kind="skills",
-                                outcome="invoked",
-                                metadata={"name": name},
-                            )
-                            # Bound the live auto-skill set after a live create
-                            # (auto-approve path). Best-effort; never break
-                            # consolidation on a lifecycle hiccup.
-                            try:
-                                self._skills_loader.run_skill_lifecycle(
-                                    max_auto_skills=self._max_auto_skills,
-                                    stale_after_days=self._stale_after_days,
-                                    archive_after_days=self._archive_after_days,
-                                )
-                            except Exception:  # pragma: no cover - defensive
-                                logger.debug("Skill lifecycle pass failed", exc_info=True)
-                        else:
-                            # create_auto_skill returned None: invalid slug,
-                            # oversized procedure, or directory already exists.
-                            # Audit the rejection so operators can see why.
-                            logger.info(
-                                "Auto-skill creation rejected for slug '%s' (creation_failed)",
-                                slug,
-                            )
-                            sel().log_tool_invocation(
-                                session_key=key,
-                                tool_name="auto_skill_create",
-                                tool_kind="skills",
-                                outcome="rejected",
-                                metadata={
-                                    "slug": slug,
-                                    "reason": "creation_failed",
-                                },
-                            )
-        else:
-            # Eligible session ran the skill-gen prompt, but the model returned
-            # no new-skill candidate. Emit a lightweight audit trail so
-            # operators can distinguish "asked, model declined" from "never
-            # asked" — previously this branch left no SEL event or log line,
-            # making it impossible to tell from the audit log whether skill
-            # generation was ever attempted during a consolidation.
-            logger.info(
-                "Auto-skill: model proposed no skill candidate for session %s",
-                key,
-            )
-            sel().log_tool_invocation(
-                session_key=key,
-                tool_name="auto_skill_create",
-                tool_kind="skills",
-                outcome="skipped",
-                metadata={"reason": "no_candidate_proposed"},
-            )
-
-        # Refine path (only if explicitly enabled)
-        if not self._auto_refine_enabled:
-            return
-        refined = result.get("refined_skill")
-        if isinstance(refined, dict):
-            name = str(refined.get("name", "")).strip()
-            if not self._skills_loader.is_auto_generated(name):
-                logger.info("Auto-skill refine rejected for %s: not in auto namespace", name)
-                sel().log_tool_invocation(
-                    session_key=key,
-                    tool_name="auto_skill_refine",
-                    tool_kind="skills",
-                    outcome="rejected",
-                    metadata={"name": name, "reason": "not_auto_namespace"},
-                )
-                return
-            description = _redact(refined.get("description", ""))
-            triggers = _redact(refined.get("triggers", ""))
-            procedure_md = _redact(refined.get("procedure_md", ""))
-            if not description or not procedure_md:
-                logger.info(
-                    "Auto-skill refine skipped for %s: empty description/procedure "
-                    "after redaction",
-                    name,
-                )
-                sel().log_tool_invocation(
-                    session_key=key,
-                    tool_name="auto_skill_refine",
-                    tool_kind="skills",
-                    outcome="rejected",
-                    metadata={"name": name, "reason": "empty_after_redaction"},
-                )
-                return
-            provenance = AutoSkillProvenance(
-                session_key=key,
-                created_at=AutoSkillProvenance.now_iso(),
-                refined_at=AutoSkillProvenance.now_iso(),
-            )
-            ok = self._skills_loader.update_auto_skill(
-                name,
-                description=description,
-                triggers=triggers,
-                procedure_md=procedure_md,
-                provenance=provenance,
-            )
-            if ok:
-                logger.info("Auto-refined skill %s from session %s", name, key)
-                sel().log_tool_invocation(
-                    session_key=key,
-                    tool_name="auto_skill_refine",
-                    tool_kind="skills",
-                    outcome="invoked",
-                    metadata={"name": name},
-                )
-            else:
-                # update_auto_skill returned False: oversized procedure,
-                # file missing, or other internal rejection.  Audit it so
-                # operators can trace why a refine was proposed but not
-                # applied.
-                logger.info("Auto-skill refine rejected for %s (update_failed)", name)
-                sel().log_tool_invocation(
-                    session_key=key,
-                    tool_name="auto_skill_refine",
-                    tool_kind="skills",
-                    outcome="rejected",
-                    metadata={"name": name, "reason": "update_failed"},
-                )
-
-    async def _call_llm(self, prompt: str) -> dict | None:
-        """Call LLM for consolidation via the persistent background session.
-
-        Uses the shared background kiro-cli process (no spawn/teardown cost).
-        Returns the parsed JSON dict, or ``None`` when the turn reached the
-        provider but produced nothing usable (a failed or unparsable answer).
-
-        Raises :class:`_ConsolidationNotDispatched` when the prompt never reached
-        the provider at all — no session manager, or the background session could
-        not be acquired because kiro-cli is missing, not logged in, or failing to
-        start. That case is signalled separately rather than folded into ``None``
-        because the two cost different things: a spent turn costs money and must
-        consume the caller's retry budget, while a prompt that was never sent costs
-        nothing and must not, or a broken host would abandon spans it never read.
-        An exception (rather than a flag beside the result) is used so a caller
-        cannot silently drop the distinction.
-
-        Once ``stream_and_collect_json`` is entered the prompt counts as sent: a
-        failure inside it may still have been billed, so it returns ``None`` and is
-        charged rather than risk an unbounded retry loop over real spend.
-        """
-        if not self._sessions:
-            logger.warning("LLM consolidation skipped — no session manager")
-            raise _ConsolidationNotDispatched("no session manager")
-
-        session_key = BACKGROUND_KEY
-        # Timing instrumentation (_bg stall investigation): measure both the
-        # wait to acquire the shared `_bg` session (queue contention behind
-        # other `_bg` consumers like chat_nav link-preview) and the LLM turn
-        # itself. No behavior change. Logged at DEBUG: silent in normal
-        # operation, surfaced only when log_level is raised to investigate a
-        # consolidation stall.
-        t_start = _time.monotonic()
-        try:
-            try:
-                client, _is_new, _resumed = await self._sessions.get_or_create(
-                    session_key, agent="kirocrew-lite"
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Consolidation could not acquire the background session "
-                    "after %.1fs — nothing was sent",
-                    _time.monotonic() - t_start,
-                    exc_info=True,
-                )
-                raise _ConsolidationNotDispatched(
-                    "background session unavailable"
-                ) from exc
-            t_acquired = _time.monotonic()
-            wait_s = t_acquired - t_start
-            # Reject all tools: this is a text/JSON-only generation turn. kiro
-            # scopes the kirocrew-lite session to tools:[] via set_mode, but the
-            # Claude Code backend skips set_mode and injects the full
-            # kirocrew-core/cron toolset — without REJECT_ALL a background
-            # consolidation turn could fire side-effecting tools (send_message,
-            # learn_add, spawn_run). REJECT_ALL keeps both providers tool-free.
-            try:
-                result = await stream_and_collect_json(
-                    client, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL
-                )
-            except Exception:
-                logger.warning(
-                    "LLM consolidation turn failed after %.1fs",
-                    _time.monotonic() - t_start,
-                    exc_info=True,
-                )
-                return None
-            turn_s = _time.monotonic() - t_acquired
-            logger.debug(
-                "Consolidation LLM turn: wait=%.1fs turn=%.1fs total=%.1fs ok=%s",
-                wait_s,
-                turn_s,
-                _time.monotonic() - t_start,
-                result is not None,
-            )
-            return result
-        finally:
-            self._sessions.release(session_key)
-            await self._sessions.recycle_background()
+    def _maybe_rotate(self, path: Path, key: str) -> None:
+        self._rewrite_coordinator._maybe_rotate(path, key)

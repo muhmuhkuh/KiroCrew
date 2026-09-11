@@ -18,6 +18,7 @@ from kiro_crew import model_registry
 from kiro_crew.dashboard.handlers.agents import (
     _advertised_cc_models,
     _cc_models,
+    _normalize_model_key,
 )
 
 # Canonical registry rows now lead the dropdown (replaces _CC_CURATED_MODELS).
@@ -37,12 +38,24 @@ def _request_with_providers(providers: dict) -> MagicMock:
     return req
 
 
-class _FakeProvider:
-    def __init__(self, models):
-        self._models = models
+def _FakeProvider(models, *, backend=None):
+    """A provider double carrying a REAL capability record, not an identity flag.
 
-    def available_models(self):
-        return self._models
+    ``_advertised_cc_models`` selects a session by
+    ``SessionCapabilities.resolves_model_from_advertised_list``, and
+    ``capabilities_of`` requires a genuine record: a ``MagicMock(spec=...)``'s
+    attributes are all truthy, so an attribute-shaped assertion would let this
+    double claim every capability at once. Setting the real record is what makes
+    the double describe a backend that exists.
+    """
+    from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+    from kiro_crew.agent_sdk.capabilities import capabilities_for
+    from kiro_crew.providers.acp import AcpProvider
+
+    provider = MagicMock(spec=AcpProvider)
+    provider.capabilities = capabilities_for(ACP_BACKEND_CLAUDE if backend is None else backend)
+    provider.available_models.return_value = models
+    return provider
 
 
 class TestAdvertisedCcModels:
@@ -62,9 +75,8 @@ class TestAdvertisedCcModels:
             }
         ]
 
-    def test_known_provider_id_mapped_to_canonical_key(self):
-        # A backend provider id that IS in the registry maps back to its
-        # canonical key so it dedups against the registry rows.
+    def test_known_provider_id_kept_verbatim(self):
+        # The advertised id is the value set_config_option accepts.
         prov = _FakeProvider(
             [
                 {
@@ -75,13 +87,23 @@ class TestAdvertisedCcModels:
             ]
         )
         out = _advertised_cc_models(_request_with_providers({"s": prov}))
-        assert out[0]["model_name"] == "opus-4.8-1m"
+        assert out[0]["model_name"] == "global.anthropic.claude-opus-4-8[1m]"
 
     def test_empty_when_no_active_sessions(self):
         assert _advertised_cc_models(_request_with_providers({})) == []
 
     def test_skips_provider_without_accessor(self):
-        out = _advertised_cc_models(_request_with_providers({"s": object()}))
+        prov = _FakeProvider([])
+        prov.available_models = None
+        out = _advertised_cc_models(_request_with_providers({"s": prov}))
+        assert out == []
+
+    def test_skips_non_claude_providers(self):
+        prov = _FakeProvider(
+            [{"modelId": "claude-opus-5", "name": "Opus 5", "description": ""}],
+            backend="",
+        )
+        out = _advertised_cc_models(_request_with_providers({"s": prov}))
         assert out == []
 
 
@@ -113,18 +135,19 @@ class TestCcModelsMerge:
         out = _cc_models(_request_with_providers({"s": prov}))
         names = [m["model_name"] for m in out]
         assert names[0] == "auto"
-        assert "sonnet-4.6-1m" in names
+        assert "global.anthropic.claude-sonnet-4-6[1m]" in names
         # The flagship is in the registry but was NOT advertised → filtered out.
         assert "opus-4.8-1m" not in names
         assert "opus-4.8" not in names
 
     def test_registry_display_name_wins_for_survivors(self):
-        """Filtering keeps the registry's cleaner display name, not the adapter's."""
+        """Filtering keeps the registry's cleaner display name, not the adapter's,
+        while the row's wire value stays the advertised id the backend accepts."""
         prov = _FakeProvider(
             [{"modelId": "global.anthropic.claude-sonnet-4-6[1m]", "name": "sonnet-4-6-v1-ugly"}]
         )
         out = _cc_models(_request_with_providers({"s": prov}))
-        row = next(m for m in out if m["model_name"] == "sonnet-4.6-1m")
+        row = next(m for m in out if m["model_name"] == "global.anthropic.claude-sonnet-4-6[1m]")
         assert row["display_name"] == "Sonnet 4.6 (1M context)"
 
     def test_unknown_advertised_models_still_pass_through(self):
@@ -169,8 +192,8 @@ class TestCcModelsMerge:
         assert names[0] == "auto"  # still after nothing, before everything else
 
     def test_no_duplicate_when_adapter_lists_known_model(self):
-        # The adapter advertises provider ids that ARE in the registry; mapped
-        # back to canonical keys they collapse to one row each (registry wins).
+        # The adapter advertises provider ids that ARE in the registry; each
+        # collapses to one row carrying the advertised wire id (registry display).
         prov = _FakeProvider(
             [
                 {
@@ -187,12 +210,12 @@ class TestCcModelsMerge:
         )
         out = _cc_models(_request_with_providers({"s": prov}))
         names = [m["model_name"] for m in out]
-        assert names.count("opus-4.8-1m") == 1
-        assert names.count("sonnet-4.6-1m") == 1
+        assert names.count("global.anthropic.claude-opus-4-8[1m]") == 1
+        assert names.count("global.anthropic.claude-sonnet-4-6[1m]") == 1
 
     def test_registry_row_keeps_friendly_display_name(self):
-        # When the adapter advertises a known id, the registry row (friendly
-        # display name) wins over the backend's terser name.
+        # When the adapter advertises a known id, the registry's friendly display
+        # name wins while the wire value stays the advertised id.
         prov = _FakeProvider(
             [
                 {
@@ -203,7 +226,7 @@ class TestCcModelsMerge:
             ]
         )
         out = _cc_models(_request_with_providers({"s": prov}))
-        opus48 = next(m for m in out if m["model_name"] == "opus-4.8-1m")
+        opus48 = next(m for m in out if m["model_name"] == "global.anthropic.claude-opus-4-8[1m]")
         assert opus48["display_name"] == "Opus 4.8 (1M context)"
 
     def test_configured_default_force_included(self):
@@ -229,3 +252,63 @@ class TestCcModelsMerge:
         assert all(m["model_name"] for m in out)
         # the canonical "auto" row is still present, exactly once.
         assert names.count("auto") == 1
+
+
+class TestNormalizeModelKey:
+    """`_normalize_model_key` routes through the canonical registry (#5339).
+
+    Mirror of the frontend `normalizeModelKey` unit tests in
+    `website/src/test/model.displayModel.test.ts` -- the two must agree, which is
+    the whole point of folding through the shared `model_registry.json`.
+    """
+
+    def test_auto_default_and_unset(self):
+        # auto/default fold to the sentinel; an unset id stays "" (distinct).
+        assert _normalize_model_key(" auto ") == "auto"
+        assert _normalize_model_key("default") == "auto"
+        assert _normalize_model_key("DEFAULT") == "auto"
+        assert _normalize_model_key("") == ""
+        assert _normalize_model_key("   ") == ""
+
+    def test_alias_key_and_provider_id_fold_to_one_key(self):
+        # An alias, the canonical key, and the claude_code provider id (with or
+        # without a routing prefix) all resolve to one canonical key, any case.
+        assert _normalize_model_key("claude-opus-4.8") == "opus-4.8-1m"
+        assert _normalize_model_key("Claude-Opus-4.8") == "opus-4.8-1m"
+        assert _normalize_model_key("opus-4.8-1m") == "opus-4.8-1m"
+        assert _normalize_model_key("opus") == "opus-4.8-1m"
+        assert _normalize_model_key("global.anthropic.claude-opus-4-8[1m]") == "opus-4.8-1m"
+        # The "fold a provider/partition prefix" half of #5339: a regional
+        # profile id that is not itself a registry entry folds after the peel.
+        assert _normalize_model_key("us.anthropic.claude-opus-4-8[1m]") == "opus-4.8-1m"
+
+    def test_distinct_context_window_variants_stay_apart(self):
+        # The old dot->dash fold made both of these `claude-opus-4-8`, equating a
+        # 200K model with a 1M one. The registry lists them as separate entries.
+        assert _normalize_model_key("claude-opus-4-8") == "opus-4.8"  # 200K
+        assert _normalize_model_key("claude-opus-4.8") == "opus-4.8-1m"  # 1M
+        assert _normalize_model_key("claude-opus-4-8") != _normalize_model_key("claude-opus-4.8")
+
+    def test_kiro_distinct_models_stay_apart_via_acp_first_fold(self):
+        # The claude_code index aliases these onto Sonnet/Opus 4.8 for dropdown
+        # dedup, but kiro serves them as DISTINCT real models. Resolving the acp
+        # index first (canonical_key's documented order) keeps them apart, so the
+        # shared fold cannot equate a Haiku pin with Sonnet 4.6 (a real 1M->200K
+        # swap the downgrade flag must catch).
+        assert _normalize_model_key("claude-haiku-4.5") == "haiku-4.5"
+        assert _normalize_model_key("claude-sonnet-4.5") == "sonnet-4.5"
+        assert _normalize_model_key("claude-sonnet-4") == "sonnet-4"
+        assert _normalize_model_key("claude-opus-4.6") == "opus-4.6-1m"
+        assert _normalize_model_key("claude-sonnet-4.6") == "sonnet-4.6-1m"
+        assert _normalize_model_key("claude-haiku-4.5") != _normalize_model_key("claude-sonnet-4.6")
+        assert _normalize_model_key("claude-opus-4.6") != _normalize_model_key("claude-opus-4.8")
+        # acp-only canonical keys resolve to themselves.
+        assert _normalize_model_key("haiku-4.5") == "haiku-4.5"
+        assert _normalize_model_key("opus-4.6-1m") == "opus-4.6-1m"
+
+    def test_unregistered_id_uses_the_string_fold(self):
+        # GPT/DeepSeek/Qwen and future models are absent from the (Anthropic-only)
+        # registry, so they keep the historical trim/lowercase/dot->dash fold.
+        assert _normalize_model_key("GPT-5.6") == "gpt-5-6"
+        assert _normalize_model_key("deepseek-3.2") == "deepseek-3-2"
+        assert _normalize_model_key("claude-opus-5") == "claude-opus-5"

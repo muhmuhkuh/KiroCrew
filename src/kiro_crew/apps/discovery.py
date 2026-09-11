@@ -6,7 +6,6 @@ Discovers builtins by scanning the filesystem: each subdirectory of
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -60,6 +59,13 @@ def _manifest_to_builtin_dict(manifest: AppManifest) -> dict[str, Any]:
         d["agents"] = list(manifest.agents)
     if manifest.skills:
         d["skills"] = list(manifest.skills)
+
+    # Same reason as agents/skills above: a typed field missing here is stripped from
+    # the persisted app.json, so a builtin's contributed commands would vanish from
+    # the launcher while an external app's survived.
+    contrib_d = manifest.contributes.to_dict()
+    if contrib_d:
+        d["contributes"] = contrib_d
 
     if manifest.mcpServers:
         d["mcpServers"] = manifest.mcpServers
@@ -152,7 +158,7 @@ def discover_builtin_apps(builtins_dir: Path | None = None) -> list[dict[str, An
                 continue
             apps.append(_manifest_to_builtin_dict(manifest))
             logger.debug("Discovered builtin app: %s v%s", manifest.name, manifest.version)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except ValueError as exc:
             logger.warning("Failed to parse builtin manifest %s: %s", manifest_path, exc)
         except Exception:
             logger.warning(

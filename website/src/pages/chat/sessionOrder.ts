@@ -1,5 +1,6 @@
 import { i18nT } from '../../i18n/t'
 import { compareText, fmtDateFields } from '../../i18n/format'
+import { safeGetItem } from '../../utils/safeStorage'
 
 /**
  * Session ordering + timestamp formatting, shared by the session sidebar and
@@ -10,6 +11,16 @@ import { compareText, fmtDateFields } from '../../i18n/format'
  * flyout would keep claiming "recent" while ranking by something else — so
  * there is one definition and both surfaces import it.
  */
+
+export const SESSION_SORT_STORAGE_KEY = 'mc-session-sort'
+const SORT_KEYS = new Set<SortKey>([
+  'date-desc', 'date-asc', 'created-desc', 'created-asc', 'name-asc', 'name-desc',
+])
+
+export function readSessionSortKey(): SortKey {
+  const stored = safeGetItem(SESSION_SORT_STORAGE_KEY)
+  return stored && SORT_KEYS.has(stored as SortKey) ? stored as SortKey : 'date-desc'
+}
 
 export type SortKey = 'date-desc' | 'date-asc' | 'created-desc' | 'created-asc' | 'name-asc' | 'name-desc'
 
@@ -37,6 +48,14 @@ export function slotActivityTs(
   return slot.last_turn_ts || slot.last_ts || slot.created
 }
 
+/** ISO-string -> epoch-seconds parse cache. A sidebar sort runs the comparator
+ *  O(n log n) times per slots mutation and the same few hundred ISO strings
+ *  recur across every run, so `new Date(iso)` per comparison is pure re-parse
+ *  cost on a hot path. Bounded: cleared wholesale at a size no realistic
+ *  session count reaches, so a long-lived tab cannot grow it without limit. */
+const _epochCache = new Map<string, number>()
+const _EPOCH_CACHE_MAX = 10000
+
 /** Last-activity instant in epoch SECONDS, with the fallback ladder both
  *  surfaces rely on. Returns 0 for a session with no usable timestamp, which
  *  sorts it last under `date-desc`. */
@@ -44,11 +63,16 @@ export function lastActivityEpoch(item: Sortable): number {
   if (item.modified != null) return item.modified
   const iso = slotActivityTs(item)
   if (!iso) return 0
+  const hit = _epochCache.get(iso)
+  if (hit !== undefined) return hit
   const ms = new Date(iso).getTime()
   // An unparseable timestamp ranks as "no timestamp" rather than poisoning the
   // comparator: NaN makes every comparison false, which leaves the whole list in
   // an arbitrary order rather than just misplacing the one broken row.
-  return Number.isNaN(ms) ? 0 : ms / 1000
+  const epoch = Number.isNaN(ms) ? 0 : ms / 1000
+  if (_epochCache.size >= _EPOCH_CACHE_MAX) _epochCache.clear()
+  _epochCache.set(iso, epoch)
+  return epoch
 }
 
 /** Shared comparator for both active sessions and history items. */
@@ -89,43 +113,45 @@ export function comparePinnedThenSort(
   b: Sortable,
   key: SortKey,
   pinned: ReadonlySet<string>,
+  pinnedRank?: ReadonlyMap<string, number>,
 ): number {
-  const pa = pinned.has(a.key) ? 0 : 1
-  const pb = pinned.has(b.key) ? 0 : 1
-  if (pa !== pb) return pa - pb
+  const aPinned = pinned.has(a.key)
+  const bPinned = pinned.has(b.key)
+  if (aPinned !== bPinned) return aPinned ? -1 : 1
+  if (aPinned && bPinned && pinnedRank) {
+    const rankDiff = (pinnedRank.get(a.key) ?? Number.MAX_SAFE_INTEGER)
+      - (pinnedRank.get(b.key) ?? Number.MAX_SAFE_INTEGER)
+    if (rankDiff !== 0) return rankDiff
+  }
   return compareBySort(a, b, key)
 }
 
 /**
- * The local-midnight instants `fmtRelativeTime` classifies against, in epoch ms.
+ * How many local calendar days back an instant falls, seen from `now`.
  *
- * Every visible session row compares against the same boundaries, so they are
- * built once per day rather than once per call. `dayEnd` is the next local
- * midnight, which is when they stop being true.
+ * `Date.UTC` projects the LOCAL calendar fields onto fixed-length UTC days, so
+ * the result counts civil days rather than elapsed time. That is what makes it
+ * survive DST: a local day is not always 86_400_000 ms long, but its
+ * (year, month, date) triple is unambiguous, and both sides are projected the
+ * same way. Negative for a future instant, which the caller folds into today.
  *
- * The lower bound matters as much as the upper one: a clock that moves BACKWARDS
- * is also outside the cached day, and must not be served boundaries from a day
- * that has not happened yet.
+ * Deliberately stateless. An earlier revision of this file cached the
+ * local-midnight instants and kept them honest with a growing set of validity
+ * terms: the clock leaving the cached day in either direction, the zone
+ * changing under it, and then the offset at each cached midnight moving
+ * independently of the others. Each boundary added to such a cache needs its
+ * own offset probe or it silently serves a label from a day that no longer
+ * begins where it did. Deriving the day index per call retires that whole class
+ * -- nothing is retained, so nothing can outlive the zone it was built in --
+ * and measures cheaper than the guarded cache it replaces, because comparing
+ * two day indices allocates no `Date` where re-probing three midnights did.
+ * It is the shape the command palette's own relative-time formatter already uses.
  */
-let dayStart = 0
-let yesterdayStart = 0
-let sixDaysAgoStart = 0
-let dayEnd = 0
-let dayYear = 0
-
-function ensureDayBoundaries(nowMs: number): void {
-  if (nowMs >= dayStart && nowMs < dayEnd) return
-  const now = new Date(nowMs)
-  const y = now.getFullYear()
-  const m = now.getMonth()
-  const day = now.getDate()
-  // Day arithmetic goes through the Date constructor rather than ms subtraction
-  // because it has to survive DST: a local day is not always 86_400_000 ms long.
-  dayStart = new Date(y, m, day).getTime()
-  yesterdayStart = new Date(y, m, day - 1).getTime()
-  sixDaysAgoStart = new Date(y, m, day - 6).getTime()
-  dayEnd = new Date(y, m, day + 1).getTime()
-  dayYear = y
+function localDaysAgo(now: Date, then: Date): number {
+  const DAY_MS = 86_400_000
+  const nowDay = Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / DAY_MS)
+  const thenDay = Math.floor(Date.UTC(then.getFullYear(), then.getMonth(), then.getDate()) / DAY_MS)
+  return nowDay - thenDay
 }
 
 /** Relative timestamp for a session row.
@@ -133,19 +159,19 @@ function ensureDayBoundaries(nowMs: number): void {
 export function fmtRelativeTime(ts: string | number | undefined): string {
   if (ts == null) return ''
   const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts)
-  const at = d.getTime()
-  if (isNaN(at)) return ''
-  ensureDayBoundaries(Date.now())
+  if (isNaN(d.getTime())) return ''
+  const now = new Date()
+  const daysAgo = localDaysAgo(now, d)
   // Every branch read the BROWSER's locale before this, so a zh dashboard on an
   // en-US browser showed "3:04 PM" and "Jul 30". This is the twin of
   // `commandPalette/providers/recentsProvider.ts`; the two are now consistent.
   const time = fmtDateFields(d, { hour: '2-digit', minute: '2-digit' })
-  if (at >= dayStart) return time
+  if (daysAgo <= 0) return time
   // The existing catalog key, NOT `fmtRelative`: CLDR returns a lowercase
   // "yesterday", which clashed with the capitalized group header in ChatSidebar
   // that already uses this same key. One key, one casing.
-  if (at >= yesterdayStart) return `${i18nT('pages.chatSidebar.yesterday')} ${time}`
-  if (at >= sixDaysAgoStart) return `${fmtDateFields(d, { weekday: 'short' })} ${time}`
-  if (d.getFullYear() === dayYear) return fmtDateFields(d, { month: 'short', day: 'numeric' })
+  if (daysAgo === 1) return `${i18nT('pages.chatSidebar.yesterday')} ${time}`
+  if (daysAgo <= 6) return `${fmtDateFields(d, { weekday: 'short' })} ${time}`
+  if (d.getFullYear() === now.getFullYear()) return fmtDateFields(d, { month: 'short', day: 'numeric' })
   return fmtDateFields(d, { year: 'numeric', month: 'short', day: 'numeric' })
 }

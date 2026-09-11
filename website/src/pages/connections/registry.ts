@@ -6,9 +6,15 @@ export interface ConnectionProvider {
   slug: string
   tier: 1 | 2 | 3
   mcp_url: string
-  recommended_scopes: string[]
   revoke_page_url: string
   docs_url: string
+  /**
+   * Short, imperative, BLOCKING provider-side requirement — the only string a
+   * card renders as a pre-connect warning, and only when present. Long
+   * reference notes live in `gotcha_copy`, which cards deliberately do not
+   * render: a warning on every card is a warning on none.
+   */
+  prerequisite_copy?: string
   gotcha_copy: string
   smoke_fixture: {
     tool: string
@@ -16,6 +22,9 @@ export interface ConnectionProvider {
   }
   launch_gate_passed: boolean
   vendor_approval_pending: boolean
+  /** Gallery bucket from the backend's closed `PROVIDER_CATEGORIES` vocabulary;
+   *  catalog metadata only, nothing renders or gates on it yet. */
+  category?: string
 }
 
 const registry = registryJson as ConnectionProvider[]

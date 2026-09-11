@@ -16,12 +16,21 @@ import kiro_crew.embeddings as embeddings_mod
 from kiro_crew.embeddings import ReembedProgress, reembed_progress, validate_custom_model_path
 from kiro_crew.vector_memory import VectorMemoryStore
 
-_MODEL_BYTES = b"g" * 1_100_000
+# Wider than the production floor so the file is not read as a truncated
+# placeholder.
+_MODEL_SIZE = embeddings_mod._GGUF_MIN_BYTES + 100_000
 
 
 def _write_model(path: Path) -> Path:
+    """Write a stand-in model file of _MODEL_SIZE bytes.
+
+    Sparse rather than a bytes literal: nothing here reads the content, only
+    ``stat().st_size``, and a literal this size would be allocated while the
+    module is IMPORTED -- charging every xdist worker for it at collection.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_MODEL_BYTES)
+    with path.open("wb") as fh:
+        fh.truncate(_MODEL_SIZE)
     return path
 
 
@@ -399,17 +408,30 @@ class TestNonObjectJsonBody:
             mem.api_memory_embedding_model(self._request(payload))
         )
         assert resp.status == 400, f"{payload!r} must be a 400, not a crash"
-        assert b"invalid_json" in resp.body
+        # The shared guard separates "unparseable" from "parsed, wrong shape";
+        # this handler used to answer invalid_json for both.
+        assert b"body_not_object" in resp.body
 
-    def test_the_guard_is_an_isinstance_check_on_dict(self) -> None:
-        """Guard against a refactor that only special-cases lists."""
+    def test_the_guard_runs_before_the_first_field_read(self) -> None:
+        """Guard against a refactor that only special-cases lists.
+
+        The check itself lives in ``_shared.read_bounded_json`` now (issue
+        #5587), so this pins the two properties that made the inline version
+        correct: the handler consults the guard BEFORE its first ``.get()``,
+        and the guard is a general ``isinstance(body, dict)`` test rather than a
+        list-only special case. The parametrized cases above prove the
+        generality behaviorally; this catches a refactor that reorders or drops
+        the call while the parametrized cases still pass for another reason.
+        """
         import inspect
 
+        from kiro_crew.dashboard.handlers._shared import read_bounded_json
         from kiro_crew.dashboard.handlers.memory import api_memory_embedding_model
 
         src = inspect.getsource(api_memory_embedding_model)
-        assert "isinstance(body, dict)" in src
-        assert src.index("isinstance(body, dict)") < src.index('body.get("path"')
+        assert "read_bounded_json(" in src
+        assert src.index("read_bounded_json(") < src.index('body.get("path"')
+        assert "isinstance(body, dict)" in inspect.getsource(read_bounded_json)
 
 
 class TestApplyIsAudited:
@@ -1141,12 +1163,28 @@ def _store(tmp_path: Path, dim: int = 8) -> VectorMemoryStore:
     return s
 
 
+def _basis_embed(dim: int = 8):
+    """One stable vector per text, orthogonal across texts.
+
+    A text-independent constant makes every write after the first score as a
+    duplicate against the indexed vector, so a loop seeding N memories leaves
+    one row behind and the progress denominator below reads 1 instead of N.
+    """
+    slots: dict[str, int] = {}
+
+    def embed(text: str) -> list[float]:
+        slot = slots.setdefault(text, len(slots) % dim)
+        return [1.0 if i == slot else 0.0 for i in range(dim)]
+
+    return embed
+
+
 class TestBackfillProgressReporting:
     """Without a denominator the indicator can only spin."""
 
     def test_reports_total_up_front(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        store.embed_fn = lambda t: [0.5] * 8
+        store.embed_fn = _basis_embed()
         for i in range(3):
             store.write_episodic(f"memory number {i} long enough to be stored here")
         store.db.execute("UPDATE episodic_memories SET embedding = NULL")
@@ -1161,7 +1199,7 @@ class TestBackfillProgressReporting:
 
     def test_progress_is_monotonic(self, tmp_path: Path) -> None:
         store = _store(tmp_path)
-        store.embed_fn = lambda t: [0.5] * 8
+        store.embed_fn = _basis_embed()
         for i in range(4):
             store.write_episodic(f"memory number {i} long enough to be stored here")
         store.db.execute("UPDATE episodic_memories SET embedding = NULL")

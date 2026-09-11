@@ -82,6 +82,7 @@ def _no_session_key(monkeypatch: pytest.MonkeyPatch) -> None:
     care whether it returns something header-safe, so freeze it.
     """
     monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat-1")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
     monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "s3cr3t")
 
 
@@ -210,7 +211,9 @@ class TestVerbHelpers:
     ):
         fn = getattr(mcp_core, verb)
         monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:chat—1")
-        with patch("kiro_crew.mcp_core.loopback_urlopen", side_effect=AssertionError("must not be called")):
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", side_effect=AssertionError("must not be called")
+        ):
             out = fn("/api/thing")
         assert "invalid in HTTP headers" in out["error"]
 
@@ -229,14 +232,18 @@ class TestVerbHelperBodies:
             assert req.headers["Content-type"] == "application/json"
 
     def test_delete_without_body_sends_no_content_type(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})) as m:
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})
+        ) as m:
             mcp_core._delete("/api/thing")
         req = m.call_args[0][0]
         assert req.data is None
         assert "Content-type" not in req.headers
 
     def test_delete_with_body_sends_json(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})) as m:
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen", return_value=_FakeResponse({"ok": True})
+        ) as m:
             mcp_core._delete("/api/thing", {"rule": "x"})
         req = m.call_args[0][0]
         assert json.loads(req.data.decode()) == {"rule": "x"}
@@ -262,7 +269,10 @@ class TestPostTransportClassification:
         assert out == {"error": "read timeout", "transport_error": True}
 
     def test_http_error_is_not_flagged_transport_error(self):
-        with patch("kiro_crew.mcp_core.loopback_urlopen", side_effect=_http_error(400, b'{"error": "nope"}')):
+        with patch(
+            "kiro_crew.mcp_core.loopback_urlopen",
+            side_effect=_http_error(400, b'{"error": "nope"}'),
+        ):
             out = mcp_core._post("/api/spawn", {})
         assert out == {"error": "nope"}
 
@@ -411,9 +421,7 @@ class TestDoSelectCrew:
         assert [c["name"] for c in out["crews"]] == ["docs"]
         assert "high confidence" in out["guidance"]
 
-    def test_unknown_crew_returns_error_with_available_names(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_unknown_crew_returns_error_with_available_names(self, monkeypatch: pytest.MonkeyPatch):
         cfg = _crew_config({"main": SimpleNamespace(triggers="", model="auto")}, "main")
         self._patch_cfg(monkeypatch, cfg)
         out = json.loads(_do_select_crew("ghost"))
@@ -424,9 +432,7 @@ class TestDoSelectCrew:
         self._patch_cfg(monkeypatch, _crew_config({}, ""))
         assert json.loads(_do_select_crew("ghost"))["available"] == "(none)"
 
-    def test_named_crew_returns_resolved_bindings(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ):
+    def test_named_crew_returns_resolved_bindings(self, monkeypatch: pytest.MonkeyPatch, tmp_path):
         cfg = _crew_config({"docs": SimpleNamespace(triggers="d", model="opus")}, "main")
         self._patch_cfg(monkeypatch, cfg)
         monkeypatch.setattr(
@@ -445,9 +451,7 @@ class TestDoSelectCrew:
             "model": "opus",
         }
 
-    def test_select_crew_tool_routes_through_do_select_crew(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_select_crew_tool_routes_through_do_select_crew(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(mcp_core, "_do_select_crew", lambda crew: f"crew={crew!r}")
         assert _call_tool("select_crew", {"crew": "docs"}) == "crew='docs'"
 
@@ -661,6 +665,48 @@ class TestWorkflowAuthor:
 
 
 class TestWorkflowRun:
+    def test_refuses_to_start_without_strict_session_identity(self):
+        with (
+            patch.object(mcp_core, "_resolve_session_key_strict", return_value=""),
+            patch.object(mcp_core, "_post") as mocked,
+        ):
+            out = _call_tool("workflow_run", {"workflow": "debug-project"})
+
+        assert "cannot verify caller identity" in out
+        mocked.assert_not_called()
+
+    def test_ad_hoc_run_keeps_the_existing_identity_fallback(self):
+        with (
+            patch.object(mcp_core, "_resolve_session_key_strict", return_value=""),
+            patch.object(mcp_core, "_post", return_value={"run_id": "r-ad-hoc"}) as mocked,
+        ):
+            out = _call_tool("workflow_run", {"source": "ctx.agent('x')"})
+
+        mocked.assert_called_once_with(
+            "/api/workflows/run",
+            {"source": "ctx.agent('x')"},
+        )
+        assert "r-ad-hoc" in out
+
+    def test_saved_workflow_reference_runs_exact_definition(self):
+        response = {"run_id": "r-saved", "workflow_id": "wfd_1", "revision": 2}
+        with (
+            patch.object(
+                mcp_core, "_resolve_session_key_strict", return_value="dashboard:verified"
+            ),
+            patch.object(mcp_core, "_post", return_value=response) as mocked,
+        ):
+            out = _call_tool(
+                "workflow_run",
+                {"workflow": "debug-project", "input": "login failure", "args": {"depth": 2}},
+            )
+        assert mocked.call_args[0] == (
+            "/api/workflows/definitions/debug-project/run",
+            {"input": "login failure", "args": {"depth": 2}},
+        )
+        assert mocked.call_args.kwargs == {"session_key": "dashboard:verified"}
+        assert "r-saved" in out and "revision 2" in out
+
     def test_neither_source_nor_intent_is_rejected(self):
         out = _call_tool("workflow_run", {})
         assert out == "Error: provide either 'source' or 'intent'"
@@ -709,6 +755,19 @@ class TestWorkflowRun:
     def test_non_int_budget_total_is_rejected_by_the_schema(self):
         out = _call_tool("workflow_run", {"source": "ctx.agent('x')", "budget_total": "lots"})
         assert "budget_total" in out
+
+
+class TestWorkflowDefinitionLibrary:
+    def test_list_saved_definitions(self):
+        response = {
+            "definitions": [
+                {"id": "wfd_1", "slug": "debug-project", "revision": 2, "name": "Debug"}
+            ]
+        }
+        with patch.object(mcp_core, "_get", return_value=response) as mocked:
+            out = _call_tool("workflow_library_list", {"search": "debugging"})
+        assert mocked.call_args[0][0] == "/api/workflows/definitions?q=debugging"
+        assert "/workflow debug-project" in out
 
 
 class TestWorkflowStatusAndResult:
@@ -774,7 +833,12 @@ class TestWorkflowStatusAndResult:
         assert secret not in out
 
     def test_result_leaves_non_str_scalars_untouched(self):
-        snap = {"run_id": "r1", "status": "finished", "result": {"n": 3, "flag": True}, "events": []}
+        snap = {
+            "run_id": "r1",
+            "status": "finished",
+            "result": {"n": 3, "flag": True},
+            "events": [],
+        }
         with patch.object(mcp_core, "_get", return_value=snap):
             payload = json.loads(_call_tool("workflow_result", {"run_id": "r1"}))
         assert payload["result"] == {"n": 3, "flag": True}
@@ -948,6 +1012,44 @@ class TestRegisterHook:
         assert "hooks.json is corrupted" in out
         assert hook_file.read_text() == "{not json"
 
+    def test_acquiring_the_lock_does_not_truncate_the_lock_file(self):
+        """The lock-file open must be WRITABLE but MUST NOT truncate.
+
+        ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+        ``"r"``; but ``"w"`` truncates at open, and on Windows a truncating
+        open of a lock file whose first byte another holder already locked
+        raises a sharing violation instead of waiting — the contending acquirer
+        crashes before it reaches ``flock_exclusive`` and the serialisation the
+        lock exists to provide never happens. POSIX ``flock`` tolerates the
+        truncate, which is why the defect is invisible on Linux.
+
+        Issue #9248; same fix as ``work_ledger._open_lock`` (PR #9237) and
+        ``session_pid.py`` (PR #9250). ``hooks.json.lock`` is the SAME file
+        ``webhooks.locked`` guards from another module, so cross-process
+        contention on it is the store's normal state — which is why truncation
+        (the platform-independent observable those PRs pinned) is asserted
+        here: seed the lock file, register a hook, require the bytes survived.
+        """
+        seed = b"lock-file-content-that-must-survive"
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(seed)
+
+        out = _call_tool("register_hook", {"hook_id": "review-bot", "context_summary": "c"})
+
+        assert "Hook registered: review-bot" in out
+        assert lock_path.read_bytes() == seed
+
+    def test_registration_works_when_the_lock_file_is_absent(self):
+        """First registration must create the lock file rather than raise."""
+        lock_path = mcp_core.config_dir() / "hooks.json.lock"
+        assert not lock_path.exists()
+
+        out = _call_tool("register_hook", {"hook_id": "first-run", "context_summary": "c"})
+
+        assert "Hook registered: first-run" in out
+        assert lock_path.exists()
+
 
 class TestReadSlackProfile:
     def test_profile_values_are_redacted_but_id_is_preserved(self):
@@ -1072,7 +1174,13 @@ class TestFileSend:
         src = tmp_path / "creds.txt"
         src.write_text("AKIA" + "P" * 16)
         out = _call_tool("file_send", {"path": str(src)})
-        assert out == "Error: file content contains sensitive data; send aborted"
+        assert out.startswith("Error: file content contains sensitive data; send aborted")
+        # The refusal now names the remedy. A wall that does not say a consented
+        # path exists is the reported complaint behind issue #7770, so this
+        # asserts MORE than the previous exact-equality pin, not less -- and it
+        # asserts the never-grantable legs are named as such.
+        assert "/api/file-delivery/consent" in out
+        assert "can never be granted" in out
 
     def test_disallowed_binary_mime_is_refused(self, tmp_path):
         src = tmp_path / "payload.bin"
@@ -1118,8 +1226,115 @@ class TestFileSend:
             out = _call_tool("file_send", {"path": str(src)})
         assert out == "File sent: report.txt (Slack upload failed: not in channel)"
 
+    def test_channel_delivery_takes_precedence_over_slack(self, tmp_path, monkeypatch):
+        # A caller linked to a Telegram chat or Discord DM gets the file THERE;
+        # the Slack owner-DM leg is the fallback, not a second copy.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": True, "channel_type": "telegram"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (delivered to telegram)"
+        assert all(c[0][0] != "/api/slack/upload-file" for c in m.call_args_list)
+
+    def test_channel_skip_leaves_the_slack_leg_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": False, "skipped": "no_channel_destination"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        # The invariant this test owns: a channel SKIP does not disturb the
+        # Slack leg, which still runs as the fallback.
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+        # The skip is also REPORTED. It used to read a bare "File sent:
+        # report.txt", which is indistinguishable from a delivery for a file
+        # that only reached the dashboard (see test_file_send_skip_reason.py).
+        assert out.startswith("File sent: report.txt")
+        assert "no_channel_destination" in out
+
+    def test_channel_failure_warns_and_falls_back_to_slack(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"error": "telegram api 400"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (channel upload failed: telegram api 400)"
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+
+    def test_an_explicit_slack_channel_beats_native_delivery(self, tmp_path, monkeypatch):
+        # channel="C…" names a DESTINATION the caller chose; the native leg's
+        # session-link inference must not silently reroute the file to the
+        # linked Telegram chat instead of the named Slack channel.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **_kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                return {"ok": True, "delivered": True, "channel_type": "telegram"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src), "channel": "C0TRACKED123"})
+        assert all(
+            c[0][0] != "/api/channel/upload-file" for c in m.call_args_list
+        ), "native delivery must not run for an explicitly named channel"
+        assert any(c[0][0] == "/api/slack/upload-file" for c in m.call_args_list)
+        assert out == "File sent: report.txt"
+
+    def test_an_unidentified_caller_gets_no_native_delivery(self, tmp_path, monkeypatch):
+        # The lenient session resolver includes a /proc ancestor walk, under
+        # which an unidentified subagent resolves to its PARENT slot — and the
+        # file would deliver into the parent's conversation. No strict
+        # identity, no native delivery; the Slack leg keeps its own classifier.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+        with patch.object(mcp_core, "_post", return_value={"ok": True}) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt"
+        assert all(c[0][0] != "/api/channel/upload-file" for c in m.call_args_list)
+
+    def test_native_delivery_pins_the_strict_identity_on_the_wire(self, tmp_path, monkeypatch):
+        # The endpoint resolves the destination from the caller's session map
+        # entry, so the request must carry the VERIFIED key — not whatever the
+        # default resolution would re-derive server-side.
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-9")
+        src = tmp_path / "report.txt"
+        src.write_text("ok")
+
+        def _post(path: str, body: dict | None = None, **kw: object) -> dict:
+            if path == "/api/channel/upload-file":
+                assert kw.get("session_key") == "dashboard:chat-9"
+                return {"ok": True, "delivered": True, "channel_type": "discord"}
+            return {"ok": True}
+
+        with patch.object(mcp_core, "_post", side_effect=_post) as m:
+            out = _call_tool("file_send", {"path": str(src)})
+        assert out == "File sent: report.txt (delivered to discord)"
+        assert any(c[0][0] == "/api/channel/upload-file" for c in m.call_args_list)
+
 
 # ── argument validation seam ──────────────────────────────────────────────
+
 
 class TestValidateArgs:
     def test_schema_backed_tool_is_validated_and_cleaned(self):

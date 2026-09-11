@@ -3,7 +3,7 @@
 #
 # Standalone distribution targets:
 #   make wheel     — self-contained pip wheel (dashboard bundled)
-#   make backend-bin — frozen standalone backend binary (PyInstaller)
+#   make backend-bin — standalone backend tree (bundled interpreter, no system Python)
 #   make desktop   — double-clickable desktop app (universal DMG on macOS / AppImage on Linux)
 .PHONY: all build frontend backend test clean wheel backend-bin desktop
 
@@ -26,6 +26,12 @@ frontend:
 	# `cat` exits 1. With `&&` chaining that non-zero exit aborts the whole
 	# recipe line, so the target fails before npm is ever reached. An absent
 	# marker must degrade to "use whatever node is on PATH", not stop the build.
+	# website/electron is its own npm package (website/package.json declares no
+	# `workspaces`), so the website/ install in this recipe never reaches it --
+	# and `npm test` / `npm run check` in website/ then die with MODULE_NOT_FOUND
+	# on its missing deps. Install it in the same shell, so it reuses the
+	# node-bin-dir PATH handling, and AFTER `npm run build`, so the desktop-only
+	# dependency tree cannot block building the dashboard itself (#7226).
 	cd website && \
 	  NBD="$$(cat "$${KIROCREW_HOME:-$$HOME/.kiro/crew}/node-bin-dir" 2>/dev/null || true)"; \
 	  { [ -z "$$NBD" ] || export PATH="$$NBD:$$PATH"; }; \
@@ -34,7 +40,9 @@ frontend:
 	    exit 1; \
 	  fi; \
 	  if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi && \
-	  npm run build
+	  npm run build && \
+	  ( cd electron && \
+	    if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi )
 	rm -rf src/kiro_crew/static/dist
 	mkdir -p src/kiro_crew/static
 	cp -R website/dist src/kiro_crew/static/dist
@@ -44,13 +52,13 @@ backend:
 	# Same `|| true` reasoning as the frontend target: an absent marker file must
 	# fall back to $(PY), not abort the recipe.
 	PY="$$(cat "$${KIROCREW_HOME:-$$HOME/.kiro/crew}/python-bin" 2>/dev/null || true)"; [ -n "$$PY" ] || PY="$(PY)"; \
-	  if [ -x $(VENV)/bin/python ] && ! $(VENV)/bin/python -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)'; then \
-	    echo "  → recreating $(VENV) (existing interpreter < 3.10)"; rm -rf $(VENV); fi; \
-	  if ! "$$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then \
-	    echo "ERROR: '$$PY' is not Python >= 3.10 (package requires-python is >=3.10)." >&2; \
+	  if [ -x $(VENV)/bin/python ] && ! $(VENV)/bin/python -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)'; then \
+	    echo "  → recreating $(VENV) (existing interpreter < 3.12)"; rm -rf $(VENV); fi; \
+	  if ! "$$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3,12) else 1)' 2>/dev/null; then \
+	    echo "ERROR: '$$PY' is not Python >= 3.12 (package requires-python is >=3.12)." >&2; \
 	    echo "       Without this gate the venv is built from a too-old interpreter, the" >&2; \
 	    echo "       version guard above deletes it on every run, and the install either" >&2; \
-	    echo "       backtracks forever or crashes at import. Provision 3.10+ first:" >&2; \
+	    echo "       backtracks forever or crashes at import. Provision 3.12+ first:" >&2; \
 	    echo "         bash ensure-python.sh   # or: make backend PY=python3.12" >&2; \
 	    exit 1; \
 	  fi; \
@@ -79,17 +87,18 @@ test: build
 #
 # Runs through the venv the `backend` target provisions rather than a bare
 # `$(PY) -m pip install --upgrade build`: on hosts whose system python3 is older
-# than 3.10 (Amazon Linux 2023 ships 3.9) that bare form installs `build` into
+# than 3.12 (Amazon Linux 2023 ships 3.9) that bare form installs `build` into
 # the *system* interpreter — mutating it without a venv, and tripping PEP 668
 # "externally-managed-environment" where the marker exists. Depending on
-# `backend` guarantees a >= 3.10 venv exists first.
+# `backend` guarantees a >= 3.12 venv exists first.
 wheel: frontend backend
 	$(PIP) install --upgrade build
 	$(VENV)/bin/python -m build --wheel
 
-# Frozen standalone backend binary (no system Python needed). Stages the
-# dashboard first so it's embedded in the bundle. Host-arch only (UNIVERSAL=0):
-# the standalone backend is a local-machine artifact, not a distributable app.
+# Standalone backend tree on a bundled python-build-standalone interpreter (no
+# system Python needed). Stages the dashboard first so it's embedded in the
+# bundle. Host-arch only (UNIVERSAL=0): the standalone backend is a
+# local-machine artifact, not a distributable app.
 backend-bin: frontend
 	UNIVERSAL=0 SKIP_FRONTEND=1 SKIP_ELECTRON=1 bash packaging/build-desktop.sh
 

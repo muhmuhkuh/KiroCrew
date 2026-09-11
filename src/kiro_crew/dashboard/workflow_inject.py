@@ -18,7 +18,7 @@ import re
 from typing import Any, Callable, Optional
 
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import DashboardState, append_and_surface, row_mid
 from kiro_crew.history import append_if_absent_off_loop
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -159,18 +159,24 @@ def inject_workflow_result(
         # Dedup: don't double-inject the same result on a re-fire.
         already = any(m.get("content") == msg for m in getattr(slot, "messages", []))
         if not already:
-            slot.append("assistant", msg, "msg msg-a")
-            # Live: surface it in the open chat without a reload (mirrors how a
-            # normal assistant turn is pushed). slot.append already broadcasts via
-            # _pending flush, but an explicit chat_message guarantees the live UI
-            # renders it into the originating conversation immediately.
-            try:
-                state.broadcast_ws(
-                    "chat_message",
-                    {"slot": slot.key, "role": "assistant", "content": msg, "kind": "workflow_result"},
+            # Carry the window copy's minted ``meta.mid`` (read off the append's
+            # return via ``row_mid``) onto the durable copy below: one logical
+            # message, one identity, so the bounded-read identity walk
+            # recognises the persisted row instead of re-appending the
+            # injection. append_and_surface delivers the live copy through
+            # exactly one identity-carrying door — an unconditional explicit
+            # frame here carries no ``meta.mid``, so the client renders the same
+            # result twice whenever append's own broadcast also fires.
+            window_mid = row_mid(
+                append_and_surface(
+                    state,
+                    slot,
+                    "assistant",
+                    msg,
+                    "msg msg-a",
+                    extra={"kind": "workflow_result"},
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            )
             # Persist so a follow-up chat turn has the result as context.
             try:
                 if state.conversation_log is not None:
@@ -190,7 +196,7 @@ def inject_workflow_result(
                     # under the SAME per-session lock the slot save takes, so the
                     # write collapses to a no-op when the save already landed it.
                     append_if_absent_off_loop(
-                        state.conversation_log, session_key, "assistant", msg
+                        state.conversation_log, session_key, "assistant", msg, mid=window_mid
                     )
             except Exception:  # noqa: BLE001
                 pass

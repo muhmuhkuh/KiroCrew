@@ -12,6 +12,7 @@ CLI subcommands let the agent invoke each step:
     python3 sage_lib/pipeline.py rule-pack <repo_identity>
     python3 sage_lib/pipeline.py prepare --link <link> --payload-file <json>
 """
+
 from __future__ import annotations
 
 import argparse
@@ -96,8 +97,18 @@ def parse_batch(text: str) -> list[str]:
     return out
 
 
-def list_open_prs(owner: str, repo: str, *, host: str = "github.com",
-                  timeout: float = 60.0) -> list[dict]:
+def list_open_gitlab_mrs(
+    namespace: str, project: str, *, host: str, timeout: float = 120.0
+) -> list[dict]:
+    """Enumerate open GitLab merge requests through Issue Radar's hardened client."""
+    from kiro_crew.apps.builtins.issue_radar.backend import gitlab_client
+
+    return gitlab_client.list_open_pulls(namespace, project, host=host, timeout=timeout)
+
+
+def list_open_prs(
+    owner: str, repo: str, *, host: str = "github.com", timeout: float = 60.0
+) -> list[dict]:
     """Enumerate a repo's OPEN pull requests via the authenticated ``gh`` CLI.
 
     Deterministic backbone (no LLM): runs ``gh api`` with a LIST argv (never
@@ -108,9 +119,16 @@ def list_open_prs(owner: str, repo: str, *, host: str = "github.com",
     the same parsed-hostname allowlist; a non-github.com (GitHub Enterprise)
     host is routed to ITS instance's API via ``--hostname`` (``gh`` must be
     authenticated for it: ``gh auth login --hostname <host>``). Returns
-    ``[{url, number, head_sha, title, author, updated_at, draft}]`` in GitHub's
-    order. Raises ``RuntimeError`` (with the stderr tail) if `gh` is missing,
-    unauthenticated, times out, or the repo can't be read.
+    ``[{url, number, head_sha, title, author, updated_at, draft, labels}]`` in
+    GitHub's order. Raises ``RuntimeError`` (with the stderr tail) if `gh` is
+    missing, unauthenticated, times out, or the repo can't be read.
+
+    ``labels`` is the PR's label NAMES. It costs no extra request: the REST list
+    payload this already asks for carries ``.labels`` inline, so the names are
+    projected out of the response in hand rather than fetched per PR or read from
+    a separate repo-labels endpoint. Order is GitHub's; a PR with none yields
+    ``[]``, never a missing key, so a caller can narrow on it without a
+    presence check.
 
     The ``gh`` binary is resolved through ``discovery.gh_bin()`` — the same
     validated resolution the dashboard's PR panel uses — rather than trusting a
@@ -121,10 +139,19 @@ def list_open_prs(owner: str, repo: str, *, host: str = "github.com",
     except discovery.GhError as e:
         raise RuntimeError(str(e)) from e
     argv = [
-        gh, "api", path, "--paginate",
-        "--jq", ".[] | {url: .html_url, number: .number, "
-                "head_sha: .head.sha, title: .title, author: .user.login, "
-                "updated_at: .updated_at, draft: .draft}",
+        gh,
+        "api",
+        path,
+        "--paginate",
+        # `.labels` rides along in the list payload, so pulling the names here is
+        # free. `// []` keeps the projection total: a PR with no labels must emit
+        # an empty list rather than `null`, or the JSONL row below would carry a
+        # non-list and every consumer would need its own guard.
+        "--jq",
+        ".[] | {url: .html_url, number: .number, "
+        "head_sha: .head.sha, title: .title, author: .user.login, "
+        "updated_at: .updated_at, draft: .draft, "
+        "labels: [(.labels // [])[] | .name]}",
     ]
     h = adapters.canonical_host(host)
     # ALWAYS pin the hostname — including github.com. Omitting the flag lets
@@ -140,14 +167,12 @@ def list_open_prs(owner: str, repo: str, *, host: str = "github.com",
     except FileNotFoundError as e:
         raise RuntimeError("the `gh` CLI is not installed on this host") from e
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(
-            f"`gh` timed out listing open PRs for {owner}/{repo}") from e
+        raise RuntimeError(f"`gh` timed out listing open PRs for {owner}/{repo}") from e
     if proc.returncode != 0:
         tail = " ".join((proc.stderr or "").strip().splitlines()[-3:])
-        raise RuntimeError(
-            f"gh api failed for {owner}/{repo} (exit {proc.returncode}): {tail}")
+        raise RuntimeError(f"gh api failed for {owner}/{repo} (exit {proc.returncode}): {tail}")
     prs: list[dict] = []
-    for line in (proc.stdout or "").splitlines():   # --jq emits JSONL
+    for line in (proc.stdout or "").splitlines():  # --jq emits JSONL
         line = line.strip()
         if not line:
             continue
@@ -155,27 +180,41 @@ def list_open_prs(owner: str, repo: str, *, host: str = "github.com",
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        prs.append({
-            "url": obj.get("url") or "",
-            "number": obj.get("number"),
-            "head_sha": obj.get("head_sha") or "",
-            "title": obj.get("title") or "",
-            "author": obj.get("author") or "",
-            "updated_at": obj.get("updated_at") or "",
-            "draft": bool(obj.get("draft")),
-        })
+        prs.append(
+            {
+                "url": obj.get("url") or "",
+                "number": obj.get("number"),
+                "head_sha": obj.get("head_sha") or "",
+                "title": obj.get("title") or "",
+                "author": obj.get("author") or "",
+                "updated_at": obj.get("updated_at") or "",
+                "draft": bool(obj.get("draft")),
+                # Coerced like every field above rather than trusted: a name is only
+                # useful as a non-empty string, and a non-list here (an older `gh`
+                # whose jq dropped the projection, a hand-edited response) would
+                # otherwise reach the client as the wrong type. A bad value narrows
+                # to `[]`, which filters nothing — never to a truthy value that would
+                # silently hide this PR from a labelled view.
+                "labels": [
+                    s
+                    for s in (obj.get("labels") if isinstance(obj.get("labels"), list) else [])
+                    if isinstance(s, str) and s
+                ],
+            }
+        )
     # Non-silent: gh returned 0 but produced non-empty, unparseable output (e.g. a
     # gh build that pretty-prints jq). Don't masquerade that as "no open PRs".
     if not prs and (proc.stdout or "").strip():
         raise RuntimeError(
-            f"could not parse `gh` output for {owner}/{repo} "
-            "(expected one JSON object per line)")
+            f"could not parse `gh` output for {owner}/{repo} " "(expected one JSON object per line)"
+        )
     return prs
 
 
 # ---------------------------------------------------------------------------
 # Per-repo rule pack resolution (design §4.3 — read-only reuse, the ONLY merge)
 # ---------------------------------------------------------------------------
+
 
 def resolve_rule_pack(pack_name: str) -> str | None:
     """Find a rule-pack SKILL.md by skill name under the KiroCrew skills dir
@@ -188,8 +227,8 @@ def resolve_rule_pack(pack_name: str) -> str | None:
     skills = store.crew_home() / "skills"
     if not skills.exists():
         return None
-    candidates = list(skills.glob(f"{pack_name}/SKILL.md"))          # flat link
-    candidates += list(skills.glob(f"*/{pack_name}/SKILL.md"))       # namespaced link
+    candidates = list(skills.glob(f"{pack_name}/SKILL.md"))  # flat link
+    candidates += list(skills.glob(f"*/{pack_name}/SKILL.md"))  # namespaced link
     if not candidates:
         return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -208,6 +247,7 @@ def rule_pack_for_repo(repo_identity: str, config: dict | None = None) -> str | 
 # ---------------------------------------------------------------------------
 # Prepare a target for the Phase 1 gate (normalize + blast radius)
 # ---------------------------------------------------------------------------
+
 
 def prepare_target(link: str, raw_payload: dict | str, config: dict | None = None) -> dict:
     """Normalize a link+payload into a ReviewTarget and attach blast-radius
@@ -232,7 +272,7 @@ def prepare_target(link: str, raw_payload: dict | str, config: dict | None = Non
 POSTING_SPECS = {
     "github": {
         "tool": "one `gh api --method POST repos/<owner>/<repo>/pulls/<n>/reviews` "
-                "call with NO `event` key (creates a PENDING, unsubmitted review)",
+        "call with NO `event` key (creates a PENDING, unsubmitted review)",
         "anchor": "a comments[] entry {path, line, side:'RIGHT'} against commit_id=<head SHA>",
         "top_anchor": "the review `body` field (a general summary on the pending review)",
     },
@@ -278,8 +318,7 @@ def fetch_spec(platform: str, host: str = "github.com") -> str:
         )
         if h != "github.com":
             spec += (
-                f" (`gh` must be authenticated for that host: "
-                f"`gh auth login --hostname {h}`)"
+                f" (`gh` must be authenticated for that host: " f"`gh auth login --hostname {h}`)"
             )
     return spec
 
@@ -311,8 +350,9 @@ def _comment_body(finding: dict) -> str:
     return _redact(body)
 
 
-def build_comment_payload(finding: dict, change_id: str, revision: str,
-                          platform: str = "github") -> dict:
+def build_comment_payload(
+    finding: dict, change_id: str, revision: str, platform: str = "github"
+) -> dict:
     """Build a DRAFT-only comment payload from a finding. ``publish`` is ALWAYS
     False (draft-only safety). For GitHub this is the single-finding anchor shape
     ({path, line, side} against the head commit SHA); the full pending review is
@@ -387,19 +427,20 @@ def build_pending_comments(record: dict) -> list[dict]:
     anchor + posting accounting."""
     out: list[dict] = []
     for i, f in enumerate(record.get("findings", []) or []):
-        out.append({
-            "kind": "finding",
-            # Stable identity for selective posting: the record is frozen once the
-            # review has run, and the report rows are generated from the same list
-            # in the same order, so the index is a durable handle the UI can name
-            # one comment by. Callers filter on this; nothing else keys off it.
-            "key": f"finding:{i}",
-            "file": str(f.get("file", "")),
-            "line": int(f.get("line", 0) or 0),
-            "body": _comment_body(f),   # _comment_body already applies _redact
-        })
-    out.append({"kind": "design", "key": "design",
-                "body": build_ship_comment(record)})
+        out.append(
+            {
+                "kind": "finding",
+                # Stable identity for selective posting: the record is frozen once the
+                # review has run, and the report rows are generated from the same list
+                # in the same order, so the index is a durable handle the UI can name
+                # one comment by. Callers filter on this; nothing else keys off it.
+                "key": f"finding:{i}",
+                "file": str(f.get("file", "")),
+                "line": int(f.get("line", 0) or 0),
+                "body": _comment_body(f),  # _comment_body already applies _redact
+            }
+        )
+    out.append({"kind": "design", "key": "design", "body": build_ship_comment(record)})
     return out
 
 
@@ -452,7 +493,7 @@ def build_github_review_payload(record: dict) -> dict:
         text = _redact(e.get("body", "") or "")
         if kind == "design":
             if text:
-                body_parts.insert(0, text)   # the ship-readiness summary leads the body
+                body_parts.insert(0, text)  # the ship-readiness summary leads the body
             continue
         # `file` is LLM-derived and goes to an external surface, so redact it too
         # (idempotent; real file paths never match credential/URL patterns, and a
@@ -463,7 +504,7 @@ def build_github_review_payload(record: dict) -> dict:
         if path and line > 0:
             comments.append({"path": path, "line": line, "side": "RIGHT", "body": text})
         elif text:
-            body_parts.append(text)          # unanchored finding -> folded into the body
+            body_parts.append(text)  # unanchored finding -> folded into the body
     payload: dict = {"body": "\n\n".join(p for p in body_parts if p), "comments": comments}
     if not commit_id:
         # Refuse rather than post unanchored. GitHub defaults a review with no
@@ -483,7 +524,7 @@ def build_github_review_payload(record: dict) -> dict:
             "`revision`, and GitHub would anchor the draft to the current head "
             "instead of the reviewed one"
         )
-    payload["commit_id"] = commit_id         # anchors comments to the reviewed head
+    payload["commit_id"] = commit_id  # anchors comments to the reviewed head
     # NOTE: intentionally NO "event" key -> the review stays PENDING (unsubmitted).
     return payload
 
@@ -491,6 +532,7 @@ def build_github_review_payload(record: dict) -> dict:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Code Review Sage pipeline helpers")

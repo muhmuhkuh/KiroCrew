@@ -28,7 +28,7 @@ from kiro_crew.config.loader import (
     config_path,
     update_config_locked,
 )
-from kiro_crew.cron import CronStoreBusy
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.dashboard.chat_utils import (
     forget_slack_options_for_thread,
     options_control_is_stale,
@@ -36,8 +36,15 @@ from kiro_crew.dashboard.chat_utils import (
     slack_options_owner_keys_snapshot,
     slack_options_slot,
 )
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.identity import channel_inbound_permitted
-from kiro_crew.security import redact_and_truncate, redact_credentials, redact_exfiltration_urls
+from kiro_crew.messaging.renderer import credential_redaction_notice
+from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
+    redact_and_truncate,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel
 from kiro_crew.slack.allowlist import (
     ACTION_ALLOWLIST_APPROVE,
@@ -97,20 +104,17 @@ _FENCE_MARKER_RE = re.compile(
     r"-{0,}\s*(?:UNTRUSTED FORWARDED CONTENT|CONTEXT ENTRY)\s+(?:BEGIN|END)\s*-{0,}",
     re.IGNORECASE,
 )
+_FENCE_MARKER_NEUTRALIZED = "[removed embedded fence marker]"
 
 
 def _neutralize_fence_markers(text: str) -> str:
-    """Strip any embedded quarantine/context fence markers from untrusted text.
+    """Neutralize Unicode-normalized forwarded/context fence variants."""
+    # Local import avoids the context -> Slack handler import cycle during
+    # module initialization; interaction handlers run only after startup.
+    from kiro_crew.context import _apply_marker_spans, _marker_spans
 
-    The forwarded body is authored by an arbitrary third party (possibly
-    external via Slack-Connect). If it contains a literal ``--- UNTRUSTED
-    FORWARDED CONTENT END ---`` (or a CONTEXT ENTRY marker), interpolating it
-    between the real fence markers would let the attacker's trailing text break
-    out of the quarantine and land in the trusted first-party region of the
-    prompt. Replace any such marker phrase with a defanged placeholder so the
-    boundary the model relies on cannot be forged from within the content.
-    """
-    return _FENCE_MARKER_RE.sub("[removed embedded fence marker]", text)
+    spans = _marker_spans(text, (_FENCE_MARKER_RE,))
+    return _apply_marker_spans(text, spans, _FENCE_MARKER_NEUTRALIZED)
 
 
 # Module-level orchestrator reference — set by ``init()``.
@@ -450,7 +454,7 @@ async def _handle_shortcut_submission(payload: dict) -> None:
 
     try:
         meta = json.loads(view.get("private_metadata", "{}"))
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
         meta = {}
 
     orig_channel = meta.get("channel", "")
@@ -2058,10 +2062,14 @@ async def _handle_cron_ack(payload: dict, action: dict, channel: str, msg_ts: st
     msg_text = payload.get("message", {}).get("text", "")[:200]
     try:
         await _orch.cron_svc.ack_job_async(job_id, msg_text)
-    except CronStoreBusy:
-        # Ack is best-effort context bookkeeping; a transiently-contended store
-        # must not fail the Slack interaction. The button already acked visually.
-        logger.warning("cron ack skipped: store busy (job %s)", job_id)
+    except (CronStoreBusy, CronStoreUnreadable) as exc:
+        # Ack is best-effort context bookkeeping; neither a transiently-contended
+        # store nor an unreadable one must fail the Slack interaction. The button
+        # already acked visually. Unreadable degrades here rather than surfacing
+        # to the user because nothing was requested of the store by the person
+        # clicking -- this is the same class as the background writers in
+        # CronService, not a user-initiated mutation.
+        logger.warning("cron ack skipped: %s (job %s)", type(exc).__name__, job_id)
     if _orch.dashboard_state:
         for n in _orch.dashboard_state._notification_log:
             if n.get("job_id") == job_id and not n.get("acked"):
@@ -2653,7 +2661,7 @@ async def _handle_session_resume(
 
     try:
         val = json.loads(action.get("value", "{}"))
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
         val = {"key": action.get("value", "")}
 
     session_key = val.get("key", "")
@@ -2753,7 +2761,7 @@ async def _handle_session_resume(
         )
 
 
-_resume_locks: dict[str, asyncio.Lock] = {}
+_resume_locks: dict[str, LoopBoundLock] = {}
 
 
 async def _handle_resume_choice(
@@ -2779,7 +2787,7 @@ async def _handle_resume_choice(
 
     try:
         val = json.loads(action.get("value", "{}"))
-    except (ValueError, json.JSONDecodeError):
+    except ValueError:
         return
 
     session_key = val.get("key", "")
@@ -2801,7 +2809,7 @@ async def _handle_resume_choice(
                 _resume_locks.pop(k, None)
                 evicted += 1
 
-    lock = _resume_locks.setdefault(session_key, asyncio.Lock())
+    lock = _resume_locks.setdefault(session_key, LoopBoundLock())
     async with lock:
         # Re-check: session may have been linked while user was choosing
         existing_thread, existing_channel = _orch.sessions.get_slack_link(session_key)
@@ -2902,7 +2910,7 @@ async def _handle_resume_choice(
                 for ln in lines:
                     try:
                         d = json.loads(ln.strip())
-                    except (ValueError, json.JSONDecodeError):
+                    except ValueError:
                         continue
                     if d.get("_type"):
                         continue
@@ -3247,6 +3255,23 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
     draft, _ = redact_exfiltration_urls(draft)
     draft, _ = redact_credentials(draft)
     await _orch.slack.post_message(channel, draft, thread_ts)
+    # Approving a draft posts it publicly to the channel, so this egress carries
+    # the same silent-corruption hazard as the streaming reply path: the two lines
+    # above replaced a credential in the draft with a placeholder, and a channel
+    # member who copies the command hits an opaque downstream failure with no hint
+    # the text was rewritten. Count the tags in the redacted draft that actually
+    # shipped and post one best-effort follow-up notice. The notice carries only a
+    # count, never secret bytes, and its failure must not undo the posted draft --
+    # the draft is already public, so raising here would lose the warning and the
+    # approve's remaining teardown too.
+    _cred_redactions = sum(draft.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+    if _cred_redactions > 0:
+        try:
+            await _orch.slack.post_message(
+                channel, credential_redaction_notice(_cred_redactions), thread_ts
+            )
+        except Exception:
+            logger.debug("Failed to post review-approve redaction notice", exc_info=True)
     await _delete_review_placeholder(channel, thread_ts)
     # Delete the ephemeral draft message
     response_url = payload.get("response_url", "")

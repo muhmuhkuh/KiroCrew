@@ -7,6 +7,7 @@ import { useSessionPalette } from '../hooks/useSessionPalette'
 import { colorName } from '../utils/sessionColors'
 
 import { i18nT } from '../i18n/t'
+import { useImeGuard } from '../hooks/useImeGuard'
 
 /** Mirrors the backend contract in chat_persistence.COLOR_HEX_RE. */
 const HEX_RE = /^#[0-9a-fA-F]{6}$/
@@ -38,6 +39,7 @@ export default function SessionColorSwatches({ slotKey, colorIndex, colorHex, on
   colorHex?: string | null
   onPicked?: () => void
 }) {
+  const ime = useImeGuard()
   const dispatch = useAppDispatch()
   const { paletteColors } = useSessionPalette()
   const [customOpen, setCustomOpen] = useState(false)
@@ -136,6 +138,11 @@ export default function SessionColorSwatches({ slotKey, colorIndex, colorHex, on
   }
 
   return (
+    // Containment only: the handler performs no action, it just keeps keystrokes
+    // aimed at the swatches and the hex field from reaching the enclosing menu's
+    // key handler (which would treat them as navigation and close the popover).
+    // Every affordance inside is a real <button> or <input>.
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- stopPropagation barrier, not an activatable control; there is no behaviour for a keyboard to be given
     <div onKeyDown={e => e.stopPropagation()}>
       <div className="flex items-center gap-1.5 px-3 py-1.5">
         <button type="button" aria-label={i18nT('components.sessionColorSwatches.no_color')} className={`w-4 h-4 rounded-full border-[1.5px] cursor-pointer transition-transform hover:scale-125 ${colorIndex == null && !colorHex ? 'border-text-strong scale-110' : 'border-transparent'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => pick(null)} title={i18nT('components.sessionColorSwatches.no_color')} />
@@ -176,12 +183,12 @@ export default function SessionColorSwatches({ slotKey, colorIndex, colorHex, on
             }}
             onKeyDown={e => {
               e.stopPropagation()
-              if (e.key === 'Enter') { e.preventDefault(); commitHex(draft) }
+              if (e.key === 'Enter') { if (ime.claimEnter(e)) commitHex(draft) }
             }}
-            onBlur={() => { if (dirtyRef.current) commitHex(draft) }}
+            {...ime.bindComposition({ onBlur: () => { if (dirtyRef.current) commitHex(draft) } })}
             aria-label={i18nT('components.sessionColorSwatches.hex_color_code')}
             placeholder="#4f8ef7"
-            className="w-[76px] bg-bg-accent border border-border rounded px-1.5 py-0.5 text-[11px] font-mono text-text outline-none focus:border-accent"
+            className="w-[76px] bg-bg-accent border border-border rounded px-1.5 py-0.5 text-[11px] font-mono text-text outline-none focus-visible:border-accent"
           />
         </div>
       )}

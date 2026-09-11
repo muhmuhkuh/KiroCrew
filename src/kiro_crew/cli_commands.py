@@ -19,12 +19,14 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from kiro_crew import __version__, beacon, platform_compat
+from kiro_crew.agent import reset_agent_model
 from kiro_crew.apps.bridges import (
     deregister_app,
     deregister_app_crons_from_service,
@@ -49,22 +51,37 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     WorkspaceConfig,
     build_provider_factory,
+    coerce_dict_section,
     config_local_path,
     config_path,
     read_config_for_update,
+    read_local_secret,
     update_config_locked,
 )
-from kiro_crew.cron import CronSchedule, CronService, format_schedule
+from kiro_crew.cron import (
+    CronSchedule,
+    CronService,
+    CronStoreUnreadable,
+    format_schedule,
+    lookup_cron_folder_id,
+)
 from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.origin import parse_dashboard_url
 from kiro_crew.eval.judge import LLMJudge
 from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
+from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
-from kiro_crew.learn import Lesson, LessonStore
+from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.memory import MemoryStore
 from kiro_crew.port_resolution import resolve_client_port_ex
+from kiro_crew.secrets.migrate import (
+    MigrationConflictError,
+    format_report,
+    migrate_env_secrets,
+)
 from kiro_crew.security import (
     BUILTIN_DENIED_RULES,
     BUILTIN_DENY_PATTERNS,
@@ -83,7 +100,7 @@ from kiro_crew.validation import (
     WORKSPACE_NAME_RE,
     normalize_lesson_category,
 )
-from kiro_crew.vector_memory import VectorMemoryStore, _lesson_display_text
+from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore, _lesson_display_text
 
 # Workspace dirs are confined to the data home: a workspace is agent-writable
 # working state, so letting --dir escape would let it be pointed at ~/.ssh or the
@@ -169,7 +186,7 @@ def _format_schedule(schedule: object) -> str:
     return format_schedule(schedule)
 
 
-def _internal_secret() -> str:
+def _internal_secret(port: int) -> str:
     """Read the per-session IPC secret written by the gateway.
 
     The gateway writes ``~/.kiro/crew/.local_secret`` (mode 0600) after a
@@ -182,10 +199,7 @@ def _internal_secret() -> str:
     server then rejects the request with 403, which is the correct
     failure mode.
     """
-    try:
-        return (config_dir() / ".local_secret").read_text().strip()
-    except Exception:
-        return ""
+    return read_local_secret(port)
 
 
 def _spawn(args: argparse.Namespace) -> None:
@@ -196,7 +210,7 @@ def _spawn(args: argparse.Namespace) -> None:
     if action == "list":
         req = urllib.request.Request(
             f"{base}/api/spawn",
-            headers={"X-Internal-Secret": _internal_secret()},
+            headers={"X-Internal-Secret": _internal_secret(args.port)},
         )
         try:
             with loopback_urlopen(req, timeout=5) as resp:
@@ -216,8 +230,16 @@ def _spawn(args: argparse.Namespace) -> None:
             print("No subagents.")
             return
         for a in agents:
-            status = "✅" if a.get("done") else "⏳"
-            print(f"  {status} {a['id']}  {a.get('task', '')[:60]}")
+            if a.get("done"):
+                status, note = "✅", ""
+            elif a.get("awaiting_approval"):
+                # A run parked on its spawn-approval prompt used to render the
+                # same bare hourglass as one that is executing, so `spawn list`
+                # could not answer "is this working or waiting for me?" (#6484).
+                status, note = "🔐", "  — waiting for spawn approval"
+            else:
+                status, note = "⏳", ""
+            print(f"  {status} {a['id']}  {a.get('task', '')[:60]}{note}")
         return
 
     if action == "run":
@@ -235,7 +257,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         data=data,
         headers={
             "Content-Type": "application/json",
-            "X-Internal-Secret": _internal_secret(),
+            "X-Internal-Secret": _internal_secret(args.port),
         },
     )
     try:
@@ -262,7 +284,8 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
 
     print(f"Spawned subagent {agent_id}, waiting for result...", file=sys.stderr)
     poll_url = f"{base}/api/spawn/{agent_id}"
-    secret = _internal_secret()
+    secret = _internal_secret(args.port)
+    told_awaiting = False
     while True:
         _time.sleep(2)
         poll_req = urllib.request.Request(poll_url, headers={"X-Internal-Secret": secret})
@@ -272,12 +295,64 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         except Exception:
             print("Error: lost connection to gateway", file=sys.stderr)
             sys.exit(1)
+        # Say WHY the wait is not progressing. A spawn with no parent session
+        # raises its approval prompt unowned, so it appears only on the global
+        # approvals surface -- not in any chat tab -- and this loop would
+        # otherwise sit on "waiting for result..." indefinitely with nothing to
+        # act on (#6484). Announced once, not every 2s poll.
+        if status.get("awaiting_approval") and not told_awaiting:
+            told_awaiting = True
+            print(
+                "Waiting for spawn approval: approve it in the dashboard "
+                "(Approvals) to start this run.",
+                file=sys.stderr,
+            )
         if status.get("done"):
             if status.get("error"):
                 print(f"Error: {status['error']}", file=sys.stderr)
                 sys.exit(1)
             print(status.get("result", ""))
             return
+
+
+class _CliConflict(Exception):
+    """An in-lock precondition re-check failed for a CLI config CRUD write.
+
+    The CLI pre-checks its inputs against a config snapshot for fast, friendly
+    errors, but the snapshot can be stale by the time the write runs. The
+    mutate callbacks below re-decide every state-dependent precondition on the
+    document read INSIDE the sidecar flock (#4767) and raise this to refuse.
+    """
+
+
+def _locked_config_write(mutate, *, cleanup_conflict=None, cleanup_failure=None) -> None:
+    """Run one config delta under the sidecar flock; exit(1) on a conflict.
+
+    Replaces the load -> mutate dataclass -> ``cfg.save()`` shape, whose
+    whole-document rename silently discarded any change another process
+    landed between the load and the save (#4767).
+
+    Resolved through the loader MODULE, not this module's by-value imports,
+    so it honors the same ``kiro_crew.config.loader.config_path`` patches the
+    old ``cfg.save()`` path did (save() resolves its path inside loader).
+
+    ``cleanup_conflict`` runs before the exit(1) on a refused precondition;
+    ``cleanup_failure`` runs when the write itself fails -- the workspace
+    create passes its staging-drop / install-rollback handlers here.
+    """
+    from kiro_crew.config import loader as _loader
+
+    try:
+        _loader.update_config_locked(_loader.config_path(), mutate=mutate)
+    except _CliConflict as exc:
+        if cleanup_conflict is not None:
+            cleanup_conflict()
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except BaseException:
+        if cleanup_failure is not None:
+            cleanup_failure()
+        raise
 
 
 def _handle_workspace(args: argparse.Namespace) -> None:
@@ -304,6 +379,8 @@ def _handle_workspace(args: argparse.Namespace) -> None:
             print(f"Error: workspace '{args.name}' already exists", file=sys.stderr)
             sys.exit(1)
         copy_from = getattr(args, "copy_from", None)
+        staged_path: Path | None = None
+        install_state = {"installed": False}
         if copy_from:
             if copy_from not in cfg.workspaces:
                 print(
@@ -365,13 +442,23 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                             skip.add(entry)
                     return skip
 
-                shutil.copytree(
-                    src_path,
-                    dst_path,
-                    dirs_exist_ok=True,
-                    symlinks=True,
-                    ignore=_ignore_sensitive,
-                )
+                # Copy to a STAGING sibling, not the destination: the copy
+                # runs before the locked registration, so a losing same-name
+                # race must leave the winner's directory untouched (#4767
+                # round 8). The staged tree is installed inside the locked
+                # mutate below, only after the in-lock checks pass.
+                staging = dst_path.parent / f".{dst_path.name}.staging-{uuid.uuid4().hex[:8]}"
+                try:
+                    shutil.copytree(
+                        src_path,
+                        staging,
+                        symlinks=True,
+                        ignore=_ignore_sensitive,
+                    )
+                except BaseException:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise
+                staged_path = staging
         else:
             ws_dir = args.dir if args.dir is not None else f"workspace-{args.name}"
 
@@ -403,8 +490,51 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        cfg.workspaces[args.name] = WorkspaceConfig(dir=ws_dir)
-        cfg.save()
+
+        def _mutate_ws_create(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            if args.name in workspaces:
+                raise _CliConflict(f"workspace '{args.name}' already exists")
+            used = {str(ws.get("dir", "")) for ws in workspaces.values() if isinstance(ws, dict)}
+            if ws_dir in used:
+                raise _CliConflict(f"directory '{ws_dir}' is already used by another workspace")
+            if staged_path is not None:
+                # Same install invariant as the dashboard handler: the
+                # destination must not exist AT ALL. publish_dir_noreplace,
+                # not check-then-rename: POSIX os.rename silently replaces an
+                # EMPTY destination, so a racer's directory created between
+                # the check and the rename would be destroyed (#4767 round 9).
+                if dst_path.exists():
+                    raise _CliConflict(
+                        f"destination directory '{ws_dir}' already exists; "
+                        "choose another dir or remove it first"
+                    )
+                try:
+                    platform_compat.publish_dir_noreplace(staged_path, dst_path)
+                except (FileExistsError, OSError) as exc:
+                    raise _CliConflict(
+                        f"destination directory '{ws_dir}' already exists; "
+                        "choose another dir or remove it first"
+                    ) from exc
+                install_state["installed"] = True
+            workspaces[args.name] = dataclasses.asdict(WorkspaceConfig(dir=ws_dir))
+            return doc
+
+        def _drop_staging() -> None:
+            if staged_path is not None and not install_state["installed"]:
+                shutil.rmtree(staged_path, ignore_errors=True)
+
+        def _rollback_install() -> None:
+            if install_state["installed"]:
+                shutil.rmtree(dst_path, ignore_errors=True)
+            elif staged_path is not None:
+                shutil.rmtree(staged_path, ignore_errors=True)
+
+        _locked_config_write(
+            _mutate_ws_create,
+            cleanup_conflict=_drop_staging,
+            cleanup_failure=_rollback_install,
+        )
         sel().log_api_access(
             caller="cli",
             operation="workspace.create",
@@ -447,8 +577,26 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            cfg.workspaces[args.name].dir = args.dir
-        cfg.save()
+
+        def _mutate_ws_update(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            entry = workspaces.get(args.name)
+            if not isinstance(entry, dict):
+                raise _CliConflict(f"workspace '{args.name}' not found")
+            if args.dir is not None:
+                used = {
+                    str(ws.get("dir", ""))
+                    for n, ws in workspaces.items()
+                    if n != args.name and isinstance(ws, dict)
+                }
+                if args.dir in used:
+                    raise _CliConflict(
+                        f"directory '{args.dir}' is already used by another workspace"
+                    )
+                entry["dir"] = args.dir
+            return doc
+
+        _locked_config_write(_mutate_ws_update)
         sel().log_api_access(
             caller="cli",
             operation="workspace.update",
@@ -497,8 +645,32 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        del cfg.workspaces[args.name]
-        cfg.save()
+
+        def _mutate_ws_delete(doc: dict) -> dict:
+            workspaces = coerce_dict_section(doc, "workspaces")
+            if args.name not in workspaces:
+                raise _CliConflict(f"workspace '{args.name}' not found")
+            # Re-check the TOP-LEVEL default in-lock: a concurrent default
+            # change between this command's snapshot and the lock would
+            # otherwise leave config pointing at a deleted workspace.
+            if doc.get("default_workspace") == args.name:
+                raise _CliConflict(f"cannot delete default workspace '{args.name}'")
+            agents = doc.get("agents")
+            if isinstance(agents, dict):
+                still_referencing = sorted(
+                    a
+                    for a, ac in agents.items()
+                    if isinstance(ac, dict) and ac.get("workspace") == args.name
+                )
+                if still_referencing:
+                    raise _CliConflict(
+                        f"workspace '{args.name}' is referenced by agents: "
+                        + ", ".join(still_referencing)
+                    )
+            del workspaces[args.name]
+            return doc
+
+        _locked_config_write(_mutate_ws_delete)
         sel().log_api_access(
             caller="cli",
             operation="workspace.delete",
@@ -587,6 +759,54 @@ def _register_app_crons_to_scheduler(app_name: str) -> list[str]:
     return registered
 
 
+def _warn_hooks_need_restart(app_name: str) -> bool:
+    """Tell the operator how a CLI enable's backend-hook change reaches a gateway.
+
+    Everything else a CLI enable writes is re-read by a running gateway:
+    ``enable_app`` writes ``installed.json``, ``register_app`` writes agent and
+    skill files, and ``_register_app_crons_to_scheduler`` writes through the
+    shared cron store that the gateway's timer tick re-syncs by content digest.
+    Backend hooks are Python modules imported INTO the gateway process, and only
+    the gateway can replace them (``on_app_enable`` ->
+    ``RouteRegistry.register_app_routes`` -> ``load_app_module``, reached by the
+    HTTP enable route and by ``on_gateway_startup``). This CLI process has no
+    handle on that one's ``sys.modules``, so it cannot load them directly --
+    but it no longer needs to: the gateway runs a hook reconciler
+    (``apps/hook_reconcile.py``) that notices an on-disk hook change this CLI
+    made and reloads it in-process within a poll interval (issue #7880). A
+    stopped gateway loads the new code on its next start.
+
+    Printing only "enabled <app>" reads as though the change were already live in
+    a running gateway, when in fact it lands a few seconds later; and pre-#7880
+    it never landed at all until a manual restart. This notice states the actual
+    timing so an operator does not verify a hook change against stale code and
+    draw the wrong conclusion.
+
+    Deliberately NOT gated on a live-gateway probe. ``_marker_port`` is the only
+    verified one available here, and it writes its own multi-gateway warning to
+    stderr, which would surface out of context on an app enable. The notice is
+    phrased conditionally instead, so it stays true whether or not a gateway is
+    up.
+
+    Only for apps that declare ``backend.hooks``: there is nothing to say
+    otherwise. Returns whether the notice was printed.
+    """
+    info = get_app(app_name)
+    manifest = info.get("manifest") if isinstance(info, dict) else None
+    backend = manifest.get("backend") if isinstance(manifest, dict) else None
+    hooks = backend.get("hooks") if isinstance(backend, dict) else None
+    if not isinstance(hooks, dict) or not hooks:
+        return False
+    declared = ", ".join(sorted(str(k) for k in hooks))
+    print(
+        f"  note: this app declares backend hooks ({declared}).\n"
+        "  A gateway that is already running reloads them automatically within a\n"
+        "  few seconds (the gateway reconciles hook changes it did not perform\n"
+        "  itself); if the gateway is stopped, they load on its next start."
+    )
+    return True
+
+
 def _run_app_mcp_server(app_name: str) -> None:
     """Run the named app's stdio MCP server in this process.
 
@@ -601,9 +821,15 @@ def _run_app_mcp_server(app_name: str) -> None:
     module_name = f"kiro_crew.apps.builtins.{app_name.replace('-', '_')}.mcp_server"
     try:
         mod = importlib.import_module(module_name)
-    except ImportError as exc:
-        print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
-        sys.exit(1)
+    except ModuleNotFoundError as exc:
+        # Only the TARGET module (or one of its parent packages) missing means
+        # "this app has no MCP server". A missing dependency imported INSIDE
+        # mcp_server.py — or any other ImportError — is a real defect and must
+        # keep its traceback rather than exit with a misleading diagnosis.
+        if exc.name and (exc.name == module_name or module_name.startswith(exc.name + ".")):
+            print(f"App {app_name!r} has no MCP server ({module_name}): {exc}", file=sys.stderr)
+            sys.exit(1)
+        raise
     runner = getattr(mod, "run_mcp_server", None)
     if runner is None:
         print(f"{module_name} defines no run_mcp_server()", file=sys.stderr)
@@ -664,14 +890,29 @@ def _handle_app(args: argparse.Namespace) -> None:
             if reg.skills:
                 print(f"   Skills registered: {len(reg.skills)}")
             _register_app_crons_to_scheduler(args.name)
+            _warn_hooks_need_restart(args.name)
         else:
             print(f"❌ {result.error}", file=sys.stderr)
             sys.exit(1)
 
     elif action == "disable":
         _cleanup_app_crons_from_scheduler(args.name)
-        deregister_app(args.name)
+        # Flip the authoritative flag BEFORE tearing resources down. A running gateway
+        # is a DIFFERENT process: it watches this app's backend and re-registers its MCP
+        # servers and agents on a health recovery, gated on the enabled flag it reads
+        # from installed.json. Deregistering first leaves a window where that flag still
+        # says enabled and the resources are already gone — and a recovery landing there
+        # puts them back for an app the operator is disabling. The gateway's own disable
+        # path has no such window because it stops the backend first, which ends the
+        # watch; the CLI cannot do that from out here, so it closes the window by
+        # ordering instead.
+        #
+        # If the deregistration below then fails, the app is still correctly marked
+        # disabled and the failure is reported to an operator already at the terminal —
+        # which is the better of the two error shapes, because the alternative is a
+        # silent re-registration nobody sees.
         result = disable_app(args.name)
+        deregister_app(args.name)
         if result.ok:
             print(f"✅ {result.message}")
         else:
@@ -708,7 +949,22 @@ def _handle_app(args: argparse.Namespace) -> None:
         from kiro_crew.apps.dev_mode import set_dev_mode
 
         enabled = not getattr(args, "off", False)
-        dev_result = set_dev_mode(args.name, enabled)
+        confirm_root = getattr(args, "confirm_out_of_install_root", False)
+        if confirm_root and not enabled:
+            # The confirmation only applies to enabling: a disable never
+            # grants. Say so rather than silently ignoring the flag — an
+            # operator who reaches for it on the wrong invocation would
+            # otherwise read the exit-0 as "confirmed".
+            print(
+                "⚠️  --confirm-out-of-install-root has no effect with --off "
+                "(disabling grants nothing)",
+                file=sys.stderr,
+            )
+        dev_result = set_dev_mode(
+            args.name,
+            enabled,
+            confirm_out_of_install_root=confirm_root,
+        )
         if "error" in dev_result:
             print(f"❌ {dev_result['error']}", file=sys.stderr)
             sys.exit(1)
@@ -734,13 +990,20 @@ def _handle_app(args: argparse.Namespace) -> None:
         include_backend = getattr(args, "backend", False)
         include_ui = getattr(args, "ui", False)
         include_cron = getattr(args, "cron", False)
-        app_dir = scaffold_app(
-            output,
-            args.name,
-            include_backend=include_backend,
-            include_ui=include_ui,
-            include_cron=include_cron,
-        )
+        try:
+            app_dir = scaffold_app(
+                output,
+                args.name,
+                include_backend=include_backend,
+                include_ui=include_ui,
+                include_cron=include_cron,
+            )
+        except ValueError as exc:
+            # scaffold_app raises when a write path escapes the app directory
+            # (traversal in the name, a symlink in the tree). Match the clean
+            # error contract of the sibling app actions, not a raw traceback.
+            print(f"❌ {exc}", file=sys.stderr)
+            sys.exit(1)
         print(f"✅ Scaffolded app: {app_dir}")
         print("   Edit app.json, add agents and skills, then:")
         if include_ui:
@@ -775,26 +1038,42 @@ def _handle_agent(args: argparse.Namespace) -> None:
         if args.name in cfg.agents:
             print(f"Error: agent '{args.name}' already exists", file=sys.stderr)
             sys.exit(1)
-        cfg.agents[args.name] = KiroCrewAgentConfig(
-            kiro_agent=args.kiro_agent,
-            workspace=args.workspace,
-            memory_store=args.memory_store,
-        )
-        cfg.save()
+
+        def _mutate_agent_create(doc: dict) -> dict:
+            agents = coerce_dict_section(doc, "agents")
+            if args.name in agents:
+                raise _CliConflict(f"agent '{args.name}' already exists")
+            agents[args.name] = dataclasses.asdict(
+                KiroCrewAgentConfig(
+                    kiro_agent=args.kiro_agent,
+                    workspace=args.workspace,
+                    memory_store=args.memory_store,
+                )
+            )
+            return doc
+
+        _locked_config_write(_mutate_agent_create)
         print(f"Created agent: {args.name}")
 
     elif action == "update":
         if args.name not in cfg.agents:
             print(f"Error: agent '{args.name}' not found", file=sys.stderr)
             sys.exit(1)
-        agent = cfg.agents[args.name]
-        if args.kiro_agent is not None:
-            agent.kiro_agent = args.kiro_agent
-        if args.workspace is not None:
-            agent.workspace = args.workspace
-        if args.memory_store is not None:
-            agent.memory_store = args.memory_store
-        cfg.save()
+
+        def _mutate_agent_update(doc: dict) -> dict:
+            agents = coerce_dict_section(doc, "agents")
+            entry = agents.get(args.name)
+            if not isinstance(entry, dict):
+                raise _CliConflict(f"agent '{args.name}' not found")
+            if args.kiro_agent is not None:
+                entry["kiro_agent"] = args.kiro_agent
+            if args.workspace is not None:
+                entry["workspace"] = args.workspace
+            if args.memory_store is not None:
+                entry["memory_store"] = args.memory_store
+            return doc
+
+        _locked_config_write(_mutate_agent_update)
         print(f"Updated agent: {args.name}")
 
     elif action == "delete":
@@ -807,15 +1086,93 @@ def _handle_agent(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(1)
-        del cfg.agents[args.name]
-        cfg.save()
+
+        def _mutate_agent_delete(doc: dict) -> dict:
+            agents = coerce_dict_section(doc, "agents")
+            if args.name not in agents:
+                raise _CliConflict(f"agent '{args.name}' not found")
+            # Re-check the default in-lock, at the authoritative TOP-LEVEL key
+            # (loader reads `data.get("default_agent")`); the agent-section
+            # key is the migration-era location and is checked as well.
+            agent_section = doc.get("agent")
+            if doc.get("default_agent") == args.name or (
+                isinstance(agent_section, dict) and agent_section.get("default_agent") == args.name
+            ):
+                raise _CliConflict(f"cannot delete default agent '{args.name}'")
+            del agents[args.name]
+            return doc
+
+        _locked_config_write(_mutate_agent_delete)
         print(f"Deleted agent: {args.name}")
 
+    elif action == "reset-model":
+        _agent_reset_model(args)
+
     else:
-        print("Usage: kirocrew agent {list|create|update|delete}")
+        print("Usage: kirocrew agent {list|create|update|delete|reset-model}")
+
+
+def _agent_reset_model(args: argparse.Namespace) -> None:
+    """Clear an agent spec's pinned model (``kirocrew agent reset-model``).
+
+    The explicit, narrow way back to the shipped default model. It exists
+    because ownership of a spec's ``model`` cannot be inferred: a value an older
+    build's propagation wrote and one the user typed in by hand are
+    byte-identical on disk, so nothing may reclassify a pin behind the user's
+    back. Before this, the only ways out were the dashboard's Agent Templates
+    editor (clear the model) and ``kirocrew setup --clean``, which also
+    regenerates the whole spec and discards every other customization with it.
+    """
+    name = getattr(args, "agent", None) or "kirocrew"
+    try:
+        spec_path, previous = reset_agent_model(name)
+    except FileNotFoundError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        # Ambiguous: two specs claim the name and the runtime's choice between
+        # them is undefined, so resetting either could strip the wrong one.
+        print(f"❌ {exc}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"❌ Could not write the agent spec: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if previous:
+        # repr on BOTH the model and the path. Neither is trusted input: an
+        # installed app writes specs into the agents directory and a cloned
+        # repository can ship one, so an OSC/ANSI sequence can arrive in the
+        # `model` value AND in the FILENAME -- the declared-name scan returns
+        # whichever file declares the requested name, so its path is attacker-
+        # shaped even though *name* itself is grammar-validated.
+        print(f"✅ Cleared {name}'s pinned model ({previous!r}) in {str(spec_path)!r}")
+    else:
+        print(f"✅ {name} had no pinned model in {str(spec_path)!r}")
+    print("   It now tracks the shipped default; restart the gateway to apply.")
 
 
 def _cron(args: argparse.Namespace) -> None:
+    """Dispatch cron subcommands, translating a refused write into an error.
+
+    ``CronService._save`` raises ``CronStoreUnreadable`` rather than silently
+    skipping the write when the last load failed, so every mutating verb here can
+    fail that way. Untranslated it reached the user as a stack trace, which names
+    the raise site but not the one action that fixes it. The exception's own
+    message carries that remediation, so it is surfaced verbatim.
+
+    One wrapper rather than a handler per verb: `add`, `update`, `remove`,
+    `pause`, `resume` and `adopt` all persist through the same ``_save``, so
+    catching at the dispatch boundary covers them without eight duplicated
+    blocks, and any verb added later is covered by construction.
+    """
+    try:
+        _cron_dispatch(args)
+    except CronStoreUnreadable as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _cron_dispatch(args: argparse.Namespace) -> None:
     """Dispatch cron subcommands: list, add, remove, pause, resume."""
 
     svc = CronService(base_dir=config_dir())
@@ -830,6 +1187,97 @@ def _cron(args: argparse.Namespace) -> None:
             status = "✅" if j.enabled else "⏸️"
             sched = _format_schedule(j.schedule)
             print(f"  {status} {j.id}  {j.name}  ({sched})  {j.message[:60]}")
+            # Ownership is printed because it decides which surfaces can manage
+            # the job at all: a job with no owning session is outside every chat
+            # session's scope, so `cron_list` from chat does not list it and the
+            # mutating tools answer a deliberately vague "job not found". That is
+            # the intended boundary, but with the field invisible here the CLI
+            # was the only place the state existed and nothing showed it -- which
+            # is what made a normal, correct state read as a job that had
+            # vanished. `cron adopt` is the way back.
+            owner = j.session_key or ""
+            provenance = j.created_by or ""
+            if owner:
+                detail = f"owner: {owner}"
+            else:
+                detail = "owner: none (manage from CLI or the dashboard Schedule page)"
+            if provenance:
+                detail += f"  created by: {provenance}"
+            print(f"      {detail}")
+
+    elif action == "adopt":
+        job_id = args.job_id
+        if getattr(args, "release", False):
+            session_key = ""
+        else:
+            # One flag, two accepted spellings of the same target. A bare slot
+            # name gets the `dashboard:` namespace the delivery consumers strip
+            # back off (messaging.py / the Slack gateway both
+            # removeprefix("dashboard:")), so adding it here is their exact
+            # inverse and needs no lookup. An already-namespaced key passes
+            # through untouched -- there is no second flag for that case,
+            # because a key with no namespace at all could never equal any
+            # caller's session key and so could only ever produce a row nobody
+            # can own.
+            target = (getattr(args, "session_of", None) or "").strip()
+            if not target:
+                print("Error: --session-of requires a session", file=sys.stderr)
+                sys.exit(1)
+            session_key = target if ":" in target else f"dashboard:{target}"
+        if not svc.adopt_job(job_id, session_key):
+            print(f"Error: job not found: {job_id}", file=sys.stderr)
+            sys.exit(1)
+        sel().log_api_access(
+            caller="cli",
+            operation="cron.adopt",
+            outcome="allowed",
+            source="cli",
+            resources=f"job_id={job_id} session_key={session_key or '(released)'}",
+        )
+        if session_key:
+            # Ownership and delivery do not have the same reach. `_owned_by`
+            # matches any namespace, so a Slack or Telegram session can own and
+            # manage a job -- but only a `dashboard:` key resolves to a slot the
+            # delivery path can inject into (both consumers reach a slot with
+            # removeprefix("dashboard:")). Saying "results are delivered there"
+            # for a `slack:` key would be a promise the code does not keep.
+            if session_key.startswith("dashboard:"):
+                print(
+                    f"Job {job_id} now belongs to {session_key}: that session can manage it "
+                    f"and its results are delivered there."
+                )
+                # A typo'd key is accepted by the store but resolves to no slot,
+                # so the job's output would go nowhere -- the same
+                # invisible-delivery state this command exists to recover from.
+                # Warn rather than refuse: the delivery path resolves a live slot
+                # first and only falls back to rehydrating from history, so a
+                # brand-new tab that has not logged anything yet is a legitimate
+                # target and absence of a log does not prove the key is wrong.
+                slot = session_key.removeprefix("dashboard:")
+                try:
+                    known = ConversationLog().has_log(slot)
+                except Exception:
+                    known = True  # cannot tell -> stay quiet rather than cry wolf
+                if not known:
+                    print(
+                        f"Warning: no recorded session named {slot!r}. If that is a typo, "
+                        f"the job's results will not reach anyone -- re-run with the right "
+                        f"key, or `--release` to undo.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(f"Job {job_id} now belongs to {session_key}: that session can manage it.")
+                print(
+                    f"Note: results are not injected into a chat for a "
+                    f"{session_key.split(':', 1)[0]!r} owner -- only a dashboard session is "
+                    f"resolved as a delivery target. Ownership transferred; delivery did not.",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"Job {job_id} released: no owning session, so manage it from the CLI or "
+                f"the dashboard Schedule page."
+            )
 
     elif action == "add":
         every = getattr(args, "every", None)
@@ -838,6 +1286,19 @@ def _cron(args: argparse.Namespace) -> None:
         approval_mode = getattr(args, "approval_mode", "") or ""
         agent = (getattr(args, "agent", "") or "").strip()
         silent = getattr(args, "silent", False)
+        folder_ref = (getattr(args, "folder", "") or "").strip()
+        # Resolve BEFORE add_job so a typo'd folder never leaves an orphaned
+        # job behind. Existing folders only: cron_folders.json is owned by the
+        # dashboard (its state rewrites the file wholesale), so a CLI-side
+        # create could be silently clobbered by the next Schedule-page folder
+        # operation.
+        folder_id = ""
+        if folder_ref:
+            found = lookup_cron_folder_id(folder_ref)
+            if found.error:
+                print(f"Error: {found.error}", file=sys.stderr)
+                sys.exit(1)
+            folder_id = found.folder_id
         if agent and not _AGENT_NAME_RE.match(agent):
             print(
                 "Error: invalid agent name (alphanumeric, hyphens, underscores; 1-64 chars)",
@@ -856,6 +1317,7 @@ def _cron(args: argparse.Namespace) -> None:
                 cron_expr=cron_expr,
                 channel=channel,
                 approval_mode=approval_mode,
+                folder_id=folder_id,
             )
         elif every:
             job = svc.add_job(
@@ -864,6 +1326,7 @@ def _cron(args: argparse.Namespace) -> None:
                 every_secs=every,
                 channel=channel,
                 approval_mode=approval_mode,
+                folder_id=folder_id,
             )
         else:
             print("Provide --every or --cron")
@@ -956,7 +1419,8 @@ def _cron(args: argparse.Namespace) -> None:
             print(f"Job not found: {args.job_id}")
 
     elif action == "remove":
-        if svc.remove_job(args.job_id):
+        removed = svc.remove_job(args.job_id, actor="cli", source="cli")
+        if removed:
             print(f"Removed job: {args.job_id}")
         else:
             print(f"Job not found: {args.job_id}")
@@ -1077,8 +1541,18 @@ def _cron_preview(args: argparse.Namespace) -> None:
                 )
             return result
 
-        def notify(self, message: str) -> None:
-            print(f"[notify suppressed]: {message}")
+        def notify(self, text: str, **kwargs: object) -> dict:
+            # Signature mirrors production ScriptContext.notify: scripts pass routing
+            # kwargs (session="origin" is the documented way for a cron to reach the
+            # chat that created it), so a positional-only stub made preview crash on
+            # the one branch a monitor cron exists for. Redaction mirrors production
+            # too -- this prints to the user's terminal, and kwargs values are
+            # script-supplied. Returns an empty dict: nothing was delivered.
+            safe_text = redact(text)
+            safe_kwargs = json.loads(redact(json.dumps(kwargs))) if kwargs else {}
+            routing = f" (kwargs: {safe_kwargs})" if safe_kwargs else ""
+            print(f"[notify suppressed]: {safe_text}{routing}")
+            return {}
 
         def close(self):
             pass
@@ -1109,6 +1583,60 @@ def _cron_preview(args: argparse.Namespace) -> None:
         )
     if outcome == "error":
         sys.exit(1)
+
+
+_TIME_SELECTOR_RE = re.compile(r"(?i)\A(?P<value>\d+)(?P<unit>[smhdw])\Z")
+_TIME_SELECTOR_UNITS = {
+    "s": 1,
+    "m": 60,
+    "h": 3600,
+    "d": 86400,
+    "w": 604800,
+}
+
+
+def parse_time_selector(raw: str, *, now: datetime | None = None) -> datetime | None:
+    """Resolve a ``--since``/``--until`` selector to an aware UTC datetime.
+
+    Accepts a relative AGE (``30m``, ``2h``, ``7d``, ``1w``) meaning "that long
+    ago", or an absolute ISO 8601 instant (``2026-08-21``,
+    ``2026-08-21T04:00:00Z``). Empty input means "no bound" and returns ``None``.
+
+    A bare ISO date/time with no offset is read as UTC — the audit log is written
+    in UTC, so interpreting it as local time would silently shift the window by
+    the host's offset. ``Z`` is normalized because ``fromisoformat`` only accepts
+    it from Python 3.11 and this package supports 3.10.
+
+    Raises ``ValueError`` with the accepted forms spelled out, so a typo gets a
+    usable message instead of an empty result the caller reads as "no events".
+    An absurd but well-formed age (``999999999999999999w``) overflows
+    ``timedelta``; that surfaces as the same ``ValueError`` rather than an
+    uncaught ``OverflowError`` traceback, so the CLI still exits 2 with guidance.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    match = _TIME_SELECTOR_RE.match(text)
+    if match:
+        seconds = int(match.group("value")) * _TIME_SELECTOR_UNITS[match.group("unit").lower()]
+        try:
+            return (now or datetime.now(tz=timezone.utc)) - timedelta(seconds=seconds)
+        except (OverflowError, OSError):
+            raise ValueError(
+                f"{raw!r} is too far in the past to represent. Use a smaller age "
+                "(30m, 2h, 7d, 1w) or an ISO 8601 instant."
+            ) from None
+    iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError:
+        raise ValueError(
+            f"cannot read {raw!r} as a time. Use a relative age (30m, 2h, 7d, 1w) "
+            "or an ISO 8601 instant (2026-08-21, 2026-08-21T04:00:00Z)."
+        ) from None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _security(args: argparse.Namespace) -> None:
@@ -1152,11 +1680,26 @@ def _security(args: argparse.Namespace) -> None:
     elif action == "events":
 
         limit = getattr(args, "limit", 20)
-        events = sel().recent(limit=limit)
+        try:
+            since = parse_time_selector(getattr(args, "since", "") or "")
+            until = parse_time_selector(getattr(args, "until", "") or "")
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            sys.exit(2)
+        if since and until and since >= until:
+            print("❌ --since must be earlier than --until")
+            sys.exit(2)
+        events = sel().recent(limit=limit, since=since, until=until)
+        window = ""
+        if since or until:
+            window = (
+                f" in [{since.isoformat() if since else '-'}, "
+                f"{until.isoformat() if until else 'now'})"
+            )
         if not events:
-            print("No security events recorded.")
+            print(f"No security events recorded{window}.")
             return
-        print(f"📋 Last {len(events)} security event(s):\n")
+        print(f"📋 Last {len(events)} security event(s){window}:\n")
         for e in events:
             ts = e.get("timestamp", "?")[:19]
             etype = e.get("event_type", "?")
@@ -1171,14 +1714,35 @@ def _security(args: argparse.Namespace) -> None:
                 print(f"    downstream: {e['downstream_service']}")
     elif action == "verify":
 
-        total, valid = sel().verify_integrity()
-        if total == 0:
+        # detailed=True: a segment dir that refused to pin (or was swapped
+        # mid-verification) leaves the ROTATED segments unchecked, and the
+        # command whose job is to surface tampering must not call that run
+        # "intact" over the live log alone (#5051 review).
+        result = sel().verify_integrity(detailed=True)
+        if not result.history_verifiable:
+            # The live-log clause is derived from the SAME pass's counts, so
+            # it can never claim "intact" over entries that did not verify.
+            if result.total and result.total != result.valid:
+                live = (
+                    f"the live log shows tampered entries: "
+                    f"{result.valid}/{result.total} entries valid"
+                )
+            elif result.total:
+                live = f"the live log verified intact: {result.valid}/{result.total} entries"
+            else:
+                live = "no events to verify"
+            print(
+                f"⚠️  Audit history UNVERIFIABLE: {result.reason}. "
+                f"Rotated segments were not checked — {live}."
+            )
+        elif result.total == 0:
             print("No security events to verify.")
-        elif total == valid:
-            print(f"✅ HMAC chain intact: {total} entries verified.")
+        elif result.total == result.valid:
+            print(f"✅ HMAC chain intact: {result.total} entries verified.")
         else:
             print(
-                f"⚠️  HMAC chain COMPROMISED: {valid}/{total} entries valid, {total - valid} tampered."
+                f"⚠️  HMAC chain COMPROMISED: {result.valid}/{result.total} entries "
+                f"valid, {result.total - result.valid} tampered."
             )
     else:
         print("Usage: kirocrew security {audit|deny-list|events|verify}")
@@ -1188,7 +1752,7 @@ def _print_denied_command_summary(*, ids: bool) -> None:
     """Print the built-in denied-command catalog as grouped counts (or, with
     ``--ids``, each category's rule ids).
 
-    The 139 built-in rules are visible and configurable to the USER (Settings
+    The built-in rules are visible and configurable to the USER (Settings
     → Security renders them in category accordions, backed by
     ``GET /api/security/denied-commands``) but were invisible to the AGENT --
     ``policy show`` reported everything except them, so an agent planning a
@@ -1336,8 +1900,127 @@ def _policy(args: argparse.Namespace) -> None:
         for scope in sorted(prof.controls):
             print(f"   • {scope}: {prof.controls[scope]}")
 
+    elif action == "source":
+        _print_policy_source()
+
+    elif action == "fetch":
+        _policy_fetch(force=getattr(args, "force", False))
+
     else:
-        print("Usage: kirocrew policy {show|validate|explain <scope> <item>|profile <name>}")
+        print(
+            "Usage: kirocrew policy {show|validate|explain <scope> <item>|"
+            "profile <name>|source|fetch}"
+        )
+
+
+def _print_policy_source() -> None:
+    """Report whether this host follows a centrally distributed ceiling.
+
+    Prints the source's SCHEME rather than its URL, matching what the dashboard
+    viewer exposes: this command is reachable from a shell the agent may drive, and
+    the endpoint is the fleet's control plane. An operator who needs the URL reads
+    it from the policy file or the environment, out of band.
+    """
+    from kiro_crew.platform.policy_distribution import (
+        POLICY_URL_ENV,
+        distribution_posture,
+        registered_policy_schemes,
+    )
+
+    posture = distribution_posture()
+    if posture.get("error_code"):
+        print(
+            "⚠️  Central policy distribution is misconfigured; see the gateway log "
+            "for the reason and check the 'distribution' block in your policy."
+        )
+        return
+    if not posture.get("configured"):
+        print("Central policy distribution: not configured (this host uses a local policy).")
+        print(
+            f"   Set {POLICY_URL_ENV}, or add a 'distribution' block to the policy, to enable it."
+        )
+        print(f"   Transports available: {', '.join(registered_policy_schemes())}")
+        return
+
+    interval = posture.get("refresh_interval_seconds") or 0
+    print("🌐 Central policy distribution: ACTIVE")
+    print(f"   transport        : {posture.get('source_scheme') or '—'}")
+    print(f"   refresh          : {f'every {interval}s' if interval else 'at boot only'}")
+    print(f"   polling now      : {'yes' if posture.get('refresher_running') else 'no'}")
+    max_age = posture.get("max_cache_age_seconds") or 0
+    print(f"   staleness bound  : {f'{max_age}s' if max_age else 'none'}")
+    print(f"   if unavailable   : {posture.get('on_unavailable')}")
+    if posture.get("cache_present"):
+        print(f"   cached copy      : {posture.get('cache_age_seconds')}s old")
+    else:
+        print("   cached copy      : none (an outage would leave this host with no ceiling)")
+    if posture.get("last_refresh_status"):
+        print(
+            f"   last refresh     : {posture['last_refresh_status']} "
+            f"({posture.get('last_refresh_age_seconds')}s ago)"
+        )
+
+
+def _policy_fetch(*, force: bool) -> None:
+    """Fetch the central policy now, applying it when it is usable.
+
+    Exits non-zero on a refusal or an unreachable source so this is usable as a
+    fleet-verification step in a config-management run: an admin rolling a change
+    needs a check that FAILS on the host that did not take it, not one that prints
+    a warning into a log nobody reads.
+
+    **What it can and cannot claim.** ``refresh_now`` installs the ceiling in the calling
+    process, and this process exits immediately — so a bare "applied" would overclaim: a
+    running gateway is a different process and keeps its own ceiling until its refresher
+    polls. What this command really establishes is that the endpoint serves a document
+    this host accepts, and that the document is now the host's last-known-good. The
+    message says which of those happened and when a running gateway takes it, because a
+    boot-only source (no ``refresh_interval_secs``) has no next cycle to take it on.
+    """
+    from kiro_crew.platform.policy_distribution import (
+        REFRESH_APPLIED,
+        REFRESH_NOT_CONFIGURED,
+        REFRESH_REJECTED,
+        REFRESH_UNCHANGED,
+        effective_refresh_interval,
+        refresh_now,
+    )
+
+    outcome = refresh_now(force=force)
+    if outcome.status == REFRESH_NOT_CONFIGURED:
+        print("Central policy distribution is not configured; nothing to fetch.")
+        return
+    if outcome.status == REFRESH_UNCHANGED:
+        print("✅ The central policy is unchanged; this host is current.")
+        if outcome.detail:
+            print(f"   {outcome.detail}")
+        return
+    if outcome.status == REFRESH_APPLIED:
+        print("✅ Fetched a valid governance ceiling and cached it as this host's own.")
+        if outcome.signature_state:
+            print(f"   provenance: {outcome.signature_state}")
+        interval = effective_refresh_interval()
+        if interval:
+            print(
+                f"   A running gateway adopts it within {interval}s, on its next refresh; "
+                "a newly started one adopts it immediately."
+            )
+        else:
+            print(
+                "   This source is boot-only (no refresh_interval_secs), so a gateway "
+                "already running keeps its current ceiling until it is restarted. Set a "
+                "refresh interval if a push should bind without one."
+            )
+        return
+    # Rejected or unreachable. The running ceiling is untouched either way, which
+    # is worth saying: an operator reading a failure needs to know whether the host
+    # is now ungoverned (it is not).
+    # "was refused", not "refused": the policy is the object of the refusal, not the
+    # thing doing it.
+    label = "was refused" if outcome.status == REFRESH_REJECTED else "could not be reached"
+    print(f"❌ The central policy {label}: {outcome.detail}")
+    print("   The ceiling already in effect is unchanged.")
+    raise SystemExit(1)
 
 
 async def _run_eval(args: argparse.Namespace) -> None:
@@ -1446,6 +2129,33 @@ async def _run_eval(args: argparse.Namespace) -> None:
     print(f"\nResults saved to:\n  {report_path}\n  {json_path}")
 
 
+# Appended to every `learn add` output that wrote something. This command builds
+# its store with no embed_fn (loading the embedding model would add its startup
+# cost to every CLI invocation), so an insert lands with a NULL vector and an
+# enrichment CLEARS the stored one (the upsert keeps a vector only when the value
+# is unchanged). Either way the row is repaired by the gateway's boot-time
+# re-embed sweep, not by this process — an unqualified success message would
+# overstate what happened, and a user searching semantically before the next
+# gateway start would not find the lesson they were just told was saved.
+# "once its embedding backend is ready" is the sweep's own guarantee, not
+# hedging: _wait_then_backfill defers the sweep to a later boot when the
+# embedding model has not landed, so "on its next start" would over-promise.
+_LEARN_EMBED_NOTE = (
+    "  Stored and keyword-searchable now; the embedding vector is filled by the\n"
+    "  gateway's re-embed sweep after it next starts, once its embedding backend\n"
+    "  is ready."
+)
+
+# INSERTED only. An enrichment resolves against the ONE existing row it rewrites
+# (write_lesson pass 1 sets ``matched`` and pass 2's generic scan runs over
+# ``[] if matched else lesson_rows``), so the substring/topic-overlap claim is
+# true only for an insert — printing it on ENRICHED would report checks that
+# never ran, the same defect this change fixes.
+_LEARN_DEDUP_NOTE = (
+    "  (Semantic dedup did not run at write time; substring/topic-overlap dedup\n" "  still did.)"
+)
+
+
 def _learn(args: argparse.Namespace) -> None:
     """Save, list, or remove learned corrections."""
 
@@ -1460,23 +2170,121 @@ def _learn(args: argparse.Namespace) -> None:
             rule = args.rule
             category = args.category
             negative = getattr(args, "negative", None)
-            if vs.write_lesson(rule, category, negative):
-                neg = f" ({negative})" if negative else ""
-                print(f"Saved: {rule}{neg} [{category}]")
-            else:
-                lesson = Lesson(
-                    ts=datetime.now(timezone.utc).isoformat(),
-                    rule=rule,
-                    category=category,
-                    negative=negative,
+            # The reporting form, not the bool. This command used to read EVERY falsy
+            # return as "the vector store did not take it" and write a second record
+            # into lessons.jsonl. Most of those returns mean the opposite -- the
+            # lesson is already stored exactly as submitted -- so the fallback wrote a
+            # redundant record for a lesson that was fine, and printed "Saved:" when
+            # nothing needed saving.
+            #
+            # The one return that really does mean "nothing was stored" is a REFUSAL,
+            # and routing that into the JSONL store was worse than redundant: that
+            # store validates no content at all, so a value this store rejected (an
+            # injection-pattern clause) landed there anyway, and the context builder
+            # reads lessons.jsonl whenever the vector store holds no lessons.
+            #
+            # So the fallback is REMOVED, not narrowed. There is no "vector store
+            # unavailable" state to fall back from here: ``vs`` is constructed and
+            # ``init()``-ed unconditionally above, which means a falsy return was the
+            # only way into that branch.
+            result = vs.write_lesson(rule, category, negative)
+            neg = f" ({negative})" if negative else ""
+            # What the save COST. The store's dedup rules tombstone a stored lesson
+            # the submitted rule contains or heavily overlaps, and this command
+            # printed "Saved:" and the dedup NOTE below without ever naming the rule
+            # it removed -- so adding a conditional rule retired the general rule
+            # inside it and the only trace was a row with is_deleted=1. Printed in
+            # full for every outcome that can carry it, because the row is a
+            # tombstone: `learn list` cannot show it and this is the last readable
+            # copy.
+            lost = ""
+            if result.superseded:
+                # Strip terminal controls FIRST, then redact. The order is the whole
+                # correctness of this function, and the intuitive order is the wrong
+                # one: redacting first leaves `AKIA<CSI>IOSFODNN7EXAMPLE` untouched,
+                # because the escape breaks the token so the credential regex does not
+                # match it -- and the control-strip then REASSEMBLES the complete
+                # credential and prints it. Measured: redact-then-strip leaks that
+                # input verbatim; strip-then-redact masks it. Stripping can only ever
+                # JOIN characters, never split a token, so running it first can only
+                # help the regex, never hide a credential from it.
+                #
+                # Both treatments are needed, and both were added in response to a
+                # real finding: an OSC payload stored in a rule would otherwise be
+                # interpreted by the terminal, and a credential in a lesson would
+                # otherwise be printed. This block prints a rule the user did NOT ask
+                # to see, on the one path guaranteed to surface it.
+                #
+                # Redacting at all (rather than control-stripping only) reversed an
+                # earlier decision here. `learn list` prints every stored lesson with
+                # control-stripping alone, and that looked like the convention to
+                # match -- but it is an EXPLICIT request to see the store, while this
+                # block surfaces a lesson the user is about to lose. The right
+                # comparison is the route, which delivers the SAME field and does
+                # redact, so controls-only made one feature's two delivery paths
+                # disagree about whether a superseded rule may carry a secret. A lesson
+                # written by history consolidation also holds model output the user
+                # never typed, so "their own store" is not "their own knowledge".
+                def _safe(text: str) -> str:
+                    text = _TERMINAL_CTRL_RE.sub("", text)
+                    text, _ = redact_exfiltration_urls(text)
+                    text, _ = redact_credentials(text)
+                    return text
+
+                lines = "".join(f"\n    - {_safe(s)}" for s in result.superseded)
+                lost = (
+                    f"\n  REMOVED {len(result.superseded)} stored "
+                    f"lesson{'s' if len(result.superseded) != 1 else ''} this rule "
+                    f"contains or overlaps:{lines}\n"
+                    "  Those are no longer in effect. A verbatim re-add is DECLINED "
+                    "while this rule is stored, so to restore one exactly, "
+                    "`learn remove` this rule first; wording that shares few "
+                    "significant words with it can coexist."
                 )
-                # save_or_enrich, not save: `learn add --negative` is explicit user
-                # intent, so a re-submitted rule should get the clause attached
-                # rather than be skipped as a duplicate. save() keeps the skip
-                # semantics for automatic writers.
-                jsonl_store.save_or_enrich(lesson)
-                neg = f" ({lesson.negative})" if lesson.negative else ""
-                print(f"Saved: {lesson.rule}{neg} [{lesson.category}]")
+            # The category is echoed ONLY where the store adopted the submitted one.
+            # It is write-once (vector_memory.py builds an enrichment with the STORED
+            # category, falling back to the submitted one only when the row has none),
+            # so an insert is the single outcome where what was typed is what is held.
+            # Anything else printing it would show a value the store may not have --
+            # the same defect this PR fixes on the reporting side. `learn list` is
+            # where stored values belong.
+            if result.outcome is LessonWriteOutcome.INSERTED:
+                print(
+                    f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n"
+                    f"{_LEARN_DEDUP_NOTE}{lost}"
+                )
+            elif result.outcome is LessonWriteOutcome.ENRICHED:
+                # No _LEARN_DEDUP_NOTE here: an enrichment matched its existing row in
+                # pass 1, which SKIPS the generic dedup scan. Instead say what the
+                # rewrite cost — the upsert cleared the vector the row already had.
+                print(
+                    f"Updated the stored lesson with this clause: {rule}{neg}\n"
+                    "  The stored category is kept; `learn list` shows it.\n"
+                    "  This rewrite cleared the row's existing embedding vector.\n"
+                    + _LEARN_EMBED_NOTE
+                )
+            elif result.outcome is LessonWriteOutcome.UNCHANGED:
+                # Nothing was written, and the store keeps the stored category and
+                # NOT-clause rather than rewriting them on a re-submit.
+                print(
+                    f"Already stored, nothing written: {rule}\n"
+                    "  A re-submit keeps the stored category and NOT-clause; "
+                    "changing one means `learn remove` then `learn add`."
+                )
+            elif result.outcome is LessonWriteOutcome.DEDUPED:
+                covered = f"Not saved: an existing lesson already covers this ({result.reason})"
+                print(f"{covered}{lost}")
+            else:
+                # REFUSED -- and any outcome a later change adds, which is deliberate:
+                # every branch above names ONE outcome, so a new one lands here and
+                # exits non-zero rather than being silently reported as a success. A
+                # non-zero exit so a script driving this command sees the failure.
+                reason = f" ({result.reason})" if result.reason else ""
+                print(
+                    f"NOT saved: the memory store refused this lesson{reason}{lost}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
         elif action == "list":
             vs_lessons = vs.get_lessons()
@@ -1508,7 +2316,9 @@ def _learn(args: argparse.Namespace) -> None:
                     # the dashboard's JSONL path: a blank/legacy category gets
                     # the store's own "knowledge" default instead of printing [].
                     category = normalize_lesson_category(le.category, strict=False)
-                    print(f"  [{_TERMINAL_CTRL_RE.sub('', category)}] {_TERMINAL_CTRL_RE.sub('', str(le.rule))}{neg}")
+                    print(
+                        f"  [{_TERMINAL_CTRL_RE.sub('', category)}] {_TERMINAL_CTRL_RE.sub('', str(le.rule))}{neg}"
+                    )
 
         elif action == "remove":
             if vs.get_lessons() and vs.delete_lesson(args.query):
@@ -1524,14 +2334,109 @@ def _learn(args: argparse.Namespace) -> None:
         vs.close()
 
 
+def _markdown_memory_store() -> MemoryStore:
+    """MemoryStore anchored where the DEFAULT runtime writer writes.
+
+    The markdown layer this surface exposes is written by the gateway's
+    consolidator, which is constructed over a bare ``MemoryStore()`` (the
+    hard-coded ``workspace`` dir under the data home). The reader must resolve
+    identically or an install whose config maps the default workspace
+    elsewhere would export a tree the consolidator never writes to. In a stock
+    config this is the same directory ``workspace_dir_for()`` returns; when
+    they diverge, the writer wins.
+    """
+    return MemoryStore()
+
+
+def _memory_search_history(args: argparse.Namespace) -> None:
+    """Print FTS5 hits from the markdown memory layer.
+
+    Reads the same index the heartbeat and gateway keep current, so this needs
+    no embedder and no vector store — it answers "where did I write this word"
+    against preferences, projects and the dated daily-history files.
+
+    Resolves the store through ``_markdown_memory_store`` for the reason spelled
+    out there: the reader must anchor exactly where the gateway's consolidator
+    writes, or a config that remaps the default workspace searches a tree
+    nothing writes to.
+    """
+    store = _markdown_memory_store()
+    results = store.search(args.query, limit=10)
+    if not results:
+        # An empty index is not the same statement as an absent word, so the two
+        # are reported differently.
+        if not store.index_row_count():
+            print("Memory history index is empty or unavailable; nothing was searched.")
+        else:
+            print("No memory-history matches.")
+        return
+    print("  Daily history / preferences / projects:")
+    for r in results:
+        # Strip terminal control sequences for the same reason the semantic
+        # listing does: memory holds whatever the user pasted into a session.
+        path = _TERMINAL_CTRL_RE.sub("", str(r.get("path", "?")))
+        snippet = _TERMINAL_CTRL_RE.sub("", str(r.get("snippet", ""))).strip()
+        print(f"    {path}")
+        if snippet:
+            print(f"        {snippet}")
+
+
+def _memory_show(args: argparse.Namespace) -> None:
+    """Read-only view of the markdown memory layer (preferences/projects/history).
+
+    Routes through :class:`MemoryStore`'s own readers so consumers depend on an
+    interface rather than the on-disk layout. A missing or empty file is a
+    normal state and prints as empty rather than erroring. Validation failures
+    go to stderr with a non-zero exit so scheduled (non-TTY) consumers get a
+    real failure signal instead of non-JSON text on stdout.
+    """
+    target = getattr(args, "target", None)
+    since_raw = getattr(args, "since", None)
+    since = None
+    if since_raw:
+        if target not in (None, "history"):
+            print("--since applies only to history", file=sys.stderr)
+            sys.exit(1)
+        try:
+            since = datetime.strptime(since_raw, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"Invalid --since date (expected YYYY-MM-DD): {since_raw}", file=sys.stderr)
+            sys.exit(1)
+    snapshot = _markdown_memory_store().markdown_snapshot(since=since)
+    if getattr(args, "format", "md") == "json":
+        payload = snapshot[target] if target else snapshot
+        print(json.dumps(payload, indent=2))
+        return
+    parts: list[str] = []
+    for key in [target] if target else ["preferences", "projects", "history"]:
+        if key == "history":
+            parts.extend(e["content"].strip() for e in snapshot[key] if e["content"].strip())
+        elif snapshot[key]["content"].strip():
+            parts.append(snapshot[key]["content"].strip())
+    text = "\n\n".join(parts)
+    if text:
+        # The markdown layer is consolidator (LLM) written — strip terminal
+        # control sequences before printing, same policy as `memory list`.
+        print(_TERMINAL_CTRL_RE.sub("", text))
+
+
 def _memory_cmd(args: argparse.Namespace) -> None:
-    """Manage vector memory system."""
+    """Manage the memory system (vector store + markdown layer)."""
+    action = getattr(args, "mem_action", None)
+    # "show" reads only the markdown layer — don't open (or create) the
+    # vector store for it.
+    if action == "show":
+        _memory_show(args)
+        return
+    # "search --layer history" reads only the markdown FTS index, so don't open
+    # (or create) the vector store for it — same reason as "show" above.
+    if action == "search" and getattr(args, "layer", "all") == "history":
+        _memory_search_history(args)
+        return
     cfg = KiroCrewConfig.load()
     store = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim)
     store.init()
     try:
-        action = getattr(args, "mem_action", None)
-
         if action == "list":
             entries = store.get_all_semantic()
             if not entries:
@@ -1548,22 +2453,36 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                 if str(e["key"]).startswith("lesson."):
                     val = _lesson_display_text(val) or val
                 safe_val = _TERMINAL_CTRL_RE.sub("", str(val))
-                print(f"  {e['key']}: {safe_val}  (confidence={e['confidence']}, source={e['source']})")
+                print(
+                    f"  {e['key']}: {safe_val}  (confidence={e['confidence']}, source={e['source']})"
+                )
 
         elif action == "search":
-            results = store.search_episodic(query_text=args.query, limit=10)
-            if not results:
-                print("No episodic memories found.")
-                return
-            for r in results:
-                tags = (
-                    json.loads(r.get("tags", "[]"))
-                    if isinstance(r.get("tags"), str)
-                    else r.get("tags", [])
-                )
-                print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
-                if tags:
-                    print(f"        tags: {', '.join(tags)}")
+            layer = getattr(args, "layer", "all")
+            if layer in ("vector", "all"):
+                results = store.search_episodic(query_text=args.query, limit=10)
+                if not results:
+                    print("No episodic memories found.")
+                    # Under "all" the markdown layer is still to come: an empty
+                    # vector result is not an empty answer.
+                    if layer == "vector":
+                        return
+                elif layer == "all":
+                    # Both sections are printed, so both are named. Unlabelled,
+                    # the first block of hits reads as the whole answer. Held
+                    # back under "vector", whose output shape is a promise.
+                    print("  Episodic recall:")
+                for r in results:
+                    tags = (
+                        json.loads(r.get("tags", "[]"))
+                        if isinstance(r.get("tags"), str)
+                        else r.get("tags", [])
+                    )
+                    print(f"  [{r.get('importance', 0):.1f}] {r['text'][:120]}")
+                    if tags:
+                        print(f"        tags: {', '.join(tags)}")
+            if layer == "all":
+                _memory_search_history(args)
 
         elif action == "stats":
             stats = store.memory_stats()
@@ -1579,6 +2498,21 @@ def _memory_cmd(args: argparse.Namespace) -> None:
             else:
                 print("  FAISS accelerator: not installed — stdlib cosine fallback (exact)")
             print(f"  Audit events: {stats['events_count']}")
+            reads = store.read_counters()
+            # This process only: the store was constructed for this command, so
+            # the totals describe the reads this invocation itself performed, not
+            # the store's lifetime. The gateway's own totals are the `reads`
+            # object on GET /api/memory/observability.
+            print(
+                f"  Reads (this process): {reads['rows_read']} rows over "
+                f"{reads['statements_executed']} statements"
+            )
+            print(
+                f"    population scans: semantic {reads['semantic_full_scans']}"
+                f" ({reads['semantic_rows_read']} rows),"
+                f" episodic {reads['episodic_full_scans']}"
+                f" ({reads['episodic_rows_read']} rows)"
+            )
 
         elif action == "audit":
             findings = scan_memory()
@@ -1591,11 +2525,15 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                 print("✅ No suspicious content in memory.")
 
         elif action == "export":
-            data = {
+            data: dict[str, object] = {
                 "semantic": store.get_all_semantic(),
                 "episodic": store.get_episodic_list(limit=10000),
                 "events": store.get_events(limit=1000),
             }
+            if getattr(args, "include_markdown", False):
+                # Opt-in so the default payload shape stays byte-identical
+                # for existing consumers.
+                data["markdown"] = _markdown_memory_store().markdown_snapshot()
             output = json.dumps(data, indent=2, default=str)
             out_file = getattr(args, "output", None)
             if out_file:
@@ -1626,9 +2564,17 @@ def _memory_cmd(args: argparse.Namespace) -> None:
             print(f"  Semantic: {counts['semantic']}")
             print(f"  Episodic: {counts['episodic']}")
             print(f"  Skipped:  {counts['skipped']}")
+            if "markdown" in data:
+                # The markdown collection is export-only: the markdown layer is
+                # consolidator-owned, so import never writes it. Say so rather
+                # than letting a backup/restore silently drop it.
+                print(
+                    "Note: the 'markdown' collection is export-only and was NOT imported "
+                    "(the markdown memory layer has no write path here)."
+                )
 
         else:
-            print("Usage: kirocrew memory {list|search|stats|audit|export|migrate|import}")
+            print("Usage: kirocrew memory {list|search|show|stats|audit|export|migrate|import}")
     finally:
         store.close()
 
@@ -1641,7 +2587,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     action = getattr(args, "artifact_action", None) or "list"
 
-    headers: dict[str, str] = {"X-Internal-Secret": _internal_secret()}
+    headers: dict[str, str] = {"X-Internal-Secret": _internal_secret(port)}
 
     def _request(method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode() if body is not None else None
@@ -1733,6 +2679,13 @@ def _artifact(args: argparse.Namespace) -> None:
             "content": _read_content(args),
             "tags": _parse_tags(getattr(args, "tags", None)),
         }
+        # An explicit --slug is forwarded whenever it is not None, INCLUDING the
+        # empty string. "" is a slug the caller named, not a request to derive
+        # one, and the store refuses it; truthy filtering would swallow it and
+        # silently take the derive-and-suffix branch instead.
+        slug_arg = getattr(args, "slug", None)
+        if slug_arg is not None:
+            body["slug"] = slug_arg
         for k in ("kind", "description"):
             v = getattr(args, k, None)
             if v:
@@ -1741,7 +2694,37 @@ def _artifact(args: argparse.Namespace) -> None:
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
-        print(f"Saved: slug={d.get('slug', '?')} version={d.get('version', 1)}")
+        slug = d.get("slug", "?")
+        print(f"Saved: slug={slug} version={d.get('version', 1)}")
+        # Present only when the slug was derived from --name, because that is the
+        # branch where a taken slug resolves by suffixing. That reads as success
+        # (exit 0, "version=1"), which is how a re-save of corrected content ends
+        # up published at a slug nobody looks at while the original keeps serving
+        # the old text. Name the slug that was taken and the verb that versions in
+        # place. An explicit --slug cannot land here: the store refuses it rather
+        # than renaming — 409 when the slug is taken, 400 when it is malformed
+        # (the empty string included) — so both surface on the error path above.
+        taken = d.get("slug_collided_with")
+        if taken:
+            print(
+                f"Warning: slug '{taken}' is already taken, so this created a NEW "
+                f"artifact at '{slug}' rather than a new version of '{taken}'. "
+                f"To version the existing artifact in place, use: "
+                f"kirocrew artifact update {taken}",
+                file=sys.stderr,
+            )
+        # Relayed from the gateway (same pattern as slug_collided_with): the
+        # handler computes the theme-contrast verdict at the convergence
+        # point, so this CLI path -- the one the motivating incident traveled
+        # -- hears it without duplicating the detector. Advisory only.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "update":
@@ -1773,6 +2756,17 @@ def _artifact(args: argparse.Namespace) -> None:
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
         print(f"Updated: slug={d.get('slug', slug)} version={d.get('version', '?')}")
+        # Relayed from the gateway (see the save action above) -- the PATCH
+        # path is exactly how the motivating incident's script pushed its
+        # hardcoded-palette page. Advisory only; the update succeeded.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "delete":
@@ -2242,3 +3236,42 @@ def _telemetry(args: argparse.Namespace) -> None:
     else:
         print("✅ Anonymous usage beacon DISABLED. Nothing will be sent.")
         print(f"   You can also delete {beacon.INSTALL_ID_FILE} from the data home.")
+
+
+def _handle_secrets(args: argparse.Namespace) -> None:
+    """Dispatch secrets subcommands. Currently only ``import`` (migration)."""
+
+    action = getattr(args, "secrets_action", None)
+
+    if action == "import":
+        # Import ONLY from the fixed data-home .env — never an arbitrary path.
+        # A caller-supplied file would let a sandbox-off agent import attacker
+        # Jira values into the vault and have the vault-first consumer trust
+        # them, so there is deliberately no --file option.
+        # A concurrent .env change or an undecryptable pre-existing vault entry
+        # aborts the migration with MigrationConflictError. That is an expected
+        # operational condition (retry after the concurrent write settles, or
+        # repair the vault entry), so surface it as a clean CLI error with a
+        # nonzero exit — never an uncaught traceback.
+        try:
+            report = migrate_env_secrets(dry_run=not args.apply)
+        except MigrationConflictError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except (OSError, ValueError) as exc:
+            # A truncated/corrupt `secrets.enc` makes the vault's `list_names()`
+            # (or a decrypt) raise `ValueError`/`OSError` rather than
+            # `MigrationConflictError`. Surface it as the same concise CLI error
+            # with a nonzero exit instead of an uncaught traceback — the store is
+            # unreadable, which the operator must repair before importing.
+            print(
+                f"error: could not read the secrets vault "
+                f"({exc.__class__.__name__}: {exc}); repair or remove the vault "
+                f"store, then re-run `kirocrew secrets import --apply`.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(format_report(report))
+    else:
+        print("Usage: kirocrew secrets import [--apply]", file=sys.stderr)
+        sys.exit(1)

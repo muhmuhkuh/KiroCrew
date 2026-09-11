@@ -267,6 +267,46 @@ def _confirmed_host(link: str) -> str:
         return ""
 
 
+def python_command() -> str:
+    """Absolute interpreter the worker must use for the app's ``sage_lib/...`` commands.
+
+    The prompts hand a session on some host shell a command line, so they have to
+    name an interpreter that exists there. ``python3`` does not: neither the
+    python.org installer nor ``python -m venv`` creates a ``python3.exe`` on
+    Windows, where the name instead resolves to a Microsoft Store app-execution
+    alias that runs no Python — the command then produces no result record and
+    the review yields nothing while looking like it ran. ``sys.executable`` is an
+    absolute path to a real interpreter on every platform, so it satisfies that.
+
+    This returns the path RAW, and deliberately does no shell quoting. Quoting
+    requires knowing the worker's shell, which is not pinned: on Windows the
+    session may get PowerShell or cmd, and the two disagree — a quoted path is a
+    string literal needing PowerShell's call operator in one and a syntax error
+    with that operator in the other. Since a Windows profile with a space in it
+    (``C:\\Users\\First Last\\...``) is ordinary rather than exceptional, guessing
+    wrong would restore the same silent no-result failure for a large share of
+    Windows users. The worker knows its own shell, so the prompt tells it to
+    quote as that shell requires.
+    Deliberately NOT the shared ``resolve_app_python(app_root)`` policy, which
+    prefers ``<app_root>/.venv``'s interpreter. ``store.app_root()`` resolves under
+    ``KIROCREW_HOME`` -- the same writable tree the review worker itself writes into,
+    and that worker is prompt-injectable. A worker that planted an executable at
+    ``.venv/Scripts/python.exe`` would have the NEXT review execute it: arbitrary
+    code execution as the gateway plus forged result records, and persistence into
+    a later run rather than a capability it already had. So the interpreter is taken
+    from the process the prompt is built IN, never from a path the worker can write.
+
+    Nothing is given up by declining the venv preference here. That preference
+    exists so an app's own dependencies are importable, and this app has no
+    ``requirements.txt``; the only non-stdlib import anywhere in ``sage_lib`` is
+    ``kiro_crew`` itself, which is importable under ``sys.executable`` by
+    construction because that is the interpreter running the gateway. An app venv
+    would in fact be the weaker choice: it need not have ``kiro_crew`` installed
+    at all, which would fail every ``sage_lib`` import instead of just the review.
+    """
+    return sys.executable
+
+
 def _fetch_instruction(link: str) -> str:
     """Platform-aware FETCH instruction for the gate/deep prompts (GitHub only),
     carrying the link's confirmed host so the worker pulls the PR from ITS
@@ -360,17 +400,22 @@ def build_review_task(change_link: str) -> str:
     separate gated stage; the driver runs neither a gate turn nor a convergence
     loop. The session RECORDS findings only — it never posts (the driver builds the
     Python-redacted bodies and a separate poster publishes them verbatim)."""
+    py = python_command()
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "Do the COMPLETE review of EXACTLY ONE change in a SINGLE thorough pass: "
         + change_link + ". There is NO separate gate and NO follow-up round — cover "
         "everything now, carefully, at maximum thinking effort.\n"
+        "Run every `sage_lib/...` command — the ones below AND the ones the skill "
+        "writes as `<python> ...` — with this interpreter: `" + py + "`. Use that "
+        "absolute path verbatim (quote it as YOUR shell requires if it contains "
+        "spaces); do NOT substitute `python3` or `python`.\n"
         "Load the `sage-review` skill and follow its per-change review ruleset:\n"
         "  1. Self-heal the store; load patterns from active namespaces "
-        "(`python3 sage_lib/learning.py list-for-review`).\n"
+        "(`" + py + " sage_lib/learning.py list-for-review`).\n"
         "  2. Resolve the per-repo rule pack (if any) and apply it as additional rules.\n"
         "  3. Fetch the change — " + _fetch_instruction(change_link) + " — and "
-        "normalize via `python3 sage_lib/pipeline.py prepare --link " + change_link
+        "normalize via `" + py + " sage_lib/pipeline.py prepare --link " + change_link
         + " --payload-file <file>`.\n"
         "  4. DESIGN dimension (THINK DEEPLY — highest leverage): work the change "
         "through the skill's `Deep design reasoning` lenses (architectural fit, "
@@ -417,7 +462,7 @@ def build_review_task(change_link: str) -> str:
         "  8. If this change is itself a FIX (is_fix), run INLINE miss-analysis "
         "(learn-from-sage): trace the introducing change, ask which dimension was "
         "blind, and STAGE the learning "
-        "(`python3 sage_lib/learning.py stage --file <pattern.json> --source fix_introduce`) "
+        "(`" + py + " sage_lib/learning.py stage --file <pattern.json> --source fix_introduce`) "
         "— NOT applied to the live ruleset until a human consolidates.\n"
         "Do NOT spawn further subagents. Execute; do not ask questions."
     )
@@ -429,16 +474,21 @@ def build_review_followup_task(change_link: str) -> str:
     changed files and APPENDS only net-new findings (never repeats/removes existing
     ones), then marks coverage complete. It runs at most one targeted pass,
     signal-driven, not count-delta-driven."""
+    py = python_command()
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "A prior pass reviewed EXACTLY ONE change: " + change_link + " but reported "
         "INCOMPLETE file coverage (coverage_complete=false) in data/results/<id>.json.\n"
+        "Run every `sage_lib/...` command — the ones below AND the ones the skill "
+        "writes as `<python> ...` — with this interpreter: `" + py + "`. Use that "
+        "absolute path verbatim (quote it as YOUR shell requires if it contains "
+        "spaces); do NOT substitute `python3` or `python`.\n"
         "Load the `sage-review` skill and follow its per-change review ruleset:\n"
         "  1. Self-heal the store; load patterns "
-        "(`python3 sage_lib/learning.py list-for-review`).\n"
+        "(`" + py + " sage_lib/learning.py list-for-review`).\n"
         "  2. Resolve the per-repo rule pack (if any) and apply it as additional rules.\n"
         "  3. Fetch the change — " + _fetch_instruction(change_link) + " — and "
-        "normalize via `python3 sage_lib/pipeline.py prepare --link " + change_link
+        "normalize via `" + py + " sage_lib/pipeline.py prepare --link " + change_link
         + " --payload-file <file>`. READ the existing record: its `findings` and "
         "`files_covered`.\n"
         "  4. Review ONLY the changed files NOT already in `files_covered`, against "
@@ -987,7 +1037,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                concurrency: int = 0, timeout: int = DEFAULT_TASK_TIMEOUT,
                generate_report: bool = True, root: Path | None = None,
                progress=None, run_id: str | None = None, cancelled=None,
-               post: bool | None = None, confirm=None) -> dict:
+               post: bool | None = None, confirm=None, preflight=None) -> dict:
     """Two-stage per change (bounded concurrency): a Phase-1 gate task, then a
     Phase-2 deep-review task for every usable verdict (PASS / CONCERNS / BLOCK).
     Each task is dispatched to the reusable worker pool (``dispatch``) and the
@@ -1015,7 +1065,16 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     published back to the pull request as a PENDING (draft) review only when it is
     enabled. It defaults to OFF, because the review is meant to be READ in the
     app, and writing to a pull request is a side effect the user asks for rather
-    than a consequence of running a review."""
+    than a consequence of running a review.
+
+    ``preflight`` is an optional zero-arg callable returning ``""`` when the
+    runtime the dispatched sessions need is available, else a message naming
+    what is missing (the app backend wires ``review_pool.runtime_preflight``).
+    A non-empty answer fails the run fast — every change is recorded as
+    ``runtime_unavailable`` with that message, and nothing is dispatched — so a
+    host that cannot spawn a reviewer reports the cause instead of completing
+    with nothing written. ``None`` (tests, callers owning their own dispatch)
+    skips the check."""
     if run_id:
         store.ensure_run_layout(run_id, root)
     store.ensure_layout(root)
@@ -1025,6 +1084,35 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     dispatch = dispatch or _unconfigured_dispatch
     progress = progress or (lambda *a, **k: None)   # (change_id, phase, extra) sink
     is_cancelled = cancelled or (lambda: False)
+
+    # Fail-fast runtime preflight. Runs BEFORE the clean-slate resets below, so a
+    # host that cannot spawn a reviewer keeps its previous report and staged
+    # records intact, and every change carries a reason that names the missing
+    # runtime instead of the untriageable "produced no result record".
+    runtime_error = str(preflight() or "") if preflight is not None else ""
+    if runtime_error:
+        failed_records: list[dict] = []
+        for link in changes:
+            change_id = _cid(link)
+            progress(change_id, "failed", {
+                "error": runtime_error, "reason": "runtime_unavailable"})
+            failed_records.append({
+                "change": link, "change_id": change_id,
+                "gate_spawn_ok": False, "gate_error": runtime_error,
+                "gate_verdict": "UNKNOWN", "phase2_ran": False,
+                "deep_spawn_ok": False, "deep_error": runtime_error,
+                "deep_reviewed": False, "result_recorded": False,
+                "design_block": False, "deep_rounds": 0,
+                "skipped_reason": "runtime_unavailable",
+            })
+        return {
+            "ok": False, "error": runtime_error,
+            "changes": len(failed_records), "gate_spawns": 0, "deep_spawns": 0,
+            "design_blocked": 0, "phase2_skipped_on_block": 0, "cancelled": 0,
+            "deep_reviewed": 0, "deep_rounds": 0, "design_comments_posted": 0,
+            "result_records": 0, "failures": failed_records,
+            "per_change": failed_records,
+        }
 
     # Whether to publish findings back to the pull request. Read ONCE per run so a
     # mid-run config edit cannot post some PRs and not others. Explicit `is True`
@@ -1125,7 +1213,8 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
             review_prompt = build_review_task(link)
         except pipeline.adapters.AdapterError as exc:
             refused = f"refusing to review: {exc}"
-            progress(change_id, "failed", {"error": refused})
+            progress(change_id, "failed", {
+                "error": refused, "reason": "review_failed"})
             return {
                 "change": link, "change_id": change_id,
                 "gate_spawn_ok": False, "gate_error": refused,
@@ -1177,11 +1266,29 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # already-written verdicts/findings.
         if not review_spawn.get("ok", False):
             rec["skipped_reason"] = "review_failed"
-            progress(change_id, "failed", {"error": review_spawn.get("error", "review failed")})
+            progress(change_id, "failed", {
+                "error": review_spawn.get("error", "review failed"),
+                "reason": "review_failed"})
             return rec
         if not rec["deep_reviewed"]:
-            rec["skipped_reason"] = "no_review_recorded"  # turn completed but wrote no review
-            progress(change_id, "failed", {"error": "review produced no result record"})
+            if rev_rec is None:
+                # Turn completed but wrote no record at all — the residual case
+                # (a genuinely empty review, or a worker whose commands ran no
+                # Python). Kept as the ``no_review_recorded`` value existing
+                # consumers key on; environment failures are discriminated by
+                # the preflight before any dispatch.
+                rec["skipped_reason"] = "no_review_recorded"
+                progress(change_id, "failed", {
+                    "error": "review produced no result record",
+                    "reason": "no_review_recorded"})
+            else:
+                # A record landed but never marked the review complete: the
+                # worker got far enough to write, then stopped short. Distinct
+                # from "wrote nothing" so the two can be triaged apart.
+                rec["skipped_reason"] = "review_record_incomplete"
+                progress(change_id, "failed", {
+                    "error": "review wrote a result record but never completed the review",
+                    "reason": "review_record_incomplete"})
             return rec
 
         # --- Bounded coverage backstop: AT MOST ONE targeted follow-up, and only

@@ -20,15 +20,17 @@ rather than a pool of per-worker ``AcpClient`` processes. Design:
     tool permission is auto-approved; and because the runtime layer has no
     ``audit_source``, the pool emits its own per-tool SEL audit.
 
-These sessions are created directly on the runtime — NOT via the gateway's
+Kiro reviews use sessions created directly on one runtime — NOT via the
 ``/api/spawn`` / ``SubagentManager`` path — so they never produce an agent card,
-a ``:lock:`` approval prompt, a Slack relay, or a 30-minute reaper slot. The
-review runs silently.
+a ``:lock:`` approval prompt, a Slack relay, or a 30-minute reaper slot. When
+KiroCrew is configured for Pi, reviews use the configured Pi ACP adapter instead
+of accidentally starting a Kiro runtime with a foreign model pin.
 
 The executor is async; the (synchronous, threaded) review driver bridges to it
 via ``asyncio.run_coroutine_threadsafe`` on the gateway event loop, and brackets
 each run with ``begin_batch()`` / ``end_batch()``. See ``backend/routes.py``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,8 +38,9 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any
 
 # The app root holds ``sage_lib/``; put it on sys.path so ``from sage_lib import store``
 # resolves on import (mirrors the sys.path setup in sibling ``review_driver.py``).
@@ -46,8 +49,10 @@ if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
 
 try:
+    from kiro_crew.acp.client import AcpClient
     from kiro_crew.acp.runtime import AcpRuntime
     from kiro_crew.acp.types import (
+        ACP_BACKEND_PI,
         EVENT_COMPLETE,
         EVENT_PERMISSION_REQUEST,
         EVENT_TEXT_CHUNK,
@@ -56,7 +61,9 @@ try:
         STOP_REASON_TOOL_STALL,
     )
 except ImportError:  # pragma: no cover - standalone / test fallback
+    AcpClient = None  # type: ignore[assignment,misc]
     AcpRuntime = None  # type: ignore[assignment,misc]
+    ACP_BACKEND_PI = None  # type: ignore[assignment]  # harness-ok: standalone fallback
     EVENT_TEXT_CHUNK = "text_chunk"  # type: ignore[assignment]
     EVENT_TOOL_CALL = "tool_call"  # type: ignore[assignment]
     EVENT_PERMISSION_REQUEST = "permission_request"  # type: ignore[assignment]
@@ -77,9 +84,121 @@ try:  # SEL audit — the runtime layer has no audit_source, so the pool emits i
 except Exception:  # pragma: no cover - standalone / test fallback
     _sel = None  # type: ignore[assignment]
 
+try:  # same resolver the AcpRuntime spawn path uses to locate the agent CLI
+    from kiro_crew.kiro_cli import resolve_kiro_cli
+except Exception:  # pragma: no cover - standalone / test fallback
+    resolve_kiro_cli = None  # type: ignore[assignment]
+
+try:  # the fail-close a backend-less host raises instead of running unaudited
+    from kiro_crew.sandbox import SandboxUnavailableError
+except Exception:  # pragma: no cover - standalone / test fallback
+    SandboxUnavailableError = None  # type: ignore[assignment,misc]
+
+try:  # platform naming — repo convention is platform_compat, never sys.platform
+    from kiro_crew import platform_compat
+except Exception:  # pragma: no cover - standalone / test fallback
+    platform_compat = None  # type: ignore[assignment]
+
+# An EMPTY tuple is a legal ``except`` target that matches nothing, so a install
+# without the sandbox module degrades to "no translation" rather than to a
+# TypeError raised from the handler itself.
+_SANDBOX_UNAVAILABLE: tuple[type[BaseException], ...] = (
+    (SandboxUnavailableError,) if SandboxUnavailableError is not None else ()
+)
+
 from sage_lib import followup, store  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def runtime_preflight() -> str:
+    """Cheap, read-only check that a reviewer session could actually be spawned.
+
+    Returns ``""`` when the runtime looks usable, else a message naming exactly
+    what is missing. Mirrors what ``_ensure_runtime_locked`` needs to spawn the
+    shared runtime — an importable ``AcpRuntime`` driving a ``kiro-cli``
+    subprocess — using the same resolver (``resolve_kiro_cli``) the runtime's
+    own spawn path goes through, so the answer here matches what a real spawn
+    would find. Without this check a review on a host with no usable agent CLI
+    completes with nothing written and reports an undiscriminated "no result
+    record", which cannot be triaged.
+
+    Deliberately does NOT spawn anything or touch the filesystem beyond the
+    executable lookup. That lookup still stats candidates under every ``PATH``
+    entry, so callers on the gateway event loop MUST offload this to a thread
+    (``asyncio.to_thread``) — one stale network mount in ``PATH`` would
+    otherwise stall the whole loop.
+    """
+    if AcpRuntime is None:
+        return (
+            "the reviewer cannot run: the ACP runtime "
+            "(kiro_crew.acp.runtime) is not importable in this install"
+        )
+    if resolve_kiro_cli is not None and resolve_kiro_cli() is None:
+        return (
+            "the reviewer cannot run: no kiro-cli executable was found on "
+            "this host (the reviewer session is driven by kiro-cli — "
+            "install it or add it to PATH)"
+        )
+    return ""
+
+
+def _is_windows() -> bool:
+    """Windows, asked the repo's way. ``platform_compat`` is the single source of
+    truth for platform naming; the ``sys.platform`` fallback exists only for the
+    standalone import path where that module is unavailable."""
+    if platform_compat is not None:
+        return bool(getattr(platform_compat, "IS_WINDOWS", False))
+    return sys.platform == "win32"  # pragma: no cover - standalone fallback
+
+
+class ReviewRuntimeUnavailable(RuntimeError):
+    """The reviewer session never started because this host could not build an
+    OS-level sandbox around it.
+
+    A ``RuntimeError`` subclass so every existing ``except Exception`` /
+    ``except RuntimeError`` handler in the backend keeps working unchanged — what
+    it adds is a message a user can act on. Translated, NOT bypassed: the review
+    worker is an LLM-directed subprocess with shell and file tools, so a host
+    that cannot confine it is refused rather than run unaudited. The remedy is an
+    operator config change, not anything about the repository or the pull request.
+    """
+
+
+def sandbox_unavailable_message(exc: BaseException | None = None) -> str:
+    """The user-facing reason a reviewer spawn was refused for want of a sandbox.
+
+    Windows gets its own wording because the cause there is structural rather
+    than a misconfiguration: Kiro Crew has no native Windows sandbox backend at
+    all (macOS uses Seatbelt, Linux uses user namespaces), so the only confined
+    path is kiro-cli's own internal sandbox taking the spawn. When that
+    delegation does not apply, the spawn fail-closes — which is correct, and is
+    why this names the one config key that changes the answer instead of leaving
+    the user with a bare exception or an empty review.
+    """
+    detail = str(exc).strip() if exc is not None else ""
+    if _is_windows():
+        base = (
+            "the reviewer cannot run: this Windows host has no OS sandbox for the "
+            "review worker. Kiro Crew ships native sandbox backends for macOS "
+            "(Seatbelt) and Linux (user namespaces) only, so a review is confined "
+            "on Windows solely when kiro-cli's own internal sandbox takes the "
+            "spawn — and it is refused rather than run unaudited when that does "
+            "not apply. To allow an unsandboxed review worker explicitly, set "
+            "agent.sandbox_allow_unsandboxed_exec=true in ~/.kiro/crew/config.json "
+            "and restart the gateway. Everything that does not spawn a reviewer "
+            "still works: adding repositories, listing and opening pull requests, "
+            "reading past reports, and publishing an already-staged draft review."
+        )
+    else:
+        base = (
+            "the reviewer cannot run: no OS sandbox backend is available on this "
+            "host, so the review worker was refused rather than run unaudited. "
+            "Install a supported backend (Linux user namespaces, or macOS "
+            "sandbox-exec), or set agent.sandbox_allow_unsandboxed_exec=true in "
+            "~/.kiro/crew/config.json to allow it explicitly."
+        )
+    return f"{base} (sandbox: {detail})" if detail else base
 
 
 def _is_abnormal_stop(reason: str) -> bool:
@@ -93,17 +212,22 @@ def _is_abnormal_stop(reason: str) -> bool:
     r = (reason or "").strip().lower()
     if not r:
         return False
-    if r in (str(STOP_REASON_TOOL_STALL).lower(),
-             str(STOP_REASON_STALE_RECOVER).lower(), "timeout"):
+    if r in (
+        str(STOP_REASON_TOOL_STALL).lower(),
+        str(STOP_REASON_STALE_RECOVER).lower(),
+        "timeout",
+    ):
         return True
     return r.startswith("error")
 
 
 # ── Tunables (resource limits live here for easy future updates) ──
-MAX_CONCURRENT = 5        # default max reviews running at once (config: review.max_concurrent)
+MAX_CONCURRENT = 5  # default max reviews running at once (config: review.max_concurrent)
 MAX_CONCURRENT_CEIL = 30  # hard ceiling — "review all" can raise concurrency up to here
-MAX_STARTING = 2          # (legacy) retained for back-compat stats; single runtime has no cold-start throttle
-DEFAULT_TASK_TIMEOUT = 5400.0   # 90 min per review turn. The single-pass review
+MAX_STARTING = (
+    2  # (legacy) retained for back-compat stats; single runtime has no cold-start throttle
+)
+DEFAULT_TASK_TIMEOUT = 5400.0  # 90 min per review turn. The single-pass review
 #   is ONE heavier turn (design + all code dimensions) that replaces up to 5 old
 #   turns, so the old 30-min cap force-killed legitimately-working large-PR reviews
 #   (stop_reason='timeout'). 90 min gives real headroom while staying well under the
@@ -111,7 +235,7 @@ DEFAULT_TASK_TIMEOUT = 5400.0   # 90 min per review turn. The single-pass review
 REVIEW_AGENT = "code-review-sage-reviewer"  # dedicated lean reviewer agent (shell-
 #   enabled so it can run the `gh` CLI to fetch/post GitHub PR reviews). The per-task
 #   prompt loads the `sage-review` skill on top of it.
-_FALLBACK_AGENT = "kirocrew"     # default agent when the reviewer agent isn't installed
+_FALLBACK_AGENT = "kirocrew"  # default agent when the reviewer agent isn't installed
 
 # Reasoning/thinking effort for the review workers. Empty string = "no explicit
 # override; inherit the model/provider default" (the config default), rather than
@@ -132,6 +256,17 @@ try:
     from kiro_crew.effort import EFFORT_LEVELS as VALID_EFFORTS
 except Exception:  # pragma: no cover - defensive
     VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _configured_provider() -> str:
+    """Return the configured chat provider without making review startup depend on it."""
+    try:
+        from kiro_crew.acp_backends import ACP_BACKEND_PI
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return "pi" if KiroCrewConfig.load().agent.acp_backend == ACP_BACKEND_PI else "acp"
+    except Exception:
+        return "acp"
 
 
 def _get_review_settings() -> dict:
@@ -181,11 +316,11 @@ def _resolve_review_agent(preferred: str = REVIEW_AGENT) -> str:
         if (kiro_agents_dir() / f"{preferred}.json").is_file():
             return preferred
     except Exception:
-        pass
+        logger.debug("could not resolve review agent %s", preferred, exc_info=True)
     return _FALLBACK_AGENT
 
 
-def _review_work_dir() -> Optional[str]:
+def _review_work_dir() -> str | None:
     """Working directory for a review worker = the installed app root, so the
     gate/deep prompts' RELATIVE paths (`sage_lib/pipeline.py`, `data/results/<id>.json`)
     resolve to exactly where the driver reads/writes. Without this the worker's
@@ -210,17 +345,25 @@ def _reviewer_model(agent: str) -> str:
     keyed on the model the agent actually runs."""
     cfg_model = _get_review_settings().get("model")
     if isinstance(cfg_model, str) and cfg_model:
-        return cfg_model
+        # Review settings historically contain Kiro's bare ids. Pi's catalog is
+        # provider-qualified, so an old bare override must not cross backends.
+        if _configured_provider() != "pi" or "/" in cfg_model or cfg_model == "auto":
+            return cfg_model
+        return "auto"
+    # Code Review Sage owns its worker lifecycle instead of going through the
+    # normal SessionManager provider factory. On Pi, the agent JSON may still
+    # contain a Kiro-only model pin, so never carry that pin across backends.
+    if _configured_provider() == "pi":
+        return "auto"
     if kiro_agents_dir is None:  # pragma: no cover - standalone fallback
         return _DEFAULT_REVIEW_MODEL
     try:
-        cfg = json.loads(
-            (kiro_agents_dir() / f"{agent}.json").read_text(encoding="utf-8"))
+        cfg = json.loads((kiro_agents_dir() / f"{agent}.json").read_text(encoding="utf-8"))
         model = cfg.get("model")
         if isinstance(model, str) and model:
             return model
     except Exception:
-        pass
+        logger.debug("could not read review agent model for %s", agent, exc_info=True)
     return _DEFAULT_REVIEW_MODEL
 
 
@@ -230,9 +373,12 @@ def reviewer_info() -> dict:
     thinking effort level (user-configured) applied to both review phases."""
     agent = _resolve_review_agent()
     settings = _get_review_settings()
-    return {"agent": agent, "model": _reviewer_model(agent),
-            "effort": settings.get("effort", _DEFAULT_EFFORT),
-            "model_source": "config" if settings.get("model") else "agent-default"}
+    return {
+        "agent": agent,
+        "model": _reviewer_model(agent),
+        "effort": settings.get("effort", _DEFAULT_EFFORT),
+        "model_source": "config" if settings.get("model") else "agent-default",
+    }
 
 
 def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT) -> None:
@@ -296,10 +442,10 @@ class _BatchRuntimeHolder:
     ``end_batch()``. All state is guarded by ``_lock``.
     """
 
-    def __init__(self, agent: str, work_dir: Optional[str]) -> None:
+    def __init__(self, agent: str, work_dir: str | None) -> None:
         self._agent = agent
         self._work_dir = work_dir
-        self._runtime: Optional["AcpRuntime"] = None
+        self._runtime: Any = None
         self._batches = 0
         self._lock = asyncio.Lock()
 
@@ -319,10 +465,10 @@ class _BatchRuntimeHolder:
             rt = None
             if self._batches == 0:
                 rt, self._runtime = self._runtime, None
-        if rt is not None:          # kill outside the lock (SIGTERM->SIGKILL can block)
+        if rt is not None:  # kill outside the lock (SIGTERM->SIGKILL can block)
             await self._kill(rt)
 
-    async def acquire(self) -> "AcpRuntime":
+    async def acquire(self) -> Any:
         """Return the live shared runtime, spawning/self-healing if needed."""
         async with self._lock:
             return await self._ensure_runtime_locked()
@@ -335,11 +481,11 @@ class _BatchRuntimeHolder:
         if rt is not None:
             await self._kill(rt)
 
-    async def _ensure_runtime_locked(self) -> "AcpRuntime":
+    async def _ensure_runtime_locked(self) -> Any:
         rt = self._runtime
         if rt is not None and rt.is_alive():
             return rt
-        if rt is not None:                          # reap a dead one first
+        if rt is not None:  # reap a dead one first
             await self._kill(rt)
         if AcpRuntime is None:
             raise RuntimeError("AcpRuntime unavailable (kiro_crew.acp.runtime not importable)")
@@ -349,8 +495,10 @@ class _BatchRuntimeHolder:
         if self._work_dir:
             try:
                 _write_effort_overlay(
-                    self._work_dir, _reviewer_model(self._agent),
-                    _get_review_settings().get("effort", _DEFAULT_EFFORT))
+                    self._work_dir,
+                    _reviewer_model(self._agent),
+                    _get_review_settings().get("effort", _DEFAULT_EFFORT),
+                )
             except Exception:
                 logger.debug("could not write review effort overlay", exc_info=True)
         # work_dir + sandbox_mode="auto" mirror the old AcpClient worker: the
@@ -358,15 +506,28 @@ class _BatchRuntimeHolder:
         # (GitHub fetch/post run via the `gh` CLI's own auth; the worker only
         # writes data/results and runs `python3 sage_lib/pipeline.py`).
         rt = AcpRuntime(agent=self._agent, work_dir=self._work_dir, sandbox_mode="auto")
-        await rt.spawn()
+        try:
+            await rt.spawn()
+        except _SANDBOX_UNAVAILABLE as exc:
+            # The ONE place a backend-less host is turned into something a user can
+            # read. Left untranslated this escaped as a bare SandboxUnavailableError
+            # through begin_batch(), which the routes layer reports as an
+            # undiscriminated run error naming no fix — the same failure mode
+            # `runtime_preflight` exists to prevent for a missing kiro-cli. Not
+            # caught to retry unsandboxed: the refusal is the correct outcome.
+            raise ReviewRuntimeUnavailable(sandbox_unavailable_message(exc)) from exc
         self._runtime = rt
-        logger.info("code-review-sage runtime spawned (agent=%s, cwd=%s)",
-                    self._agent, self._work_dir)
+        logger.info(
+            "code-review-sage runtime spawned (agent=%s, cwd=%s)", self._agent, self._work_dir
+        )
         return rt
 
-    async def _kill(self, rt: "AcpRuntime") -> None:
+    async def _kill(self, rt: Any) -> None:
         try:
-            await rt.kill()
+            # Deliberate pool teardown (batch drain / force_shutdown). The
+            # reap-a-dead-one caller is covered too: _mark_dead refuses the
+            # INFO downgrade when the process already exited on its own.
+            await rt.kill(expected=True)
         except Exception:
             logger.debug("code-review-sage runtime kill error", exc_info=True)
 
@@ -402,20 +563,27 @@ class ReviewPool:
 
     def __init__(
         self,
-        max_workers: Optional[int] = None,
-        agent: Optional[str] = None,
-        work_dir: Optional[str] = None,
+        max_workers: int | None = None,
+        agent: str | None = None,
+        work_dir: str | None = None,
         # accepted-and-ignored for back-compat with older callers/tests:
-        max_starting: Optional[int] = None,
-        worker_factory: Optional[object] = None,
+        max_starting: int | None = None,
+        worker_factory: object | None = None,
     ) -> None:
         self._agent = _resolve_review_agent(agent or REVIEW_AGENT)
         self._work_dir = work_dir if work_dir is not None else _review_work_dir()
+        # The Kiro runtime cannot run a Pi-configured account. Pi's ACP adapter
+        # is process-per-session, so it uses the same semaphore but not the shared
+        # AcpRuntime holder below.
+        self._pi_backend = _configured_provider() == "pi"
         # Auto mode = no explicit max_workers -> the semaphore tracks the live
         # review.max_concurrent config (resized per batch). An explicit value
         # (tests / standalone) is honored verbatim and never resized.
         self._auto_max = not max_workers
-        self._max = int(max_workers) if max_workers else effective_max_concurrent()
+        try:
+            self._max = int(max_workers) if max_workers else effective_max_concurrent()
+        except (TypeError, ValueError):
+            self._max = MAX_CONCURRENT
         self._max = max(1, min(self._max, MAX_CONCURRENT_CEIL))
         self._sema = asyncio.Semaphore(self._max)
         self._holder = _BatchRuntimeHolder(self._agent, self._work_dir)
@@ -434,15 +602,70 @@ class ReviewPool:
             if eff != self._max:
                 self._max = eff
                 self._sema = asyncio.Semaphore(eff)
+        if self._pi_backend:
+            return
         await self._holder.begin_batch()
 
     async def end_batch(self) -> None:
         """Close a review batch — kills the runtime once the last batch drains."""
+        if self._pi_backend:
+            return
         await self._holder.end_batch()
 
-    async def send(self, task: str, timeout: float = DEFAULT_TASK_TIMEOUT,
-                   on_activity: Callable[[str, int], None] | None = None,
-                   keep_session_key: str | None = None) -> str:
+    async def _send_pi(
+        self, task: str, timeout: float, on_activity: Callable[[str, int], None] | None = None
+    ) -> str:
+        """Run one isolated review turn through the configured Pi ACP backend."""
+        if AcpClient is None:  # pragma: no cover - standalone fallback
+            raise RuntimeError("Pi ACP client unavailable")
+        client = AcpClient(
+            work_dir=self._work_dir,
+            model=_reviewer_model(self._agent),
+            agent=self._agent,
+            sandbox_mode="auto",
+            acp_backend=ACP_BACKEND_PI,
+        )
+        parts: list[str] = []
+        steps = 0
+        try:
+            async for ev in client.stream_events(task, timeout=timeout):
+                kind = getattr(ev, "kind", None)
+                if kind == EVENT_TEXT_CHUNK:
+                    parts.append(getattr(ev, "text", "") or "")
+                elif kind == EVENT_TOOL_CALL:
+                    await self._audit_tool(client, ev)
+                    steps += 1
+                    if on_activity is not None:
+                        try:
+                            on_activity(str(getattr(ev, "title", "") or ""), steps)
+                        except Exception:
+                            logger.debug("activity callback failed", exc_info=True)
+                elif kind == EVENT_PERMISSION_REQUEST:
+                    req_id = getattr(ev, "request_id", "")
+                    try:
+                        await client.approve_tool(req_id)
+                    except Exception:
+                        logger.debug("Pi tool approve failed", exc_info=True)
+                    else:
+                        await self._audit_tool(
+                            client, ev, request_id=req_id, outcome="auto_approved"
+                        )
+                elif kind == EVENT_COMPLETE:
+                    reason = getattr(ev, "stop_reason", "") or ""
+                    if _is_abnormal_stop(reason):
+                        raise RuntimeError(f"review turn ended abnormally (stop_reason={reason!r})")
+                    break
+            return "".join(parts)
+        finally:
+            await client.shutdown()
+
+    async def send(
+        self,
+        task: str,
+        timeout: float = DEFAULT_TASK_TIMEOUT,
+        on_activity: Callable[[str, int], None] | None = None,
+        keep_session_key: str | None = None,
+    ) -> str:
         """Run one review task on its own session of the shared runtime and return
         the final assistant text. Auto-approves every tool permission (the reviewer
         runs the `gh` CLI + shell) and emits a per-tool SEL audit.
@@ -459,6 +682,8 @@ class ReviewPool:
         if self._closed:
             raise RuntimeError("ReviewPool is shut down")
         async with self._sema:
+            if self._pi_backend:
+                return await self._send_pi(task, timeout, on_activity)
             runtime = await self._holder.acquire()
             handle = None
             try:
@@ -479,11 +704,9 @@ class ReviewPool:
                             steps += 1
                             if on_activity is not None:
                                 try:
-                                    on_activity(
-                                        str(getattr(ev, "title", "") or ""), steps)
+                                    on_activity(str(getattr(ev, "title", "") or ""), steps)
                                 except Exception:
-                                    logger.debug("activity callback failed",
-                                                 exc_info=True)
+                                    logger.debug("activity callback failed", exc_info=True)
                         elif kind == EVENT_PERMISSION_REQUEST:
                             # Auto-approve (the reviewer needs `gh` + shell) AND record
                             # the permission DECISION in the security ledger, tagged with
@@ -497,8 +720,8 @@ class ReviewPool:
                                 logger.debug("tool approve failed", exc_info=True)
                             else:
                                 await self._audit_tool(
-                                    handle, ev, request_id=req_id,
-                                    outcome="auto_approved")
+                                    handle, ev, request_id=req_id, outcome="auto_approved"
+                                )
                         elif kind == EVENT_COMPLETE:
                             stop_reason = getattr(ev, "stop_reason", "") or ""
                             break
@@ -516,7 +739,8 @@ class ReviewPool:
                 # the PR reviewed or posts on partial output.
                 if _is_abnormal_stop(stop_reason):
                     raise RuntimeError(
-                        f"review turn ended abnormally (stop_reason={stop_reason!r})")
+                        f"review turn ended abnormally (stop_reason={stop_reason!r})"
+                    )
                 # Keep the transcript AFTER the health gate above: a session whose
                 # turn died has no findings to be asked about, and recording it
                 # would leave a file nothing will ever load.
@@ -547,15 +771,19 @@ class ReviewPool:
         try:
             handle.keep_transcript = True  # type: ignore[attr-defined]
             followup.write_descriptor(
-                run_id, change_id, sid=sid, agent=self._agent,
-                cwd=self._work_dir or "")
+                run_id, change_id, sid=sid, agent=self._agent, cwd=self._work_dir or ""
+            )
         except Exception:
-            logger.debug("could not keep the review session resumable",
-                         exc_info=True)
+            logger.debug("could not keep the review session resumable", exc_info=True)
 
-    async def _audit_tool(self, handle: object, ev: object, *,
-                          request_id: object = None,
-                          outcome: str = "auto_approved") -> None:
+    async def _audit_tool(
+        self,
+        handle: object,
+        ev: object,
+        *,
+        request_id: object = None,
+        outcome: str = "auto_approved",
+    ) -> None:
         """Emit a per-tool SEL audit (the runtime layer has no ``audit_source``,
         so without this the reviewer's tool calls would never reach the security log
         — parity with ``AcpClient._maybe_audit_tool_call``). Best-effort + bounded:
@@ -577,14 +805,18 @@ class ReviewPool:
             await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda: _sel().log_tool_invocation(
-                        session_key=getattr(handle, "session_id", "") or "",
-                        agent=self._agent,
-                        source="subagent",
-                        tool_name=getattr(ev, "title", None) or "unknown",
-                        tool_kind=getattr(ev, "tool_kind", None) or "",
-                        outcome=outcome,
-                        request_id=rid,
+                    lambda: (
+                        _sel().log_tool_invocation(
+                            session_key=getattr(handle, "session_id", "") or "",
+                            agent=self._agent,
+                            source="subagent",
+                            tool_name=getattr(ev, "title", None) or "unknown",
+                            tool_kind=getattr(ev, "tool_kind", None) or "",
+                            outcome=outcome,
+                            request_id=rid,
+                        )
+                        if _sel is not None
+                        else None
                     ),
                 ),
                 timeout=5.0,
@@ -596,23 +828,39 @@ class ReviewPool:
         """Live occupancy for the dashboard. Keeps the legacy key names
         (``workers``/``idle``/``busy``/``max``/``starting_max``) so the existing UI
         keeps working, and adds the runtime-model keys."""
+        if self._pi_backend:
+            return {
+                "workers": 0,
+                "idle": 0,
+                "busy": 0,
+                "max": self._max,
+                "starting_max": MAX_STARTING,
+                "runtime_alive": False,
+                "active_sessions": 0,
+                "batches": 0,
+            }
         h = self._holder.stats()
         active = h["active_sessions"]
         return {
-            "workers": active, "idle": 0, "busy": active,
-            "max": self._max, "starting_max": MAX_STARTING,
-            "runtime_alive": h["runtime_alive"], "active_sessions": active,
+            "workers": active,
+            "idle": 0,
+            "busy": active,
+            "max": self._max,
+            "starting_max": MAX_STARTING,
+            "runtime_alive": h["runtime_alive"],
+            "active_sessions": active,
             "batches": h["batches"],
         }
 
     async def shutdown(self) -> None:
         """Force-tear-down the runtime (app disable / gateway shutdown / standalone)."""
         self._closed = True
-        await self._holder.force_shutdown()
+        if not self._pi_backend:
+            await self._holder.force_shutdown()
 
 
 # ── Process-wide singleton (owned by the gateway backend) ──
-_POOL: Optional[ReviewPool] = None
+_POOL: ReviewPool | None = None
 
 
 def get_pool() -> ReviewPool:
@@ -638,9 +886,16 @@ def pool_stats() -> dict:
         # No pool yet (before the first review) — report the static default cap.
         # Avoid effective_max_concurrent() here: it reads config.json, and this
         # runs synchronously on the gateway event loop from the /runs handler.
-        return {"workers": 0, "idle": 0, "busy": 0,
-                "max": MAX_CONCURRENT, "starting_max": MAX_STARTING,
-                "runtime_alive": False, "active_sessions": 0, "batches": 0}
+        return {
+            "workers": 0,
+            "idle": 0,
+            "busy": 0,
+            "max": MAX_CONCURRENT,
+            "starting_max": MAX_STARTING,
+            "runtime_alive": False,
+            "active_sessions": 0,
+            "batches": 0,
+        }
     return _POOL.stats()
 
 
@@ -663,16 +918,25 @@ def make_sync_dispatch(
     Never raises — failures come back in the ``error`` field so the driver's phase
     switch can react deterministically."""
 
-    def dispatch(task: str, timeout: float = default_timeout,
-                 on_activity: Callable[[str, int], None] | None = None,
-                 keep_session_key: str | None = None) -> dict:
+    def dispatch(
+        task: str,
+        timeout: float = default_timeout,
+        on_activity: Callable[[str, int], None] | None = None,
+        keep_session_key: str | None = None,
+    ) -> dict:
         try:
             # The callback fires on the gateway loop's thread while the driver's
             # worker thread blocks here; the progress writer it feeds is lock-
             # guarded and copy-on-write, so that crossing is safe.
             fut = asyncio.run_coroutine_threadsafe(
-                pool.send(task, timeout=timeout, on_activity=on_activity,
-                          keep_session_key=keep_session_key), loop)
+                pool.send(
+                    task,
+                    timeout=timeout,
+                    on_activity=on_activity,
+                    keep_session_key=keep_session_key,
+                ),
+                loop,
+            )
             # Give the bridge a little headroom past the task timeout so the
             # pool's own timeout fires first with a cleaner error.
             out = fut.result(timeout=timeout + 60)

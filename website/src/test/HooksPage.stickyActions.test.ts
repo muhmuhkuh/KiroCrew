@@ -39,7 +39,11 @@ const loadSource = async () => {
 describe('HooksPage table sticky Actions column', () => {
   it('measures the real scroller', async () => {
     const src = await loadSource()
-    expect(src).toMatch(/<div ref=\{attachHooksScroller\} className="overflow-x-auto">/)
+    // The scroller ref is a wrapper that delegates to the hook's attach and
+    // additionally measures the scroller's visible width for the expanded
+    // last_error row; both must land on the same element.
+    expect(src).toMatch(/<div ref=\{attachHooksScrollerMeasured\} className="overflow-x-auto">/)
+    expect(src).toMatch(/const attachHooksScrollerMeasured = useCallback\(\(node: HTMLDivElement \| null\) => \{\s*attachHooksScroller\(node\)/)
   })
 
   it('pins the Actions header cell with an overflow-gated seam', async () => {
@@ -54,14 +58,19 @@ describe('HooksPage table sticky Actions column', () => {
 
   it('pins the Actions body cell with the row-state overlay and gated seam', async () => {
     const src = await loadSource()
-    const cell = src.match(/<td aria-label=\{i18nT\('pages\.hooksPage\.actions'\)\} className="([^"]*)">/)
+    // Anchored on the class shape: the cell deliberately carries NO aria-label
+    // (the header names the column; a cell label would triple-name the ⋯
+    // trigger for screen readers — see #4297).
+    const cell = src.match(/<td className="(sticky[^"]*)">/)
     expect(cell, 'the Actions <td> moved or changed shape').toBeTruthy()
     const cls = cell![1]
     expect(cls).toContain('sticky')
     expect(cls).toContain('right-0')
     expect(cls).toContain('bg-card')
     // The row names the group the overlay listens to…
-    expect(src).toMatch(/<tr key=\{h\.id\} className=\{`group\/hookrow /)
+    // The row is wrapped in a keyed Fragment so its expandable last_error row
+    // can follow it as a sibling; the key moved to the Fragment.
+    expect(src).toMatch(/<Fragment key=\{h\.id\}>\s*<tr className=\{`group\/hookrow /)
     // …and the overlay mirrors zebra on even rows, hover on odd rows.
     const overlay = src.match(/<div aria-hidden className=\{`absolute inset-0 -z-10 ([^`]*)`\} \/>/)
     expect(overlay, 'the row-state overlay is gone from the Actions cell').toBeTruthy()
@@ -73,7 +82,7 @@ describe('HooksPage table sticky Actions column', () => {
     // Scope to each sticky cell's OWN markup: a seam div counted globally
     // could drift outside the cell and still pass, recreating the defect.
     const header = src.match(/<th className="[^"]*sticky[^"]*">([\s\S]*?)<\/th>/)
-    const body = src.match(/<td aria-label=\{i18nT\('pages\.hooksPage\.actions'\)\}[\s\S]*?<\/td>/)
+    const body = src.match(/<td className="sticky[^"]*"[\s\S]*?<\/td>/)
     expect(header, 'the sticky Actions <th> moved or changed shape').toBeTruthy()
     expect(body, 'the sticky Actions <td> moved or changed shape').toBeTruthy()
     // The seam is the full literal: a seam that loses top-0/bottom-0 spans

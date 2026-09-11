@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ArrowUpFromLine, Check, ChevronDown, Target } from 'lucide-react'
-import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
+import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
+import { platformShortcut } from '../utils/platform'
 
 import { i18nT } from '../i18n/t'
 
@@ -33,8 +34,8 @@ const BUSY_SEND_MODE_LABEL_KEY: Record<BusySendMode, string> = {
   queue: 'components.chatInput.queue',
 }
 const BUSY_SEND_MODE_DESC_KEY: Record<BusySendMode, string> = {
-  steer: 'components.chatInput.steer_desc',
-  queue: 'components.chatInput.queue_desc',
+  steer: 'components.chatInput.steer_act_on_this_right_away_desc',
+  queue: 'components.chatInput.queue_run_after_the_current_work_finishes_desc',
 }
 const BUSY_SEND_MODES: Array<{ mode: BusySendMode; icon: React.ReactNode }> = [
   { mode: 'steer', icon: <Target size={15} /> },
@@ -57,6 +58,28 @@ export function readBusySendMode(slotKey?: string | null): BusySendMode {
   // unscoped key. A slot that has never chosen a mode inherits that value, so
   // an existing "queue" user keeps their default instead of being reset.
   return safeGetItem(BUSY_SEND_MODE_LS_KEY) === 'queue' ? 'queue' : 'steer'
+}
+
+/**
+ * The GLOBAL default — what Enter does while busy in a session whose split
+ * button was never touched. Settings → Chat writes it; `readBusySendMode` falls
+ * back to it for every slot without a scoped choice. Stored under the legacy
+ * unscoped key, which is exactly the inheritance the migration comment above
+ * describes: sessions that made their own choice keep it, everyone else follows.
+ */
+export function readBusySendDefault(): BusySendMode {
+  return safeGetItem(BUSY_SEND_MODE_LS_KEY) === 'queue' ? 'queue' : 'steer'
+}
+
+export function setBusySendDefault(mode: BusySendMode): boolean {
+  const ok = safeSetItem(BUSY_SEND_MODE_LS_KEY, mode)
+  // Mounted composers whose slot has NO scoped choice inherit the default, so
+  // they must move now, not on their next mount; scoped slots are untouched.
+  for (const [storageKey, subs] of modeListeners) {
+    if (safeGetItem(storageKey) !== null) continue
+    for (const fn of subs) fn(mode)
+  }
+  return ok
 }
 
 /** Live subscribers to the persisted mode, grouped by storage key. "What does
@@ -113,39 +136,36 @@ export default function BusySendButton({
   onModeChange,
   onFire,
   disabled = false,
+  altChordAvailable = false,
 }: {
   mode: BusySendMode
   onModeChange: (m: BusySendMode) => void
   /** Fire the currently selected mode with the composer's text. */
   onFire: () => void
   disabled?: boolean
+  /**
+   * Whether ⌘↩ / Ctrl+Enter currently performs the OTHER action for one send.
+   * Only the host knows (it depends on the send-key mode), and the menu must not
+   * promise a chord that in `ctrl-enter` mode sends with the CURRENT action and
+   * in `enter-ctrl-newline` inserts a newline.
+   */
+  altChordAvailable?: boolean
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const [menuRect, setMenuRect] = useState<DOMRect | null>(null)
   const splitRef = useRef<HTMLDivElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const caretRef = useRef<HTMLButtonElement>(null)
-  // This menu has no filter input; the ref stays null so useListboxKeyboard
-  // treats ArrowUp from the first option as a no-op instead of a focus jump.
-  const noInputRef = useRef<HTMLElement | null>(null)
 
   const closeToTrigger = useCallback(() => {
     setMenuOpen(false)
     caretRef.current?.focus()
   }, [])
 
-  // Keyboard operability for the portaled menu (WAI-ARIA menu pattern):
-  // focus moves into the first option on open, ArrowUp/Down + Home/End roam,
-  // Escape/Tab close and return focus to the caret trigger.
-  const { onListKeyDown } = useListboxKeyboard({
-    open: menuOpen,
-    dropdownRef: menuRef,
-    inputRef: noInputRef,
-    hasFilterInput: false,
-    filteredCount: BUSY_SEND_MODES.length,
-    onEnterSingleMatch: () => {},
-    closeToTrigger,
-  })
+  // The portaled picker advertises role="menu", so it uses the shared menu
+  // contract: arrows wrap, Home/End jump, and Tab stays within the open rows.
+  // Escape remains host-owned because closing must restore the caret trigger.
+  useMenuKeyboard({ enabled: menuOpen, containerRef: menuRef })
 
   useEffect(() => {
     if (!menuOpen) return
@@ -171,11 +191,14 @@ export default function BusySendButton({
   return (
     <div className="relative flex items-center" ref={splitRef}>
       <div className={`flex items-stretch h-8 rounded-full overflow-hidden transition-colors ${mode === 'steer' ? 'bg-accent text-accent-fg' : 'bg-warn text-warn-fg'}`}>
+        {/* Only the fire half dims when disabled: the caret (mode toggle) stays
+            live because picking steer-vs-queue before typing is a real workflow,
+            and a dimmed control that still works would read as broken. */}
         <button
-          className="w-8 h-8 bg-transparent border-none flex items-center justify-center cursor-pointer hover:bg-black/15 transition-all text-inherit"
+          className="w-8 h-8 bg-transparent border-none flex items-center justify-center cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 hover:bg-black/15 transition-all text-inherit"
           onClick={onFire}
           disabled={disabled}
-          title={mode === 'steer' ? i18nT('components.chatInput.steer_inject_into_the_running_turn_enter') : i18nT('components.chatInput.queue_run_after_the_current_turn_finishes_enter')}
+          title={mode === 'steer' ? i18nT('components.chatInput.steer_act_on_this_as_soon_as_possible_enter') : i18nT('components.chatInput.queue_run_after_the_current_work_finishes_enter')}
           aria-label={mode === 'steer' ? i18nT('components.chatInput.steer') : i18nT('components.chatInput.queue_message')}
           data-testid="busy-send-button"
         >
@@ -199,7 +222,13 @@ export default function BusySendButton({
         <div
           ref={menuRef}
           role="menu"
-          onKeyDown={onListKeyDown}
+          tabIndex={-1}
+          onKeyDown={event => {
+            if (event.key !== 'Escape') return
+            event.preventDefault()
+            event.stopPropagation()
+            closeToTrigger()
+          }}
           className="fixed w-[250px] rounded-xl bg-bg-elevated border border-border shadow-xl p-1.5 animate-slide-up z-[60]"
           style={{ left: Math.max(8, Math.min(menuRect.right - 250, window.innerWidth - 250 - 8)), bottom: window.innerHeight - menuRect.top + 8 }}
         >
@@ -225,6 +254,18 @@ export default function BusySendButton({
               {mode === m && <Check size={14} className="text-accent shrink-0" />}
             </button>
           ))}
+          {/* The keyboard gesture for a one-off flip, so the menu is not the only
+              way to reach the other action — named concretely (queue vs steer)
+              for the CURRENT mode, and only when the host says the chord is live.
+              A div (block) so the hint is its own text run, not glued onto the
+              last option's description. */}
+          {altChordAvailable && (
+            <div className="text-[11px] text-muted px-2 pt-1.5 pb-1 border-t border-border mt-1">
+              {mode === 'steer'
+                ? i18nT('components.chatInput.alt_action_hint_queues', { chord: platformShortcut('Cmd+Enter') })
+                : i18nT('components.chatInput.alt_action_hint_steers', { chord: platformShortcut('Cmd+Enter') })}
+            </div>
+          )}
         </div>,
         document.body
       )}

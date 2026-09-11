@@ -10,6 +10,7 @@ import {
   type McpAppRenderPayload,
 } from '../lib/mcpAppSrcdoc'
 import { planReveal, prefersReducedMotion, hasRevealed, markRevealed } from './mcpAppReveal'
+import { noteStaleOwnerResponse } from '../api/staleOwnerSignal'
 
 /** Inline height for a rendered MCP App before it reports its own size. */
 const DEFAULT_HEIGHT = 480
@@ -667,6 +668,10 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
               const body = (await resp.json().catch(() => null)) as
                 | { result?: unknown; error?: unknown }
                 | null
+              // Raise the dashboard's re-auth prompt when the relay was denied
+              // for a stale pre-owner session; the error below still reaches
+              // the app iframe, which keeps its own failure handling.
+              if (!resp.ok) noteStaleOwnerResponse(resp.status, body)
               if (resp.ok && body && 'result' in body) {
                 post({ jsonrpc: '2.0', id: msg.id, result: body.result })
               } else if (body && body.error && typeof body.error === 'object') {
@@ -990,6 +995,7 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
             </IconButton>
           </IconButtonGroup>
         </div>
+        {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onLoad is a document-load lifecycle hook (it is how the bridge learns the app navigated away from our trusted srcdoc), not a user interaction; the keyboard reaches the app THROUGH the frame, not by activating it */}
         <iframe
           ref={iframeRef}
           onLoad={() => {
@@ -1007,10 +1013,18 @@ export default function McpAppFrame({ payload }: { payload: McpAppRenderPayload 
           // `[tabindex]:not([tabindex="-1"])`, which a bare <iframe> does not
           // satisfy — so Tab cycled on that one control and a keyboard user
           // could never reach the canvas they had just opened full screen.
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- the tab stop is the ONLY way into the sandboxed app's own focusable content; removing it strands keyboard users outside the frame
           tabIndex={0}
           allow={allow || undefined}
           className="w-full border-none bg-card block"
-          style={{ height: displayHeight }}
+          // `translateZ(0)` promotes the frame onto its own compositing layer.
+          // Without it an engine can lay the srcDoc document out, run its
+          // scripts and report a correct height while rasterizing nothing —
+          // and this frame is a full-screen overlay, so a skipped first paint
+          // is a blank viewport with no error state. The 3D form adds no
+          // visual offset with no perspective set. Same remedy as
+          // ArtifactBody / WidgetFrame / ArtifactThumbs; keep them in step.
+          style={{ height: displayHeight, transform: 'translateZ(0)' }}
           title={`${payload.server} / ${payload.tool}`}
         />
       </div>

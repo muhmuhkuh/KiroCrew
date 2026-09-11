@@ -16,10 +16,7 @@ every existing patch site.
 
 from __future__ import annotations
 
-import json
 import unicodedata
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlencode
@@ -79,7 +76,13 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "slug": {
                         "type": "string",
-                        "description": "Optional explicit slug (lowercase, digits, hyphens). Auto-derived from name when omitted.",
+                        "description": (
+                            "Optional explicit slug (lowercase, digits, hyphens). "
+                            "A taken or malformed slug is REFUSED, never renamed — "
+                            "call artifact_update on the existing slug to version "
+                            "it in place. Omit to derive one from name and let a "
+                            "collision resolve by suffixing (-2, -3, ...)."
+                        ),
                     },
                     "kind": {
                         "type": "string",
@@ -570,6 +573,29 @@ def schemas() -> list[dict[str, Any]]:
     ]
 
 
+def _theme_contrast_hint(flagged: object) -> str:
+    """Phrase the MCP-side hint from the gateway's relayed verdict.
+
+    ``flagged`` is the ``theme_contrast_warning`` field the save/update
+    handlers stamp on their responses — computed there from the PERSISTED
+    content (the request body can be stale for file-promoted saves), so
+    this wrapper only converts the relayed boolean into hint text: the
+    exact pattern ``slug_collided_with`` uses. Warning only, never a
+    reject — same contract as the dedup and cost hints.
+    """
+    if not flagged:
+        return ""
+    return (
+        "\n\n⚠️  Hardcoded colors, no theme variables: this content renders "
+        "inside the dashboard's themed iframe, and literal colors (#hex / "
+        "rgb() / hsl()) clash when the user switches between light, dark and "
+        "custom themes -- worst when only one half of a foreground/background "
+        "pair is set. Prefer the injected theme vars with fallbacks, e.g. "
+        "`color:var(--text,#111); background:var(--bg,#fff)` -- the widgets "
+        "skill carries the full variable table."
+    )
+
+
 def artifact_save(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, ARTIFACT_SAVE_SCHEMA)
     save_body: dict[str, Any] = {
@@ -703,12 +729,29 @@ def artifact_save(name: str, args: dict[str, Any]) -> str:
             )
     # Widgets re-surface via the re-emit tag; only non-widgets need the link.
     ref_link = "" if kind == "widget" else f"{mcp_core._artifact_ref_link(slug, name)}\n\n"
+    # The store had to suffix the derived slug, so this is a new artifact rather
+    # than a new version of the one already at that slug. Reported by the store,
+    # so it holds for every kind — the dedup probe above is a name-based
+    # pre-check scoped to chat widgets, and stays silent for a markdown or text
+    # deliverable saved under a name that is already in use. Suppressed when
+    # that probe already fired, so a colliding widget gets one warning.
+    collision_hint = ""
+    taken = d.get("slug_collided_with")
+    if taken and not dedup_hint:
+        collision_hint = (
+            f"\n\n⚠️  slug {taken!r} is already taken, so this is a NEW artifact "
+            f"at slug={slug!r} — not a new version of {taken!r}. If you meant to "
+            f"revise that artifact, delete this one and call `artifact_update` on "
+            f"{taken!r}. If both are genuinely needed, rename one to disambiguate."
+        )
     return (
         f"Saved artifact: slug={slug} version={version}\n\n"
         f"{ref_link}"
         f"{mcp_core._artifact_reemit_hint(slug, name, kind)}"
         f"{dedup_hint}"
         f"{cost_hint}"
+        f"{collision_hint}"
+        f"{_theme_contrast_hint(d.get('theme_contrast_warning'))}"
     )
 
 
@@ -762,31 +805,14 @@ def artifact_update(name: str, args: dict[str, Any]) -> str:
     # it from the X-Internal-Secret header presence (MCP=agent,
     # dashboard=user). This is more secure than trusting a body field
     # and saves the agent from having to remember to set it.
-    # _post helper sends POST; we need PATCH. Build the request directly
-    # and send it through loopback_urlopen, which drops any HTTP_PROXY so
-    # X-Internal-Secret cannot leave the host.
-    data = json.dumps(update_body).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": mcp_core._internal_secret(),
-    }
-    sk = mcp_core._resolve_session_key()
-    if sk:
-        headers["X-Session-Key"] = sk
-    req = urllib.request.Request(
-        f"{mcp_core._api_base()}/api/artifacts/{slug}", data=data, headers=headers, method="PATCH"
-    )
-    try:
-        with mcp_core._api_urlopen(req, timeout=30) as http_resp:
-            d = json.loads(http_resp.read())
-    except urllib.error.HTTPError as exc:
-        try:
-            err_body = json.loads(exc.read()).get("error", str(exc))
-        except Exception:
-            err_body = str(exc)
-        return f"Error: {err_body}"
-    except Exception as exc:
-        return f"Error: {exc}"
+    # ``_patch`` is the PATCH verb helper (it did not exist when this was
+    # written, which is why the request used to be hand-rolled). Going through
+    # it buys the refusal-invalidate-re-resolve-replay recovery every
+    # other verb has, the ``X-Internal-Caller`` audit attribution, the
+    # latin-1 session-key guard, and redaction of the gateway's error body.
+    d = mcp_core._patch(f"/api/artifacts/{slug}", update_body)
+    if d.get("error"):
+        return f"Error: {d['error']}"
     out = [f"Updated artifact: slug={d.get('slug', slug)} version={d.get('version', '?')}"]
     # Surface source_path so the agent can emit unified-diff headers
     # when summarising the change in chat (powers the dashboard's
@@ -806,6 +832,15 @@ def artifact_update(name: str, args: dict[str, Any]) -> str:
     else:
         out.append("")
         out.append(mcp_core._artifact_ref_link(d.get("slug", slug), d.get("name", "")))
+    # Same soft nudge as artifact_save: an iterate pass that writes a
+    # hardcoded palette into a themed iframe should hear about it now,
+    # not when the user flips the dashboard theme. The verdict is the
+    # gateway's relayed ``theme_contrast_warning`` (False for
+    # metadata-only updates, which have nothing to lint).
+    theme_hint = _theme_contrast_hint(d.get("theme_contrast_warning"))
+    if theme_hint:
+        out.append("")
+        out.append(theme_hint.lstrip("\n"))
     return "\n".join(out)
 
 
@@ -828,28 +863,9 @@ def artifact_revert(name: str, args: dict[str, Any]) -> str:
         "event_type": "reverted",
         "from_version": target_version,
     }
-    data = json.dumps(body).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": mcp_core._internal_secret(),
-    }
-    sk = mcp_core._resolve_session_key()
-    if sk:
-        headers["X-Session-Key"] = sk
-    req = urllib.request.Request(
-        f"{mcp_core._api_base()}/api/artifacts/{slug}", data=data, headers=headers, method="PATCH"
-    )
-    try:
-        with mcp_core._api_urlopen(req, timeout=30) as http_resp:
-            d = json.loads(http_resp.read())
-    except urllib.error.HTTPError as exc:
-        try:
-            err_body = json.loads(exc.read()).get("error", str(exc))
-        except Exception:
-            err_body = str(exc)
-        return f"Error: {err_body}"
-    except Exception as exc:
-        return f"Error: {exc}"
+    d = mcp_core._patch(f"/api/artifacts/{slug}", body)
+    if d.get("error"):
+        return f"Error: {d['error']}"
     # Surface source_path on the response so the calling agent can build
     # a proper unified-diff header (--- <path>\n+++ <path>) when
     # summarising the revert in chat. The dashboard's diff renderer

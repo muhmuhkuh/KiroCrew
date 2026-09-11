@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pathlib
 import threading
 import time
 from pathlib import Path
@@ -228,6 +229,24 @@ class TestCollectRecentSessions:
         rows = _collect_recent_sessions(None)
         assert len(rows) == 1
         assert rows[0]["title"] == "ok"
+        assert rows[0]["msgs"] == [{"role": "user", "content": "hi"}]
+
+    def test_skips_valid_json_lines_that_are_not_records(self, sess_dir):
+        path = sess_dir / "dashboard_non_record.jsonl"
+        path.write_text(
+            "\n".join(
+                [
+                    json.dumps({"_type": "metadata", "title": "ok"}),
+                    "null",
+                    json.dumps(["not", "a", "record"]),
+                    json.dumps({"role": "user", "content": "hi"}),
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        rows = _collect_recent_sessions(None)
+
         assert rows[0]["msgs"] == [{"role": "user", "content": "hi"}]
 
     def test_truncates_long_message_content(self, sess_dir):
@@ -919,6 +938,62 @@ class TestSlashSessionsAudit:
 # ---------------------------------------------------------------------------
 # Bounded reads: only the newest ``limit`` matching transcripts are opened
 # ---------------------------------------------------------------------------
+
+
+class TestWithMessagesBoundsTheRead:
+    """``with_messages=False`` must avoid the transcript READ, not just the append.
+
+    The parameter exists because a caller rendering only title/agent/active would
+    otherwise pay a multi-MB read per row for a preview it discards. A gate placed
+    after ``read_text()`` skips building ``msgs`` and saves none of that, which is a
+    promise the docstring makes and the code has to keep.
+    """
+
+    def _seed(self, tmp_path):
+        d = tmp_path / "sessions"
+        d.mkdir()
+        p = d / "dashboard_big.jsonl"
+        _write_jsonl(
+            p,
+            title="huge",
+            agent="kirocrew",
+            messages=[("user", "x" * 2000) for _ in range(50)],
+        )
+        return d, p
+
+    def test_it_reads_only_the_metadata_line(self, tmp_path, monkeypatch):
+        from kiro_crew.messaging import sessions_view as sv
+
+        d, path = self._seed(tmp_path)
+        # Measured on the FILE, so this cannot pass by the collector reading
+        # everything and discarding it: read_text pulls the whole transcript,
+        # readline pulls one line.
+        real_read_text = pathlib.Path.read_text
+        used_read_text = []
+
+        def _spy(self, *a, **kw):
+            if self == path:
+                used_read_text.append(True)
+            return real_read_text(self, *a, **kw)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", _spy)
+        rows = sv._collect_recent_sessions(None, limit=5, sessions_dir=d, with_messages=False)
+
+        assert not used_read_text, "with_messages=False must not read the whole transcript"
+        # Still a usable row: the header fields the caller actually asked for.
+        assert len(rows) == 1
+        assert rows[0]["title"] == "huge"
+        assert rows[0]["agent"] == "kirocrew"
+        # Shape does not fork: msgs is present and empty.
+        assert rows[0]["msgs"] == []
+
+    def test_the_default_still_reads_the_preview(self, tmp_path):
+        """Non-vacuity: the bound is scoped to the flag, not applied always."""
+        from kiro_crew.messaging import sessions_view as sv
+
+        d, _ = self._seed(tmp_path)
+        rows = sv._collect_recent_sessions(None, limit=5, sessions_dir=d)
+        assert rows[0]["msgs"], "the default must still build the preview"
 
 
 class TestBoundedTranscriptReads:

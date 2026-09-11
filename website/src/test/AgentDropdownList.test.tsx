@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeAll } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import AgentDropdownList, { ManageAgentsFooter } from '../components/AgentDropdownList'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from '../components/AgentDropdownList'
 import type { AgentItem } from '../components/AgentDropdownList'
 
 // jsdom doesn't implement scrollIntoView
@@ -39,6 +41,54 @@ describe('AgentDropdownList', () => {
     render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     expect(screen.getByText('Main agent')).toBeInTheDocument()
   })
+
+  it('declares no scroll container of its own, leaving the host as the single scroll owner', () => {
+    // Both hosts (ChatPage and ChatPane) wrap this list in their own
+    // `overflow-y-auto max-h-[280px]` listbox. When the component also carried
+    // `overflow-y-auto max-h-[300px]`, the panel showed two nested scrollbars
+    // (#6375). Every option row's ancestor inside the component must stay
+    // overflow-free so exactly one scrollbar — the host's — appears. Checked
+    // via class AND inline style, so neither a Tailwind overflow utility nor
+    // a `style={{ overflowY: 'auto' }}` can reintroduce the nested scroller.
+    const { container } = render(
+      <AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} />
+    )
+    const option = screen.getAllByRole('option')[0]
+    let checked = 0
+    for (let el: HTMLElement | null = option.parentElement; el && container.contains(el); el = el.parentElement) {
+      checked++
+      expect(el.className).not.toMatch(/overflow-(y-)?(auto|scroll)/)
+      expect(el.style.overflowY).toMatch(/^(|visible)$/)
+      expect(el.style.overflow).toMatch(/^(|visible)$/)
+    }
+    // Guard against the loop passing vacuously (e.g. rows moved into a portal).
+    expect(checked).toBeGreaterThan(0)
+  })
+})
+
+describe('AgentDropdownList hosts own the scroll (#6375)', () => {
+  // The component deliberately declares no scroll container (see the test
+  // above), which moves the "exactly one scroll owner" invariant into the two
+  // hosts. Pin it structurally: each render site must wrap the list in a
+  // listbox that carries the overflow + max-height, or the pop-up grows
+  // unbounded with no failing test.
+  // vitest's cwd is website/ (the vitest config root), and import.meta.url is
+  // not file-scheme under its transform, so resolve from cwd instead.
+  const hosts = [
+    ['ChatPage', join(process.cwd(), 'src', 'pages', 'ChatPage.tsx')],
+    ['ChatPane', join(process.cwd(), 'src', 'components', 'ChatPane.tsx')],
+  ] as const
+
+  it.each(hosts)('%s wraps the list in a scroll-owning listbox', (_name, file) => {
+    const src = readFileSync(file, 'utf8')
+    const sites = [...src.matchAll(/<AgentDropdownList[\s>]/g)]
+    expect(sites.length).toBeGreaterThan(0)
+    for (const site of sites) {
+      // The wrapper opens within the few hundred chars above the render site.
+      const windowBefore = src.slice(Math.max(0, site.index! - 600), site.index!)
+      expect(windowBefore).toMatch(/role="listbox"[^>]*className="[^"]*overflow-y-auto[^"]*max-h-\[/)
+    }
+  })
 })
 
 describe('AgentDropdownList default-agent affordance', () => {
@@ -47,62 +97,65 @@ describe('AgentDropdownList default-agent affordance', () => {
     expect(screen.getByText('Default')).toBeInTheDocument()
   })
 
-  it('renders no default toggle at all when onSetDefault is omitted', () => {
+  it('puts no second control inside the option rows', () => {
+    // A row's one job is picking the agent for this session. A nested control had to
+    // stopPropagation to keep the two apart, and its scope ("for new sessions") could
+    // only live in a tooltip — the footer row states it on screen instead.
     render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={() => {}} />)
-    expect(screen.queryByLabelText('Start new sessions with this agent')).not.toBeInTheDocument()
-  })
-
-  it('names the global scope on the toggle rather than saying only "default"', () => {
-    // An unqualified "Set as default" reads as session-scoped in a pop-up whose other
-    // job is switching the agent for this session.
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={() => {}} onSetDefault={() => {}} />)
-    expect(screen.getByLabelText('Start new sessions with this agent')).toBeInTheDocument()
-  })
-
-  it('sets the default without also selecting the agent for this session', () => {
-    const onSelect = vi.fn()
-    const onSetDefault = vi.fn()
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={onSelect} onSetDefault={onSetDefault} />)
-    fireEvent.click(screen.getByLabelText('Start new sessions with this agent'))
-    expect(onSetDefault).toHaveBeenCalledWith('builtin')
-    // The row click handler must not also fire — picking an agent for one session
-    // and changing the global default are different actions.
-    expect(onSelect).not.toHaveBeenCalled()
-  })
-
-  it('offers no toggle on the row that already holds the default', () => {
-    // Clearing the default is destructive (the product ends up with none) and must not
-    // hide behind the same gesture that sets one. Only the Templates page clears it.
-    const onSetDefault = vi.fn()
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="kirocrew" onSelect={() => {}} onSetDefault={onSetDefault} />)
-    // Two agents, one is the default, so exactly one toggle is offered.
-    expect(screen.getAllByLabelText('Start new sessions with this agent')).toHaveLength(1)
-  })
-
-  it('activates the default toggle from the keyboard without selecting the row', () => {
-    const onSelect = vi.fn()
-    const onSetDefault = vi.fn()
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={onSelect} onSetDefault={onSetDefault} />)
-    const toggles = screen.getAllByLabelText('Start new sessions with this agent')
-    fireEvent.keyDown(toggles[0], { key: 'Enter' })
-    expect(onSetDefault).toHaveBeenCalledWith('kirocrew')
-    expect(onSelect).not.toHaveBeenCalled()
-  })
-
-  it('enrols the toggle in the listbox roving-focus ring so a keyboard user can reach it', () => {
-    // useListboxKeyboard moves focus across `[data-option],[role="option"]`. Without
-    // data-option the control is pointer-only: it cannot take a tab stop of its own
-    // because it is nested inside the option button.
-    render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} onSetDefault={() => {}} />)
-    const toggles = screen.getAllByLabelText('Start new sessions with this agent')
-    expect(toggles).toHaveLength(2)
-    for (const t of toggles) expect(t).toHaveAttribute('data-option')
+    for (const option of screen.getAllByRole('option')) {
+      expect(option.querySelector('[role="button"]')).toBeNull()
+    }
   })
 
   it('explains the two same-row markers rather than relying on colour alone', () => {
     render(<AgentDropdownList agents={agents} activeAgent="kirocrew" defaultAgent="kirocrew" onSelect={() => {}} />)
     expect(screen.getByTitle('New sessions start with this agent')).toBeInTheDocument()
     expect(screen.getByTitle('Active in this session')).toBeInTheDocument()
+  })
+})
+
+describe('DefaultAgentRow', () => {
+  it('names both the agent it writes and the scope it writes it to', () => {
+    // An unqualified "Set as default" reads as session-scoped in a pop-up whose other
+    // job is switching the agent for this session, and a bare icon can only put the
+    // scope in a tooltip.
+    render(<DefaultAgentRow agentName="reviewer" isDefault={false} onSetDefault={() => {}} />)
+    expect(screen.getByRole('button', { name: 'Set reviewer as default agent for new sessions' })).toBeInTheDocument()
+  })
+
+  it('writes the default when activated', () => {
+    const onSetDefault = vi.fn()
+    render(<DefaultAgentRow agentName="reviewer" isDefault={false} onSetDefault={onSetDefault} />)
+    fireEvent.click(screen.getByRole('button'))
+    expect(onSetDefault).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports the state instead of offering a no-op write once the agent holds it', () => {
+    // Clearing the default is destructive (the product ends up with none) and must not
+    // hide behind the same gesture that sets one. Only the Templates page clears it.
+    const onSetDefault = vi.fn()
+    render(<DefaultAgentRow agentName="reviewer" isDefault onSetDefault={onSetDefault} />)
+    const row = screen.getByRole('button', { name: 'Default agent for new sessions' })
+    expect(row).toBeDisabled()
+    expect(row).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(row)
+    expect(onSetDefault).not.toHaveBeenCalled()
+  })
+
+  it('joins the listbox roving-focus ring, the only keyboard path to it', () => {
+    // `useListboxKeyboard` consumes Tab to close the pop-up, so a plain button in
+    // the footer is pointer-only however correct its markup is. The hook moves real
+    // focus across `[data-option],[role="option"]`, and its own wiring notes say an
+    // action row must carry `data-option` + tabIndex={-1} to be reachable.
+    render(<DefaultAgentRow agentName="reviewer" isDefault={false} onSetDefault={() => {}} />)
+    const row = screen.getByRole('button')
+    expect(row).toHaveAttribute('data-option')
+    expect(row).toHaveAttribute('tabindex', '-1')
+  })
+
+  it('leaves the ring once it is disabled, so focus never stops on a dead row', () => {
+    render(<DefaultAgentRow agentName="reviewer" isDefault onSetDefault={() => {}} />)
+    expect(screen.getByRole('button')).not.toHaveAttribute('data-option')
   })
 })
 

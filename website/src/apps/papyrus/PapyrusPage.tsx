@@ -5,7 +5,7 @@
  *
  * - **No paper open** → `ProjectList`, which follows the standard page layout
  *   (`PageHeader` + `px-4 md:px-6 pb-8` container + `StatCard` row + `Card` sections).
- * - **A paper open** → a split-pane workspace: file tree, Monaco source pane and
+ * - **A paper open** → a split-pane workspace: file tree, Pierre source pane and
  *   diagnostics on the left; the rendered PDF on the right; an optional co-author
  *   chat panel beyond that. A paper and its PDF need the full viewport, so the
  *   editor is deliberately full-bleed and carries its own toolbar.
@@ -21,9 +21,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2, MessageSquare, Play, Sparkles, TerminalSquare, X, ChevronDown, ChevronUp } from 'lucide-react'
+import { AlertTriangle, ArrowDownToLine, ArrowLeft, ArrowUpFromLine, FileDown, Loader2, MessageSquare, Play, Sparkles, TerminalSquare, ChevronDown, ChevronUp } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { Btn } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
+import { useConfirm } from '../../components/ConfirmDialog'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import SearchableSelect from '../../components/SearchableSelect'
 import { useAppDispatch, useAppSelector } from '../../store'
@@ -96,6 +98,7 @@ const isFlushAbort = (err: Error): boolean => err.message === FLUSH_FAILED
  */
 
 export default function PapyrusPage() {
+  const { confirm, confirmDialog } = useConfirm()
   const queryClient = useQueryClient()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
@@ -150,7 +153,7 @@ export default function PapyrusPage() {
   // DURING the save, which is exactly what has to be detected.
   const bufferRef = useRef('')
   // Re-entry guard for save-and-compile. In a ref so the Cmd+S handler passed to
-  // Monaco keeps a stable identity across compile cycles.
+  // The editor keeps a stable identity across compile cycles.
   const compilingRef = useRef(false)
 
   useEffect(() => { bufferFileRef.current = currentFile }, [currentFile])
@@ -452,11 +455,13 @@ export default function PapyrusPage() {
     //
     // Placed above the clear so the early return leaves every guard exactly as it
     // was; the ordering the tests pin (clear -> reload) is unchanged.
-    if (dirtyRef.current && !window.confirm(
-      i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
+    if (dirtyRef.current && !(await confirm({
+      title: i18nT('apps.papyrus.workspace.co_author_conflict_discard_title'),
+      body: i18nT('apps.papyrus.workspace.co_author_conflict_discard_confirm', {
         file: conflicted ?? '',
       }),
-    )) return
+      confirmLabel: i18nT('apps.papyrus.workspace.co_author_conflict_discard_button'),
+    }))) return
     // Cleared BEFORE the reload, and the refs too: `reloadOpenFile` refuses to adopt
     // while the buffer is dirty, and its no-flush branch would otherwise re-record the
     // very conflict being resolved. So the guard has to be down for the reload to run.
@@ -486,7 +491,7 @@ export default function PapyrusPage() {
       dirtyRef.current = true
       setDirty(true)
     }
-  }, [reloadOpenFile])
+  }, [reloadOpenFile, confirm])
 
   const applyCompileResult = useCallback((result: Awaited<ReturnType<typeof papyrusApi.compile>>) => {
     setDiagnostics(Array.isArray(result.errors) ? result.errors : [])
@@ -696,15 +701,24 @@ export default function PapyrusPage() {
     prevBusyRef.current = coAuthorBusy
     if (!wasBusy || coAuthorBusy || !slotKey) return
     void (async () => {
+      let refreshed = false
       try {
         await invalidateFiles()
         // `false`: do NOT flush. The agent just wrote this file, so the browser
         // buffer is the stale copy — flushing would save it over the agent's edits.
         await reloadOpenFile(false)
-        if (project) applyCompileResult(await papyrusApi.compile(project))
+        refreshed = true
       } catch {
         // A refresh failure is not worth a banner: the user's next Cmd+S recovers,
         // and surfacing it would blame them for the agent's turn.
+      }
+      if (!refreshed || !project) return
+      try {
+        applyCompileResult(await papyrusApi.compile(project))
+      } catch (err) {
+        // The compile REQUEST failing is different: the PDF is now stale against
+        // the agent's edits and nothing else says so until the next Cmd+S.
+        setError(err instanceof Error ? err.message : String(err))
       }
     })()
   }, [coAuthorBusy, slotKey, project, invalidateFiles, reloadOpenFile, applyCompileResult])
@@ -818,20 +832,9 @@ export default function PapyrusPage() {
   if (!project) {
     return (
       <>
-        {error && (
-          <div className="mx-6 mt-2 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise" role="alert">
-            <AlertTriangle className="lucide-inline text-danger shrink-0 mt-0.5" />
-            <div className="flex-1 text-[13px] text-text break-words">{error}</div>
-            <button
-              type="button"
-              onClick={() => setError('')}
-              aria-label={i18nT('apps.papyrus.page.dismiss_error')}
-              className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors"
-            >
-              <X className="lucide-inline" />
-            </button>
-          </div>
-        )}
+        {/* No hand-off: the project list below holds the unsaved new-paper name and
+            clone-URL inputs, which the navigation would discard. */}
+        <ErrorNotice className="mx-6 mt-2 animate-rise" message={error} onDismiss={() => setError('')} />
         <ProjectList onOpenProject={openProject} />
       </>
     )
@@ -882,7 +885,7 @@ export default function PapyrusPage() {
         {hasConflict && (
           // The conflict has to be VISIBLE and have an exit. A silent read-only editor
           // whose saves fail would be worse than the overwrite it replaced.
-          <span className="flex items-center gap-2 text-[12px] text-warning">
+          <span className="flex items-center gap-2 text-[12px] text-warn">
             <AlertTriangle className="lucide-inline" />
             {i18nT('apps.papyrus.workspace.co_author_conflict')}
             <Btn onClick={resolveConflict}>
@@ -957,20 +960,9 @@ export default function PapyrusPage() {
         </Btn>
       </div>
 
-      {error && (
-        <div className="mx-3 mt-2 bg-danger/10 border border-danger/20 rounded-lg p-2.5 flex items-start gap-3 animate-rise" role="alert">
-          <AlertTriangle className="lucide-inline text-danger shrink-0 mt-0.5" />
-          <div className="flex-1 text-[13px] text-text break-words">{error}</div>
-          <button
-            type="button"
-            onClick={() => setError('')}
-            aria-label={i18nT('apps.papyrus.page.dismiss_error')}
-            className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none transition-colors"
-          >
-            <X className="lucide-inline" />
-          </button>
-        </div>
-      )}
+      {/* No hand-off: the open editor buffer is unsaved (a save banner is showing
+          precisely because it did not persist). */}
+      <ErrorNotice className="mx-3 mt-2 animate-rise" message={error} onDismiss={() => setError('')} />
 
       {/* Workspace */}
       <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
@@ -1056,7 +1048,7 @@ export default function PapyrusPage() {
           </div>
 
           {/* Status bar */}
-          <div className="flex items-center gap-4 px-3 py-1 border-t border-border bg-bg-subtle text-[12px] text-muted shrink-0">
+          <div className="flex items-center gap-4 px-3 py-1 border-t border-border bg-bg-accent text-[12px] text-muted shrink-0">
             <span title={i18nT('apps.papyrus.workspace.save_and_compile_hint')}>
               {i18nT('apps.papyrus.workspace.cursor_position', { line: cursor.line, column: cursor.column })}
             </span>
@@ -1133,6 +1125,7 @@ export default function PapyrusPage() {
           )}
         </AnimatePresence>
       </div>
+      {confirmDialog}
     </div>
   )
 }

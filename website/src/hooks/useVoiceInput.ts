@@ -23,11 +23,41 @@ export const voiceInputSupported =
 /** Release a pre-warmed mic if the user presses but doesn't start within this window. */
 const WARM_IDLE_MS = 15000
 
+/**
+ * Shortest gap between two recogniser prewarm requests.
+ *
+ * The gateway keeps a loaded model resident for its own idle-eviction window
+ * (ten minutes by default), so one request a minute is more than enough to keep
+ * it hot, while a repeated press or a nervous hover costs nothing. Module scope
+ * rather than a ref: residency is a property of the GATEWAY, not of a component
+ * instance, so remounting the chat page must not re-issue the request.
+ */
+const MODEL_WARM_THROTTLE_MS = 60000
+let lastModelWarmAt = 0
+
+/**
+ * Ask the gateway to load the speech model and run one throwaway decode.
+ *
+ * Fire-and-forget, and deliberately not awaited by any caller: the point is to
+ * move a cost that is paid ONCE (a cold load compiles a GPU pipeline, measured at
+ * 7.4 s, and the first decode after a load allocates its graph) out of the moment
+ * the user stops speaking. A failure means only that the first utterance pays what
+ * it would have paid anyway, so it must never block or fail capture.
+ */
+function warmModel(): void {
+  const now = Date.now()
+  if (now - lastModelWarmAt < MODEL_WARM_THROTTLE_MS) return
+  lastModelWarmAt = now
+  api.sttPrewarm().catch(() => { /* the first utterance pays the load instead */ })
+}
+
 interface Opts {
   streaming?: boolean
   onPartial?: (text: string, sessionId: string | null) => void
   /** Fired when streaming semantic endpointing judges the utterance complete. */
   onEndpoint?: () => void
+  /** Streaming capture stopped; final corrections may still arrive while typing. */
+  onCaptureStop?: () => void
   /** Id of the session/slot that currently owns the mic. Snapshotted the
    *  instant a recording starts so the resulting transcript can be attributed
    *  to the slot that initiated it — even if the user switches sessions before
@@ -64,6 +94,10 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   // Latest partial hypothesis, mirrored so the dictation panel can render it
   // muted. Cleared on final/stop so a stale partial can't linger as grey text.
   const [partial, setPartial] = useState('')
+  // Byte progress of a one-time model download the live session is waiting on.
+  // Surfaced to the recording chrome because otherwise the wait is
+  // indistinguishable from a hung microphone.
+  const [download, setDownload] = useState<{ done: number; total: number } | null>(null)
   // Unthrottled per-frame audio features, written in place by the level meter
   // and read by the shader's render loop. A ref (not state) on purpose: this
   // updates ~60x/sec and must never trigger a React render.
@@ -138,13 +172,15 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   // Destructure individual members so downstream useCallback deps track
   // stable references (start/stop/recording) instead of the hook's
   // always-new return object literal, preventing memoization churn.
-  const { recording: streamRecording, start: streamStart, stop: streamStop, switchDevice: streamSwitchDevice, cancel: streamCancel } = useStreamingStt({
+  const { recording: streamRecording, draining: streamDraining, start: streamStart, stop: streamStop, switchDevice: streamSwitchDevice, cancel: streamCancel } = useStreamingStt({
     onPartial: streamOnPartial,
     onFinal: streamOnFinal,
+    onCaptureStop: opts.onCaptureStop,
     onError: setError,
     onLevel: setLevel,
     onDevice: streamOnDevice,
     onEndpoint: streamOnEndpoint,
+    onDownload: setDownload,
     sampleRef,
   })
 
@@ -288,10 +324,20 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     setDeviceLabel(''); setDeviceId('')
   }, [])
 
-  // Pre-warm the mic on pointer-down so the click that follows starts capture
-  // instantly. Auto-releases if recording doesn't start within WARM_IDLE_MS so
-  // a press-without-record doesn't hold the mic open.
+  // Pre-warm on pointer-down so the click that follows starts capture instantly.
+  //
+  // TWO warmups with different owners. The recogniser is warmed for BOTH capture
+  // paths, because the model load and its first graph allocation are paid by
+  // whichever path speaks first and they are the same cost either way. The
+  // microphone is warmed only on the batch path (getUserMedia + the first audio
+  // frame have noticeable latency there); the streaming path acquires the mic
+  // inside its own start() and warming here would open a second stream.
+  //
+  // Auto-releases the MIC if recording doesn't start within WARM_IDLE_MS so a
+  // press-without-record doesn't hold it open. The model needs no such release:
+  // the gateway evicts it on its own idle timer.
   const prewarm = useCallback(() => {
+    warmModel()
     if (streamEnabled || !voiceInputSupported || startingRef.current || mediaRef.current) return
     acquireWarm().catch(() => { /* error is surfaced on the actual start() */ })
     if (warmTimerRef.current) clearTimeout(warmTimerRef.current)
@@ -309,11 +355,14 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
       // this stream to the slot now on screen.
       if (startingRef.current) return
       startingRef.current = true
+      // Stop spoken replies before capture can feed them back into dictation.
+      window.dispatchEvent(new CustomEvent('voice-stop'))
       const gen = ++startGenRef.current
       const streamSession = sessionIdRef.current
       streamSessionRef.current = streamSession
       try {
-        await streamStart()
+        const started = await streamStart()
+        if (started === false) return
         // Aborted by a slot switch during startup — stop the stream rather than
         // capture invisibly for a slot that is no longer on screen.
         if (streamSession !== sessionIdRef.current) { streamStop(); return }
@@ -332,6 +381,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     }
     if (!voiceInputSupported || startingRef.current) return
     startingRef.current = true
+    window.dispatchEvent(new CustomEvent('voice-stop'))
     const gen = ++startGenRef.current
     // Attribute this recording's transcript to the slot that owns the mic RIGHT
     // NOW. Captured as a local (not the ref) so a second recording started in
@@ -441,10 +491,10 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
       setError(humanizeMicError(e))
     }
     if (gen === startGenRef.current) startingRef.current = false
-  }, [streamEnabled, streamStart, acquireWarm])
+  }, [streamEnabled, streamStart, streamStop, acquireWarm])
 
   const stop = useCallback(() => {
-    if (streamEnabled) { streamStop(); setSessionOwner(null); return }
+    if (streamEnabled) { streamStop(); return }
     setPartial('')
     levelStopRef.current?.()
     levelStopRef.current = null
@@ -489,6 +539,10 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     setSessionOwner(null)
   }, [streamEnabled, streamCancel, releaseWarm])
 
+  useEffect(() => {
+    if (streamEnabled && !streamRecording && !streamDraining && !startingRef.current) setSessionOwner(null)
+  }, [streamEnabled, streamRecording, streamDraining])
+
   const isRecording = streamEnabled ? streamRecording : recording
   const toggle = useCallback(() => { if (isRecording) stop(); else start() }, [isRecording, start, stop])
   /**
@@ -532,5 +586,5 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   /** True when `switchDevice` takes effect immediately rather than next recording. */
   const deviceSwitchIsLive = streamEnabled && streamRecording
 
-  return { recording: isRecording, transcribing, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error, level, deviceLabel, deviceId, clearError, partial, sampleRef, switchDevice, deviceSwitchIsLive }
+  return { recording: isRecording, transcribing: transcribing || !!streamDraining, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error, level, deviceLabel, deviceId, clearError, partial, download, sampleRef, switchDevice, deviceSwitchIsLive }
 }

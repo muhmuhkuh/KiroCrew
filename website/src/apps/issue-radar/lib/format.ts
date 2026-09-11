@@ -1,30 +1,53 @@
 // Pure, side-effect-free helpers + localStorage accessors + constants for
 // Issue Radar. No React, no component imports — safe to pull into any module.
-import { AlertCircle, ArrowDownAZ, Clock, Hash, type LucideIcon } from 'lucide-react'
-import { fmtRelative, toDate } from '../../../i18n/format'
-import { i18nT } from '../../../i18n/t'
-import { loadColumnCollapsed, loadColumnWidth } from '../../../lib/columnWidth'
-import { DASHBOARD_TABS, SORT_KEYS } from './types'
-import type { ActiveRepo, CrewSortKey, DashboardTab, MainView, PrSortKey, PrStateFilter, SettingsTarget, SortDir, SortKey, StateFilter } from './types'
+import {
+ AlertCircle,
+ ArrowDownAZ,
+ Clock,
+ Flag,
+ Hash,
+ type LucideIcon,
+} from "lucide-react";
+import { activeLocale, fmtRelative, toDate } from "../../../i18n/format";
+import {
+ DEFAULT_LANGUAGE,
+ SUPPORTED_LANGUAGES,
+ type LanguageEntry,
+} from "../../../i18n/languages";
+import { i18nT } from "../../../i18n/t";
+import { loadColumnCollapsed, loadColumnWidth } from "../../../lib/columnWidth";
+import { DASHBOARD_TABS, SORT_KEYS } from "./types";
+import type {
+ ActiveRepo,
+ CrewSortKey,
+ DashboardTab,
+ MainView,
+ PrSortKey,
+ PrStateFilter,
+ SettingsTarget,
+ SortDir,
+ SortKey,
+ StateFilter,
+} from "./types";
 
-export const ACTIVE_KEY = 'kc:issue-radar:active-repo'
-export const LIST_WIDTH_KEY = 'kc:issue-radar:list-width'
-export const DEFAULT_LIST_WIDTH = 320
-export const MIN_LIST_WIDTH = 240
-export const MAX_LIST_WIDTH = 600
+export const ACTIVE_KEY = "kc:issue-radar:active-repo";
+export const LIST_WIDTH_KEY = "kc:issue-radar:list-width";
+export const DEFAULT_LIST_WIDTH = 320;
+export const MIN_LIST_WIDTH = 240;
+export const MAX_LIST_WIDTH = 600;
 
-export const RAIL_WIDTH_KEY = 'kc:issue-radar:rail-width'
-export const RAIL_COLLAPSED_KEY = 'kc:issue-radar:rail-collapsed'
+export const RAIL_WIDTH_KEY = "kc:issue-radar:rail-width";
+export const RAIL_COLLAPSED_KEY = "kc:issue-radar:rail-collapsed";
 /** Matches the rail's original fixed `w-72`, so an existing user sees no jump. */
-export const DEFAULT_RAIL_WIDTH = 288
-export const MIN_RAIL_WIDTH = 220
-export const MAX_RAIL_WIDTH = 460
+export const DEFAULT_RAIL_WIDTH = 288;
+export const MIN_RAIL_WIDTH = 220;
+export const MAX_RAIL_WIDTH = 460;
 /** Width of the collapsed rail: a vertical rounded-rect strip showing only the
  * repo logo and the full owner/repo turned on its side. Dragging the rail well
  * past its minimum snaps to this instead of stopping at a stubborn wall. */
-export const COLLAPSED_RAIL_WIDTH = 48
+export const COLLAPSED_RAIL_WIDTH = 48;
 
-export const APP_VERSION = '0.1.0'
+export const APP_VERSION = "0.1.0";
 
 /** Coerce an API/cache value to an array. A non-array — an unexpected response
  * shape, a 200 that carried an error object, or a stale backend/cache still
@@ -36,7 +59,7 @@ export const APP_VERSION = '0.1.0'
  * provider (context.tsx) guards its derivations the same way; views that run
  * their OWN queries must too. */
 export function asArray<T>(v: unknown): T[] {
-  return Array.isArray(v) ? (v as T[]) : []
+ return Array.isArray(v) ? (v as T[]) : [];
 }
 
 /** How often an OPEN detail pane re-reads its item from GitHub. A detail pane is
@@ -46,14 +69,14 @@ export function asArray<T>(v: unknown): T[] {
  * 30s is chosen for watching CI: a check flipping red is the thing you are
  * waiting on, and each poll costs a handful of `gh` calls for ONE item (not the
  * whole list), so the traffic stays proportionate. */
-export const DETAIL_POLL_MS = 30_000
+export const DETAIL_POLL_MS = 30_000;
 
 /** Poll interval for a MERGED or CLOSED item. Its expensive parts — the diff
  * shape, the check run, the commit list — are frozen; only late commentary can
  * still arrive. Polling those at the open-item rate spends the same 5-7 `gh`
  * calls every 30s to observe state that cannot change, so closed items back off
  * by an order of magnitude instead of being switched off entirely. */
-export const CLOSED_DETAIL_POLL_MS = 300_000
+export const CLOSED_DETAIL_POLL_MS = 300_000;
 
 /** The poll interval an item deserves, given whether it is still open.
  *
@@ -63,8 +86,11 @@ export const CLOSED_DETAIL_POLL_MS = 300_000
  * calls to observe state that cannot change — which is not what the setting is
  * asking for even when it names a shorter interval.
  */
-export function detailPollMs(open: boolean, openMs: number = DETAIL_POLL_MS): number {
-  return open ? openMs : CLOSED_DETAIL_POLL_MS
+export function detailPollMs(
+ open: boolean,
+ openMs: number = DETAIL_POLL_MS,
+): number {
+ return open ? openMs : CLOSED_DETAIL_POLL_MS;
 }
 
 /** Poll interval for the issue / pull-request LISTS.
@@ -80,7 +106,7 @@ export function detailPollMs(open: boolean, openMs: number = DETAIL_POLL_MS): nu
  * so a "new issue" bell notification and the list row it refers to land in the
  * same window instead of the notification arriving a refresh ahead of the list.
  */
-export const LIST_POLL_MS = 60_000
+export const LIST_POLL_MS = 60_000;
 
 // ── Refresh preferences ───────────────────────────────────────────────────
 // The intervals above are the DEFAULTS, not the whole story: how fresh the app
@@ -116,16 +142,18 @@ export const LIST_POLL_MS = 60_000
  * The floor is 30s, and it is not arbitrary: see the note above — it is twice the
  * backend's 15s probe-coalescing window, which is what keeps the shared 30/min search
  * quota bounded no matter how many tabs are open. */
-export const LIST_POLL_CHOICES_MS = [30_000, 60_000, 120_000, 300_000] as const
+export const LIST_POLL_CHOICES_MS = [30_000, 60_000, 120_000, 300_000] as const;
 
 /** Selectable detail-poll intervals, in ms. A detail poll is ONE item's worth of
  * traffic (a handful of calls), so it can safely be faster than a list poll. */
-export const DETAIL_POLL_CHOICES_MS = [15_000, 30_000, 60_000, 120_000] as const
+export const DETAIL_POLL_CHOICES_MS = [
+ 15_000, 30_000, 60_000, 120_000,
+] as const;
 
 /** How long a fetched list stays "fresh" before react-query will refetch it on
  * mount/focus. Raising it is what makes returning to the app paint instantly
  * from cache instead of re-fetching. */
-export const STALE_TIME_CHOICES_MS = [0, 30_000, 120_000, 600_000] as const
+export const STALE_TIME_CHOICES_MS = [0, 30_000, 120_000, 600_000] as const;
 
 /** How long an UNMOUNTED query's data is kept before react-query garbage-collects it.
  *
@@ -143,31 +171,31 @@ export const STALE_TIME_CHOICES_MS = [0, 30_000, 120_000, 600_000] as const
  * stale instead of fetching". Bounded rather than `Infinity` so a long-lived tab that has
  * visited many repos does not retain every one of their lists forever.
  */
-export const CACHE_RETENTION_MS = 30 * 60_000
+export const CACHE_RETENTION_MS = 30 * 60_000;
 
 /** Defaults for the refresh preferences — the historical hardcoded behaviour, so
  * an existing user's app behaves identically until they change something. */
 export const REFRESH_DEFAULTS = {
-  listPollMs: LIST_POLL_MS,
-  detailPollMs: DETAIL_POLL_MS,
-  staleTimeMs: 30_000,
-  /** Keep polling while the tab is in the BACKGROUND. Default off, which is
-   * react-query's own default: a backgrounded tab costs nothing, at the price of
-   * returning to a stale list and waiting for the first poll. */
-  pollInBackground: false,
-  /** Load the pull-request list as soon as the app opens, rather than waiting for
-   * the PR surface to be opened. Default off because that fetch also runs the
-   * GraphQL enrichment, so it spends budget on data the user may never look at. */
-  prefetchPulls: false,
-} as const
+ listPollMs: LIST_POLL_MS,
+ detailPollMs: DETAIL_POLL_MS,
+ staleTimeMs: 30_000,
+ /** Keep polling while the tab is in the BACKGROUND. Default off, which is
+  * react-query's own default: a backgrounded tab costs nothing, at the price of
+  * returning to a stale list and waiting for the first poll. */
+ pollInBackground: false,
+ /** Load the pull-request list as soon as the app opens, rather than waiting for
+  * the PR surface to be opened. Default off because that fetch also runs the
+  * GraphQL enrichment, so it spends budget on data the user may never look at. */
+ prefetchPulls: false,
+} as const;
 
 /** The user's refresh preferences. */
 export interface RefreshPrefs {
-  listPollMs: number
-  detailPollMs: number
-  staleTimeMs: number
-  pollInBackground: boolean
-  prefetchPulls: boolean
+ listPollMs: number;
+ detailPollMs: number;
+ staleTimeMs: number;
+ pollInBackground: boolean;
+ prefetchPulls: boolean;
 }
 
 /** Coerce a persisted interval back into one of its OFFERED choices.
@@ -178,30 +206,81 @@ export interface RefreshPrefs {
  * take the app down with 403s. An unrecognized value falls back to the default.
  */
 export function coerceInterval(
-  value: unknown, choices: readonly number[], fallback: number,
+ value: unknown,
+ choices: readonly number[],
+ fallback: number,
 ): number {
-  return typeof value === 'number' && choices.includes(value) ? value : fallback
+ return typeof value === "number" && choices.includes(value) ? value : fallback;
 }
 
 /** The refresh preferences from persisted state, each field validated. */
-export function coerceRefreshPrefs(raw: Partial<RefreshPrefs> | undefined): RefreshPrefs {
-  return {
-    listPollMs: coerceInterval(
-      raw?.listPollMs, LIST_POLL_CHOICES_MS, REFRESH_DEFAULTS.listPollMs,
-    ),
-    detailPollMs: coerceInterval(
-      raw?.detailPollMs, DETAIL_POLL_CHOICES_MS, REFRESH_DEFAULTS.detailPollMs,
-    ),
-    staleTimeMs: coerceInterval(
-      raw?.staleTimeMs, STALE_TIME_CHOICES_MS, REFRESH_DEFAULTS.staleTimeMs,
-    ),
-    pollInBackground: typeof raw?.pollInBackground === 'boolean'
-      ? raw.pollInBackground
-      : REFRESH_DEFAULTS.pollInBackground,
-    prefetchPulls: typeof raw?.prefetchPulls === 'boolean'
-      ? raw.prefetchPulls
-      : REFRESH_DEFAULTS.prefetchPulls,
-  }
+export function coerceRefreshPrefs(
+ raw: Partial<RefreshPrefs> | undefined,
+): RefreshPrefs {
+ return {
+  listPollMs: coerceInterval(
+   raw?.listPollMs,
+   LIST_POLL_CHOICES_MS,
+   REFRESH_DEFAULTS.listPollMs,
+  ),
+  detailPollMs: coerceInterval(
+   raw?.detailPollMs,
+   DETAIL_POLL_CHOICES_MS,
+   REFRESH_DEFAULTS.detailPollMs,
+  ),
+  staleTimeMs: coerceInterval(
+   raw?.staleTimeMs,
+   STALE_TIME_CHOICES_MS,
+   REFRESH_DEFAULTS.staleTimeMs,
+  ),
+  pollInBackground:
+   typeof raw?.pollInBackground === "boolean"
+    ? raw.pollInBackground
+    : REFRESH_DEFAULTS.pollInBackground,
+  prefetchPulls:
+   typeof raw?.prefetchPulls === "boolean"
+    ? raw.prefetchPulls
+    : REFRESH_DEFAULTS.prefetchPulls,
+ };
+}
+
+/** "Follow the dashboard language" — the default, persisted as the empty string
+ * so an unset field already means follow, with no migration for existing users. */
+export const AI_LANGUAGE_FOLLOW = "";
+
+/** The languages an AI-output directive may name.
+ *
+ * A FOURTH question, deliberately not one of the three lists in `i18n/languages`
+ * (resolvable / browser-detectable / pickable): "what language may the agent be
+ * told to write in". The pseudolocale is excluded because it is a rendering
+ * device, not a language — instructing a model to answer in `en-XA` would produce
+ * garbage rather than padded text.
+ */
+export const AI_LANGUAGE_CHOICES: readonly LanguageEntry[] =
+ SUPPORTED_LANGUAGES.filter((l) => !l.devOnly);
+
+/** Coerce a persisted AI-language choice. Anything unrecognized — a hand-edited
+ * value, or a language this build no longer ships — falls back to follow, which
+ * is the only value that cannot be wrong. */
+export function coerceAiLanguage(value: unknown): string {
+ if (typeof value !== "string") return AI_LANGUAGE_FOLLOW;
+ return AI_LANGUAGE_CHOICES.some((l) => l.code === value)
+  ? value
+  : AI_LANGUAGE_FOLLOW;
+}
+
+/** The BCP-47 tag an agent prompt should name, or `''` for "say nothing".
+ *
+ * English resolves to `''` rather than to `'en'`: the prompts are written in
+ * English, so a directive would restate the language they are already in, and
+ * suppressing it keeps every prompt byte-identical to what an English user
+ * sends today. `''` is therefore both "not configured" and "no directive
+ * needed", which is what makes the follow case free.
+ */
+export function resolveAiLanguage(pref: string): string {
+ const tag = coerceAiLanguage(pref) || activeLocale();
+ if (tag === DEFAULT_LANGUAGE) return "";
+ return AI_LANGUAGE_CHOICES.some((l) => l.code === tag) ? tag : "";
 }
 
 /** Compact "now / 5m ago / 3h ago / 2d ago" from an epoch-ms timestamp.
@@ -213,8 +292,8 @@ export function coerceRefreshPrefs(raw: Partial<RefreshPrefs> | undefined): Refr
  * `month`/`months` plural morphology comes from CLDR rather than being
  * hand-rolled (which is unexpressible outside English). */
 export function relativeTime(ms: number): string {
-  if (!ms) return ''
-  return fmtRelative(ms)
+ if (!ms) return "";
+ return fmtRelative(ms);
 }
 
 /** Timeline-friendly label: within the last 24h it reads as a compact elapsed
@@ -222,13 +301,13 @@ export function relativeTime(ms: number): string {
  * calendar-based relativeDate ("yesterday / 5 days ago / 2 months ago").
  * Future timestamps (clock skew) defer to relativeDate. */
 export function relativeTimeOrDate(iso: string): string {
-  const then = toDate(iso)
-  if (!then) return ''
-  const secs = Math.floor((Date.now() - then.getTime()) / 1000)
-  // Inside a day, show elapsed time compactly; the calendar wording below is
-  // only meaningful once a date boundary has been crossed.
-  if (secs >= 0 && secs < 86400) return fmtRelative(then)
-  return relativeDate(iso)
+ const then = toDate(iso);
+ if (!then) return "";
+ const secs = Math.floor((Date.now() - then.getTime()) / 1000);
+ // Inside a day, show elapsed time compactly; the calendar wording below is
+ // only meaningful once a date boundary has been crossed.
+ if (secs >= 0 && secs < 86400) return fmtRelative(then);
+ return relativeDate(iso);
 }
 
 /** Human "today / yesterday / N days ago" from an ISO timestamp.
@@ -242,84 +321,97 @@ export function relativeTimeOrDate(iso: string): string {
  * The `style: 'long'` override is deliberate: this label sits in a timeline
  * where "5 days ago" reads better than the compact "5d ago". */
 export function relativeDate(iso: string): string {
-  const then = toDate(iso)
-  if (!then) return ''
-  const now = new Date()
-  const d0 = new Date(then.getFullYear(), then.getMonth(), then.getDate())
-  const n0 = new Date(now.getFullYear(), now.getMonth(), now.getDate())
-  const days = Math.round((n0.getTime() - d0.getTime()) / 86400000)
-  // Re-anchor onto whole days so the relative formatter picks the day/month/year
-  // unit from a calendar difference rather than from a partial-day remainder.
-  const anchored = new Date(n0.getTime() - days * 86400000)
-  // `unit: 'day'` is required: this function has already reduced its input to
-  // whole calendar days, and with an auto-picked unit a zero delta would mean
-  // "under one second" and render "now" for something that happened earlier
-  // today. Pinning the day unit renders "today" / "今天".
-  return fmtRelative(anchored, { style: 'long', now: n0.getTime(), unit: 'day' })
+ const then = toDate(iso);
+ if (!then) return "";
+ const now = new Date();
+ const d0 = new Date(then.getFullYear(), then.getMonth(), then.getDate());
+ const n0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+ const days = Math.round((n0.getTime() - d0.getTime()) / 86400000);
+ // Re-anchor onto whole days so the relative formatter picks the day/month/year
+ // unit from a calendar difference rather than from a partial-day remainder.
+ const anchored = new Date(n0.getTime() - days * 86400000);
+ // `unit: 'day'` is required: this function has already reduced its input to
+ // whole calendar days, and with an auto-picked unit a zero delta would mean
+ // "under one second" and render "now" for something that happened earlier
+ // today. Pinning the day unit renders "today" / "今天".
+ return fmtRelative(anchored, {
+  style: "long",
+  now: n0.getTime(),
+  unit: "day",
+ });
 }
 
-
 export function loadListWidth(): number {
-  return loadColumnWidth(LIST_WIDTH_KEY, MIN_LIST_WIDTH, MAX_LIST_WIDTH, DEFAULT_LIST_WIDTH)
+ return loadColumnWidth(
+  LIST_WIDTH_KEY,
+  MIN_LIST_WIDTH,
+  MAX_LIST_WIDTH,
+  DEFAULT_LIST_WIDTH,
+ );
 }
 
 export function loadRailWidth(): number {
-  return loadColumnWidth(RAIL_WIDTH_KEY, MIN_RAIL_WIDTH, MAX_RAIL_WIDTH, DEFAULT_RAIL_WIDTH)
+ return loadColumnWidth(
+  RAIL_WIDTH_KEY,
+  MIN_RAIL_WIDTH,
+  MAX_RAIL_WIDTH,
+  DEFAULT_RAIL_WIDTH,
+ );
 }
 
 /** Collapsed state is stored apart from the width so collapsing and re-expanding
  * the rail returns it to the width the user had chosen, not the default. */
 export function loadRailCollapsed(): boolean {
-  return loadColumnCollapsed(RAIL_COLLAPSED_KEY)
+ return loadColumnCollapsed(RAIL_COLLAPSED_KEY);
 }
 
 export function loadActiveRepo(): ActiveRepo | null {
-  try {
-    const raw = localStorage.getItem(ACTIVE_KEY)
-    if (!raw) return null
-    const p = JSON.parse(raw)
-    // Only owner/repo are required: a value persisted before GitLab support has
-    // no provider/host, and rejecting it would silently drop the user's repo on
-    // upgrade. The absent fields mean public GitHub, which is what it was.
-    if (p && typeof p.owner === 'string' && typeof p.repo === 'string') {
-      return {
-        owner: p.owner,
-        repo: p.repo,
-        ...(typeof p.provider === 'string' ? { provider: p.provider } : {}),
-        ...(typeof p.host === 'string' ? { host: p.host } : {}),
-      }
-    }
-  } catch {
-    /* corrupted value — ignore */
+ try {
+  const raw = localStorage.getItem(ACTIVE_KEY);
+  if (!raw) return null;
+  const p = JSON.parse(raw);
+  // Only owner/repo are required: a value persisted before GitLab support has
+  // no provider/host, and rejecting it would silently drop the user's repo on
+  // upgrade. The absent fields mean public GitHub, which is what it was.
+  if (p && typeof p.owner === "string" && typeof p.repo === "string") {
+   return {
+    owner: p.owner,
+    repo: p.repo,
+    ...(typeof p.provider === "string" ? { provider: p.provider } : {}),
+    ...(typeof p.host === "string" ? { host: p.host } : {}),
+   };
   }
-  return null
+ } catch {
+  /* corrupted value — ignore */
+ }
+ return null;
 }
 
 export function saveActiveRepo(repo: ActiveRepo) {
-  localStorage.setItem(ACTIVE_KEY, JSON.stringify(repo))
+ localStorage.setItem(ACTIVE_KEY, JSON.stringify(repo));
 }
 
 /** Pick a black/white foreground that stays legible on a GitHub label colour
  * (6-hex, no leading '#'). Uses the standard sRGB luminance threshold. */
 export function readableText(hex: string): string {
-  const h = (hex || '').replace('#', '')
-  if (h.length !== 6) return '#000'
-  const r = parseInt(h.slice(0, 2), 16)
-  const g = parseInt(h.slice(2, 4), 16)
-  const b = parseInt(h.slice(4, 6), 16)
-  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
-  return luminance > 0.6 ? '#000' : '#fff'
+ const h = (hex || "").replace("#", "");
+ if (h.length !== 6) return "#000";
+ const r = parseInt(h.slice(0, 2), 16);
+ const g = parseInt(h.slice(2, 4), 16);
+ const b = parseInt(h.slice(4, 6), 16);
+ const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+ return luminance > 0.6 ? "#000" : "#fff";
 }
 
 /** A translucent tint of a GitHub label colour, for the unselected (light
  * filled) label-row state. */
 export function hexToRgba(hex: string, alpha: number): string {
-  const h = (hex || '').replace('#', '')
-  if (h.length !== 6) return `rgba(136,136,136,${alpha})`
-  const r = parseInt(h.slice(0, 2), 16)
-  const g = parseInt(h.slice(2, 4), 16)
-  const b = parseInt(h.slice(4, 6), 16)
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+ const h = (hex || "").replace("#", "");
+ if (h.length !== 6) return `rgba(136,136,136,${alpha})`;
+ const r = parseInt(h.slice(0, 2), 16);
+ const g = parseInt(h.slice(2, 4), 16);
+ const b = parseInt(h.slice(4, 6), 16);
+ return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
 /** Sort options rendered in the Filters section.
@@ -329,17 +421,53 @@ export function hexToRgba(hex: string, alpha: number): string {
  * re-resolve on a language switch. A getter runs on every property access, and
  * the access is `{f.label}` inside FiltersSection's render — so the consumers
  * need no change. */
-export const SORT_FIELDS: { key: SortKey; label: string; icon: LucideIcon }[] = [
-  { key: 'number', get label() { return i18nT('apps.issueRadar.lib.format.number') }, icon: Hash },
-  { key: 'updated', get label() { return i18nT('apps.issueRadar.lib.format.last_update') }, icon: Clock },
-]
+export const SORT_FIELDS: { key: SortKey; label: string; icon: LucideIcon }[] =
+ [
+  {
+   key: "number",
+   get label() {
+    return i18nT("apps.issueRadar.lib.format.number");
+   },
+   icon: Hash,
+  },
+  {
+   key: "updated",
+   get label() {
+    return i18nT("apps.issueRadar.lib.format.last_update");
+   },
+   icon: Clock,
+  },
+  {
+   key: "priority",
+   get label() {
+    return i18nT("apps.issueRadar.lib.format.priority");
+   },
+   icon: Flag,
+  },
+ ];
 
 /** Sort options for the pull-request list — same fields, and deliberately the
  *  same two catalog keys, as the issue list above. */
-export const PR_SORT_FIELDS: { key: PrSortKey; label: string; icon: LucideIcon }[] = [
-  { key: 'number', get label() { return i18nT('apps.issueRadar.lib.format.number') }, icon: Hash },
-  { key: 'updated', get label() { return i18nT('apps.issueRadar.lib.format.last_update') }, icon: Clock },
-]
+export const PR_SORT_FIELDS: {
+ key: PrSortKey;
+ label: string;
+ icon: LucideIcon;
+}[] = [
+ {
+  key: "number",
+  get label() {
+   return i18nT("apps.issueRadar.lib.format.number");
+  },
+  icon: Hash,
+ },
+ {
+  key: "updated",
+  get label() {
+   return i18nT("apps.issueRadar.lib.format.last_update");
+  },
+  icon: Clock,
+ },
+];
 
 /** Sort options for the crew roster, in the order the rail lists them.
  *
@@ -347,11 +475,33 @@ export const PR_SORT_FIELDS: { key: PrSortKey; label: string; icon: LucideIcon }
  * ascending direction is the urgency order the backend already ranks by (a crew
  * waiting on a human above one that is merely working). Labels are getters for the
  * same reason the two lists above use them — a locale switch must re-read them. */
-export const CREW_SORT_FIELDS: { key: CrewSortKey; label: string; icon: LucideIcon }[] = [
-  { key: 'status', get label() { return i18nT('apps.issueRadar.lib.format.crew_sort_status') }, icon: AlertCircle },
-  { key: 'name', get label() { return i18nT('apps.issueRadar.lib.format.crew_sort_name') }, icon: ArrowDownAZ },
-  { key: 'created', get label() { return i18nT('apps.issueRadar.lib.format.crew_sort_created') }, icon: Clock },
-]
+export const CREW_SORT_FIELDS: {
+ key: CrewSortKey;
+ label: string;
+ icon: LucideIcon;
+}[] = [
+ {
+  key: "status",
+  get label() {
+   return i18nT("apps.issueRadar.lib.format.crew_sort_status");
+  },
+  icon: AlertCircle,
+ },
+ {
+  key: "name",
+  get label() {
+   return i18nT("apps.issueRadar.lib.format.crew_sort_name");
+  },
+  icon: ArrowDownAZ,
+ },
+ {
+  key: "created",
+  get label() {
+   return i18nT("apps.issueRadar.lib.format.crew_sort_created");
+  },
+  icon: Clock,
+ },
+];
 
 // ── Persisted UI state ────────────────────────────────────────────────────
 // The whole app view (which dashboard / issues / settings page is showing, the
@@ -359,52 +509,59 @@ export const CREW_SORT_FIELDS: { key: CrewSortKey; label: string; icon: LucideIc
 // Issue Radar for another KiroCrew page and coming back restores exactly where
 // you were. Mirrors loadActiveRepo above (the active repo is persisted on its
 // own key); together they fully restore the app on return.
-export const UI_STATE_KEY = 'kc:issue-radar:ui-state'
+export const UI_STATE_KEY = "kc:issue-radar:ui-state";
 
 export interface PersistedUiState {
-  mainView: MainView
-  dashboardTab: DashboardTab
-  settingsTarget: SettingsTarget
-  selectedIssue: number | null
-  query: string
-  selectedLabels: string[]
-  requestedByMe: boolean
-  assignedToMe: boolean
-  createdByMember: boolean
-  stateFilter: StateFilter
-  sortKey: SortKey
-  sortDir: SortDir
-  // ── pull-request view ──
-  selectedPull: number | null
-  prQuery: string
-  prSelectedLabels: string[]
-  prAuthoredByMe: boolean
-  prAssignedToMe: boolean
-  prReviewRequestedByMe: boolean
-  prDraftOnly: boolean
-  prCreatedByMember: boolean
-  prStateFilter: PrStateFilter
-  prSortKey: PrSortKey
-  prSortDir: SortDir
-  // ── refresh preferences ──
-  // Persisted with the rest of the UI state rather than in a separate store: they
-  // are per-browser view preferences like the filters, not repo configuration (a
-  // per-repo home would make "how often does this poll" a property of the repo,
-  // which is not what the setting means).
-  refresh: RefreshPrefs
+ mainView: MainView;
+ dashboardTab: DashboardTab;
+ settingsTarget: SettingsTarget;
+ selectedIssue: number | null;
+ query: string;
+ selectedLabels: string[];
+ selectedStatuses?: string[];
+ requestedByMe: boolean;
+ assignedToMe: boolean;
+ createdByMember: boolean;
+ stateFilter: StateFilter;
+ sortKey: SortKey;
+ sortDir: SortDir;
+ // ── pull-request view ──
+ selectedPull: number | null;
+ prQuery: string;
+ prSelectedLabels: string[];
+ prAuthoredByMe: boolean;
+ prAssignedToMe: boolean;
+ prReviewRequestedByMe: boolean;
+ prDraftOnly: boolean;
+ prCreatedByMember: boolean;
+ prStateFilter: PrStateFilter;
+ prSortKey: PrSortKey;
+ prSortDir: SortDir;
+ // ── refresh preferences ──
+ // Persisted with the rest of the UI state rather than in a separate store: they
+ // are per-browser view preferences like the filters, not repo configuration (a
+ // per-repo home would make "how often does this poll" a property of the repo,
+ // which is not what the setting means).
+ refresh: RefreshPrefs;
+ // ── AI output language ──
+ // Same reasoning as the refresh block: a per-browser view preference, not repo
+ // configuration. It is deliberately SEPARATE from `dashboard.language` so the
+ // interface and the agent's prose can differ — an English dashboard whose
+ // findings come back in Chinese is a supported combination, not a mismatch.
+ aiLanguage: string;
 }
 
 /** Load the persisted UI state. Partial by design — any missing field falls
  * back to its default at the call site. Returns {} on first run / corruption. */
 export function loadUiState(): Partial<PersistedUiState> {
-  try {
-    const raw = localStorage.getItem(UI_STATE_KEY)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw)
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
+ try {
+  const raw = localStorage.getItem(UI_STATE_KEY);
+  if (!raw) return {};
+  const parsed = JSON.parse(raw);
+  return parsed && typeof parsed === "object" ? parsed : {};
+ } catch {
+  return {};
+ }
 }
 
 /** Coerce a persisted sort key back into a currently-supported one. A key that
@@ -412,21 +569,70 @@ export function loadUiState(): Partial<PersistedUiState> {
  * order) must not survive a reload, or the list would render unsorted with no
  * matching option highlighted in the rail. */
 export function coerceSortKey(value: unknown): SortKey {
-  return (SORT_KEYS as readonly string[]).includes(value as string) ? (value as SortKey) : 'number'
+ return (SORT_KEYS as readonly string[]).includes(value as string)
+  ? (value as SortKey)
+  : "number";
 }
 
 /** Same idea for the dashboard tab: a tab whose view no longer exists falls
  * back to Overview instead of rendering an empty main area. */
 export function coerceDashboardTab(value: unknown): DashboardTab {
-  return (DASHBOARD_TABS as readonly string[]).includes(value as string) ? (value as DashboardTab) : 'overview'
+ return (DASHBOARD_TABS as readonly string[]).includes(value as string)
+  ? (value as DashboardTab)
+  : "overview";
 }
 
-export function saveUiState(state: PersistedUiState) {
-  try {
-    localStorage.setItem(UI_STATE_KEY, JSON.stringify(state))
-  } catch {
-    /* quota exceeded / private mode — persistence is best-effort */
+/** What a caller may hand `saveUiState`: any subset of the document, and for
+ * `refresh` any subset of ITS members too. `refresh` is a document of its own, so a
+ * caller that changed one member must be able to say so without restating the rest --
+ * see `saveUiState` for why sending the whole object is a clobber one level down. */
+export type UiStatePatch = Partial<Omit<PersistedUiState, "refresh">> & {
+ refresh?: Partial<RefreshPrefs>;
+};
+
+/** Merge the given fields into the persisted UI state, leaving every other field
+ * on disk untouched.
+ *
+ * This USED to take the whole `PersistedUiState` and overwrite the document, which
+ * made two dashboard tabs clobber each other: the provider's save effect fires on
+ * any view/filter/selection change, so a tab persisting one unrelated edit rewrote
+ * every other field from whatever it read at mount, reverting the other tab's work.
+ *
+ * Merging is only half the fix and does not work on its own -- a caller that still
+ * passes every field overwrites with the same stale values, because its payload wins
+ * the spread. The caller must send ONLY the fields it actually changed; the provider
+ * does that by diffing against the document it last wrote. Both halves are required,
+ * so keep them together if this is ever refactored.
+ *
+ * `refresh` is merged MEMBER-WISE for the same reason the document is: it holds five
+ * independent settings, so replacing the whole object reproduces the clobber one level
+ * down -- one tab toggling background polling and another changing an interval would
+ * each revert the other's member. Only the members the caller names are written.
+ *
+ * Unlike `patchUiState` this MAY carry `refresh`, because its one caller builds those
+ * values from `refreshPrefs`, which only ever comes out of `coerceRefreshPrefs` in
+ * `setRefreshPrefs`. `patchUiState` keeps the narrower type for the connect flow,
+ * where no such guarantee exists.
+ *
+ * @returns true when the document was written, false when the write was swallowed
+ * (quota exceeded / private mode). A caller that tracks what it last PERSISTED must
+ * not advance that record on false, or the fields in this patch would count as
+ * stored while the document on disk still holds the old ones. */
+export function saveUiState(patch: UiStatePatch): boolean {
+ try {
+  const stored = loadUiState();
+  const next: Record<string, unknown> = { ...stored, ...patch };
+  if (patch.refresh) {
+   // Spread the STORED members under the patch, so a member this caller did not
+   // name keeps whatever another tab last wrote for it.
+   next.refresh = { ...(stored.refresh ?? {}), ...patch.refresh };
   }
+  localStorage.setItem(UI_STATE_KEY, JSON.stringify(next));
+  return true;
+ } catch {
+  /* quota exceeded / private mode — persistence is best-effort */
+  return false;
+ }
 }
 
 /** Merge a single field into the persisted UI state, leaving the rest intact.
@@ -438,19 +644,19 @@ export function saveUiState(state: PersistedUiState) {
  * already-mounted case (the "connect another repo" modal) switches view through
  * the context instead. */
 export function patchUiState(
-  // `refresh` is deliberately EXCLUDED from what this may write. It is the one
-  // persisted field with a validated domain — an out-of-range interval is a real
-  // provider-budget hazard (see `coerceInterval`) — and this is the only write path
-  // that does not go through `setRefreshPrefs`. The read side coerces anyway, so a bad
-  // value could not take effect, but keeping it out of the type means a future caller
-  // cannot introduce the bypass in the first place.
-  patch: Partial<Omit<PersistedUiState, 'refresh'>>,
+ // `refresh` is deliberately EXCLUDED from what this may write. It is the one
+ // persisted field with a validated domain — an out-of-range interval is a real
+ // provider-budget hazard (see `coerceInterval`) — and this is the only write path
+ // that does not go through `setRefreshPrefs`. The read side coerces anyway, so a bad
+ // value could not take effect, but keeping it out of the type means a future caller
+ // cannot introduce the bypass in the first place.
+ patch: Partial<Omit<PersistedUiState, "refresh">>,
 ) {
-  try {
-    localStorage.setItem(UI_STATE_KEY, JSON.stringify({ ...loadUiState(), ...patch }))
-  } catch {
-    /* best-effort, same as saveUiState */
-  }
+ // The body is `saveUiState`'s -- the merge is the same operation, and this
+ // signature is the only difference worth keeping. `patch.refresh` is
+ // unrepresentable here, so the nested-merge branch there is simply never taken.
+ // The write result is passed through for the same reason it exists there.
+ return saveUiState(patch);
 }
 
 /** Pending "open the first issue" intent, set at connect time.
@@ -463,24 +669,31 @@ export function patchUiState(
  * the flag fire on their next visit and yank selection to the first issue of
  * whatever repo is active. Storage is also shared across tabs, where whichever
  * tab resolved first would consume the other's intent. */
-let autoSelectFirstIssue: { owner: string; repo: string } | null = null
+let autoSelectFirstIssue: { owner: string; repo: string } | null = null;
 
 /** GitHub names are case-preserving but not case-sensitive. */
-const repoKey = (r: { owner: string; repo: string }) => `${r.owner}/${r.repo}`.toLowerCase()
+const repoKey = (r: { owner: string; repo: string }) =>
+ `${r.owner}/${r.repo}`.toLowerCase();
 
 /** Ask the workspace to open the first open issue once the list has loaded.
  * SCOPED to the repo that was just connected: the provider may still be
  * showing the previous repo while its issues refetch, and an unscoped flag
  * would be consumed by that render and select an issue from the OLD repo. */
-export function markAutoSelectFirstIssue(repo: { owner: string; repo: string }) {
-  autoSelectFirstIssue = { owner: repo.owner, repo: repo.repo }
+export function markAutoSelectFirstIssue(repo: {
+ owner: string;
+ repo: string;
+}) {
+ autoSelectFirstIssue = { owner: repo.owner, repo: repo.repo };
 }
 
 /** Read AND clear the flag, but only when `active` is the repo the intent was
  * recorded for. Returns true only for that repo's first caller. */
-export function consumeAutoSelectFirstIssue(active: { owner: string; repo: string }): boolean {
-  if (!autoSelectFirstIssue) return false
-  if (repoKey(autoSelectFirstIssue) !== repoKey(active)) return false
-  autoSelectFirstIssue = null
-  return true
+export function consumeAutoSelectFirstIssue(active: {
+ owner: string;
+ repo: string;
+}): boolean {
+ if (!autoSelectFirstIssue) return false;
+ if (repoKey(autoSelectFirstIssue) !== repoKey(active)) return false;
+ autoSelectFirstIssue = null;
+ return true;
 }

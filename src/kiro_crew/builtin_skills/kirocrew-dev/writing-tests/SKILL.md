@@ -1,6 +1,6 @@
 ---
 name: writing-tests
-description: "How to write a Kiro Crew backend test that has NO side effects and does not flake. Use when adding, editing, reviewing, or debugging a pytest test in the Kiro Crew source repo: which conftest is under your file, what leaks (temp dirs, the real data home, ~/.kiro, cron, threads, child processes), how to tell which of the five flake classes you have and where each one's fix is written, and the cross-platform traps on macOS/Linux/Windows and arm64. Also covers diagnosing a residue failure and keeping the parallel suite fast."
+description: "How to write a Kiro Crew backend test that has NO side effects and does not flake. Use when adding, editing, reviewing, or debugging a pytest test in the Kiro Crew source repo: which conftest is under your file, what leaks (temp dirs, the real data home, ~/.kiro, cron, threads, child processes), how to tell which of the six flake classes you have and where each one's fix is written, and the cross-platform traps on macOS/Linux/Windows and arm64. Also covers diagnosing a residue failure and keeping the parallel suite fast."
 triggers: write a test, add a test, fix a flaky test, test is flaky, test side effect, temp dir residue, tmp residue, kirocrew test, pytest kirocrew, test isolation, conftest, xdist, test leaked
 repo_scope: src/kiro_crew
 ---
@@ -17,6 +17,24 @@ repo_scope: src/kiro_crew
 > the decision order — what to check first, and what the failure looks like when you
 > get it wrong.
 
+## Where this skill stops, and which sibling takes over
+
+This skill owns **authoring** a test: isolation, determinism, cross-platform
+behaviour, diagnosing a residue failure, and suite speed. Three siblings own the
+neighbouring steps, and none of them restates what is here:
+
+| You are doing | Skill |
+|---|---|
+| Writing, fixing, or speeding up a test | **this skill** |
+| Running the build gate in a worktree, and deciding whether a red is yours | **kirocrew-worktree-dev** |
+| Driving a branch to a review-ready PR and through CI | **prepare-pr** |
+| Polling that PR until it is green | **babysit** |
+
+The line that matters most in practice: **kirocrew-worktree-dev** tells you whether a
+failure is yours (re-run it on `origin/main`, mine CI for what is genuinely flaky);
+once it is yours, the fix is here. Do not fix a flake from a summary of the five
+determinism classes — pick the class from the symptom, in Rule 2.
+
 ## The two properties, and why they are one problem
 
 A test must be **hermetic** (no effect that outlives it, anywhere but its own tmp dir)
@@ -27,22 +45,27 @@ surfaces as a flake in a file you never touched.
 
 ## Rule 0 — Know which conftest is under your file BEFORE you isolate anything
 
-`setup.cfg` declares three testpaths and they do **not** get the same fixtures. The
+`setup.cfg` declares two testpaths and they do **not** get the same fixtures. The
 table is in [testing-conventions.md](../../../../../docs/system-specs/common/testing-conventions.md)
 § Which conftest you are standing on — read it rather than a second copy here, which
-would drift. The short version: only `test/` gets `test/conftest.py`; `transfer/` and
-`src/kiro_crew/apps/builtins/*/tests/` get the rootdir `conftest.py` plus that app's
+would drift. The short version: only `test/` gets `test/conftest.py`;
+`src/kiro_crew/apps/builtins/*/tests/` gets the rootdir `conftest.py` plus that app's
 own `tests/conftest.py` where one exists.
 
-The rootdir `conftest.py` is the **host-mutation floor** — the guards that protect the
-developer's machine, so they hold everywhere. Everything else is in `test/conftest.py`.
+The rootdir `conftest.py` is the **host floor** — the guards that protect the
+developer's machine, so they hold everywhere. That covers damage (temp dirs, the data
+home, services) and *resource exhaustion*: the xdist worker budget is registered there,
+from the repo-root `xdist_budget.py`, because a run that spawns one worker per core on a
+small laptop takes the machine down and does not care which testpath asked. Everything
+else is in `test/conftest.py`.
 
 Getting this wrong is the most expensive mistake in this suite, because it fails
 **silently and asymmetrically**: an in-package test that assumes `test/conftest.py`'s
 fixtures passes on CI (where the operator's home is empty) and damages a real install
-locally. When you add isolation, ask: *could a test in ANY testpath damage the host
-without this?* If yes it belongs at the rootdir; if no, put it in `test/conftest.py`,
-where the in-package suites pay nothing for it.
+locally. When you add isolation, ask: *could a test in ANY testpath damage the host —
+or consume enough memory, cores or disk to take it down — without this?* If yes it
+belongs at the rootdir; if no, put it in `test/conftest.py`, where the in-package suites
+pay nothing for it.
 
 ## Rule 1 — The side-effect floor: what actually leaks
 
@@ -72,10 +95,41 @@ it is a "your shell stops working" issue.
 safe — and it needs to be, because resolving it is **not a read**: it creates the home
 and its marker, and can run the `~/.kirocrew` → `~/.kiro/crew` migration.
 
-Two shapes escape the env var:
+Six shapes escape the env var:
 
+- **`monkeypatch.undo()` in the body of a test.** It reverts EVERY record on the shared
+  instance — your own patches, every fixture that set something through it (`stores`
+  pins `KIROCREW_HOME` that way), and until the floor got its own instance, the floor
+  itself. A restore that ran `empty_trash()` after `undo()` emptied the operator's real
+  trash. A patch you need to drop before the test ends goes in
+  `with pytest.MonkeyPatch.context() as patched:`; `undo()` is not a scoped tool.
+- **A detached task.** `asyncio.create_task(...)` at boot with no one awaiting it keeps
+  running after the test that started it has returned; when its work resolves a path
+  (`peek_next` → `spool_path()` → `data_home()`, on a `to_thread` worker) it resolves
+  the OPERATOR's home. Fixed where the task is scheduled: `_start_channel_transports`
+  resolves `spool_path()` on the loop and hands it to the task, so the worker reads a
+  location fixed at boot. Resolve every environment-derived input of a detached task on
+  the calling side before detaching, or give the test a handle it can await.
+- **What a closed loop leaves behind.** pytest-asyncio 0.20 ends the loop with a bare
+  `loop.close()`. A pending task's coroutine then gets `GeneratorExit` at garbage
+  collection, so its `finally` blocks run *then* (`_run_chat`'s queue cycle reaches a
+  sync `KiroCrewConfig.load()`); a default-executor job (`to_thread`) is abandoned
+  mid-flight. Both resolved `config_dir()` after the unpin and grew a fresh fake
+  `HOME`'s `~/.kiro/crew`. The floor's `tryfirst` teardown hook now cancels pending
+  tasks, runs them to completion and joins the executor while the pins hold, the way
+  `asyncio.run` shuts down. A `coroutine ... was never awaited` warning pointing at that
+  hook means your test left an unstarted turn behind: await it, or keep the patch that
+  was meant to catch it in force until it has run.
+- **A default that bypasses the pin on purpose.** `PodConfig.load()` derives the pod
+  plane from `_default_home()` / `Path.home()` so a pod cannot redirect the host's
+  registry; the floor pins `KIROCREW_POD_ROOT` / `KIROCREW_POD_ENV_DIR` for that reason.
+  A new resolver with its own default gets a floor pin AND a ratchet in
+  `test_host_isolation_floor.py` in the same change.
 - **Import-time from `config_dir()`** (`subagent_persistence._SUBAGENTS_DIR`): the var
-  is read after the module captured the path. Each has its own autouse pin.
+  is read after the module captured the path. Each has its own autouse pin. A
+  **collection-time probe** is the same shape one step earlier: a module-level
+  `_can_spawn()` used by a `skipif` runs before any pin and read the REAL
+  `config.json`; run such probes under an empty `KIROCREW_HOME`.
 - **Import-time from `Path.home()`**: `~/.kiro` is *kiro-cli's* home, machine-wide and
   shared with the real installed agent — `~/.kiro/settings/mcp.json` is the live
   agent's MCP server list. `_isolate_shared_kiro_paths` redirects these from a table,
@@ -87,11 +141,17 @@ Two shapes escape the env var:
   projected the developer's *installed* agent specs and failed with an
   `AcpRuntimeError` naming a prompt file in an unrelated worktree.
 
-  Two entries are excluded because they must *never* be redirected —
-  `security._EXTRACT_INTO_TRUST_ROOT_RE` and `kiro_usage_api._CLI_SQLITE_DBS` are
-  security anchors whose whole point is naming the real home. **Stub the reader, never
+  Some entries are excluded, and for two opposite reasons — already redirected
+  elsewhere (the macOS launchd set, moved as one group by `_isolate_launchd_paths`),
+  or a **security anchor that must never move**: the file browser's allow-list root
+  `file_explorer/server._HOME`. **Stub the reader, never
   move the anchor.** Redirecting a matcher so a test can pass makes it assert against a
-  pattern that no longer matches the thing it protects.
+  pattern that no longer matches the thing it protects. An anchor that stops being an
+  import-time `Path.home()` binding leaves this tripwire's reach entirely —
+  `kiro_usage_api`'s kiro-cli sqlite tuples now resolve the home inside
+  `identity_stores.sqlite_dbs()`, so their anchor rule is pinned by
+  `test_identity_stores.py::TestUsageTuplesAnchorTheRealHome` instead. Read
+  `_EXCLUDED` for the live list rather than a copy here.
 
 ### 1c. A child process inherits pytest's CWD, which is the repo root
 
@@ -183,21 +243,29 @@ The rootdir conftest traps the stdlib spawn funnels and refuses a
 (`show`, `cat`, `is-active`) are allowed and need no stub. A test reaching the make-live
 cutover path must stub **both** `_run_cmd` and `_dropin_path`.
 
-## Rule 2 — Determinism: five classes, one correct fix each
+## Rule 2 — Determinism: six classes, one correct fix each
 
 Never "fix" a flake with a rerun, a longer `sleep`, a weakened assertion, or a skip.
 Full detail and examples: testing-conventions § Determinism.
 
-The five classes, the tell that identifies each, and the ONE correct fix for each are in
+The six classes, the tell that identifies each, and the ONE correct fix for each are in
 [testing-conventions.md](../../../../../docs/system-specs/common/testing-conventions.md)
-§ Determinism. Read the section matching your symptom before changing anything: four of the five
+§ Determinism. Read the section matching your symptom before changing anything: most of them
 have a fix that looks like the obvious one and is not.
 
 What this skill adds is when to go looking — a test that passes alone and fails in the suite, or
-one that splits by Python version rather than by machine load, is one of those five and not a
+one that splits by Python version rather than by machine load, is one of those six and not a
 mystery. Do not reach for a rerun, a longer `sleep`, a weakened assertion, or a skip.
 
-A sixth, adjacent trap: **a patch target that misses.** Patch the namespace whose
+The sixth class has a tell of its own: **the run ends early, not red.** On Windows a test that
+blocks past `--timeout` is not failed, its xdist worker is killed, and with
+`--max-worker-restart=0` the run aborts with every uncollected result missing. If a full run
+reports a few thousand tests instead of ~60k, look for `worker ... crashed while running` in the
+log: the named test is one that can wait forever. Wait on the observable state, not a guessed
+`sleep`, and bound the await whose refusal is under test with `asyncio.wait_for` so a missed
+refusal fails by name at that line.
+
+An adjacent trap: **a patch target that misses.** Patch the namespace whose
 globals the code under test actually reads. It fails in both directions — patching a
 package re-export when the caller reads its own defining module, or patching
 `pkg.mod.fn` when the caller did `from pkg.mod import fn` and holds its own binding.
@@ -205,16 +273,40 @@ Either way the real function runs, the assertion passes for the wrong reason, an
 test pays real time. **Treat an unexpectedly slow "mocked" test as evidence the mock
 missed.**
 
-A seventh: **the host is an input, and a "surely-unused" number is not a constant.**
+Another: **the host is an input, and a "surely-unused" number is not a constant.**
 `999999` reads as an impossible PID and is not — `pid_max` is 4194304, so on a
 long-running host it names a live process. That broke two tests in opposite ways: one
 stopped pruning an entry whose owner "must be dead", and one accused a planted `ps` shim
 of executing when it had not. If the code *probes* the PID, pin the probe; if the number
 must never appear in real output, pick one no OS can allocate (`99999999999`).
 
+The host's free MEMORY is an input too, and the most-used probe of it is
+`SubagentManager.spawn`, which refuses — registering nothing in `_tasks` — on a
+pressured machine. A refusal is still a `SubagentInfo`, so the test dies a line
+later on a bare `KeyError`, not on the assert that would have named the cause. Any
+file driving `spawn` takes `pytestmark = pytest.mark.usefixtures("healthy_host_memory")`,
+and `test_subagent_spawn_host_pin.py` fails when a new one does not. The two guards it
+pins, and why it stays transparent for the parser's own tests, are in
+testing-conventions § Determinism 1. Both the fixture and its ratchet are
+`test/`-only — `healthy_host_memory` lives in `test/conftest.py`, and
+`test_subagent_spawn_host_pin.py` scans `test/*.py` non-recursively. An in-package
+app suite cannot request the fixture and is not swept, so a test there that drives
+`SubagentManager.spawn` must pin the two guards itself.
+
+One more, for tests of a **single-flight or coalescing** path ("N concurrent readers
+share ONE scan"): the property only holds for readers that arrive WHILE the shared
+operation is in flight, so the test has to keep it in flight until they have. An
+instant stub does not: `asyncio.gather` starts the leader first, its executor job
+finishes on the pool thread before the loop reaches the `await`, and on Python 3.13
+the wrapped future is already done — awaiting a done future does not yield. The
+leader then completes with a waiter count of one and the next reader assembles again,
+once in five loaded runs. Gate the stub on a `threading.Event`, poll until every
+reader is registered, then release it. Whatever the count of assemblies asserts, the
+test must first establish the concurrency it is asserting about.
+
 ## Rule 3 — Cross-platform: macOS, Linux (x86_64 + arm64), Windows
 
-- **Route POSIX calls through `platform_compat`.** See AGENTS.md's shim table. Most
+- **Route POSIX calls through `platform_compat`.** See docs/system-specs/common/platform-compat.md. Most
   important: `os.kill(pid, 0)` **TERMINATES** the target on Windows — it is not a
   liveness probe. Use `platform_compat.pid_exists`.
 - **Path length is a real constraint.** Windows caps a path at 260 characters unless
@@ -268,8 +360,8 @@ spawned without `cwd=`.
 
 ## Rule 5 — Keep the parallel suite fast
 
-At ~26.5k tests, **per-test setup cost dominates any single slow test** — an autouse
-fixture is paid ~26,500 times. Profile, never guess; compare candidates back to back on
+At ~56.5k tests, **per-test setup cost dominates any single slow test** — an autouse
+fixture is paid ~56,500 times. Profile, never guess; compare candidates back to back on
 the same host (`git stash`, run, pop, run), because a loaded host makes an absolute
 number meaningless.
 
@@ -285,12 +377,43 @@ The recurring wins, in order of leverage:
 3. **An expensive immutable thing built per test** — a real `git` repo costs ~1–1.6s in
    subprocesses. Build it once `scope="session"` and `copytree` it per test; copy *from*
    the template rather than yielding it, so nothing one test does can reach another's.
+4. **A module-cached tree scan paid once per WORKER** — an `lru_cache`d `rglob` +
+   `ast.parse` of `src/` (~30 s) is computed again on every xdist worker the module's
+   tests land on; five full runs measured eighteen ratchet modules each re-scanning on
+   3–5 workers, ~22 CPU-minutes per run. Add
+   `pytestmark = pytest.mark.xdist_group(name="tree_scan_<module>")` — one group per
+   file, never one shared group — and the scan runs once per run.
 
 **After any speedup, mutate the production code the test covers and confirm the test
 still FAILS.** A test made faster by checking less is a regression. Restore from a copy
 of the file you mutated, not from git — `git checkout --` discards unrelated uncommitted
 work — and sequence with `;`, not `&&`, or the restore only runs when the mutation
 did *not* work.
+
+## Rule 6 — MEMORY is the other budget, and collection is most of it
+
+A worker costs ~1.5 GiB, and ~750 MiB of that is paid before your test runs: every
+xdist worker independently collects every item in both testpaths (~57k), and 99% of that footprint is
+private, so more workers never amortize it. This is why `-n auto` is bounded by
+available memory — on an 8–16 GiB laptop the full suite otherwise swaps the machine.
+
+The consequence for how you write a test:
+
+- **An allocation at module scope is multiplied by every worker, and outlives the
+  test.** A big literal inside `@pytest.mark.parametrize` is the worst shape: it is
+  built while the module is IMPORTED and the mark keeps it alive on the function
+  object for the whole session, so one test's payload is charged to all of them. Two
+  such literals — a 64 MiB frame and a 40 MB string — cost 102 MiB per worker until
+  they were moved into the test bodies behind a sentinel.
+- **A transient peak counts too**, because a worker's high-water mark is what the
+  budget must reserve. Building an image as a list of per-pixel tuples cost ~390 MiB
+  for a 17 MB PNG; one `frombytes` over a bytes buffer was 10x smaller and
+  byte-equivalent.
+- **Derive a size from the production constant** rather than restating it. A literal
+  `40_000_001` beside a `_MAX_LAYER_B_CHARS` of `40_000_000` hides both the coupling
+  and the cost, and goes stale silently.
+- Suspect a **module-scope literal** whenever a file's collection RSS is large; measure
+  it with `pytest <file> --collect-only` and `/proc/self/status`'s `VmHWM`.
 
 ## Checklist before you push a test
 
@@ -299,13 +422,53 @@ did *not* work.
 - [ ] Every `mkdtemp` has `addCleanup` on the next line (or uses `tmp_path`)
 - [ ] Every child that may create a file gets `cwd=` under `tmp_path`, and every
       assertion is scoped to where that child actually ran
+- [ ] Anything whose default directory is `Path.cwd()` (`TaskRunner(work_dir=...)`) is
+      constructed with an explicit `tmp_path`; a gitignored name at the repo root is the
+      one leak the residue guard cannot see
+- [ ] A background worker gets every environment-derived input (paths AND config) from the
+      dispatching thread, and registers itself so the rootdir conftest teardown can join it
 - [ ] Every thread, task, child process, socket and connection it starts is stopped in a
       `finally` or an `addCleanup`
-- [ ] Globals mutated through `monkeypatch`, never raw assignment
+- [ ] Globals mutated through `monkeypatch`, never raw assignment — including `os.environ`
+      keys a REAL production startup path is known to write (`PLAYWRIGHT_MCP_OUTPUT_DIR`,
+      `KIROCREW_TELEMETRY`, `PATH`), restored in the shared helper that drives it
+- [ ] A variable the code under test WRITES and that is absent before the test goes
+      through `forget_env_at_teardown(monkeypatch, name)` — `delenv(raising=False)` on an
+      absent key records no undo, and a `delenv` AFTER the write puts the written value back
+- [ ] No `monkeypatch.undo()` in a test body: it reverts every fixture's records too. A
+      patch you need to drop early lives in `with pytest.MonkeyPatch.context() as patched:`
+- [ ] No module-level `skipif` probe that reads `KiroCrewConfig` / `config_dir()` /
+      `Path.home()` — it runs before any pin and observes the operator's real config
+- [ ] Fixture paths are absolute on EVERY host: `host_abs("usr", "bin")`, never a `/usr/bin`
+      literal (`ntpath.isabs` rejects a driveless path from Python 3.13); a path that belongs
+      to a simulated platform is judged with that platform's module (`posixpath`)
+- [ ] Nothing assumes the ancestry of `tmp_path` is bare (no `.venv`, no project marker
+      above it), that `127.0.0.1:1` refuses connections, that `python3` is on PATH (spawn
+      `sys.executable`), or that `git`/`gh` sit in a trusted system directory
+- [ ] A source ratchet strips docstrings with `ast`, not by subtracting `__doc__` from
+      `inspect.getsource` (3.13 dedents docstrings)
+- [ ] A test whose contract IS a real symlink is listed in `test/requires-real-symlinks.txt`;
+      one that needs a directory that resolves elsewhere uses `make_dir_link`
 - [ ] No `AsyncMock` standing in for a synchronous method; every `cancel()` awaited
+- [ ] No module-level asyncio primitive (`Lock`/`Event`/`Future`/in-flight dict) reachable
+      from the code under test without a per-test reset
+- [ ] Nothing can block forever: every await the test itself must unblock is wrapped in a
+      bounded `wait_for`; no `sleep(0.05)` standing in for "let the other task register"
+- [ ] A test of a coalescing / single-flight path holds the shared operation open (a
+      gated stub) until every reader has registered, then releases it — an instant stub
+      lets the leader finish before the others arrive, and a done future never yields
+- [ ] A module that `rglob`+`ast.parse`s `src/` once per module also carries
+      `pytestmark = pytest.mark.xdist_group(name="tree_scan_<module>")`, or every xdist
+      worker it touches re-runs the scan
+- [ ] A fixture stamped from a module-level `NOW` is only compared by production code
+      whose clock is pinned to that same `NOW` (a `frozen_clock` fixture) -- never two clocks
+- [ ] After `await handler(...)`, an assertion on something a worker thread emits via
+      `call_soon_threadsafe` waits on that signal, not on the handler returning
 - [ ] No assertion on a rate, a sample count, or an absolute duration
 - [ ] Source files read via `_REPO_ROOT = Path(__file__).resolve().parents[N]`, never a
       relative `Path("src/...")` — xdist workers may change CWD
 - [ ] Passes at `-n0` **and** under `-n auto`, and passes when run alone
+- [ ] No large allocation at module scope — especially not inside `parametrize`, where
+      every worker pays it at collection and holds it for the session
 - [ ] Cross-platform: `platform_compat` for process/signal/lock calls, no assumption
       about path separators, case sensitivity, `/tmp`, or timer granularity

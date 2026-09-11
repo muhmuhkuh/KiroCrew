@@ -1,4 +1,4 @@
-"""Detection, install sequencing, and the presence-is-consent gate."""
+"""Detection, install sequencing, and the capability-availability probe."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import env as env_mod
 from kiro_crew.browser_cli import install as mod
 
 # The real implementation, captured before the autouse fixture below replaces
@@ -15,6 +16,27 @@ from kiro_crew.browser_cli import install as mod
 # restore THIS (re-reading ``mod._required_revisions`` there would just re-bind
 # the stub to itself, silently leaving every test on the fallback path).
 _REAL_REQUIRED_REVISIONS = mod._required_revisions
+
+
+@pytest.fixture(autouse=True)
+def _clear_node_bin_dir_caches() -> None:
+    """``node_bin_dirs`` / ``_node_all_bin_dirs`` are ``lru_cache``d for the
+    process lifetime, keyed on nothing (the former) or on ``(home, mise_data)``
+    (the latter). ``cli_path()`` reaches both via ``find_node_tool`` ->
+    ``node_augmented_path`` -> ``node_bin_dirs()``. Once any earlier test in
+    this worker (this file or another) resolves a node tool with the real
+    ``$HOME``, the memoized real-machine mise/volta/nvm directories stay
+    prepended to every later PATH lookup regardless of a test's own ``HOME``
+    override -- ``test_the_cli_is_found_where_the_standalone_installer_puts_it``
+    got the operator's real mise-installed ``playwright-cli`` shim instead of
+    the ``tmp_path``-rooted wrapper it wrote, only when an earlier test had
+    warmed the cache first (no-test-side-effects; mirrors the fixture in
+    test_node_toolchain_resolution.py)."""
+    env_mod.node_bin_dirs.cache_clear()
+    env_mod._node_all_bin_dirs.cache_clear()
+    yield
+    env_mod.node_bin_dirs.cache_clear()
+    env_mod._node_all_bin_dirs.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -148,10 +170,10 @@ def test_available_is_false_without_the_binary(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_available_is_presence_only(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Presence is consent: a broken Node or missing browser does not revoke it.
+    """Presence reports availability even with a broken Node or missing browser.
 
-    Reporting "not consented" for a repairable environment would send the
-    operator to the wrong fix, and there is no toggle that could say otherwise.
+    Reporting a repairable environment as absent would send the operator to the
+    wrong fix. Shell approval is a separate decision made by the runner.
     """
     _wire(
         monkeypatch,
@@ -165,10 +187,10 @@ def test_available_is_presence_only(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_no_consent_flag_is_consulted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The gate reads PATH and nothing else -- no flag file, no config key.
+    """Availability reads PATH and nothing else -- no flag file, no config key.
 
     An empty data home must not make an installed CLI unavailable, which is what
-    a re-introduced consent file would do.
+    a capability flag would do. Approval remains outside this module.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "empty-home"))
     _wire(
@@ -191,7 +213,9 @@ def test_install_aborts_when_npm_is_missing(monkeypatch: pytest.MonkeyPatch) -> 
     assert calls == []
 
 
-def test_install_runs_all_three_steps_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_install_runs_all_three_steps_and_scopes_browser_to_chromium(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/playwright-cli"})
 
     result = mod.install()
@@ -203,7 +227,9 @@ def test_install_runs_all_three_steps_in_order(monkeypatch: pytest.MonkeyPatch) 
         "install-skills",
     ]
     assert calls[0] == ["/n/npm", "install", "-g", "@playwright/cli@latest"]
-    assert calls[1] == ["/n/playwright-cli", "install-browser"]
+    # Omitting the argument installs every engine. Optional WebKit dependencies
+    # must not veto a baseline Chromium install on a host where Chromium works.
+    assert calls[1] == ["/n/playwright-cli", "install-browser", "chromium"]
     assert calls[2] == [
         "/n/playwright-cli",
         "install",
@@ -222,12 +248,12 @@ def test_install_adds_with_deps_only_where_the_host_honours_it(
     monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: True)
     apt_calls = _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"})
     mod.install()
-    assert ["/n/pw", "install-browser", "--with-deps"] in apt_calls
+    assert ["/n/pw", "install-browser", "chromium", "--with-deps"] in apt_calls
 
     monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: False)
     other_calls = _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"})
     mod.install()
-    assert ["/n/pw", "install-browser"] in other_calls
+    assert ["/n/pw", "install-browser", "chromium"] in other_calls
     assert all("--with-deps" not in argv for argv in other_calls)
 
 
@@ -276,8 +302,8 @@ def test_install_falls_back_without_deps_when_the_package_step_is_refused(
     assert result["steps"][1]["ok"] is False
     # ...but it must not veto an install the retry completed.
     assert result["steps"][2]["ok"] is True
-    assert ["/n/pw", "install-browser", "--with-deps"] in calls
-    assert ["/n/pw", "install-browser"] in calls
+    assert ["/n/pw", "install-browser", "chromium", "--with-deps"] in calls
+    assert ["/n/pw", "install-browser", "chromium"] in calls
 
 
 def test_a_zero_exit_carrying_the_host_validation_warning_is_a_failure(
@@ -719,8 +745,11 @@ class TestFailureDetailIsRedactedAtTheSource:
         step = mod._step("npm-install-global", ["npm", "install"], 1.0)
 
         # Extract the actual secret value (the part after = or between : and @)
-        # and confirm it does not survive.
-        assert "[REDACTED]" in step["stderr"]
+        # and confirm it does not survive. The inline-credential URL shape is
+        # now caught by the SHARED pass (whose marker is "[REDACTED:
+        # credential]") before the npm-specific patterns run, so accept either
+        # redaction marker -- what matters is that the secret is gone.
+        assert "[REDACTED" in step["stderr"]
         # None of the raw secret portions should appear.
         for fragment in (
             "npm_abc123secretXYZ",
@@ -732,60 +761,86 @@ class TestFailureDetailIsRedactedAtTheSource:
                 assert fragment not in step["stderr"]
 
     def test_redaction_timing_scales_linearly(self):
-        """Doubling the input must not more than triple the runtime.
+        """Redaction must not blow up super-linearly on adversarial input.
 
-        An absolute-duration assertion is fragile across CI environments
-        (coverage overhead, CPU contention). A bounded RATIO between two
-        input sizes is stable: quadratic or exponential growth (ReDoS)
-        doubles the ratio on each doubling of input, while linear growth
-        keeps it near 2.0.
+        **What this asserts, and why it is no longer a tight ratio.** The bound
+        this test exists to defend is the gap between LINEAR and CATASTROPHIC,
+        which is the gap between milliseconds and seconds-to-minutes. It does
+        not need to resolve 2.0x from 3.0x, and trying to do so is what made it
+        flake three separate times:
 
-        Two measurement details keep the ratio itself stable on a shared CI
-        runner, matching what ``TestIsDeniedReDoSResistance`` already does
-        for the same class of assertion:
+        * originally, one ``perf_counter`` sample per size — billed for
+          whatever the OS gave the sibling xdist workers;
+        * then ``thread_time`` + best-of-3, which removed the cross-worker
+          noise but not the tick quantization on Windows (~15.625ms steps, so
+          6 ticks over 2 ticks reports exactly 3.0 and fails ``< 3.0``);
+        * then an adaptive repeat count to clear the tick, which still failed
+          CI at **3.07x** on the 3.12 shard — the ONE shard that runs under
+          ``--cov``, whose tracer bills every ``re`` call unevenly across the
+          two samples while the 3.10 shard (``--no-cov``) passed.
 
-        * ``thread_time``, not ``perf_counter``: wall-clock bills this test
-          for however long the OS gave the core to the sibling pytest-xdist
-          workers, and that noise lands unevenly across the two samples.
-          Redaction is single-threaded pure-regex work, so per-thread CPU is
-          its complete cost — a genuinely catastrophic pattern inflates it
-          identically.
-        * Best-of-3 per size: this is a floor measurement, and scheduler
-          noise only ever ADDS, so the minimum is the closest estimate of
-          the true cost. A single sample per size (what this test used
-          before) let one unlucky small-input reading — the denominator —
-          push the ratio over the limit on an otherwise-healthy matcher,
-          which is how this failed CI intermittently at ~3.1-3.2x.
+        Measured directly: for genuinely linear code, twelve independent
+        best-of-3 ratio measurements on one machine spread **1.53x to 2.50x**.
+        A ±0.5 band around 2.0 leaves no room under a 3.0 ceiling, so the
+        ratio is measuring scheduler and tracer noise, not scaling.
 
-        Neither change weakens the guarantee: the bound stays at 3.0x, and
-        quadratic growth still lands at >=4x on every sample.
+        So the shape is asserted where the code HAS structure to observe, and
+        the timing bound is made generous enough that only catastrophe trips
+        it — the rule ``TestIsDeniedReDoSResistance`` and
+        ``TestUserRegexReDoSGate`` already follow ("only has to separate
+        linear from catastrophic … not assert a sub-100ms wall clock on a
+        shared, parallel CI runner"):
+
+        * **Structural half, deterministic:** the pattern is checked to carry
+          a bounded quantifier. Catastrophic backtracking on this input needs
+          an unbounded one, so its ABSENCE is the actual guarantee — and this
+          half cannot flake at all.
+        * **Timing half, generously bounded:** doubling the input must not
+          cost more than :data:`_CATASTROPHIC_CEILING`. Real quadratic growth
+          on 50k chars runs for seconds; the measured linear cost is ~30ms.
+          Two orders of magnitude of headroom is what makes it stable.
         """
+        import re
         import time
 
-        def cost(text: str) -> float:
-            """CPU consumed by THIS thread redacting *text*."""
-            start = time.thread_time()
-            mod._redact(text)
-            return time.thread_time() - start
+        #: Separates linear from catastrophic with room for a loaded runner and
+        #: a coverage tracer. The linear cost of 50k chars is ~30ms here; a
+        #: genuinely quadratic matcher on the same input takes seconds. Anything
+        #: in between is noise, and this test declines to adjudicate it.
+        _CATASTROPHIC_CEILING = 2.0
 
-        # Adversarial: all chars match the env-var prefix class [A-Z0-9_],
-        # the shape that triggered the original catastrophic backtracking
-        # before the {0,40} bound was added.
+        # Adversarial: all chars match the env-var prefix class [A-Z0-9_], the
+        # shape that triggered the original catastrophic backtracking before
+        # the {0,40} bound was added.
         small = "A" * 25_000
         large = "A" * 50_000
 
-        # Warm up (JIT, import overhead).
-        mod._redact(small)
+        # ── The structural half: the bound that PREVENTS the blow-up ──
+        # The keyword pattern is the one that backtracked catastrophically, and
+        # ``{0,40}`` is precisely what fixed it: an unbounded run before a
+        # required keyword is what explodes on a long class-matching input
+        # (measured as a 120s timeout on 50 KB of stderr — see
+        # ``_NPM_SECRET_RES``). Asserting the bound is PRESENT is both stronger
+        # and completely deterministic, where timing it is neither.
+        keyword_res = [
+            pattern.pattern for pattern in mod._NPM_SECRET_RES if "TOKEN" in pattern.pattern
+        ]
+        assert keyword_res, "the keyword redaction pattern is gone"
+        for pattern in keyword_res:
+            assert re.search(r"\{\d*,\d+\}", pattern), (
+                "the keyword prefix lost its bounded quantifier, which is the only "
+                f"thing keeping it linear on a long [A-Z0-9_] run: {pattern}"
+            )
 
-        t_small = min(cost(small) for _ in range(3))
-        t_large = min(cost(large) for _ in range(3))
-
-        # Linear growth ⇒ ratio ≈ 2.0; allow up to 3.0 for noise.
-        # ReDoS (quadratic+) yields ratio ≥ 4.0 reliably.
-        ratio = t_large / max(t_small, 1e-9)
-        assert ratio < 3.0, (
-            f"Redaction scaled super-linearly: {t_large:.4f}s / "
-            f"{t_small:.4f}s = {ratio:.1f}x (limit 3.0x)"
+        # ── The timing half: catastrophe only ──
+        mod._redact(small)  # warm up (JIT, import overhead)
+        start = time.thread_time()
+        mod._redact(large)
+        elapsed = time.thread_time() - start
+        assert elapsed < _CATASTROPHIC_CEILING, (
+            f"redacting {len(large)} adversarial chars took {elapsed:.3f}s, over the "
+            f"{_CATASTROPHIC_CEILING}s catastrophic-backtracking ceiling — the "
+            "matcher is no longer linear in input length"
         )
 
 
@@ -1335,3 +1390,52 @@ class TestManifestResolution:
         monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", "/nonexistent-prefix")
         assert mod._browsers_manifest_path() is None
         assert _REAL_REQUIRED_REVISIONS() is None
+
+
+def _lifecycle_contract_tree(tmp_path: Path) -> tuple[Path, Path]:
+    package = tmp_path / "node_modules" / "@playwright" / "cli"
+    core = package / "node_modules" / "playwright-core"
+    (core / "lib" / "tools" / "cli-client").mkdir(parents=True)
+    (core / "browsers.json").write_text('{"browsers": []}', encoding="utf-8")
+    registry = core / "lib" / "tools" / "cli-client" / "registry.js"
+    bundle = core / "lib" / "coreBundle.js"
+    return package, registry, bundle
+
+
+def test_lifecycle_env_contract_is_confirmed_from_serving_cli_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, registry, bundle = _lifecycle_contract_tree(tmp_path)
+    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
+    bundle.write_text("process.env.PWTEST_SOCKETS_DIR || os.tmpdir()", encoding="utf-8")
+    monkeypatch.setattr(mod, "_cli_package_dirs", lambda: [package])
+    mod._source_contains.cache_clear()
+
+    assert mod.cli_lifecycle_env_supported() is True
+
+
+def test_lifecycle_env_contract_fails_when_upstream_hook_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    package, registry, bundle = _lifecycle_contract_tree(tmp_path)
+    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
+    bundle.write_text("// lifecycle socket override removed upstream", encoding="utf-8")
+    monkeypatch.setattr(mod, "_cli_package_dirs", lambda: [package])
+    mod._source_contains.cache_clear()
+
+    assert mod.cli_lifecycle_env_supported() is False
+
+
+def test_lifecycle_contract_never_falls_through_to_stale_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    active, active_registry, active_bundle = _lifecycle_contract_tree(tmp_path / "active")
+    stale, stale_registry, stale_bundle = _lifecycle_contract_tree(tmp_path / "stale")
+    active_registry.write_text("// hook removed", encoding="utf-8")
+    active_bundle.write_text("// hook removed", encoding="utf-8")
+    stale_registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
+    stale_bundle.write_text("process.env.PWTEST_SOCKETS_DIR || os.tmpdir()", encoding="utf-8")
+    monkeypatch.setattr(mod, "_cli_package_dirs", lambda: [active, stale])
+    mod._source_contains.cache_clear()
+
+    assert mod.cli_lifecycle_env_supported() is False

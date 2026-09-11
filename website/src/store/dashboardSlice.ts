@@ -1,8 +1,10 @@
 import { safeSetItem } from '../utils/safeStorage'
+import { jsonEqual } from '../utils/structuralEqual'
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
-import type { StatusData, ChatSlot, TodoList } from '../types'
+import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
 
 export interface SubagentDetail {
@@ -13,6 +15,17 @@ interface DashboardState {
   status: StatusData | null
   connected: boolean
   slots: ChatSlot[]
+  /** Increments for every accepted authoritative full-slot frame/reply. */
+  slotsGeneration: number
+  /** Per-key optimistic/reconciliation pin writes, independent of other slot fields. */
+  slotPinGenerations: Record<string, number>
+  // Slot keys in the order the session sidebar actually DISPLAYS them
+  // (pinned-first + the user's sort, flat-view aware). Published by
+  // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts so
+  // Ctrl/Alt+N targets the Nth visible row rather than the Nth element of
+  // `slots` (which arrives in backend insertion order). Empty until the
+  // sidebar first renders — consumers fall back to `slots` order then.
+  sidebarOrder: string[]
   approvalMode: string
   channelTrusted: boolean
   refreshTrigger: number
@@ -57,6 +70,9 @@ const initialState: DashboardState = {
   status: null,
   connected: false,
   slots: [],
+  slotsGeneration: 0,
+  slotPinGenerations: {},
+  sidebarOrder: [],
   approvalMode: 'normal',
   channelTrusted: false,
   refreshTrigger: 0,
@@ -76,13 +92,125 @@ const initialState: DashboardState = {
 
 export const fetchSlots = createAsyncThunk('dashboard/fetchSlots', () => api.chatSlots())
 
-export const changeApprovalMode = createAsyncThunk(
+/** Switch the approval mode, carrying a policy refusal back to the caller.
+ *
+ *  The gateway answers 403 `mode_disabled_by_policy` when the `approval_modes`
+ *  scope forbids the mode. A plain `throw` would reach the reducer as
+ *  `action.error.message` only, dropping the machine-readable code with it, so
+ *  the caller could not tell a policy refusal from a network failure — and the
+ *  picker would have nothing to show but silence. `rejectWithValue` keeps the
+ *  code, which is what makes the refusal reportable next to the control. */
+export const changeApprovalMode = createAsyncThunk<
+  string,
+  { mode: string; slot?: string },
+  { rejectValue: { code: string; message: string } }
+>(
   'dashboard/changeApprovalMode',
-  async ({ mode, slot }: { mode: string; slot?: string }) => {
-    await api.chatMode(mode, slot)
+  async ({ mode, slot }, { rejectWithValue }) => {
+    try {
+      await api.chatMode(mode, slot)
+    } catch (e) {
+      const body = e instanceof ApiError ? e.body : ''
+      let code = ''
+      try { code = JSON.parse(body || '{}')?.code ?? '' } catch { /* not JSON */ }
+      return rejectWithValue({
+        code,
+        message: e instanceof Error ? e.message : String(e),
+      })
+    }
     return mode
   },
 )
+
+/** Drop one slot's live sub-agent state.
+ *
+ *  These three maps are keyed by the bare slot key and are otherwise cleared
+ *  only wholesale on reconnect, so a departed slot's counters and rows would
+ *  otherwise survive for the tab's lifetime.
+ *
+ *  Driven by the AUTHORITATIVE slot-list writers — `sseSlots` and
+ *  `fetchSlots.fulfilled` — and deliberately NOT by `removeSlotOptimistic`: that
+ *  reducer runs before the delete is confirmed, and `sseSubagentText` drops every
+ *  frame for a slot with no `subagentRunning` entry, so evicting optimistically
+ *  would leave a slot whose delete failed alive but permanently mute. */
+/** Reconcile per-slot dashboard state against an authoritative slot list. Both
+ *  authoritative writers (`sseSlots`, `fetchSlots.fulfilled`) drive teardown
+ *  through here, so the two cannot drift apart the way the eviction lists this
+ *  PR unified once did. `unreadSlots` is written back only when it actually
+ *  shrank, since the live-frame writer runs on every slots frame. */
+const reconcileSlots = (state: DashboardState, liveKeys: Set<string>, evictStale = true): void => {
+  // `countUnreadByMode` deliberately keeps orphan unread keys contributing to
+  // the badge, on the premise that a reconcile drains them shortly. Draining on
+  // both writers is what keeps that premise true. Always run: a wrongly drained
+  // badge self-heals on the next unread event, and the refetch is the documented
+  // route by which a remotely deleted slot's badge is cleared.
+  const unread = state.unreadSlots ?? []
+  const drained = unread.filter(k => liveKeys.has(k))
+  if (drained.length !== unread.length) {
+    state.unreadSlots = drained
+    safeSet('mc-unread-slots', JSON.stringify(drained))
+  }
+  // Eviction is NOT recoverable, so it is skipped when the caller cannot vouch
+  // for the list's freshness: an HTTP reply in flight can be older than the live
+  // frames that arrived while it travelled, and would then delete a slot the
+  // stream has since created.
+  if (!evictStale) return
+  for (const key of Object.keys(state.subagentRunning ?? {})) {
+    if (!liveKeys.has(key)) evictSlotSubagents(state, key)
+  }
+}
+
+const evictSlotSubagents = (state: DashboardState, slotKey: string): void => {
+  delete state.subagentRunning[slotKey]
+  delete state.subagentDetails[slotKey]
+  delete state.subagentText[slotKey]
+}
+
+/** Apply an authoritative slot list, reusing the object identity of every row
+ *  whose content is unchanged, and touching `state.slots` only when the list
+ *  actually moved.
+ *
+ *  Membership AND order come from `next` — the server is authoritative on both.
+ *  Only per-row identity is carried across, and only for a structurally equal
+ *  row, so no consumer can read stale content off a reused reference. The
+ *  comparison uses the shared `jsonEqual`, whose key-order independence and
+ *  field-agnosticism this relies on: a row may have been patched in place by
+ *  `touchSlotActivity` / `updateSlot` / `patchSlotLink` since it was stored (so
+ *  its key order can differ from the payload's), and a comparator that listed
+ *  `ChatSlot`'s fields would stop seeing a newly added one and pin a stale row
+ *  on screen — a correctness bug, where an extra re-render is only a cost.
+ *
+ *  Identity is load-bearing here rather than a micro-optimisation. The sidebar
+ *  renders every row as a Framer `motion.div` with `layout="position"` inside one
+ *  `LayoutGroup`, and every selector over `dashboard.slots` invalidates when the
+ *  array or any row changes reference. Assigning the incoming array wholesale
+ *  hands every row a new reference on every frame, so one slot's status change
+ *  re-renders and re-measures the entire list — which reads as the sidebar
+ *  reloading rather than as one session becoming active. Slot pushes coalesce at
+ *  200ms server-side, so a single active turn delivers several full lists per
+ *  second and the effect is continuous.
+ *
+ *  Skipping the assignment (rather than assigning an equal array) is the half
+ *  that matters most: it leaves the array reference alone, which lets a
+ *  downstream `useMemo` skip its filter and sort entirely instead of recomputing
+ *  an equal result. */
+const applySlots = (state: DashboardState, next: ChatSlot[]): void => {
+  const prev = state.slots ?? []
+  const byKey = new Map(prev.map(s => [s.key, s]))
+  let changed = prev.length !== next.length
+  const merged = next.map((incoming, i) => {
+    const existing = byKey.get(incoming.key)
+    // Reusing a draft row inside a freshly assigned array is fine: Immer
+    // finalizes drafts found in the assigned value within the same scope, so an
+    // untouched row resolves back to its base object and keeps its identity.
+    const reused = existing !== undefined && jsonEqual(existing, incoming) ? existing : incoming
+    // Positional compare, so a pure reorder counts as changed even though every
+    // row is individually reusable.
+    if (reused !== prev[i]) changed = true
+    return reused
+  })
+  if (changed) state.slots = merged
+}
 
 const dashboardSlice = createSlice({
   name: 'dashboard',
@@ -100,9 +228,34 @@ const dashboardSlice = createSlice({
         state.updateProgress = action.payload.update_progress
       }
     },
+    // A slots frame carries only the live YOLO boolean, not a status snapshot.
+    // Keep the last authoritative status intact so fields such as yolo_duration
+    // remain available to the approval-mode confirmation copy.
+    sseYolo(state, action: PayloadAction<boolean>) {
+      if (state.status) state.status.yolo = action.payload
+      state.approvalMode = action.payload ? 'yolo' : (state.approvalMode === 'yolo' ? 'normal' : state.approvalMode)
+    },
     sseConnected(state) { state.connected = true; state.slotsLoaded = false; state.subagentRunning = {}; state.subagentDetails = {}; state.subagentText = {} },
     sseDisconnected(state) { state.connected = false },
-    sseSlots(state, action: PayloadAction<ChatSlot[]>) { state.slots = action.payload; state.slotsLoaded = true },
+    sseSlots(state, action: PayloadAction<ChatSlot[]>) {
+      // Read before `slotsLoaded` is set: an empty frame is ambiguous, and this
+      // is what disambiguates it. Not yet loaded means a reconnect delivered it
+      // before the first real snapshot, so treating it as authoritative would
+      // evict every live slot's state. Already loaded means the list genuinely
+      // went empty — the last slot was deleted, possibly by another client —
+      // and skipping teardown there would strand its state permanently.
+      // Return BEFORE writing anything: assigning an empty `slots` would blank
+      // the sidebar until restoration finishes, and marking it loaded would
+      // claim a snapshot arrived when none has.
+      if (action.payload.length === 0 && !state.slotsLoaded) return
+      applySlots(state, action.payload)
+      state.slotsGeneration = (state.slotsGeneration ?? 0) + 1
+      state.slotsLoaded = true
+      reconcileSlots(state, new Set(action.payload.map(s => s.key)))
+    },
+    // Sidebar → shortcuts order feed (see DashboardState.sidebarOrder). The
+    // dispatch site diff-guards, so every action here is a real order change.
+    setSidebarOrder(state, action: PayloadAction<string[]>) { state.sidebarOrder = action.payload },
     // Live TODO-list delta. Patched into the SAME slots array that sseSlots
     // populates rather than a parallel map, so the mid-turn push and the
     // reconnect snapshot can never disagree about a slot's list. A delta for an
@@ -110,6 +263,18 @@ const dashboardSlice = createSlice({
     sseTodoUpdate(state, action: PayloadAction<{ slot: string; todo: TodoList | null }>) {
       const slot = (state.slots ?? []).find(s => s.key === action.payload.slot)
       if (slot) slot.todo = action.payload.todo
+    },
+    // Live MCP session-report delta, same merge discipline as sseTodoUpdate. A
+    // null payload is meaningful and must be stored: it is what the gateway
+    // pushes when a session reset makes the previous report describe a session
+    // that no longer exists, and keeping the old value would leave a dead
+    // session's server list on screen as the live one's.
+    sseMcpReportUpdate(
+      state,
+      action: PayloadAction<{ slot: string; mcp_report: McpSessionReport | null }>,
+    ) {
+      const slot = (state.slots ?? []).find(s => s.key === action.payload.slot)
+      if (slot) slot.mcp_report = action.payload.mcp_report
     },
     // Bump a slot's recency timestamps on live message activity so the sidebar
     // re-ranks immediately off the finer-grained chat_message stream (vs waiting
@@ -222,7 +387,11 @@ const dashboardSlice = createSlice({
     },
     updateSlotPin(state, action: PayloadAction<{ key: string; pinned: boolean }>) {
       const slot = state.slots.find(s => s.key === action.payload.key)
-      if (slot) slot.pinned = action.payload.pinned
+      if (slot) {
+        slot.pinned = action.payload.pinned
+        state.slotPinGenerations ??= {}
+        state.slotPinGenerations[action.payload.key] = (state.slotPinGenerations[action.payload.key] ?? 0) + 1
+      }
     },
     triggerRefresh(state) { state.refreshTrigger += 1 },
     markSlotUnread(state, action: PayloadAction<string>) {
@@ -245,9 +414,7 @@ const dashboardSlice = createSlice({
       // prototype would write through Object.prototype in the else-branch below.
       if (!slot || isUnsafeKey(slot)) return
       if (running <= 0) {
-        delete state.subagentRunning[slot]
-        delete state.subagentDetails[slot]
-        delete state.subagentText[slot]
+        evictSlotSubagents(state, slot)
       } else {
         state.subagentRunning[slot] = running
         if (agents) state.subagentDetails[slot] = agents.map(a => ({
@@ -309,17 +476,21 @@ const dashboardSlice = createSlice({
   extraReducers: (builder) => {
     builder
       .addCase(fetchSlots.fulfilled, (state, action) => {
-        state.slots = action.payload
+        // A reply in flight can be older than the live frames that arrived while
+        // it travelled, so it may omit a slot the stream has since created. The
+        // unread drain still runs — that is this path's documented job, and a
+        // badge self-heals — but eviction is withheld once the stream is live.
+        const fresh = !state.slotsLoaded
+        applySlots(state, action.payload)
+        state.slotsGeneration = (state.slotsGeneration ?? 0) + 1
         state.slotsLoaded = true
-        const liveKeys = new Set(action.payload.map((s: { key: string }) => s.key))
-        state.unreadSlots = state.unreadSlots.filter(k => liveKeys.has(k))
-        safeSet('mc-unread-slots', JSON.stringify(state.unreadSlots))
+        reconcileSlots(state, new Set(action.payload.map((s: { key: string }) => s.key)), fresh)
       })
       .addCase(changeApprovalMode.fulfilled, (state, action) => { state.approvalMode = action.payload })
   },
 })
 
-export const { sseStatus, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
+export const { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
   setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
 
 /**

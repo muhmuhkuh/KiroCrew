@@ -31,9 +31,14 @@ from kiro_crew.subagent_persistence import (
     create_agent_folder,
     prune_stale_tombstones,
     read_state,
+    remember_live_cleanup_identity,
     update_state,
     write_tombstone,
 )
+
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 # ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -43,12 +48,6 @@ def agent_root(tmp_path, monkeypatch):
     """Point subagent persistence at a temp directory."""
     monkeypatch.setattr("kiro_crew.subagent_persistence._SUBAGENTS_DIR", tmp_path)
     return tmp_path
-
-
-@pytest.fixture(autouse=True)
-def _mock_memory_ok(monkeypatch):
-    """Prevent memory guard from refusing spawns on low-RAM build machines."""
-    monkeypatch.setattr("kiro_crew.subagent.check_memory_available", lambda **_kw: (True, 8.0))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -555,9 +554,15 @@ class TestTombstonePruningCleansSessionFiles:
         if d.exists():
             shutil.rmtree(d)
 
-        # Create subagent folder with session_id in state
+        # Create a plain subagent folder with explicit non-retention and session identity.
         create_agent_folder(agent_id, task="old task")
-        update_state(agent_id, session_id=session_id, provider="acp")
+        update_state(agent_id, session_id=session_id, provider="acp", keep=False)
+        remember_live_cleanup_identity(
+            agent_id,
+            session_id=session_id,
+            provider="acp",
+            keep=False,
+        )
 
         # Write an old tombstone (8 days ago)
         write_tombstone(agent_id, cause="timeout", recovery_action="delivered")

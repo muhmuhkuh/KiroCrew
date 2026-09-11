@@ -14,7 +14,7 @@ import { ChevronsRight, Plus, FileText, Settings } from 'lucide-react'
 import type { SpecSummary } from '../api'
 import { phaseLabel as phaseLabelFor, PHASE_BUILDING_KEY, PHASE_READY_KEY, APP_VERSION } from '../api'
 import { ACCENT, SEL_BG, SEL_BORDER, PULSE_MOTION, Btn } from './shared'
-import { SearchInput } from '../../../components/ui'
+import { SearchInput, FilteredEmpty } from '../../../components/ui'
 import { SpecListSkeleton } from './Shimmer'
 import Clickable from '../../../components/Clickable'
 
@@ -61,7 +61,7 @@ export default function SpecRail({
             aria-label={i18nT('apps.specBuilder.components.specRail.show_spec_list')}
             className="min-w-0 flex-1 flex items-center gap-2 h-9 px-1.5 rounded-md cursor-pointer bg-transparent border-none text-muted hover:text-text hover:bg-bg-hover transition-colors focus-ring"
           >
-            <FileText size={15} className="text-accent shrink-0" />
+            <FileText className="lucide-inline text-accent shrink-0" />
             <span className="min-w-0 truncate text-[13px] font-semibold text-text">
               {i18nT('apps.specBuilder.components.specRail.spec_builder')}
             </span>
@@ -131,15 +131,21 @@ export default function SpecRail({
               label={<Settings className="lucide-inline" />}
             />
           )}
-          <FileText size={15} className="text-accent shrink-0" />
+          <FileText className="lucide-inline text-accent shrink-0" />
         </span>
       </aside>
     )
   }
 
-  const match = (s: SpecSummary) => s.name.toLowerCase().includes(filter.toLowerCase())
-  const active = specs.filter((s) => match(s) && s.phase !== 'tasks')
-  const ready = specs.filter((s) => match(s) && s.phase === 'tasks')
+  const needle = filter.toLowerCase()
+  const match = (s: SpecSummary) => (
+    s.name.toLowerCase().includes(needle)
+    || (s.title ?? '').toLowerCase().includes(needle)
+  )
+  const working = specs.filter((s) => match(s) && !s.archived)
+  const active = working.filter((s) => s.phase !== 'tasks')
+  const ready = working.filter((s) => s.phase === 'tasks')
+  const archived = specs.filter((s) => match(s) && s.archived)
 
   const groupHeader = (label: string, n: number) => (
     <div
@@ -167,7 +173,7 @@ export default function SpecRail({
         key={s.name}
         onClick={() => setSel(s.name)}
         aria-current={selected || undefined}
-        aria-label={s.name + ' — ' + phaseLabel}
+        aria-label={(s.title || s.name) + ' — ' + phaseLabel}
         className="flex items-center gap-2 px-2.5 py-2 rounded-lg cursor-pointer mb-0.5 focus-ring"
         style={{
           background: selected ? SEL_BG : 'transparent',
@@ -178,7 +184,7 @@ export default function SpecRail({
           ? <motion.span className="w-[7px] h-[7px] rounded-full shrink-0" style={dotStyle} {...PULSE_MOTION} />
           : <span className="w-[7px] h-[7px] rounded-full shrink-0" style={dotStyle} />}
         <span className="text-[13px] font-medium overflow-hidden text-ellipsis whitespace-nowrap text-text flex-1 min-w-0">
-          {s.name}
+          {s.title || s.name}
         </span>
         <span
           className="text-[11px] font-mono whitespace-nowrap"
@@ -222,10 +228,18 @@ export default function SpecRail({
           <SpecListSkeleton />
         ) : (
           <>
-            {active.length > 0 && groupHeader('ACTIVE', active.length)}
+            {active.length > 0 && groupHeader(i18nT('apps.specBuilder.components.specRail.active'), active.length)}
             {active.map(row)}
             {ready.length > 0 && groupHeader(i18nT('apps.specBuilder.components.specRail.plan_ready'), ready.length)}
             {ready.map(row)}
+            {archived.length > 0 && groupHeader(i18nT('apps.meetings.review.archivedSection'), archived.length)}
+            {archived.map(row)}
+            {specs.length > 0 && active.length === 0 && ready.length === 0 && archived.length === 0 && (
+              /* The shared filtered-to-nothing state: echoes the query back and
+                 offers the one-click clear-filter exit (ui.tsx's FilteredEmpty
+                 is documented for exactly this case). */
+              <FilteredEmpty query={filter} onClear={() => setFilter('')} />
+            )}
           </>
         )}
       </div>
@@ -235,7 +249,7 @@ export default function SpecRail({
           in an icon + name + version line and keeps Settings in the rail rather
           than hiding it behind a one-off entry point. */}
       <div className="shrink-0 border-t border-border px-3 py-2.5 flex items-center gap-2">
-        <FileText size={15} className="text-accent shrink-0" />
+        <FileText className="lucide-inline text-accent shrink-0" />
         <span className="text-[13px] font-medium text-text">{i18nT('apps.specBuilder.components.specRail.spec_builder')}</span>
         <span className="text-[12px] text-muted opacity-70">{i18nT('apps.specBuilder.components.specRail.v')}{APP_VERSION}</span>
         <span className="flex-1" />

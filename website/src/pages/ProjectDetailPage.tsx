@@ -10,11 +10,16 @@ import DagView from './aidlc/DagView';
 import PhasedView from './aidlc/PhasedView';
 import TaskDetailPanel from './aidlc/TaskDetailPanel';
 import { api } from '../api/client';
-import { AlertTriangle, Download, Hourglass } from 'lucide-react';
+import { AlertTriangle, Download, Hourglass, Zap } from 'lucide-react';
+import { Badge } from '../components/ui';
+import ErrorNotice from '../components/ErrorNotice';
 
 import { i18nT } from '../i18n/t'
 type Tab = 'idea' | 'tasks';
 type ViewMode = 'dag' | 'phased';
+
+/** Human text for a caught failure: the `ApiError` / `Error` message, else the value itself. */
+const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /** Minimal shape of a step returned by api.updatePlan (subset of TaskDetail). */
 interface SavedStep {
@@ -49,7 +54,7 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
   const selected = selectedTask !== null ? tasks.find(t => t.index === selectedTask) : null;
 
   // Poll pending approvals for force_approval gates
-  const { data: approvalMap = {} } = useQuery({
+  const { data: approvalMap = {}, isError: approvalsFailed, error: approvalsError } = useQuery({
     queryKey: ['approvals', run.task_id],
     queryFn: async () => {
       const list = await api.approvals();
@@ -64,17 +69,24 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
     refetchInterval: 3000,
   });
 
+  // The last approval decision / approval-flag toggle that failed. Both used
+  // to vanish: the mutations had no onError and nothing read isError, so a
+  // refused decision looked like one that had not been clicked.
+  const [actionError, setActionError] = useState('');
+
   const queryClient = useQueryClient();
   const { mutate: handleApprove } = useMutation({
     mutationFn: async (decision: 'approve' | 'reject') => {
       if (!selected || !approvalMap[selected.index]) return;
       return api.resolveApproval(approvalMap[selected.index], decision);
     },
+    onMutate: () => setActionError(''),
     onSuccess: (_, decision) => {
       queryClient.invalidateQueries({ queryKey: ['approvals', run.task_id] });
       onRefresh?.();
       if (decision === 'reject' && selected) setSelectedTask(selected.index);
     },
+    onError: (e) => setActionError(errText(e)),
   });
   const { mutate: dagApprove } = useMutation({
     mutationFn: async ({ index, decision }: { index: number; decision: 'approve' | 'reject' }) => {
@@ -82,16 +94,20 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
       if (!approvalId) return;
       return api.resolveApproval(approvalId, decision);
     },
+    onMutate: () => setActionError(''),
     onSuccess: (_, { index, decision }) => {
       queryClient.invalidateQueries({ queryKey: ['approvals', run.task_id] });
       onRefresh?.();
       if (decision === 'reject') setSelectedTask(index);
     },
+    onError: (e) => setActionError(errText(e)),
   });
   const { mutateAsync: toggleApprovalMut } = useMutation({
     mutationFn: ({ index, updates }: { index: number; updates: Record<string, boolean> }) =>
       api.updateTask(run.task_id, index, updates),
+    onMutate: () => setActionError(''),
     onSuccess: () => { onRefresh?.(); queryClient.invalidateQueries({ queryKey: ['approvals', run.task_id] }); },
+    onError: (e) => setActionError(errText(e)),
   });
   const exportMutation = useMutation({
     mutationFn: () => api.exportPlanYaml(run.task_id),
@@ -105,8 +121,12 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
       const updates: Record<string, boolean> = { [field]: value };
       if (field === 'requires_approval' && !value) updates.force_approval = false;
       const res = await toggleApprovalMut({ index, updates });
-      return !!res?.ok || !('ok' in (res || {}));
-    } catch { return false; }
+      const ok = !!res?.ok || !('ok' in (res || {}));
+      // A resolved `{ ok: false }` is a refusal too; the panel only reverts its
+      // checkbox on `false`, so the reason has to be shown from here.
+      if (!ok) setActionError(res?.error || i18nT('pages.projectDetailPage.failed_to_update_task'));
+      return ok;
+    } catch { return false; }  // onError above already recorded the message
   }, [toggleApprovalMut]);
   const isPlanning = run.status === 'planning';
   const editableStatuses: RunStatus[] = ['planned', 'failed', 'cancelled', 'running', 'paused'];
@@ -179,6 +199,34 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
             </>
           )}
           <div className="flex-1" />
+          {/* Auto-approve indicator — mirrors the badge on the ProjectsPage
+              rail card. Placed before Export YAML so it sits with the row's
+              secondary actions. Live-grant gated so a paused run whose grant
+              expired doesn't assert active trust (matches ProjectsPage.tsx's
+              sync effect). Uses the shared `Badge` primitive (variant='warn'
+              = amber pill) per GPT 5.6 Round 4 review (2026-08-19). The
+              detail-header row has more horizontal room than the 220px rail
+              card, so we keep the visible "Auto-approve" text above the
+              `sm` viewport breakpoint (per Fable UX 2026-08-18); below `sm`
+              (640px) — a narrow phone viewport or a heavily localized
+              locale — the text collapses to icon-only so the row cannot
+              overflow (per GPT 5.6 Round 3 2026-08-19). The `aria-label`
+              carries the accessible name in every state. */}
+          {(run.auto_approve_remaining_secs ?? 0) > 0 && (
+            <Badge
+              variant="warn"
+              role="img"
+              className="shrink-0 mr-2"
+              aria-label={i18nT('pages.projectsPage.auto_approve_tool_calls')}
+              title={i18nT('pages.projectsPage.auto_approve_tool_calls')}
+              data-testid="auto-approve-badge"
+            >
+              <Zap className="lucide-inline" />
+              <span className="hidden sm:inline">
+                {i18nT('pages.projectsPage.auto_approve')}
+              </span>
+            </Badge>
+          )}
           {!isPlanning && (run.task_details || []).length > 0 && (
             <button
               onClick={() => exportMutation.mutate()}
@@ -190,6 +238,15 @@ export default function ProjectDetailPage({ run, onRetry, onRefresh }: Props) {
             </button>
           )}
         </div>
+
+        {/* No hand-off: `pendingEdits` (task title / description / depends_on
+            drafts, kept in this page's state and shown as the DAG's pending
+            badge) and the open TaskDetailPanel's edit form are unsaved local
+            state; the parent ProjectsPage also holds an unsaved `workspaceDir`
+            override. A hand-off unmounts all of it. */}
+        <ErrorNotice message={approvalsFailed ? errText(approvalsError) : ''} className="mx-4 mt-2 shrink-0" testId="project-detail-approvals-error" />
+        <ErrorNotice message={actionError} onDismiss={() => setActionError('')} className="mx-4 mt-2 shrink-0" testId="project-detail-action-error" />
+        <ErrorNotice message={exportMutation.isError ? errText(exportMutation.error) : ''} onDismiss={() => exportMutation.reset()} className="mx-4 mt-2 shrink-0" testId="project-detail-export-error" />
 
         {/* Approval banner */}
         {run.status === 'running' && Object.keys(approvalMap).length > 0 && (() => {

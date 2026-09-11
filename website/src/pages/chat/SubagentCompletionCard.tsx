@@ -22,9 +22,12 @@ import { i18nT } from '../../i18n/t'
 import { useRowDisclosure } from './rowDisclosure'
 import {
   parseSubagentCompletionMessage,
+  isModelDowngrade,
   type ParsedSubagentCompletion,
   type SubagentOutcome,
 } from './subagentCompletion'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import { normalizeModelKey } from '../../lib/model'
 
 function outcomeLabel(outcome: SubagentOutcome): string {
   if (outcome === 'failed') return i18nT('pages.chat.subagentCompletionCard.failed')
@@ -34,7 +37,7 @@ function outcomeLabel(outcome: SubagentOutcome): string {
 }
 
 /** Headline for the card: what happened, in the user's language. */
-function headline(parsed: ParsedSubagentCompletion): string {
+export function headline(parsed: ParsedSubagentCompletion): string {
   if (parsed.kind === 'single') {
     // The cap keeps one long task from pushing the chips and controls off the
     // row. CSS `truncate` cannot supply the cue here — it only fires when the
@@ -61,7 +64,7 @@ function headline(parsed: ParsedSubagentCompletion): string {
   })
 }
 
-const CHIP = 'shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border'
+const CHIP = 'shrink-0 inline-flex items-center gap-1 text-[10px] leading-4 px-1.5 py-0.5 rounded border'
 
 /**
  * Make a wave digest's per-agent outcomes readable without an emoji font.
@@ -88,17 +91,26 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
   message,
   onFileOpen,
   onFolderOpen,
+  onSessionOpen,
+  sessions,
+  activeSession,
   disclosureKey,
   onOpenPanel,
 }: {
   message: ChatMessage
   onFileOpen?: (path: string, opts?: { line?: number }) => void
   onFolderOpen?: (path: string) => void
+  /** Session switching for a `/chat?sid=` link in the payload, same triple the
+   *  assistant row passes. Omitted by hosts with no slot roster. */
+  onSessionOpen?: (key: string) => void
+  sessions?: ReadonlyMap<string, string>
+  activeSession?: string
   disclosureKey?: string
   /** Opens the Subagents side panel. Omitted by hosts that have no side panel
    *  (the embed SDK), which then render the card without the button. */
   onOpenPanel?: (parsed: ParsedSubagentCompletion) => void
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const parsed = parseSubagentCompletionMessage(message)
   const failed = parsed !== null && (parsed.kind === 'single' ? parsed.outcome === 'failed' : parsed.failed > 0)
   // A restart orphan: the run was cut short but its result survived on disk, so
@@ -116,6 +128,16 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
   if (!parsed) return null
 
   const stopped = parsed.kind === 'single' && parsed.outcome === 'stopped'
+  // The model the run actually served (issue #3582), shown as a chip on the
+  // single-agent card. When the spawn pinned a model AND the served id differs,
+  // it is a downgrade (routing/config/availability) — flag it so a model-pinned
+  // review's real model is not silently misread.
+  const resolvedModel = parsed.kind === 'single' ? parsed.resolvedModel : ''
+  const requestedModel = parsed.kind === 'single' ? parsed.requestedModel : ''
+  // Namespace-aware: a short alias and the canonical provider id name the same
+  // model, so compare normalized (see isModelDowngrade) rather than raw !==,
+  // which falsely flagged aliases and the "auto" sentinel (GPT review on #3582).
+  const modelDowngraded = isModelDowngrade(requestedModel, resolvedModel)
   // A digest chunk that is not the wave's last one reports a PARTIAL delivery.
   // Neither a success tick nor an in-progress spinner is honest about it: the
   // first reads "wave done" while siblings are still running, and the second
@@ -134,7 +156,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
   // gutter, so it sat 20px right of every sibling row and 40px narrower.
   return (
     <div
-      className="rounded-md bg-accent/10 border border-accent/20 overflow-hidden"
+      className="rounded-md bg-accent/10 ring-1 ring-inset forced-colors:border ring-accent/20 overflow-hidden"
       data-testid="subagent-completion-card"
     >
       <div className="flex items-center gap-2 px-3 py-2">
@@ -152,7 +174,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
           )}
         </span>
         <Bot size={12} className="text-accent/70 shrink-0" aria-hidden />
-        <span id={headlineId} className="truncate text-[13px] font-medium text-text-strong">{headline(parsed)}</span>
+        <span id={headlineId} className="truncate text-[13px] leading-5 font-medium text-text-strong">{headline(parsed)}</span>
         {parsed.kind === 'single' ? (
           <span
             className={`${CHIP} ${
@@ -186,8 +208,46 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
             )}
           </>
         )}
+        {(resolvedModel || requestedModel) && (() => {
+          const resolvedKnown = !!resolvedModel
+          const displayModel = resolvedModel || requestedModel
+          // Requested-only (model not yet resolved): render a muted chip only
+          // for the 'auto' sentinel. For a concrete pinned id, render nothing —
+          // the chip appears once the model resolves. See ActivityViewer.tsx for
+          // the matching guard.
+          if (!resolvedKnown && !modelDowngraded && normalizeModelKey(displayModel) !== 'auto') return null
+          return (
+            <code
+              className={`${CHIP} font-mono max-w-[8rem] ${
+                modelDowngraded
+                  ? 'bg-warn-subtle border-warn/20 text-warn'
+                  : resolvedKnown
+                    ? 'bg-accent/10 border-accent/20 text-accent/80'
+                    : 'bg-bg-hover border-border text-muted/60'
+              }`}
+              data-testid="subagent-completion-model"
+              title={
+                modelDowngraded
+                  ? i18nT('pages.chat.activityViewer.model_downgraded', {
+                      requested: requestedModel,
+                      resolved: resolvedModel,
+                    })
+                  : resolvedKnown
+                    ? i18nT('pages.chat.activityViewer.model_label', { model: resolvedModel })
+                    : i18nT('pages.chat.activityViewer.model_effective', { model: displayModel })
+              }
+            >
+              {modelDowngraded && <AlertCircle size={10} aria-hidden />}
+              {/* Left-truncate: long ids share a provider prefix
+                  (us.anthropic.claude-…), so clipping the END hides the one part
+                  that says WHICH model. rtl+plaintext keeps the glyphs in logical
+                  LTR order while the ellipsis falls on the left (UX review #3582). */}
+              <span className="truncate inline-block max-w-full [direction:rtl] [unicode-bidi:plaintext] text-left align-bottom">{displayModel}</span>
+            </code>
+          )
+        })()}
         {parsed.kind === 'single' ? (
-          <span className="text-[10px] text-muted font-mono truncate hidden sm:inline">
+          <span className="text-[10px] leading-4 text-muted font-mono truncate hidden sm:inline">
             {parsed.agentId}
           </span>
         ) : parsed.chunks > 1 ? (
@@ -197,7 +257,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
           // fraction: beside "10 of 18 results delivered" a second, smaller
           // "1/2" reads as a competing ratio, and a tooltip-only explanation is
           // invisible to touch and keyboard.
-          <span className="text-[10px] text-muted truncate hidden sm:inline">
+          <span className="text-[10px] leading-4 text-muted truncate hidden sm:inline">
             {i18nT('pages.chat.subagentCompletionCard.digest_chunk_n_of_n', {
               chunk: parsed.chunk,
               chunks: parsed.chunks,
@@ -211,7 +271,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
               onClick={() => onOpenPanel(parsed)}
               title={i18nT('pages.chat.subagentCompletionCard.open_in_the_subagents_panel')}
               aria-label={i18nT('pages.chat.subagentCompletionCard.open_in_the_subagents_panel')}
-              className="pi-morph flex items-center gap-1 text-[11px] text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer px-1.5 py-1 rounded hover:bg-accent/10 transition-colors"
+              className="pi-morph flex items-center gap-1 text-[11px] leading-4 text-accent hover:text-accent-hover bg-transparent border-none cursor-pointer px-1.5 py-1 rounded hover:bg-accent/10 transition-colors"
             >
               <PanelRightSolid size={13} />
               <span className="hidden sm:inline">{i18nT('pages.chat.subagentCompletionCard.panel')}</span>
@@ -223,7 +283,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
               onClick={() => setExpanded(e => !e)}
               aria-expanded={expanded}
               title={detailsLabel}
-              className="flex items-center gap-1 text-[11px] text-muted hover:text-text bg-transparent border-none cursor-pointer px-1.5 py-1 rounded hover:bg-bg-hover transition-colors"
+              className="flex items-center gap-1 text-[11px] leading-4 text-muted hover:text-text bg-transparent border-none cursor-pointer px-1.5 py-1 rounded hover:bg-bg-hover transition-colors"
             >
               {detailsLabel}
               <ChevronDown size={13} className={`transition-transform ${expanded ? 'rotate-180' : ''}`} />
@@ -231,6 +291,26 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
           )}
         </div>
       </div>
+      {modelDowngraded && (
+        // Visible (not hover-only) requested-vs-served text. The chip's tooltip
+        // is invisible to touch / keyboard / screen-reader users, but the
+        // requested-vs-served fact IS the audit point of this feature, so it is
+        // rendered as persistent text here too (UX review #3582). role=status so
+        // AT announces it; the amber matches the chip.
+        <div
+          className="flex items-start gap-1.5 px-3 py-1.5 border-t border-warn/20 bg-warn-subtle/50 text-[11px] leading-4 text-warn"
+          role="status"
+          data-testid="subagent-completion-downgrade"
+        >
+          <AlertCircle size={12} className="shrink-0 mt-0.5" aria-hidden />
+          <span className="min-w-0 break-words">
+            {i18nT('pages.chat.activityViewer.model_downgraded', {
+              requested: requestedModel,
+              resolved: resolvedModel,
+            })}
+          </span>
+        </div>
+      )}
       {expanded && parsed.body && (
         // max-h + overflow-y-auto: a wave digest grows one block per agent, so a
         // 7+-agent batch renders taller than the viewport. The body scrolls
@@ -242,11 +322,16 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
         // tabIndex + region role: a scroll region with no focusable descendant
         // is unreachable to a keyboard, and a failure digest opens expanded, so
         // this is a scroller a keyboard user meets without asking for it.
+        // The ring is INSET because the card root's overflow-hidden clips an
+        // outward ring where the body is flush with the card (left/right/
+        // bottom) — pre-fix, the only indicator was the UA :focus-visible
+        // outline reduced to a hairline on the top edge alone (WCAG 2.4.7).
         <div
-          className="px-3 pb-2 pt-1 border-t border-accent/10 max-h-[24rem] overflow-y-auto overflow-x-hidden"
+          className="px-3 pb-2 pt-1 border-t border-accent/10 max-h-[24rem] overflow-y-auto overflow-x-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
           data-testid="subagent-completion-body"
           role="region"
           aria-labelledby={headlineId}
+          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
           tabIndex={0}
         >
           {/* softBreaks: the payload is machine-composed plain text whose line
@@ -257,6 +342,9 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
             content={parsed.kind === 'batch' ? legibleDigest(parsed.body) : parsed.body}
             onFileOpen={onFileOpen}
             onFolderOpen={onFolderOpen}
+            onSessionOpen={onSessionOpen}
+            sessions={sessions}
+            activeSession={activeSession}
             softBreaks
           />
         </div>

@@ -27,10 +27,11 @@ import {
 } from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import { store as globalStore } from '../store'
-import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, sweepStaleOptimistic, appendMessage, OPTIMISTIC_TIMEOUT_MS } from '../store/chatSlice'
+import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard } from '../store/chatSlice'
 import { sseSlots } from '../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import type { ChatSlot } from '../types'
+import { recentErrors } from '../utils/errorReport'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -42,6 +43,7 @@ vi.mock('../api/client', () => ({
     autonudgeList: vi.fn().mockResolvedValue({ enabled: false, loops: [] }),
     pendingQuestions: vi.fn().mockResolvedValue([]),
     voiceSynthesize: vi.fn().mockResolvedValue({ ok: true }),
+    voiceCancel: vi.fn().mockResolvedValue({ ok: true }),
     sessions: vi.fn().mockResolvedValue({ sessions: [], has_more: false }),
   },
 }))
@@ -202,7 +204,10 @@ describe('useWebSocket frame router', () => {
   function mount() {
     const hook = renderHook(() => useWebSocket(), { wrapper })
     const ws = WS_INSTANCES[0]
-    act(() => { ws.simulateOpen() })
+    act(() => {
+      ws.simulateOpen()
+      window.dispatchEvent(new CustomEvent('voice-synthesis-start', { detail: { slot: ACTIVE, request_id: 'test-voice' } }))
+    })
     return { ...hook, ws }
   }
 
@@ -245,9 +250,13 @@ describe('useWebSocket frame router', () => {
     }
   })
 
-  it('applies the yolo and channel-trust side channels riding a slots frame', () => {
+  it('applies slots-frame side channels without discarding dashboard status', () => {
     const { ws } = mount()
     act(() => {
+      ws.simulateMessage({
+        type: 'dashboard',
+        data: { version: '1.0.0', yolo: false, yolo_duration: 'until_shutdown' },
+      })
       ws.simulateMessage({
         type: 'slots',
         data: [slotFixture(ACTIVE)],
@@ -257,6 +266,7 @@ describe('useWebSocket frame router', () => {
     })
     expect(dash().slots.map(s => s.key)).toEqual([ACTIVE])
     expect(dash().approvalMode).toBe('yolo')
+    expect(dash().status).toMatchObject({ yolo: true, yolo_duration: 'until_shutdown' })
     expect(dash().channelTrusted).toBe(true)
   })
 
@@ -630,7 +640,7 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().folderSuggestions[ACTIVE]).toEqual({
-      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12,
+      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12, turns: 0,
     })
 
     act(() => {
@@ -660,6 +670,8 @@ describe('useWebSocket frame router', () => {
       ws.simulateMessage({ type: 'subagent_chunk', data: { slot: ACTIVE, id: 'ag-1', text: 'partial ' } })
       ws.simulateMessage({ type: 'subagent_tool', data: { slot: ACTIVE, id: 'ag-1', tool: 'fs_read', tool_count: 2 } })
     })
+    // Subagent chunks are now buffered and flushed per animation frame (PR #5945).
+    act(() => { const pending = rafCbs; rafCbs = []; pending.forEach(cb => cb(0)) })
     expect(chat().subagents['ag-1']?.streaming).toBe('partial ')
     expect(chat().subagents['ag-1']?.lastTool).toBe('fs_read')
 
@@ -962,8 +974,8 @@ describe('useWebSocket frame router', () => {
     const audio = () => (URL.createObjectURL as ReturnType<typeof vi.fn>).mock.calls.length
 
     await act(async () => {
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('first') } })
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('second') } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('first') } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('second') } })
     })
     expect(audio()).toBe(2)
     expect(chat().voicePlaying).toBe(true)
@@ -979,35 +991,67 @@ describe('useWebSocket frame router', () => {
     expect(chat().voicePlaying).toBe(false)
   })
 
-  it('advances past a chunk whose audio element errors', async () => {
+  it('uses the WAV MIME type supplied with a local voice chunk', async () => {
+    const blobs: Blob[] = []
+    URL.createObjectURL = vi.fn((blob: Blob) => {
+      blobs.push(blob)
+      return 'blob:voice-wav'
+    })
     vi.stubGlobal('Audio', MockAudio)
     const { ws } = mount()
+
     await act(async () => {
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('a') } })
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('b') } })
+      ws.simulateMessage({
+        type: 'voice_chunk',
+        data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('wav'), audioMime: 'audio/wav' },
+      })
     })
-    act(() => { MockAudio.instances[0].onerror?.() })
-    expect(MockAudio.instances).toHaveLength(2)
+
+    expect(blobs).toHaveLength(1)
+    expect(blobs[0].type).toBe('audio/wav')
   })
 
-  it('advances past a chunk the browser refuses to play', async () => {
-    MockAudio.playResult = () => Promise.reject(new Error('autoplay blocked'))
+  it.each(['media-error', 'autoplay-blocked'])('cancels the entire voice queue after %s', async failure => {
+    let rejectPlayback!: (reason: Error) => void
+    MockAudio.playResult = () => new Promise((_, reject) => { rejectPlayback = reject })
     vi.stubGlobal('Audio', MockAudio)
     const { ws } = mount()
-    await act(async () => {
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('a') } })
-    })
-    // The rejection released the queue rather than wedging it.
-    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:voice-1')
+    const errors = vi.fn()
+    window.addEventListener('voice-error', errors)
+    try {
+      await act(async () => {
+        ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('a') } })
+        ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('b') } })
+      })
+      await act(async () => {
+        if (failure === 'media-error') MockAudio.instances[0].onerror?.()
+        else rejectPlayback(new DOMException('autoplay blocked', 'NotAllowedError'))
+      })
+      await act(async () => {
+        ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('late') } })
+      })
+      expect(errors).toHaveBeenCalledOnce()
+      expect((errors.mock.calls[0][0] as CustomEvent).detail.code).toBe(
+        failure === 'media-error' ? 'voice_playback_failed' : 'voice_playback_blocked',
+      )
+      expect(MockAudio.instances).toHaveLength(1)
+      expect(MockAudio.instances[0].pause).toHaveBeenCalledOnce()
+      expect(api.voiceCancel).toHaveBeenCalledWith(ACTIVE, 'test-voice')
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:voice-1')
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:voice-2')
+      expect(chat().voicePlaying).toBe(false)
+    } finally {
+      window.removeEventListener('voice-error', errors)
+    }
   })
 
   it('drops voice audio for a background slot and a malformed payload', async () => {
     vi.stubGlobal('Audio', MockAudio)
     const { ws } = mount()
     await act(async () => {
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: BACKGROUND, audio: btoa('x') } })
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: 'not-base64-@@@' } })
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: BACKGROUND, audio: btoa('x') } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: 'not-base64-@@@' } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE } })
     })
     expect(MockAudio.instances).toHaveLength(0)
     expect(chat().voicePlaying).toBe(false)
@@ -1015,19 +1059,38 @@ describe('useWebSocket frame router', () => {
 
   it('stores the stitched replay audio from voice_complete', () => {
     const { ws } = mount()
-    act(() => { ws.simulateMessage({ type: 'voice_complete', data: { audio: 'BASE64MP3' } }) })
+    act(() => { ws.simulateMessage({ type: 'voice_complete', data: { slot: ACTIVE, request_id: 'test-voice', audio: 'BASE64MP3' } }) })
     expect(chat().voiceAudio).toBe('BASE64MP3')
 
     act(() => { ws.simulateMessage({ type: 'voice_complete', data: {} }) })
     expect(chat().voiceAudio).toBe('BASE64MP3')
   })
 
+  it('journals an asynchronous synthesis failure with no ChatPage listener mounted', () => {
+    const { ws } = mount()
+    const before = recentErrors().map(report => report.id)
+    act(() => {
+      ws.simulateMessage({ type: 'voice_error', data: {
+        slot: ACTIVE, request_id: 'test-voice', code: 'voice_synthesis_failed',
+      } })
+      // A repeated terminal frame belongs to the already-consumed request.
+      ws.simulateMessage({ type: 'voice_error', data: {
+        slot: ACTIVE, request_id: 'test-voice', code: 'voice_synthesis_failed',
+      } })
+    })
+    const added = recentErrors().filter(report => !before.includes(report.id))
+    expect(added).toHaveLength(1)
+    expect(added[0]).toMatchObject({
+      source: 'system', code: 'voice_synthesis_failed', endpoint: '/api/voice/synthesize',
+    })
+  })
+
   it('interrupts playback and empties the queue on a voice-stop event', async () => {
     vi.stubGlobal('Audio', MockAudio)
     const { ws } = mount()
     await act(async () => {
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('a') } })
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('b') } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('a') } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('b') } })
     })
     expect(chat().voicePlaying).toBe(true)
 
@@ -1039,7 +1102,7 @@ describe('useWebSocket frame router', () => {
 
     // Muted afterwards: a further chunk is ignored.
     await act(async () => {
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('c') } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('c') } })
     })
     expect(chat().voicePlaying).toBe(false)
   })
@@ -1048,7 +1111,7 @@ describe('useWebSocket frame router', () => {
     vi.stubGlobal('Audio', MockAudio)
     const { ws } = mount()
     await act(async () => {
-      ws.simulateMessage({ type: 'voice_chunk', data: { slot: ACTIVE, audio: btoa('a') } })
+      ws.simulateMessage({ type: 'voice_chunk', data: { request_id: 'test-voice', slot: ACTIVE, audio: btoa('a') } })
     })
     expect(chat().voicePlaying).toBe(true)
 
@@ -1074,7 +1137,7 @@ describe('useWebSocket frame router', () => {
     })
     await act(async () => { rafCbs[0](0) })
 
-    expect(api.voiceSynthesize).toHaveBeenCalledWith(ACTIVE, 'This sentence is long enough.')
+    expect(api.voiceSynthesize).toHaveBeenCalledWith(ACTIVE, 'This sentence is long enough.', expect.objectContaining({ request_id: expect.any(String) }))
   })
 
   it('does not re-speak a sentence it already sent, nor a fragment', async () => {
@@ -1090,8 +1153,8 @@ describe('useWebSocket frame router', () => {
       ws.simulateMessage({ type: 'chat_chunk', data: { slot: ACTIVE, content: 'x', seq: 1 } })
     })
     await act(async () => { rafCbs[0](0) })
-    // "Short." is under the 10-character floor and the tail has no boundary.
-    expect(api.voiceSynthesize).not.toHaveBeenCalled()
+    // A short sentence is still speakable; the unfinished tail waits.
+    expect(api.voiceSynthesize).toHaveBeenCalledWith(ACTIVE, 'Short.', expect.objectContaining({ request_id: expect.any(String) }))
   })
 
   it('speaks the unspoken tail when the turn finishes', async () => {
@@ -1105,7 +1168,7 @@ describe('useWebSocket frame router', () => {
     })
 
     await act(async () => { ws.simulateMessage({ type: 'chat_done', data: { slot: ACTIVE } }) })
-    expect(api.voiceSynthesize).toHaveBeenCalledWith(ACTIVE, 'A complete final answer.')
+    expect(api.voiceSynthesize).toHaveBeenCalledWith(ACTIVE, 'A complete final answer.', expect.objectContaining({ request_id: expect.any(String) }))
   })
 
   it('re-reads the auto-speak preference when the finished turn had it off', async () => {
@@ -1125,7 +1188,7 @@ describe('useWebSocket frame router', () => {
       }))
     })
     await act(async () => { ws.simulateMessage({ type: 'chat_done', data: { slot: ACTIVE } }) })
-    expect(api.voiceSynthesize).toHaveBeenCalledWith(ACTIVE, 'Spoken because the pane turned it on.')
+    expect(api.voiceSynthesize).toHaveBeenCalledWith(ACTIVE, 'Spoken because the pane turned it on.', expect.objectContaining({ request_id: expect.any(String) }))
 
     // ...and switching it back off silences the next turn.
     ;(api.voiceSynthesize as ReturnType<typeof vi.fn>).mockClear()
@@ -1755,50 +1818,5 @@ describe('useWebSocket slots reconcile', () => {
     testStore.dispatch(sseChatMessage({ slot: BACKGROUND, role: 'assistant', content: 'keep me', ts: '1' }))
     testStore.dispatch(sseSlots([]))
     expect(testStore.getState().chat.slotMessages[BACKGROUND]).toBeDefined()
-  })
-})
-
-describe('useWebSocket client-side optimistic timeout sweep (#3973)', () => {
-  beforeEach(() => { vi.useFakeTimers() })
-  afterEach(() => { vi.useRealTimers() })
-
-  it('dispatches sweepStaleOptimistic on a 10s interval independent of the heartbeat', () => {
-    const testStore = createTestStore({
-      chat: { ...chatReducer(undefined, { type: '@@INIT' }), activeSlot: ACTIVE },
-    })
-    // Inject an optimistic message with a backdated timestamp so the sweep can mark it stale
-    const oldTs = Date.now() - (OPTIMISTIC_TIMEOUT_MS + 5_000)
-    testStore.dispatch(appendMessage({
-      role: 'user', content: 'pending msg', cls: '', ts: '2026-08-16T14:00:00.000Z',
-      meta: { sendId: 's-timer', optimistic: true, optimisticTs: oldTs },
-    }))
-    expect(testStore.getState().chat.messages[0].meta?.stale).toBeUndefined()
-
-    const wrapper = ({ children }: { children: React.ReactNode }) =>
-      createElement(QueryClientProvider, { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
-        createElement(Provider, { store: testStore }, children))
-
-    renderHook(() => useWebSocket(), { wrapper })
-
-    // The WebSocket may or may not have connected — the timer fires regardless.
-    // Advance past the 10s interval.
-    act(() => { vi.advanceTimersByTime(10_000) })
-
-    expect(testStore.getState().chat.messages[0].meta?.stale).toBe(true)
-  })
-
-  it('cleans up the interval on unmount', () => {
-    const testStore = createTestStore({
-      chat: { ...chatReducer(undefined, { type: '@@INIT' }), activeSlot: ACTIVE },
-    })
-    const wrapper = ({ children }: { children: React.ReactNode }) =>
-      createElement(QueryClientProvider, { client: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
-        createElement(Provider, { store: testStore }, children))
-
-    const { unmount } = renderHook(() => useWebSocket(), { wrapper })
-    const clearSpy = vi.spyOn(global, 'clearInterval')
-    act(() => { unmount() })
-    expect(clearSpy).toHaveBeenCalled()
-    clearSpy.mockRestore()
   })
 })

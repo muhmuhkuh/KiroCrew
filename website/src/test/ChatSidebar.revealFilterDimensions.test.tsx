@@ -8,9 +8,11 @@
  * the refactor, which deliberately changed no filter's behaviour.
  *
  * The structural cases are the before/after guard, and their reach is narrow:
- * they fail while the effect names filter state directly, and they pin the set
- * that IS registered. A filter added to filteredSlots' enumeration and never
- * registered here still reveals nothing -- one opt-in remains, not zero.
+ * they fail while the effect names filter state directly, and they pin that
+ * the registry adapts the single filterDimensions declaration rather than
+ * declaring dimensions of its own. The declaration's shape — and that
+ * filteredSlots and listNarrowed derive from the same source — is pinned by
+ * ChatSidebar.filterDimensions.test.tsx.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -32,21 +34,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -79,18 +81,20 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
+import type { ChatSlot } from '../types'
 
 const RUNNING_ONLY_LS_KEY = 'mc-session-running-only'
 const TAG_FILTER_LS_KEY = 'mc-session-tag-filter'
 
 /** `k-alpha` is running and tagged Alpha; `k-beta` is neither, so it is the row
  *  every filter below excludes and therefore the reveal target throughout. */
-const SLOTS = [
+const SLOTS: ChatSlot[] = [
   { key: 'k-alpha', title: 'alpha session', running: true, messages: 2, tags: ['t1'] },
   { key: 'k-beta', title: 'beta session', running: false, messages: 2, tags: ['t2'] },
-]
+] as unknown as ChatSlot[]
 
-function renderSidebar(slots: any[] = SLOTS) {
+function renderSidebar(slots: ChatSlot[] = SLOTS) {
   // Spread the real slice defaults: RTK REPLACES a slice with preloadedState
   // rather than merging, so a partial drops keys the reducers assume exist.
   const defaults = createTestStore().getState()
@@ -102,12 +106,12 @@ function renderSidebar(slots: any[] = SLOTS) {
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
+    } as unknown as RootState['dashboard'],
     chat: {
       ...defaults.chat,
       activeSlot: null, slotStatusDetail: {},
       revealRequest: null, revealNonce: 0,
-    } as any,
+    } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
@@ -217,14 +221,20 @@ describe('reveal filter dimensions are registered, not enumerated in the effect'
     expect(effect).toContain('revealBlockingFilters')
   })
 
-  it('the registry is the single place a dimension is declared', () => {
+  it('the registry derives from the single filterDimensions declaration', () => {
     const registry = flat.match(/const revealBlockingFilters = useMemo<RevealBlockingFilter\[\]>.*?\}, \[[^\]]*\]\)/)?.[0]
     expect(registry).toBeDefined()
-    // Search, status, tags, folder. Pins the REGISTERED set only: bump this in
-    // the same commit as a fifth entry so the addition is a decision, not drift.
-    expect([...registry!.matchAll(/\bhides:/g)]).toHaveLength(4)
-    // Every registered dimension carries the means to drop itself, so the
-    // effect never needs to know which state backs it.
-    expect([...registry!.matchAll(/\bclear:/g)]).toHaveLength(4)
+    // Dimensions are declared ONCE, in filterDimensions (whose shape
+    // ChatSidebar.filterDimensions.test.tsx pins); this registry only adapts
+    // them, so it can no longer hold a dimension the other consumers miss.
+    expect(registry).toContain('filterDimensions.map')
+    for (const named of [
+      'filterTagIds', 'clearTagFilter',
+      'slotFilter', 'setSlotFilter',
+      'activeFilters', 'setActiveFilters', 'SESSION_FILTERS',
+      'filterHiddenSubtree', 'setFilterHiddenFolders',
+    ]) {
+      expect(registry, `reveal registry must not name ${named} directly`).not.toContain(named)
+    }
   })
 })

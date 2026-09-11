@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,7 +25,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
+from body_stream_helpers import BodyStreamPayload
 
+from conftest import host_abs
 from kiro_crew.dashboard.handlers import mcp as mcp_mod
 from kiro_crew.mcp_discovery import McpServerInfo
 
@@ -41,9 +45,19 @@ def _request(
     """Minimal aiohttp request double, matching the suite's existing style."""
     req = MagicMock(spec=web.Request)
     if isinstance(body, Exception):
+        # Malformed body: real undecodable bytes for the streaming (capped)
+        # path, a raising mock for the ``request.json()`` (uncapped) path.
+        raw = b"{not json"
         req.json = AsyncMock(side_effect=body)
     else:
+        raw = json.dumps(body).encode() if body is not None else b""
+        # Kept alive: ``api_mcp_server_detail`` reads uncapped
+        # (``max_bytes=None``) and consumes ``request.json()``.
         req.json = AsyncMock(return_value=body)
+    req.content = BodyStreamPayload(raw)
+    req.content_length = len(raw) if raw else None
+    req.charset = None
+    req.can_read_body = bool(raw)
     req.app = {"state": state if state is not None else _State()}
     req.query = query or {}
     req.match_info = match_info or {}
@@ -57,6 +71,21 @@ class _State:
 
     def __init__(self) -> None:
         self._background_tasks: set[asyncio.Task] = set()
+
+
+def _effective_stubs(section: dict[str, Any]) -> list[str]:
+    """The stub set IN EFFECT for a saved ``mcp_gateway`` section.
+
+    The toggle handler no longer rewrites ``stub_servers``: that key is the roster
+    a distribution ships and keeps growing, and a click is recorded as a decision
+    in ``stub_overrides`` over it. What the operator sees stubbed is the two
+    resolved together, so that -- not either key alone -- is what a test about
+    toggle behaviour should assert. Reads the production resolver so these tests
+    cannot drift from the runtime's own answer.
+    """
+    from kiro_crew.config.loader import _resolve_stub_servers
+
+    return _resolve_stub_servers(section)
 
 
 def _payload(resp: web.Response) -> Any:
@@ -521,6 +550,70 @@ class TestServerDetail:
         assert "server name is required" in _payload(resp)["error"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name",
+        ["../../evil", "..", "a/../b", "a" * 129, "-leading-dash"],
+        ids=["traversal", "bare-dotdot", "embedded-dotdot", "overlong", "bad-leading-char"],
+    )
+    async def test_put_rejects_a_name_the_rest_of_the_tree_would_refuse(
+        self, sandbox: SimpleNamespace, name: str
+    ) -> None:
+        """PUT is the writer, so it must not plant a key nothing else can address.
+
+        ``_is_valid_mcp_name`` is the predicate the validation-dependent readers
+        in this tree enforce (several call sites in ``mcp.py`` itself, plus
+        ``mcp_custom.py``, ``mcp_discover.py`` and ``connections.py``). A name
+        carrying ``..`` or exceeding ``_MAX_MCP_NAME_LEN`` written through this
+        route is invisible to those, so the entry cannot be managed through them.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request({"command": "node"}, match_info={"name": name}, method="PUT")
+        )
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_server_name"
+        # The refusal must land before the write, not after it.
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_still_removes_a_malformed_junk_key(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """DELETE stays permissive on purpose, so a junk key remains clearable.
+
+        This mirrors the documented grant/revoke asymmetry in ``security.py``:
+        the writer validates, the remover does not, because guarding a remover
+        would strand exactly the entries the writer guard prevents. ``DELETE``
+        and ``api_mcp_remove`` are both such removers. Guarding this handler's
+        DELETE half is the specific regression this test forbids.
+        """
+        _write_global(sandbox, {"../../evil": {"command": "x"}})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(None, match_info={"name": "../../evil"}, method="DELETE")
+        )
+        assert resp.status == 200
+        assert _payload(resp)["removed"] is True
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_put_accepts_the_names_the_validator_allows(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The guard must not narrow the accepted set beyond the shared validator.
+
+        ``_VALID_MCP_NAME_RE`` deliberately admits ``@``, ``/``, ``.``, ``:`` and
+        ``_`` so scoped package ids (``@scope/pkg``) keep working.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(
+                {"command": "node"}, match_info={"name": "@scope/pkg.name_v2:1"}, method="PUT"
+            )
+        )
+        assert resp.status == 200
+        assert "@scope/pkg.name_v2:1" in _read_global(sandbox)
+
+    @pytest.mark.asyncio
     async def test_delete_absent_is_404(self, sandbox: SimpleNamespace) -> None:
         _write_global(sandbox, {})
         resp = await mcp_mod.api_mcp_server_detail(
@@ -591,10 +684,14 @@ class TestServerDetail:
         registered PATH fragment must be emitted complete. See env.emit_env."""
         import os
 
-        monkeypatch.setenv("PATH", "/usr/bin")
+        # Spelled for the host (conftest.host_abs): declared entries pass through
+        # the ``os.path.isabs`` filter in env._spec_path_entries, and from Python
+        # 3.13 a bare ``/opt/shims`` is not absolute under ntpath (no drive).
+        shims, usr_bin = host_abs("opt", "shims"), host_abs("usr", "bin")
+        monkeypatch.setenv("PATH", usr_bin)
         resp = await mcp_mod.api_mcp_server_detail(
             _request(
-                {"command": "node", "env": {"PATH": "/opt/shims", "K": "v"}},
+                {"command": "node", "env": {"PATH": shims, "K": "v"}},
                 match_info={"name": "srv"},
                 method="PUT",
             )
@@ -602,8 +699,8 @@ class TestServerDetail:
         assert resp.status == 200
         written = _read_global(sandbox)["srv"]["env"]
         entries = written["PATH"].split(os.pathsep)
-        assert entries[0] == "/opt/shims", "caller-authored entries stay first"
-        assert "/usr/bin" in entries, "inherited PATH must survive the override"
+        assert entries[0] == shims, "caller-authored entries stay first"
+        assert usr_bin in entries, "inherited PATH must survive the override"
         assert written["K"] == "v"
 
 
@@ -1128,7 +1225,12 @@ class TestLocalOverlayOwnsTheStubKeys:
         )
         assert resp.status == 200
         saved = json.loads(base.read_text(encoding="utf-8"))["mcp_gateway"]
-        assert saved["stub_servers"] == ["x-mcp", "y-mcp"]
+        assert _effective_stubs(saved) == ["x-mcp", "y-mcp"]
+        # The overlay's migrated roster is frozen into the base, and the click is a
+        # decision on top of it -- the allowlist is preserved either way, which is
+        # what this test is about.
+        assert saved["stub_servers"] == ["x-mcp"]
+        assert saved["stub_overrides"] == {"y-mcp": True}
 
     @pytest.mark.asyncio
     async def test_the_per_server_setter_refuses_a_shadowed_write(
@@ -1150,6 +1252,42 @@ class TestLocalOverlayOwnsTheStubKeys:
         )
         assert resp.status == 409
         assert _payload(resp)["code"] == "overlay_owns_stub_servers"
+
+    @pytest.mark.asyncio
+    async def test_an_overlay_owning_the_override_map_also_refuses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard must cover the key the toggle actually writes.
+
+        The decision lands in ``stub_overrides``, and the overlay wins the deep
+        merge per-key. Checking only ``stub_servers`` would let the click write base
+        ``config.json`` and answer 200 while the overlay kept the server on its own
+        value -- the silent never-takes-effect failure the guard exists to prevent,
+        reintroduced by relocating the write.
+        """
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp"]}}), encoding="utf-8"
+        )
+        config_local_path().write_text(
+            json.dumps({"mcp_gateway": {"stub_overrides": {"a-mcp": False}}}),
+            encoding="utf-8",
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": True}, state=SimpleNamespace())
+        )
+        assert resp.status == 409, (
+            "the toggle wrote a value the gateway would not read -- the overlay "
+            "shadows stub_overrides, so this had to be refused"
+        )
+        body = _payload(resp)
+        assert body["code"] == "overlay_owns_stub_servers"
+        assert "stub_overrides" in body["error"]
 
     @pytest.mark.asyncio
     async def test_a_corrupt_overlay_is_treated_as_absent(
@@ -1242,7 +1380,12 @@ class TestGatewayEnableErrors:
             _request({"enabled": True}, state=state)
         )
         assert resp.status == 500
-        assert "broker died" in _payload(resp)["error"]
+        # The raw exception text stays server-side (in the SEL log below); the
+        # verbatim-rendered client body gets a generic message + machine code.
+        body = _payload(resp)
+        assert "broker died" not in body["error"]
+        assert body["error"] == "apply failed"
+        assert body["code"] == "mcp_apply_failed"
         outcomes = [c.kwargs.get("outcome") for c in sel.log_api_access.call_args_list]
         assert "error" in outcomes
 
@@ -1255,13 +1398,24 @@ def routed_allowlist(monkeypatch: pytest.MonkeyPatch):
     """Pin ``KiroCrewConfig.load().mcp_gateway.stub_servers``."""
     import kiro_crew.config.loader as loader
 
-    def _set(names: list[str]) -> None:
+    def _set(names: list[str], *, enabled: bool = False, forward_declared_env: bool = False) -> None:
         # ``socket_path`` is part of the real ``McpGatewayConfig`` and the
         # handler reads it to locate the observed-hazard ledger. A double that
         # omitted it would make the row builder raise on a field production
         # always has — empty is the honest stand-in for "no broker configured".
+        #
+        # ``enabled`` + ``forward_declared_env`` are read for the same reason:
+        # together they decide whether stubbing a server could produce a SHARED
+        # backend at all, which the row reports as ``pooling_blocked_by_env``.
+        # Defaults match a fresh install (sharing off, no forwarding), so the
+        # existing cases keep describing the state they were written for.
         cfg = SimpleNamespace(
-            mcp_gateway=SimpleNamespace(stub_servers=list(names), socket_path="")
+            mcp_gateway=SimpleNamespace(
+                stub_servers=list(names),
+                socket_path="",
+                enabled=enabled,
+                forward_declared_env=forward_declared_env,
+            )
         )
         monkeypatch.setattr(loader.KiroCrewConfig, "load", staticmethod(lambda: cfg))
 
@@ -1285,6 +1439,370 @@ def _seed_probe(monkeypatch, *names: str) -> None:
 
 
 class TestGatewayServers:
+    @pytest.mark.asyncio
+    async def test_the_write_resolves_eligibility_against_the_state_it_writes_under(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The sharing state the rule reads is the one the write itself sees.
+
+        A client filtering its own rows can only answer for the moment it read
+        them, and sharing is a separate switch another dashboard or the CLI can
+        flip. So the client sends candidates and the decision happens here, inside
+        the lock hold that performs the write: a server whose evidence supports a
+        stub but not co-tenancy is written while sharing is off and skipped once it
+        is on, with no guard, expectation or retry in between.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "a.json").write_text(
+            json.dumps({"name": "alpha", "mcpServers": {"a-mcp": {"command": "run"}}}),
+            encoding="utf-8",
+        )
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", agents)
+        # Patch the LOADER's name: the handler re-imports ``config_path`` from
+        # ``kiro_crew.config.loader`` inside the function body, so patching this
+        # module's copy is silently ignored.
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+        # Supports a stub, does not support co-tenancy -- the case where the two
+        # sharing states must disagree.
+        from kiro_crew.mcp_gateway.shareability import ShareVerdict, Strength
+
+        monkeypatch.setattr(
+            mcp_mod,
+            "_assess_server",
+            lambda name, **kw: ShareVerdict(
+                name=name,
+                strength=Strength.MEASURED,
+                recommend_stub=True,
+                recommend_share=False,
+                reasons=(),
+            ),
+        )
+
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": False, "stub_servers": []}}))
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": True})
+        )
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["stubbed"] == ["a-mcp"]
+        assert body["skipped"] == []
+        saved = json.loads(cfg_path.read_text())["mcp_gateway"]
+        assert _effective_stubs(saved) == ["a-mcp"]
+        # Recorded as a decision over the roster, which the write leaves alone.
+        assert saved["stub_servers"] == []
+        assert saved["stub_overrides"] == {"a-mcp": True}
+
+        # Same request, same verdict, sharing now ON: the write must decline it and
+        # say which name it declined, rather than co-tenanting on the weaker flag.
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": True})
+        )
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["stubbed"] == []
+        assert body["skipped"] == [{"name": "a-mcp", "reason": "evidence_insufficient"}]
+        # Nothing qualified means the file is not rewritten at all.
+        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == []
+
+    @pytest.mark.asyncio
+    async def test_the_overlay_decides_forward_declared_env_for_the_batch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``config.local.json`` wins, because the rewriter reads the merged value.
+
+        Whether a declared key is forwarded decides whether a pooled spawn happens
+        at all, so reading the base value while the rewriter reads the overlay would
+        let the batch report a stub whose backend is left direct. The sharing switch
+        beside it is already read this way.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "mcp_gateway": {
+                        "enabled": True,
+                        "stub_servers": [],
+                        "forward_declared_env": True,
+                    }
+                }
+            )
+        )
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+        monkeypatch.setattr(
+            mcp_mod, "_local_overlay_section", lambda: {"forward_declared_env": False}
+        )
+
+        seen: dict[str, bool] = {}
+
+        def _record(names, *, sharing_on, forward_declared_env):  # type: ignore[no-untyped-def]
+            seen["forward"] = forward_declared_env
+            return list(names), []
+
+        monkeypatch.setattr(mcp_mod, "_stub_eligibility", _record)
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": True})
+        )
+        assert resp.status == 200
+        assert seen["forward"] is False, (
+            "the batch must use the effective value the rewriter sees, not the base"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unstubbing_never_asks_the_evidence_for_permission(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Removing a stub needs no verdict.
+
+        Eligibility gates ADDING co-tenancy. Applying it to a removal would strand
+        an operator with a stub they explicitly asked to drop, on the grounds that
+        the evidence for keeping it had weakened.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(
+            json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": ["a-mcp"]}})
+        )
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": False, "resolve_eligibility": True})
+        )
+        assert resp.status == 200
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == []
+
+    @pytest.mark.asyncio
+    async def test_a_single_toggle_writes_exactly_the_name_it_was_given(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Absent ``resolve_eligibility`` means "write exactly what I named".
+
+        The per-row switch is a direct instruction about one server the operator is
+        looking at, so it needs no verdict lookup; and an older dashboard served
+        from a previous build sends no such field. Neither may be filtered.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        # Patch the LOADER's name: the handler re-imports ``config_path`` from
+        # ``kiro_crew.config.loader`` inside the function body, so patching this
+        # module's copy is silently ignored.
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+        monkeypatch.setattr(
+            loader.KiroCrewConfig,
+            "load",
+            staticmethod(
+                lambda: SimpleNamespace(
+                    mcp_gateway=SimpleNamespace(
+                        enabled=True, stub_servers=[], socket_path="", forward_declared_env=False
+                    )
+                )
+            ),
+        )
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": True})
+        )
+        assert resp.status == 200
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_the_stub_write_goes_through_the_locked_config_primitive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The stub write is only sound inside a CROSS-PROCESS lock.
+
+        ``_MCP_GATEWAY_APPLY_LOCK`` and ``_get_config_lock`` are asyncio locks:
+        they serialize this gateway's own handlers and say nothing about another
+        process. The CLI writes ``mcp_gateway.enabled`` through the same file, so
+        reading the sharing state outside the lock would let it change before the
+        write -- and stub-only servers land in a pool that is now shared. The
+        eligibility rule reads that state INSIDE this hold, which is what makes the
+        decision and the write see one config.
+
+        ``update_config_locked`` holds an advisory ``flock`` for the whole
+        read-modify-write, and its own docstring names it the required path for new
+        config.json mutations. This asserts the batch actually uses it rather than
+        re-implementing the read-then-write it replaced; a regression to
+        ``write_config_atomically`` would reopen the window silently, since every
+        behavioural test still passes with the lock removed.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+
+        seen: list[str] = []
+        real = loader.update_config_locked
+
+        def _recording_update(path=None, **kwargs):  # type: ignore[no-untyped-def]
+            seen.append("locked")
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(loader, "update_config_locked", _recording_update)
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": False})
+        )
+        assert resp.status == 200
+        # Empty means the handler wrote config.json some other way, which is the
+        # regression: a direct ``write_config_atomically`` passes every behavioural
+        # test in this file while reopening the cross-process window.
+        assert seen == ["locked"]
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_request_still_waits_for_the_write_to_finish(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Cancellation must not unwind the locks while the worker is mid-write.
+
+        A worker thread cannot be cancelled. With a bare ``asyncio.to_thread`` the
+        ``CancelledError`` propagates immediately, both locks unwind, and the thread
+        keeps mutating config.json -- so an agent-CRUD save can interleave with a
+        write the caller already gave up on, which is exactly the interleaving those
+        locks exist to prevent.
+
+        The property asserted is ORDERING, not merely that the file was written:
+        the write lands either way, since nothing stops the thread. What
+        distinguishes the two is whether the write had FINISHED by the time
+        cancellation was observable.
+        """
+        import kiro_crew.config.loader as loader
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+
+        entered = threading.Event()
+        finished = threading.Event()
+        real = loader.update_config_locked
+
+        def _slow_update(path=None, **kwargs):  # type: ignore[no-untyped-def]
+            entered.set()
+            # Long enough that the cancellation below lands while this is running.
+            time.sleep(0.4)
+            try:
+                return real(path, **kwargs)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(loader, "update_config_locked", _slow_update)
+
+        task = asyncio.create_task(
+            mcp_mod.api_mcp_gateway_set_stub(_request({"names": ["a-mcp"], "stub": True}))
+        )
+        await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert finished.is_set(), (
+            "cancellation was observable before the offloaded write completed, so "
+            "both locks were released while the worker was still writing"
+        )
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_the_stub_write_also_holds_the_lock_agent_crud_writes_under(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The file lock excludes other PROCESSES; it does not exclude this one.
+
+        Agent CRUD saves config through ``cfg.save()`` ->
+        ``write_config_atomically``, which takes no advisory file lock and
+        serializes only on ``_get_config_lock``. So the two guards cover disjoint
+        sets of writers: holding only the file lock leaves an in-process agent
+        save free to interleave with this read-modify-write and silently drop one
+        of the two changes.
+
+        The offload is what makes this reachable -- ``await asyncio.to_thread``
+        yields the event loop mid-write. Asserting the lock is HELD while the
+        offloaded write runs is what a behavioural test cannot see: removing
+        ``_get_config_lock`` leaves every stub assertion in this file passing.
+        """
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.handlers.agents import _get_config_lock
+
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"mcp_gateway": {"enabled": True, "stub_servers": []}}))
+        monkeypatch.setattr(loader, "config_path", lambda: cfg_path)
+
+        held_during_write: list[bool] = []
+        real = loader.update_config_locked
+        # ``_get_config_lock`` calls ``asyncio.get_running_loop()``, so it can only
+        # be resolved here on the event loop -- the recorder below runs on a
+        # ``to_thread`` worker. ``Lock.locked()`` needs no loop, so capture the
+        # object now and only read its state from the thread.
+        lock = _get_config_lock()
+
+        def _checking_update(path=None, **kwargs):  # type: ignore[no-untyped-def]
+            held_during_write.append(lock.locked())
+            return real(path, **kwargs)
+
+        monkeypatch.setattr(loader, "update_config_locked", _checking_update)
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"names": ["a-mcp"], "stub": True, "resolve_eligibility": False})
+        )
+        assert resp.status == 200
+        assert held_during_write == [True], (
+            "the config lock agent CRUD writes under must be held across the "
+            "offloaded write, not merely taken somewhere in the handler"
+        )
+
+    @pytest.mark.asyncio
+    async def test_declared_env_blocks_pooling_only_while_sharing_is_on(
+        self, agents_dir: Path, routed_allowlist
+    ) -> None:
+        """The row has to say when stubbing could not produce a SHARED backend.
+
+        The rewriter leaves an env-declaring entry unwrapped rather than spawn a
+        pooled backend without a declared key, so a bulk action that stubbed it
+        would report work the broker then silently skips. With sharing OFF there
+        is no pooled spawn to withhold anything, so the same server is not
+        blocked — the flag describes the pooled path, not the server.
+        """
+        (agents_dir / "a.json").write_text(
+            json.dumps(
+                {
+                    "name": "alpha",
+                    "mcpServers": {
+                        "declares-env": {"command": "run", "env": {"HOME_DIR": "/x"}},
+                        "no-env": {"command": "run"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        routed_allowlist([], enabled=True)
+        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        assert rows["declares-env"]["pooling_blocked_by_env"] is True
+        assert rows["no-env"]["pooling_blocked_by_env"] is False
+
+        # Same config, sharing off: nothing is pooled, so nothing is withheld.
+        routed_allowlist([], enabled=False)
+        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        assert rows["declares-env"]["pooling_blocked_by_env"] is False
+
+        # Forwarding on: only the rotating-secret and credential classes are
+        # withheld, so an ordinary declared key stops blocking.
+        routed_allowlist([], enabled=True, forward_declared_env=True)
+        rows = {r["name"]: r for r in _payload(await mcp_mod.api_mcp_gateway_servers(_request()))["servers"]}
+        assert rows["declares-env"]["pooling_blocked_by_env"] is False
+
     @pytest.mark.asyncio
     async def test_missing_agents_dir_yields_no_rows(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, routed_allowlist
@@ -1523,7 +2041,13 @@ class TestGatewaySetStub:
     async def test_persists_allowlist_without_an_apply_callback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With the gateway unwired the allowlist is persisted, applied=False."""
+        """With the gateway unwired the allowlist is persisted AND reported pending.
+
+        The write happens before the callback is ever reached, so an unwired
+        gateway means the change was recorded -- the same state the callback
+        reports. Answering ``applied: false`` alone would drop the client onto its
+        fault branch and blame the gateway for a change that is safely saved.
+        """
         from kiro_crew.config.loader import config_path
 
         monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
@@ -1537,9 +2061,39 @@ class TestGatewaySetStub:
             "name": "ok-mcp",
             "stub": True,
             "applied": False,
+            "restart_required": True,
         }
         saved = json.loads(config_path().read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["ok-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["ok-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_an_unwired_batch_that_wrote_nothing_claims_no_restart(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The unwired answer must stay tied to something having been WRITTEN.
+
+        A server-resolved batch where no candidate qualified persists nothing, so
+        there is no pending change and nothing for a restart to pick up. Claiming
+        ``restart_required`` here would send the operator to restart the gateway
+        for a write that never happened.
+        """
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        monkeypatch.setattr(
+            mcp_mod,
+            "_collect_server_rows",
+            lambda *a, **k: {},
+        )
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request(
+                {"names": ["nope-mcp"], "stub": True, "resolve_eligibility": True},
+                state=SimpleNamespace(),
+            )
+        )
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body.get("applied") is False
+        assert "restart_required" not in body
+        assert body.get("stubbed") == []
 
     @pytest.mark.asyncio
     async def test_the_first_toggle_keeps_the_migrated_legacy_set(
@@ -1567,7 +2121,10 @@ class TestGatewaySetStub:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["x-mcp", "y-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["x-mcp", "y-mcp"]
+        # The migrated set is frozen into the roster, not merged with the click.
+        assert saved["mcp_gateway"]["stub_servers"] == ["x-mcp"]
+        assert saved["mcp_gateway"]["stub_overrides"] == {"y-mcp": True}
 
     @pytest.mark.asyncio
     async def test_a_disabled_legacy_config_is_not_seeded_by_the_write(
@@ -1589,7 +2146,9 @@ class TestGatewaySetStub:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["y-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["y-mcp"]
+        # The inert allowlist stays unrevived: the roster froze empty.
+        assert saved["mcp_gateway"]["stub_servers"] == []
 
     @pytest.mark.asyncio
     async def test_removal_dedupes_and_drops_non_string_entries(
@@ -1611,7 +2170,93 @@ class TestGatewaySetStub:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["b-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["b-mcp"]
+        # The write still normalizes the roster's FORM -- the duplicate and the
+        # non-string are gone -- while leaving its membership to the roster's owner.
+        # A surviving duplicate would make the dashboard's stub_count overcount.
+        assert saved["mcp_gateway"]["stub_servers"] == ["a-mcp", "b-mcp"]
+        assert saved["mcp_gateway"]["stub_overrides"] == {"a-mcp": False}
+
+    @pytest.mark.asyncio
+    async def test_toggling_back_to_agree_with_the_roster_drops_the_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Re-following the roster, not freezing its current value.
+
+        An override that agrees with the roster is identical in effect today and
+        differs tomorrow: stored, it would pin that server against the next roster
+        change. So an operator who toggles a server back to what the roster says is
+        asking to follow the roster again, and the entry must go.
+        """
+        from kiro_crew.config.loader import config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp"]}}), encoding="utf-8"
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": False}, state=SimpleNamespace())
+        )
+        assert resp.status == 200
+        saved = json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert saved["stub_overrides"] == {"a-mcp": False}
+        assert _effective_stubs(saved) == []
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": True}, state=SimpleNamespace())
+        )
+        assert resp.status == 200
+        saved = json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert "stub_overrides" not in saved, (
+            "the override survived a toggle back to the roster's own answer, so "
+            "this server is now pinned against any later roster change"
+        )
+        assert _effective_stubs(saved) == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_a_deviation_does_not_shadow_a_later_roster_addition(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end through the handler: the reason the two layers are separate.
+
+        The operator turns one shipped server off; the edition then ships another.
+        The new server must arrive, and the one they turned off must stay off.
+        """
+        from kiro_crew.config.loader import config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp", "b-mcp"]}}),
+            encoding="utf-8",
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "b-mcp", "stub": False}, state=SimpleNamespace())
+        )
+        assert resp.status == 200
+
+        # Checked BEFORE the release is simulated: overwriting the roster below
+        # would otherwise hide a handler that had already taken it over, and the
+        # claim being made here is precisely that the click did not.
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["mcp_gateway"]["stub_servers"] == ["a-mcp", "b-mcp"], (
+            "the click rewrote the roster, so the edition no longer owns it"
+        )
+        assert saved["mcp_gateway"]["stub_overrides"] == {"b-mcp": False}
+
+        # The edition's next release grows the roster. Nothing else is touched.
+        saved["mcp_gateway"]["stub_servers"] = ["a-mcp", "b-mcp", "c-mcp"]
+        path.write_text(json.dumps(saved), encoding="utf-8")
+
+        assert _effective_stubs(saved["mcp_gateway"]) == ["a-mcp", "c-mcp"], (
+            "the roster addition did not arrive, or the operator's opt-out was "
+            "overwritten -- the click took ownership of the roster"
+        )
 
     @pytest.mark.asyncio
     async def test_apply_result_is_merged_into_the_response(
@@ -1642,10 +2287,14 @@ class TestGatewaySetStub:
             _request({"name": "ok-mcp", "stub": True}, state=state)
         )
         assert resp.status == 500
-        assert "relink" in _payload(resp)["error"]
+        # Raw exception text stays server-side; client body is generic + coded.
+        body = _payload(resp)
+        assert "relink" not in body["error"]
+        assert body["error"] == "apply failed"
+        assert body["code"] == "mcp_apply_failed"
         # The config write happens BEFORE apply, so it survives the failure.
         saved = json.loads(config_path().read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["ok-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["ok-mcp"]
         outcomes = [c.kwargs.get("outcome") for c in sel.log_api_access.call_args_list]
         assert "error" in outcomes
 
@@ -1730,12 +2379,13 @@ class TestGatewaySetStubBatch:
             "names": ["b-mcp", "a-mcp", "a-mcp"],
             "stub": True,
             "applied": False,
+            "restart_required": True,
         }
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == [
+        assert _effective_stubs(saved["mcp_gateway"]) == [
+            "kept-mcp",
             "a-mcp",
             "b-mcp",
-            "kept-mcp",
         ]
 
     @pytest.mark.asyncio
@@ -1762,7 +2412,7 @@ class TestGatewaySetStubBatch:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["kept-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["kept-mcp"]
 
     @pytest.mark.asyncio
     async def test_re_applies_the_pool_once_for_the_whole_batch(
@@ -1798,6 +2448,7 @@ class TestGatewaySetStubBatch:
             "name": "ok-mcp",
             "stub": True,
             "applied": False,
+            "restart_required": True,
         }
         audited = [c.kwargs.get("resources") for c in sel.log_api_access.call_args_list]
         assert any("name=ok-mcp" in (r or "") for r in audited)
@@ -1830,3 +2481,374 @@ class TestSyncFileLock:
 
 
 # ── POST /api/mcp-gateway/apps-enable ───────────────────────────────────
+
+# ── GET/POST /api/mcp/measure ───────────────────────────────────────────
+
+
+class TestMeasureProgressPayload:
+    """The measurement readout's wire contract.
+
+    ``done`` and ``measured`` are separate fields because a pass can attempt a
+    server and produce no verdict: a pre-flight that could not run leaves the row
+    unmeasured on purpose. The dashboard advances its progress line on ``done``
+    and builds its closing claim from ``measured``, so collapsing them is what let
+    a pass that measured nothing report that it measured everything it tried.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_status_payload_carries_both_counts(self) -> None:
+        body = _payload(await mcp_mod.api_mcp_measure_progress(_request(method="GET")))
+        assert body["ok"] is True
+        # Named individually: a reader of this test should see that the two counts
+        # are both on the wire, which is the whole change.
+        assert "done" in body, body
+        assert "measured" in body, body
+        assert "total" in body, body
+
+    @pytest.mark.asyncio
+    async def test_starting_a_pass_clears_the_previous_pass_counts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stale ``measured`` would render as this pass's result.
+
+        The progress dict outlives the pass that wrote it, and the closing line is
+        built from ``measured``, so a new pass that has not measured anything yet
+        would inherit the previous pass's number and close on it.
+        """
+        # Stand in for a finished earlier pass. Restored by monkeypatch, so this
+        # cannot leak into another test through the module global.
+        monkeypatch.setitem(mcp_mod._measure_progress, "running", False)
+        monkeypatch.setitem(mcp_mod._measure_progress, "done", 7)
+        monkeypatch.setitem(mcp_mod._measure_progress, "measured", 7)
+        monkeypatch.setitem(mcp_mod._measure_progress, "total", 7)
+        monkeypatch.setitem(mcp_mod._measure_progress, "error", "RuntimeError")
+
+        # The pass itself spawns processes; this test is about the reset, so the
+        # background body is replaced rather than run.
+        started = asyncio.Event()
+
+        async def _noop() -> None:
+            started.set()
+
+        monkeypatch.setattr(mcp_mod, "_bg_measure_all", _noop)
+
+        state = _State()
+        body = _payload(
+            await mcp_mod.api_mcp_measure_start(_request(method="POST", state=state))
+        )
+        assert body["ok"] is True and body["running"] is True
+        assert body["measured"] == 0, body
+        assert body["done"] == 0, body
+        assert body["error"] == "", body
+
+        # Let the stubbed task run so it does not outlive the test.
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.gather(*state._background_tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_a_second_start_while_running_is_reported_not_queued(self) -> None:
+        """Refusing is what keeps a second press from doubling the spawn load."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def _running():
+            prior = dict(mcp_mod._measure_progress)
+            mcp_mod._measure_progress.update(running=True, done=1, measured=1, total=4)
+            try:
+                yield
+            finally:
+                mcp_mod._measure_progress.clear()
+                mcp_mod._measure_progress.update(prior)
+
+        with _running():
+            body = _payload(
+                await mcp_mod.api_mcp_measure_start(_request(method="POST"))
+            )
+        assert body["ok"] is False and body["running"] is True
+        # The in-flight pass's own numbers, not a reset: the operator pressing a
+        # second time is still watching the first pass.
+        assert (body["measured"], body["done"], body["total"]) == (1, 1, 4), body
+
+
+class TestStubEligibility:
+    """The eligibility rule, which lives on the server rather than in the browser.
+
+    A client can only answer for the moment it read the rows: sharing is a separate
+    switch another dashboard or the CLI can flip, and verdicts move as measurements
+    land. Resolving it inside the write's own lock hold is what makes the decision
+    and the write see one state, so these are the tests of the rule itself.
+    """
+
+    @staticmethod
+    def _spec(agents_dir: Path, servers: dict[str, dict]) -> None:
+        (agents_dir / "a.json").write_text(
+            json.dumps({"name": "alpha", "mcpServers": servers}), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _verdict(monkeypatch: pytest.MonkeyPatch, *, stub: bool, share: bool) -> None:
+        """Pin the verdict so these test the RULE, not the engine behind it."""
+        from kiro_crew.mcp_gateway.shareability import ShareVerdict, Strength
+
+        monkeypatch.setattr(
+            mcp_mod,
+            "_assess_server",
+            lambda name, **kw: ShareVerdict(
+                name=name,
+                strength=Strength.NO_OBJECTION,
+                recommend_stub=stub,
+                recommend_share=share,
+                reasons=(),
+            ),
+        )
+
+    def test_the_sharing_state_picks_which_flag_the_rule_reads(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same server, same verdict, two answers.
+
+        With sharing OFF a stub keeps the backend 1:1 with the session, so the
+        weakest useful verdict is enough. With sharing ON the identical write hands
+        that server co-tenants, which is what ``recommend_share`` means.
+        """
+        self._spec(agents_dir, {"a-mcp": {"command": "run"}})
+        self._verdict(monkeypatch, stub=True, share=False)
+
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=False, forward_declared_env=False
+        )
+        assert eligible == ["a-mcp"]
+        assert skipped == []
+
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=True, forward_declared_env=False
+        )
+        assert eligible == []
+        assert skipped == [{"name": "a-mcp", "reason": "evidence_insufficient"}]
+
+    def test_a_server_claiming_isolation_is_allowed_to_co_tenant(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._spec(agents_dir, {"a-mcp": {"command": "run"}})
+        self._verdict(monkeypatch, stub=True, share=True)
+        eligible, _ = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=True, forward_declared_env=False
+        )
+        assert eligible == ["a-mcp"]
+
+    def test_declared_env_a_shared_backend_would_withhold_skips_the_server(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rewriter leaves that entry unwrapped, so stubbing produces no pool.
+
+        Counting it would report work the broker never does. With sharing OFF there
+        is no pooled spawn to withhold anything, so the same server qualifies.
+        """
+        self._spec(agents_dir, {"a-mcp": {"command": "run", "env": {"HOME_DIR": "/x"}}})
+        self._verdict(monkeypatch, stub=True, share=True)
+
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=True, forward_declared_env=False
+        )
+        assert eligible == []
+        assert skipped == [{"name": "a-mcp", "reason": "pooling_blocked_by_env"}]
+
+        eligible, _ = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=False, forward_declared_env=False
+        )
+        assert eligible == ["a-mcp"]
+
+    def test_a_server_with_no_stdio_pipe_is_never_eligible(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._spec(agents_dir, {"http-mcp": {"url": "https://example.test"}})
+        self._verdict(monkeypatch, stub=True, share=True)
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["http-mcp"], sharing_on=False, forward_declared_env=False
+        )
+        assert eligible == []
+        assert skipped == [{"name": "http-mcp", "reason": "cannot_stub"}]
+
+    def test_a_denylisted_server_is_never_eligible(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``UNPOOLABLE_SERVERS`` is empty today, so the branch is patched in.
+
+        Testing it against the live set would pass by vacuum: an empty denylist
+        makes the assertion unfalsifiable, and the day a name is added is exactly
+        when this needs to already work.
+        """
+        import kiro_crew.mcp_gateway.rewriter as rewriter_mod
+
+        monkeypatch.setattr(rewriter_mod, "UNPOOLABLE_SERVERS", frozenset({"walled-mcp"}))
+        self._spec(agents_dir, {"walled-mcp": {"command": "run"}})
+        self._verdict(monkeypatch, stub=True, share=True)
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["walled-mcp"], sharing_on=False, forward_declared_env=False
+        )
+        assert eligible == []
+        assert skipped == [{"name": "walled-mcp", "reason": "cannot_stub"}]
+
+    def test_a_measurement_of_a_replaced_command_does_not_count(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Cache rows are keyed by NAME, so a replaced command keeps the old row.
+
+        That is tolerable for a rendered row, which only shows a stale verdict
+        until the next probe. It is not tolerable for an automatic write: stubbing
+        on it pools a program nobody measured, and with sharing on that hands one
+        session's state to another. The eligibility read therefore goes through
+        ``VerdictCache.get`` with the CURRENT identity, where a mismatch reads as
+        no measurement.
+        """
+        from kiro_crew.mcp_gateway.evaluate import identity_for
+        from kiro_crew.mcp_gateway.verdict_cache import CachedPreflight, load_cache
+
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        monkeypatch.setattr(mcp_mod, "records_dir", lambda _socket: runtime)
+
+        # Measure the server as it stands, storing a clean row under its identity.
+        self._spec(agents_dir, {"a-mcp": {"command": "orig-server"}})
+        measured = SimpleNamespace(command="orig-server", args=[], env={})
+        cache = load_cache(runtime)
+        cache.put(
+            "a-mcp",
+            identity_for(measured),
+            CachedPreflight(ran=True, caller_sensitive=False, reasons=(), evaluated_at=0.0),
+        )
+        cache.flush()
+
+        # First leg: with the command unchanged the measurement is honoured, so
+        # the assertion below is about identity rather than about an empty cache.
+        self._verdict(monkeypatch, stub=True, share=True)
+        eligible, _ = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=True, forward_declared_env=False
+        )
+        assert eligible == ["a-mcp"]
+
+        # Same name, different program. The stored row still exists and
+        # ``get_by_name`` would return it; the identity-checked read must not.
+        self._spec(agents_dir, {"a-mcp": {"command": "replaced-server"}})
+        monkeypatch.setattr(
+            mcp_mod,
+            "_assess_server",
+            lambda name, **kw: SimpleNamespace(
+                recommend_stub=kw["preflight"] is not None,
+                recommend_share=kw["preflight"] is not None,
+            ),
+        )
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=True, forward_declared_env=False
+        )
+        assert eligible == []
+        assert skipped == [{"name": "a-mcp", "reason": "evidence_insufficient"}]
+
+    def test_a_recorded_hazard_survives_an_identity_change(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Hazards are read name-wide, and that asymmetry is deliberate.
+
+        A preflight can promote a server, so it must belong to the program being
+        written about. A hazard only ever demotes, so filtering it by the current
+        identity would DISCARD a recorded objection -- the permissive direction --
+        every time a command changed. The cautious read is the wider one.
+        """
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        monkeypatch.setattr(mcp_mod, "records_dir", lambda _socket: runtime)
+        self._spec(agents_dir, {"a-mcp": {"command": "run"}})
+
+        seen: dict[str, tuple[str, ...]] = {}
+
+        def _capture(name, **kw):  # type: ignore[no-untyped-def]
+            seen[name] = kw["observed_hazards"]
+            return SimpleNamespace(recommend_stub=False, recommend_share=False)
+
+        monkeypatch.setattr(
+            mcp_mod, "_assess_server", _capture
+        )
+        monkeypatch.setattr(
+            mcp_mod.hazards,
+            "load_ledger",
+            lambda _rt: SimpleNamespace(as_dict=lambda: {"a-mcp": ("caller_state_leak",)}),
+        )
+
+        mcp_mod._stub_eligibility(["a-mcp"], sharing_on=True, forward_declared_env=False)
+        assert seen["a-mcp"] == ("caller_state_leak",)
+
+    def test_two_agents_declaring_one_name_differently_have_no_usable_measurement(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Definitions that differ only in env are different programs to the pool.
+
+        ``PoolKey`` includes the effective env, so these two declarations never
+        share a backend with each other -- but the write is per NAME and covers
+        both. A measurement of one is therefore not evidence for the other, and
+        accepting it would pool a program nobody probed.
+
+        The command and args are byte-identical here on purpose: that is the case a
+        command+args launch hash cannot see, so this fails if eligibility consults
+        that proxy instead of the full identity.
+        """
+        from kiro_crew.mcp_gateway.evaluate import identity_for
+        from kiro_crew.mcp_gateway.verdict_cache import CachedPreflight, load_cache
+
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        monkeypatch.setattr(mcp_mod, "records_dir", lambda _socket: runtime)
+
+        (agents_dir / "a.json").write_text(
+            json.dumps(
+                {"name": "alpha", "mcpServers": {"a-mcp": {"command": "run", "env": {"K": "1"}}}}
+            ),
+            encoding="utf-8",
+        )
+        (agents_dir / "b.json").write_text(
+            json.dumps(
+                {"name": "beta", "mcpServers": {"a-mcp": {"command": "run", "env": {"K": "2"}}}}
+            ),
+            encoding="utf-8",
+        )
+
+        # A clean measurement exists for the FIRST declaration.
+        cache = load_cache(runtime)
+        cache.put(
+            "a-mcp",
+            identity_for(SimpleNamespace(command="run", args=[], env={"K": "1"})),
+            CachedPreflight(ran=True, caller_sensitive=False, reasons=(), evaluated_at=0.0),
+        )
+        cache.flush()
+
+        monkeypatch.setattr(
+            mcp_mod,
+            "_assess_server",
+            lambda name, **kw: SimpleNamespace(
+                recommend_stub=kw["preflight"] is not None,
+                recommend_share=kw["preflight"] is not None,
+            ),
+        )
+        # ``forward_declared_env`` on, so a plainly-named declared key is forwarded
+        # rather than withheld. Without it the env-withheld branch answers first
+        # and this would pass without exercising identity at all.
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["a-mcp"], sharing_on=True, forward_declared_env=True
+        )
+        assert eligible == []
+        assert skipped == [{"name": "a-mcp", "reason": "evidence_insufficient"}]
+
+    def test_a_name_no_agent_declares_is_reported_rather_than_written(
+        self, agents_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stale client can name a server that has since been removed.
+
+        Writing it would put a name in ``stub_servers`` that nothing can ever spawn,
+        so it is skipped and named instead.
+        """
+        self._spec(agents_dir, {"a-mcp": {"command": "run"}})
+        self._verdict(monkeypatch, stub=True, share=True)
+        eligible, skipped = mcp_mod._stub_eligibility(
+            ["ghost-mcp"], sharing_on=False, forward_declared_env=False
+        )
+        assert eligible == []
+        assert skipped == [{"name": "ghost-mcp", "reason": "unknown"}]

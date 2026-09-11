@@ -23,6 +23,7 @@ import { useRecentsProvider } from './commandPalette/providers/recentsProvider'
 import { useSettingsProvider } from './commandPalette/providers/settingsProvider'
 import { useAppsProvider } from './commandPalette/providers/appsProvider'
 import { Highlighted } from './commandPalette/Highlighted'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 import { useVisualViewport } from '../hooks/useVisualViewport'
@@ -61,7 +62,9 @@ import { useVisualViewport } from '../hooks/useVisualViewport'
  * shared hook, this component registers a *window*-phase capture listener:
  * window-capture fires before document-capture, so it can
  * `stopImmediatePropagation()` those two keys before the hook's document-level
- * listener sees them.
+ * listener sees them. Because that ordering also bypasses the hook's IME
+ * guard, both intercepted branches consult the hook's shared latch (its
+ * returned `claimKey`) before acting, declining keys the IME owns.
  *
  * Highlighting renders matched indices as React `<strong>` nodes split out of
  * the title — never `dangerouslySetInnerHTML` (`frontend-security` lint rule).
@@ -312,6 +315,7 @@ export default function CommandPalette({
           default: {
             // Exhaustiveness guard — every EnterAction kind must have a branch.
             const _exhaustive: never = action
+            // eslint-disable-next-line no-console -- unreachable while `EnterAction` is exhaustively handled; it only fires when a kind is ADDED without a branch, and the compile-time `never` above cannot report that at runtime. Silence would make Enter do nothing with no trace.
             console.warn('[CommandPalette] dispatchEnter: unhandled enter action', _exhaustive)
           }
         }
@@ -398,7 +402,7 @@ export default function CommandPalette({
     [dispatchEnter],
   )
 
-  const { selected, setSelected, selectedRef, itemRefs } = useListKeyboardNav({
+  const { selected, setSelected, selectedRef, itemRefs, claimKey } = useListKeyboardNav({
     open,
     count: results.length,
     wrap: true,
@@ -423,10 +427,21 @@ export default function CommandPalette({
   // way the palette needs: Tab (cycle category) and ⌥/Alt+Enter (preview).
   // window-capture runs before the hook's document-capture listener, so
   // stopImmediatePropagation here keeps the hook from also acting on them.
+  // Outranking the hook also outranks its IME guard, so each choose-class
+  // branch consults the hook's own latch first via `claimKey`: a Tab the IME
+  // owns (candidate-list navigation, or the committing keydown inside the
+  // post-composition window) must not adopt the scope hint and wipe the
+  // half-composed query. A declined key is already consumed per `claimKey`'s
+  // contract — stopPropagation keeps it from the hook's document listener,
+  // and preventDefault fires only where the browser would otherwise act.
+  // Backspace is not a choose-class key (the IME consumes its own Backspace
+  // mid-composition, and the composing text keeps `queryRef` non-empty, so
+  // the branch stays inert), and needs no guard.
   useEffect(() => {
     if (!open) return
     const onWinKey = (e: KeyboardEvent) => {
       if (e.key === 'Tab') {
+        if (!claimKey(e)) return
         e.preventDefault()
         e.stopImmediatePropagation()
         // Prefix + Tab adopts the hinted scope (clearing the query); Shift+Tab
@@ -443,6 +458,7 @@ export default function CommandPalette({
         e.stopImmediatePropagation()
         setScope(null)
       } else if (e.key === 'Enter' && e.altKey && !e.metaKey && !e.ctrlKey) {
+        if (!claimKey(e)) return
         e.preventDefault()
         e.stopImmediatePropagation()
         const r = resultsRef.current
@@ -453,7 +469,7 @@ export default function CommandPalette({
     }
     window.addEventListener('keydown', onWinKey, true)
     return () => window.removeEventListener('keydown', onWinKey, true)
-  }, [open, selectedRef])
+  }, [open, selectedRef, claimKey])
 
   if (!open) return null
 
@@ -467,7 +483,13 @@ export default function CommandPalette({
     // tab (or the recents quick-switcher), leaving the All tab's swallow
     // untouched.
     <div className="px-3 py-6 text-center text-[12px] flex flex-col items-center gap-2">
-      <span className="text-muted">{i18nT('components.commandPalette.search_failed')}</span>
+      {/* The palette holds only a transient search string, so the hand-off loses nothing. */}
+      <ErrorNotice
+        variant="inline"
+        askAgent
+        testId="command-palette-search-error"
+        message={i18nT('components.commandPalette.search_failed')}
+      />
       <button
         type="button"
         onClick={() => { void refetch() }}
@@ -512,6 +534,10 @@ export default function CommandPalette({
   )
 
   return createPortal(
+    // The backdrop's onMouseDown is click-outside dismissal, a pointer-only
+    // convenience: Escape closes the palette through useListKeyboardNav, so the
+    // keyboard already has the same exit and needs no path to this element.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- backdrop dismissal on the dialog shell, with Escape as the keyboard equivalent
     <div
       // Pinned to the VISUAL viewport, not `inset-0`. A keyboard shrinks the visual
       // viewport on every browser; only Chromium also shrinks the layout one (via
@@ -526,6 +552,10 @@ export default function CommandPalette({
       aria-label={i18nT('components.commandPalette.search_everywhere')}
       onMouseDown={onClose}
     >
+      {/* Containment only: the panel's onMouseDown performs no action, it just
+          keeps a press inside the panel from reaching the backdrop's dismiss.
+          Every control in here is a real input or button. */}
+      {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- stopPropagation barrier, not an activatable control; there is no behaviour for a keyboard to be given */}
       <div
         className="w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col"
         // Both numbers come from the VISUAL viewport in px, not a percentage

@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 import weakref
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -41,8 +42,9 @@ from kiro_crew.config.paths import data_home
 from kiro_crew.dashboard.chat_utils import (
     slot_history_key,
 )
-from kiro_crew.history import on_loop_persist_strict
 from kiro_crew.knowledge.llm_pool import LLMPool
+from kiro_crew.llm_helpers import _extract_json_of_type
+from kiro_crew.on_loop_db import OnLoopDBGuard
 from kiro_crew.platform_compat import is_link_or_junction, unlink_link_or_junction
 
 try:
@@ -201,48 +203,24 @@ def _safe_campaign_dir(campaign_id: str) -> Path | None:
 # --- Database ---
 
 
-class OnLoopDBError(RuntimeError):
-    """A campaigns-DB connection was opened on the event loop under strict mode."""
-
-
-_ON_LOOP_DB_WARN_INTERVAL_S = 60.0
-_on_loop_db_warn_last = 0.0
-
-
-def _check_on_loop_db_discipline() -> None:
-    """Enforce (strict) or diagnose (production) an on-loop ``_get_db`` entry.
-
-    Called at the top of :func:`_get_db`. No running event loop means the
-    caller is already off-loop (worker thread / executor / CLI) — the common,
-    correct case — and this is a no-op.
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return  # off-loop: the sanctioned path — nothing to flag
-    if on_loop_persist_strict():
-        raise OnLoopDBError(
-            "auto_research campaigns DB opened on the event loop; the 30s "
-            "busy timeout means one lock wait can stall the loop past the "
-            "watchdog budget and kill the gateway. Offload the DB section "
-            "(asyncio.to_thread / run_in_executor) like the surrounding "
-            "handlers do."
-        )
-    global _on_loop_db_warn_last
-    now = time.monotonic()
-    if now - _on_loop_db_warn_last >= _ON_LOOP_DB_WARN_INTERVAL_S:
-        _on_loop_db_warn_last = now
-        logger.warning(
-            "auto_research: _get_db() ran ON the event loop without "
-            "offloading; a contended write here blocks every task (including "
-            "the watchdog heartbeat) for up to 30s. Route it through "
-            "asyncio.to_thread / run_in_executor.",
-            stack_info=True,
-        )
+# The campaigns DB carries a 30s busy timeout, so one on-loop lock wait can
+# outlast the 25s loop-stall watchdog budget and kill the gateway. #7039
+# offloaded all six call sites and added this guard; it now uses the shared
+# implementation in ``kiro_crew.on_loop_db``. Defaults are deliberate: this
+# surface IS fully offloaded, so it stays on the shared
+# ``KIROCREW_STRICT_ON_LOOP_PERSIST`` switch (which the e2e harness exports) and
+# keeps the dev-mode arm, where a raise means genuinely new drift.
+_ON_LOOP_DB_GUARD = OnLoopDBGuard(
+    label="auto_research campaigns DB",
+    remedy=(
+        "Offload the DB section (asyncio.to_thread / run_in_executor) like the "
+        "surrounding handlers do."
+    ),
+)
 
 
 def _get_db() -> sqlite3.Connection:
-    _check_on_loop_db_discipline()
+    _ON_LOOP_DB_GUARD.check()
     dbp = db_path()
     dbp.parent.mkdir(parents=True, exist_ok=True)
     # Explicit 30s busy timeout (vs the 5s driver default). The research worker
@@ -441,7 +419,7 @@ def _campaign_model(config: dict) -> str:
 
     Availability is NOT screened here: no advertised-model list exists outside a
     live session. If the pick stops being served, the session layer's withhold
-    (``_pinned_model_withheld`` in chat_runner) KEEPS the pin, runs the worker on
+    (``_pinned_model_verdict`` in chat_runner) KEEPS the pin, runs the worker on
     the backend default, and posts a notice card — but that card lands in the
     app-owned ``research-<cid>`` transcript, which the Research Lab page does not
     render, so the fallback is not visible on this app's own surfaces.
@@ -477,7 +455,8 @@ def validate_campaign(config: dict) -> dict:
         and config.get("execution_mode", DEFAULT_EXECUTION_MODE) == "workflow"
     ):
         # The workflow engine resolves its own models per step; a campaign-level
-        # pin would be silently ignored, which the AGENTS.md contract forbids.
+        # pin would be silently ignored, which
+        # docs/system-specs/common/model-selection.md forbids.
         errors.append(
             "Model selection requires agent mode — workflow mode runs on the default model"
         )
@@ -581,9 +560,13 @@ def check_stagnation(campaign_id: str) -> bool:
         return False
     for f in files[-5:]:
         try:
-            if json.loads(f.read_text()).get("new_findings_count", 0) > 0:
+            # LLM-written cycle file: pin UTF-8 (Windows would otherwise decode
+            # with the ANSI code page) and absorb bad bytes, because a decode
+            # error here would abort the whole watchdog sweep.
+            raw = f.read_text(encoding="utf-8", errors="replace")
+            if json.loads(raw).get("new_findings_count", 0) > 0:
                 return False
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return False
     return True
 
@@ -599,6 +582,92 @@ def _campaign_dir(campaign_id: str) -> Path:
     return d
 
 
+def _read_text_or_missing(path: Path) -> str | None:
+    """Read *path*, or return ``None`` when it does not exist.
+
+    Blocking; call through ``asyncio.to_thread``. The existence check rides
+    with the read so the pair costs one worker hop and a file removed between
+    them reads as missing rather than raising. Any OTHER ``OSError`` still
+    propagates, so an unreadable file keeps its 500 rather than being
+    downgraded to "no findings yet".
+
+    UTF-8 is pinned because the file is agent-written prose (FINDINGS.md): on
+    Windows the default locale encoding is the ANSI code page, so an em dash or
+    a CJK character would raise. ``errors="replace"`` keeps a partially
+    corrupt report readable instead of turning an export into a 500.
+    """
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+
+
+def _read_json_or_missing(path: Path) -> Any:
+    """Parse a JSON file, or return ``None`` when it is missing or unusable.
+
+    Blocking; call through ``asyncio.to_thread``. Both callers already treated
+    a corrupt file as "no data", so the parse error is folded in here.
+    """
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_text(path: Path, text: str) -> None:
+    """Write *text* to *path*. Blocking; call off-loop.
+
+    Deliberately does NOT create missing parents: both callers wrote into an
+    existing campaign directory before the off-loop move, so a concurrent
+    campaign deletion must keep winning (recreating the directory here would
+    resurrect a deleted campaign's data).
+
+    UTF-8 is pinned: the payload is LLM prose (FINDINGS.md,
+    findings_for_knowledge.md), so the Windows ANSI code page would raise
+    UnicodeEncodeError on the first em dash or CJK character and no report
+    would ever be produced.
+    """
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_new_cycle_files(pending: list[tuple[Path, str]]) -> bool:
+    """Write each cycle file that does not exist yet. Blocking; call off-loop.
+
+    The "already written by an earlier poll" check stays with the write it
+    guards, so idempotence costs no per-cycle stat on the event loop. Returns
+    whether anything was written.
+    """
+    wrote = False
+    for fpath, text in pending:
+        if fpath.exists():
+            continue
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(text, encoding="utf-8")
+        wrote = True
+    return wrote
+
+
+def _copy_parent_findings(src: Path, dst: Path) -> None:
+    """Seed a forked campaign with its parent's findings. Blocking; call off-loop."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Agent-written prose on both ends: pin UTF-8 so a fork does not lose the
+        # parent's context to a locale-encoding error, and absorb bad bytes.
+        content = src.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return
+    dst.write_text(content, encoding="utf-8")
+
+
+def _unlink_if_present(path: Path) -> bool:
+    """Remove *path*, reporting whether it was there. Blocking; call off-loop."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def _questions_path(campaign_id: str) -> Path | None:
     """Path to the agent's pending clarification question (if any)."""
     d = _safe_campaign_dir(campaign_id)
@@ -611,8 +680,12 @@ def _pending_question(campaign_id: str) -> str | None:
     if not p or not p.exists():
         return None
     try:
-        return str(json.loads(p.read_text()).get("question", "")) or None
-    except (json.JSONDecodeError, OSError):
+        # The agent authors questions.json and its clarification text is very
+        # often non-ASCII, so UTF-8 must be explicit: a locale-encoding failure
+        # here 500s get_campaign and strands the campaign in NEEDS_INPUT.
+        raw = p.read_text(encoding="utf-8", errors="replace")
+        return str(json.loads(raw).get("question", "")) or None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
 
 
@@ -624,7 +697,8 @@ def write_status(campaign_id: str, status: str, **extra: Any) -> None:
         json.dumps(
             {"status": status, "campaign_id": campaign_id, "ts": time.time(), **extra},
             indent=2,
-        )
+        ),
+        encoding="utf-8",
     )
 
 
@@ -632,7 +706,8 @@ def write_guidance(campaign_id: str, text: str) -> None:
     if not _validate_campaign_id(campaign_id):
         return
     d = _campaign_dir(campaign_id)
-    (d / "guidance.txt").write_text(text)
+    # User-typed mid-campaign guidance — non-ASCII is the norm, not the edge case.
+    (d / "guidance.txt").write_text(text, encoding="utf-8")
 
 
 def get_findings(campaign_id: str) -> list[dict]:
@@ -645,8 +720,9 @@ def get_findings(campaign_id: str) -> list[dict]:
     results = []
     for f in _cycle_finding_files(findings_dir):
         try:
-            results.append(_redact_finding(json.loads(f.read_text())))
-        except (json.JSONDecodeError, OSError):
+            raw = f.read_text(encoding="utf-8", errors="replace")
+            results.append(_redact_finding(json.loads(raw)))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             continue
     return results
 
@@ -673,9 +749,16 @@ def _read_finding_file(path: Path) -> dict:
     dict (`.items()`), so a non-object payload must be rejected here — letting
     it raise would abort the watchdog iteration mid-cycle (e.g. the stall
     verdict would never settle the campaign, leaving it RUNNING forever).
+
+    UTF-8 is pinned but bad bytes are NOT replaced, deliberately: this reader
+    feeds the stall verdict, so a genuinely corrupt file must keep reading as
+    absent ({}) rather than as mojibake. Before the explicit encoding a
+    perfectly valid UTF-8 finding hit that same {} branch on a Windows ANSI
+    console, so the watchdog saw zero new findings and failed a healthy
+    campaign as stalled.
     """
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return {}
     if not isinstance(data, dict):
@@ -756,7 +839,9 @@ def create_campaign(config: dict) -> dict:
     if grill_tree and isinstance(grill_tree, list):
         d = _campaign_dir(campaign_id)
         d.mkdir(parents=True, exist_ok=True)
-        d.joinpath("grill_tree.json").write_text(json.dumps(grill_tree, indent=2))
+        d.joinpath("grill_tree.json").write_text(
+            json.dumps(grill_tree, indent=2), encoding="utf-8"
+        )
     write_status(campaign_id, CampaignStatus.READY)
     _audit("campaign_created", campaign_id)
     return {"id": campaign_id, "name": name, "status": CampaignStatus.READY}
@@ -842,9 +927,36 @@ def list_campaigns() -> list[dict]:
 
 
 def delete_campaign(campaign_id: str) -> dict:
-    """Delete a campaign's DB row and its research dir (findings + report)."""
+    """Delete a campaign's research dir (findings + report), then its DB row.
+
+    Directory cleanup runs BEFORE the DB delete, and the row is kept when
+    cleanup fails, so a caller who retries the same id gets a real retry of
+    the cleanup instead of ``{"error": "campaign not found"}`` against an
+    already-vanished row. Windows refuses to unlink a file another process
+    still holds open (POSIX allows it), so a live worker session's handle on
+    a findings file can make this tree removal fail HALFWAY; the previous
+    ``ignore_errors=True`` swallowed that and deleted the row anyway, leaving
+    orphaned findings with no id left to retry them under.
+    """
     if not _validate_campaign_id(campaign_id):
         return {"error": "invalid campaign_id"}
+    d = _safe_campaign_dir(campaign_id)
+    if d and d.exists():
+        failures: list[str] = []
+
+        def _on_error(_func: Any, path: Any, _exc: BaseException) -> None:
+            failures.append(str(path))
+
+        shutil.rmtree(d, onexc=_on_error)
+        if failures:
+            logger.warning(
+                "auto_research: campaign %s directory cleanup left %d path(s) "
+                "behind (a process may still hold them open); the database row "
+                "is kept so retrying this delete will try cleanup again",
+                campaign_id,
+                len(failures),
+            )
+            return {"error": "cleanup incomplete", "residual": True}
     db = _get_db()
     db.execute("BEGIN")
     rows = db.execute("DELETE FROM campaigns WHERE id = ?", (campaign_id,)).rowcount
@@ -852,10 +964,7 @@ def delete_campaign(campaign_id: str) -> dict:
     db.close()
     if rows == 0:
         return {"error": "campaign not found"}
-    d = _safe_campaign_dir(campaign_id)
-    if d and d.exists():
-        shutil.rmtree(d, ignore_errors=True)
-    return {"id": campaign_id, "deleted": True}
+    return {"id": campaign_id, "deleted": True, "residual": False}
 
 
 # --- Watchdog ---
@@ -877,6 +986,45 @@ def _campaign_transition_lock(campaign_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         locks[campaign_id] = lock
     return lock
+
+
+async def _settle_before_cancellation(
+    task: "asyncio.Task[Any]",
+    *,
+    on_settled: "Callable[[asyncio.Task[Any]], None] | None" = None,
+) -> Any:
+    """Await *task* and guarantee it SETTLES before cancellation propagates
+    out of this coroutine.
+
+    ``asyncio.to_thread`` keeps running after its awaiting task is cancelled,
+    so a caller holding the campaign transition lock would release it while
+    the filesystem mutation is still in flight — letting a lock-serialized
+    DELETE interleave and have its directory resurrected by the worker's
+    ``mkdir``. Mirrors the shield-and-settle discipline of the terminal
+    settlement in the watchdog path.
+
+    When *on_settled* is provided, it is invoked with the now-settled *task*
+    on the cancellation path only — after the settle loop and before the
+    original cancellation is re-raised — so a caller can retrieve and report
+    the worker outcome without letting it replace the shutdown cancellation.
+    When it is None the helper just re-raises the cancellation as before.
+    """
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Repeated shutdown cancellation must not cancel the worker
+                # wait; the thread finishes regardless, so keep settling.
+                continue
+            except Exception:
+                # The worker failed; the cancellation below still wins.
+                break
+        if on_settled is not None:
+            on_settled(task)
+        raise cancelled
 
 
 def _guarded_txn(
@@ -995,7 +1143,8 @@ async def _expire_trust(cid: str, observed_started_at: float | None) -> None:
                             "question": "Auto-approval expired after 24h. Resume to "
                             "re-authorize and continue."
                         }
-                    )
+                    ),
+                    encoding="utf-8",
                 )
             except OSError:
                 logger.warning(
@@ -1377,26 +1526,11 @@ async def _settle_campaign_from_watchdog(
             await _remove_terminating_loop()
             _emit_sse({"type": status.value, "campaign_id": campaign_id})
 
-    settlement = asyncio.create_task(_settle())
-    try:
-        await asyncio.shield(settlement)
-    except asyncio.CancelledError as cancelled:
-        # Status persistence and loop removal are one terminal transition. A
-        # shutdown cancellation after SQLite commits must not leave an active
-        # persisted loop that start() can re-arm for a terminal campaign.
-        while not settlement.done():
-            try:
-                await asyncio.shield(settlement)
-            except asyncio.CancelledError:
-                # Repeated shutdown cancellation must not cancel the cleanup
-                # task or let the watchdog resume its polling loop.
-                continue
-            except Exception:
-                # Retrieve and report the worker failure below without letting
-                # it replace the watchdog's shutdown cancellation.
-                break
+    def _report_terminal_settlement(settled: "asyncio.Task[Any]") -> None:
+        # Retrieve and report the worker failure without letting it replace the
+        # watchdog's shutdown cancellation.
         try:
-            settlement.result()
+            settled.result()
         except asyncio.CancelledError:
             logger.error("auto_research terminal settlement was cancelled")
         except Exception:
@@ -1404,7 +1538,13 @@ async def _settle_campaign_from_watchdog(
             # campaign remains non-terminal and its active loop can retry after
             # restart instead of leaving shutdown stuck in the watchdog loop.
             logger.exception("auto_research terminal settlement failed during shutdown")
-        raise cancelled
+
+    # Status persistence and loop removal are one terminal transition. A
+    # shutdown cancellation after SQLite commits must not leave an active
+    # persisted loop that start() can re-arm for a terminal campaign, so settle
+    # the cleanup task before the cancellation propagates.
+    settlement = asyncio.create_task(_settle())
+    await _settle_before_cancellation(settlement, on_settled=_report_terminal_settlement)
 
 
 async def _watchdog_loop(app: web.Application | None = None) -> None:
@@ -1691,7 +1831,7 @@ async def _launch_loop(request: web.Request, cid: str, *, prepared: bool = False
     # Pin the campaign's explicit model pick on the worker slot ('' = inherit
     # the research agent's / backend's default resolution — never a hardcoded
     # id here). If a concrete pick is not served for this account, the session
-    # layer's withhold (_pinned_model_withheld) KEEPS the pin and runs the
+    # layer's withhold (_pinned_model_verdict) KEEPS the pin and runs the
     # worker on the backend default — the notice it posts lands in the hidden
     # research-<cid> transcript, not on the Research Lab page.
     campaign_model = row["model"] or ""
@@ -1756,6 +1896,7 @@ async def _launch_loop(request: web.Request, cid: str, *, prepared: bool = False
         idle_secs=int(row["idle_secs"] or DEFAULT_IDLE_SECS),
         max_cycles=int(row["max_cycles"] or 0),
         stop_sentinel_path=str(_campaign_dir(cid) / "STOP"),
+        admission_check=lambda: state.get_slot(slot.key) is slot,
     )
 
 
@@ -1889,7 +2030,7 @@ def _write_brief(cid: str, row: Any) -> None:
             "Wait for all completion events, then synthesize results into your cycle finding. "
             f"If fewer than {pw} sub-questions remain open, spawn only as many as needed.",
         ]
-    _campaign_dir(cid).joinpath("brief.md").write_text("\n".join(lines))
+    _campaign_dir(cid).joinpath("brief.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 # --- RL v2: recursive exploration (emergent sub-questions) ---
@@ -1940,8 +2081,10 @@ def _ingest_emergent_questions(campaign_id: str) -> list[dict]:
         ef.unlink(missing_ok=True)  # not agent mode (or gone) — discard
         return []
     try:
-        raw = json.loads(ef.read_text())
-    except (json.JSONDecodeError, OSError):
+        # LLM-authored sub-question text — non-ASCII is expected, so UTF-8 is
+        # explicit and bad bytes are absorbed rather than aborting the sweep.
+        raw = json.loads(ef.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         raw = []
     ef.unlink(missing_ok=True)  # consumed regardless of validity
     if not isinstance(raw, list) or not raw:
@@ -2099,7 +2242,7 @@ def _enter_finalize(campaign_id: str) -> bool:
     flag = d / _FINALIZE_FLAG
     if flag.exists():
         return False  # already signaled — leave the guidance in place
-    flag.write_text(str(time.time()))
+    flag.write_text(str(time.time()), encoding="utf-8")
     write_guidance(
         campaign_id,
         "FINALIZE MODE — you are near the cycle budget. STOP opening new "
@@ -2165,7 +2308,8 @@ def _write_workflow_run_id(campaign_id: str, run_id: str) -> None:
     # old). Persisting the offset makes the resumed run append correctly.
     cycle_offset = len(_list_cycle_files(campaign_id))
     d.joinpath(_WORKFLOW_RUN_FILE).write_text(
-        json.dumps({"run_id": run_id, "ts": time.time(), "cycle_offset": cycle_offset})
+        json.dumps({"run_id": run_id, "ts": time.time(), "cycle_offset": cycle_offset}),
+        encoding="utf-8",
     )
 
 
@@ -2175,8 +2319,8 @@ def _read_workflow_cycle_offset(campaign_id: str) -> int:
     if not p or not p.exists():
         return 0
     try:
-        return int(json.loads(p.read_text()).get("cycle_offset", 0) or 0)
-    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        return int(json.loads(p.read_text(encoding="utf-8")).get("cycle_offset", 0) or 0)
+    except (OSError, ValueError, TypeError):
         return 0
 
 
@@ -2186,8 +2330,8 @@ def _read_workflow_run_id(campaign_id: str) -> str | None:
     if not p or not p.exists():
         return None
     try:
-        return str(json.loads(p.read_text()).get("run_id") or "") or None
-    except (json.JSONDecodeError, OSError):
+        return str(json.loads(p.read_text(encoding="utf-8")).get("run_id") or "") or None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None
 
 
@@ -2303,9 +2447,11 @@ async def _poll_workflow_campaign(
             # progress, mark it FAILED rather than let it sit zombie forever.
             d = _safe_campaign_dir(campaign_id)
             run_file = (d / _WORKFLOW_RUN_FILE) if d else None
-            if run_file and run_file.exists():
+            run_meta = (
+                await asyncio.to_thread(_read_json_or_missing, run_file) if run_file else None
+            )
+            if isinstance(run_meta, dict):
                 try:
-                    run_meta = json.loads(run_file.read_text())
                     started_ts = float(run_meta.get("ts", 0))
                     if started_ts and (time.time() - started_ts) > 3600:
                         await _guarded_transition(
@@ -2319,7 +2465,7 @@ async def _poll_workflow_campaign(
                             ),
                             error_message="Workflow run snapshot lost after 1h — run likely evicted or crashed.",
                         )
-                except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                except (OSError, ValueError, TypeError):
                     pass
             return
         # ALL snapshot processing runs under the campaign's transition lock:
@@ -2356,11 +2502,10 @@ async def _poll_workflow_campaign(
             # per-investigation progress, and total_cycles is a UI counter, not the
             # DW round count. The DW script's max_rounds caps exploration rounds;
             # per_round is already bounded by parallel_workers to limit fan-out).
+            pending: list[tuple[Path, str]] = []
             for i in range(len(investigate)):
                 cycle_no = cycle_offset + i + 1
                 fpath = d.joinpath("findings", "cycle_%03d.json" % cycle_no)
-                if fpath.exists():
-                    continue  # already written by an earlier poll (idempotent)
                 meta, fin = investigate[i]
                 label = str(meta.get("label", ""))
                 insight = label[len("investigate: ") :] if label.startswith("investigate: ") else label
@@ -2373,13 +2518,21 @@ async def _poll_workflow_campaign(
                     "new_findings_count": 1,
                     "evidence_strength": "moderate",
                 }
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                fpath.write_text(json.dumps(finding, indent=2))
-                wrote = True
-            if wrote:
-                count = len(_list_cycle_files(campaign_id))
+                pending.append((fpath, json.dumps(finding, indent=2)))
+            if pending:
 
-                def _persist_cycle_count() -> None:
+                def _write_and_persist_cycles() -> bool:
+                    """Write new cycle files AND persist the count in ONE worker.
+
+                    The bookkeeping rides in the same worker as the mutation so a
+                    task cancellation delivered at an await cannot land between
+                    them — the thread finishes both or neither, mirroring
+                    ``_txn_and_notify``'s commit-then-notify discipline. Blocking;
+                    call off-loop.
+                    """
+                    if not _write_new_cycle_files(pending):
+                        return False
+                    count = len(_list_cycle_files(campaign_id))
                     db = _get_db()
                     try:
                         db.execute("BEGIN")
@@ -2394,8 +2547,17 @@ async def _poll_workflow_campaign(
                         db.commit()
                     finally:
                         db.close()
+                    return True
 
-                await asyncio.to_thread(_persist_cycle_count)
+                # One worker hop for the whole batch, bookkeeping included.
+                # Settled before cancellation can release the transition lock
+                # (see _settle_before_cancellation).
+                wrote = bool(
+                    await _settle_before_cancellation(
+                        asyncio.create_task(asyncio.to_thread(_write_and_persist_cycles))
+                    )
+                )
+            if wrote:
                 _emit_sse(
                     {
                         "type": "new_finding",
@@ -2410,7 +2572,11 @@ async def _poll_workflow_campaign(
                 if not report:
                     fs = (result or {}).get("findings") or []
                     report = "\n\n".join(str(x) for x in fs) if isinstance(fs, list) else ""
-                d.joinpath("FINDINGS.md").write_text(_redact_llm(report) or "(no findings gathered)")
+                await asyncio.to_thread(
+                    _write_text,
+                    d.joinpath("FINDINGS.md"),
+                    _redact_llm(report) or "(no findings gathered)",
+                )
 
                 def _complete_and_notify() -> dict | None:
                     r = _guarded_txn(
@@ -2546,14 +2712,36 @@ def _compact_tree(tree: list[dict]) -> str:
     return "\n".join(lines) if lines else "(empty — this is the first round)"
 
 
+def _grill_node_shaped(value: object) -> bool:
+    """Prefer predicate: an array carrying at least one node-shaped record.
+
+    Disambiguates the payload from stray bracketed PROSE that also parses as
+    an array (a "see item [1]:" marker, a trailing "[12]." citation) — those
+    decode to arrays of scalars and are never preferred."""
+    return isinstance(value, list) and any(
+        isinstance(item, dict) and "kind" in item and "text" in item for item in value
+    )
+
+
 def _parse_grill_nodes(raw: str) -> list[dict]:
-    """Extract child node dicts {kind, text, recommended?} from an LLM reply."""
-    start, end = raw.find("["), raw.rfind("]")
-    if start < 0 or end <= start:
-        return []
+    """Extract child node dicts {kind, text, recommended?} from an LLM reply.
+
+    Extraction delegates to the shared ``llm_helpers._extract_json_of_type``
+    scanner, so a stray bracket in surrounding prose no longer corrupts the
+    span the way the old outermost ``find('[') .. rfind(']')`` slice did.
+    Returns [] on any parse failure, or when two DIFFERENT node-shaped arrays
+    make the choice ambiguous (the shared contract refuses to guess)."""
     try:
-        items = json.loads(raw[start : end + 1])
-    except (json.JSONDecodeError, ValueError):
+        items = _extract_json_of_type(raw, list, prefer=_grill_node_shaped)
+    except RecursionError:
+        # The stdlib decoder recurses per nesting level, so a nesting bomb in
+        # the untrusted reply overflows long before any structural bound. This
+        # parser's callers are outside any exception envelope (the grill-expand
+        # handler would surface it as HTTP 500), so degrade to no-nodes here.
+        # PR #5066 makes the shared scanner fail closed on this centrally;
+        # this guard becomes redundant-but-harmless once that lands.
+        return []
+    if not isinstance(items, list):
         return []
     out = []
     for it in items:
@@ -2684,13 +2872,19 @@ async def _handle_get(request: web.Request) -> web.Response:
 
 
 def _read_report(campaign_id: str) -> str:
-    """Read the agent's cumulative FINDINGS.md report (empty if none yet)."""
+    """Read the agent's cumulative FINDINGS.md report (empty if none yet).
+
+    UTF-8 with byte replacement: the report is LLM prose, and
+    ``UnicodeDecodeError`` is a ``ValueError`` — NOT an ``OSError`` — so before
+    this it escaped the handler and turned GET /campaigns/{id}/report into a 500
+    for any report containing a non-ASCII character.
+    """
     d = _safe_campaign_dir(campaign_id)
     if not d:
         return ""
     p = d / "FINDINGS.md"
     try:
-        return p.read_text() if p.exists() else ""
+        return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
     except OSError:
         return ""
 
@@ -2773,10 +2967,11 @@ async def _handle_action(request: web.Request) -> web.Response:
         fork_dir = _safe_campaign_dir(result["id"])
         if parent_dir is None or fork_dir is None:
             return web.json_response({"error": "Invalid campaign ID"}, status=400)
-        fork_dir.mkdir(parents=True, exist_ok=True)
-        parent_findings = parent_dir / "FINDINGS.md"
-        if parent_findings.exists():
-            (fork_dir / "parent_findings.md").write_text(parent_findings.read_text())
+        # One hop: the copy reads the parent's findings (unbounded LLM output)
+        # and writes them into the fork, neither of which belongs on the loop.
+        await asyncio.to_thread(
+            _copy_parent_findings, parent_dir / "FINDINGS.md", fork_dir / "parent_findings.md"
+        )
         _audit("campaign_forked", result["id"], parent=cid)
         return web.json_response(result, status=201)
 
@@ -2891,8 +3086,8 @@ async def _handle_nudge(request: web.Request) -> web.Response:
     # Guarded: a Stop/Pause that committed while this handler ran must win —
     # restoring RUNNING over it would resurrect a campaign with no worker.
     qp = _questions_path(cid)
-    if qp and qp.exists():
-        qp.unlink()
+    cleared = await asyncio.to_thread(_unlink_if_present, qp) if qp is not None else False
+    if cleared:
         await _guarded_transition(
             cid, CampaignStatus.RUNNING, allowed_current=(CampaignStatus.NEEDS_INPUT,)
         )
@@ -2996,7 +3191,7 @@ async def _handle_to_artifact(request: web.Request) -> web.Response:
     if d is None:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     findings_path = d / "FINDINGS.md"
-    if not findings_path.exists():
+    if not await asyncio.to_thread(findings_path.exists):
         return web.json_response({"error": "No findings yet"}, status=404)
 
     def _read_export_row() -> sqlite3.Row | None:
@@ -3014,7 +3209,9 @@ async def _handle_to_artifact(request: web.Request) -> web.Response:
     if row is None:
         return web.json_response({"error": "Not found"}, status=404)
     question = row["question"]
-    findings_md = findings_path.read_text()
+    findings_md = await asyncio.to_thread(_read_text_or_missing, findings_path)
+    if findings_md is None:
+        return web.json_response({"error": "No findings yet", "code": "findings_missing"}, status=404)
     subs = json.loads(row["sub_questions"] or "[]")
 
     # Prefer an LLM-authored report (synthesized + nicely formatted). Cap the
@@ -3159,7 +3356,7 @@ async def _handle_knowledge_status(request: web.Request) -> web.Response:
     # (it has not, until the user adds it), so no filesystem side effects here.
     uri = str((d / "findings_for_knowledge.md").resolve())
     try:
-        existing = store.get_source_by_uri(uri)
+        existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     except Exception:
         logger.exception("knowledge-status lookup failed for %s", cid)
         return web.json_response({"in_library": False})
@@ -3179,7 +3376,7 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     if d is None:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     findings_path = d / "FINDINGS.md"
-    if not findings_path.exists():
+    if not await asyncio.to_thread(findings_path.exists):
         return web.json_response({"error": "No findings yet"}, status=404)
     # Access knowledge store and pipeline from app state
     state = request.app.get("state")
@@ -3189,16 +3386,19 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     pipeline = request.app.get("knowledge_pipeline")
     if pipeline is None:
         return web.json_response({"error": "Knowledge pipeline unavailable"}, status=503)
+    raw_findings = await asyncio.to_thread(_read_text_or_missing, findings_path)
+    if raw_findings is None:
+        return web.json_response({"error": "No findings yet", "code": "findings_missing"}, status=404)
     # The Knowledge Library is an external surface (content surfaces to users and
     # agents via RAG/search), so redact credentials + exfil URLs before ingestion.
     # The agent may have encountered secrets mid-research; ingesting raw would
     # leak them. Write a sanitized copy and ingest THAT, never the raw file.
-    redacted = _redact_finding({"v": findings_path.read_text()})["v"]
+    redacted = _redact_finding({"v": raw_findings})["v"]
     sanitized_path = d / "findings_for_knowledge.md"
-    sanitized_path.write_text(redacted)
+    await asyncio.to_thread(_write_text, sanitized_path, redacted)
     uri = str(sanitized_path.resolve())
     # Dedup check
-    existing = store.get_source_by_uri(uri)
+    existing = await asyncio.to_thread(store.get_source_by_uri, uri)
     if existing:
         return web.json_response(
             {"error": "Already in Knowledge Library", "id": existing["id"]}, status=409
@@ -3216,24 +3416,43 @@ async def _handle_to_knowledge(request: web.Request) -> web.Response:
     # The Knowledge Library is an external surface (RAG/search), so even the
     # source name metadata must be redacted before ingestion — matching the
     # treatment _handle_to_artifact applies to its artifact name.
+    # Redact the question WHOLE, then bound: cutting first can split a
+    # credential at the 60-char boundary into fragments no redaction regex
+    # matches, leaking it into the Knowledge Library source name.
     name = (
-        f"Research: {_redact_finding({'v': row['question'][:60]})['v']}"
+        f"Research: {_redact_finding({'v': row['question']})['v'][:60]}"
         if row
         else f"Research: {cid}"
     )
-    sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
-    store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (sid,))
-    store.db.commit()
+
+    # The store hands out one connection per thread, so all statement work for
+    # this request runs off-loop in a single worker: a lock wait on the store's
+    # busy timeout must stall a thread, never the event loop (issue #7020's
+    # loop-stall class). ``add_source`` rides in the same closure because the
+    # status UPDATE needs its ``sid`` on the same per-thread connection.
+    def _add_source_marked_syncing() -> str:
+        new_sid = store.add_source(name=name, source_type="local_file", uri=uri, properties={})
+        store.db.execute("UPDATE sources SET sync_status = 'syncing' WHERE id = ?", (new_sid,))
+        store.db.commit()
+        return new_sid
+
+    sid = await asyncio.to_thread(_add_source_marked_syncing)
 
     async def _bg_ingest() -> None:
-        try:
-            await pipeline.ingest_file(uri, source_id=sid)
+        def _mark_synced() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'synced' WHERE id = ?", (sid,))
             store.db.commit()
-        except Exception:
-            logger.exception("Research findings ingestion failed for %s", cid)
+
+        def _mark_error() -> None:
             store.db.execute("UPDATE sources SET sync_status = 'error' WHERE id = ?", (sid,))
             store.db.commit()
+
+        try:
+            await pipeline.ingest_file(uri, source_id=sid)
+            await asyncio.to_thread(_mark_synced)
+        except Exception:
+            logger.exception("Research findings ingestion failed for %s", cid)
+            await asyncio.to_thread(_mark_error)
 
     task = asyncio.create_task(_bg_ingest())
     app_tasks = request.app.setdefault("_bg_tasks", set())
@@ -3368,12 +3587,9 @@ async def _handle_grill_tree(request: web.Request) -> web.Response:
     if d is None:
         return web.json_response({"error": "Invalid campaign ID"}, status=400)
     tree_path = d / "grill_tree.json"
-    if not tree_path.exists():
+    tree = await asyncio.to_thread(_read_json_or_missing, tree_path)
+    if tree is None:
         return web.json_response({"tree": []})
-    try:
-        tree = json.loads(tree_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        tree = []
     # Never trust LLM output: node text/recommended fields are model-generated,
     # so redact credentials + exfiltration URLs before serving to the dashboard
     # (same treatment as cycle findings via _redact_finding).

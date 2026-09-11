@@ -255,7 +255,23 @@ class TestControlFrames:
     async def test_ping_is_answered_with_pong_and_closes(self, peer_ok):
         writer = _FakeWriter()
         await _handle(_ScriptedReader({"type": "ping"}, {"type": "ping"}), writer, _fake_pool())
-        assert writer.frames() == [{"type": "pong"}]
+        frames = writer.frames()
+        assert len(frames) == 1
+        assert frames[0]["type"] == "pong"
+
+    @pytest.mark.asyncio
+    async def test_pong_reports_the_target_map_so_an_adopter_can_check_it(
+        self, peer_ok, monkeypatch
+    ):
+        """``GatewayManager`` adopts any process answering ``pong`` without a
+        version handshake, and adoption is the one path that never applies the
+        spec's ``mcp_target_env``. Without this field the adopter cannot tell a
+        daemon that predates a ``stub_servers`` change from a current one, which
+        is how a stale daemon silently removed a whole server's tools."""
+        monkeypatch.setenv("KIROCREW_MCP_TARGET_KIROCREW_CORE", "kirocrew mcp-core")
+        writer = _FakeWriter()
+        await _handle(_ScriptedReader({"type": "ping"}), writer, _fake_pool())
+        assert "KIROCREW_CORE" in writer.frames()[0]["targets"]
 
     @pytest.mark.asyncio
     async def test_stats_merges_the_warm_pool_hit_tally(self, peer_ok, monkeypatch):
@@ -387,6 +403,48 @@ class TestControlFrames:
         await _handle(_ScriptedReader(_register_frame(stub_uuid="")), writer, _fake_pool())
         assert writer.frames() == [{"type": "rejected", "reason": "missing stub_uuid"}]
 
+    @pytest.mark.asyncio
+    async def test_register_naming_a_reserved_stub_prefix_is_rejected(self, peer_ok):
+        """`Backend` exempts an internally-prefixed stub uuid from the MCP Apps
+        render path AND the model-visibility filter, so a stub that merely NAMES
+        itself with the prefix would inherit both exemptions and be served tools
+        the model is meant not to see. The prefix is the gateway's own; refuse it
+        at registration."""
+        from kiro_crew.mcp_gateway.backend import INTERNAL_STUB_PREFIXES
+
+        assert INTERNAL_STUB_PREFIXES  # a silently empty tuple would pass vacuously
+        for prefix in INTERNAL_STUB_PREFIXES:
+            writer = _FakeWriter()
+            await _handle(
+                _ScriptedReader(_register_frame(stub_uuid=f"{prefix}deadbeef")),
+                writer,
+                _fake_pool(),
+            )
+            assert writer.frames() == [
+                {"type": "rejected", "reason": "reserved stub_uuid prefix"}
+            ], prefix
+
+    @pytest.mark.asyncio
+    async def test_reserved_stub_prefix_rejection_is_audited(self, peer_ok, monkeypatch):
+        """The refusal is an access decision, so it belongs in the SEL and not
+        only in the WARNING log.
+
+        Without this, the one connection someone tried to sneak an internal
+        exemption through is the one connection the security event log has no
+        record of -- the operator sees a denial that never happened rather than
+        one that did.
+        """
+        from kiro_crew.mcp_gateway.backend import INTERNAL_STUB_PREFIXES
+
+        audited: list[str] = []
+        monkeypatch.setattr(gw, "_audit_reserved_stub_prefix_denied", audited.append)
+        await _handle(
+            _ScriptedReader(_register_frame(stub_uuid=f"{INTERNAL_STUB_PREFIXES[0]}deadbeef")),
+            _FakeWriter(),
+            _fake_pool(),
+        )
+        assert audited == [f"{INTERNAL_STUB_PREFIXES[0]}deadbeef"]
+
 
 # --- registration bookkeeping ------------------------------------------------
 
@@ -482,6 +540,15 @@ class TestRegisterBookkeeping:
 # --- bridge-phase frame hygiene ---------------------------------------------
 
 
+#: Stands in for the oversize frame, which the test body materializes.
+#: ``_MAX_FRAME_BYTES`` is 64 MiB, and a bytes literal that size inside
+#: ``parametrize`` is allocated while the module is IMPORTED -- so every xdist
+#: worker pays it during collection and holds it for the whole session, because
+#: the mark keeps its argvalues alive on the function object. One test needs the
+#: payload; all of them were paying for it.
+_OVERSIZE_FRAME = "oversize-frame"
+
+
 class TestBridgeFrameHygiene:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -489,7 +556,7 @@ class TestBridgeFrameHygiene:
         [
             (asyncio.LimitOverrunError("no separator found", 64), True),
             (b"", True),
-            (b"x" * (gw._MAX_FRAME_BYTES + 2), True),
+            (_OVERSIZE_FRAME, True),
             (b"not json at all\n", False),
             (b"[1, 2, 3]\n", False),
         ],
@@ -503,6 +570,8 @@ class TestBridgeFrameHygiene:
         connection. Neither may ever acquire a backend."""
         acquire = AsyncMock()
         monkeypatch.setattr(gw, "_acquire_backend", acquire)
+        if bad_frame is _OVERSIZE_FRAME:
+            bad_frame = b"x" * (gw._MAX_FRAME_BYTES + 2)
         # The trailing ping is the probe: it is answered only if the connection
         # survived the bad frame.
         reader = _ScriptedReader(_register_frame(), bad_frame, {"type": "ping"})
@@ -561,10 +630,16 @@ class TestEnsureBackendRejections:
         "exc,expected_reason,fallback,audit",
         [
             (
+                # Fallback-ELIGIBLE: at the pre-flight no real MCP frame has
+                # been forwarded, and an unknown target here can only be map
+                # drift (a stub exists only because the rewriter wrapped that
+                # server, and it holds the real --target-command on its argv).
+                # Tagging it terminal is what killed the server outright instead
+                # of degrading it to a per-session exec.
                 gw._TargetUnknown("no target mapping for server 'demo-mcp'"),
                 "no target mapping for server 'demo-mcp'",
-                False,
-                "_audit_pool_rejected",
+                True,
+                "_audit_pool_fallback",
             ),
             (
                 BackendUnavailable("circuit breaker OPEN"),
@@ -731,6 +806,44 @@ class TestBackendGoneHandling:
         assert reader.remaining == 1, "a terminal error must close the connection"
 
     @pytest.mark.asyncio
+    async def test_a_refused_replacement_tells_the_session_why(
+        self, peer_ok, monkeypatch
+    ):
+        """A validated-and-rejected replacement is not the same event as an
+        unrecoverable spawn, and the client is the only party that could act on
+        knowing the tool set moved — the log and the audit trail are not visible
+        to it."""
+        backend = _fake_backend()
+        backend.forward_from_stub = AsyncMock(  # type: ignore[method-assign]
+            side_effect=BackendGone("stdin closed")
+        )
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(backend, True)))
+        monkeypatch.setattr(
+            gw,
+            "_respawn_backend_for_stub",
+            AsyncMock(
+                side_effect=gw._ReplacementRefused(
+                    "the MCP server was replaced and its tool set changed "
+                    "(gone=read_file); this session's tools are stale"
+                )
+            ),
+        )
+        reader = _ScriptedReader(
+            _register_frame(),
+            {"jsonrpc": "2.0", "id": 9, "method": "tools/list"},
+            {"type": "ping"},
+        )
+        writer = _FakeWriter()
+
+        await _handle(reader, writer, _fake_pool())
+
+        last = writer.frames()[-1]
+        assert last["id"] == 9
+        assert "tool set changed" in last["error"]["message"]
+        assert "gone=read_file" in last["error"]["message"]
+        assert reader.remaining == 1, "a terminal error must close the connection"
+
+    @pytest.mark.asyncio
     async def test_successful_respawn_replays_the_captured_initialize_and_retries(
         self, peer_ok, monkeypatch
     ):
@@ -745,7 +858,7 @@ class TestBackendGoneHandling:
         replacement = asyncio.create_task(asyncio.Event().wait(), name="cov-drain")
         respawn_args: list[tuple[Any, ...]] = []
 
-        async def _respawn(*args: Any):
+        async def _respawn(*args: Any, **kwargs: Any):
             # Mirror the real helper's contract: it stops the old inbox drain
             # before handing back a fresh backend, so the two writer tasks
             # never race onto the same socket.
@@ -893,14 +1006,19 @@ class TestDisconnectTeardown:
 class TestRunGatewaydLifecycle:
     @pytest.mark.asyncio
     async def test_prewarm_count_is_clamped_and_persisted_hot_keys_are_warmed(
-        self, tmp_path, monkeypatch
+        self, tmp_path, short_sock_dir, monkeypatch
     ):
         """``prewarm_count >= max_backends`` would pin the whole pool, so it is
         clamped to leave one reclaimable slot -- and only the clamped number of
         persisted hot keys is warmed."""
-        socket_path = tmp_path / "gw.sock"
+        # The endpoint must bind under a short root (sun_path cap). The daemon
+        # derives its hot-keys store as a sibling of the socket
+        # (``default_hot_keys_path``), so the seed file has to live in the same
+        # short dir. The credential watch path is passed explicitly, so it can
+        # stay on tmp_path.
+        socket_path = short_sock_dir / "gw.sock"
         socket_path.parent.mkdir(parents=True, exist_ok=True)
-        hot_keys_path = tmp_path / "hot-keys.json"
+        hot_keys_path = short_sock_dir / "hot-keys.json"
         now = time.time()
         hot_keys_path.write_text(
             json.dumps(
@@ -966,9 +1084,9 @@ class TestRunGatewaydLifecycle:
 
     @pytest.mark.asyncio
     async def test_a_crashing_connection_handler_is_logged_and_the_daemon_keeps_serving(
-        self, tmp_path, monkeypatch, caplog
+        self, short_sock_dir, monkeypatch, caplog
     ):
-        socket_path = tmp_path / "gw-crash.sock"
+        socket_path = short_sock_dir / "gw-crash.sock"
         handled = asyncio.Event()
 
         async def _explode(*args, **kwargs):
@@ -1007,3 +1125,48 @@ class TestRunGatewaydLifecycle:
             await asyncio.wait_for(daemon, timeout=15)
 
         assert any("connection handler crashed" in rec.message for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_an_abrupt_client_disconnect_is_not_logged_as_a_crash(
+        self, short_sock_dir, monkeypatch, caplog
+    ):
+        socket_path = short_sock_dir / "gw-reset.sock"
+        handled = asyncio.Event()
+
+        async def _reset(*args, **kwargs):
+            handled.set()
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+        monkeypatch.setattr(gw, "_handle_connection", _reset)
+
+        stop_event = asyncio.Event()
+        daemon = asyncio.create_task(
+            gw.run_gatewayd(
+                socket_path,
+                max_backends=2,
+                idle_timeout_secs=300,
+                stop_event=stop_event,
+                target_resolver=_resolver,
+            )
+        )
+        try:
+            for _ in range(500):
+                if socket_path.exists():
+                    break
+                await asyncio.sleep(0.02)
+            assert socket_path.exists(), "the daemon never bound its endpoint"
+            with caplog.at_level(logging.ERROR, logger=gw.logger.name):
+                _, writer = await asyncio.open_unix_connection(str(socket_path))
+                writer.close()
+                await asyncio.wait_for(handled.wait(), timeout=10)
+                # A reset peer is routine: the accept loop still serves.
+                _, writer2 = await asyncio.open_unix_connection(str(socket_path))
+                writer2.close()
+                await asyncio.sleep(0.05)
+        finally:
+            stop_event.set()
+            await asyncio.wait_for(daemon, timeout=15)
+
+        assert not any(
+            "connection handler crashed" in rec.message for rec in caplog.records
+        )

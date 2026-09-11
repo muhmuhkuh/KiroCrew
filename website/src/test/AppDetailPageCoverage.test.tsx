@@ -16,6 +16,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { consumeChatHandoff, installSoftNavigate, __resetErrorJournalForTests, __resetNavSeamForTests } from '../utils/errorReport'
 
 // The resolved colour mode drives screenshot-set and hero selection, so it has
 // to be switchable per test. `vi.hoisted` keeps the box defined before the mock
@@ -58,6 +59,8 @@ import AppDetailPage from '../pages/AppDetailPage'
 const NAME = 'ledger-lens'
 const DENIED = 'blocked by execution policy: third-party app execution is disabled'
 const TRUST_MODAL = /to run its own code\?/i
+const REPO_ALIAS = 'https://example.test/display/ledger-lens'
+const TRUST_REPOSITORY = 'https://clone.example.test/Owner/ledger-lens'
 
 type Dict = Record<string, unknown>
 
@@ -72,6 +75,7 @@ function installedApp(overrides: Dict = {}): Dict {
     resources: 'gateway',
     lifecycle: 'gateway',
     installedAt: '2026-07-01T00:00:00Z',
+    trustRepository: TRUST_REPOSITORY,
     manifest: {
       displayName: 'Ledger Lens',
       description: 'Reads your books and explains them.',
@@ -89,6 +93,8 @@ function registryRow(overrides: Dict = {}): Dict {
     description: 'Reads your books and explains them.',
     version: '1.0.0',
     author: 'zezhexu',
+    repo: REPO_ALIAS,
+    trustRepository: TRUST_REPOSITORY,
     installed: false,
     ...overrides,
   }
@@ -139,7 +145,9 @@ describe('AppDetailPage — uncovered surfaces', () => {
   })
 
   afterEach(() => {
-    delete (window as Window & { __mc_chat_launch?: unknown }).__mc_chat_launch
+    __resetErrorJournalForTests()
+    __resetNavSeamForTests()
+    sessionStorage.clear()
   })
 
   // --- Not found / load failure --------------------------------------------
@@ -148,7 +156,9 @@ describe('AppDetailPage — uncovered surfaces', () => {
     renderDetail()
 
     expect(await screen.findByText('App Not Found')).toBeInTheDocument()
-    expect(screen.getByText(`App "${NAME}" not found`)).toBeInTheDocument()
+    // A genuine miss reads as absence, with no error notice: nothing failed.
+    expect(screen.getByText(`"${NAME}" doesn't exist`)).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: /back to apps/i }))
     expect(await screen.findByText('apps list')).toBeInTheDocument()
@@ -160,13 +170,21 @@ describe('AppDetailPage — uncovered surfaces', () => {
     listRegistry.mockResolvedValue(null)
     renderDetail()
 
-    expect(await screen.findByText('App Not Found')).toBeInTheDocument()
-    expect(screen.getByText(/Cannot read properties of null/)).toBeInTheDocument()
+    // A load FAILURE is not "not found": the header says so, and the reason
+    // goes through the shared ErrorNotice (with the agent hand-off) plus Retry.
+    expect(await screen.findByText('Failed to load app')).toBeInTheDocument()
+    expect(screen.queryByText('App Not Found')).not.toBeInTheDocument()
+    const notice = screen.getByRole('alert')
+    expect(notice.textContent).toMatch(/Cannot read properties of null/)
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
   })
 
-  it('renders the app even when the registry and system endpoints fail', async () => {
-    // Both are best-effort enrichment, so a failure must degrade to the
-    // installed record rather than taking the page down with it.
+  it('renders the app even when the registry and system endpoints fail, and says so', async () => {
+    // Both are enrichment, so a failure must degrade to the installed record
+    // rather than taking the page down with it — but it is still a failed
+    // request, so the reader is told through the shared notice instead of the
+    // catalog silently reading as empty.
     getApp.mockResolvedValue(installedApp())
     listRegistry.mockRejectedValue(new Error('registry offline'))
     system.mockRejectedValue(new Error('no system info'))
@@ -174,7 +192,9 @@ describe('AppDetailPage — uncovered surfaces', () => {
     await loaded()
 
     expect(screen.getByText('Reads your books and explains them.')).toBeInTheDocument()
-    expect(screen.queryByText('registry offline')).not.toBeInTheDocument()
+    const notice = screen.getByRole('alert')
+    expect(notice.textContent).toContain('registry offline')
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
   })
 
   // --- Screenshot gallery + lightbox ---------------------------------------
@@ -258,9 +278,12 @@ describe('AppDetailPage — uncovered surfaces', () => {
     await loaded()
 
     const thumb = screen.getByAltText('Screenshot 1') as HTMLImageElement
-    expect(thumb.style.display).toBe('')
     fireEvent.error(thumb)
-    expect(thumb.style.display).toBe('none')
+    // #6864/#6886 review: a terminal thumbnail unmounts its button entirely —
+    // the old display:none shape left an invisible, tabbable "Open screenshot"
+    // button that opened a broken lightbox for keyboard users.
+    expect(screen.queryByAltText('Screenshot 1')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Open screenshot 1')).not.toBeInTheDocument()
   })
 
   it('prefers the dark screenshot set when the resolved mode is dark', async () => {
@@ -303,7 +326,12 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(document.querySelector('img[src="/hero/browse-light.png"]')).toBeNull()
 
     fireEvent.error(hero)
-    expect(hero.style.display).toBe('none')
+    // #6864: the terminal state is now an UNMOUNTED banner. The fallback
+    // candidate here is the identical URL (no registry row, so the local art
+    // already won the precedence), nothing is retried, and no empty bordered
+    // box is left where the banner was.
+    expect(document.querySelector('img[src="/hero/detail-light.png"]')).toBeNull()
+    expect(document.querySelector('.aspect-\\[25\\/6\\]')).toBeNull()
   })
 
   // --- Install log panel ---------------------------------------------------
@@ -326,12 +354,24 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(log.textContent).toContain('installing dependencies')
     expect(screen.getByText('pip exploded')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: /fix with ai/i }))
-
-    const launch = (window as Window & { __mc_chat_launch?: { message: string } }).__mc_chat_launch
-    expect(launch?.message).toContain('installing dependencies')
-    expect(launch?.message).toContain(`app-sources/${NAME}/`)
-    expect(await screen.findByText('chat page')).toBeInTheDocument()
+    // The hand-off is the shared ErrorNotice's "Ask the agent", not a bespoke
+    // button: the failed headline and the page banner both resolve the journal
+    // entry `reportInstallFailure` wrote, so the staged prompt carries the log
+    // tail the old button used to paste by hand.
+    const navigated: string[] = []
+    installSoftNavigate(to => { navigated.push(to) })
+    try {
+      const [handoff] = screen.getAllByRole('button', { name: /ask the agent/i })
+      expect(handoff).toBeInTheDocument()
+      fireEvent.click(handoff)
+      const prompt = consumeChatHandoff()
+      expect(prompt).toContain('pip exploded')
+      expect(prompt).toContain('installing dependencies')
+      expect(prompt).toContain('/api/apps/registry/install-stream')
+      expect(navigated).toEqual(['/chat'])
+    } finally {
+      __resetNavSeamForTests()
+    }
   })
 
   it('closes the install log once a successful install has landed', async () => {
@@ -509,7 +549,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /trust this app and enable/i }))
 
-    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(NAME))
+    await waitFor(() => expect(trustApp).toHaveBeenCalledWith(NAME, TRUST_REPOSITORY))
     await waitFor(() => expect(screen.queryByText(TRUST_MODAL)).not.toBeInTheDocument())
     expect(installFromRegistryStream).toHaveBeenCalledTimes(2)
   })
@@ -580,7 +620,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
     // hand-off alongside it.
     expect(screen.getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     expect(screen.queryByText('git conflict')).not.toBeInTheDocument()
   })
 

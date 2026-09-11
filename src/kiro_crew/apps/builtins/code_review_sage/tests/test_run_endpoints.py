@@ -363,6 +363,28 @@ class TestReposCrud(_RunEndpointBase):
         self.assertEqual(resp.status, 400)
 
 
+class TestSelfHostedGitlabRepoPrs(_RunEndpointBase):
+    async def test_repo_prs_dispatches_to_glab_for_allowlisted_host(self):
+        cfg_path = store.data_dir() / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["gitlab_hosts"] = ["gitlab.bildungsinnovator.com"]
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        prs = [{
+            "url": "https://gitlab.bildungsinnovator.com/bildungsinnovator/-/merge_requests/7",
+            "number": 7, "head_sha": "abc", "title": "Fix it",
+        }]
+        with unittest.mock.patch.object(
+                self.mod.pipeline, "list_open_gitlab_mrs", return_value=prs) as list_mrs:
+            resp = await self.mod._handle_repo_prs(_Req(query={
+                "repo": "https://gitlab.bildungsinnovator.com/bildungsinnovator"}))
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.body)
+        self.assertEqual(data["repo"], "gitlab.bildungsinnovator.com/bildungsinnovator")
+        self.assertEqual(data["prs"][0]["number"], 7)
+        list_mrs.assert_called_once_with("", "bildungsinnovator",
+                                         host="gitlab.bildungsinnovator.com")
+
+
 class TestRunIdParamRejectsMalformed(_RunEndpointBase):
     """A ``{run_id}`` that is not already its own safe form must 404 rather than
     be repaired into a DIFFERENT, real run's id.

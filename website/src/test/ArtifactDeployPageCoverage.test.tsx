@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, waitFor, fireEvent, within } from '@testing-library/react'
 import { useLocation } from 'react-router-dom'
 import ArtifactDeployPage from '../pages/ArtifactDeployPage'
 import { renderWithProviders } from './helpers'
@@ -52,8 +52,17 @@ const SITE: Json = {
 
 function installFetch(cfg: FetchCfg = {}): Call[] {
   const calls: Call[] = []
+  // `text()` and `headers` are what the shared `toApiError` factory reads on a
+  // non-2xx reply. An empty-object body stands in for "no body" here, so the
+  // factory's `HTTP <status>` fallback is what the notice shows for it.
   const reply = (status: number, data: Json) =>
-    ({ ok: status < 400, status, json: async () => data }) as unknown as Response
+    ({
+      ok: status < 400,
+      status,
+      json: async () => data,
+      text: async () => (Object.keys(data).length ? JSON.stringify(data) : ''),
+      headers: { get: () => null },
+    }) as unknown as Response
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url)
     const method = (init?.method ?? 'GET').toUpperCase()
@@ -220,14 +229,17 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
   it('surfaces the backend reason a registration was refused', async () => {    installFetch({ available: ['other-sso'], write: { status: 400, body: { error: 'profile not found in ~/.aws/config' } } })
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: /other-sso/ }))
-    expect(await screen.findByText('Error: profile not found in ~/.aws/config')).toBeInTheDocument()
+    // The backend reason is the ErrorNotice message verbatim (no "Error:" lead),
+    // so the journal message-match keeps working.
+    const notice = await screen.findByRole('alert')
+    expect(notice.textContent).toContain('profile not found in ')
   })
 
   it('falls back to a generic reason when the refusal carries no error field', async () => {
     installFetch({ available: ['other-sso'], write: { status: 500, body: {} } })
     renderPage()
     fireEvent.click(await screen.findByRole('button', { name: /other-sso/ }))
-    expect(await screen.findByText('Error: add failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 500')
   })
 
   it('creates and registers a profile from the form, then closes and clears it', async () => {
@@ -287,36 +299,45 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     renderPage()
     await profilesLoaded()
     fireEvent.click(screen.getByLabelText('Make ship-sandbox the default profile'))
-    expect(await screen.findByText('Error: update failed')).toBeInTheDocument()
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 409')
   })
 
+  // The removal guard is the in-app dialog, never window.confirm — the native
+  // confirm freezes the renderer's event loop and cannot restate the action.
   it('removes a profile from the registry after confirmation, saying the AWS config is untouched', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const confirmSpy = vi.spyOn(window, 'confirm')
     const calls = installFetch()
     renderPage()
     await profilesLoaded()
     fireEvent.click(screen.getByLabelText('Remove ship-sandbox from registry'))
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("Remove 'ship-sandbox' from the registry?"))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/Remove “ship-sandbox” from the registry\?/)).toBeInTheDocument()
+    // Opening the dialog alone must not delete anything.
+    expect(writes(calls, '/profiles')).toHaveLength(0)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove profile' }))
     expect(await screen.findByText('Removed from registry (your ~/.aws/config is untouched).')).toBeInTheDocument()
     expect(writes(calls, '/profiles')[0].method).toBe('DELETE')
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 
   it('sends nothing when the removal confirm is declined', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
     const calls = installFetch()
     renderPage()
     await profilesLoaded()
     fireEvent.click(screen.getByLabelText('Remove ship-sandbox from registry'))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     expect(writes(calls, '/profiles')).toHaveLength(0)
   })
 
   it('reports a failed removal', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     installFetch({ write: { status: 500, body: {} } })
     renderPage()
     await profilesLoaded()
     fireEvent.click(screen.getByLabelText('Remove ship-sandbox from registry'))
-    expect(await screen.findByText('Error: remove failed')).toBeInTheDocument()
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Remove profile' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('HTTP 500')
   })
 
   it('shows the account behind a verified profile', async () => {
@@ -325,7 +346,7 @@ describe('ArtifactDeployPage — profile registry mutations', () => {
     await profilesLoaded()
     fireEvent.click(screen.getAllByRole('button', { name: /Verify/ })[0])
     // Built from the mock rather than inlined: the literal "account <12
-    // digits>" string is the shape scripts/scrub-lint.sh rejects.
+    // digits>" string is the shape the internal-content scan rejects.
     const account = (PROFILES[0] as { account: string }).account
     expect(
       await screen.findByText(new RegExp(`access reachable \\(account ${account}\\)`)),
@@ -408,14 +429,21 @@ describe('ArtifactDeployPage — recall and destroy two-call guard', () => {
   afterEach(() => vi.restoreAllMocks())
 
   it('binds a confirmed recall to the resources the preview call resolved', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const confirmSpy = vi.spyOn(window, 'confirm')
     const calls = installFetch({ sites: [SITE] })
     renderPage()
     await screen.findByText(/Deployments \(1\)/)
     fireEvent.click(screen.getByRole('button', { name: /Recall/ }))
 
+    // The dialog names the LIVE resources the preview resolved — in the
+    // in-app dialog, never window.confirm.
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/bkt-9f3/)).toBeInTheDocument()
+    // Opening the dialog alone must not send the confirmed call.
+    expect(writes(calls, '/recall')).toHaveLength(1)
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Recall site' }))
+
     await waitFor(() => expect(writes(calls, '/recall')).toHaveLength(2))
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('bkt-9f3'))
     const [preview, commit] = writes(calls, '/recall')
     expect(preview.body).toEqual({ site_id: 'blog', profile: 'ship-prod' })
     expect(commit.body).toEqual({
@@ -423,14 +451,16 @@ describe('ArtifactDeployPage — recall and destroy two-call guard', () => {
       expected_bucket: 'bkt-9f3', expected_distribution_id: 'E1DIST',
     })
     expect(await screen.findByText("Recalled 'blog'.")).toBeInTheDocument()
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 
   it('sends no confirmed recall when the dialog is declined', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
     const calls = installFetch({ sites: [SITE] })
     renderPage()
     await screen.findByText(/Deployments \(1\)/)
     fireEvent.click(screen.getByRole('button', { name: /Recall/ }))
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
     await waitFor(() => expect(writes(calls, '/recall')).toHaveLength(1))
     expect(screen.queryByText(/Recalled/)).toBeNull()
   })
@@ -447,45 +477,52 @@ describe('ArtifactDeployPage — recall and destroy two-call guard', () => {
   })
 
   it('reports a recall the backend refused after confirmation', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     installFetch({ sites: [SITE], commit: { status: 409, body: { error: 'bucket changed since preview' } } })
     renderPage()
     await screen.findByText(/Deployments \(1\)/)
     fireEvent.click(screen.getByRole('button', { name: /Recall/ }))
-    expect(await screen.findByText('Error: bucket changed since preview')).toBeInTheDocument()
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Recall site' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('bucket changed since preview')
   })
 
   it('names the bucket and the distribution in the destroy dialog and binds both', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const confirmSpy = vi.spyOn(window, 'confirm')
     const calls = installFetch({ sites: [SITE] })
     renderPage()
     await screen.findByText(/Deployments \(1\)/)
     fireEvent.click(screen.getByRole('button', { name: /Destroy/ }))
 
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/distribution E1DIST/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Destroy site' }))
+
     await waitFor(() => expect(writes(calls, '/destroy')).toHaveLength(2))
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('distribution E1DIST'))
     expect(writes(calls, '/destroy')[1].body).toMatchObject({
       confirm: true, expected_bucket: 'bkt-9f3', expected_distribution_id: 'E1DIST',
     })
     expect(await screen.findByText(/Destroying 'blog'/)).toBeInTheDocument()
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 
   it('marks unknown resources with a question mark rather than an empty dialog', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     installFetch({ sites: [SITE], preview: { status: 200, body: {} } })
     renderPage()
     await screen.findByText(/Deployments \(1\)/)
     fireEvent.click(screen.getByRole('button', { name: /Destroy/ }))
-    await waitFor(() => expect(confirmSpy).toHaveBeenCalledWith(expect.stringMatching(/bucket \? and distribution \?/)))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(/bucket \? and distribution \?/)).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
   })
 
   it('reports a destroy that the backend refused after confirmation', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     installFetch({ sites: [SITE], commit: { status: 409, body: { error: 'site was recreated since preview' } } })
     renderPage()
     await screen.findByText(/Deployments \(1\)/)
     fireEvent.click(screen.getByRole('button', { name: /Destroy/ }))
-    expect(await screen.findByText('Error: site was recreated since preview')).toBeInTheDocument()
+    const dialog = await screen.findByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Destroy site' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('site was recreated since preview')
   })
 
   it('fails the destroy closed when the preview cannot resolve the resources', async () => {

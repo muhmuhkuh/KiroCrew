@@ -3,8 +3,10 @@
 ## Overview
 
 The side conversation module adds an ephemeral Q&A thread to a parent chat
-slot. Users invoke it via the `/side` command or the "Side" tab in the
-Activity panel. The `/side` command is intercepted client-side regardless of
+slot. Users invoke it via the `/side` command or the "Side Chat" tab in the
+Activity panel — the user-facing name is Side Chat, while `side` remains the
+internal spelling for the tab id, state, routes and this module. The `/side`
+command is intercepted client-side regardless of
 the parent turn's state: while a turn is running, the composer's steer path
 checks `isInterceptedSlashCommand` before steering, so the command opens the
 side chat instead of being injected into the running turn as literal text.
@@ -270,8 +272,8 @@ Deliberately separate from `broadcast_ws` main-channel events.
 
 ### `ActivityViewer.tsx`
 
-5th tab: `{key: 'side', label: 'Side', icon: MessageSquare}`. Renders
-`<SideChat slot={slot} />` when active.
+5th tab: `{key: 'side', label: i18nT('pages.chat.activityViewer.side'), icon:
+MessageCircleQuestionMark}`. Renders `<SideChat slot={slot} />` when active.
 
 ### `SideChat.tsx`
 
@@ -282,11 +284,15 @@ answer and a queued one is a card, so both are placed by the server frame.
 While a turn is in flight the composer stays editable and swaps its send button
 for the shared `BusySendButton`; queued entries render as `QueueStack` cards whose
 cancel and edit wait for the server's own frame before changing what the user
-sees.
+sees. A persistent helper beneath the composer states that Side Chat is
+context-only, tools and MCPs are unavailable, and action-taking belongs in the
+main chat; unlike an empty-state note, it remains visible after messages exist.
 
 The composer's DRAFT behaviour is not owned here. It comes from the chat SDK's
-`app-sdk/useComposerDraft`, which this surface was the first consumer of, and
-which owns four invariants this file must not re-derive:
+`app-sdk/useComposerDraft`, which this surface was the first consumer of
+(`app-sdk/ChatEmbed.tsx` the second, wired to its bare `<input>` via the same
+`submitOnEnter`/`isComposing` without attaching `textareaRef` — no auto-grow
+box to size), and which owns four invariants this file must not re-derive:
 
 - A follow-up pick edits the draft, and the picked set is read back OFF the draft
   rather than stored beside it. The draft is what gets submitted, so it is the
@@ -298,7 +304,13 @@ which owns four invariants this file must not re-derive:
 - An Enter that commits an IME candidate is not a submit. This surface's own
   handler predated the shared hook and lacked the guard, so a Chinese/Japanese/
   Korean candidate confirmed with Enter submitted the partial text with nothing
-  left to recover.
+  left to recover. Declining the submit does not release the key: the guard
+  consumes it (`useImeGuard`'s `claimEnter`), because the browser's default for an
+  unclaimed Enter is to put a line break in the draft. Recovery from a composition
+  abandoned without a `compositionend` ships with the tracking rather than with the
+  caller -- `ime.bindComposition()` is the only composition binding the hook
+  exposes, and it carries the blur reset, because a latched guard now declines
+  Enter silently instead of visibly.
 - The submit size limit (`MAX_QUESTION_BYTES`) is measured in UTF-8 bytes, not
   code units. The hook only reports whether the limit is exceeded; this file
   still owns the refusal and its wording.
@@ -379,13 +391,13 @@ Busy-send invariants live in `test/test_side_steer_queue.py`:
 | Unproven delivery is recovered | `test_an_unconsumed_steer_becomes_a_queue_card_instead_of_vanishing` |
 | A proven delivery is not duplicated | `test_a_consumed_steer_is_settled_and_not_requeued` |
 | A failed drain keeps the text | `test_a_failed_drain_puts_the_entry_back_instead_of_dropping_it` |
+| Close wins over a late drain | `test_close_drops_the_queue_and_a_late_drain_cannot_resurrect_it`, `test_a_stale_task_cannot_drain_a_newer_sides_queue` |
 
 The settlement rules themselves are in `test/test_steer_settle.py` (equality not
 containment, count-awareness, settle-all on an unusable echo), and
 `test/test_llm_helpers_steer_echo.py` covers the REAL `stream_and_collect`
 dispatch — every steering caller fakes that helper, so without it the hook could
 be dead at runtime while all of them stayed green.
-| Close wins over a late drain | `test_close_drops_the_queue_and_a_late_drain_cannot_resurrect_it`, `test_a_stale_task_cannot_drain_a_newer_sides_queue` |
 
 Frontend invariants are covered in KiroCrewWebsite under `src/test/`:
 `SideChat.close.test.tsx`, `SideChat.multiturn.test.tsx`,
@@ -394,14 +406,12 @@ Frontend invariants are covered in KiroCrewWebsite under `src/test/`:
 `SideSlashCommand.steer.test.tsx` (command interception wins over mid-turn
 steer routing), and the `sseSideResult` block in `chatSlice.test.ts`.
 
-Structural greps enforce compile-time invariants:
-
-- `main_path_baseline.sh` — context.py + chat.py SHA-equal to baseline
-- `no_main_context_pollution.sh` — no side symbols in main path files
-- `no_memory_writes_from_side.sh` — no learn/save/memory calls from side
-- `no_new_slot_in_side_path.sh` — side handlers never call get_or_create_slot
-- `exactly_five_activity_tabs.sh` — tab count matches spec
-- `side_tab_registered.sh` — "Side" tab present in ActivityViewer
+Nothing enforces invariant 2 (main path byte-frozen) mechanically. It is a
+review-time rule, held by the backend and frontend suites above plus the
+`_side` sidecar's own isolation from `context.build_message`: a side symbol
+reaching the main path shows up as a `test/test_side.py` failure, not as a
+structural check. Making the freeze a real invariant needs a test; until one
+exists this file does not claim one.
 
 ## Design
 

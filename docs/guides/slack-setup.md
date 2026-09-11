@@ -24,7 +24,7 @@ Both paths require a Slack workspace where you can install apps (see [Prerequisi
 ## Prerequisites
 
 - A **Slack workspace** where you have permission to install apps. If you don't have one, create a free workspace at <https://slack.com/get-started>. You can install your own apps in a workspace you own.
-- Python and Kiro Crew installed (`pip install kirocrew`), so you can run the `kirocrew` CLI.
+- Python and Kiro Crew installed through a [supported install path](install.md#install-paths), so you can run the `kirocrew` CLI.
 
 > **Tip**: Use a personal or test workspace for your first run. You can always export the app manifest and recreate the app in another workspace later (see [Reusing the App in Another Workspace](#reusing-the-app-in-another-workspace)).
 
@@ -268,6 +268,19 @@ Multi-user access is disabled at the authorization predicate itself, not by
 configuration: `is_allowed_user` resolves to an owner check, `is_open_channel`
 always returns false, and the channel-join allowlist prompt is a no-op. A
 `/<command> @user` invocation replies that multi-user access is disabled.
+
+> **Setting or changing `KIROCREW_OWNER_ID` invalidates existing dashboard
+> sessions.** The value is not just the Slack DM routing target — it is also the
+> dashboard's authorization principal and the subject baked into every dashboard
+> token at mint time. A dashboard session signed in before the value was set (or
+> before it changed) keeps its old subject for its whole life, so owner-only
+> actions (the Trust/YOLO switch, tool approvals, worktree creation, cloud
+> setup, and the other owner-gated surfaces) are denied for it afterwards. For a
+> session from before an owner was FIRST configured, the dashboard detects the
+> case and shows a sign-in banner; a session signed in under a PREVIOUS owner
+> value is denied with the generic response and likewise needs a fresh sign-in.
+> Either way, run `kirocrew token` and open the fresh link to re-authenticate
+> under the new owner.
 
 ### Reaction Emojis
 

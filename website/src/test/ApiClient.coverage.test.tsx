@@ -125,8 +125,9 @@ describe('client transport', () => {
   })
 
   it('POST/PUT/PATCH send a JSON content type alongside the placeholder key', async () => {
-    await api.trustApp('demo')
+    await api.trustApp('demo', 'https://example.test/owner/demo')
     expect(call().headers).toMatchObject({ 'Content-Type': 'application/json', 'X-Session-Key': 'dashboard:ui' })
+    expect(call().body).toEqual({ repository: 'https://example.test/owner/demo' })
     await api.setTrustAllApps(true)
     expect(call(1).method).toBe('PUT')
     expect(call(1).headers['Content-Type']).toBe('application/json')
@@ -158,6 +159,28 @@ describe('client transport', () => {
     expect(call().headers['X-Session-Key']).toBe('dashboard:chat-3')
   })
 
+  it('the feature-video routes put the caller\'s session key on the wire', async () => {
+    // Both routes are gated server-side by `_is_restricted_session`, which treats
+    // the shared `dashboard:ui` placeholder as NOT restricted -- so a key that never
+    // reaches the header makes that guard unreachable and lets a session which keeps
+    // nothing record a PERMANENT verdict.
+    await api.featureVideoNext('dashboard:chat-4')
+    expect(call().url).toBe('/api/feature-videos/next')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.featureVideoFeedback('vid-1', 'seen', 'dashboard:chat-4')
+    expect(call(1).url).toBe('/api/feature-videos/feedback')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+    expect(call(1).body).toEqual({ id: 'vid-1', status: 'seen' })
+  })
+
+  it('the feature-video routes fall back to the placeholder when no key is passed', async () => {
+    await api.featureVideoNext()
+    expect(call().headers['X-Session-Key']).toBe('dashboard:ui')
+    await api.featureVideoFeedback('vid-1', 'dismissed')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:ui')
+  })
+
   it('createArtifact derives the session key from origin_session_key when none is passed', async () => {
     await api.createArtifact({ name: 'Doc', content: '<p/>', origin_session_key: 'chat-9' })
     expect(call().headers['X-Session-Key']).toBe('dashboard:chat-9')
@@ -171,6 +194,73 @@ describe('client transport', () => {
   it('createArtifact falls back to the placeholder when the body names no session', async () => {
     await api.createArtifact({ name: 'Doc', content: '<p/>' })
     expect(call().headers['X-Session-Key']).toBe('dashboard:ui')
+  })
+
+  // The steering verbs are the case the placeholder actively broke: the server
+  // resolves a `workspace/` key against the project of the slot named by this
+  // header, so `dashboard:ui` — which names no slot — made project steering
+  // unreachable as soon as two chats sat on different projects. All five verbs
+  // take the key, because a file created under one project must stay readable,
+  // editable and deletable from the same page load.
+  it('the steering reads send the caller\'s session key, on the GET as well as the POST family', async () => {
+    await api.steeringFiles('dashboard:chat-4')
+    expect(call().url).toBe('/api/steering')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.steeringFile('workspace/api.md', 'dashboard:chat-4')
+    expect(call(1).url).toBe('/api/steering/workspace/api.md')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('the steering writes send the caller\'s session key', async () => {
+    await api.createSteering('api.md', '# API', 'workspace', 'dashboard:chat-4')
+    expect(call().method).toBe('POST')
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.updateSteering('workspace/api.md', '# API v2', 'dashboard:chat-4')
+    expect(call(1).method).toBe('PUT')
+    expect(call(1).url).toBe('/api/steering/workspace/api.md')
+    expect(call(1).headers['X-Session-Key']).toBe('dashboard:chat-4')
+
+    await api.deleteSteering('workspace/api.md', 'dashboard:chat-4')
+    expect(call(2).method).toBe('DELETE')
+    expect(call(2).headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('a workspace write states which project the caller was listed', async () => {
+    // The session key names a chat slot and that slot's project can be
+    // re-pointed, so the slot alone cannot say which project the user believed
+    // they were editing. The listing's `project_key` rides along and the server
+    // refuses (409) when it no longer resolves to the same one.
+    await api.createSteering('api.md', '# API', 'workspace', 'dashboard:chat-4', 'pk-abc')
+    expect(call().headers['X-Steering-Project']).toBe('pk-abc')
+
+    await api.updateSteering('workspace/api.md', '# v2', 'dashboard:chat-4', 'pk-abc')
+    expect(call(1).headers['X-Steering-Project']).toBe('pk-abc')
+
+    await api.deleteSteering('workspace/api.md', 'dashboard:chat-4', 'pk-abc')
+    expect(call(2).headers['X-Steering-Project']).toBe('pk-abc')
+  })
+
+  it('omits the project header when the caller has no project key', async () => {
+    // Absent is not "any project": the server fails a workspace write closed on
+    // a missing header, so sending nothing is the honest wire form.
+    await api.createSteering('api.md', '# API', 'user', 'dashboard:chat-4')
+    expect(call().headers['X-Steering-Project']).toBeUndefined()
+    expect(call().headers['X-Session-Key']).toBe('dashboard:chat-4')
+  })
+
+  it('every steering verb falls back to the placeholder when no session key is passed', async () => {
+    // The tab passes `undefined` when no chat is open rather than inventing a
+    // slot name, so the fallback is what a settings page with no chat sends.
+    await api.steeringFiles()
+    await api.steeringFile('workspace/api.md')
+    await api.createSteering('api.md', '# API', 'workspace')
+    await api.updateSteering('workspace/api.md', '# API v2')
+    await api.deleteSteering('workspace/api.md')
+    for (let i = 0; i < 5; i++) {
+      expect(call(i).headers['X-Session-Key']).toBe('dashboard:ui')
+    }
   })
 })
 
@@ -425,40 +515,76 @@ describe('session-expired banner', () => {
     })
   })
 
-  it('hands recovery to the hub instead of bannering when embedded in the Instances pane', () => {
-    // Inside the hub's iframe the user cannot fetch the REMOTE token, so the
-    // parent is signalled and re-mints instead. The message carries no secret.
-    const post = vi.fn()
+  function withMockedParent(post: (...args: unknown[]) => unknown, body: () => Promise<void>) {
     const original = Object.getOwnPropertyDescriptor(window, 'parent')
     Object.defineProperty(window, 'parent', {
       value: { postMessage: post },
       writable: true,
       configurable: true,
     })
-    try {
-      checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
-      expect(post).toHaveBeenCalledWith({ type: 'mc-auth-expired' }, '*')
-      expect(banner()).toBeNull()
-      expect(fetchMock).not.toHaveBeenCalled()
-    } finally {
+    return body().finally(() => {
       if (original) Object.defineProperty(window, 'parent', original)
-    }
+    })
+  }
+
+  const embedded403 = () =>
+    checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))
+
+  it('recovers an embedded pane with its OWN silent refresh before troubling the hub', async () => {
+    // The pane holds the same 30-day refresh cookie as the top-level path. A
+    // lapsed access cookie (laptop slept through the proactive refresh) is fixed
+    // by one refresh call — no SSH mint, no iframe reload, no lost pane state.
+    const post = vi.fn()
+    fetchMock.mockResolvedValue(okJson({ ok: true }))
+    await withMockedParent(post, async () => {
+      embedded403()
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled())
+      expect(post).not.toHaveBeenCalled()
+      expect(banner()).toBeNull()
+    })
+  })
+
+  it('hands recovery to the hub — ONCE — when the pane cannot refresh itself', async () => {
+    // A terminal 401 means the refresh chain is gone, so the hub must re-mint.
+    // Every later 403 in this document is the SAME unrepaired session: the hub
+    // answers each ask with an SSH mint, so asking once is the whole budget.
+    const post = vi.fn()
+    fetchMock.mockResolvedValue(res(401, 'revoked'))
+    await withMockedParent(post, async () => {
+      embedded403()
+      await vi.waitFor(() => expect(post).toHaveBeenCalledWith({ type: 'mc-auth-expired' }, '*'))
+      for (let i = 0; i < 5; i++) embedded403()
+      await Promise.resolve()
+      expect(post).toHaveBeenCalledTimes(1)
+      // Still no banner: the hub owns recovery inside a pane.
+      expect(banner()).toBeNull()
+    })
+  })
+
+  it('re-opens the hub hand-off after auth is restored', async () => {
+    // The latch is about one UNREPAIRED session, not the lifetime of the
+    // document: a 2xx proves recovery, so a later genuine lapse may ask again.
+    const post = vi.fn()
+    fetchMock.mockResolvedValue(res(401, 'revoked'))
+    await withMockedParent(post, async () => {
+      embedded403()
+      await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(1))
+      removeAuthBanner() // what a successful response does
+      embedded403()
+      await vi.waitFor(() => expect(post).toHaveBeenCalledTimes(2))
+    })
   })
 
   it('falls through to the banner path when the parent frame is unreachable', async () => {
-    const original = Object.getOwnPropertyDescriptor(window, 'parent')
-    Object.defineProperty(window, 'parent', {
-      value: { postMessage: () => { throw new Error('cross-origin') } },
-      writable: true,
-      configurable: true,
+    fetchMock.mockResolvedValue(res(401, 'revoked'))
+    // Exhaust the pane's own refresh first (terminal 401), so the 403 below goes
+    // straight to the hand-off — which throws. The throw is swallowed and the
+    // banner is the documented fallback.
+    await expect(attemptSilentRefresh()).resolves.toBe(false)
+    await withMockedParent(() => { throw new Error('cross-origin') }, async () => {
+      expect(() => embedded403()).not.toThrow()
+      await vi.waitFor(() => expect(banner()).not.toBeNull())
     })
-    try {
-      // The postMessage throw is swallowed; the call still returns the response.
-      expect(() => checkSessionExpired(res(403, '', { headers: { 'X-Auth-Required': 'true' } }))).not.toThrow()
-    } finally {
-      if (original) Object.defineProperty(window, 'parent', original)
-      await Promise.resolve()
-    }
   })
 
   it('attemptSilentRefresh reports false on a terminal 401 and true on a rotation', async () => {
@@ -473,6 +599,15 @@ describe('session-expired banner', () => {
 /* ──────────────────── 2. URL and body construction ──────────────────── */
 
 describe('query-string builders', () => {
+  it('wakatimeExportUrl builds the export href with encoded dates and the format', () => {
+    expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'csv')).toBe(
+      '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=csv',
+    )
+    expect(api.wakatimeExportUrl('2026-09-01', '2026-09-07', 'json')).toBe(
+      '/api/wakatime/export?start=2026-09-01&end=2026-09-07&format=json',
+    )
+  })
+
   it('kiroPrerequisite distinguishes latched read, coalesced poll and explicit probe', async () => {
     await api.kiroPrerequisite()
     expect(call().url).toBe('/api/kiro-prerequisite')
@@ -558,14 +693,16 @@ describe('query-string builders', () => {
     expect(call().url).toBe('/api/sessions?limit=30&offset=0')
     await api.sessions(10, 20, true)
     expect(call(1).url).toBe('/api/sessions?limit=10&offset=20&preview=1')
+    await api.sessions(30, 0, false, true)
+    expect(call(2).url).toBe('/api/sessions?limit=30&offset=0&exclude_open=1')
     await api.sessionsSearch('a b', 5)
-    expect(call(2).url).toBe('/api/sessions/search?q=a%20b&limit=5')
+    expect(call(3).url).toBe('/api/sessions/search?q=a%20b&limit=5')
     await api.vectorEpisodic(10, 5, 'promo,l6')
-    expect(call(3).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
+    expect(call(4).url).toBe('/api/memory/episodic?limit=10&offset=5&tags=promo%2Cl6')
     await api.vectorEpisodic()
-    expect(call(4).url).toBe('/api/memory/episodic?limit=50&offset=0')
+    expect(call(5).url).toBe('/api/memory/episodic?limit=50&offset=0')
     await api.vectorEpisodicSearch('q', 'tag')
-    expect(call(5).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
+    expect(call(6).url).toBe('/api/memory/episodic/search?q=q&tags=tag')
   })
 
   it('discovery endpoints append provider and limit only when set', async () => {
@@ -760,6 +897,8 @@ describe('request bodies with conditionally-omitted keys', () => {
     // index 0 is a legitimate fork point and must not be dropped as falsy.
     await api.forkChatSlot('chat-1', 0, 'why', 'plan', 'down')
     expect(call(1).body).toEqual({ at_message_index: 0, prompt: 'why', mode: 'plan', direction: 'down' })
+    await api.forkChatSlot('chat-1', 7, undefined, undefined, 'head', 'row-42')
+    expect(call(2).body).toEqual({ at_message_index: 7, at_message_id: 'row-42', direction: 'head' })
   })
 
   it('slackLink sends no body at all when it is only asking for the existing link', async () => {
@@ -859,11 +998,11 @@ describe('request bodies with conditionally-omitted keys', () => {
     expect(call(3).body).toEqual({ steps: [{ title: 'a' }], task_id: '', original_input: '' })
   })
 
-  it('createWebhookToken requires a signature by default', async () => {
-    await api.createWebhookToken('ci')
-    expect(call().body).toEqual({ label: 'ci', require_signature: true })
+  it('createWebhookToken requires a signature by default and carries the destination', async () => {
+    await api.createWebhookToken('ci', undefined, 'code-reviewer')
+    expect(call().body).toEqual({ agent: 'code-reviewer', label: 'ci', require_signature: true })
     await api.createWebhookToken('legacy', false)
-    expect(call(1).body).toEqual({ label: 'legacy', require_signature: false })
+    expect(call(1).body).toEqual({ agent: '', label: 'legacy', require_signature: false })
   })
 
   it('addUserDeniedCommand defaults the operator note to empty', async () => {
@@ -990,7 +1129,7 @@ describe('sendChat theme consent', () => {
 
   it('steerChat always injects into the running turn', async () => {
     await api.steerChat('now', 'chat-1')
-    expect(call().url).toBe('/api/chat')
+    expect(call().url).toBe('/api/chat?ws=1')
     expect(call().body).toEqual({ message: 'now', slot: 'chat-1', steer: true })
   })
 })
@@ -998,11 +1137,16 @@ describe('sendChat theme consent', () => {
 /* ─────────────── 3. the non-trivial method implementations ─────────────── */
 
 describe('revealPath', () => {
-  it('copies the path when the host is headless and cannot reveal it', async () => {
+  // The transport is side-effect-free: it posts the action and returns the wire
+  // shape. When the host is headless it hands back a `copy` path for the caller
+  // (`revealOrOpen`) to write — `api.revealPath` itself never touches the
+  // clipboard, so the degrade lives in exactly one place.
+  it('returns the copy path when the host is headless and cannot reveal it', async () => {
     fetchMock.mockResolvedValue(okJson({ copy: '/home/u/report.zip' }))
-    await api.revealPath('/home/u/report.zip')
+    const r = await api.revealPath('/home/u/report.zip')
     expect(call().body).toEqual({ path: '/home/u/report.zip', action: 'reveal' })
-    expect(vi.mocked(copyToClipboard)).toHaveBeenCalledWith('/home/u/report.zip')
+    expect(r).toMatchObject({ copy: '/home/u/report.zip' })
+    expect(vi.mocked(copyToClipboard)).not.toHaveBeenCalled()
   })
 
   it('does not touch the clipboard when the OS handled it', async () => {
@@ -1048,6 +1192,29 @@ describe('sttTranscribe', () => {
       await api.sttTranscribe(new Blob(['a']))
     } finally { spy.mockRestore() }
     expect(calls[0][2]).toBe('recording.webm')
+  })
+})
+
+describe('uploadCrewAvatar', () => {
+  // Same happy-dom caveat as sttTranscribe: the filename the client chose is
+  // read off the append call, not out of the FormData.
+  it('stages the picture as multipart under the field the handler reads', async () => {
+    const calls: unknown[][] = []
+    const spy = vi.spyOn(FormData.prototype, 'append').mockImplementation(function (
+      this: FormData,
+      ...args: unknown[]
+    ) {
+      calls.push(args)
+    })
+    const blob = new Blob(['png'], { type: 'image/png' })
+    try {
+      await api.uploadCrewAvatar('my crew', blob)
+    } finally { spy.mockRestore() }
+    const { url, init } = call()
+    expect(url).toBe('/api/agents/my%20crew/avatar')
+    expect(init?.method).toBe('POST')
+    expect(init?.body).toBeInstanceOf(FormData)
+    expect(calls).toEqual([['file', blob, 'avatar.png']])
   })
 })
 
@@ -1285,16 +1452,73 @@ describe('publishToProvider', () => {
   })
 })
 
+describe('voice synthesis request ownership', () => {
+  it('announces the request synchronously and sends the same id to the gateway', async () => {
+    const started = vi.fn()
+    window.addEventListener('voice-synthesis-start', started)
+    try {
+      const synthesis = api.voiceSynthesize('slot-1', '你好')
+      expect(started).toHaveBeenCalledOnce()
+      const detail = (started.mock.calls[0][0] as CustomEvent).detail
+      expect(detail.slot).toBe('slot-1')
+      expect(detail.request_id).toEqual(expect.any(String))
+      await synthesis
+      expect(call().body).toEqual({ slot: 'slot-1', text: '你好', request_id: detail.request_id })
+    } finally {
+      window.removeEventListener('voice-synthesis-start', started)
+    }
+  })
+
+  it('preserves the structured HTTP error for the request owner to filter', async () => {
+    const failed = vi.fn()
+    fetchMock.mockResolvedValue(res(502, { error: 'provider unavailable', code: 'voice_model_config_invalid' }))
+    window.addEventListener('voice-synthesis-failed', failed)
+    try {
+      await expect(api.voiceSynthesize('slot-1', '你好', { request_id: 'request-1' })).rejects.toBeInstanceOf(ApiError)
+      expect(failed).toHaveBeenCalledOnce()
+      expect((failed.mock.calls[0][0] as CustomEvent).detail).toEqual({
+        slot: 'slot-1', request_id: 'request-1', code: 'voice_model_config_invalid',
+      })
+    } finally {
+      window.removeEventListener('voice-synthesis-failed', failed)
+    }
+  })
+})
+
 /* ─────────────────── 4. whole-surface request invariant ─────────────────── */
 
 describe('every api method issues one well-formed /api request', () => {
   // Exercised individually above with the fixtures they need (a Blob, a
   // ReadableStream, a File list, an object-URL download).
-  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'installFromRegistryStream', 'exportPlanYaml'])
+  // `skills` joins them because it wraps the fetch in a deadline, so it USES the
+  // signal argument rather than forwarding it; junk there is not a URL question.
+  // `appSessionStatus` cannot be probed positionally: its 4th argument is a
+  // boolean selecting between the two prefixes an app backend may be served at,
+  // and the generic probe passes the truthy string 'sw-4', which legitimately
+  // routes to the reverse-proxy base `/apps/<app>/api/` rather than `/api/`.
+  // Covered exhaustively by `appSessionStatus.test.ts` — both prefixes, app-name
+  // encoding, the statusPath guard, and the junk-leak assertions this table
+  // would otherwise apply.
+  // `wakatimeExportUrl` is a pure URL builder: it RETURNS the string the export
+  // anchor navigates to and issues no fetch, so the one-request probe below
+  // cannot apply. Covered by a direct URL assertion in `query-string builders`.
+  const HAND_TESTED = new Set(['sttTranscribe', 'uploadFiles', 'uploadCrewAvatar', 'installFromRegistryStream', 'exportPlanYaml', 'skills', 'slashCommands', 'appSessionStatus', 'wakatimeExportUrl'])
 
   type AnyFn = (...args: unknown[]) => unknown
   const methods = Object.entries(api as unknown as Record<string, AnyFn>)
     .filter(([name, fn]) => typeof fn === 'function' && !HAND_TESTED.has(name))
+
+  // Methods whose URL comes out of an ARGUMENT'S FIELD rather than a positional
+  // string. The generic `'sw-1'` args below would make such a method build its
+  // URL from `undefined` — a harness artifact, not a defect in the method — so
+  // each one names the minimal shape its URL is read from.
+  const ARGS: Record<string, unknown[]> = {
+    // `invokeFileMenuItem(item, ctx)`: the URL is `item.endpoint`.
+    invokeFileMenuItem: [
+      { id: 'send', app: 'doc-store', endpoint: '/api/apps/doc-store/send' },
+      { surface: 'file-overflow', path: '/tmp/a.txt', kind: 'file' },
+    ],
+  }
 
   it('covers the whole surface (guards against the table silently shrinking)', () => {
     expect(methods.length).toBeGreaterThan(300)
@@ -1305,7 +1529,7 @@ describe('every api method issues one well-formed /api request', () => {
     // Generic positional arguments. Every method is a thin URL/body builder, so
     // what this asserts is the construction itself: a forgotten argument or a
     // botched template literal shows up as `undefined` inside the path.
-    await Promise.resolve(fn('sw-1', 'sw-2', 'sw-3', 'sw-4'))
+    await Promise.resolve(fn(...(ARGS[name] ?? ['sw-1', 'sw-2', 'sw-3', 'sw-4'])))
 
     expect(fetchMock, `${name} issued no request`).toHaveBeenCalledTimes(1)
     const { url, init } = call()

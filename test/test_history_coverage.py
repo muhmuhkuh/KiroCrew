@@ -20,8 +20,10 @@ Every test writes only under ``tmp_path``; no network, no subprocess.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -36,6 +38,7 @@ from kiro_crew.history import (
     ConversationLog,
     HistoryConsolidator,
 )
+from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.vector_memory import SemanticRejectCode
 
 
@@ -72,6 +75,57 @@ class TestOffLoopWrappers:
             H.append_off_loop(log, "k", "user", "hi", agent="a")
         assert "inline append failed" in caplog.text
         log.append.assert_called_once_with("k", "user", "hi", agent="a")
+
+    def test_append_rows_groups_the_pair_under_one_atomic_hold(self, tmp_path) -> None:
+        """A prompt+result pair must not be two independent off-loop writes.
+
+        Dispatched separately, two worker threads can land them out of order or
+        land one alone, leaving the replay with a reversed or half-written run
+        that no timestamp ordering repairs. The rows go through one
+        ``atomic_appends`` hold instead, which is that contract's stated
+        companion for a multi-append caller that offloads.
+        """
+        log = H.ConversationLog(base_dir=tmp_path)
+        holds: list[str] = []
+        real_atomic = log.atomic_appends
+
+        @contextlib.contextmanager
+        def _spy(key: str):
+            holds.append(key)
+            with real_atomic(key):
+                yield
+
+        with patch.object(log, "atomic_appends", _spy):
+            H.append_rows_if_absent_off_loop(
+                log,
+                "cron:abc",
+                [
+                    ("user", "the prompt", "msg msg-u", "m-1"),
+                    ("assistant", "the result", "msg msg-a", "m-2"),
+                ],
+            )
+        assert holds == ["cron:abc"], "the pair must share exactly one atomic hold"
+        rows = log.read_messages("cron:abc")
+        assert [r["role"] for r in rows] == ["user", "assistant"], "order must be preserved"
+        assert [r["meta"]["mid"] for r in rows] == ["m-1", "m-2"]
+
+    def test_append_rows_keeps_per_row_idempotence(self, tmp_path) -> None:
+        """A row the slot save already persisted is skipped without dropping its sibling."""
+        log = H.ConversationLog(base_dir=tmp_path)
+        log.append("cron:abc", "user", "the prompt", mid="m-1")
+        H.append_rows_if_absent_off_loop(
+            log,
+            "cron:abc",
+            [
+                ("user", "the prompt", "msg msg-u", "m-1"),
+                ("assistant", "the result", "msg msg-a", "m-2"),
+            ],
+        )
+        rows = log.read_messages("cron:abc")
+        assert [r["role"] for r in rows] == ["user", "assistant"], (
+            "the already-present prompt must not be duplicated, and must not "
+            "suppress the result"
+        )
 
     def test_append_if_absent_off_loop_inline_failure_is_logged(self, caplog) -> None:
         log = MagicMock()
@@ -296,6 +350,98 @@ class TestReadTailMessages:
             assert log._read_tail_messages(path, 5, None) == []
 
 
+class TestReadFileChangeMessages:
+    def test_skips_large_irrelevant_rows_and_never_warms_message_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = _log(tmp_path)
+        path = log._path("large")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        change = {
+            "role": "assistant",
+            "content": "done",
+            "ts": "2026-08-25T18:00:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/report.md"}]},
+        }
+        _write(
+            path,
+            _jsonl(
+                {"_type": "metadata"},
+                {"role": "assistant", "content": "x" * 1_000_000},
+                change,
+            ),
+        )
+
+        real_loads = H.json.loads
+        parsed_sizes: list[int] = []
+
+        def tracking_loads(value, *args, **kwargs):
+            parsed_sizes.append(len(value))
+            return real_loads(value, *args, **kwargs)
+
+        monkeypatch.setattr(H.json, "loads", tracking_loads)
+        rows = log.read_file_change_messages("large")
+
+        assert rows == [
+            {
+                "ts": "2026-08-25T18:00:00Z",
+                "meta": {"file_changes": [{"path": "/tmp/report.md"}]},
+            }
+        ]
+        assert len(parsed_sizes) == 1
+        assert parsed_sizes[0] < 1_000
+        assert len(log._msg_cache) == 0
+
+        def unexpected_parse(*_args, **_kwargs):
+            pytest.fail("unchanged projection should come from its lightweight cache")
+
+        monkeypatch.setattr(H.json, "loads", unexpected_parse)
+        assert log.read_file_change_messages("large") is rows
+
+    def test_changed_file_replaces_cached_projection(self, tmp_path: Path) -> None:
+        log = _log(tmp_path)
+        path = log._path("changed")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        first = {
+            "role": "assistant",
+            "ts": "2026-08-25T18:00:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/old.md"}]},
+        }
+        second = {
+            "role": "assistant",
+            "ts": "2026-08-25T18:01:00Z",
+            "meta": {"file_changes": [{"path": "/tmp/new-report.md"}]},
+        }
+        _write(path, _jsonl({"_type": "metadata"}, first))
+        assert log.read_file_change_messages("changed")[0]["meta"] == first["meta"]
+
+        _write(path, _jsonl({"_type": "metadata"}, second))
+
+        assert log.read_file_change_messages("changed") == [
+            {"ts": second["ts"], "meta": second["meta"]}
+        ]
+
+    def test_session_write_invalidates_cached_projection(self, tmp_path: Path) -> None:
+        log = _log(tmp_path)
+        _write(
+            log._path("written"),
+            _jsonl(
+                {"_type": "metadata"},
+                {
+                    "role": "assistant",
+                    "content": "first",
+                    "meta": {"file_changes": [{"path": "/tmp/first.md"}]},
+                },
+            ),
+        )
+        assert log.read_file_change_messages("written")
+        assert "written" in log._file_change_cache
+
+        log.append("written", "assistant", "no document change")
+
+        assert "written" not in log._file_change_cache
+
+
 class TestLastMessagePreview:
     def test_missing_file(self, tmp_path: Path) -> None:
         assert _log(tmp_path).last_message_preview("nope") == ""
@@ -401,6 +547,7 @@ class TestListSessions:
         mtime = (tmp_path / "s1.jsonl").stat().st_mtime
         log._meta_cache["s1"] = (
             mtime,
+            log._cache_gen("s1"),
             {
                 "_type": "metadata",
                 "created_at": "cached-at",
@@ -439,6 +586,7 @@ class TestListSessions:
         mtime = (tmp_path / "s1.jsonl").stat().st_mtime
         log._msg_cache["s1"] = (
             mtime,
+            log._cache_gen("s1"),
             [
                 {"role": "assistant", "content": "skip"},
                 {"role": "user", "content": "cached title"},
@@ -920,7 +1068,7 @@ class TestDedupeJudge:
             "kiro_crew.history.stream_and_collect", AsyncMock(return_value="DUP")
         ):
             assert await c._dedupe_judge("prompt") == "DUP"
-        sessions.release.assert_called_once_with(H.BACKGROUND_KEY)
+        sessions.release.assert_called_once_with(BACKGROUND_KEY)
         sessions.recycle_background.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -941,7 +1089,7 @@ class TestDedupeJudge:
             AsyncMock(side_effect=RuntimeError("provider down")),
         ):
             assert await c._dedupe_judge("prompt") == ""
-        sessions.release.assert_called_once_with(H.BACKGROUND_KEY)
+        sessions.release.assert_called_once_with(BACKGROUND_KEY)
 
     @pytest.mark.asyncio
     async def test_release_failure_is_swallowed(self) -> None:
@@ -972,7 +1120,7 @@ class TestMergeSkillUpdate:
         prompt = collector.await_args.args[1]
         for needle in ("EXISTING BODY", "the description", "trig1, trig2", "1. do it"):
             assert needle in prompt
-        sessions.release.assert_called_once_with(H.BACKGROUND_KEY)
+        sessions.release.assert_called_once_with(BACKGROUND_KEY)
         sessions.recycle_background.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -991,7 +1139,7 @@ class TestMergeSkillUpdate:
             AsyncMock(side_effect=RuntimeError("provider down")),
         ):
             assert await c._merge_skill_update("b", "d", "t", "p") is None
-        sessions.release.assert_called_once_with(H.BACKGROUND_KEY)
+        sessions.release.assert_called_once_with(BACKGROUND_KEY)
 
     @pytest.mark.asyncio
     async def test_release_failure_is_swallowed(self) -> None:
@@ -1347,6 +1495,11 @@ class TestSkillTextHelpers:
         [
             (None, ""),
             ("---\nname: x\n---\nbody text", "body text"),
+            # The locator tolerates a carriage return before each fence
+            # newline, exactly like SKILL_UPDATE's fence: a block the field
+            # parser reads must be a block this strips, or the header rides
+            # into the update-merge prompt under a re-emitted fence.
+            ("---\r\nname: x\r\n---\r\nbody text", "body text"),
             ("no frontmatter", "no frontmatter"),
         ],
     )
@@ -1404,3 +1557,193 @@ class TestIsIncognitoTranscript:
         write gate normalizes via its own allowlist and denies on None, so
         stripping here would silently change which callers fail closed."""
         assert H.is_incognito_transcript("incognito ") is False
+
+
+class TestSidecarSummariesSurviveMtimePreservingRewrites:
+    """Housekeeping that CHANGES the transcript must drop the summary sidecars.
+
+    ``get_cached_summary`` / ``get_cached_intent_summary`` validate their
+    sidecars against ``session_mtime`` — and ``session_mtime``'s docstring calls
+    that "a faithful 'has this conversation changed?' signal". It is not, for
+    housekeeping: ``_rewrite_session_locked`` and ``_maybe_rotate`` deliberately
+    restore the pre-write mtime (``_restore_mtime``) so they do not float stale
+    sessions to the top of ``list_sessions``.
+
+    So a compaction that drops half a transcript leaves the recorded signature
+    still matching, and the sidecar describing the PRE-rewrite conversation is
+    served as valid. Unlike the in-process caches #4293 guards with a generation
+    counter, these are files on disk: the staleness outlives the process and is
+    permanent until a genuine ``append`` lands.
+    """
+
+    def _seed(self, log, key: str) -> float:
+        log.append(key, "user", "first message")
+        log.append(key, "assistant", "first reply")
+        log.append(key, "user", "second message")
+        # Age the transcript BEFORE stamping the sidecars against its mtime.
+        # Filesystem mtime resolution is not the clock's: tmpfs and ext4 stamp from
+        # the kernel's cached wall time, which advances on a timer tick rather than
+        # per write, so these appends and a later one can share a single
+        # ``st_mtime_ns`` (measured: 200 rapid writes to /tmp on a 6.12 kernel
+        # produced ONE distinct value). Every test in this class turns on telling
+        # "the mtime moved" apart from "the mtime was preserved", so that gap has to
+        # be REPRESENTABLE. Backdating states the precondition outright; a sleep
+        # would express the same thing by guessing how long a tick is.
+        now = log.session_mtime(key)
+        assert now is not None
+        aged = now - 60.0
+        os.utime(log._path(key), (aged, aged))
+        sig = log.session_mtime(key)
+        assert sig == aged
+        log.set_cached_summary(key, "describes the PRE-rewrite conversation", sig)
+        log.set_cached_intent_summary(key, {"intents": [{"text": "pre-rewrite"}]}, sig)
+        assert log.get_cached_summary(key) == "describes the PRE-rewrite conversation"
+        return sig
+
+    def test_an_advanced_content_generation_invalidates_both_sidecars(
+        self, tmp_path: Path
+    ) -> None:
+        """The general contract, independent of which writer moved the content.
+
+        ``rotation_generation`` is the module's content-identity counter: it is
+        advanced by every write that makes the transcript a DIFFERENT body of
+        content — a rotation, the dashboard rewrite save
+        (regenerate / rewind / fork, ``chat_persistence``) and a channel
+        transcript merge. Those are exactly the writers that also restore the
+        pre-write mtime, so the counter is the half of the signature that can
+        still tell the sidecars their subject changed.
+
+        Here the metadata is advanced the same way those writers advance it,
+        with the mtime restored, so the ONLY thing that moved is the content
+        identity.
+        """
+        log = _log(tmp_path)
+        sig = self._seed(log, "k")
+
+        path = log._path("k")
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        meta = json.loads(lines[0])
+        meta["rotation_generation"] = int(meta.get("rotation_generation", 0) or 0) + 1
+        lines[0] = json.dumps(meta) + chr(10)
+        path.write_text("".join(lines), encoding="utf-8")
+        H._restore_mtime(path, sig)
+        # Every real preserved-mtime writer invalidates inside its locked
+        # section; without that the in-process metadata cache would still
+        # serve the old generation and this would test nothing.
+        log._invalidate_cache("k")
+
+        assert log.session_mtime("k") == sig, (
+            "precondition: the mtime must be UNCHANGED — otherwise the old "
+            "signature would have caught this on its own and the test proves "
+            "nothing about the generation"
+        )
+        assert log.get_cached_summary("k") is None, (
+            "the summary describes a body of content that has been replaced"
+        )
+        assert log.get_cached_intent_summary("k") is None
+
+        # ...but the payload is still ON DISK and reported as STALE, not gone.
+        # ``read_intent_summary`` deliberately prefers a summary marked out of
+        # date over an empty panel ("an empty panel reads as 'this feature is
+        # broken'"), which is why the signature is widened rather than the
+        # sidecars being deleted outright.
+        payload, stale = log.read_intent_summary("k")
+        assert payload is not None and stale is True
+
+    def test_a_rotation_invalidates_both_sidecars(self, tmp_path: Path) -> None:
+        """Rotation archives the oldest messages — same class, same fix."""
+        log = _log(tmp_path)
+        self._seed(log, "k")
+
+        path = log._path("k")
+        prev_mtime = path.stat().st_mtime
+        with patch.object(H, "_SESSION_MAX_BYTES", 1):
+            log._maybe_rotate(path, "k")
+
+        assert log.get_cached_summary("k") is None
+        assert log.get_cached_intent_summary("k") is None
+        assert path.stat().st_mtime == prev_mtime
+
+    def test_a_metadata_only_write_keeps_them(self, tmp_path: Path) -> None:
+        """The deliberate exclusion, and the reason this is not "invalidate on
+        every preserved-mtime write".
+
+        ``mark_consolidated`` rewrites ``lines[0]`` only — the bookkeeping
+        offset — and never touches a message. The conversation the summary
+        describes is unchanged, so discarding an LLM-generated summary here
+        would be a pure cost with no correctness gain.
+        """
+        log = _log(tmp_path)
+        self._seed(log, "k")
+
+        log.mark_consolidated("k", 1)
+
+        assert log.get_cached_summary("k") == "describes the PRE-rewrite conversation"
+        assert log.get_cached_intent_summary("k") is not None
+
+    def _advance_generation(self, log, key: str, sig: float) -> None:
+        """A rewrite that replaces the content and RESTORES the mtime."""
+        path = log._path(key)
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        meta = json.loads(lines[0])
+        meta["rotation_generation"] = int(meta.get("rotation_generation", 0) or 0) + 1
+        lines[0] = json.dumps(meta) + chr(10)
+        path.write_text("".join(lines), encoding="utf-8")
+        H._restore_mtime(path, sig)
+        log._invalidate_cache(key)
+
+    def test_a_rewrite_during_generation_cannot_bless_a_stale_summary(
+        self, tmp_path: Path
+    ) -> None:
+        """The write side of the same hole.
+
+        Summary generation holds no lock while the model call is in flight, so
+        the caller captures the signature BEFORE reading the transcript. If the
+        setter read the generation at WRITE time, a rewrite landing in that
+        window would stamp the NEW content's identity onto the OLD summary — and
+        because the rewrite also preserves the mtime, nothing else would ever
+        catch it. The summary would then be served as fresh forever.
+
+        The generation therefore comes from the caller, captured with the
+        signature, exactly as ``mark_consolidated`` already takes the generation
+        its caller snapshotted.
+        """
+        log = _log(tmp_path)
+        sig = self._seed(log, "k")
+        generation = log.rotation_generation("k")
+
+        self._advance_generation(log, "k", sig)
+
+        log.set_cached_summary("k", "summarises the REPLACED content", sig, generation)
+
+        assert log.session_mtime("k") == sig, "precondition: the mtime was preserved"
+        assert log.get_cached_summary("k") is None, (
+            "a summary of superseded content must not be served as current"
+        )
+
+    def test_the_intent_setter_refuses_a_summary_the_rewrite_superseded(
+        self, tmp_path: Path
+    ) -> None:
+        """``set_cached_intent_summary`` already refuses on a changed mtime; a
+        preserved-mtime rewrite is the case that guard cannot see, so it refuses
+        on the generation too rather than storing a known-stale payload."""
+        log = _log(tmp_path)
+        sig = self._seed(log, "k")
+        generation = log.rotation_generation("k")
+
+        self._advance_generation(log, "k", sig)
+
+        stored = log.set_cached_intent_summary(
+            "k", {"intents": [{"text": "superseded"}]}, sig, generation
+        )
+
+        assert stored is False, "the payload describes content that was replaced"
+
+    def test_a_genuine_append_still_invalidates_by_signature(self, tmp_path: Path) -> None:
+        """Control: the existing mtime rule keeps working for ordinary writes."""
+        log = _log(tmp_path)
+        self._seed(log, "k")
+
+        log.append("k", "user", "a real new message")
+
+        assert log.get_cached_summary("k") is None

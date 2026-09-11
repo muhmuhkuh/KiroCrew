@@ -21,6 +21,7 @@ import type { DiscoveredSkill } from '../types'
 
 import { i18nT } from '../i18n/t'
 import { fmtCompact } from '../i18n/format'
+import { useImeGuard } from '../hooks/useImeGuard'
 interface Props {
   open: boolean
   onClose: () => void
@@ -40,6 +41,7 @@ type InstallPhase =
   | { step: 'error'; message: string }
 
 export default function SkillBrowserModal({ open, onClose }: Props) {
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
@@ -166,10 +168,12 @@ export default function SkillBrowserModal({ open, onClose }: Props) {
     if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1) }
     else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1) }
     else if (e.key === 'Enter' && selectedSkill && !(selectedSkill.installed || installedOverride.has(skillKey(selectedSkill)))) {
-      e.preventDefault()
+      // Only the Enter branch is claimed — arrow navigation stays untouched.
+      if (!ime.claimEnter(e)) return
       const phase = installPhases[skillKey(selectedSkill)]
       if (!phase || phase.step === 'error') handleInstall(selectedSkill)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `ime` stays out on purpose: useImeGuard hands back a fresh object per render whose claimEnter closes over a ref-held latch, so any copy reads the live composition state when the key fires. Listing it would rebuild the handler (and re-prop both the search bar and every row) every render for no gain.
   }, [moveSelection, selectedSkill, installedOverride, installPhases, handleInstall])
 
   return (
@@ -193,6 +197,7 @@ export default function SkillBrowserModal({ open, onClose }: Props) {
           onQueryChange={handleQueryChange}
           onKeyDown={handleKeyDown}
           onClear={clearQuery}
+          inputProps={ime.bindComposition()}
         />
 
         <DiscoveryStates debouncedQuery={debouncedQuery} isLoading={isLoading} resultCount={results.length} noun="skills" />

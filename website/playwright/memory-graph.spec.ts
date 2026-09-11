@@ -10,8 +10,9 @@ import { test, expect } from '@playwright/test'
 test.describe('Memory surfaces E2E Tests', () => {
   test('Overview drills into the memory browser and back', async ({ page }) => {
     await page.goto('/overview', { waitUntil: 'domcontentloaded' })
-    // Two summary cards share the verb; Usage renders first, Memory second.
-    const drill = page.getByRole('button', { name: 'View details' }).nth(1)
+    // Summary cards share the verb, in render order: Usage (0), WakaTime (1),
+    // Memory (2).
+    const drill = page.getByRole('button', { name: 'View details' }).nth(2)
     await drill.waitFor({ state: 'visible' })
     await drill.click()
     await expect(page.getByRole('heading', { name: /memory settings/i })).toBeVisible({ timeout: 5000 })
@@ -21,7 +22,7 @@ test.describe('Memory surfaces E2E Tests', () => {
   })
 
   test('memory browser exposes the manual summarize action', async ({ page }) => {
-    await page.goto('/settings?tab=overview&view=memory', { waitUntil: 'domcontentloaded' })
+    await page.goto('/settings/overview?view=memory', { waitUntil: 'domcontentloaded' })
     await expect(page.getByRole('button', { name: /summarize now/i })).toBeVisible({ timeout: 5000 })
   })
 

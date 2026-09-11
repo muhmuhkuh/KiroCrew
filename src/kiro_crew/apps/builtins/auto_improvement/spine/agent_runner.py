@@ -35,14 +35,17 @@ import subprocess
 import threading
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.hooks import TOOL_DENY, HookManager, hooks_config_from_config_dict
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import SIGKILL, kill_process_tree
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from .git_safety import GIT_SAFE_CONFIG, require_pinned
 
@@ -530,6 +533,7 @@ def _governance_denial(ev: object, *, session_key: str, agent: str) -> str:
             app="auto-improvement",
             tool_kind=tool_kind,
             raw_params=getattr(ev, "raw_tool_params", None),
+            diff_path=getattr(ev, "diff_path", "") or "",
             command=command or None,
             # From the EVENT, not derived from the command. `HookManager.on_tool_call` denies
             # when `is_shell and not command` — a shell tool whose command could not be
@@ -661,17 +665,13 @@ class AgentRunner:
         try:
             kill_process_tree(popen.pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError, ValueError):
-            try:
+            with suppress(Exception):
                 popen.kill()
-            except Exception:  # noqa: BLE001
-                pass
         try:
             popen.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
-            try:
+            with suppress(Exception):
                 kill_process_tree(popen.pid, SIGKILL)
-            except Exception:  # noqa: BLE001
-                pass
 
     @staticmethod
     def available() -> bool:
@@ -837,6 +837,7 @@ class AgentRunner:
         # longer reach credentials outside the worktree — without removing the only path
         # that works when no in-process provider is configured. Deleting it would turn
         # "no provider" from "degraded but functional" into "silently does nothing".
+        cleanup = None
         try:
             popen, cleanup = self._spawn_sandboxed_agent(cmd, cwd)
         except FileNotFoundError:
@@ -888,25 +889,28 @@ class AgentRunner:
                 ok=False, error=f"{type(e).__name__}: {e}", duration_s=time.monotonic() - t0
             )
 
-        proc = type("P", (), {"returncode": popen.returncode, "stdout": stdout, "stderr": stderr})()
-
         dur = time.monotonic() - t0
-        if proc.returncode != 0:
+        if popen.returncode != 0:
             return AgentResult(
-                ok=False, error=f"exit {proc.returncode}: {proc.stderr[-400:]}", duration_s=dur
+                ok=False,
+                error=f"exit {popen.returncode}: {redact_via_context(stderr or '')[-400:]}",
+                duration_s=dur,
             )
         try:
-            envelope = json.loads(proc.stdout)
+            envelope = json.loads(stdout)
         except json.JSONDecodeError:
             return AgentResult(
                 ok=False,
                 error="unparseable claude json envelope",
                 duration_s=dur,
-                raw={"stdout": proc.stdout[-400:]},
+                raw={"stdout": stdout[-400:]},
             )
 
         result_text = envelope.get("result", "")
-        cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+        try:
+            cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
         with self._cost_lock:
             self._total_cost_usd += cost
         if envelope.get("is_error"):
@@ -927,10 +931,8 @@ class AgentRunner:
         )
 
     def _emit_activity(self, ev: dict) -> None:
-        try:
+        with suppress(Exception):
             self._on_activity(ev)  # type: ignore[misc]
-        except Exception:  # noqa: BLE001 — a sink error must never break the run
-            pass
 
     def _run_streaming(
         self, popen, t0: float, timeout_s: float, *, cwd: str | None = None
@@ -1011,7 +1013,8 @@ class AgentRunner:
         except Exception:  # noqa: BLE001
             self._terminate_group(popen)
         stderr_thread.join(timeout=2.0)  # let the drain finish; tail comes from its buffer
-        stderr_tail = ("".join(stderr_chunks))[-400:]
+        # Redact BEFORE the tail cut, same reason as the non-streaming path above.
+        stderr_tail = redact_via_context("".join(stderr_chunks))[-400:]
 
         dur = time.monotonic() - t0
         with self._cost_lock:
@@ -1171,13 +1174,26 @@ class SessionAgentRunner:
     @staticmethod
     def available() -> bool:
         """True iff a Kiro Crew provider factory can be built (a backend is configured).
-        Lets the backend prefer this runner and fall back to the subprocess ``claude -p``
-        runner only when no provider is available."""
+        Lets the backend prefer this runner; there is no subprocess fallback left, so a
+        False here means the backend stays offline."""
         try:
 
             cfg = KiroCrewConfig.load()
             return cfg.create_provider_factory() is not None
         except Exception:  # noqa: BLE001 — any failure → not available, caller falls back
+            # Do NOT discard this. ``create_provider_factory`` has a single method-level
+            # return and cannot yield None, so False is reachable ONLY from this handler —
+            # i.e. only when something raised. The backend's offline reason already tells
+            # the operator that "the gateway config load or the provider-factory
+            # construction raised", and without this line it can never say WHAT raised.
+            # The realistic cause is the acp → client → session → config.loader circular
+            # import the loader documents, which resolves only when ``acp`` is imported
+            # first, and it was previously invisible in every log.
+            logger.warning(
+                "SessionAgentRunner.available(): provider factory could not be built, "
+                "reporting the agent runner as unavailable",
+                exc_info=True,
+            )
             return False
 
     def ensure_agent_registered(self) -> bool:
@@ -1251,10 +1267,8 @@ class SessionAgentRunner:
     def _emit_activity(self, ev: dict) -> None:
         if self._on_activity is None:
             return
-        try:
+        with suppress(Exception):
             self._on_activity(ev)
-        except Exception:  # noqa: BLE001 — a sink error must never break the run
-            pass
 
     def run(
         self,
@@ -1532,10 +1546,8 @@ class SessionAgentRunner:
             return _finish(ok=True)
         finally:
             if provider is not None:
-                try:
+                with suppress(Exception):
                     await provider.shutdown()
-                except Exception:  # noqa: BLE001
-                    pass
 
     @staticmethod
     async def _reject(provider, rid, *, tool: str = "", session_key: str = "") -> None:
@@ -1604,7 +1616,7 @@ class SessionAgentRunner:
             except Exception:  # noqa: BLE001 - the agent's own timeout covers this
                 logger.debug("reject_tool after audit failure also failed: %s", exc)
             return
-        try:
+        with suppress(Exception):
             # ONE-SHOT, never `always=True`. Persistent approval tells the provider to stop
             # sending permission requests for matching calls (the base contract: "the user
             # picked 'always allow'", and ACP backends may turn it into an `addRules`
@@ -1614,8 +1626,6 @@ class SessionAgentRunner:
             # with its first approval; re-deciding per call is the whole point of routing
             # through here. Raised by the GPT review of this branch.
             await provider.approve_tool(rid)
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _repro_test_dir(worktree: Path) -> str:
@@ -1624,7 +1634,7 @@ def _repro_test_dir(worktree: Path) -> str:
     The prompt used to hard-code ``test/``, but a repo using ``tests/`` (plural) then got
     a reproducing test written into a directory that does not exist, so T2 could never
     collect it and EVERY candidate failed ``test_invalid`` regardless of fix quality.
-    Found by running docs/system-specs/modules/auto-improvement-test-plan.md against Zedmor/chess_test, which uses ``tests/``.
+    Found by running docs/system-specs/modules/auto-improvement.md against Zedmor/chess_test, which uses ``tests/``.
 
     The edit fence already permits both (``_ADDABLE_TEST_GLOBS``), so only the
     instruction was wrong. Prefers an EXISTING directory; falls back to ``test``.
@@ -1788,7 +1798,7 @@ def author_bug_fix(
     st = subprocess.run(
         ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, "status", "--porcelain"],
         capture_output=True,
-        text=True,
+        **UTF8_TEXT,
     )
     if not st.stdout.strip():
         return False
@@ -1942,6 +1952,6 @@ def author_perf_fix(
     st = subprocess.run(
         ["git", "-C", str(worktree), *_GIT_SAFE_CONFIG, "status", "--porcelain"],
         capture_output=True,
-        text=True,
+        **UTF8_TEXT,
     )
     return bool(st.stdout.strip())

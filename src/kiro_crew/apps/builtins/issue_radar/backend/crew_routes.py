@@ -390,10 +390,18 @@ async def _json_object(request: web.Request) -> tuple[dict, web.Response | None]
     Split out of :func:`_body_preamble` so the agent write path can read a body
     without the owner/repo gate it does not use — one implementation, so the two
     paths cannot drift on which malformed payload gets which refusal.
+
+    Follows the ``dashboard/handlers/_shared.read_bounded_json`` contract on
+    Q1/Q2 (400 for a non-object; catch spanning the client-input failure set of
+    ``LookupError``/``RecursionError``/``ValueError`` so an unknown ``charset=``
+    codec is a 400 and a mid-read transport error still propagates). The
+    deliberate divergence is the extra ``_holds_non_finite_number`` gate below:
+    ``NaN``/``Infinity`` decode fine here but are not valid JSON on the wire, so
+    they are refused rather than persisted.
     """
     try:
         raw = await request.json()
-    except Exception:
+    except (LookupError, RecursionError, ValueError):
         return {}, web.json_response(
             {"error": "request body must be JSON", "code": "invalid_json"}, status=400
         )
@@ -820,13 +828,21 @@ async def _revoke_execution(
 
 
 async def _handle_crew_work(request: web.Request) -> web.Response:
-    """PUT /crew/work {"owner","repo","crew_id","number", ...patch, "event",
-    "event_kind"} -> {"item","event"}.
+    """PUT /crew/work {"owner","repo","crew_id","number"?, ...patch, "event",
+    "event_kind"} -> {"item","event","skip"}.
 
     THE route a crew writes its progress through, and the one the MCP write tool
     targets. It upserts the work item AND appends one ledger line in a single
     call, which is the whole point: a phase cannot change without a logged reason,
     because there is no route that changes one without the other.
+
+    ``number`` IS OPTIONAL, and omitting it is how a crew records a step that
+    belongs to no issue — today only a queue sweep that took nothing. That case
+    exists because the alternative was worse: a crew with an empty queue had no
+    way to report the cycle except by attributing it to an issue it never touched,
+    so the record either lied or was not written at all. A numberless write takes
+    the crew-level path below: one ledger line, no work item, no skip entry, and
+    no work-item fields accepted.
 
     ORDER MATTERS and is: validate the log line -> write the item -> index a skip
     -> append the line. Validating the kind and text FIRST means the store's own
@@ -879,13 +895,12 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
             return early
         crew_id = routes._str_field(body, "crew_id")
 
-    # Reusing the PR field parser rather than copying its bound: the bound is the
-    # point (the number becomes a FILENAME), and a second copy is how one of them
-    # ships without it. Its out-of-range text says "pull-request number", which is
-    # cosmetically wrong here and only reachable past 1e9.
-    number, number_error = routes._pr_number_field(body)
-    if number_error is not None:
-        return number_error
+    # `number` is OPTIONAL, and its ABSENCE is what selects a crew-level line: a
+    # step that belongs to no issue, which today is only "swept the queue and took
+    # nothing". Presence, not truthiness -- a present-but-invalid number is still a
+    # 400 below rather than being silently reinterpreted as "no issue", because a
+    # crew that meant an issue must not have a typo read as a queue sweep.
+    crew_level = "number" not in body
 
     event_text, too_long = routes._pr_body_field(body, "event")
     if too_long is not None:
@@ -903,10 +918,69 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
              "code": "invalid_event_kind"},
             status=400,
         )
+    # The vocabulary and the shape are paired in BOTH directions, so neither can
+    # drift into the other's meaning. A missing number with an item kind is the
+    # fabricated-number bug this route is being opened up to avoid, and accepting
+    # it would only move the fabrication into the store; a crew-level kind WITH a
+    # number would file a queue sweep under an issue it never touched, which is the
+    # same lie in the other direction.
+    _sweep = crew_store.CREW_LEVEL_EVENT_KIND
+    if crew_level and event_kind != _sweep:
+        return web.json_response(
+            {"error": (f"'number' is required for event_kind {event_kind!r} — only "
+                       f"{_sweep} records a step with no issue"),
+             "code": "number_required"},
+            status=400,
+        )
+    if not crew_level and event_kind == _sweep:
+        return web.json_response(
+            {"error": (f"event_kind {event_kind!r} is crew-level and takes no "
+                       "'number' — it records a step that belongs to no issue"),
+             "code": "unexpected_number"},
+            status=400,
+        )
 
     _crew, missing = await _require_crew(key, crew_id, must_be_live=True)
     if missing is not None:
         return missing
+
+    if crew_level:
+        # Refused rather than dropped. Every field named here patches a WORK ITEM,
+        # and this call creates none, so honouring the write while discarding them
+        # would report success for a phase move or a CI reading that was never
+        # stored anywhere. `skip_scope` is named alongside them because a pass is a
+        # decision about one issue and is indexed by that issue's number.
+        stray = sorted(
+            field for field in (*_WORK_PATCH_FIELDS, "skip_scope") if field in body
+        )
+        if stray:
+            return web.json_response(
+                {"error": (f"{', '.join(repr(f) for f in stray)} belong to a work item, "
+                           "so they cannot be sent without a 'number'"),
+                 "code": "item_fields_without_number"},
+                status=400,
+            )
+        checkpoint = await routes._st(
+            key,
+            crew_store.record_crew_checkpoint,
+            key.owner,
+            key.repo,
+            crew_id,
+            event_text,
+        )
+        return web.json_response(checkpoint)
+
+    # Parsed here rather than above so the log line is validated FIRST, which is
+    # the order this route's docstring prescribes, and so the numbered path holds a
+    # plain ``int`` with no sentinel standing in for the crew-level case.
+    #
+    # Reusing the PR field parser rather than copying its bound: the bound is the
+    # point (the number becomes a FILENAME), and a second copy is how one of them
+    # ships without it. Its out-of-range text says "pull-request number", which is
+    # cosmetically wrong here and only reachable past 1e9.
+    number, number_error = routes._pr_number_field(body)
+    if number_error is not None:
+        return number_error
 
     patch = {field: body[field] for field in _WORK_PATCH_FIELDS if field in body}
     # The route derives the pass's PROSE (only it has the request body); the store
@@ -985,6 +1059,53 @@ async def _handle_crew_pause(request: web.Request) -> web.Response:
         await _revoke_execution(request, crew, "paused")
     routes._audit("crew_pause", f"{key.slug}:{crew_id}:{'on' if paused else 'off'}", "ok")
     return web.json_response({"crew": crew})
+
+
+# ── the crew fabric (pipeline view) ─────────────────────────────────────────
+
+
+def _fabric_page(owner: str, repo: str, root: Any) -> dict[str, Any]:
+    """The ``items`` half of ``GET /crew/fabric``, computed in ONE off-loop call.
+
+    The provider gate is NOT here — it is the route's, because a non-GitHub repo
+    still answers 200 with an empty list and this helper is only reached once the
+    repo is known to be crew-bearing. Kept parallel to ``_crews_page`` /
+    ``_crew_page``: one off-loop hop that reads every crew's items and the ledger,
+    rather than a hop per crew.
+    """
+    return {
+        "schema": crew_store.FABRIC_SCHEMA,
+        "phases": list(crew_store.SPINE_PHASES),
+        "items": crew_store.fold_fabric(owner, repo, root),
+    }
+
+
+async def _handle_crew_fabric(request: web.Request) -> web.Response:
+    """GET /crew/fabric?owner&repo -> {schema, owner, repo, provider, host,
+    generated_at, phases[], items[]} — the pipeline view's whole payload.
+
+    Cookie-authenticated browser only, gated on the repo being CONNECTED, exactly
+    like ``GET /crews``: no write gate (it is a read) and no agent reachability (it
+    is not in ``_AGENT_REACHABLE``, so ``_agent_gate`` refuses an internal-secret
+    caller).
+
+    Non-GitHub providers answer ``items: []`` at HTTP 200, not an error: crews are a
+    GitHub-only feature today, so a GitLab repo simply has no crews to fold, and the
+    frontend renders the same designed empty state it renders for a GitHub repo that
+    never ran one. A repo with no crews answers the same way, from the fold itself.
+    """
+    key, early = await _query_preamble(request)
+    if early is not None:
+        return early
+    if key.is_github:
+        page = await asyncio.to_thread(
+            partial(_fabric_page, key.owner, key.repo, routes._scope(key))
+        )
+    else:
+        page = {"schema": crew_store.FABRIC_SCHEMA, "phases": list(crew_store.SPINE_PHASES), "items": []}
+    return web.json_response(
+        {**routes._identity(key), "generated_at": store._now_iso(), **page}
+    )
 
 
 # ── repo-wide protocol settings ─────────────────────────────────────────────
@@ -1114,6 +1235,7 @@ def register_crew_routes(app: web.Application) -> None:
     _add("GET", "/crews/settings", _handle_crews_settings_get)
     _add("PUT", "/crews/settings", _handle_crews_settings_put)
     _add("GET", "/crew", _handle_crew_read)
+    _add("GET", "/crew/fabric", _handle_crew_fabric)
     _add("PUT", "/crew", _handle_crew_update)
     _add("DELETE", "/crew", _handle_crew_retire)
     _add("PUT", "/crew/work", _handle_crew_work)

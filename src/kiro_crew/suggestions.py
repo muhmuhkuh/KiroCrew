@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING
 from aiohttp import web
 
 from kiro_crew.context import ContextBuilder
-from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
+from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.sel import sel
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
@@ -64,7 +64,9 @@ class SuggestionsCache:
 
     suggestions: list[str] = field(default_factory=lambda: list(_FALLBACK_SUGGESTIONS))
     generated_at: float = 0.0
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # LoopBoundLock, not asyncio.Lock (#4800): the cache is stored on the
+    # long-lived DashboardState, which outlives any single event loop.
+    _lock: LoopBoundLock = field(default_factory=LoopBoundLock, repr=False)
     _task: asyncio.Task | None = field(default=None, repr=False)  # type: ignore[type-arg]
 
 
@@ -167,39 +169,29 @@ def _redact_suggestions(suggestions: list[str]) -> list[str]:
 
 async def generate_suggestions(state: DashboardState) -> list[str]:
     """Generate suggestions using the background kiro-cli session."""
-    context = _build_context(state)
+    # _build_context() calls list_sessions() + recent() — O(all sessions) disk IO.
+    # Offload to keep the event loop responsive (same pattern as this PR's other
+    # two offload sites in sessions.py).
+    context = await asyncio.to_thread(_build_context, state)
     if not context or len(context) < 50:
         logger.debug("Insufficient context for suggestions — using fallback")
         return list(_FALLBACK_SUGGESTIONS)
 
     prompt = _PROMPT_TEMPLATE.replace("{context}", context)
 
-    session = await state.sessions.get_bg_session()
-    text = ""
+    # run_bg_oneliner owns the shared background-session skeleton (acquire _bg,
+    # reject + SEL-audit any tool call, drive the event loop, destroy in finally)
+    # and its reactive rejected-model fallback — so a partition that does not
+    # serve "auto" (e.g. GovCloud) retries once with an advertised model instead
+    # of failing permanently. Best-effort: on any error fall back to the static
+    # suggestions rather than surfacing it.
     try:
-        async def _stream() -> str:
-            nonlocal text
-            async for event in session.prompt(prompt):
-                if event.kind == EVENT_TEXT_CHUNK:
-                    text += event.text
-                elif event.kind == EVENT_PERMISSION_REQUEST:
-                    sel().log_tool_invocation(
-                        session_key="_bg",
-                        tool_name=getattr(event, "title", "unknown"),
-                        outcome="denied",
-                        source="suggestions",
-                    )
-                    await session.reject_tool(event.request_id)
-                elif event.kind == EVENT_COMPLETE:
-                    break
-            return text
-
-        await asyncio.wait_for(_stream(), timeout=60)
-    except asyncio.TimeoutError:
-        logger.warning("Suggestions generation timed out")
+        text = await run_bg_oneliner(
+            state.sessions, prompt, sel_source="suggestions", timeout=60
+        )
+    except Exception:
+        logger.warning("Suggestions generation failed", exc_info=True)
         return list(_FALLBACK_SUGGESTIONS)
-    finally:
-        await session.destroy()
 
     suggestions = _parse_suggestions(text)
     if suggestions:

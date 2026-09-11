@@ -170,9 +170,10 @@ interface PanelOverrides {
   content?: string
   onSubmitComments?: (message: string) => void
   embedded?: boolean
+  connected?: boolean
 }
 
-function renderPanel({ kind = 'markdown', content = SEED_CONTENT, onSubmitComments, embedded }: PanelOverrides = {}) {
+function renderPanel({ kind = 'markdown', content = SEED_CONTENT, onSubmitComments, embedded, connected }: PanelOverrides = {}) {
   const onClose = vi.fn()
   const utils = renderWithProviders(
     <Routes>
@@ -186,6 +187,7 @@ function renderPanel({ kind = 'markdown', content = SEED_CONTENT, onSubmitCommen
             onClose={onClose}
             onSubmitComments={onSubmitComments}
             embedded={embedded}
+            connected={connected}
           />
         }
       />
@@ -494,6 +496,26 @@ describe('ArtifactPanel', () => {
       expect(document.activeElement).toBe(focusable[1])
     })
 
+    it('declines a boundary Tab that belongs to an IME composition', async () => {
+      // On WebKit the keydown that commits a candidate arrives AFTER
+      // compositionend with `isComposing` already false — unguarded, the trap
+      // would yank focus and abort the composition (issue class of the shared
+      // hook's own guard).
+      renderPanel()
+      await screen.findByText(NAME)
+      const dialog = await enterFullscreen()
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+
+      last.focus()
+      fireEvent.compositionStart(last)
+      fireEvent.compositionEnd(last)
+      fireEvent.keyDown(dialog, { key: 'Tab' })
+      expect(document.activeElement).toBe(last)
+      expect(document.activeElement).not.toBe(first)
+    })
+
     it('navigates to the full artifact page from the overlay header', async () => {
       renderPanel()
       await screen.findByText(NAME)
@@ -591,6 +613,38 @@ describe('ArtifactPanel', () => {
       fireEvent.click(overlaySubmit)
       expect(onSubmitComments).toHaveBeenCalledTimes(1)
       expect(within(dialog).getByText('2 comments to send to this chat')).toBeInTheDocument()
+    })
+  })
+
+  describe('offline gating (submit-to-chat)', () => {
+    // The submit bar must mirror ChatInput's Send gating: while the gateway is
+    // disconnected the chat send path silently refuses messages, so an offline
+    // Submit would flash the fake "submitting" spinner and drop the batch.
+    it('disables Submit with the offline affordance when disconnected', async () => {
+      stubComments = [mkComment()]
+      renderPanel({ onSubmitComments: vi.fn(), connected: false })
+      await screen.findByText(NAME)
+      const btn = screen.getByLabelText('Submit disabled — gateway offline')
+      expect(btn).toBeDisabled()
+      expect(btn).toHaveAttribute('title', 'Gateway offline — reconnect to submit comments')
+    })
+
+    it('does not fire onSubmitComments while disconnected', async () => {
+      stubComments = [mkComment()]
+      const onSubmitComments = vi.fn()
+      renderPanel({ onSubmitComments, connected: false })
+      await screen.findByText(NAME)
+      fireEvent.click(screen.getByLabelText('Submit disabled — gateway offline'))
+      expect(onSubmitComments).not.toHaveBeenCalled()
+    })
+
+    it('keeps Submit enabled when connected is omitted (default true)', async () => {
+      stubComments = [mkComment()]
+      const onSubmitComments = vi.fn()
+      renderPanel({ onSubmitComments })
+      await screen.findByText(NAME)
+      fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+      expect(onSubmitComments).toHaveBeenCalledTimes(1)
     })
   })
 })

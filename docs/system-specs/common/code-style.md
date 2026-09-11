@@ -29,27 +29,31 @@ Paths below are relative to `src/kiro_crew/`.
 | Heartbeat intervals | `heartbeat.py` | `_DEFAULT_INTERVAL`, `_FTS_REBUILD_TICKS`, `_PRUNE_TICKS`, `HEARTBEAT_TASK_TIMEOUT_SECS`, `HEARTBEAT_FILE`. |
 | Subagent limits | `subagent.py` | `_MAX_CONCURRENT`, `_TIMEOUT_SECS`, `_TURN_LIMIT`, `_MAX_DONE_RESULT_LEN`, `_STARTUP_TIMEOUT_SECS`, `INJECTION_TIMEOUT`, the reaper/stall intervals. |
 | Slot state caps | `dashboard/state.py` | `_MAX_SLOT_MESSAGES`, `_MAX_PERSISTED_NOTIFICATIONS`, `_MAX_SOURCE_LINKS_PER_SLOT`, `_MAX_PENDING_CONTEXT`, `NATIVE_SUBAGENT_DONE_RESULT_CAP`, `_QUESTION_TIMEOUT_MAX`. |
-| Injected-message envelope prefixes | `dashboard/state.py` | `CRON_NOTIFY_PREFIX` / `CRON_NOTIFY_END` / `CRON_NOTIFY_RE`, `SUBAGENT_COMPLETION_PREFIX`, `SUBAGENT_SYNTHESIS_PREFIX`, and the five `*_RECOVERY_PREFIX` markers. All in one place so the frontend has one list to mirror. See [injected-messages](injected-messages.md). |
+| Injected-message envelope prefixes | `dashboard/state.py` | `CRON_NOTIFY_PREFIX` / `CRON_NOTIFY_END` / `CRON_NOTIFY_RE`, `SUBAGENT_COMPLETION_PREFIX`, `SUBAGENT_SYNTHESIS_PREFIX`, and every `*_RECOVERY_PREFIX` marker — `test_recovery_card_prefixes.py` is the cross-language drift guard that keys on that suffix. All in one place so the frontend has one list to mirror. See [injected-messages](injected-messages.md). |
 | Usage cache TTLs | `dashboard/handlers/usage.py` | `_CACHE_TTL`, `_TOKEN_CACHE_TTL`, `_CONTEXT_CACHE_TTL`, `_TOKEN_HISTORY_DAYS`, `_CONTEXT_TOP_SESSIONS`. |
 | Webhook hook limits | `dashboard/handlers/hooks.py` | `_HOOK_MAX_CONCURRENT` (semaphore-backed, 429 past it), `_HOOK_MESSAGE_MAX_LEN`, `_HOOK_TIMEOUT_DEFAULT` / `_HOOK_TIMEOUT_MAX` (both prime, to avoid a thundering herd with cron intervals). |
 | Embed cache | `embeddings.py` | `_EMBED_CACHE_MAX` (128 entries, keyed by text plus model id; the comment there carries the memory arithmetic). |
+| Bytecode-cache GC limits | `pycache_gc.py` | `PYCACHE_MAX_AGE_DAYS`, `PYCACHE_MAX_TOTAL_BYTES`, `PYCACHE_GC_INTERVAL_SECS` (the `<data home>/cache/pycache` TTL, size cap, and periodic-sweep cadence). |
 | Slack UX strings and pacing | `slack/handler.py` | `_THINKING`, `_CURSOR`, `_NO_RESPONSE`, `_STATUS_WORKING`, `_TRUNCATION_MARKER`, plus `_EDIT_INTERVAL`, `_APPROVAL_TIMEOUT`, `_SLACK_SECTION_TEXT_LIMIT`, the stall thresholds and the phase debounce. |
 | Cross-cutting shared constants | `constants.py` | `KIROCREW_SPAWNED_ENV`, `ENV_TRUTHY`, `CHAT_TURN_TIMEOUT`, `COMPACT_WAIT_TIMEOUT_SECS` (one budget, shared by manual and automatic compaction), the `[OPTIONS:]` parse regexes, `DATA_WARNING`, `BANNER`. |
 | Gateway shutdown budget | `gateway_shutdown_budget.py` | Gateway cooperative timeout, service-manager signal margin, and the derived systemd/launchd stop deadline. |
 | Process-wide shutdown signal | `__init__.py` | `shutdown_event`. Background loops `await shutdown_event.wait()` with a timeout instead of a plain `asyncio.sleep`, so they wake instantly on Ctrl-C. |
 | Base agent config | `config/defaults.json` | `tools`, `allowedTools`, `resources`, `hooks`, model. Packaged as package data, so editing it needs no code change. |
 | Managed MCP server specs | `agent.py` | `_MANAGED_MCP_SERVERS`: which servers are auto-registered and refreshed while preserving user customizations. |
-| Built-in skills | `builtin_skills/<name>/SKILL.md` | Frontmatter (`always`, `triggers`, `dir`) is the skill's own contract. This is the only tree copied into a user's `~/.kiro/crew/skills/`. |
+| AgentCore policy-field validators | `platform/agentcore_schema.py` | `AGENTCORE_GATEWAY_URL_MAX`, `WORKLOAD_NAME_MIN` / `WORKLOAD_NAME_MAX`, `normalize_agentcore_gateway_url`, `normalize_agentcore_workload_name`. AWS-free so governance can parse a policy without the optional extra. |
+| Built-in skills | `builtin_skills/<name>/SKILL.md` | Frontmatter (`always`, `triggers`, `dir`) is the skill's own contract. This is the only tree copied into a user's `~/.kiro/crew/skills/`, so a skill any shipped feature, tool or doc references MUST live here. The top-level `skills/` tree is repo-checkout-only and reaches no installed user. |
 
 Other style rules:
 
 | Rule | Requirement |
 |---|---|
 | Line length | 100 chars (black and isort are both configured to it) |
-| Python version | >= 3.10; `from __future__ import annotations` for type hints |
+| Python version | >= 3.12; `from __future__ import annotations` for type hints |
 | Imports | `import logging` plus `logger = logging.getLogger(__name__)` |
 | Async | `asyncio` throughout; `async def` for all I/O |
+| Module-global asyncio primitives | Never a bare `asyncio.Lock()`/`Event()`/`Queue()` at module scope — it binds to the import-time (or first-use) loop and raises `RuntimeError` from any other loop (Python 3.10+). Use `kiro_crew.loop_lock.LoopBoundLock` for locks, or create the primitive inside the coroutine. CI enforces this (`loop-bound-locks` gate). |
 | Dataclasses | `@dataclass` for data containers |
+| Product name | The product is **Kiro Crew**: two words, a space, capital `K`. Identifiers keep the spelling their own system gave them (the `kirodotdev/KiroCrew` repo slug, `KiroCrew.dmg` artifacts, the `KiroCrew Nightly` OS identifier, the `kirocrew` CLI, `KIROCREW_*` env vars, `kiro_crew` imports). CI gates the lines a change ADDS, so an existing spelling nearby does not exempt a new one; run `BRAND_BASE_REF=origin/main python3 scripts/check_brand_name.py` before pushing. |
 | Errors | Custom exceptions in `acp/client.py`; return error strings at tool boundaries. See [error-handling](error-handling.md). |
 
 ## Comments explain the WHY
@@ -62,7 +66,10 @@ Do NOT put in a comment or docstring:
 
 - PR or review numbers, review-round or finding markers, ticket ids
 - incident dates, milestone tags, commit SHAs
-- historical narration: "previously", "used to", "we now", "Status: implemented"
+- historical narration: "previously", "used to", "we now", "no longer",
+  "historically", "Status: implemented"
+- a change's place in a sequence of changes: "hotfix", "follow-up to",
+  "regression for", "round N", "GPT round", "review round"
 
 That history lives in git. State CURRENT behavior in present tense. A comment that
 narrates a change is stale the moment the next change lands, and a reader cannot
@@ -71,13 +78,29 @@ tell whether it describes the code in front of them.
 Keep them concise. `_vendor/` (vendored third-party code) and pragma comments
 (`# type: ignore`, `# noqa`) are exempt.
 
+`scripts/check_comment_history.py` enforces this, and the list above IS its rule
+set: every phrase named there is a pattern in the script, and the script matches
+nothing the list does not name. It reads only comment tokens and docstrings, so a
+string literal that is not a docstring is never scanned and a user-facing message
+using one of these phrases is fine. Present-tense purpose is not narration:
+"regression test pins this shape" passes, "regression for the truncated parse"
+does not.
+
+The ~7,600 markers the tree already carries are recorded per file in
+`comment-history-baseline.json`. A file not listed there must be clean, a listed
+file may not grow its count, and a count that drops must be lowered in the same
+PR — run `python3 scripts/check_comment_history.py --write-baseline`, which only
+ever lowers and prunes. It refuses when the baseline is absent, so deleting the
+file cannot amnesty the tree; restore it from git instead.
+
 ## The lint pitfalls
 
-The blocking gates are black (baselined), isort, flake8 and mypy. Run them before
+The blocking gates are black (baselined), the subprocess-encoding gate (baselined), the comment-history gate (baselined), isort, flake8 and mypy. Run them before
 committing:
 
 ```bash
-python3 scripts/check_black_formatting.py && isort src/kiro_crew test
+python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py
+python3 scripts/check_comment_history.py && isort src/kiro_crew test
 flake8 src/kiro_crew test && mypy src/kiro_crew
 python -m pytest
 ```
@@ -88,6 +111,12 @@ recorded in `.github/black-baseline.txt` and exempted; every other file must be
 clean, and a file that *becomes* clean must be pruned from the list, so it only
 ever shrinks. Format what you touched with
 `black --target-version py310 <paths>`, never the whole tree.
+
+**On macOS, run `mypy --platform linux src/kiro_crew`.** CI type-checks on Linux, and
+typeshed guards `os.listxattr` / `getxattr` / `setxattr` behind
+`sys.platform == "linux"` even though macOS has them. A bare local run therefore
+reports errors in files you did not touch, and — the half that matters — it MISSES the
+Linux-only errors CI fails on, so a clean local run is a false green.
 
 | Gate | Rule | Detail |
 |---|---|---|
@@ -107,6 +136,30 @@ The formatter, linter and type-checker are pinned to exact versions in both
 `setup.cfg`'s `dev` extra and `pyproject.toml`'s `dependency-groups`, because
 black and mypy change their output across minor releases and a floating range
 makes a local venv disagree with CI. Bump them in lockstep.
+
+## Subprocess output is decoded explicitly
+
+A text-mode subprocess call (`text=True` / `universal_newlines=True`) without an
+explicit `encoding=` decodes the child's output with the locale's code page —
+UTF-8 on POSIX, the legacy ANSI code page on Windows, where any non-ASCII byte
+becomes mojibake (#3219). CI gates this with
+`scripts/check_subprocess_encoding.py` (AST-based, so multi-line calls are
+judged as one call), behind the shrink-only
+`.github/subprocess-encoding-baseline.txt`.
+
+For a child whose output encoding is knowable — `git`, `gh`, a Python
+interpreter we spawn running our own code — pin the decode with the shared
+definition in `kiro_crew.subprocess_utf8`: splat `**UTF8_TEXT` into the call
+(this keeps the call going through the module's own `subprocess` attribute, so
+tests that patch it by name keep intercepting — and it adds no new spawn
+primitive for `test_spawn_audit` to police). For a Python child, also pin the
+EMIT side with `env={**os.environ, "PYTHONIOENCODING": "utf-8"}`: piped stdout
+on Windows otherwise re-encodes with the ANSI code page before the decode ever
+sees it. Standalone scripts that cannot
+import the package write `encoding="utf-8", errors="replace"` inline. A child
+that genuinely writes in the console encoding (`ps`, `systeminfo`, user shells)
+keeps locale decoding and says so with an inline `# subprocess-encoding: locale`
+marker — an audit trail, not an escape hatch.
 
 ## Frontend
 

@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING
 
 from kiro_crew import embeddings as _embeddings
+from kiro_crew.embeddings import PRIORITY_NORMAL
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.knowledge.chunker import CHUNK_OVERLAP, CHUNK_TOKEN_SIZE
 
@@ -96,6 +97,22 @@ class InProcessEmbedder:
             logger.info("Embedding model not yet available — knowledge embeddings disabled")
         return bool(self._available)
 
+    def wait_ready(self, timeout: float | None = None) -> bool:
+        """Wait for the shared backend in a synchronous, one-shot flow.
+
+        Normal Knowledge requests use :meth:`is_available` and never block on
+        model loading. Benchmarks and other one-shot CLI flows may opt into a
+        bounded wait. Backends without a blocking readiness seam retain the
+        non-blocking :meth:`~kiro_crew.embeddings.EmbeddingBackend.is_ready`
+        fallback required by the public backend contract.
+        """
+        backend = self._get_embedder()
+        wait_ready = getattr(backend, "wait_ready", None)
+        ready = wait_ready(timeout=timeout) if callable(wait_ready) else backend.is_ready()
+        self._available = bool(ready)
+        self._last_check = time.time()
+        return self._available
+
     async def is_available_async(self) -> bool:
         """Loop-safe :meth:`is_available` — runs the probe off-loop.
 
@@ -110,13 +127,20 @@ class InProcessEmbedder:
             return self._available
         return await run_in_embed_pool(self.is_available)
 
-    def embed(self, text: str) -> list[float] | None:
-        """Embed a single text. Returns float list or None on failure."""
+    def embed(self, text: str, *, priority: int = PRIORITY_NORMAL) -> list[float] | None:
+        """Embed a single text. Returns float list or None on failure.
+
+        *priority* is the scheduling class (``PRIORITY_*``) forwarded to the
+        shared backend, which orders competing callers on the one in-process
+        model and sizes its thread pool per class — corpus loops pass
+        ``PRIORITY_BULK`` so they run on the reduced bulk pool and an
+        interactive embed is served ahead of them.
+        """
         if not text.strip():
             return None
         if not self.is_available():
             return None
-        vec = self._get_embedder().embed(text)
+        vec = self._get_embedder().embed(text, priority=priority)
         if vec is None:
             # The backend stopped producing vectors (reset/reload failure) —
             # invalidate the cached availability so the next call re-probes
@@ -125,9 +149,18 @@ class InProcessEmbedder:
         return vec
 
     def embed_for_item(
-        self, title: str, summary: str | None, content: str | None = None
+        self,
+        title: str,
+        summary: str | None,
+        content: str | None = None,
+        *,
+        priority: int = PRIORITY_NORMAL,
     ) -> list[float] | None:
-        """Embed title + summary + chunk content for knowledge items."""
+        """Embed title + summary + chunk content for knowledge items.
+
+        *priority* is forwarded to :meth:`embed` (see there); the default keeps
+        every existing caller on the normal interactive class.
+        """
         parts = [title]
         if summary:
             parts.append(summary)
@@ -142,7 +175,7 @@ class InProcessEmbedder:
                 )
                 content = content[: self.content_budget]
             parts.append(content)
-        return self.embed(" ".join(parts))
+        return self.embed(" ".join(parts), priority=priority)
 
 
 # Keep the old name as an alias so references to OllamaEmbedder in type
@@ -176,7 +209,7 @@ def bytes_to_floats(data: bytes) -> list[float]:
     # so one bad row is skipped instead of aborting the dedup sweep.
     try:
         parsed = json.loads(data)
-    except (json.JSONDecodeError, TypeError, ValueError, UnicodeDecodeError):
+    except (TypeError, ValueError, UnicodeDecodeError):
         parsed = None
     else:
         if isinstance(parsed, list):

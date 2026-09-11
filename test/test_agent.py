@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -12,31 +13,56 @@ from unittest.mock import patch
 
 import pytest
 
+# Shared with ``test_mcp_rebuild_reconsumption`` via a dedicated helpers module --
+# the repo's convention, since a test module is not importable from another one.
+# Re-exported under the original private names so the call sites below are unchanged.
+from mcp_merge_helpers import DEFAULT_MANAGED_MCPS as _DEFAULT_MANAGED_MCPS
+from mcp_merge_helpers import bundled_defaults as _bundled_defaults
+from mcp_merge_helpers import run_install_mcp_merge as _run_install_mcp_merge
+from windows_sim import replace_sharing_violation
+
+from conftest import host_abs, requires_symlinks
 from kiro_crew import agent_state
-from kiro_crew.agent import install_agent, migrate_agent_specs
+from kiro_crew import atomic_write as aw
+from kiro_crew.agent import _MANAGED_MCP_ENTRY_KEYS, install_agent, migrate_agent_specs
 
 
-def _bundled_defaults(tmp_path: Path) -> Path:
-    """Write a minimal bundled defaults.json and return its parent dir."""
-    cfg_dir = tmp_path / "config"
-    cfg_dir.mkdir()
-    defaults = {
-        "model": "claude-default",
-        "tools": ["ReadFile"],
-        "allowedTools": ["ReadFile"],
-        "mcpServers": {},
-        "toolsSettings": {"execute_bash": {"deniedCommands": ["rm -rf /"]}},
-        "hooks": {"preToolUse": "audit"},
-    }
-    (cfg_dir / "defaults.json").write_text(json.dumps(defaults))
-    (cfg_dir / "prompt.md").write_text("system prompt")
-    return cfg_dir
+def _reject_json_constant(name: str):  # pragma: no cover - raises by design
+    """Stand in for a strict JSON reader.
+
+    ``NaN``/``Infinity``/``-Infinity`` are Python extensions, not JSON, so a
+    conforming parser (kiro-cli's) refuses them. Python's own loader accepts them
+    silently, which is exactly why a test that only re-reads with ``json.loads``
+    would pass on a spec kiro-cli cannot read.
+    """
+    raise AssertionError(f"emitted spec carries the non-JSON constant {name!r}")
 
 
-_DEFAULT_MANAGED_MCPS = {
-    "kirocrew-cron": {"command": "/usr/bin/kirocrew", "args": ["mcp-cron"]},
-    "kirocrew-core": {"command": "/usr/bin/kirocrew", "args": ["mcp-core"]},
-}
+@pytest.fixture
+def launchers_confined_to_tmp(tmp_path: Path):
+    """Let ``_resolve_kirocrew_bin`` accept only launchers the test wrote under ``tmp_path``.
+
+    Steps 1 and 2 of the resolver walk EVERY ancestor of the fake package dir,
+    and that dir sits under ``tmp_path`` -- so whatever the host keeps above the
+    temp root is a candidate too. A developer whose ``TMPDIR`` lives inside a
+    checkout has a real ``<checkout>/.venv/Scripts/kirocrew.exe`` (or
+    ``.venv/bin/kirocrew``) on that walk, and it wins over the launcher the test
+    built because step 1 runs to the filesystem root before step 2 starts.
+    Patching ``os.path.isfile`` does not close that door: the validator asks
+    ``Path.is_file`` and ``os.access``. Confining the validator itself makes the
+    resolver's answer a function of the tree the test built, wherever pytest put
+    it. Real validation still runs inside that tree, so a test that expects a
+    stale or dead launcher to be REJECTED keeps that assertion.
+    """
+    import kiro_crew.agent as agent_mod
+
+    real_works = agent_mod._launcher_works
+
+    def _confined(path: Path) -> bool:
+        return str(path).startswith(str(tmp_path)) and real_works(path)
+
+    with patch("kiro_crew.agent._launcher_works", side_effect=_confined):
+        yield
 
 
 def _run_install(tmp_path: Path, cfg_dir: Path, managed_mcps: dict | None = None, **kwargs) -> Path:  # type: ignore[return]
@@ -87,6 +113,552 @@ class TestInstallAgent:
         config = json.loads(path.read_text(encoding="utf-8"))
         assert config["model"] == "claude-default"
         assert "ReadFile" in config["tools"]
+
+    def test_fresh_install_preserves_safe_managed_server_overrides(self, tmp_path: Path):
+        """A clean rebuild keeps preferences without ceding invocation ownership."""
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "command": "/tmp/untrusted",
+                            "args": ["other"],
+                            "url": "https://example.invalid/mcp",
+                            "timeout": 45,
+                            "env": {"MINE": "keep", "KIROCREW_HOME": "/tmp/wrong"},
+                            "autoApprove": ["unreviewed_tool"],
+                        }
+                    }
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        assert entry["command"] == "/usr/bin/kirocrew"
+        assert entry["args"] == ["mcp-core"]
+        assert "url" not in entry
+        assert entry["timeout"] == 45
+        assert entry["env"]["MINE"] == "keep"
+        assert entry["env"].get("KIROCREW_HOME") != "/tmp/wrong"
+        assert "autoApprove" not in entry
+
+    def test_fresh_install_drops_unsupported_entry_keys(self, tmp_path: Path):
+        """A managed entry carries only our fields plus the user's own.
+
+        kiro-cli rejects a spec with a field it does not know, and it rejects the
+        WHOLE agent when it does -- so one stray ``cwd`` on a managed server would
+        take every Kiro Crew tool down with it. Preserving the user's
+        timeout/env/disabled is what put unknown keys in reach on this path (the
+        build used to rebuild the entry from scratch), so the allow-list ships
+        with the preservation rather than after it.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "cwd": "/tmp/elsewhere",
+                            "initializationOptions": {"x": 1},
+                            "url": "https://example.invalid/mcp",
+                            "headers": {"Authorization": "Bearer x"},
+                            "timeout": 45,
+                            "disabled": False,
+                            "disabledTools": ["delete_file"],
+                            "env": {"MINE": "keep"},
+                        }
+                    }
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        # The supported customizations survive -- that is the fix.
+        assert entry["timeout"] == 45
+        assert entry["disabled"] is False
+        assert entry["env"]["MINE"] == "keep"
+        # A user GUARD, not a preference: dropping it would silently re-expose a
+        # tool the user turned off, so it is carried rather than re-derived.
+        assert entry["disabledTools"] == ["delete_file"]
+        # Everything the user cannot declare on a managed server is gone, and
+        # url/headers are dropped as instances of the rule, not as named fields.
+        for unsupported in ("cwd", "initializationOptions", "url", "headers"):
+            assert unsupported not in entry, unsupported
+        # Nothing outside the closed set reaches the spec.
+        assert set(entry) <= _MANAGED_MCP_ENTRY_KEYS
+
+    def test_refresh_drops_unsupported_entry_keys(self, tmp_path: Path):
+        """The refresh path drops the same keys, since one enforcer owns both."""
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "model": "claude-user-custom",
+                    "tools": [],
+                    "allowedTools": [],
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "command": "/old/path/kirocrew",
+                            "args": ["mcp-core"],
+                            "cwd": "/tmp/elsewhere",
+                            "timeout": 30,
+                            "disabledTools": ["execute_cmd"],
+                            "env": {"MINE": "keep"},
+                        },
+                    },
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        assert entry["timeout"] == 30
+        assert entry["env"]["MINE"] == "keep"
+        # The refresh path is the one that would silently widen the tool surface
+        # by dropping this, since it is the path an existing config takes.
+        assert entry["disabledTools"] == ["execute_cmd"]
+        assert "cwd" not in entry
+        assert set(entry) <= _MANAGED_MCP_ENTRY_KEYS
+
+    def test_fresh_install_strips_launcher_exec_env_from_a_managed_entry(self, tmp_path: Path):
+        """A managed shim's env cannot choose what the shim executes.
+
+        Some managed commands are scripts whose shebang resolves the interpreter by
+        NAME at exec time, so a declared ``PATH`` picks the binary and ``BASH_ENV``
+        names a file a non-interactive shell sources first. Neither configures our
+        process; both replace the program. Case variants are asserted because
+        ``sanitize_spec_env`` keeps each key's original spelling while Windows env
+        names are case-insensitive.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "env": {
+                                "PATH": "/tmp/evil/bin",
+                                "BASH_ENV": "/tmp/evil.sh",
+                                "ENV": "/tmp/evil.sh",
+                                "SHELLOPTS": "xtrace",
+                                "BASHOPTS": "expand_aliases",
+                                "NODE_OPTIONS": "--require /tmp/evil.js",
+                                "NODE_PATH": "/tmp/evil/node_modules",
+                                "Path": "/tmp/evil/bin",
+                                "bash_env": "/tmp/evil.sh",
+                                "MINE": "keep",
+                            }
+                        }
+                    }
+                }
+            )
+        )
+
+        # Simulated DEFAULT install, so no data-home pin is emitted and the
+        # assertion below can be an exact equality on the whole env.
+        with patch("kiro_crew.agent._valid_override_home", return_value=None):
+            path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        # The user's own variable is still preserved -- that is the fix this PR is.
+        assert entry["env"] == {"MINE": "keep"}
+
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+    def test_fresh_install_drops_a_non_finite_timeout(self, tmp_path: Path, literal: str):
+        """A float can be the right type and still not be representable in JSON.
+
+        Python's ``json`` accepts these three literals on the way in and writes them
+        back verbatim, so a type check alone ships a spec no strict parser will
+        read -- and kiro-cli rejects the whole agent with it. All three are
+        parametrized because ``isfinite`` is one test for one class, and a fix that
+        only named ``NaN`` would leave the infinities.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            '{"mcpServers": {"kirocrew-core": {"timeout": ' + literal + "}}}"
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        raw = path.read_text(encoding="utf-8")
+        entry = json.loads(raw)["mcpServers"]["kirocrew-core"]
+
+        assert "timeout" not in entry
+        # The emitted file is parseable by a STRICT reader, which is the property
+        # that actually matters -- Python's own loader would accept the bad value.
+        assert literal not in raw
+        json.loads(raw, parse_constant=_reject_json_constant)
+
+    def test_refresh_drops_non_string_tool_list_items(self, tmp_path: Path):
+        """A list of the right type can still hold the wrong items.
+
+        Both list-valued keys carry tool NAMES, so ``disabledTools: [1]`` passes a
+        container-only check and still emits a spec kiro-cli refuses. Filtered per
+        ITEM, not dropped whole -- the same rule this fix applies to env entries --
+        because discarding the list would re-expose every tool the user did name
+        correctly, which is the opposite of what a guard is for.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        (kiro_dir / "kirocrew.json").write_text(
+            json.dumps(
+                {
+                    "model": "claude-user-custom",
+                    "tools": [],
+                    "allowedTools": [],
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "command": "/old/path/kirocrew",
+                            "args": ["mcp-core"],
+                            "disabledTools": ["delete_file", 1, None, {"a": 1}],
+                            "autoApprove": ["read_file", 2],
+                        },
+                    },
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        raw = path.read_text(encoding="utf-8")
+        entry = json.loads(raw)["mcpServers"]["kirocrew-core"]
+
+        # The correctly-named guard survives its malformed neighbours.
+        assert entry["disabledTools"] == ["delete_file"]
+        assert entry["autoApprove"] == ["read_file"]
+        assert all(isinstance(i, str) for i in entry["disabledTools"])
+        assert all(isinstance(i, str) for i in entry["autoApprove"])
+
+    def test_fresh_install_drops_ill_typed_entry_values(self, tmp_path: Path):
+        """A right key with a wrong-typed value is dropped, not shipped.
+
+        The spec is schema-checked, so ``"disabled": "false"`` costs the user every
+        Crew tool exactly like an unknown field would. Dropping beats coercing for
+        the same reason as env entries: a value we invent is not the one they wrote.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "disabled": "false",
+                            "timeout": "45",
+                            "disabledTools": "delete_file",
+                            "autoApprove": {"not": "a list"},
+                            "env": {"MINE": "keep"},
+                        }
+                    }
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        for ill_typed in ("disabled", "timeout", "disabledTools"):
+            assert ill_typed not in entry, ill_typed
+        # The well-typed sibling in the same entry still survives, so one bad
+        # value does not discard the rest of the user's customization.
+        assert entry["env"]["MINE"] == "keep"
+        assert entry["command"] == "/usr/bin/kirocrew"
+
+    def test_fresh_install_drops_a_boolean_timeout(self, tmp_path: Path):
+        """``bool`` is an ``int`` subclass, so a bare isinstance check leaks here."""
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps({"mcpServers": {"kirocrew-core": {"timeout": True}}})
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        assert "timeout" not in entry
+
+    def test_fresh_install_strips_reserved_control_env_keys(self, tmp_path: Path):
+        """agent.json cannot smuggle control-plane env vars into a managed server.
+
+        ``KIROCREW_APPROVAL_MODE`` is read straight out of os.environ by
+        mcp_tools/spawn.py and forwarded as ``approval_mode`` on every
+        ``spawn_run`` subagent launch. If an agent-writable agent.json could
+        seed it onto kirocrew-core's env, a clean rebuild would hand every
+        subagent auto-approval — a full PreToolUse-gate bypass. The other
+        session-identity/secret keys are stripped for the same reason: none
+        of them is something agent.json should ever be able to set.
+
+        The interpreter/loader names are asserted alongside them because they
+        reach the same outcome one layer earlier: a managed server is a Python
+        entry point, so a ``PYTHONPATH`` here lets a ``sitecustomize`` module run
+        during interpreter startup -- inside the process holding the internal API
+        secret, with no tool call for the gate to intercept.
+
+        The strip is ``env.sanitize_spec_env``, so the property under test is
+        the one a name list cannot state: two whole NAMESPACES, ``KIROCREW_``
+        and ``PYTHON``, are refused by PREFIX and case-INSENSITIVELY.
+        ``KIROCREW_CLI`` is asserted because ``mcp_cron._caller_is_cli()`` reads
+        it as "skip per-session ownership entirely";
+        ``PYTHONBREAKPOINT`` because it takes a dotted callable and imports it;
+        ``KIROCREW_NOT_YET_INVENTED`` and ``PYTHONNOTYETINVENTED`` stand for the
+        next variable in each namespace that nobody has added yet, which is the
+        case an enumeration structurally cannot cover. The odd-cased spellings
+        matter on Windows, where environment names are case-insensitive so
+        ``Kirocrew_Approval_Mode`` reaches the consumer exactly like the
+        upper-cased name.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "env": {
+                                "MINE": "keep",
+                                "KIROCREW_APPROVAL_MODE": "auto",
+                                "KIROCREW_SESSION_KEY": "forged",
+                                "KIROCREW_INTERNAL_SECRET": "forged",
+                                "KIROCREW_PRINCIPAL": "forged",
+                                "KIROCREW_CLI": "1",
+                                "KIROCREW_NOT_YET_INVENTED": "forged",
+                                "Kirocrew_Approval_Mode": "auto",
+                                "pythonpath": "/x/evil-lowercase",
+                                "PYTHONPATH": "/x/evil",
+                                "PYTHONHOME": "/x/evil",
+                                "PYTHONSTARTUP": "/x/evil.py",
+                                "PYTHONEXECUTABLE": "/x/evil-python",
+                                "PYTHONWARNINGS": "ignore::evil.Boom",
+                                "PYTHONPLATLIBDIR": "evil-lib",
+                                "PYTHONBREAKPOINT": "evil.run",
+                                "PYTHONUSERBASE": "/x/evil-site",
+                                "PYTHONNOTYETINVENTED": "forged",
+                                "LD_PRELOAD": "/x/evil.so",
+                                "LD_LIBRARY_PATH": "/x/evil",
+                                "DYLD_INSERT_LIBRARIES": "/x/evil.dylib",
+                                "DYLD_LIBRARY_PATH": "/x/evil",
+                            },
+                        }
+                    }
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        assert entry["env"]["MINE"] == "keep"
+        for reserved in (
+            "KIROCREW_APPROVAL_MODE",
+            "KIROCREW_SESSION_KEY",
+            "KIROCREW_INTERNAL_SECRET",
+            "KIROCREW_PRINCIPAL",
+            "KIROCREW_CLI",
+            "KIROCREW_NOT_YET_INVENTED",
+            "Kirocrew_Approval_Mode",
+            "pythonpath",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "PYTHONSTARTUP",
+            "PYTHONEXECUTABLE",
+            "PYTHONWARNINGS",
+            "PYTHONPLATLIBDIR",
+            "PYTHONBREAKPOINT",
+            "PYTHONUSERBASE",
+            "PYTHONNOTYETINVENTED",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ):
+            assert reserved not in entry["env"], reserved
+
+    def test_refresh_strips_reserved_control_env_keys(self, tmp_path: Path):
+        """The refresh path (existing kirocrew.json) scrubs the same reserved keys.
+
+        Asserted on this path too because the shared enforcer is what makes the
+        two agree -- a key stripped on one emit path and preserved on the other
+        is the drift this PR exists to remove.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        kiro_dir = tmp_path / "kiro_agents"
+        kiro_dir.mkdir(exist_ok=True)
+        existing = {
+            "model": "claude-user-custom",
+            "tools": [],
+            "allowedTools": [],
+            "mcpServers": {
+                "kirocrew-core": {
+                    "command": "/old/path/kirocrew",
+                    "args": ["mcp-core"],
+                    "env": {
+                        "MINE": "keep",
+                        "KIROCREW_APPROVAL_MODE": "auto",
+                        "KIROCREW_CLI": "1",
+                        "KIROCREW_NOT_YET_INVENTED": "forged",
+                        "PYTHONPATH": "/x/evil",
+                        "LD_PRELOAD": "/x/evil.so",
+                    },
+                },
+            },
+        }
+        (kiro_dir / "kirocrew.json").write_text(json.dumps(existing))
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        assert entry["env"]["MINE"] == "keep"
+        for reserved in (
+            "KIROCREW_APPROVAL_MODE",
+            "KIROCREW_CLI",
+            "KIROCREW_NOT_YET_INVENTED",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+        ):
+            assert reserved not in entry["env"], reserved
+
+    def test_fresh_install_drops_malformed_non_dict_env(self, tmp_path: Path):
+        """A non-object ``env`` override does not crash the rebuild.
+
+        Pre-fix this fed a non-dict straight to ``dict(...)``, which raises
+        for values like a plain string or a list of non-pair items and would
+        abort the whole config rebuild over a single bad agent.json value.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps({"mcpServers": {"kirocrew-core": {"env": "not-a-dict"}}})
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        assert entry["command"] == "/usr/bin/kirocrew"
+        # The malformed string is discarded rather than fed to dict(...); any
+        # remaining ``env`` key is only Kiro Crew's own KIROCREW_HOME pin (the
+        # test harness's tmp_path counts as an override home).
+        assert set(entry.get("env", {})) <= {"KIROCREW_HOME"}
+
+    def test_fresh_install_drops_non_string_env_values(self, tmp_path: Path):
+        """An ill-typed ``env`` value never reaches the emitted spec.
+
+        The container check above guards ``env`` itself; this guards its
+        ENTRIES. JSON permits any type as a value, and the emitted
+        ``mcpServers`` env is a string map, so copying ``{"PORT": 3000}``
+        through would ship a spec kiro-cli rejects -- costing the user every
+        Crew MCP tool because of one mistyped config value. The bad entries are
+        dropped rather than coerced, and a well-typed sibling still survives,
+        so one bad value does not discard the whole block.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-core": {
+                            "env": {
+                                "GOOD": "kept",
+                                "PORT": 3000,
+                                "FLAG": True,
+                                "NOTHING": None,
+                                "LISTY": ["a", "b"],
+                                "NESTED": {"k": "v"},
+                            },
+                        }
+                    }
+                }
+            )
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-core"]
+
+        assert entry["env"]["GOOD"] == "kept"
+        for bad in ("PORT", "FLAG", "NOTHING", "LISTY", "NESTED"):
+            assert bad not in entry["env"], bad
+        assert all(
+            isinstance(k, str) and isinstance(v, str) for k, v in entry["env"].items()
+        )
+
+    def test_fresh_install_pins_our_data_home_against_a_declared_home(
+        self, tmp_path: Path
+    ):
+        """A declared ``HOME`` cannot relocate a managed shim's data home.
+
+        ``HOME`` is deliberately NOT in ``env.py``'s deny set -- a user's own MCP
+        server legitimately needs it -- so preserving a user's ``env`` means a
+        managed entry can now carry one. That reaches ``Path.home()``, which is
+        how a managed shim resolves OUR data home when no pin is present, so a
+        declared ``HOME`` would relocate the whole store: ``cron_add`` would
+        report success where the gateway never reads and the job would never run.
+
+        Stripped for this population rather than pinned unconditionally. On a
+        default install the child DERIVES the right home by inheriting the
+        gateway's own ``HOME``, and ``TestDataHomePin`` in
+        ``test_computer_use_registration.py`` pins that a default install emits
+        no ``env`` at all, so that an existing user's ``kirocrew.json`` is not
+        churned. Removing the hijack keeps both properties; adding a pin would
+        have broken the second one.
+
+        The case variants are asserted because ``sanitize_spec_env`` preserves
+        each key's ORIGINAL case, so a spec declaring ``userprofile`` arrives
+        with that spelling -- and Windows env names are case-insensitive, so an
+        exact-case strip would miss it while the OS still honoured it.
+        """
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir(exist_ok=True)
+        (user_home / "agent.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "kirocrew-cron": {
+                            "env": {
+                                "HOME": "/x/evil-home",
+                                "USERPROFILE": "C:\\x\\evil-home",
+                                "userprofile": "C:\\x\\evil-lower",
+                                "UserProfile": "C:\\x\\evil-mixed",
+                                "Home": "/x/evil-mixed",
+                                "MINE": "keep",
+                            },
+                        }
+                    }
+                }
+            )
+        )
+
+        # Simulated DEFAULT install: no override home, so nothing pins the child
+        # and the declared HOME would otherwise decide where our data lives.
+        with patch("kiro_crew.agent._valid_override_home", return_value=None):
+            path = _run_install(tmp_path, cfg_dir)
+        entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["kirocrew-cron"]
+
+        for spelling in ("HOME", "USERPROFILE", "userprofile", "UserProfile", "Home"):
+            assert spelling not in entry["env"], spelling
+        # The user's genuine variable still survives, and no pin was invented --
+        # the default-install spec is not churned.
+        assert entry["env"] == {"MINE": "keep"}
 
     def test_existing_config_preserves_user_model(self, tmp_path: Path):
         """Existing kirocrew.json → user's model choice survives restart."""
@@ -476,6 +1048,52 @@ class TestAtomicJsonWrite:
         assert stat.S_IMODE(target.stat().st_mode) == 0o644
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
 
+    def test_a_contended_rename_is_retried_on_windows(self, tmp_path: Path, monkeypatch):
+        """The rename this writer ends on is the one Windows can refuse.
+
+        The docstring reasons about Linux, where `rename()` is atomic and a
+        reader holding the destination cannot block it. On Windows `os.replace`
+        raises `PermissionError` (`WinError 32`) while ANY other handle is open
+        on either path, and a freshly written temp file is exactly what an
+        indexer or AV scanner touches. `replace_with_retry` exists for that
+        window and every other tmp-plus-rename writer in the tree goes through
+        it; this one hand-rolled the rename and did not.
+
+        It matters here more than most: these are the agent configs kiro-cli
+        reads at spawn, so a refused rename surfaces as a failed spawn.
+        """
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _atomic_json_write
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(aw, "_REPLACE_BACKOFF_SECONDS", 0)
+        target = tmp_path / "agent.json"
+        target.write_text("{}", encoding="utf-8")
+
+        with replace_sharing_violation(match="agent.json", times=1) as state:
+            _atomic_json_write(target, {"key": "value"})
+
+        assert state["n"] == 2, "one refused rename, then one that succeeded"
+        assert json.loads(target.read_text(encoding="utf-8")) == {"key": "value"}
+
+    def test_a_posix_permission_error_still_propagates(self, tmp_path: Path, monkeypatch):
+        """POSIX permits replacing an open file, so a PermissionError there is a
+        real access fault — retrying would only delay an honest failure, and
+        the temp file must still be cleaned up."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _atomic_json_write
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        target = tmp_path / "agent.json"
+        target.write_text("{}", encoding="utf-8")
+
+        with replace_sharing_violation(match="agent.json", times=1):
+            with pytest.raises(PermissionError):
+                _atomic_json_write(target, {"key": "value"})
+
+        assert list(tmp_path.glob("*.tmp")) == [], "the temp file must not be left behind"
+        assert target.read_text(encoding="utf-8") == "{}", "the target is unchanged"
+
     def test_no_temp_file_left_on_success(self, tmp_path: Path):
         from kiro_crew.agent import _atomic_json_write
 
@@ -489,6 +1107,7 @@ class TestAtomicJsonWrite:
 class TestAllSkillPathsLocalSymlinks:
     """Test symlink resolution in _all_skill_paths for ~/.aim/skills/local/."""
 
+    @requires_symlinks
     def test_resolves_local_symlink_with_skills_parent(self, tmp_path: Path):
         """Symlink target whose parent is named 'skills' is added."""
         from kiro_crew.agent import _all_skill_paths
@@ -510,6 +1129,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(target_parent) in paths
 
+    @requires_symlinks
     def test_skips_symlink_with_non_skills_parent(self, tmp_path: Path):
         """Symlink target whose parent is NOT named 'skills' is excluded."""
         from kiro_crew.agent import _all_skill_paths
@@ -528,6 +1148,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(tmp_path / "project" / "other") not in paths
 
+    @requires_symlinks
     def test_skips_sensitive_parent_path(self, tmp_path: Path):
         """Symlink resolving into a sensitive directory is excluded."""
         from kiro_crew.agent import _all_skill_paths
@@ -547,6 +1168,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(sensitive_skills) not in paths
 
+    @requires_symlinks
     def test_skips_broken_symlink(self, tmp_path: Path):
         """Broken symlink raises OSError with strict=True and is logged."""
         from kiro_crew.agent import _all_skill_paths
@@ -586,6 +1208,7 @@ class TestAllSkillPathsLocalSymlinks:
 
         assert str(local_dir / "not-a-symlink" / "skills") not in paths
 
+    @requires_symlinks
     def test_ignores_symlink_to_file(self, tmp_path: Path):
         """Symlink pointing to a file (not directory) is skipped."""
         from kiro_crew.agent import _all_skill_paths
@@ -606,8 +1229,92 @@ class TestAllSkillPathsLocalSymlinks:
         assert str(tmp_path / "project" / "skills") not in paths
 
 
+@pytest.mark.usefixtures("launchers_confined_to_tmp")
 class TestResolveKirocrewBin:
     """Tests for lazy kirocrew binary resolution."""
+
+    @pytest.fixture
+    def no_interpreter_scripts(self, tmp_path: Path):
+        """Neutralise the interpreter's-own-prefix resolution step.
+
+        That step answers from the REAL interpreter running this suite, whose
+        prefix legitimately holds a ``bin/kirocrew`` whenever the suite runs
+        inside an install — so it short-circuits resolution before any LATER
+        step can be observed. Tests asserting a later step must point it at an
+        empty prefix; tests asserting the step itself supply their own.
+        """
+        empty = tmp_path / "empty-prefix"
+        empty.mkdir(exist_ok=True)
+        with patch("sys.exec_prefix", str(empty)):
+            yield
+
+    def test_prefers_interpreter_scripts_dir_over_path(self, tmp_path: Path):
+        """A sibling-tree console script beats an unrelated one on PATH.
+
+        A prefix-style runtime can put the package under
+        ``<root>/lib/python3.12/site-packages/`` and the console script under
+        the interpreter prefix ``<root>/python3.12/`` — sibling trees, so the
+        parent walk cannot reach the script. Resolution used to fall through to
+        PATH and pick up whatever ``kirocrew`` an unrelated earlier install had
+        left there, then cache it as the command for the built-in MCP servers.
+
+        The launcher is created through ``_kirocrew_bin_subpath`` rather than at
+        a hardcoded ``bin/kirocrew``, so the layout is the one this OS actually
+        looks for (``Scripts\\kirocrew.exe`` on Windows).
+        """
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
+
+        root = tmp_path / "runtime"
+        pkg_dir = root / "lib" / "python3.12" / "site-packages" / "kiro_crew"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "__init__.py").write_text("")
+
+        # The console script lives under the interpreter PREFIX, a sibling tree
+        # of the package, not above site-packages.
+        prefix = root / "python3.12"
+        own_bin = _kirocrew_bin_subpath(prefix)
+        own_bin.parent.mkdir(parents=True, exist_ok=True)
+        own_bin.write_text("#!/bin/sh\nexec true\n")
+        own_bin.chmod(0o755)
+
+        # An unrelated install's launcher, earlier on PATH.
+        other = tmp_path / "elsewhere"
+        other.mkdir()
+        path_bin = other / "kirocrew"
+        path_bin.write_text("#!/bin/sh\nexec true\n")
+        path_bin.chmod(0o755)
+
+        mock_mc = unittest.mock.MagicMock()
+        mock_mc.__file__ = str(pkg_dir / "__init__.py")
+
+        # Keep the real validator but confine it to this tmp tree, so a
+        # ``kirocrew`` that happens to exist on the host cannot be selected.
+        _real_works = agent_mod._launcher_works
+
+        def _scoped_works(p: Path) -> bool:
+            return str(p).startswith(str(tmp_path)) and _real_works(p)
+
+        old_val = agent_mod._KIROCREW_BIN
+        try:
+            agent_mod._KIROCREW_BIN = None
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict("sys.modules", {"kiro_crew": mock_mc}))
+                stack.enter_context(
+                    patch("kiro_crew.agent._launcher_works", side_effect=_scoped_works)
+                )
+                stack.enter_context(patch("sys.exec_prefix", str(prefix)))
+                stack.enter_context(
+                    patch(
+                        "shutil.which",
+                        side_effect=lambda c: str(path_bin) if c == "kirocrew" else None,
+                    )
+                )
+                result = _resolve_kirocrew_bin()
+            assert result == str(own_bin)
+            assert result != str(path_bin)
+        finally:
+            agent_mod._KIROCREW_BIN = old_val
 
     def test_finds_bin_in_parent_hierarchy(self, tmp_path: Path):
         """Walks up from package dir to find bin/kirocrew."""
@@ -641,7 +1348,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_falls_back_to_shutil_which(self, tmp_path: Path):
+    def test_falls_back_to_shutil_which(self, tmp_path: Path, no_interpreter_scripts):
         """Falls back to PATH lookup when bin/ not found in hierarchy."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
@@ -683,7 +1390,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_returns_kirocrew_when_not_found(self, tmp_path: Path):
+    def test_returns_kirocrew_when_not_found(self, tmp_path: Path, no_interpreter_scripts):
         """Returns 'kirocrew' string when not found anywhere."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
@@ -705,7 +1412,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_skips_stale_shutil_which_result(self, tmp_path: Path):
+    def test_skips_stale_shutil_which_result(self, tmp_path: Path, no_interpreter_scripts):
         """Falls through to bare 'kirocrew' when shutil.which returns a
         path that no longer exists (e.g. deleted after Toolbox migration).
         Regression test for scenario where
@@ -741,7 +1448,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_walk_and_path_miss_falls_back_to_bare(self, tmp_path: Path):
+    def test_walk_and_path_miss_falls_back_to_bare(self, tmp_path: Path, no_interpreter_scripts):
         """When the bin walk and PATH both miss, fall back to bare 'kirocrew'.
 
         The public install has no Brazil ``brazil-path run.runtimefarm`` step,
@@ -782,7 +1489,7 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_brazil_path_failure_falls_through(self, tmp_path: Path):
+    def test_brazil_path_failure_falls_through(self, tmp_path: Path, no_interpreter_scripts):
         """brazil-path raising an exception falls through without crashing."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
@@ -1035,6 +1742,114 @@ class TestResolveKirocrewBin:
             agent_mod._KIROCREW_BIN = old_val
 
 
+class TestKirocrewBinSubpath:
+    """Tests for the per-OS console-script subpath (#4439).
+
+    On Windows the resolver must prefer the relocatable ``bin\\kirocrew.cmd``
+    shim over the pip-generated ``Scripts\\kirocrew.exe``: inside the shipped
+    desktop bundle the ``.exe`` embeds the ABSOLUTE interpreter path of the
+    build agent and can never run on the user's machine, while the ``.cmd``
+    resolves its interpreter via ``%~dp0``. Mirrors the ranking in
+    ``website/electron/find-bin.js``.
+    """
+
+    def test_posix_returns_bin_kirocrew(self, tmp_path: Path, monkeypatch):
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        # Even with a stray kirocrew.cmd present, POSIX resolution is unchanged.
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "kirocrew.cmd").write_text("@echo off\n")
+        assert _kirocrew_bin_subpath(tmp_path) == tmp_path / "bin" / "kirocrew"
+
+    def test_windows_prefers_relocatable_cmd_shim(self, tmp_path: Path, monkeypatch):
+        """Bundle layout: BOTH launchers exist -> the .cmd shim wins."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        (tmp_path / "bin").mkdir()
+        cmd_shim = tmp_path / "bin" / "kirocrew.cmd"
+        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        (tmp_path / "Scripts").mkdir()
+        (tmp_path / "Scripts" / "kirocrew.exe").write_bytes(b"MZ")
+        assert _kirocrew_bin_subpath(tmp_path) == cmd_shim
+
+    def test_windows_falls_back_to_scripts_exe_without_cmd(self, tmp_path: Path, monkeypatch):
+        """Plain pip install: no .cmd shim -> Scripts/kirocrew.exe as before."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        (tmp_path / "Scripts").mkdir()
+        (tmp_path / "Scripts" / "kirocrew.exe").write_bytes(b"MZ")
+        expected = tmp_path / "Scripts" / "kirocrew.exe"
+        assert _kirocrew_bin_subpath(tmp_path) == expected
+
+    def test_windows_cmd_must_be_a_file(self, tmp_path: Path, monkeypatch):
+        """A directory named kirocrew.cmd does not shadow the .exe fallback."""
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _kirocrew_bin_subpath
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        (tmp_path / "bin" / "kirocrew.cmd").mkdir(parents=True)
+        expected = tmp_path / "Scripts" / "kirocrew.exe"
+        assert _kirocrew_bin_subpath(tmp_path) == expected
+
+    def test_bin_is_usable_accepts_cmd_batch_shim(self, tmp_path: Path):
+        """A `.cmd` starts with `@`, not `#!` -> no shebang to validate, usable."""
+        from kiro_crew.agent import _bin_is_usable
+
+        shim = tmp_path / "kirocrew.cmd"
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        assert _bin_is_usable(shim) is True
+
+    def test_resolver_walk_finds_cmd_shim_in_bundle_layout(
+        self, tmp_path: Path, monkeypatch, launchers_confined_to_tmp
+    ):
+        """End-to-end: the parent walk PREFERS the bundle's .cmd on Windows.
+
+        Pins the issue's failure mode: the bundle ships BOTH launchers, and
+        resolving the co-present ``Scripts\\kirocrew.exe`` instead of the
+        ``.cmd`` shim is exactly the #4439 defect.
+        """
+        import kiro_crew.agent as agent_mod
+        from kiro_crew import platform_compat
+        from kiro_crew.agent import _resolve_kirocrew_bin
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+
+        # Bundle layout (packaging/build-desktop.sh build_backend_windows):
+        # <root>/Lib/site-packages/kiro_crew + <root>/bin/kirocrew.cmd
+        # + the pip-dropped <root>/Scripts/kirocrew.exe (non-relocatable).
+        root = tmp_path / "kirocrew-backend"
+        pkg_dir = root / "Lib" / "site-packages" / "kiro_crew"
+        pkg_dir.mkdir(parents=True)
+        (pkg_dir / "__init__.py").write_text("")
+        (root / "bin").mkdir()
+        cmd_shim = root / "bin" / "kirocrew.cmd"
+        cmd_shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        # The test host is POSIX, where the resolver's X_OK gate is real.
+        cmd_shim.chmod(0o755)
+        (root / "Scripts").mkdir()
+        dead_exe = root / "Scripts" / "kirocrew.exe"
+        dead_exe.write_bytes(b"MZ")
+        dead_exe.chmod(0o755)
+
+        mock_mc = unittest.mock.MagicMock()
+        mock_mc.__file__ = str(pkg_dir / "__init__.py")
+
+        old_val = agent_mod._KIROCREW_BIN
+        try:
+            agent_mod._KIROCREW_BIN = None
+            with patch.dict("sys.modules", {"kiro_crew": mock_mc}):
+                result = _resolve_kirocrew_bin()
+            assert result == str(cmd_shim)
+        finally:
+            agent_mod._KIROCREW_BIN = old_val
+
+
 class TestKirocrewMcpInvocation:
     """Tests for built-in MCP server invocation resolution.
 
@@ -1059,6 +1874,44 @@ class TestKirocrewMcpInvocation:
 
         # Bare "kirocrew" is the unresolved sentinel from _resolve_kirocrew_bin.
         with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value="kirocrew"):
+            cmd, args = _kirocrew_mcp_invocation("mcp-core")
+        assert cmd == sys.executable
+        assert args == ["-m", "kiro_crew", "mcp-core"]
+
+    def test_unwraps_cmd_shim_to_sibling_interpreter(self, tmp_path: Path):
+        """A resolved bin/kirocrew.cmd is never emitted verbatim (#4439).
+
+        Mirrors website/electron/main.js: the shim is unwrapped to
+        ``<root>/python.exe -s -m kiro_crew <sub>`` so kiro-cli spawns the
+        interpreter, not a batch file.
+        """
+        from kiro_crew.agent import _kirocrew_mcp_invocation
+
+        root = tmp_path / "kirocrew-backend"
+        (root / "bin").mkdir(parents=True)
+        shim = root / "bin" / "kirocrew.cmd"
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+        interpreter = root / "python.exe"
+        interpreter.write_bytes(b"MZ")
+        interpreter.chmod(0o755)  # X_OK is real on the POSIX test host
+
+        with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
+            cmd, args = _kirocrew_mcp_invocation("mcp-cron")
+        assert cmd == str(interpreter)
+        # -P keeps the spawn CWD off sys.path (the bundle interpreter is
+        # pinned 3.12, so the 3.11+ flag is safe); -s drops user site-packages.
+        assert args == ["-P", "-s", "-m", "kiro_crew", "mcp-cron"]
+
+    def test_cmd_shim_without_interpreter_falls_back_to_sys_executable(self, tmp_path: Path):
+        """Corrupted bundle: shim present but python.exe missing -> sys.executable."""
+        from kiro_crew.agent import _kirocrew_mcp_invocation
+
+        root = tmp_path / "kirocrew-backend"
+        (root / "bin").mkdir(parents=True)
+        shim = root / "bin" / "kirocrew.cmd"
+        shim.write_text('@echo off\r\n"%~dp0..\\python.exe" -s -m kiro_crew %*\r\n')
+
+        with patch("kiro_crew.agent._resolve_kirocrew_bin", return_value=str(shim)):
             cmd, args = _kirocrew_mcp_invocation("mcp-core")
         assert cmd == sys.executable
         assert args == ["-m", "kiro_crew", "mcp-core"]
@@ -1307,6 +2160,7 @@ class TestKiroHooksMerge:
         result = _merge_kiro_hooks({}, user)
         assert result["preToolUse"] == [{"command": hook, "matcher": "*"}]
 
+    @requires_symlinks
     def test_validate_rejects_symlink_to_sensitive(self, tmp_path: Path):
         """Symlinks resolving to sensitive paths are rejected."""
         from kiro_crew.agent import _validate_hook_command
@@ -2527,6 +3381,7 @@ class TestKiroHooksAutoimport:
         assert result["preToolUse"][0]["command"].endswith("/ok.sh")
         assert any("not executable" in rec.message for rec in caplog.records)
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_skips_sensitive_path(self, tmp_path: Path, monkeypatch):
         """Scripts resolving into a sensitive path (~/.ssh) are rejected."""
         from kiro_crew.agent import _autoimport_kiro_hooks
@@ -3404,6 +4259,7 @@ class TestKiroHooksAutoimport:
             for rec in caplog.records
         )
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_rejects_symlink_escaping_dir(self, tmp_path: Path, caplog):
         """A symlink inside hooks_dir pointing at an outside script is rejected.
 
@@ -3512,6 +4368,7 @@ class TestKiroHooksAutoimport:
         assert command == str(script)
         assert "failed validation" in reason
 
+    @requires_symlinks
     def test_kiro_hooks_dir_stored_as_resolved_path(self, tmp_path: Path, monkeypatch):
         """Regression: ``_autoimport_kiro_hooks`` receives the *resolved* hooks dir.
 
@@ -3708,6 +4565,7 @@ class TestKiroHooksAutoimport:
             f"(nothing was rejected); got: {sel_calls!r}"
         )
 
+    @requires_symlinks
     def test_kiro_hooks_autoimport_rejects_dir_equal_to_symlinked_home(
         self, tmp_path: Path, monkeypatch, caplog
     ):
@@ -3980,7 +4838,9 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
             assert "url" not in entry, f"{name} still has stale url"
             assert "headers" not in entry, f"{name} still has stale headers"
             assert entry["command"]
-            assert entry["args"] == args
+            # Windows uses the interpreter-module fallback, which prepends
+            # ``-m kiro_crew.__main__`` before the same managed subcommand.
+            assert entry["args"][-len(args) :] == args
 
     def test_non_managed_server_url_preserved(self):
         from kiro_crew.agent import _refresh_dynamic_fields
@@ -4111,61 +4971,9 @@ def _make_exec(tmp_path: Path, name: str) -> str:
     return str(p)
 
 
-def _run_install_mcp_merge(
-    tmp_path: Path,
-    cfg_dir: Path,
-    *,
-    cc_servers: dict,
-    kiro_servers: dict,
-    kirocrew_servers: dict | None = None,
-    which_side_effect=lambda c, **kw: c,
-) -> dict:
-    """Run install_agent with CC-global and Kiro-global mcp.json seeded and a
-    customizable shutil.which. Returns the parsed kirocrew.json config."""
-    kiro_dir = tmp_path / "kiro_agents"
-    kiro_dir.mkdir(exist_ok=True)
-    prompt = cfg_dir / "prompt.md"
-    mc_config = tmp_path / "empty_mc_config.json"
-    if not mc_config.exists():
-        mc_config.write_text(json.dumps({"agent": {"kiro_hooks_autoimport": False}}))
-    kiro_mcp = tmp_path / "fake_kiro_mcp.json"
-    cc_mcp = tmp_path / "fake_cc_mcp.json"
-    kiro_mcp.write_text(json.dumps({"mcpServers": kiro_servers}))
-    cc_mcp.write_text(json.dumps({"mcpServers": cc_servers}))
-    if kirocrew_servers is not None:
-        kc_home = tmp_path / "kirocrew_home"
-        kc_home.mkdir(parents=True, exist_ok=True)
-        (kc_home / "mcp.json").write_text(json.dumps({"mcpServers": kirocrew_servers}))
-
-    _user_home = tmp_path / "kirocrew_home"
-    patches = [
-        patch.multiple(
-            "kiro_crew.agent",
-            KIRO_AGENTS_DIR=kiro_dir,
-            _BUNDLED_CFG_DIR=cfg_dir,
-            _KIROCREW_BIN="/usr/bin/kirocrew",
-            _MANAGED_MCP_SERVERS=_DEFAULT_MANAGED_MCPS,
-            _KIRO_MCP_JSON=kiro_mcp,
-            _CC_MCP_JSON=cc_mcp,
-        ),
-        patch("kiro_crew.agent._user_dir", lambda: _user_home),
-        patch("kiro_crew.agent._prompt_path", return_value=prompt),
-        patch("kiro_crew.agent._shipped_defaults", return_value=cfg_dir / "defaults.json"),
-        patch("kiro_crew.agent._project_dir", return_value=None),
-        patch("kiro_crew.agent._aim_skill_paths", return_value=[]),
-        patch("kiro_crew.agent.shutil.which", side_effect=which_side_effect),
-        patch("kiro_crew.agent._mc_config_path", return_value=mc_config),
-        # A companion contributes the Claude Code scope via the CPP seam — the
-        # core no longer reads ~/.claude.json directly at rebuild time (OSS is
-        # Kiro-only). Point the seam at cc_mcp so these merge-priority tests
-        # exercise the seam-routed provider-global merge.
-        patch("kiro_crew.agent._extra_mcp_scope_globals", return_value=[cc_mcp]),
-    ]
-    with ExitStack() as stack:
-        for p in patches:
-            stack.enter_context(p)
-        path = install_agent()
-    return json.loads(path.read_text(encoding="utf-8"))
+def _abs(*parts: str) -> str:
+    """Host-absolute fixture path; see ``conftest.host_abs`` for why ``/opt/shims`` is not enough."""
+    return host_abs(*parts)
 
 
 class TestSpecEnvPathIsExpandedOnEmit:
@@ -4179,19 +4987,25 @@ class TestSpecEnvPathIsExpandedOnEmit:
     """
 
     def test_declared_path_is_expanded(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+        # Host-absolute spellings: the spec's entries pass through the
+        # ``os.path.isabs`` filter in ``_spec_path_entries``, and from Python 3.13
+        # ``ntpath.isabs("/opt/shims")`` is False (no drive), so a POSIX spelling
+        # is dropped as "non-absolute" on Windows and the assertion below sees the
+        # augmentation first instead of the declared dir.
+        shims, usr_bin, bin_dir = _abs("opt", "shims"), _abs("usr", "bin"), _abs("bin")
+        monkeypatch.setenv("PATH", os.pathsep.join([usr_bin, bin_dir]))
         cfg_dir = _bundled_defaults(tmp_path)
         config = _run_install_mcp_merge(
             tmp_path,
             cfg_dir,
             cc_servers={},
-            kiro_servers={"wrapped": {"command": "/opt/wrapped", "env": {"PATH": "/opt/shims"}}},
+            kiro_servers={"wrapped": {"command": "/opt/wrapped", "env": {"PATH": shims}}},
         )
         emitted = config["mcpServers"]["wrapped"]["env"]["PATH"].split(os.pathsep)
         # The declared dir stays first, and the inherited PATH survives.
-        assert emitted[0] == "/opt/shims"
-        assert "/usr/bin" in emitted
-        assert "/bin" in emitted
+        assert emitted[0] == shims
+        assert usr_bin in emitted
+        assert bin_dir in emitted
 
     def test_other_env_keys_are_untouched(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setenv("PATH", "/usr/bin")
@@ -4305,9 +5119,9 @@ class TestSpecEnvPathIsExpandedOnEmit:
 
     def test_rebuild_is_stable(self, tmp_path: Path, monkeypatch) -> None:
         """install_agent runs on every start; the emitted PATH must not grow."""
-        monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
+        monkeypatch.setenv("PATH", os.pathsep.join([_abs("usr", "bin"), _abs("bin")]))
         cfg_dir = _bundled_defaults(tmp_path)
-        servers = {"wrapped": {"command": "/opt/wrapped", "env": {"PATH": "/opt/shims"}}}
+        servers = {"wrapped": {"command": "/opt/wrapped", "env": {"PATH": _abs("opt", "shims")}}}
         first = _run_install_mcp_merge(
             tmp_path, cfg_dir, cc_servers={}, kiro_servers=servers
         )["mcpServers"]["wrapped"]["env"]["PATH"]
@@ -4517,6 +5331,115 @@ class TestRefreshDynamicFieldsSyncsConfigModel:
         assert config["model"] == "claude-sonnet-4.6"
 
 
+class TestResetAgentModel:
+    """The explicit way back to the shipped default (#2559).
+
+    Ownership of a spec's ``model`` cannot be inferred -- a value an older
+    build's propagation wrote and one the user typed in are identical on disk --
+    so the reset is a user action, and these tests pin that it clears BOTH halves
+    of the state (the spec pin and the sidecar flag) and never guesses.
+    """
+
+    def _spec(self, tmp_path: Path, stem: str, body: dict) -> Path:
+        spec = tmp_path / f"{stem}.json"
+        spec.write_text(json.dumps(body), encoding="utf-8")
+        return spec
+
+    def test_clear_model_pin_drops_the_pin_and_resumes_tracking(self):
+        from kiro_crew.agent import clear_model_pin
+
+        config = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        clear_model_pin(config, "kirocrew")
+        assert "model" not in config
+        assert agent_state.get_model_managed("kirocrew") is True
+
+    def test_clear_model_pin_is_idempotent_with_no_pin(self):
+        from kiro_crew.agent import clear_model_pin
+
+        config: dict = {"name": "kirocrew"}
+        clear_model_pin(config, "kirocrew")
+        assert "model" not in config
+        assert agent_state.get_model_managed("kirocrew") is True
+
+    def test_reset_writes_the_spec_and_reports_the_previous_model(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import kiro_crew.agent as agent_mod
+
+        self._spec(tmp_path, "kirocrew", {"name": "kirocrew", "model": "claude-opus-4.8"})
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: tmp_path)
+
+        spec_path, previous = agent_mod.reset_agent_model("kirocrew")
+
+        assert previous == "claude-opus-4.8"
+        assert json.loads(spec_path.read_text(encoding="utf-8")) == {"name": "kirocrew"}
+        assert agent_state.get_model_managed("kirocrew") is True
+
+    def test_reset_overrides_an_explicit_freeze(self, tmp_path: Path, monkeypatch):
+        """A frozen editor pick is the user's own answer, and asking for a reset
+        is a NEWER answer from the same user -- so it wins."""
+        import kiro_crew.agent as agent_mod
+
+        agent_state.set_model_managed("kirocrew", False)
+        self._spec(tmp_path, "kirocrew", {"name": "kirocrew", "model": "claude-haiku-4.5"})
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: tmp_path)
+
+        agent_mod.reset_agent_model("kirocrew")
+        assert agent_state.get_model_managed("kirocrew") is True
+
+    def test_reset_never_writes_bookkeeping_into_the_spec(self, tmp_path: Path, monkeypatch):
+        """kiro-cli validates specs with deny_unknown_fields and drops the whole
+        agent on an unknown key, so a stray sidecar key must be lifted out."""
+        import kiro_crew.agent as agent_mod
+
+        self._spec(
+            tmp_path,
+            "kirocrew",
+            {"name": "kirocrew", "model": "claude-opus-4.8", "cc_model": "claude-sonnet-4.6"},
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: tmp_path)
+
+        spec_path, _ = agent_mod.reset_agent_model("kirocrew")
+        written = json.loads(spec_path.read_text(encoding="utf-8"))
+        assert "cc_model" not in written and "model_managed" not in written
+        assert agent_state.get_cc_model("kirocrew") == "claude-sonnet-4.6"
+
+    def test_reset_resolves_a_spec_whose_filename_differs_from_its_name(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import kiro_crew.agent as agent_mod
+
+        self._spec(tmp_path, "some-file", {"name": "custom-agent", "model": "claude-haiku-4.5"})
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: tmp_path)
+
+        spec_path, previous = agent_mod.reset_agent_model("custom-agent")
+        assert spec_path.name == "some-file.json"
+        assert previous == "claude-haiku-4.5"
+
+    def test_reset_refuses_an_agent_with_no_spec(self, tmp_path: Path, monkeypatch):
+        import kiro_crew.agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: tmp_path)
+        with pytest.raises(FileNotFoundError):
+            agent_mod.reset_agent_model("kirocrew")
+        # Nothing was claimed on a failed reset.
+        assert agent_state.get_model_managed("kirocrew") is None
+
+    def test_refresh_still_leaves_an_unrecorded_spec_alone(self, tmp_path: Path):
+        """The counterpart contract: with no sidecar entry the refresh must not
+        reclassify a pin on its own. Inferring ownership from the value is what
+        makes the explicit reset necessary rather than optional."""
+        from kiro_crew.agent import _refresh_dynamic_fields
+
+        mc = tmp_path / "config.json"
+        mc.write_text(json.dumps({"agent": {"model": "auto"}}), encoding="utf-8")
+        config = {"name": "kirocrew", "model": "claude-opus-4.8"}
+        with patch("kiro_crew.agent._mc_config_path", return_value=mc):
+            _refresh_dynamic_fields(config)
+        assert config["model"] == "claude-opus-4.8"
+        assert agent_state.get_model_managed("kirocrew") is None
+
+
 # ── ensure_agent_materialized (self-heal for kiro-cli "Mode not found") ──
 
 
@@ -4578,3 +5501,432 @@ def test_ensure_agent_materialized_swallows_errors(tmp_path, monkeypatch):
 
     managed = Path(agent_mod.AGENT_FILENAME).stem
     assert agent_mod.ensure_agent_materialized(managed) is False
+
+
+class TestAgentSpecPathRejectsTraversal:
+    """``agent_spec_path`` validates the name BEFORE the path join (#4911 review).
+
+    The path it returns is one ``reset_agent_model`` then WRITES, and the CLI
+    takes the name from a user-supplied ``--agent``, so a traversal would rewrite
+    an arbitrary JSON file and strip its ``model`` key. The guard lives at the
+    resolver so every caller inherits it.
+    """
+
+    def test_traversal_is_refused_and_the_outside_file_is_untouched(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        outsider = tmp_path / "victim.json"
+        original = json.dumps({"model": "claude-opus-4.8", "keep": 1})
+        outsider.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        assert agent_mod.agent_spec_path("../victim") is None
+        with pytest.raises(FileNotFoundError):
+            agent_mod.reset_agent_model("../victim")
+        assert outsider.read_text(encoding="utf-8") == original
+
+    @pytest.mark.parametrize(
+        "name",
+        ["../victim", "a/b", "..", "", "with space", "sub/../../x", "tab\tname"],
+    )
+    def test_names_outside_the_grammar_are_refused(self, tmp_path: Path, monkeypatch, name):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+        assert agent_mod.agent_spec_path(name) is None
+
+    def test_a_valid_name_still_resolves(self, tmp_path: Path, monkeypatch):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "my-agent_2.json").write_text(
+            json.dumps({"name": "my-agent_2"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+        assert agent_mod.agent_spec_path("my-agent_2") == agents / "my-agent_2.json"
+
+
+class TestSpecPathRefusesSymlinks:
+    """A spec is read and then written back, so a symlink is refused, not followed.
+
+    Following one copies the target's contents into the agents directory, which
+    launders a file the reader may not otherwise be allowed to open into a freely
+    readable location (#4911 review).
+    """
+
+    @requires_symlinks
+    def test_a_symlinked_spec_is_refused_and_the_target_is_not_copied(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        secret = tmp_path / "protected.json"
+        secret.write_text(json.dumps({"model": "leaked", "secret": "s"}), encoding="utf-8")
+        link = agents / "kirocrew.json"
+        link.symlink_to(secret)
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        assert agent_mod.agent_spec_path("kirocrew") is None
+        with pytest.raises(FileNotFoundError):
+            agent_mod.reset_agent_model("kirocrew")
+        # The link is intact and nothing was copied into the agents directory.
+        assert link.is_symlink()
+        assert json.loads(secret.read_text(encoding="utf-8"))["secret"] == "s"
+
+    @requires_symlinks
+    def test_the_name_scan_also_skips_a_symlink(self, tmp_path: Path, monkeypatch):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text(json.dumps({"name": "wanted", "model": "x"}), encoding="utf-8")
+        (agents / "some-file.json").symlink_to(outside)
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        assert agent_mod.agent_spec_path("wanted") is None
+
+    def test_a_plain_spec_is_still_accepted(self, tmp_path: Path, monkeypatch):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "kirocrew.json").write_text(json.dumps({"name": "kirocrew"}), encoding="utf-8")
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        assert agent_mod.agent_spec_path("kirocrew") == agents / "kirocrew.json"
+
+
+class TestSpecPathPrefersTheDeclaredName:
+    """A declared ``name`` wins over a matching filename (#4911 review).
+
+    The caller WRITES to the path this returns, so selecting ``<name>.json``
+    when that file declares a different agent clears the wrong agent's pin and
+    leaves the requested one pinned. Matches the order the repo's other two
+    resolvers already use.
+    """
+
+    def _dir(self, tmp_path: Path, monkeypatch) -> Path:
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+        return agents
+
+    def test_a_filename_declaring_another_agent_is_not_selected(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The resolver prefers the declared name. (The WRITE path additionally
+        refuses this state outright -- see TestResetRefusesAnAmbiguousName --
+        because the runtime's choice between the two files is undefined.)"""
+        import kiro_crew.agent as agent_mod
+
+        agents = self._dir(tmp_path, monkeypatch)
+        (agents / "foo.json").write_text(
+            json.dumps({"name": "bar", "model": "bar-model"}), encoding="utf-8"
+        )
+        (agents / "elsewhere.json").write_text(
+            json.dumps({"name": "foo", "model": "foo-model"}), encoding="utf-8"
+        )
+
+        assert agent_mod.agent_spec_path("foo") == agents / "elsewhere.json"
+
+    def test_a_mismatched_filename_is_used_when_nothing_declares_the_name(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """`foo.json` declaring `bar`, with nothing declaring `foo`: the runtime
+        matches it by STEM, so it is the live spec for `--agent foo` and refusing
+        it would leave a live pin unresettable (#4911 review)."""
+        import kiro_crew.agent as agent_mod
+
+        agents = self._dir(tmp_path, monkeypatch)
+        (agents / "foo.json").write_text(
+            json.dumps({"name": "bar", "model": "m"}), encoding="utf-8"
+        )
+
+        assert agent_mod.agent_spec_path("foo") == agents / "foo.json"
+        spec_path, previous = agent_mod.reset_agent_model("foo")
+        assert spec_path.name == "foo.json"
+        assert previous == "m"
+
+    def test_the_filename_is_accepted_when_it_declares_no_name(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import kiro_crew.agent as agent_mod
+
+        agents = self._dir(tmp_path, monkeypatch)
+        (agents / "foo.json").write_text(json.dumps({"model": "m"}), encoding="utf-8")
+        assert agent_mod.agent_spec_path("foo") == agents / "foo.json"
+
+    def test_the_filename_is_accepted_when_it_declares_the_same_name(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import kiro_crew.agent as agent_mod
+
+        agents = self._dir(tmp_path, monkeypatch)
+        (agents / "foo.json").write_text(json.dumps({"name": "foo"}), encoding="utf-8")
+        assert agent_mod.agent_spec_path("foo") == agents / "foo.json"
+
+
+class TestResetRefusesAnAmbiguousName:
+    """Two specs claiming one name is refused, not guessed (#4911 review).
+
+    The runtime resolver accepts EITHER a declared-name match or a filename
+    match and iterates an unordered glob, so which of the two is live is
+    undefined. Clearing either could leave the live pin in place and strip the
+    model from a spec nothing reads.
+    """
+
+    def test_a_declared_match_plus_a_filename_match_is_refused(
+        self, tmp_path: Path, monkeypatch
+    ):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "foo.json").write_text(
+            json.dumps({"name": "bar", "model": "bar-model"}), encoding="utf-8"
+        )
+        (agents / "elsewhere.json").write_text(
+            json.dumps({"name": "foo", "model": "foo-model"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        with pytest.raises(ValueError) as exc:
+            agent_mod.reset_agent_model("foo")
+        assert "undefined" in str(exc.value)
+        # NEITHER file was touched.
+        assert json.loads((agents / "foo.json").read_text(encoding="utf-8"))["model"] == (
+            "bar-model"
+        )
+        assert json.loads((agents / "elsewhere.json").read_text(encoding="utf-8"))["model"] == (
+            "foo-model"
+        )
+        assert agent_mod.agent_state.get_model_managed("foo") is None
+
+    def test_an_unambiguous_declared_match_still_resets(self, tmp_path: Path, monkeypatch):
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "elsewhere.json").write_text(
+            json.dumps({"name": "foo", "model": "foo-model"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        spec_path, previous = agent_mod.reset_agent_model("foo")
+        assert spec_path.name == "elsewhere.json"
+        assert previous == "foo-model"
+
+    def test_two_specs_declaring_the_same_name_is_refused(self, tmp_path: Path, monkeypatch):
+        """Same undefined-liveness argument as the filename collision: the
+        runtime iterates unordered, so a writer cannot pick (#4911 review)."""
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "a.json").write_text(
+            json.dumps({"name": "dup", "model": "a-model"}), encoding="utf-8"
+        )
+        (agents / "b.json").write_text(
+            json.dumps({"name": "dup", "model": "b-model"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        with pytest.raises(ValueError) as exc:
+            agent_mod.agent_spec_path("dup")
+        assert "undefined" in str(exc.value)
+
+        with pytest.raises(ValueError):
+            agent_mod.reset_agent_model("dup")
+        # Neither model was cleared.
+        assert json.loads((agents / "a.json").read_text(encoding="utf-8"))["model"] == "a-model"
+        assert json.loads((agents / "b.json").read_text(encoding="utf-8"))["model"] == "b-model"
+        assert agent_mod.agent_state.get_model_managed("dup") is None
+
+
+class TestSpecReadsAreSizeCapped:
+    """Spec reads go through the hardened, size-capped gate (#4911 review).
+
+    The agents directory is user-writable and shared with other tools, so an
+    oversized file there must be refused rather than slurped into memory. Uses a
+    LOWERED cap instead of a real 50 MB fixture -- writing 50 MB in a test is not
+    acceptable, and the property under test is "the cap is consulted", not its
+    value. Verified against the real 50 MB cap once by hand before landing.
+    """
+
+    def test_an_oversized_spec_is_refused_by_resolver_and_reset(self, tmp_path: Path, monkeypatch):
+        import kiro_crew.agent as agent_mod
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 256)
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "model": "m", "pad": "x" * 1024}), encoding="utf-8"
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        assert agent_mod.agent_spec_path("kirocrew") is None
+        with pytest.raises(FileNotFoundError):
+            agent_mod.reset_agent_model("kirocrew")
+
+    def test_a_normal_sized_spec_under_the_same_cap_still_resets(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The A-side of the cap test: proves the refusal above is the SIZE, not
+        the lowered cap breaking every read."""
+        import kiro_crew.agent as agent_mod
+        from kiro_crew import hooks
+
+        monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 256)
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "model": "claude-opus-4.8"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        _, previous = agent_mod.reset_agent_model("kirocrew")
+        assert previous == "claude-opus-4.8"
+
+
+class TestResetOutputEscapesUntrustedPaths:
+    """A spec FILENAME is untrusted input too (#4911 review).
+
+    The declared-name scan returns whichever file declares the requested name, so
+    its path is attacker-shaped even though the requested name is
+    grammar-validated. Every line that prints one -- success, no-pin, and the
+    ambiguity refusal -- must escape it.
+
+    The hostile path is INJECTED rather than created on disk: control bytes are
+    illegal in a Windows filename, so building the fixture would make these
+    assertions Windows-only-skipped, and the property under test is "the printer
+    escapes what it is handed", not "the filesystem accepts odd names". Keeping
+    the assertion platform-independent follows the conftest rule of probing or
+    injecting rather than blanket-skipping a platform.
+    """
+
+    HOSTILE = "/tmp/agents/evil\x1b[2J.json"
+
+    def test_the_success_line_escapes_the_path(self, monkeypatch, capsys):
+        import kiro_crew.cli_commands as cli_commands
+
+        monkeypatch.setattr(
+            cli_commands,
+            "reset_agent_model",
+            lambda name: (Path(self.HOSTILE), "claude-opus-4.8"),
+        )
+
+        cli_commands._agent_reset_model(argparse.Namespace(agent="kirocrew"))
+
+        out = capsys.readouterr().out
+        assert "Cleared" in out
+        assert "\x1b" not in out, "raw escape from a spec filename reached the terminal"
+        assert "\\x1b" in out, "the path is still shown, just escaped"
+
+    def test_the_no_pin_line_escapes_the_path(self, monkeypatch, capsys):
+        import kiro_crew.cli_commands as cli_commands
+
+        monkeypatch.setattr(
+            cli_commands, "reset_agent_model", lambda name: (Path(self.HOSTILE), "")
+        )
+
+        cli_commands._agent_reset_model(argparse.Namespace(agent="kirocrew"))
+
+        out = capsys.readouterr().out
+        assert "had no pinned model" in out
+        assert "\x1b" not in out
+        assert "\\x1b" in out
+
+    def test_the_ambiguity_refusal_escapes_both_paths(self, tmp_path: Path, monkeypatch):
+        """The refusal message names two paths; both come off disk."""
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "kirocrew.json").write_text(
+            json.dumps({"name": "other"}), encoding="utf-8"
+        )
+        (agents / "elsewhere.json").write_text(
+            json.dumps({"name": "kirocrew"}), encoding="utf-8"
+        )
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+        # Inject the hostile path as the CONFLICTING file, portably.
+        monkeypatch.setattr(
+            agent_mod, "_conflicting_spec_for", lambda n, c, d: Path(self.HOSTILE)
+        )
+
+        with pytest.raises(ValueError) as exc:
+            agent_mod.reset_agent_model("kirocrew")
+        assert "\x1b" not in str(exc.value)
+        assert "\\x1b" in str(exc.value)
+
+    def test_the_duplicate_name_refusal_escapes_paths(self, tmp_path: Path, monkeypatch):
+        """The other refusal builds its message from a list of real spec paths."""
+        import kiro_crew.agent as agent_mod
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "a.json").write_text(json.dumps({"name": "dup"}), encoding="utf-8")
+        (agents / "b.json").write_text(json.dumps({"name": "dup"}), encoding="utf-8")
+        monkeypatch.setattr(agent_mod, "kiro_agents_dir_path", lambda: agents)
+
+        with pytest.raises(ValueError) as exc:
+            agent_mod.agent_spec_path("dup")
+        # Both paths are repr'd, so a control byte in either could not execute.
+        assert "'" in str(exc.value), "paths are quoted (repr), not raw"
+        assert "a.json" in str(exc.value) and "b.json" in str(exc.value)
+
+
+class TestSelHookRejectedRedaction:
+    """#5582: ``_sel_hook_rejected`` must redact ``command`` before its 200-char cut.
+
+    The old spelling sliced ``command[:200]`` inside the f-string and redacted
+    the assembled message afterwards, so a credential cut at the boundary lost
+    its tail, stopped matching the credential regex, and the raw prefix escaped
+    into the SEL audit row.
+    """
+
+    def _capture_sel(self, monkeypatch) -> list:
+        import kiro_crew.agent as agent_mod
+
+        events: list = []
+
+        class _Log:
+            def log(self, event) -> None:
+                events.append(event)
+
+        monkeypatch.setattr(agent_mod, "sel", lambda: _Log())
+        return events
+
+    def test_credential_straddling_the_cut_is_not_leaked(self, monkeypatch) -> None:
+        from kiro_crew.agent import _sel_hook_rejected
+
+        events = self._capture_sel(monkeypatch)
+        # fabricated AKIA-shaped literal, inlined (a ``secret``-named binding
+        # trips CodeQL's name-based sensitive-source heuristic); the 200-char
+        # cut lands 8 chars into the 20-char key
+        command = "x" * 192 + "AKIAIOSFODNN7EXAMPLE" + " --flag"
+        _sel_hook_rejected("preToolUse", command, "denied")
+        assert len(events) == 1
+        assert "AKIA" not in events[0].resources
+
+    def test_plain_command_truncation_unchanged(self, monkeypatch) -> None:
+        """Ordinary path is result-preserving: no secret ⇒ the same 200-char slice."""
+        from kiro_crew.agent import _sel_hook_rejected
+
+        events = self._capture_sel(monkeypatch)
+        _sel_hook_rejected("preToolUse", "c" * 250, "denied")
+        assert len(events) == 1
+        assert events[0].resources == f"event=preToolUse command={'c' * 200}"

@@ -7,7 +7,7 @@
  * ChatPage wraps this in Virtuoso for virtualized scrolling.
  * ChatEmbed wraps this in a simple scrollable div.
  */
-import React, { useMemo, useCallback, memo } from 'react'
+import React, { useMemo, useCallback, useLayoutEffect, memo } from 'react'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
 import TurnBlock from '../pages/chat/TurnBlock'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
@@ -27,7 +27,28 @@ export interface ChatMessageListProps {
   messages: ChatMessage[]
   running: boolean
   contentWidth?: string
-  onApprove?: (approvalId: string, decision: string) => void
+  /** Resolve a pending approval. MUST return the request's promise: rejection
+   *  reaches the approval row's rollback and the buttons come back. The type
+   *  deliberately has no `void` arm so a fire-and-forget handler — the exact
+   *  shape behind #5524 — cannot compile against this boundary. */
+  onApprove?: (approvalId: string, decision: string) => Promise<unknown>
+  /** Resolve EVERY pending approval in a permission group with one decision
+   *  (batch multi-select, Req 4.1-4.4). The host receives all pending approval
+   *  ids and MUST route each through the SLOT-scoped approve endpoint (the same
+   *  path `onApprove` uses when it records trust) — never the bare id-scoped
+   *  one-shot resolve, which matches slot futures by bare id with no session
+   *  check. Like `onApprove`, MUST return the settle promise so the row's
+   *  rollback restores the buttons; it settles per id and surfaces any excluded
+   *  call rather than aborting the whole batch. Wired only by hosts whose
+   *  approve path is slot-scoped; left unset elsewhere. */
+  onApproveBatch?: (approvalIds: string[], decision: string) => Promise<unknown>
+  /** Offer the standing-trust tier on pending-approval rows. FAIL-CLOSED: set it
+   *  only when `onApprove` routes to an endpoint that RECORDS standing trust
+   *  (the slot approve endpoint carries the decision verbatim). Hosts resolving
+   *  through the one-shot `resolveApproval` endpoint must leave it unset — that
+   *  path has no trust verb, so a Trust offer there overstates the grant
+   *  (#5400, #5434). */
+  canTrust?: boolean
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
@@ -42,6 +63,30 @@ export interface ChatMessageListProps {
   /** Extra renderer entries, searched before the built-ins. An entry reusing a
    *  built-in id replaces it; one claiming an undrawn role adds a row type. */
   renderers?: readonly MessageRenderer[]
+  /** Reports the grouped display items this component computed, in the order
+   *  the rows' `data-display-index` numbers them — what the pinned-prompt
+   *  banner (`usePinnedPrompt`) reads to find the prompt above the fold.
+   *  Supplying it (or `hiddenRow`) is what turns row indexing ON: every display
+   *  item is then wrapped in a `data-display-index` block. Off otherwise —
+   *  the wrapper is one extra div per row, and a host that does not read the
+   *  indices should not pay for it (the embed SDK's DOM stays byte-identical).
+   *  Fired from a layout effect, so by the time the host reads it the rows
+   *  carrying those indices are in the DOM — a scroll rAF between commit and a
+   *  passive effect could otherwise read fresh DOM indices against a stale
+   *  list (the same ordering ChatPage keeps for its own `displayItemsRef`). */
+  onDisplayItems?: (items: DisplayItem[]) => void
+  /** The one indexed row to hide: the row whose bubble the pinned-prompt
+   *  banner is currently standing in for. Hidden by `visibility`, not
+   *  `display` — the row must keep its height or the transcript reflows under
+   *  the reader. Matched by message IDENTITY (`ts`) when the row has one, and
+   *  by display index only as the fallback for a message with no ts: the
+   *  index is computed in a scroll frame against a list that a streaming
+   *  append or a turn regroup can shift before this render, so matching on it
+   *  first hid the wrong row (the "two stacked boxes" bug the main chat fixed).
+   *  Deliberately a single hidden-row key, not a per-row style hook: one
+   *  consumer needs exactly this, and the ts-vs-index rule lives here once
+   *  instead of in every host. */
+  hiddenRow?: { ts?: string | null; index: number }
 }
 
 // ── Stable helpers (outside component) ──
@@ -57,11 +102,19 @@ const ChatMessageList = memo(function ChatMessageList({
   running,
   contentWidth = '900px',
   onApprove,
+  onApproveBatch,
+  canTrust,
   onFileOpen,
   renderTool,
   hideCardOwnedOAuth = false,
   renderers,
+  onDisplayItems,
+  hiddenRow,
 }: ChatMessageListProps) {
+  // Row indexing is inferred from the props that consume it, not a separate
+  // flag: a host that reads indices supplies onDisplayItems (and hides through
+  // hiddenRow); one that supplies neither gets the unwrapped DOM.
+  const indexRows = onDisplayItems != null || hiddenRow != null
 
   // Phase 1: Build raw items — skip permissions, group thinking
   const displayItems = useMemo<DisplayItem[]>(() => {
@@ -149,7 +202,7 @@ const ChatMessageList = memo(function ChatMessageList({
       </div>
     )
     const row = (children: React.ReactNode, tight = false) => (
-      <div key={key} className={`px-4 mx-auto w-full ${tight ? 'py-0.5' : 'py-1'}`} style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
+      <div key={key} className={`px-4 mx-auto w-full ${tight ? 'py-0' : 'py-1'}`} style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         {children}
       </div>
     )
@@ -188,16 +241,43 @@ const ChatMessageList = memo(function ChatMessageList({
       ? (decision: string) => onApprove(lastPerm.meta!.approval_id as string, decision)
       : undefined
 
+    // Batch resolver over EVERY pending id in this group (Req 4.1-4.4). Only
+    // offered when the host supplied onApproveBatch AND there is MORE THAN ONE
+    // pending approval — a single-id "batch" is never invoked (CollapsibleToolGroup
+    // batches only when pendingPermCount > 1) yet a > 0 handler still flips the
+    // (onApprove || onApproveBatch) render gates, so the gate matches its one
+    // real trigger by requiring > 1 here. TOOL_DENY calls never surface as
+    // pending permissions (backend gate; locked by the T5-guard test), so this
+    // id list is deny-free.
+    const batchIds = unresolvedPerms
+      .map(m => m.meta?.approval_id as string | undefined)
+      .filter((x): x is string => !!x)
+    const handleApproveBatch = onApproveBatch && batchIds.length > 1
+      ? (decision: string) => onApproveBatch(batchIds, decision)
+      : undefined
+    // Every pending call's meta, so the batch row can preview ALL N commands the
+    // one click will approve — not just the newest (permissionMeta). The human
+    // gate against an untrusted agent must show each command being approved.
+    // Map 1:1 over unresolvedPerms (NO filter): a meta-less pending perm becomes
+    // an empty {} so CollapsibleToolGroup renders its "No preview available"
+    // placeholder row for it. Filtering here would make permissionMetas.length <
+    // pendingPermCount, so the "Review all N" note would promise more rows than
+    // render — the silent-row gap the placeholder exists to prevent.
+    const batchMetas = unresolvedPerms.map(m => m.meta ?? {})
+
     return (
-      <div key={'grp-' + item.startIdx} className="px-4 mx-auto w-full py-0.5" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
+      <div key={'grp-' + item.startIdx} className="px-4 mx-auto w-full py-0" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         <CollapsibleToolGroup
           count={nonPerm.length}
-          autoExpand={running && item.startIdx >= messages.length - 5}
+          autoExpand={(running && item.startIdx >= messages.length - 5) || !!handleApproveBatch}
           hasPermission={unresolvedPerms.length > 0}
           isRunning={running}
           permissionMeta={lastPerm?.meta}
+          permissionMetas={batchMetas}
           pendingPermCount={unresolvedPerms.length}
           onApprove={handleApprove}
+          onApproveBatch={handleApproveBatch}
+          canTrust={canTrust}
         >
           {/* Grouped messages (thinking, permission) return null from renderMessage
               intentionally — CollapsibleToolGroup handles their display via its
@@ -206,15 +286,29 @@ const ChatMessageList = memo(function ChatMessageList({
         </CollapsibleToolGroup>
       </div>
     )
-  }, [renderMessage, running, messages.length, contentWidth, onApprove])
+  }, [renderMessage, running, messages.length, contentWidth, onApprove, onApproveBatch, canTrust])
 
   // Render a DisplayItem (single, group, or turn)
   const renderDisplayItem = useCallback((item: DisplayItem, i: number) => {
-    if (item.kind === 'turn') {
-      return <TurnBlock key={'turn-' + i} turn={item} renderItem={renderItem} />
-    }
-    return renderItem(item, i)
-  }, [renderItem])
+    const node = item.kind === 'turn'
+      ? <TurnBlock key={'turn-' + i} turn={item} renderItem={renderItem} />
+      : renderItem(item, i)
+    if (!indexRows) return node
+    const hidden = hiddenRow != null && (hiddenRow.ts != null
+      ? (item.kind === 'single' && item.msg.ts === hiddenRow.ts)
+      : hiddenRow.index === i)
+    // A plain block wrapper: it takes the row's own box (padding included), so
+    // its rect IS the row's rect for the geometry that reads it, and it adds no
+    // class of its own so the theming contract on the inner row is untouched.
+    return (
+      <div key={'row-' + i} data-display-index={i} style={hidden ? { visibility: 'hidden' } : undefined}>
+        {node}
+      </div>
+    )
+  }, [renderItem, indexRows, hiddenRow])
+
+  // Layout effect, not passive: see `onDisplayItems`.
+  useLayoutEffect(() => { onDisplayItems?.(displayItems) }, [displayItems, onDisplayItems])
 
   return (
     <>

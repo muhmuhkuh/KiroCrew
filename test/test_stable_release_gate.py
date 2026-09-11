@@ -60,6 +60,12 @@ def _workflow() -> dict:
     return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
 
 
+def _needs(spec: dict) -> list[str]:
+    """A job's ``needs``, normalized -- the key accepts a bare string too."""
+    needs = spec.get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
 def _gate_step() -> dict:
     steps = _workflow()["jobs"][GATE_JOB]["steps"]
     step = next((item for item in steps if item.get("name") == STEP_NAME), None)
@@ -98,6 +104,7 @@ def _make_repo(
     *,
     changelog_headings: Iterable[str] = (),
     stable_tag: str | None = None,
+    declared_version: str | None = "1.2.3",
 ) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -107,7 +114,32 @@ def _make_repo(
         f"{heading}\n\nnotes for {heading}\n\n" for heading in changelog_headings
     )
     (repo / "CHANGELOG.md").write_text(body, encoding="utf-8")
-    _git(repo, "add", "CHANGELOG.md")
+    tracked = ["CHANGELOG.md"]
+
+    # The gate also compares the tag against all three version declarations, so
+    # a fixture repo needs them or every case would fail on the missing files
+    # rather than on the behaviour under test. ``declared_version=None`` omits
+    # them deliberately, for the case that pins the missing-file failure.
+    if declared_version is not None:
+        (repo / "src" / "kiro_crew").mkdir(parents=True)
+        (repo / "src" / "kiro_crew" / "__init__.py").write_text(
+            f'__version__ = "{declared_version}"\n', encoding="utf-8"
+        )
+        (repo / "pyproject.toml").write_text(
+            f'[project]\nname = "kirocrew"\nversion = "{declared_version}"\n', encoding="utf-8"
+        )
+        (repo / "website" / "electron").mkdir(parents=True)
+        (repo / "website" / "electron" / "package.json").write_text(
+            '{\n  "name": "kirocrew-desktop",\n' f'  "version": "{declared_version}",\n' "}\n",
+            encoding="utf-8",
+        )
+        tracked += [
+            "src/kiro_crew/__init__.py",
+            "pyproject.toml",
+            "website/electron/package.json",
+        ]
+
+    _git(repo, "add", *tracked)
     _git(repo, "commit", "-q", "-m", "first")
     if stable_tag:
         _git(repo, "tag", stable_tag)
@@ -121,6 +153,7 @@ def _run(
     version: str,
     override: str = "",
     gh: str = "match",
+    promote_mode: str = "false",
 ) -> subprocess.CompletedProcess[str]:
     """Execute the real gate step with a ``gh`` shim on PATH.
 
@@ -154,6 +187,7 @@ def _run(
             "HOME": str(repo),
             "CHANNEL": channel,
             "VERSION": version,
+            "PROMOTE_MODE": promote_mode,
             "OVERRIDE": override,
             "GITHUB_REPOSITORY": "kirodotdev/KiroCrew",
             "GH_TOKEN": "shim",
@@ -180,6 +214,54 @@ def test_gate_job_has_no_job_level_condition() -> None:
     the step body.
     """
     assert "if" not in _workflow()["jobs"][GATE_JOB]
+
+
+def _skippable_jobs(jobs: dict) -> set[str]:
+    """Every job that can report ``skipped``, transitively.
+
+    A job with an ``if:`` can skip on its own. A job without one skips whenever
+    anything it needs skipped, so the property propagates down the graph -- and
+    it propagates THROUGH an ``always()``-guarded job that itself succeeded,
+    which is the part that is not obvious (actions/runner#2205).
+    """
+    skippable = {name for name, spec in jobs.items() if "if" in spec}
+    while True:
+        grown = {
+            name
+            for name, spec in jobs.items()
+            if name not in skippable and any(n in skippable for n in _needs(spec))
+        }
+        if not grown:
+            return skippable
+        skippable |= grown
+
+
+def test_no_job_downstream_of_a_skippable_one_relies_on_the_default_condition() -> None:
+    """A job with no ``if:`` does not run in a graph that skips anything.
+
+    With no ``if:`` the condition is ``success()``, which is false when ANY job
+    in the needs closure was skipped. Every release graph skips something by
+    design -- ``resolve-promotion`` on insider, the build jobs on stable -- so a
+    lane that leans on the default never executes. It also never goes red: a
+    skip is not a failure, so the run still concludes ``success``. That is how
+    five consecutive releases, v0.3.0 among them, published bytes to a channel
+    with no GitHub Release page and nobody noticed.
+
+    ``stable-gate`` and ``build-windows`` are not exempted by name: they need
+    only ``version``, which has no dependencies and therefore cannot skip.
+    """
+    jobs = _workflow()["jobs"]
+    skippable = _skippable_jobs(jobs)
+    offenders = {
+        name: str(spec.get("if", ""))
+        for name, spec in jobs.items()
+        if any(n in skippable for n in _needs(spec)) and "needs." not in str(spec.get("if", ""))
+    }
+    assert not offenders, (
+        "these jobs depend on a job that can be skipped, but their condition "
+        "does not name their dependencies' results, so a skip upstream silently "
+        f"skips them: {offenders}"
+    )
 
 
 def test_gate_checks_out_full_history() -> None:
@@ -245,10 +327,68 @@ def test_documented_and_promoted_release_passes(tmp_path: Path) -> None:
     result = _run(repo, channel="stable", version="1.2.3")
     assert result.returncode == 0, result.stdout + result.stderr
     assert MATCHING_RUN in result.stdout
-    assert "both preconditions satisfied" in result.stdout
+    assert "all preconditions satisfied" in result.stdout
 
 
 # ── behaviour: each precondition fails on its own ─────────────────────────
+
+
+def test_a_release_branch_still_declaring_the_rc_spelling_blocks(tmp_path: Path) -> None:
+    """The tag being bare is not evidence that the branch is.
+
+    A rebuild re-stamps the artifact, so a stale declaration would ship correct
+    bytes while leaving every source install and later RC on the old spelling.
+    The 0.4.0 promotion was nearly tagged in exactly this state because only the
+    tag name was checked.
+    """
+    repo = _make_repo(
+        tmp_path,
+        changelog_headings=["## [1.2.3] — 2026-08-07"],
+        stable_tag="v1.2.3",
+        declared_version="1.2.3-rc.9",
+    )
+    result = _run(repo, channel="stable", version="1.2.3")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "declares '1.2.3-rc.9', not the bare '1.2.3'" in result.stdout
+    assert "Land the drop-RC-suffix PR" in result.stdout
+
+
+def test_a_missing_version_file_fails_closed_rather_than_aborting(tmp_path: Path) -> None:
+    """An absent declaration must be a verdict, not a crash.
+
+    Left to ``set -e``, sed's own error would abort the script mid-way and skip
+    both the failure summary and the override path -- the same trap the tag
+    lookup is guarded against.
+    """
+    repo = _make_repo(
+        tmp_path,
+        changelog_headings=["## [1.2.3] — 2026-08-07"],
+        stable_tag="v1.2.3",
+        declared_version=None,
+    )
+    result = _run(repo, channel="stable", version="1.2.3")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "is missing from the tagged tree" in result.stdout
+    # Still reached the summary rather than dying inside the loop.
+    assert "unmet precondition(s)" in result.stdout
+
+
+def test_promoting_bytes_warns_that_the_shipped_version_keeps_the_rc_stamp(
+    tmp_path: Path,
+) -> None:
+    """Byte reuse is allowed, but the cost has to be visible in the run log."""
+    repo = _make_repo(
+        tmp_path,
+        changelog_headings=["## [1.2.3] — 2026-08-07"],
+        stable_tag="v1.2.3",
+    )
+    result = _run(repo, channel="stable", version="1.2.3", promote_mode="true")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "will ship an RC-stamped version" in result.stdout
+
+    rebuilt = _run(repo, channel="stable", version="1.2.3", promote_mode="false")
+    assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
+    assert "carry the bare 1.2.3" in rebuilt.stdout
 
 
 def test_missing_changelog_section_blocks(tmp_path: Path) -> None:

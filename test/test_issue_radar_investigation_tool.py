@@ -128,6 +128,11 @@ class TestArgValidation(unittest.TestCase):
         assert cleaned["host"] == "gitlab.acme.internal"
         assert cleaned["kind"] == "pull"
 
+    def test_accepts_a_jira_identity(self):
+        cleaned = self._ok(provider="jira", host="acme.atlassian.net")
+        assert cleaned["provider"] == "jira"
+        assert cleaned["host"] == "acme.atlassian.net"
+
     def test_rejects_an_unknown_provider(self):
         with pytest.raises(ValidationError):
             self._ok(provider="bitbucket")
@@ -162,7 +167,8 @@ def _call_tool_capturing_put(**over):
     cleaned = validate_tool_args(args, MCP_CORE_SCHEMAS[TOOL])
     captured: dict = {}
 
-    def fake_put(path, body=None):
+    def fake_put(path: str, body: dict | None = None):
+        assert body is not None
         captured["path"] = path
         captured["body"] = body
         return {"investigation": {"findings": body.get("findings")}}
@@ -217,6 +223,12 @@ class TestToolBody(unittest.TestCase):
         assert body["provider"] == "gitlab"
         assert body["host"] == "gitlab.acme.internal"
         assert body["kind"] == "pull"
+
+    def test_sends_jira_identity_to_the_record_route(self):
+        captured, _ = self._call(provider="jira", host="acme.atlassian.net")
+        body = captured["body"]
+        assert body["provider"] == "jira"
+        assert body["host"] == "acme.atlassian.net"
 
     def test_surfaces_a_gateway_error_instead_of_claiming_success(self):
         cleaned = validate_tool_args(
@@ -349,7 +361,7 @@ class TestPutHandlerBoundsTheItemNumber:
         async def _json():
             return body
 
-        request.json = _json  # type: ignore[method-assign]
+        request.json = _json  # type: ignore[assignment]
         return await ir_routes._handle_put_investigation(request)
 
     @pytest.mark.asyncio
@@ -359,7 +371,7 @@ class TestPutHandlerBoundsTheItemNumber:
         # no store fixture is needed.
         resp = await self._put({"owner": "acme", "repo": "widget", "number": 10**12})
         assert resp.status == 400
-        assert str(ir_routes.MAX_ITEM_NUMBER) in resp.text
+        assert str(ir_routes.MAX_ITEM_NUMBER) in (resp.text or "")
 
     @pytest.mark.asyncio
     async def test_accepts_the_boundary_value(self):

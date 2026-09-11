@@ -25,7 +25,6 @@ import re
 import socket
 from base64 import b64encode
 from dataclasses import dataclass
-from html import unescape
 from html.parser import HTMLParser
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -86,6 +85,24 @@ _WHITESPACE_RUN = re.compile(r"\s+")
 _META_CHARSET = re.compile(rb"""charset\s*=\s*["']?\s*([\w.:+-]{1,40})""", re.IGNORECASE)
 _COLOR_SCHEME_MEDIA = re.compile(r"prefers-color-scheme\s*:\s*(dark|light)", re.IGNORECASE)
 _MEDIA_NEGATION = re.compile(r"\bnot\b", re.IGNORECASE)
+#: Title shapes an auth wall serves in place of the page a link names. Every
+#: alternative is anchored at BOTH ends: the leading gate phrase must be
+#: followed by the end of the title, an explicit separator, or a gate
+#: continuation ("to …", "with your …") — a bare prefix match would also blank
+#: real titles that merely start with the phrase ("Login security best
+#: practices", "Sign in with Apple: a guide"). English-only on purpose: each
+#: added language multiplies the false-positive surface, and a missed gate
+#: degrades to today's behavior.
+_LOGIN_PAGE_TITLE = re.compile(
+    r"""(?x)
+      ^\s* (?:please\s+)? (?:sign|log) [\s-]? (?:in|on)
+          \s* (?: $ | [|\-–—·:•] | to\b | with\s+your\b )   # "Sign In", "Sign in to X | Slack"
+    | [|\-–—·:•] \s* (?:sign|log) [\s-]? in \s*$            # "Acme Corp - Sign In"
+    | ^\s* single\s+sign [\s-]? on \s* (?: $ | [|\-–—·:•] ) # "Single Sign-On", "SSO - Okta"
+    | ^\s* authentication\s+required \s*$
+    """,
+    re.IGNORECASE,
+)
 
 
 class UnfurlRejected(Exception):
@@ -159,47 +176,28 @@ class ExtractedMeta:
     """
 
 
-def _reject_if_internal_ip(candidate: str) -> None:
-    """Raise ``blocked_url`` if *candidate* parses as a non-public IP.
+def _is_not_public(
+    ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+) -> bool:
+    """Whether *ip* is anything other than a globally reachable unicast address.
 
-    Returns silently when *candidate* is not an IP literal at all — the caller
-    then treats it as a hostname to resolve.
+    Allowlist AND denylist, deliberately both. ``is_global`` is the allowlist half
+    and is the only formulation that closes a whole class rather than one instance
+    — enumerating non-public categories already leaked ``100.64.0.0/10`` (RFC 6598
+    shared space, what a Tailscale tailnet and most CGNAT hand out), which CPython
+    special-cases in ``is_global`` but not in ``is_private``.
 
-    Two normalizations matter here, and both are bypasses if skipped:
-
-    * ``canonicalize_ip`` folds the alternate IPv4 encodings the OS resolver
-      accepts but :mod:`ipaddress` rejects (``0x7f000001``, ``0177.0.0.1``,
-      ``2130706433``, ``127.1``). Without it those fall through to the hostname
-      branch and reach the metadata endpoint.
-    * IPv4-mapped IPv6 is unwrapped explicitly. ``IPv6Address("::ffff:127.0.0.1")``
-      reports ``is_loopback == False``, and its ``is_private`` only consults the
-      mapped address on Python 3.13+ — so on every supported version below that,
-      the mapped form is a clean bypass unless unwrapped by hand.
+    ``is_global`` alone is NOT sufficient either, because CPython's IPv6
+    ``is_global`` is just ``not is_private`` and its private table omits ranges
+    that are plainly not routable: ``ff00::/8`` multicast and the deprecated
+    ``fec0::/10`` site-local both report ``is_global=True``. So every category flag
+    ``ipaddress`` exposes is also rejected. Neither half is redundant: the
+    allowlist catches what the flags forgot, the flags catch what ``is_global``
+    forgot, and ``test_vet_rejects_every_special_purpose_range`` pins the union
+    against a table of IANA special-purpose prefixes so the next gap is found by
+    the suite instead of by a reviewer.
     """
-    try:
-        ip = ipaddress.ip_address(canonicalize_ip(candidate))
-    except ValueError:
-        return  # a hostname, not a literal
-    mapped = getattr(ip, "ipv4_mapped", None)
-    if mapped is not None:
-        ip = mapped
-    # Allowlist AND denylist, deliberately both. `is_global` is the allowlist half
-    # and is the only formulation that closes a whole class rather than one
-    # instance — enumerating non-public categories already leaked
-    # `100.64.0.0/10` (RFC 6598 shared space, what a Tailscale tailnet and most
-    # CGNAT hand out), which CPython special-cases in `is_global` but not in
-    # `is_private`.
-    #
-    # `is_global` alone is NOT sufficient either, because CPython's IPv6
-    # `is_global` is just `not is_private` and its private table omits ranges that
-    # are plainly not routable: `ff00::/8` multicast and the deprecated
-    # `fec0::/10` site-local both report `is_global=True`. So every category flag
-    # `ipaddress` exposes is also rejected. Neither half is redundant: the
-    # allowlist catches what the flags forgot, the flags catch what `is_global`
-    # forgot, and `test_vet_rejects_every_special_purpose_range` pins the union
-    # against a table of IANA special-purpose prefixes so the next gap is found
-    # by the suite instead of by a reviewer.
-    if (
+    return (
         not ip.is_global
         or ip.is_multicast
         or ip.is_reserved
@@ -208,7 +206,88 @@ def _reject_if_internal_ip(candidate: str) -> None:
         or ip.is_unspecified
         # IPv6-only; absent on IPv4Address.
         or getattr(ip, "is_site_local", False)
-    ):
+    )
+
+
+def _literal_is_not_public(
+    ip: "ipaddress.IPv4Address | ipaddress.IPv6Address",
+) -> bool:
+    """Whether an already-PARSED literal is non-public, tunnel encodings unwrapped.
+
+    Split out so a caller holding a resolution result reaches the same decision
+    through :func:`address_is_not_public` instead of enumerating category flags
+    again. The two encodings handled here are about how an address was WRITTEN,
+    which is why they do not belong in :func:`_is_not_public`, and both are
+    bypasses if skipped:
+
+    * IPv4-mapped IPv6 is unwrapped explicitly. ``IPv6Address("::ffff:127.0.0.1")``
+      reports ``is_loopback == False``, and its ``is_private`` only consults the
+      mapped address on Python 3.13+ — so on every supported version below that,
+      the mapped form is a clean bypass unless unwrapped by hand.
+    * 6to4 is checked on BOTH readings, not unwrapped. ``2002:0a00:0001::1`` is a
+      routable v6 address AND names the v4 tunnel endpoint ``10.0.0.1``, so each
+      has to pass: ``2002::/16`` entered CPython's IPv6 private table only with
+      gh-113171 (3.10.14, 3.11.9, 3.12.4), so on an older patch release of a
+      version this project supports the v6 form reports ``is_global`` while the
+      packet goes inward — and substituting the payload instead would let
+      ``2002:8000::`` through, whose payload ``128.0.0.0`` is public.
+    """
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    # 6to4 is an ADDITIONAL refusal rather than a substitution — see the docstring
+    # for why the two encodings are not symmetric.
+    sixtofour = getattr(ip, "sixtofour", None)
+    if sixtofour is not None and _is_not_public(sixtofour):
+        return True
+    return _is_not_public(ip)
+
+
+def address_is_not_public(address: str) -> bool:
+    """Whether *address*, an IP literal from a resolution result, is non-public.
+
+    The entry point for a caller that has ALREADY resolved a host and holds the
+    answers — the Teams attachment fetch and the WeCom media fetch — so the
+    address rules have one owner rather than a category-flag list re-enumerated
+    per channel. Each such list written independently has missed the same two
+    ranges: ``100.64.0.0/10`` (RFC 6598 shared space, what a tailnet and most
+    CGNAT hand out) is not in CPython's ``is_private`` table and only
+    ``is_global`` rejects it, and ``fec0::/10`` reports ``is_global=True`` so an
+    ``is_private``-only check approves it. :func:`_is_not_public` documents why
+    both halves are required.
+
+    Fails CLOSED: a value that does not parse as an IP literal returns ``True``.
+    That is the opposite of :func:`_reject_if_internal_ip`'s default, and
+    deliberately so — for the URL vet a non-literal is a hostname still to be
+    resolved, while here it is a resolution result about to reach a socket, and an
+    address this function cannot read is one it cannot approve.
+    """
+    try:
+        ip = ipaddress.ip_address(canonicalize_ip(address))
+    except ValueError:
+        return True
+    return _literal_is_not_public(ip)
+
+
+def _reject_if_internal_ip(candidate: str) -> None:
+    """Raise ``blocked_url`` if *candidate* parses as a non-public IP.
+
+    Returns silently when *candidate* is not an IP literal at all — the caller
+    then treats it as a hostname to resolve. :func:`address_is_not_public` is the
+    sibling for values that are already known to be addresses; it fails closed on
+    an unparseable one instead of passing it through as a name.
+
+    ``canonicalize_ip`` folds the alternate IPv4 encodings the OS resolver accepts
+    but :mod:`ipaddress` rejects (``0x7f000001``, ``0177.0.0.1``, ``2130706433``,
+    ``127.1``). Without it those fall through to the hostname branch and reach the
+    metadata endpoint. The ipv4-mapped and 6to4 unwrapping lives in
+    :func:`_literal_is_not_public`.
+    """
+    try:
+        ip = ipaddress.ip_address(canonicalize_ip(candidate))
+    except ValueError:
+        return  # a hostname, not a literal
+    if _literal_is_not_public(ip):
         raise UnfurlRejected("blocked_url")
 
 
@@ -285,10 +364,18 @@ def vet_unfurl_url(
         resolver = resolve or _default_resolve
         try:
             addresses: Sequence[str] = resolver(host, port)
-        except OSError:
+        except (OSError, UnicodeError):
             # NXDOMAIN, no route, resolver timeout. Fail CLOSED: an unresolvable
             # host is one whose addresses we could not check, and the vet's
             # contract is "safe to connect to", not "probably fine".
+            #
+            # `UnicodeError` is listed because it is NOT an `OSError` -- it is a
+            # `ValueError`. `getaddrinfo` raises it for a host carrying a lone
+            # surrogate (`https://\ud800.example/`), which arrives intact from a
+            # JSON string, so an `OSError`-only catch let it escape the vet
+            # entirely and surface as a 500. A host the resolver cannot encode is
+            # a host whose addresses were never checked: the same answer as
+            # NXDOMAIN, for the same reason.
             raise UnfurlRejected("blocked_url") from None
         if not addresses:
             raise UnfurlRejected("blocked_url")
@@ -301,6 +388,17 @@ def vet_unfurl_url(
         addresses = [literal]
 
     normalized = urlunsplit((scheme, parts.netloc, parts.path or "/", parts.query, ""))
+    # yarl raises `UnicodeError` (a `ValueError`, not an `OSError`) encoding a host
+    # that carries a lone surrogate — reachable because a JSON string can hold one,
+    # so it arrives intact from a request body or a config value. Refused rather
+    # than propagated: a URL whose wire form cannot be derived is one this function
+    # cannot promise anything about, which is the same fail-closed answer the
+    # resolver branch gives. Derived here, before the result is built, so the
+    # failure has one exit instead of a half-constructed `VettedUrl`.
+    try:
+        wire_host = yarl.URL(normalized).raw_host or host
+    except (ValueError, UnicodeError):
+        raise UnfurlRejected("invalid_url") from None
     return VettedUrl(
         url=normalized,
         scheme=scheme,
@@ -312,7 +410,7 @@ def vet_unfurl_url(
         # link would be refused by our own pin, surface as a 502, and sit in the
         # negative cache for ten minutes. Deriving it here keeps "the pinned host
         # is exactly what the client asks for" true in one provable place.
-        wire_host=yarl.URL(normalized).raw_host or host,
+        wire_host=wire_host,
         port=port,
         ip=str(addresses[0]),
         domain=host[4:] if host.startswith("www.") else host,
@@ -330,8 +428,8 @@ def normalize_cache_key(url: str) -> str:
 
 
 def clean_text(value: str, cap: int) -> str:
-    """Unescape entities, collapse whitespace runs, trim, and hard-cap length."""
-    collapsed = _WHITESPACE_RUN.sub(" ", unescape(value)).strip()
+    """Normalize already-decoded HTMLParser text and hard-cap its length."""
+    collapsed = _WHITESPACE_RUN.sub(" ", value).strip()
     return collapsed[:cap]
 
 
@@ -390,8 +488,8 @@ class _HeadParser(HTMLParser):
     for tags that cannot appear in it.
 
     ``convert_charrefs`` is left at its default (True) so entity decoding
-    happens in the parser; :func:`clean_text` unescapes again, which is a no-op
-    on already-decoded text and covers the attribute path.
+    happens once in the parser for both text and attributes. Downstream helpers
+    preserve any literal entity spellings that remain after that decoding.
     """
 
     def __init__(self) -> None:
@@ -486,6 +584,23 @@ class _HeadParser(HTMLParser):
         ]
 
 
+def is_login_page_title(title: str) -> bool:
+    """Whether *title* names an auth gate rather than the page the URL names.
+
+    An unauthenticated fetch of an auth-gated link is answered with the site's
+    sign-in page — a 200, so it parses like any other document — and its title
+    ("Sign in to Amazon | Slack") describes the gate, not the linked content.
+    Rendering it verbatim mislabels the chip; the caller blanks the text fields
+    instead so the client falls back to the domain.
+
+    The pattern is deliberately conservative (see :data:`_LOGIN_PAGE_TITLE`).
+    The asymmetry justifies the remaining false positives: matching a real
+    article title costs a domain-labelled chip that is still true, while missing
+    a gate title shows a claim about the page that is false.
+    """
+    return bool(_LOGIN_PAGE_TITLE.search(title))
+
+
 def extract_meta(html: str, *, base_url: str) -> ExtractedMeta:
     """Pull title/description/site_name/icon candidates out of *html*.
 
@@ -553,7 +668,7 @@ def _absolutize(href: str, base_url: str) -> str:
     ``data:image/svg+xml`` hole the allowlist exists to close.
     """
     try:
-        resolved = urljoin(base_url, unescape(href).strip())
+        resolved = urljoin(base_url, href.strip())
     except ValueError:
         return ""
     return resolved if urlsplit(resolved).scheme in ALLOWED_SCHEMES else ""

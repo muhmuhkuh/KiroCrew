@@ -1,15 +1,17 @@
-import { useEffect, useState } from 'react'
-import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
-import { Virtuoso } from 'react-virtuoso'
-import { RefreshCw, Search, X } from 'lucide-react'
-import { useIssueRadar } from '../context'
-import { relativeTimeOrDate, relativeTime } from '../lib/format'
-import type { Issue } from '../api'
-import LabelChip from './LabelChip'
-import ListSkeleton from './ListSkeleton'
-import ListEmptyState from './ListEmptyState'
+import { useEffect, useState } from "react";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
+import { Virtuoso } from "react-virtuoso";
+import { RefreshCw, Search, X } from "lucide-react";
+import { useIssueRadar } from "../context";
+import { relativeTimeOrDate, relativeTime } from "../lib/format";
+import { providerTerms, trackedItemProjectScope } from "../lib/links";
+import type { Issue } from "../api";
+import LabelChip from "./LabelChip";
+import ListSkeleton from "./ListSkeleton";
+import ListEmptyState from "./ListEmptyState";
 
-import { i18nT } from '../../../i18n/t'
+import { i18nT } from "../../../i18n/t";
+import ErrorNotice from "../../../components/ErrorNotice";
 /** Above this many rendered rows the per-card layout/enter animation is dropped
  * AND the list switches to a virtualized scroller: Framer's layout pass measures
  * every node, and mounting thousands of card DOM nodes at once janks on large
@@ -18,7 +20,7 @@ import { i18nT } from '../../../i18n/t'
  * over it, only the visible rows exist and the animation would fight the
  * virtualizer anyway. Typing a search that narrows the list back under the cap
  * re-enables both. */
-const ANIM_CAP = 200
+const ANIM_CAP = 200;
 
 /** Middle column: a search box, the filtered + sorted issue list (cards
  * animate as the search narrows them), and a footer carrying the count, the
@@ -28,51 +30,90 @@ const ANIM_CAP = 200
  * animation is switched off for the duration, since animating a size change
  * scale-transforms the card and visibly stretches its text on every pointer
  * move. Dropped from the drag, the cards simply re-wrap. */
-export default function IssueList({ resizing = false }: { resizing?: boolean }) {
+export default function IssueList({
+  resizing = false,
+}: {
+  resizing?: boolean;
+}) {
   const {
-    filteredIssues, sortedIssues, issuesLoading, issuesError, issuesPartial,
-    stateFilter, issues, colorByName,
-    selectedIssue, setSelectedIssue, refresh, refreshing, listDetail,
-    query, setQuery, issuesUpdatedAt,
-  } = useIssueRadar()
+    filteredIssues,
+    sortedIssues,
+    issuesLoading,
+    issuesError,
+    issuesPartial,
+    stateFilter,
+    issues,
+    colorByName,
+    selectedIssue,
+    setSelectedIssue,
+    refresh,
+    refreshing,
+    listDetail,
+    query,
+    setQuery,
+    issuesUpdatedAt,
+    active,
+  } = useIssueRadar();
+  // The refresh controls name where the data comes FROM, and that is not always
+  // GitHub — a GitLab or Azure DevOps workspace being told its issues came from
+  // GitHub is simply wrong copy.
+  const terms = providerTerms(active);
+  // Azure DevOps overloads `owner` as `{organization}/{project}`, so the project
+  // name is its second segment. Empty for every other provider, whose tracked
+  // items really are repository-scoped.
+  const projectScope = trackedItemProjectScope(active);
 
-  const reduce = useReducedMotion()
-  const animate = !reduce && sortedIssues.length <= ANIM_CAP
+  const reduce = useReducedMotion();
+  const animate = !reduce && sortedIssues.length <= ANIM_CAP;
 
   // Re-render every 30s so the "Updated Nm ago" label stays fresh without a
   // refetch.
-  const [, tick] = useState(0)
+  const [, tick] = useState(0);
   useEffect(() => {
-    const id = setInterval(() => tick((t) => t + 1), 30_000)
-    return () => clearInterval(id)
-  }, [])
+    const id = setInterval(() => tick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const cardClass = (isSel: boolean) =>
     `w-full text-left rounded-lg border p-2.5 cursor-pointer bg-card hover:bg-bg-hover transition-colors ${
-      isSel ? 'border-accent' : 'border-border'
-    }`
+      isSel ? "border-accent" : "border-border"
+    }`;
 
   const cardInner = (iss: Issue) => (
     <>
       <div className="flex items-center justify-between gap-2 text-[12px] text-muted mb-1">
         <span className="truncate">
           <span className="font-bold text-accent">#{iss.number}</span>
-          {iss.author ? ` · ${iss.author}` : ''}
+          {iss.author ? ` · ${iss.author}` : ""}
         </span>
-        <span className="flex-shrink-0">{relativeTimeOrDate(iss.updated_at)}</span>
+        <span className="flex-shrink-0">
+          {relativeTimeOrDate(iss.updated_at)}
+        </span>
       </div>
-      <div className="text-[14px] leading-snug text-text line-clamp-2">{iss.title}</div>
-      {iss.labels.length > 0 && (
+      <div className="text-[14px] leading-snug text-text line-clamp-2">
+        {iss.title}
+      </div>
+      {(iss.status || iss.labels.length > 0) && (
         <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+          {iss.status && (
+            <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted">
+              {iss.status}
+            </span>
+          )}
           {iss.labels.map((name) => (
-            <LabelChip key={name} name={name} color={colorByName.get(name) ?? '888888'} small />
+            <LabelChip
+              key={name}
+              name={name}
+              color={colorByName.get(name) ?? "888888"}
+              small
+            />
           ))}
         </div>
       )}
     </>
-  )
+  );
 
-  const lastUpdated = relativeTime(issuesUpdatedAt)
+  const lastUpdated = relativeTime(issuesUpdatedAt);
 
   return (
     <section className="flex flex-col min-h-0 h-full">
@@ -82,17 +123,28 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
         <div className="flex items-center gap-1.5 rounded-lg border border-border bg-card px-2.5 transition-colors focus-within:border-accent">
           <Search size={14} className="flex-shrink-0 text-muted opacity-60" />
           <input
+            /* focus-cue-ok: the cue is on the WRAPPER, not here — the pill above
+               carries `focus-within:border-accent`, so focusing this input turns
+               the whole border accent-coloured. Same structure as PrList's search
+               box; a ring on the bare input would sit inside that border and read
+               as two nested outlines. */
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={i18nT('apps.issueRadar.components.issueList.search_issues')}
-            aria-label={i18nT('apps.issueRadar.components.issueList.search_issues_2')}
+            placeholder={i18nT("apps.issueRadar.components.issueList.search", {
+              label: i18nT(terms.trackedItemPluralTitleKey),
+            })}
+            aria-label={i18nT("apps.issueRadar.components.issueList.search_2", {
+              label: i18nT(terms.trackedItemPluralTitleKey),
+            })}
             className="flex-1 min-w-0 bg-transparent py-2.5 text-[13px] text-text placeholder:text-muted outline-none"
           />
           {query && (
             <button
-              onClick={() => setQuery('')}
-              title={i18nT('apps.issueRadar.components.issueList.clear_search')}
-              aria-label={i18nT('apps.issueRadar.components.issueList.clear_search')}
+              onClick={() => setQuery("")}
+              title={i18nT("apps.issueRadar.components.issueList.clear_search")}
+              aria-label={i18nT(
+                "apps.issueRadar.components.issueList.clear_search",
+              )}
               className="flex-shrink-0 cursor-pointer bg-transparent leading-none text-muted hover:text-text"
             >
               <X size={13} />
@@ -104,22 +156,37 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
       {/* Card list — a bottom gradient fades the last cards out. */}
       <div className="relative flex-1 min-h-0">
         {issuesLoading && (
-          <div className="absolute inset-0 overflow-y-auto scrollbar-none px-4 pb-2 flex flex-col gap-2" style={{ scrollbarWidth: 'none' }}>
+          <div
+            className="absolute inset-0 overflow-y-auto scrollbar-none px-4 pb-2 flex flex-col gap-2"
+            style={{ scrollbarWidth: "none" }}
+          >
             <ListSkeleton />
           </div>
         )}
-        {issuesError && <div className="px-4 py-2 text-[14px] text-danger">{issuesError.message}</div>}
+        {/* A list read; the search box above is a filter, not a draft. */}
+        <ErrorNotice
+          message={issuesError?.message}
+          askAgent
+          className="mx-4 my-2"
+        />
         {!issuesLoading && filteredIssues.length === 0 && (
           <div className="px-4 pb-2">
-            <ListEmptyState searching={Boolean(query.trim())} label={i18nT('apps.issueRadar.components.issueList.issues')} />
+            <ListEmptyState
+              searching={Boolean(query.trim())}
+              label={i18nT(terms.trackedItemPluralTitleKey)}
+            />
           </div>
         )}
-        {!issuesLoading && sortedIssues.length > 0 && (
-          animate ? (
+        {!issuesLoading &&
+          sortedIssues.length > 0 &&
+          (animate ? (
             // Small list: a plain animated flow. Cheap, and the reorder/enter
             // animation is worth it. AnimatePresence needs all siblings mounted, so
             // this path is deliberately NOT virtualized (bounded by ANIM_CAP).
-            <div className="absolute inset-0 overflow-y-auto scrollbar-none px-4 pb-2 flex flex-col gap-2" style={{ scrollbarWidth: 'none' }}>
+            <div
+              className="absolute inset-0 overflow-y-auto scrollbar-none px-4 pb-2 flex flex-col gap-2"
+              style={{ scrollbarWidth: "none" }}
+            >
               <AnimatePresence initial={false} mode="popLayout">
                 {sortedIssues.map((iss) => (
                   <motion.button
@@ -127,16 +194,19 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
                     // 'position' (not the default size+position): a size-animating
                     // layout pass distorts the card's text with a scale transform
                     // whenever the column rewraps. Off entirely mid-resize.
-                    layout={resizing ? false : 'position'}
+                    layout={resizing ? false : "position"}
                     initial={{ opacity: 0, y: 6 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, scale: 0.97 }}
                     transition={{
-                      layout: { type: 'spring', stiffness: 550, damping: 40 },
+                      layout: { type: "spring", stiffness: 550, damping: 40 },
                       duration: 0.18,
                       ease: [0.16, 1, 0.3, 1],
                     }}
-                    onClick={() => { setSelectedIssue(iss.number); listDetail.openDetail() }}
+                    onClick={() => {
+                      setSelectedIssue(iss.number);
+                      listDetail.openDetail();
+                    }}
                     className={cardClass(selectedIssue === iss.number)}
                   >
                     {cardInner(iss)}
@@ -163,13 +233,16 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
             // same reason.
             <Virtuoso
               className="absolute inset-0 scrollbar-none"
-              style={{ scrollbarWidth: 'none' }}
+              style={{ scrollbarWidth: "none" }}
               data={sortedIssues}
               computeItemKey={(_i, iss) => iss.number}
               itemContent={(_i, iss) => (
                 <div className="px-4 pb-2">
                   <button
-                    onClick={() => { setSelectedIssue(iss.number); listDetail.openDetail() }}
+                    onClick={() => {
+                      setSelectedIssue(iss.number);
+                      listDetail.openDetail();
+                    }}
                     className={cardClass(selectedIssue === iss.number)}
                   >
                     {cardInner(iss)}
@@ -177,43 +250,75 @@ export default function IssueList({ resizing = false }: { resizing?: boolean }) 
                 </div>
               )}
             />
-          )
-        )}
+          ))}
         {/* Bottom fade — the last cards dissolve toward the footer instead of a
             hard divider. Fades to --bg (the panel background behind the list). */}
         <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-8 bg-gradient-to-t from-bg to-transparent" />
       </div>
 
+      {/* Azure DevOps work items hang off the PROJECT, not the repository, so two
+          connected repos in one project show the identical list. Undisclosed, that
+          duplication reads as a caching bug, or gets the same item triaged twice by
+          two people who each think they are looking at their own repo's queue. */}
+      {projectScope && (
+        <div className="flex-shrink-0 px-4 pt-2 text-[11px] leading-snug text-muted opacity-80">
+          {i18nT(
+            "apps.issueRadar.components.issueList.tracked_items_are_project_scoped",
+            { project: projectScope },
+          )}
+        </div>
+      )}
+
       {/* Footer — count on the left, last-refresh time + refresh on the right. */}
       <div className="flex-shrink-0 flex items-center gap-2 px-4 pt-2 pb-4 text-[12px] text-muted">
-        <span title={stateFilter === 'closed' && issues.length >= 100 ? i18nT('apps.issueRadar.components.issueList.closed_issues_are_capped_at_the_100_most_recentl') : undefined}>
-          {i18nT('apps.issueRadar.components.issueList.issue', { count: filteredIssues.length })}
+        <span
+          title={
+            stateFilter === "closed" && issues.length >= 100
+              ? i18nT(
+                  "apps.issueRadar.components.issueList.closed_issues_are_capped_at_the_100_most_recentl",
+                )
+              : undefined
+          }
+        >
+          {i18nT(terms.trackedItemCountKey, { count: filteredIssues.length })}
         </span>
         {/* Cold-start: these are only the newest page while the full list loads
             behind them. Say so, so the count does not read as the whole repo. */}
         {issuesPartial && (
           <span className="inline-flex items-center gap-1 text-muted opacity-70">
             <RefreshCw size={11} className="animate-spin" />
-            {i18nT('apps.issueRadar.components.issueList.loading_the_rest')}
+            {i18nT("apps.issueRadar.components.issueList.loading_the_rest")}
           </span>
         )}
         <span className="ml-auto flex items-center gap-2">
           {lastUpdated && (
-            <span className="tabular-nums" title={i18nT('apps.issueRadar.components.issueList.time_since_the_issue_list_was_last_fetched_from')}>
-              {i18nT('apps.issueRadar.components.issueList.updated')} {lastUpdated}
+            <span
+              className="tabular-nums"
+              title={i18nT(
+                "apps.issueRadar.components.issueList.time_since_issue_list_last_fetched_from",
+                { provider: terms.providerName },
+              )}
+            >
+              {i18nT("apps.issueRadar.components.issueList.updated")}{" "}
+              {lastUpdated}
             </span>
           )}
           <button
             onClick={refresh}
             disabled={refreshing}
-            title={i18nT('apps.issueRadar.components.issueList.re_fetch_issues_labels_from_github')}
-            aria-label={i18nT('apps.issueRadar.components.issueList.refresh_issues')}
+            title={i18nT(
+              "apps.issueRadar.components.issueList.re_fetch_issues_and_labels_from",
+              { provider: terms.providerName },
+            )}
+            aria-label={i18nT(
+              "apps.issueRadar.components.issueList.refresh_issues",
+            )}
             className="inline-flex items-center cursor-pointer bg-transparent text-muted hover:text-text disabled:opacity-30"
           >
-            <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
+            <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
           </button>
         </span>
       </div>
     </section>
-  )
+  );
 }

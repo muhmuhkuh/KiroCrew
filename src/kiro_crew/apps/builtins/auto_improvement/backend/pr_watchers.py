@@ -56,14 +56,27 @@ import subprocess
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+from kiro_crew.platform.context import redact_via_context
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from ..spine.git_safety import GIT_SAFE_CONFIG, require_pinned
 from . import pr_checks, store
 
 logger = logging.getLogger(__name__)
+
+
+def _remove_tree(path: str) -> None:
+    """Remove a watcher-owned directory without letting cleanup mask the result."""
+    try:
+        shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        return
+
 
 #: The push/fetch sentinel — the same string ``clone_setup`` writes, so a tree
 #: neutralized here reads as push-disabled to every other check in the app.
@@ -151,6 +164,7 @@ def _git(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
         ["git", *_GIT_SAFE_CONFIG, *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         errors="replace",
         timeout=timeout,
     )
@@ -163,7 +177,7 @@ def _gh(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     :func:`is_watchable_pr`), so no caller-controlled string reaches argv[0].
     """
     try:
-        return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(["gh", *args], capture_output=True, timeout=timeout, **UTF8_TEXT)
     except (OSError, subprocess.SubprocessError) as exc:
         # gh absent / timed out: synthesize a failure so callers need no try block.
         return subprocess.CompletedProcess(
@@ -267,12 +281,17 @@ def setup_isolated_clone(
         return "", f"destination is a symlink (refused): {dest}"
     try:
         if os.path.exists(dest):
-            shutil.rmtree(dest, ignore_errors=True)
+            _remove_tree(dest)
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         # --local hardlinks the object store: no network, near-instant, cheap on disk.
         proc = _git("clone", "--local", shared_clone, dest, timeout=300)
         if proc.returncode != 0:
-            return "", f"git clone --local failed: {(proc.stderr or '').strip()[:200]}"
+            # Redact BEFORE the bound: a slice can cut a credential in the URL git
+            # echoes mid-match, leaving a fragment no downstream pass recognises.
+            return "", (
+                f"git clone --local failed: "
+                f"{redact_via_context((proc.stderr or '').strip())[:200]}"
+            )
         if branch:
             checkout = _git("-C", dest, "checkout", branch, timeout=60)
             if checkout.returncode != 0:
@@ -284,10 +303,10 @@ def setup_isolated_clone(
                 # revision. Reachable, not hypothetical: the loop's own reset paths can drop
                 # a generated bug-PR branch from the shared clone before a watcher clones it.
                 # Raised by the GPT review.
-                shutil.rmtree(dest, ignore_errors=True)
+                _remove_tree(dest)
                 return "", (
                     f"could not check out the pull request head {branch!r}: "
-                    f"{(checkout.stderr or '').strip()[:160]}"
+                    f"{redact_via_context((checkout.stderr or '').strip())[:160]}"
                 )
         _fetch_base_ref(dest, base_ref)
         neutralize_origin(dest)
@@ -296,7 +315,7 @@ def setup_isolated_clone(
     ok, offenders = assert_origin_neutralized(dest)
     if not ok:
         # Fail closed: never hand the agent a tree we could not prove is dead.
-        shutil.rmtree(dest, ignore_errors=True)
+        _remove_tree(dest)
         return "", f"could not neutralize origin (still live: {offenders[:2]})"
     return dest, ""
 
@@ -435,9 +454,7 @@ def build_nudge_prompt(st: WatcherState, clone: str, status: dict[str, Any]) -> 
         + inspection
         + "\n\nHARD LIMITS — these are not preferences:\n"
         "  • NEVER publish this PR/MR, mark it ready for review, merge it, or enable\n"
-        "    auto-merge "
-        + forbid
-        + ".\n"
+        "    auto-merge " + forbid + ".\n"
         "    Publishing is a human decision.\n"
         "  • NEVER push. This clone's origin is deliberately dead\n"
         f"    ({DISABLED_NO_PUSH}); do not re-point it, and do not push to an explicit\n"
@@ -571,8 +588,8 @@ class PRWatcherRegistry:
             title=title,
             branch=branch,
             base_ref=base_ref,
-            max_nudges=max(1, int(max_nudges or DEFAULT_MAX_NUDGES)),
-            interval_s=max(0.0, float(interval_s)),
+            max_nudges=max(1, _safe_int(max_nudges or DEFAULT_MAX_NUDGES, DEFAULT_MAX_NUDGES)),
+            interval_s=max(0.0, _safe_float(interval_s, DEFAULT_NUDGE_INTERVAL_S)),
             clone=clone,
             started_at=now,
             updated_at=now,
@@ -1170,7 +1187,17 @@ class PRWatcherRegistry:
         itself stays best-effort (a lost patch must not fail the watcher), but "the patch
         was lost" and "the directory holding the commits may be deleted" are different
         decisions, and conflating them destroyed verified work.
+
+        No clone configured means no working tree to diff — there is nothing to export
+        and nothing to retain. Without this guard the fallback `git diff`/`git status`
+        calls below still ran with `-C ""`, which git treats as no `-C` at all: it walks
+        up from the process's real CWD and operates on whatever repository (or worktree)
+        happens to contain it, spawning a host-side git call — and `require_pinned`'s
+        attributes pin write — against the operator's real checkout instead of this run's
+        clone.
         """
+        if not clone:
+            return True
         try:
             self._export_fix(st, clone, attempt)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1290,6 +1317,32 @@ _RECONCILABLE_STATUSES = RECONCILABLE_STATUSES
 _CLONE_DIR_RE = re.compile(r"[A-Za-z0-9_.-]{1,48}-[0-9a-f]{12}")
 
 
+def _safe_int(value: object, default: int = 0) -> int:
+    """Coerce provider status/config input to an integer without raising."""
+    try:
+        return int(str(value or 0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: object, default: float) -> float:
+    """Coerce a watcher interval without letting malformed input kill a thread."""
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _strict_true(value: object) -> bool:
+    """Accept only the JSON boolean ``true``, never truthy strings or integers."""
+    return isinstance(value, bool) and bool(value)
+
+
+def _strict_false(value: object) -> bool:
+    """Accept only the JSON boolean ``false``, never missing or malformed values."""
+    return isinstance(value, bool) and not value
+
+
 def _needs_attention(status: dict[str, Any]) -> bool:
     """True when a PR's own status says a human/agent should act on it.
 
@@ -1297,12 +1350,12 @@ def _needs_attention(status: dict[str, Any]) -> bool:
     sweep and the UI cannot disagree about what "red" means. A merged or closed PR is
     explicitly NOT attention-worthy — re-driving it would nudge a finished change.
     """
-    if not isinstance(status, dict) or status.get("ok") is False:
+    if not isinstance(status, dict) or _strict_false(status.get("ok")):
         return False
-    if status.get("state") in {"MERGED", "CLOSED"} or status.get("merged") is True:
+    if status.get("state") in {"MERGED", "CLOSED"} or _strict_true(status.get("merged")):
         return False
     checks = status.get("checks")
-    if isinstance(checks, dict) and int(checks.get("failingCount") or 0) > 0:
+    if isinstance(checks, dict) and _safe_int(checks.get("failingCount")) > 0:
         return True
     # BLOCKED means a hard problem (closed unmerged, dirty merge state) the watcher's
     # nudge loop is built to work through. PROGRESS alone is normal in-flight CI.
@@ -1331,11 +1384,11 @@ def auto_publish_gate(status: dict[str, Any]) -> tuple[bool, str]:
     auto-merge, and never touches a protected branch — those stay human decisions and
     the spine's push policy is unchanged.
     """
-    if not isinstance(status, dict) or status.get("ok") is False:
+    if not isinstance(status, dict) or _strict_false(status.get("ok")):
         return False, "status unavailable"
-    if status.get("merged") is True or status.get("state") in {"MERGED", "CLOSED"}:
+    if _strict_true(status.get("merged")) or status.get("state") in {"MERGED", "CLOSED"}:
         return False, "pull request is already closed or merged"
-    if status.get("draft") is not True:
+    if not _strict_true(status.get("draft")):
         return False, "pull request is not a draft"
     verdict = str(status.get("verdict") or "")
     if verdict != "READY":
@@ -1343,15 +1396,15 @@ def auto_publish_gate(status: dict[str, Any]) -> tuple[bool, str]:
     checks = status.get("checks")
     if not isinstance(checks, dict):
         return False, "no check summary available"
-    if int(checks.get("failingCount") or 0) > 0:
+    if _safe_int(checks.get("failingCount")) > 0:
         return False, "failing checks"
-    if int(checks.get("total") or 0) <= 0:
+    if _safe_int(checks.get("total")) <= 0:
         return False, "no checks ran — cannot prove green"
     # `unresolvedThreads`, NOT `unresolvedComments`: `fetch_pr_status` only ever emits the
     # former (`pr_checks.py`), so reading the latter meant this condition's input was always
     # ABSENT — always falsy, never fired. The one control whose job is "do not publish over a
     # human's open question" was structurally unreachable. Raised by the Opus 5 review.
-    if int(status.get("unresolvedThreads") or 0) > 0:
+    if _safe_int(status.get("unresolvedThreads")) > 0:
         return False, "unresolved review threads"
     return True, "green: READY, no failing checks, no unresolved threads"
 
@@ -1359,7 +1412,7 @@ def auto_publish_gate(status: dict[str, Any]) -> tuple[bool, str]:
 def auto_publish_enabled() -> bool:
     """The ``autoPublish`` config flag. OFF unless explicitly turned on."""
     config = store.read_json(store.config_path(), {}) or {}
-    return bool(config.get("autoPublish") is True)
+    return _strict_true(config.get("autoPublish"))
 
 
 def _watcher_egress_accepted() -> bool:
@@ -1371,7 +1424,7 @@ def _watcher_egress_accepted() -> bool:
     does not. Same shape as :func:`auto_publish_enabled`. See :meth:`_make_runner`.
     """
     config = store.read_json(store.config_path(), {}) or {}
-    return bool(config.get("watcherAcceptEgressRisk") is True)
+    return _strict_true(config.get("watcherAcceptEgressRisk"))
 
 
 def publish_if_authorized(pr: str, status: dict[str, Any]) -> tuple[bool, str]:
@@ -1391,13 +1444,13 @@ def publish_if_authorized(pr: str, status: dict[str, Any]) -> tuple[bool, str]:
         proc = _gitlab_ready(pr)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
-            return False, f"glab mr update --ready failed: {tail[0][:160]}"
+            return False, f"glab mr update --ready failed: {redact_via_context(tail[0])[:160]}"
         logger.info("watchers: marked MR %s ready for review (%s)", pr, reason)
         return True, reason
     proc = _gh("pr", "ready", pr)
     if proc.returncode != 0:
         tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
-        return False, f"gh pr ready failed: {tail[0][:160]}"
+        return False, f"gh pr ready failed: {redact_via_context(tail[0])[:160]}"
     logger.info("watchers: marked %s ready for review (%s)", pr, reason)
     return True, reason
 
@@ -1426,9 +1479,10 @@ def _delete_clone_if_unowned(reg: PRWatcherRegistry, child: Path) -> bool:
                 st = reg._watchers.get(fp)
                 thread = reg._threads.get(fp)
                 alive = thread is not None and thread.is_alive()
-                if alive or bool(getattr(st, "unexported_work", False)):
-                    if os.path.realpath(reg._clone_dir(fp)) == target:
-                        return False  # owned right now — do not touch
+                if (alive or bool(getattr(st, "unexported_work", False))) and os.path.realpath(
+                    reg._clone_dir(fp)
+                ) == target:
+                    return False  # owned right now — do not touch
             # Still unowned, and the lock is held so it cannot become owned before we delete.
             shutil.rmtree(child)
             return True
@@ -1512,7 +1566,7 @@ def _work_items(status: dict[str, Any]) -> list[str]:
     items = list(checks.get("failing", []))
     if str(status.get("mergeable") or "").lower() == "conflicting":
         items.append("merge conflicts")
-    threads = int(status.get("unresolvedThreads") or 0)
+    threads = _safe_int(status.get("unresolvedThreads"))
     if threads:
         items.append(f"{threads} review thread(s)")
     return items

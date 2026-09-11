@@ -16,7 +16,6 @@ judgement calls the prompt has to name.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -25,7 +24,7 @@ from kiro_crew.acp.types import STOP_REASON_END_TURN
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.history import is_incognito_transcript
-from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.session_summary import (
     count_user_turns,
     extract_turns,
@@ -201,24 +200,32 @@ def _should_summarize(
     return ""
 
 
+def _summary_shaped(value: object) -> bool:
+    """Prefer predicate: a dict that carries the summary payload's ``intents`` list.
+
+    Disambiguates the payload from stray braced JSON in surrounding prose (a
+    ``{placeholder}`` aside, an inline worked example) — those parse as dicts
+    but never carry the payload shape ``normalize_payload`` consumes."""
+    return isinstance(value, dict) and isinstance(value.get("intents"), list)
+
+
 def _parse_reply(text: str) -> object:
-    """Pull a JSON object out of a model reply, tolerating fenced output."""
+    """Pull a JSON object out of a model reply, tolerating fences and prose.
+
+    Delegates to the shared ``llm_helpers._extract_json_of_type`` scanner
+    (fence markers are just prose to it), so a stray brace in the prose does not
+    corrupt the extracted span the way an outermost
+    ``find('{') .. rfind('}')`` slice would. Returns None when nothing parses —
+    the caller then keeps the previous cached summary — or when two DIFFERENT
+    payload-shaped dicts make the choice ambiguous (the shared contract
+    refuses to guess)."""
     raw = (text or "").strip()
     if not raw:
         return None
-    if raw.startswith("```"):
-        # Strip a fence and any language tag, then the trailing fence.
-        raw = raw.split("\n", 1)[-1]
-        if raw.rstrip().endswith("```"):
-            raw = raw.rstrip()[: -len("```")]
-    start, end = raw.find("{"), raw.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        return json.loads(raw[start : end + 1])
-    except json.JSONDecodeError:
-        logger.debug("Session summary: reply was not valid JSON")
-        return None
+    data = _extract_json_of_type(raw, dict, prefer=_summary_shaped)
+    if data is None:
+        logger.debug("Session summary: reply carried no usable JSON object")
+    return data
 
 
 async def generate_session_summary(
@@ -261,12 +268,12 @@ async def generate_session_summary(
         return False
 
     # Take the in-flight guard HERE -- immediately after the gate that reads it,
-    # and before every remaining await. On-demand generation gave this function a
-    # concurrent, user-driven entry point: two clicks from two clients (or a click
-    # racing a turn-end pass) both awaited the flush/mtime/read before either set
-    # the marker, so both passed the `in_flight` gate and both spent a model call.
-    # The signature guard made that safe but not free -- it prevents the second
-    # write, after the tokens are already gone.
+    # and before every remaining await. On-demand generation is a concurrent,
+    # user-driven entry point: setting the marker any later lets two clicks from
+    # two clients (or a click racing a turn-end pass) both await the
+    # flush/mtime/read, both pass the `in_flight` gate and both spend a model
+    # call. The signature guard makes that safe but not free -- it prevents only
+    # the second write, after the tokens are already gone.
     slot._summary_in_flight = True
     try:
         return await _generate_locked(state, slot, cfg, key, log, force=force)
@@ -318,6 +325,11 @@ async def _generate_locked(
     # pair old records with the new mtime and store an incomplete summary that
     # the cache then serves as fresh.
     sig = await asyncio.to_thread(log.session_mtime, key)
+    # Captured WITH the signature, not at write time. A rewind / regenerate
+    # / rotation landing while the model call is in flight PRESERVES the
+    # mtime, so `sig` alone cannot see it; the content-identity generation
+    # can, and the write guard refuses the payload once it has moved.
+    generation = await asyncio.to_thread(log.rotation_generation, key)
     if sig is None:
         # No transcript on disk yet means nothing to key a cache entry on.
         return False
@@ -392,7 +404,7 @@ async def _generate_locked(
     payload["generated_at"] = time.time()
     payload["user_turns"] = user_turns
     payload["last_activity"] = last_activity_ts(turns)
-    stored = await asyncio.to_thread(log.set_cached_intent_summary, key, payload, sig)
+    stored = await asyncio.to_thread(log.set_cached_intent_summary, key, payload, sig, generation)
     if not stored:
         # The transcript was deleted or changed while the model call was in
         # flight; the write was refused so a permanent delete stays deleted.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -26,6 +27,7 @@ from kiro_crew.dashboard.handlers.usage import (
     read_context_tokens,
     read_effective_agent,
     read_effective_model,
+    read_turn_model,
 )
 
 # ── _parse_sessions ─────────────────────────────────────────────────────
@@ -39,9 +41,33 @@ def _write_session(path, lines, mtime=None):
 
 
 class TestParseSessions:
-    def test_no_directory(self, tmp_path):
-        with patch.object(usage_mod, "_SESSIONS_DIR", tmp_path / "nope"):
-            assert _parse_sessions() == {"error": "No sessions directory"}
+    @pytest.mark.parametrize("directory_exists", [False, True])
+    def test_empty_session_stats(self, tmp_path, directory_exists):
+        sessions_dir = tmp_path / "cli"
+        if directory_exists:
+            sessions_dir.mkdir()
+        with patch.object(usage_mod, "_SESSIONS_DIR", sessions_dir):
+            result = _parse_sessions()
+        assert result == {
+            "total_sessions": 0,
+            "total_messages": 0,
+            "total_tool_calls": 0,
+            "all_time_sessions": 0,
+            "daily_history": [],
+            "today": {"sessions": 0, "messages": 0, "tool_calls": 0},
+            "this_week": {"sessions": 0, "messages": 0, "tool_calls": 0},
+            "this_month": {"sessions": 0, "messages": 0, "tool_calls": 0},
+            "avg_msgs_per_session": 0,
+            "avg_tools_per_session": 0,
+            # An empty history is COMPLETE data, not incomplete: nothing was
+            # dropped, so the did-not-load total is a present zero rather than
+            # an absent key (#6733). Omitting it would make "complete" and
+            # "unknown" indistinguishable on the wire -- the adapter's
+            # ``s.refused_transcripts ?? 0`` would synthesise the promise of
+            # completeness the payload never made.
+            "refused_transcripts": 0,
+        }
+        assert sessions_dir.exists() == directory_exists
 
     def test_iterdir_oserror(self, tmp_path):
         d = tmp_path / "cli"
@@ -51,7 +77,45 @@ class TestParseSessions:
         ):
             result = _parse_sessions()
             assert "error" in result
-            assert "boom" in result["error"]
+            # The OSError carries a filesystem path; it stays server-side. The
+            # returned `error` is a generic message with a machine-readable code.
+            assert "boom" not in result["error"]
+            assert result["error"] == "cannot read sessions directory"
+            assert result["code"] == "sessions_dir_unreadable"
+
+    def test_iterdir_oserror_keeps_the_whole_statistics_shape(self, tmp_path):
+        """An unreadable directory reports the reason WITHOUT changing the shape.
+
+        Consumers read the period keys unconditionally --
+        ``website/src/providers/adapters/acp.ts`` goes straight to
+        ``s.today.sessions`` on the 200 -- so an error-ONLY object is not a
+        degraded answer, it is a differently-shaped one, and it raises a
+        ``TypeError`` in the client instead of showing the message this branch
+        exists to produce. The zeros are a shape, not a measurement, which is why
+        ``error`` has to travel WITH them.
+        """
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with patch.object(usage_mod, "_SESSIONS_DIR", empty):
+            baseline = _parse_sessions()
+        # Guard the guard: a baseline that lost its period keys would make the
+        # comparison below pass while proving nothing.
+        assert {"today", "this_week", "this_month", "daily_history"} <= set(baseline)
+
+        d = tmp_path / "cli"
+        d.mkdir()
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch(
+            "pathlib.Path.iterdir", side_effect=OSError("boom")
+        ):
+            result = _parse_sessions()
+
+        assert result["error"] == "cannot read sessions directory"
+        assert result["code"] == "sessions_dir_unreadable"
+        assert "boom" not in result["error"]
+        # Exactly the successful key set plus the two error keys, so a statistic
+        # added later cannot go missing from this branch without failing here.
+        assert set(result) - {"error", "code"} == set(baseline)
+        assert {k: v for k, v in result.items() if k in baseline} == baseline
 
     def test_skips_non_jsonl(self, tmp_path):
         d = tmp_path / "cli"
@@ -72,6 +136,49 @@ class TestParseSessions:
             r = _parse_sessions()
             assert r["total_sessions"] == 0
 
+    def test_refused_transcripts_are_reported_not_swallowed(self, tmp_path, caplog):
+        """#6733: a refused transcript is skipped, and the skip must be visible.
+        Before this, a home whose every transcript the path validator refused
+        rendered as a legitimate "zero sessions" with nothing to say why.
+
+        Asserted on BOTH the payload field and the log: the count is now carried
+        in ``refused_transcripts`` so the usage page can render a warning instead
+        of a confident zero (the earlier #7285 review kept it log-only while no
+        renderer read it; UsageTab now does).
+        """
+        d = tmp_path / "cli"
+        d.mkdir()
+        _write_session(d / "s1.jsonl", [{"kind": "Prompt"}])
+        _write_session(d / "s2.jsonl", [{"kind": "Prompt"}])
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", return_value=None
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+        assert r["total_sessions"] == 0
+        # The silent-zero fix: the count reaches the client, not just the log.
+        assert r["refused_transcripts"] == 2
+        # One aggregated record, not one per file: a UNC home refuses every
+        # transcript, and per-file logging would emit thousands.
+        refusals = [
+            rec for rec in caplog.records if "could not be loaded" in rec.getMessage()
+        ]
+        assert len(refusals) == 1
+        assert "2" in refusals[0].getMessage()
+
+    def test_no_refusal_log_when_every_transcript_validates(self, tmp_path, caplog):
+        """The counterpart: the healthy path stays quiet and reports zero refusals."""
+        d = tmp_path / "cli"
+        d.mkdir()
+        f = d / "s1.jsonl"
+        _write_session(f, [{"kind": "Prompt"}])
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", return_value=str(f)
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+        assert r["total_sessions"] == 1
+        assert r["refused_transcripts"] == 0
+        assert not [rec for rec in caplog.records if "could not be loaded" in rec.getMessage()]
+
     def test_stat_oserror(self, tmp_path):
         d = tmp_path / "cli"
         d.mkdir()
@@ -89,6 +196,75 @@ class TestParseSessions:
         ), patch.object(Path, "stat", stat_side_effect):
             r = _parse_sessions()
             assert r["all_time_sessions"] == 0
+            # #6733 First Principles: a stat failure is a did-not-load branch, so
+            # it feeds the incomplete-data count -- otherwise the transcript
+            # vanishes with no trace and the warning stays silent.
+            assert r["refused_transcripts"] == 1
+
+    def test_all_three_did_not_load_branches_feed_the_count(self, tmp_path, caplog):
+        """#6733 First Principles: the warning's ABSENCE promises complete data,
+        so every branch that drops a transcript must feed refused_transcripts --
+        not just the validator refusal. Three transcripts, one lost to each of
+        the three branches (validator refusal, stat failure, read failure);
+        the count must be 3 and total_sessions 0, so a page hit by only the two
+        non-validator branches still shows the warning rather than a silent
+        under-count.
+        """
+        d = tmp_path / "cli"
+        d.mkdir()
+        f_refuse = d / "refuse.jsonl"
+        f_stat = d / "stat.jsonl"
+        f_read = d / "read.jsonl"
+        _write_session(f_refuse, [{"kind": "Prompt"}])
+        _write_session(f_stat, [{"kind": "Prompt"}])
+        _write_session(f_read, [{"kind": "Prompt"}])
+
+        def validate(p):
+            return None if p.endswith("refuse.jsonl") else p
+
+        orig_stat = Path.stat
+
+        def stat_side_effect(self_, *a, **kw):
+            if self_.name == f_stat.name:
+                raise OSError("stat fail")
+            return orig_stat(self_, *a, **kw)
+
+        orig_open = Path.open
+
+        def open_side_effect(self_, *a, **kw):
+            if self_.name == f_read.name:
+                raise OSError("read fail")
+            return orig_open(self_, *a, **kw)
+
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", side_effect=validate
+        ), patch.object(Path, "stat", stat_side_effect), patch.object(
+            Path, "open", open_side_effect
+        ), caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"):
+            r = _parse_sessions()
+        assert r["total_sessions"] == 0
+        assert r["refused_transcripts"] == 3
+        loaded_msgs = [
+            rec for rec in caplog.records if "could not be loaded" in rec.getMessage()
+        ]
+        assert len(loaded_msgs) == 1
+        assert "3" in loaded_msgs[0].getMessage()
+
+    def test_old_session_is_not_counted_as_did_not_load(self, tmp_path):
+        """The cutoff branch is a deliberate 30-day window filter, NOT a load
+        failure: an old transcript loaded fine, so it must NOT inflate the
+        incomplete-data count (it stays in all_time_sessions)."""
+        d = tmp_path / "cli"
+        d.mkdir()
+        f = d / "old.jsonl"
+        old_mtime = time.time() - (60 * 86400)
+        _write_session(f, [{"kind": "Prompt"}], mtime=old_mtime)
+        with patch.object(usage_mod, "_SESSIONS_DIR", d), patch.object(
+            usage_mod, "validate_file_path", return_value=str(f)
+        ):
+            r = _parse_sessions()
+        assert r["all_time_sessions"] == 1
+        assert r["refused_transcripts"] == 0
 
     def test_old_session_counted_alltime_only(self, tmp_path):
         d = tmp_path / "cli"
@@ -326,9 +502,50 @@ class TestApiKiroUsage:
                 assert data["sessions"]["total_sessions"] == 1
 
     @pytest.mark.asyncio
+    async def test_missing_directory_preserves_billing_and_refreshes(self, tmp_path):
+        sessions_dir = tmp_path / "cli"
+        session_file = sessions_dir / "first.jsonl"
+        billing = {"credits_used": 10, "credits_plan": 100, "plan": "Pro"}
+        with (
+            patch.object(usage_mod, "_SESSIONS_DIR", sessions_dir),
+            patch.object(usage_mod, "get_usage_cache", return_value=billing),
+            patch.object(usage_mod, "validate_file_path", return_value=str(session_file)),
+        ):
+            app = web.Application()
+            app.router.add_get("/api/usage/kiro", api_kiro_usage)
+            async with TestClient(TestServer(app)) as client:
+                response = await client.get("/api/usage/kiro")
+                assert response.status == 200
+                data = await response.json()
+                assert "error" not in data
+                assert data["sessions"]["total_sessions"] == 0
+                for period in ("today", "this_week", "this_month"):
+                    assert data["sessions"][period] == {
+                        "sessions": 0,
+                        "messages": 0,
+                        "tool_calls": 0,
+                    }
+                assert data["billing"]["credits_used"] == 10
+                assert data["billing"]["plan"] == "Pro"
+                assert not sessions_dir.exists()
+
+                sessions_dir.mkdir()
+                _write_session(session_file, [{"kind": "Prompt"}])
+                usage_mod._CACHE_TS = time.time() - usage_mod._CACHE_TTL - 1
+                refreshed = await client.get("/api/usage/kiro")
+                assert refreshed.status == 200
+                updated = await refreshed.json()
+                assert updated["sessions"]["total_sessions"] == 1
+                assert updated["sessions"]["total_messages"] == 1
+                assert updated["billing"] == data["billing"]
+
+    @pytest.mark.asyncio
     async def test_error_not_cached(self, tmp_path):
-        with patch.object(usage_mod, "_SESSIONS_DIR", tmp_path / "nope"), patch.object(
-            usage_mod, "get_usage_cache", return_value={}
+        invalid_directory = tmp_path / "cli"
+        invalid_directory.write_text("not a directory", encoding="utf-8")
+        with (
+            patch.object(usage_mod, "_SESSIONS_DIR", invalid_directory),
+            patch.object(usage_mod, "get_usage_cache", return_value={}),
         ):
             app = web.Application()
             app.router.add_get("/api/usage/kiro", api_kiro_usage)
@@ -338,6 +555,43 @@ class TestApiKiroUsage:
                 assert "error" in data
                 # Cache should NOT be set
                 assert usage_mod._CACHE == {}
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_directory_still_answers_the_full_shape(self, tmp_path):
+        """The reason rides WITH the statistics, and billing is unaffected.
+
+        A file where the transcript directory should be makes ``iterdir()`` raise
+        a real ``NotADirectoryError`` -- no mock -- which is the branch a
+        roaming-profile or permission-denied home takes. The route answers 200
+        because billing is a separate half of the payload, so the sessions half
+        has to stay readable by a client that goes straight to ``today``.
+        """
+        invalid_directory = tmp_path / "cli"
+        invalid_directory.write_text("not a directory", encoding="utf-8")
+        billing = {"credits_used": 10, "credits_plan": 100, "plan": "Pro"}
+        with (
+            patch.object(usage_mod, "_SESSIONS_DIR", invalid_directory),
+            patch.object(usage_mod, "get_usage_cache", return_value=billing),
+        ):
+            app = web.Application()
+            app.router.add_get("/api/usage/kiro", api_kiro_usage)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/usage/kiro")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["error"] == "cannot read sessions directory"
+        assert data["sessions"]["code"] == "sessions_dir_unreadable"
+        assert data["sessions"]["total_sessions"] == 0
+        for period in ("today", "this_week", "this_month"):
+            assert data["sessions"][period] == {
+                "sessions": 0,
+                "messages": 0,
+                "tool_calls": 0,
+            }
+        assert data["sessions"]["daily_history"] == []
+        assert data["billing"]["plan"] == "Pro"
+        assert usage_mod._CACHE == {}
 
     @pytest.mark.asyncio
     async def test_unavailable_sentinel_yields_empty_billing(self, tmp_path):
@@ -1126,6 +1380,42 @@ class TestReadEffectiveModel:
         node._client = node
         node._model = "claude-opus-4.8"
         assert read_effective_model(node) == "claude-opus-4.8"
+
+
+class TestReadTurnModel:
+    """read_turn_model: display attribution — concrete id, `auto`, or blank."""
+
+    def test_concrete_id_outranks_the_sentinel(self):
+        # A resolved id anywhere in the chain wins even while an outer wrapper
+        # still reports the Auto request, so a pinned turn never reads "auto".
+        handle = type("Handle", (), {"_resolved_model_id": "claude-opus-4.8"})()
+        provider = type("P", (), {"_model": "auto", "_handle": handle})()
+        assert read_turn_model(provider) == "claude-opus-4.8"
+
+    def test_auto_request_with_no_resolved_id_reports_auto(self):
+        # The case read_effective_model collapses to "": the user chose Auto and
+        # the backend disclosed no id. Reporting the choice is not guessing.
+        assert read_turn_model(_Inner("auto")) == "auto"
+        assert read_effective_model(_Inner("auto")) == ""
+
+    def test_auto_sentinel_is_matched_case_and_space_insensitively(self):
+        assert read_turn_model(_Inner("  AUTO ")) == "auto"
+
+    def test_auto_found_deeper_in_the_chain(self):
+        inner = type("Handle", (), {"_model": "auto"})()
+        assert read_turn_model(type("P", (), {"_handle": inner})()) == "auto"
+
+    def test_no_model_information_stays_blank(self):
+        # Distinct from the Auto case: nothing is known, so nothing is claimed.
+        assert read_turn_model(object()) == ""
+
+    def test_never_raises_on_a_hostile_source(self):
+        class Boom:
+            @property
+            def _model(self):
+                raise RuntimeError("no")
+
+        assert read_turn_model(Boom()) == ""
 
 
 class TestReadEffectiveAgent:

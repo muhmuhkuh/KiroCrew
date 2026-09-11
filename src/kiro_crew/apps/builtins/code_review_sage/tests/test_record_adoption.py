@@ -22,6 +22,8 @@ from sage_lib import results
 from sage_lib import review_driver as D
 from sage_lib import store
 
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
+
 
 def _record(cid: str = "CR-1") -> dict:
     return {
@@ -165,7 +167,11 @@ class TestDriverAdopts(_Base):
                            root=self.root, run_id="run-a", progress=prog)
         self.assertEqual(seen["CR-1"], "failed")
         self.assertEqual(out["result_records"], 0)
+        # The residual "turn completed, nothing written" case keeps this value —
+        # discriminated causes (runtime preflight, incomplete record) carry
+        # their own reasons and must never collapse back into it.
         self.assertEqual(out["per_change"][0]["skipped_reason"], "no_review_recorded")
+        self.assertFalse(out["per_change"][0]["result_recorded"])
 
 
 if __name__ == "__main__":  # pragma: no cover
@@ -248,6 +254,7 @@ class TestStakedSlot(_Base):
     def test_an_empty_slot_is_already_the_wanted_state(self):
         self.assertTrue(results.stake_shared("CR-never-seen", self.root))
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_symlink_is_removed_not_followed(self):
         # os.unlink removes the link itself, so the target it aimed at must survive.
         target = self.root / "elsewhere.json"

@@ -1,9 +1,11 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { MessageSquareQuote, MessageCircleQuestion, Copy, Check } from 'lucide-react'
+import { MessageSquareQuote, MessageCircleQuestionMark, Copy, Check } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { containedSelectionRange } from '../utils/selectionContainment'
+import { i18nT } from '../i18n/t'
 
 export interface SelectionAction {
   id: string
@@ -244,7 +246,7 @@ interface SelectionToolbarProps {
   containerRef: React.RefObject<HTMLElement | null>
   /** Actions to show in the toolbar */
   actions: SelectionAction[]
-  /** External trigger (e.g. from Monaco) — shows toolbar at given position with given text */
+  /** External trigger (e.g. from the code editor) — shows toolbar at given position with given text */
   externalSelection?: { text: string; x: number; y: number } | null
 }
 
@@ -279,7 +281,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   const checkSelection = useCallback(() => {
     const sel = window.getSelection()
     if (!sel || sel.isCollapsed || !sel.toString().trim()) {
-      // Only dismiss if toolbar was shown by DOM selection (not external/Monaco)
+      // Only dismiss if toolbar was shown by DOM selection (not external/editor)
       if (sourceRef.current === 'dom') setVisible(false)
       return
     }
@@ -287,9 +289,17 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     const container = containerRef.current
     if (!container) { setVisible(false); return }
 
-    // Ensure selection is within our container
+    // Ensure selection is within our container. Containment cannot be judged by
+    // `commonAncestorContainer` alone — see `containedSelectionRange`, which
+    // carries the boundary-normalization mechanism and both rejection tiers.
+    //
+    // `measureRange` is what the toolbar is positioned from, and the helper
+    // returns it clamped to the container: an accepted overhang's boundary point
+    // would otherwise pull the next block's line box into the rect and park the
+    // toolbar one line below the selection on the touch/keyboard paths.
     const range = sel.getRangeAt(0)
-    if (!container.contains(range.commonAncestorContainer)) {
+    const measureRange = containedSelectionRange(range, container)
+    if (!measureRange) {
       setVisible(false)
       return
     }
@@ -299,7 +309,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
 
     selectedTextRef.current = text
 
-    const rect = range.getBoundingClientRect()
+    const rect = measureRange.getBoundingClientRect()
     selectionRectRef.current = rect
     const x = triggeredByMouseRef.current
       ? lastMouseRef.current.x
@@ -344,7 +354,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     }
   }, [visible, pos])
 
-  // External trigger (Monaco selections that don't use window.getSelection)
+  // External trigger (editor selections that don't use window.getSelection)
   useEffect(() => {
     if (externalSelection) {
       selectedTextRef.current = externalSelection.text
@@ -512,7 +522,7 @@ export function useSelectionActions(
     actions.push({
       id: 'quote',
       icon: <MessageSquareQuote size={12} />,
-      label: 'Quote',
+      label: i18nT('components.selectionToolbar.quote'),
       onClick: onQuote,
     })
   }
@@ -523,8 +533,8 @@ export function useSelectionActions(
   if (onAsk) {
     actions.push({
       id: 'ask',
-      icon: <MessageCircleQuestion size={12} />,
-      label: 'Ask in Side',
+      icon: <MessageCircleQuestionMark size={12} />,
+      label: i18nT('components.selectionToolbar.ask'),
       onClick: onAsk,
     })
   }
@@ -532,7 +542,7 @@ export function useSelectionActions(
   actions.push({
     id: 'copy',
     icon: <Copy size={12} />,
-    label: 'Copy',
+    label: i18nT('components.selectionToolbar.copy'),
     onClick: (text) => { copyToClipboard(text) },
   })
 

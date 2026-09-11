@@ -98,37 +98,52 @@ vi.mock('../components/SimpleSelect', () => ({
     optionLabels?: string[]
     clearLabel?: string
     'aria-label'?: string
-  }) => (
-    <div>
-      <button type="button" role="combobox" aria-label={ariaLabel} aria-expanded={false}>
-        {optionLabels?.[options.indexOf(value)] ?? value ?? clearLabel}
-      </button>
-      {clearLabel && (
-        <button type="button" role="option" aria-selected={value === ''} onClick={() => onChange('')}>
-          {clearLabel}
-        </button>
-      )}
-      {options.map((o, i) => (
+  }) => {
+    /* `role="combobox"` owes ARIA an `aria-controls`, so the option rows sit in a real
+       listbox the trigger names — the stub's whole point is to keep the accessible
+       surface the tests query. The id is derived from the label because two of these
+       stubs can be mounted at once and their ids have to stay distinct. The action row
+       stays OUTSIDE the listbox: it is not an option. */
+    const listboxId = `zzq-listbox-${(ariaLabel ?? 'unlabelled').replace(/\W+/g, '-')}`
+    return (
+      <div>
         <button
-          key={o}
           type="button"
-          role="option"
-          aria-selected={o === value}
-          onClick={() => onChange(o)}
+          role="combobox"
+          aria-label={ariaLabel}
+          aria-expanded={false}
+          aria-controls={listboxId}
         >
-          {optionLabels?.[i] ?? o}
+          {optionLabels?.[options.indexOf(value)] ?? value ?? clearLabel}
         </button>
-      ))}
-      {action && (
-        <button type="button" onClick={action.onSelect}>{action.label}</button>
-      )}
-    </div>
-  ),
+        <div role="listbox" id={listboxId}>
+          {clearLabel && (
+            <button type="button" role="option" aria-selected={value === ''} onClick={() => onChange('')}>
+              {clearLabel}
+            </button>
+          )}
+          {options.map((o, i) => (
+            <button
+              key={o}
+              type="button"
+              role="option"
+              aria-selected={o === value}
+              onClick={() => onChange(o)}
+            >
+              {optionLabels?.[i] ?? o}
+            </button>
+          ))}
+        </div>
+        {action && (
+          <button type="button" onClick={action.onSelect}>{action.label}</button>
+        )}
+      </div>
+    )
+  },
 }))
 
 
 import KiroCrewAgentsPage from '../pages/KiroCrewAgentsPage'
-import CrewAvatar from '../components/CrewAvatar'
 
 function createTestStore() {
   return configureStore({
@@ -213,19 +228,19 @@ function pressEscape() {
 
 /** A roster card, addressed by the accessible name the card exposes. */
 function crewCard(name: string) {
-  return screen.getByRole('button', { name: `Edit crew ${name}` })
+  return screen.getByRole('button', { name: `Edit agent ${name}` })
 }
 
 /** Open the editor dialog on `name` and return the dialog element. */
 async function openEditor(name: string): Promise<HTMLElement> {
   fireEvent.click(crewCard(name))
-  return await screen.findByRole('dialog', { name: `Edit crew ${name}` })
+  return await screen.findByRole('dialog', { name: `Edit agent ${name}` })
 }
 
 /** Open the editor dialog in create mode and return the dialog element. */
 async function openCreate(): Promise<HTMLElement> {
   fireEvent.click(screen.getByTestId('new-crew'))
-  return await screen.findByRole('dialog', { name: 'Create a new crew' })
+  return await screen.findByRole('dialog', { name: 'Create a new agent' })
 }
 
 describe('crew editor — collision warning', () => {
@@ -235,6 +250,8 @@ describe('crew editor — collision warning', () => {
     // has already happened.
     await renderRoster()
     const sheet = await openEditor('oncall')
+    // Both the picker and the warning live on the workspace/memory pane.
+    fireEvent.click(within(sheet).getByTestId('crew-rail-place'))
 
     // oncall starts on its own store, so nothing collides yet.
     expect(within(sheet).queryByText(/Also used by/)).not.toBeInTheDocument()
@@ -256,6 +273,16 @@ describe('crew editor — collision warning', () => {
       expect(within(sheet).getByText(/Also used by kirocrew/)).toBeInTheDocument(),
     )
     expect(mockApi.updateKirocrewAgent).not.toHaveBeenCalled()
+
+    // The overview must agree with that warning about WHICH resource collides.
+    // Reading a persisted per-agent count here instead of the in-flight value
+    // reports the collision the crew used to have, so the same screen showed a
+    // sharing count with no pill on the node that caused it.
+    fireEvent.click(within(sheet).getByTestId('crew-rail-overview'))
+    await waitFor(() =>
+      expect(within(sheet).getByTestId('crew-wire-memory')).toHaveTextContent('Shared'),
+    )
+    expect(within(sheet).getByTestId('crew-wire-workspace')).not.toHaveTextContent('Shared')
   })
 })
 
@@ -280,7 +307,7 @@ describe('crew editor — keyboard (via a binding select)', () => {
     // the right thing, and it is why this is asserted through the DOM rather than
     // by role: the editor must still be MOUNTED (the form is not destroyed) even
     // though it is hidden from AT.
-    const editorEl = document.querySelector('[aria-label="Create a new crew"]')
+    const editorEl = document.querySelector('[aria-label="Create a new agent"]')
     expect(editorEl).toBeTruthy()
     expect(editorEl!.closest('[aria-hidden="true"]')).toBeTruthy()
 
@@ -293,12 +320,37 @@ describe('crew editor — keyboard (via a binding select)', () => {
       expect(screen.queryByRole('dialog', { name: 'Create Workspace' })).not.toBeInTheDocument(),
     )
     // ...and with the nested layer gone the editor is exposed to AT again.
-    expect(screen.getByRole('dialog', { name: 'Create a new crew' })).toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'Create a new agent' })).toBeInTheDocument()
 
     // Once the nested dialog is gone the editor owns Escape again.
     pressEscape()
     await waitFor(() =>
-      expect(screen.queryByRole('dialog', { name: 'Create a new crew' })).not.toBeInTheDocument(),
+      expect(screen.queryByRole('dialog', { name: 'Create a new agent' })).not.toBeInTheDocument(),
     )
+  })
+})
+
+describe('crew editor — overview diagram nodes navigate to their pane', () => {
+  it('clicking the workspace node lands on the workspace/memory pane, focus following', async () => {
+    // The clicked node unmounts with the overview pane, which would drop
+    // keyboard focus to the body — the arriving tabpanel must catch it.
+    await renderRoster()
+    const sheet = await openEditor('oncall')
+    fireEvent.click(within(sheet).getByTestId('crew-wire-workspace'))
+
+    expect(within(sheet).getByTestId('crew-rail-place')).toHaveAttribute('aria-selected', 'true')
+    expect(within(sheet).getByRole('combobox', { name: 'Workspace' })).toBeInTheDocument()
+    // Focus is handed to the panel, and the panel must arrive NAMED — an
+    // unnamed tabpanel is announced as nothing but "tab panel".
+    const panel = within(sheet).getByRole('tabpanel', { name: 'Workspace · Memory' })
+    expect(document.activeElement).toBe(panel)
+  })
+
+  it('clicking the unbound webhook ghost lands on the webhook pane', async () => {
+    // The ghost reports a missing binding; its pane is where the binding is made.
+    await renderRoster()
+    const sheet = await openEditor('oncall')
+    fireEvent.click(within(sheet).getByTestId('crew-wire-webhook'))
+    expect(within(sheet).getByTestId('crew-rail-webhook')).toHaveAttribute('aria-selected', 'true')
   })
 })

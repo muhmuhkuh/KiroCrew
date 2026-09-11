@@ -25,10 +25,45 @@ Works from:
 | Discord DM | `discord:{agent}:direct:{user}` | fixed interval after each unattended turn |
 
 `autonudge_stop(reason?)` stops the loop bound to the current session from
-any of those surfaces. `monitor_update(message?, interval_secs?, max_cycles?)`
+any of those surfaces.
+`monitor_update(message?, interval_secs?, max_cycles?, max_runtime_secs?, banner?)`
 revises the loop already bound to this session in place, keeping its cycle
 count — use it when the instruction you armed has gone stale, or to raise the
-cap on a loop that is still doing useful work.
+cap on a loop that is still doing useful work. For a structured monitor it also
+takes `target?`, `objective?`, `max_agent_turns?`, `max_tokens?`,
+`max_provider_errors?` and `wake_instructions?`; every field is
+omit-to-leave-unchanged.
+
+Two `monitor_start` parameters are worth naming because their defaults are easy
+to inherit by accident:
+
+- `gate` (default true) holds a cycle back until the thing you are watching has
+  actually changed. Pass `gate=false` when the loop's duty is to act **while** the
+  subject is quiet — refresh a heartbeat file, chase a reviewer who has not
+  replied, keep a branch rebased on a moving base — because continued silence is
+  invisible to the observation. A gated loop is never starved: it is delivered
+  anyway after enough quiet intervals.
+- `banner` — a short line such as `watching PR #123 for CI` — changes only what is
+  stored and broadcast as a transcript row; the model still receives `message`
+  whole every cycle. Pass one whenever `message` is long, or a multi-KB
+  instruction is re-stored on every cycle. It is refused with a 400 on a
+  channel-bound loop (`slack:` / `discord:` / `webex:`); `monitor_update(banner="")`
+  clears one.
+
+### For a public GitHub pull request, prefer the structured monitor
+
+`monitor_watch(kind="github_pull_request", target=<PR URL>,
+objective="review_ready", interval_secs?, max_runtime_secs?, max_agent_turns?,
+max_tokens?, max_provider_errors?, wake_instructions?)` probes the pull request
+cheaply and wakes the owning session only when a new revision needs action —
+unchanged, pending, retry and terminal probes spend no agent turn, unlike a
+`monitor_start` cycle which spends a full turn every interval. Put the compact
+act-on-wake instruction in `wake_instructions`. Inspect it with `monitor_inspect`
+(no arguments — it resolves your own session) and end it with
+`monitor_stop(reason?)`, which retains the terminal outcome for inspection. One
+structured monitor per session, occupying the same slot as a `monitor_start`
+loop. Use `monitor_start` instead when you need to ACT most cycles, or when what
+you are watching is not a public GitHub PR.
 
 ### `interval_secs` counts between the loop's own cycles
 
@@ -42,10 +77,117 @@ stretch this: a due fire waits for the user's turn to end, then delivers.
 
 `max_cycles` (default 24) is a **runaway backstop, not a finish line**. A loop
 that coasts into its cap did not complete — it ran out of rope, and whatever
-it was watching is still unresolved. Real loop stores show this is the common
-failure: two live babysit loops ended at exactly 24/24 and 20/20 delivered
-cycles, neither having called `autonudge_stop`. Evaluate the exit condition
-every single cycle and stop deliberately.
+it was watching is still unresolved. Evaluate the exit condition every single
+cycle and stop deliberately.
+
+**This is the dominant failure, not a rare one.** Measured on a real loop store
+(4 loops, 84 delivered cycles, 14.9h wall clock, 7.5h of model turn time):
+**4 of 4 ended at exactly their cap** — 24/24, 20/20, 28/28, 12/12 — with
+`stopped_reason` either empty or `cycle_cap`, and **0 of 4 carried an
+agent-supplied stop reason**. None set `max_runtime_secs`, so cycle count was
+the only bound on spend.
+
+The reason this is expensive rather than merely untidy: the cap is reached the
+same way whether the loop **converged early** and then re-polled for nothing, or
+**never converged** and stopped with the work still unresolved. The two are
+indistinguishable from outside — the loop simply goes inactive — so a loop that
+stops only at its cap tells you nothing about which happened, and bills you for
+the difference.
+
+### Stall tripwire — stop on no-progress, not just on success
+
+An exit condition keyed only on *success* cannot end a loop that is stuck, and
+stuck is the common case: a blocker needing a human decision, an upstream
+outage, a flake nobody owns. So carry a second exit condition.
+
+Each cycle, record the **progress key** — `pr_status.py --json` emits every
+field of it:
+
+| field | why it is in the key |
+|---|---|
+| `head_sha` | a new head means you pushed; work happened |
+| `failing_checks` (sorted, workflow-qualified) | *which* checks are red, not how many — qualified by workflow because two workflows can publish the same check name, and a name-only list stays identical when one starts failing as the other stops |
+| `checks_failing` | the count, as a cheap scalar |
+| `readiness_kind` | distinguishes running from failing from unpublished |
+| `exit_code` | collapses the whole verdict |
+| `status` | the verdict *reason* — a conflict and a failing check are both exit `20` and can carry an identical check set, so without this a changed blocker extends a stall streak instead of resetting it |
+
+If the key is byte-identical for **3 consecutive counting cycles** and you pushed
+nothing in that span, the loop is not making progress. **Stop it**: report what is
+blocking, why you could not move it, and what decision you need, then call
+`autonudge_stop` with that as the reason.
+
+**Only a settled cycle counts.** A cycle whose poll exits `10` is reporting work
+still in flight, and waiting is exactly what the loop is for — so an exit-`10`
+cycle neither counts toward the tripwire nor resets it; skip it and move on.
+**Both exit `0` and exit `20` are settled, and both count.** A PR can sit at exit
+`0` indefinitely — green checks, but not review-ready because a human-owned thread
+or an unanswered advisory concern is outstanding — and a tripwire that counted only
+`20` would never notice that kind of stall. Exit `2` is an environment fault:
+escalate it rather than counting it.
+
+This matters because a running PR yields a byte-identical key every cycle by
+construction (`failing_checks` empty, `readiness_kind` `running`, `exit_code` 10),
+so counting those would fire the tripwire after ~15 minutes of ordinary CI on a
+repo where a single gate can legitimately run an hour. Skipping rather than
+resetting is deliberate too: a PR that flickers between running and blocked would
+otherwise reset forever and never be recognised as stuck. What bounds a genuinely
+endless wait is not this tripwire but `max_runtime_secs`.
+
+**Persist the key AND the streak count — session memory is not durable enough.**
+A stalled loop is precisely the long-running case that walks into compaction (see
+above), which can summarise away the counter at the moment it matters; the loop
+then coasts to its cap exactly as before, which is the failure this tripwire
+exists to prevent. Storing only the last key is not enough: that tells the next
+cycle what the previous key was but not whether this is match one, two or three,
+so the streak itself would still live in memory and still be lost. Write BOTH to
+one file — the key plus an integer count — and read it first on every settled
+cycle, then:
+
+- key matches the stored key → increment the count, write it back, trip at 3;
+- key differs → overwrite with the new key and a count of 1.
+
+**Put that file where the loop's own state lives, not in temp.** A babysit runs
+for hours and `TMPDIR` is periodically reaped by the OS, which would silently
+reset the streak — the same erasure as compaction, just a different eraser. Use
+the data home beside the loop's stop sentinel, i.e.
+`${KIROCREW_HOME:-$HOME/.kiro/crew}/workspace/.babysit-key-<loop-id>`, which is the
+convention `stop_sentinel_path` already follows and is not machine-cleaned. Write
+`$HOME`, not `~`: a tilde inside a parameter-expansion default is not expanded, so
+the literal `~` would survive and the state would land in a `~/` directory
+relative to the current working directory — lost the moment that directory
+changes.
+
+Nothing in the monitor engine observes the key today, so that file is the only
+durable record; moving the counter into the loop store, so the engine itself could
+stop on it, is the follow-up that would make this enforceable rather than
+advisory.
+
+**The key is GitHub-only today.** `pr_status.py --json` is its only emitter, so on
+GitLab or Bitbucket you must first derive an equivalent key from that host's own
+verdict fields (the table above). The 3-cycle rule means nothing until something
+emits a comparable value.
+
+Two things deliberately stay OUT of the key:
+
+- **Finding counts.** A finding you rebutted or deferred keeps being re-raised,
+  so a key including it never stabilises and the tripwire never fires. Worse,
+  the count moves when a bot merely re-words a comment. Read findings to decide
+  *what to do*; do not let them decide *whether you are stuck*.
+- **Unresolved-thread counts.** `?` means "could not establish", and a transient
+  API blip would read as progress.
+
+Escalating early is correct — a stalled loop does not become unstuck by being
+re-run 18 more times; it becomes unstuck when a human answers the question. This
+is **not** licence to park on a *fixable* blocker: the tripwire fires only when
+nothing changed **because there was nothing you could change unilaterally**. A
+diagnosed, verified fix gets applied and pushed, which moves `head_sha` and
+resets the count by construction.
+
+Deliberate stops are the goal. `autonudge_stop` should carry a real sentence
+naming the exit condition, the tripwire, or a terminal PR state. A loop whose
+store row later reads `cycle_cap` is a defect in that loop's instructions, not
+a completed job.
 
 ### Context grows every cycle
 
@@ -74,16 +216,153 @@ not write it off as flakiness.
 ## Decision table
 
 - User is waiting and total time < 30 min → `wait` + poll, no loop.
-- "Babysit / monitor / keep checking" in THIS conversation → `monitor_start`.
+- "Babysit / monitor / keep checking" in THIS conversation, in a phase where
+  you ACT most cycles (fixing findings, pushing revisions) → `monitor_start`.
+- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing to
+  do until a signal → still `monitor_start`, and name the pull request in the
+  instruction **by full URL** — `https://github.com/<owner>/<repo>/pull/<N>`.
+  That form is the only one that selects a subject: a bare `PR #123`, or the
+  `owner/name#123` shorthand, deliberately refuses inference, so the loop stays
+  on the plain timer and every interval spends a turn. The user will usually say
+  "babysit PR #123"; you write the URL. A loop naming one public GitHub pull
+  request that way is gated by default:
+  quiet cycles cost no agent turn, and it wakes only on a real change. The
+  `pr_watch` script cron (below) is now only for what that cannot reach --
+  an enterprise host, or detection with no owning loop.
 - Reacting to review feedback or CI on a PR → `monitor_start` or in-turn
-  `wait`+poll. **Never `cron_add`, never HEARTBEAT.md** (see below).
+  `wait`+poll for the active-fix phase. **Never an agent (LLM) cron, never
+  HEARTBEAT.md** (see below). The `pr_watch` script cron is fine: it is the
+  detector, not the reactor — the woken agent turn does the reacting with
+  this session's own trust.
 - Work belongs in a fresh isolated session each cycle, and needs no tools that
   require approval → `cron_add`.
 - Cleaning up after a merge you have already verified → `cron_add`, as a
   `script` cron at roughly a 5-minute interval.
 - External system will call back → `register_hook`.
 
-### Never use cron or heartbeat to react to reviewer feedback
+### Watch mode — a manual cron for what the default gate cannot reach
+
+**Read this first: you probably do not need this section.** A `monitor_start`
+loop whose instruction names ONE public GitHub pull request is already gated --
+it observes that pull request each interval with one bounded `gh` call and
+re-injects your message only when it actually changed, so a cycle where nothing
+changed costs no agent turn. That is the default, on every arming surface, with
+no steps to take. Use it, and skip to the end of this section.
+
+Watch mode is the manual version, and only three situations still need it:
+
+- the pull request is on an **enterprise host** -- the gate pins public GitHub,
+  because choosing a host from data is not something a watch message may do;
+- there is **no owning loop** to gate: you want detection without a babysit
+  session, e.g. a fire-and-forget notification;
+- you need the cron's own knobs -- `known_reds` to suppress failures inherited
+  from the base branch, `note` to carry text into the wake, `wake_on_green`.
+
+If none of those apply, arming this cron gives you a second watcher on the same
+pull request, and the two will wake you separately for the same event.
+
+```
+script cron (zero tokens, every ~5 min)
+  ├─ nothing changed / checks still running     → silent, no delivery
+  ├─ merged / closed                            → final message, cron removes itself
+  └─ unexpected state                           → ONE agent turn in THIS session
+       (CONFLICTING · new failing check not in known_reds · all green
+        · a comment or review someone else posted)
+```
+
+**Why the interval can be small.** A tick of this cron costs one bounded `gh`
+call and no tokens at all, so the interval is limited by API politeness rather
+than by spend -- 60s is reasonable, and 300s is a default rather than a floor.
+An UNGATED `monitor_start` cycle, by contrast, costs a full agent turn on the
+session's whole context, which is what forces its interval up.
+
+Arm it **from the session that owns the babysit** — the cron captures that
+session as its wake target; armed anywhere else, the wake lands in the wrong
+chat. Cron scripts must live under `~/.kiro/crew/crons/`, so copy the synced
+skill asset there first (re-copy on every arm — it keeps the copy current
+with skill updates):
+
+```
+CREW_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"
+cp "$CREW_HOME/skills/kirocrew-dev/babysit/scripts/pr_watch.py" \
+   "$CREW_HOME/crons/pr_watch.py"
+
+cron_add(
+  name="pr-watch #1234",
+  script="~/.kiro/crew/crons/pr_watch.py:watch",
+  every=300,
+  timeout=120,
+  message='{"repo": "owner/name", "pr": 1234,
+            "known_reds": ["Frontend Tests (4)"],
+            "note": "worktree ~/oss/wt-foo, branch fix/foo"}'
+)
+```
+
+The `cp` runs in your shell, so it has to resolve `KIROCREW_HOME` -- an install
+that moved its data home has no `~/.kiro/crew/skills` at all and a hardcoded
+path fails with `No such file or directory`. The `script=` value is different:
+the gateway resolves it against its OWN config directory (and forces the
+`crons/` root), so the conventional spelling there is correct as written.
+
+- `known_reds` — check names that are red on the BASE branch (inherited
+  breakage). The watch never wakes for them and treats "everything else
+  green" as review-ready. Populate it from what you verified against main's
+  own CI, and update the cron message if main's condition changes.
+- `note` — one line of context echoed into the wake brief. Put the worktree
+  and branch here so the woken turn starts oriented; if this session keeps a
+  work ledger, the brief also tells the woken turn to read it.
+- `coalesce_secs` — optional convergence window, default 240, `0` disables it.
+  Reds arriving while checks are still running are **coalesced into one
+  wake** instead of one wake each. This matters on a repository whose checks
+  finish over many minutes: a 34-second body gate and a five-minute reviewer
+  lane both flipping red on one head used to be two separate wakes, each
+  arriving before the other checks had even started. The window opens on the
+  first anomaly and fires once `coalesce_secs` has elapsed AND either everything
+  has settled or a 30-minute hard cap is hit — so a `pending` count that
+  never drains costs a delayed wake, never a lost one.
+- **A grace-gated wake always costs at least one extra tick**, because a
+  window cannot open and fire within the same tick. On a 60s cron that is at
+  least 60s of added latency. Set `coalesce_secs: 0` when latency matters more
+  than coalescing.
+- A merge conflict and a merged/closed PR **bypass the window** and fire
+  immediately: a dirty PR dispatches no checks, so `pending` never drains and
+  waiting observes nothing at all.
+- Wakes are deduplicated **per head SHA**: one wake per conflict, per new red
+  check name, per all-green. A force-push resets the memory, so the next
+  anomaly on the new head wakes again. Quiet ticks deliver nothing at all.
+- A conversation signal older than five hours is never treated as new. That bound
+  is a constant in the script, deliberately not a cron parameter: the probe keeps
+  no memory of its own, so without it arming a watch on a PR with forty comments
+  would report all forty on the first tick — and as a knob it had no caller while
+  its one real constraint (stay under the kernel's six-hour re-alert window) is
+  now asserted in code rather than merely documented. The value sits close to that
+  ceiling on purpose: too large costs one coalesced arm-time wake, while too small
+  costs a silent permanent MISS whenever the watch stops ticking for longer than
+  the horizon (laptop asleep, gateway down, cron auto-paused). Those two prices are
+  not equal, so the horizon is pushed as high as the kernel allows.
+- The watch reads PR state, the check rollup, AND the conversation: comments and
+  submitted reviews. It reports **that**
+  something was said -- who, and when -- and never quotes the body. Reading the
+  text, judging whether it is a real finding, and deciding what to do stay the
+  woken agent's job, done with this session's trust rather than a cron script's.
+  This is what closes the gap `monitor_start` used to cover: a comment moves no
+  check, and on this repository a reviewer lane can report success while its
+  comment body carries findings, so a rollup-only watch would sit quiet on a
+  green PR nobody had read.
+- Conversation signals are deduplicated per comment/review id and **survive a
+  force-push**, because a comment belongs to the pull request rather than to the
+  commit under review. Check-derived signals still reset per head. Your own
+  comments are ignored, or the watch would wake you to read the disposition you
+  just posted.
+- Merged or closed → the cron delivers a final message and removes itself.
+  If you finish the babysit early, remove it yourself (`cron_remove`).
+- Typical composition: drive the active-fix phase with `monitor_start`; when
+  the PR goes quiet (checks running, awaiting review), stop the loop
+  (`autonudge_stop`) and arm the watch. When a wake arrives, act on it; if
+  heavy fixing resumes, re-arm `monitor_start` and remove the watch until
+  things go quiet again.
+
+### Never use an agent cron or heartbeat to react to reviewer feedback
 
 Both are structurally incapable of it, and both fail in ways that look like
 success:
@@ -192,8 +471,29 @@ talking about from your cwd):
 ```bash
 SKILL_DIR="${KIROCREW_HOME:-$HOME/.kiro/crew}/skills/kirocrew-dev/prepare-pr"
 python3 "$SKILL_DIR/scripts/pr_status.py" <pr#>     # exit 0 clean / 10 running / 20 blocked / 2 env
+python3 "$SKILL_DIR/scripts/pr_status.py" <pr#> --json   # same exit code, plus the progress key on stdout
 python3 "$SKILL_DIR/scripts/pr_findings.py" <pr#>   # only after 20: failed steps, log tails, threads
 ```
+
+`--json` adds one machine-readable object to stdout and changes nothing else —
+same exit codes, same prose above it. Use it for the stall tripwire: the object
+carries the full 40-char `head_sha` (the prose only ever prints 12), the sorted
+`failing_checks` list, and `readiness_kind`, so two cycles can be compared
+byte-for-byte instead of by eyeballing a diff of human text.
+
+Its `advisory` half is what you read when checking the exit conditions below:
+`unresolved_threads` (`null` there is the same "could not establish" as a `?`),
+`findings` per reviewer, `stale_reviewers` / `blocking_reviewers`, and
+`elided_stamp_reviewers` — lanes whose freshness stamp MANGLED the head SHA
+(the workflows have the model retype it, so a lane can drop the middle and
+splice the head's prefix to its suffix). The gate verifies such a stamp against
+the current head and accepts it, which is why it is not a stale reviewer; the
+list exists so the emitter defect is still visible. Report it ONCE per head as
+a lane-quality note — it never blocks, and re-running that workflow usually
+produces a clean stamp. Nothing else is emitted — ambient PR state (mergeable,
+merge state, review decision, check totals) stays in the prose above, which is
+where those conditions already read it, so there is no second copy to keep in
+sync.
 
 Drive the cycle off the **exit code**, not off prose: `10` → report nothing and
 wait for the next cycle; `20` → drill in with `pr_findings.py` and act; `2` →
@@ -332,10 +632,15 @@ Two limits worth knowing before you trust it on an arbitrary PR:
    - what to do with findings (fix + push, summarize, escalate),
    - the exit condition, ending with: "when met, tell the user and call
      `autonudge_stop`".
-2. **Call `monitor_start`.** `interval_secs` default 300 suits CI/review
-   polling. `max_cycles` defaults to 24 (≈2h of idle gaps at 300s); raise it
-   for longer work, and pass `0` for unlimited only when the user explicitly
-   asks for an unbounded loop.
+2. **Call `monitor_start`, and always pass a wall-clock budget.**
+   `interval_secs` default 300 suits CI/review polling. `max_cycles` defaults to
+   24 (≈2h of idle gaps at 300s); raise it for longer work, and pass `0` for
+   unlimited only when the user explicitly asks for an unbounded loop.
+   **Set `max_runtime_secs` too.** It is the only bound that holds when
+   per-cycle work grows: measured cycles ran 124s–823s of model time *on top of*
+   the idle gap, so a 12-cycle cap took 4.1 hours. Cycle count does not bound
+   spend. Budget the wall clock you would actually accept (e.g. `14400` for four
+   hours) so a stalled loop dies on time rather than on arithmetic.
 3. **Confirm it armed.** Read `~/.kiro/crew/autonudge.json` and check your
    loop is there. The tool's reply is not evidence — see above.
 4. **Tell the user monitoring is active and END YOUR TURN.** The loop wakes
@@ -343,23 +648,43 @@ Two limits worth knowing before you trust it on an arbitrary PR:
 5. **Each cycle:** do the check, act, and report only real signals. Don't
    post "nothing new" every cycle. If the instruction no longer matches
    reality, `monitor_update` it rather than working around it.
-6. **On the exit condition** (or the user saying stop): report, then call
+   **Keep a no-signal cycle cheap.** On exit `10` the correct cycle is: read the
+   exit code, write nothing, end the turn. Do not re-read review-bot bodies, job
+   logs, or diffs on a cycle whose own status call already said nothing changed —
+   that is where a watch loop turns into a spend loop. One `pr_status.py` run is
+   6–8 `gh` invocations; the expensive reads belong to exit `20`.
+6. **Persist the progress key and its streak count to a file** (not session
+   memory — compaction eats both) and apply the stall tripwire above: 3
+   byte-identical keys on *settled* cycles (exit `0` or `20`) with no push means
+   stop and escalate. Exit-`10` cycles are skipped, not counted and not reset;
+   exit `2` escalates.
+7. **On the exit condition** (or the user saying stop): report, then call
    `autonudge_stop` with a reason. Do not let the cap do this for you.
 
 ## Example
 
 User: "babysit PR #247 until it's review-ready"
 
+Note what the message does with that: the user said `PR #247`, and the armed
+instruction names the pull request by FULL URL. That is what makes the loop
+observation-gated -- copy the user's bare number into the message and it is not.
+
 ```
 monitor_start(
-  message="Check PR #247. FIRST read
+  message="Check https://github.com/owner/repo/pull/247. FIRST read
            gh pr view 247 --json mergeable,mergeStateStatus,reviewDecision —
            rules 6 and 7 of the babysit skill govern what each value means.
            Then run
            python3 \"${KIROCREW_HOME:-$HOME/.kiro/crew}/skills/kirocrew-dev/prepare-pr/scripts/pr_status.py\" 247
-           and act on its exit code (10 = still running, report nothing;
+           and act on its exit code, passing --json so the progress key is
+           machine-comparable (10 = still running, report nothing and do not
+           read bot bodies or job logs;
            20 = drill in with pr_findings.py, or stop if the reason is a
-           terminal PR state). If this repo's reviewer conclusions are on the
+           terminal PR state). Keep the progress_key AND a consecutive-match
+           count in the data home beside the loop's stop sentinel, reading that
+           file rather than trusting memory: 3 byte-identical keys on settled
+           cycles (exit 0 or 20) with no push in that span means stop and
+           escalate. If this repo's reviewer conclusions are on the
            unreliable list you established for it, resolve the AI review lane
            from the job log plus the comment body for the current head SHA
            rather than the conclusion; where the conclusion is trustworthy, use
@@ -375,6 +700,7 @@ monitor_start(
            user the PR is review-ready and call autonudge_stop.",
   interval_secs=300,
   max_cycles=20,
+  max_runtime_secs=14400,
 )
 ```
 
@@ -387,7 +713,10 @@ own "green is weaker than it looks" caveat.
 
 ## Rules & gotchas
 
-- **One loop per session** — a new `monitor_start` replaces the existing loop.
+- **One automation per session** — `monitor_start` is **create-only**: it refuses
+  while a loop (or a structured monitor) already occupies this session. To change
+  a running loop use `monitor_update`; to replace it, `autonudge_stop` first, then
+  arm again.
 - **Busy sessions skip a cycle** (never queue) — a long-running turn delays
   the next check to the following interval; skipped cycles don't count
   toward `max_cycles`.
@@ -399,6 +728,9 @@ own "green is weaker than it looks" caveat.
   dashboard/Slack for tool-heavy babysitting or run the gateway with
   `--approval yolo`/`auto`).
 - **Kill switches:** `autonudge_stop` (preferred), the dashboard 🎯 popover
-  (dashboard loops), `max_cycles`, or the per-loop STOP sentinel file.
+  (dashboard loops), `max_cycles`, or `max_runtime_secs`. A STOP sentinel file
+  only exists for a loop armed with an explicit `stop_sentinel_path` (the HTTP
+  `POST /api/autonudge` path accepts one); a loop armed through `monitor_start`
+  has none.
 - Loops fire `[auto-nudge cycle N]`-tagged messages — treat them as your own
   scheduled wake-ups, not user input.

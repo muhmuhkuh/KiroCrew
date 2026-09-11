@@ -7,6 +7,40 @@ import { i18nT } from '../../i18n/t'
 
 const API = '/api/apps/issue-radar'
 
+/** The per-request UI-language hint for the backend's AI-prose calls.
+ *
+ * `aiLanguage` must ALREADY be resolved through the app's own
+ * `resolveAiLanguage()` (`lib/format.ts`) by the calling component, which is the
+ * single place Issue Radar decides what language its AI output should be in --
+ * the same resolver `investigate.ts` and `review.ts` use. Deriving it here from
+ * a raw `activeLocale()` instead would give the app two disagreeing resolvers
+ * and ignore the user's explicit "Agent output language" pick, so a `ja` picker
+ * would produce Japanese investigations beside English summaries.
+ *
+ * Why a hint has to exist at all: the dashboard's default language is "follow
+ * the browser", resolved entirely client-side, and the gateway reads
+ * `Accept-Language` nowhere -- so without this the backend cannot know the
+ * language of any install that never set `dashboard.language`, and every AI card
+ * comes back English inside a fully localized UI. Sending the already-resolved
+ * tag also keeps the catalog matcher in one place (`detect.ts`) instead of
+ * growing a second copy in Python.
+ *
+ * Deliberately per-request and never written to config: "Auto" is
+ * browser-relative, so persisting what this browser resolved would tell a
+ * different browser to discard its own pick -- see the `adoptedServerValue`
+ * rationale in `LanguageProvider.tsx`. An explicitly configured
+ * `dashboard.language` still outranks it server-side.
+ *
+ * An empty tag sends NO field. `resolveAiLanguage` returns `''` both for "follow
+ * an English browser" and for an explicit English pick, and the directive-free
+ * prompt already produces English -- so omitting it leaves an English user's
+ * request byte-identical to what it has always been, caches included.
+ *
+ * Spread into the query for GETs and into the body for POSTs. */
+function langHint(aiLanguage: string): Record<string, string> {
+  return aiLanguage ? { lang: aiLanguage } : {}
+}
+
 export interface ConnectResponse {
   owner: string
   repo: string
@@ -23,6 +57,10 @@ export interface Issue {
   number: number
   title: string
   url: string
+  /** Provider-native status name, when the provider exposes one (for example Jira). */
+  status?: string | null
+  /** Provider-native priority name, when the provider exposes one (for example Jira). */
+  priority?: string | null
   labels: string[]
   comments: number
   /** Total reaction count across all emoji (populated on next refresh). */
@@ -254,6 +292,8 @@ export interface IssueDetailData {
   number: number
   title: string
   body: string
+  status?: string | null
+  priority?: string | null
   state: string
   state_reason: string | null
   url: string
@@ -398,6 +438,28 @@ export interface IssueStateResponse {
   number: number
   state: string
   state_reason: string | null
+}
+
+/** Thrown by `setIssueAssignees` on a 409: somebody else changed the assignees
+ * between the read this client rendered and the write. Carries the set the forge
+ * actually holds so the caller can re-render instead of retrying blindly. */
+export class AssigneesConflictError extends Error {
+  current: string[]
+  constructor(message: string, current: string[]) {
+    super(message)
+    this.name = 'AssigneesConflictError'
+    this.current = current
+  }
+}
+
+/** Response to an assignee edit — the issue's authoritative assignee logins
+ * after the replace. Read back from the provider (not the request), because a
+ * success is not required to be an exact echo (GitLab Free keeps only one). */
+export interface IssueAssigneesResponse {
+  owner: string
+  repo: string
+  number: number
+  assignees: string[]
 }
 
 /** The pull-request actions the UI can invoke on ONE PR.
@@ -767,6 +829,12 @@ export interface InvestigationRecord {
   started_at: string
   last_opened_at: string
   findings: InvestigationFindings | null
+  /** Which session's run the stored `findings` were written under. Server-owned
+   * (it is not part of `InvestigationPatch`): the store stamps it on every write
+   * and uses it to REPLACE rather than merge the first findings of a new run, so
+   * a re-run's verdict never blends with the previous one's. Null when no
+   * findings are stored. */
+  findings_slot_key?: string | null
 }
 
 /** Which sequence a number belongs to. Only load-bearing on GitLab, where issues
@@ -816,6 +884,35 @@ async function parseErrorBody(r: Response): Promise<string> {
   }
 }
 
+/** One dependency edge in the repo's dependency graph: `blocked` cannot proceed
+ * until `blocker` is closed/merged. `source` records where the edge came from —
+ * `native` is a GitHub-native issue dependency; `inferred` is derived from
+ * timeline cross-references (and never written back to GitHub). */
+export interface DepEdge {
+  blocked: number
+  blocker: number
+  source: 'native' | 'inferred'
+}
+
+/** A node in the dependency graph's node map, keyed by its number as a string.
+ * A thin descriptor the client joins against the live issue/PR list rows where
+ * present, and falls back to when a referenced number is not in the loaded list. */
+export interface DepNode {
+  kind: 'issue' | 'pull'
+  state: 'open' | 'closed' | 'merged'
+  title: string
+}
+
+/** The `GET /api/apps/issue-radar/deps` payload. Schema-versioned so a client
+ * can refuse a shape it does not understand rather than mis-render it. */
+export interface DepsResponse {
+  schema: number
+  fetched_at?: string
+  edges: DepEdge[]
+  /** Node descriptors keyed by number-as-string (e.g. `"5190"`). */
+  nodes: Record<string, DepNode>
+}
+
 /** The full identity of a connected repository.
  *
  * A ref is `owner`/`repo` plus the provider and — for self-managed instances —
@@ -833,8 +930,12 @@ export interface RepoRef {
   host?: string
 }
 
-/** Which forge a repo lives on. */
-export type SourceProvider = 'github' | 'gitlab'
+/** Which forge a repo lives on.
+ *
+ * `azure` is Azure DevOps on `dev.azure.com`, where `owner` carries
+ * `{organization}/{project}` — a slash-joined pair, the same way `owner` carries a
+ * nested group path on GitLab. */
+export type SourceProvider = 'github' | 'gitlab' | 'azure' | 'jira'
 
 /** Which provider account an account-scoped endpoint should ask about.
  *
@@ -899,10 +1000,13 @@ export const CREW_PHASES = [
 export type CrewPhase = typeof CREW_PHASES[number]
 
 /** Mirrors `crew_store.EVENT_KINDS`. The store REFUSES an unknown kind, so this
- * union is enforced server-side rather than merely documented. */
+ * union is enforced server-side rather than merely documented.
+ *
+ * `sweep` is the one kind that belongs to no issue — a crew reporting that it
+ * checked the queue and took nothing — so its lines carry no `number`. */
 export const CREW_EVENT_KINDS = [
   'claim', 'investigate', 'reply', 'implement', 'ci',
-  'review', 'conflict', 'merge', 'handback', 'skip', 'yield',
+  'review', 'conflict', 'merge', 'handback', 'skip', 'yield', 'sweep',
 ] as const
 
 export type CrewEventKind = typeof CREW_EVENT_KINDS[number]
@@ -1029,7 +1133,10 @@ export interface CrewEvent {
   id: string
   ts: string
   crew_id: string
-  number: number
+  /** ABSENT on a crew-level line (`kind: 'sweep'`), which belongs to no issue.
+   *  Optional rather than nullable because the backend omits the key entirely —
+   *  a `0` would be indistinguishable from a real issue number. */
+  number?: number
   kind: CrewEventKind
   text: string
 }
@@ -1268,9 +1375,10 @@ export const issueRadarApi = {
   },
 
   /** AI triage (summary + suggested labels), cache-first server-side; pass
-   * refresh to force a regenerate. */
-  issueAi: async (ref: RepoRef, number: number, opts?: { refresh?: boolean }): Promise<IssueAiResponse> => {
-    const q = new URLSearchParams({ ...repoQuery(ref), number: String(number) })
+   * refresh to force a regenerate. `aiLanguage` is the tag from
+   * `resolveAiLanguage()` -- see `langHint`. */
+  issueAi: async (ref: RepoRef, number: number, aiLanguage: string, opts?: { refresh?: boolean }): Promise<IssueAiResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), ...langHint(aiLanguage), number: String(number) })
     if (opts?.refresh) q.set('refresh', '1')
     const r = await fetch(`${API}/issue-ai?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
@@ -1280,9 +1388,10 @@ export const issueRadarApi = {
   /** AI summary of a pull request — its description, whole conversation, and
    * check state. Cache-first server-side, and the cache self-invalidates when
    * the PR moves (new comment / push / flipped check), so no manual refresh is
-   * needed to pick up changes; pass refresh to force a regenerate anyway. */
-  pullAi: async (ref: RepoRef, number: number, opts?: { refresh?: boolean }): Promise<PrAiResponse> => {
-    const q = new URLSearchParams({ ...repoQuery(ref), number: String(number) })
+   * needed to pick up changes; pass refresh to force a regenerate anyway.
+   * `aiLanguage` is the tag from `resolveAiLanguage()` -- see `langHint`. */
+  pullAi: async (ref: RepoRef, number: number, aiLanguage: string, opts?: { refresh?: boolean }): Promise<PrAiResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), ...langHint(aiLanguage), number: String(number) })
     if (opts?.refresh) q.set('refresh', '1')
     const r = await fetch(`${API}/pull-ai?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
@@ -1316,6 +1425,46 @@ export const issueRadarApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...repoBody(ref), number, state, state_reason: stateReason }),
     })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** REPLACE an issue's assignees with `assignees` (the FINAL set of logins, not
+   * an add/remove delta). Requires triage/push access (403 otherwise). An empty
+   * array clears all assignees; a junk entry is a 400, never a silent clear.
+   *
+   * `expected` is the set you last READ and is REQUIRED: the write only lands if
+   * the forge still holds it. That is what stops replace semantics from silently
+   * erasing a concurrent edit — two people who each add one name would otherwise
+   * have the later write overwrite the earlier addition. A stale `expected` throws
+   * {@link AssigneesConflictError} carrying the current set; re-render from it and
+   * let the user redo the edit rather than retrying the same body.
+   *
+   * A login the forge will not assign is a 400 whose `error` sentence names the
+   * refused logins (the body also carries `invalid_assignees`), and NOTHING is
+   * applied — GitHub answers 422 for the whole request and GitLab is pre-checked
+   * against the project roster. Rendering the thrown message is therefore already
+   * actionable; it is not an upstream failure to retry.
+   *
+   * On success the returned `assignees` is read back from the write rather than
+   * echoed from the request, because a success is not required to be an exact echo
+   * (GitLab Free keeps only the first assignee) — render THAT. */
+  setIssueAssignees: async (
+    ref: RepoRef, number: number, assignees: string[], expected: string[],
+  ): Promise<IssueAssigneesResponse> => {
+    const r = await fetch(`${API}/issue/assignees`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...repoBody(ref), number, assignees, expected }),
+    })
+    if (r.status === 409) {
+      const body = (await r.json().catch(() => ({}))) as { error?: string; assignees?: string[] }
+      throw new AssigneesConflictError(
+        body.error || i18nT('apps.issueRadar.api.assignees_changed_elsewhere'),
+        body.assignees ?? [],
+      )
+    }
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },
@@ -1597,22 +1746,25 @@ export const issueRadarApi = {
   },
 
   /** Read the repo's cached AI label recommendations (`recommendations` is null
-   * if none generated yet). Never runs the model. */
-  getRecommendations: async (ref: RepoRef): Promise<RecommendationsResponse> => {
-    const q = new URLSearchParams(repoQuery(ref))
+   * if none generated yet). Never runs the model. `aiLanguage` must match what
+   * the generate call used: the server refuses to serve a set written in another
+   * language, so a mismatch reads as "none generated yet". */
+  getRecommendations: async (ref: RepoRef, aiLanguage: string): Promise<RecommendationsResponse> => {
+    const q = new URLSearchParams({ ...repoQuery(ref), ...langHint(aiLanguage) })
     const r = await fetch(`${API}/recommendations?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },
 
   /** Generate (and cache) label recommendations via one model call over the
-   * repo's labels + a sample of its open issues. */
-  generateRecommendations: async (ref: RepoRef): Promise<RecommendationsResponse> => {
+   * repo's labels + a sample of its open issues. `aiLanguage` is the tag from
+   * `resolveAiLanguage()` -- see `langHint`. */
+  generateRecommendations: async (ref: RepoRef, aiLanguage: string): Promise<RecommendationsResponse> => {
     const r = await fetch(`${API}/recommendations`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(repoBody(ref)),
+      body: JSON.stringify({ ...repoBody(ref), ...langHint(aiLanguage) }),
     })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
@@ -1636,7 +1788,9 @@ export const issueRadarApi = {
   /** Read the untagged queue + any cached label suggestions for it. Never runs
    * the model, so it is safe to call whenever the Tagging dashboard mounts.
    * Pass refresh to re-read the issues from GitHub rather than the local cache
-   * (needed to notice labels added on GitHub itself). */
+   * (needed to notice labels added on GitHub itself).
+   *
+   * Sends NO language hint, deliberately -- see `generateTagging`. */
   tagging: async (
     ref: RepoRef, opts?: { refresh?: boolean },
   ): Promise<TaggingResponse> => {
@@ -1649,7 +1803,16 @@ export const issueRadarApi = {
 
   /** Generate label suggestions with ONE batched model call. Omit `numbers` to
    * take the next un-analysed slice of the queue (repeat to walk a long backlog);
-   * pass `numbers` to (re)analyse specific issues. */
+   * pass `numbers` to (re)analyse specific issues.
+   *
+   * Sends NO language hint, deliberately. The tagging cache is ONE document per
+   * repo that ACCUMULATES across many batched calls, and the store drops every
+   * accumulated entry when the language it was written in changes -- safe while
+   * the language is install-wide (a deliberate operator switch, once), but a
+   * per-browser hint would make two browsers on different languages alternate
+   * forever, each wiping the queue the other just paid a model to build. This
+   * surface needs its cache partitioned by language first; until then it follows
+   * `dashboard.language` only. */
   generateTagging: async (
     ref: RepoRef, numbers?: number[],
   ): Promise<GenerateTaggingResponse> => {
@@ -1852,6 +2015,18 @@ export const issueRadarApi = {
       // an object and never falls back to reading loose fields.
       body: JSON.stringify({ ...repoBody(ref), settings: patch }),
     })
+    if (!r.ok) throw new Error(await parseErrorBody(r))
+    return r.json()
+  },
+
+  /** The repo's dependency edges (blocked-by / blocking) + a node map, for the
+   * Graph tab and the detail-pane "Blocked by / Blocking" section. Cache-first,
+   * like `/issues`. The backend route lands in a SEPARATE PR (M1), so callers
+   * must treat a 404/500/empty answer as "no dependency data yet" and render a
+   * designed empty state rather than an error — see GraphView / DepsSection. */
+  deps: async (ref: RepoRef): Promise<DepsResponse> => {
+    const q = new URLSearchParams(repoQuery(ref))
+    const r = await fetch(`${API}/deps?${q.toString()}`, { credentials: 'same-origin' })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()
   },

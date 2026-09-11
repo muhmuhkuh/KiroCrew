@@ -29,8 +29,35 @@ EXPECTED_LAUNCH_REGISTRY = {
     "linear",
     "notion",
     "stripe",
+    "superhuman",
     "vercel",
+    # Industry-baseline batch 1 (ChatGPT + Claude both list them, public remote
+    # MCP with OAuth discovery, L0-green). Registered so the nightly L0 probe
+    # and the OAuth banner allowlist cover them; every one is held back from
+    # the Connect grid until its manual launch-gate check.
+    "airtable",
+    "asana",
+    "paypal",
+    "sentry",
+    "supabase",
 }
+# Tier 3: the vendor admits OAuth clients from an allowlist or waitlist, so no
+# amount of local verification can pass the gate until Kiro is admitted. They
+# are excluded from get_all_providers() as well as from the grid.
+VENDOR_APPROVAL_PENDING = {"canva", "dropbox", "figma"}
+# Registered so the OAuth banner allowlist stays registry-derived, but held back
+# from the Connect grid: GitHub until the Kiro app is registered, Superhuman until
+# a logged-in check records its revoke surface and walks the consent flow, and
+# the batch-1 entries until each has a manual launch-gate check.
+LAUNCH_GATED = {
+    "github",
+    "superhuman",
+    "airtable",
+    "asana",
+    "paypal",
+    "sentry",
+    "supabase",
+} | VENDOR_APPROVAL_PENDING
 
 
 def test_registry_contains_only_the_agreed_launch_set():
@@ -39,15 +66,37 @@ def test_registry_contains_only_the_agreed_launch_set():
 
 def test_probe_accessor_includes_every_entry_even_when_launch_gated():
     providers = get_all_registry_providers()
-    assert {provider["slug"] for provider in providers} == EXPECTED_LAUNCH_REGISTRY
-    github = next(provider for provider in providers if provider["slug"] == "github")
-    assert github["launch_gate_passed"] is False
+    assert {provider["slug"] for provider in providers} == (
+        EXPECTED_LAUNCH_REGISTRY | VENDOR_APPROVAL_PENDING
+    )
+    gated = {p["slug"] for p in providers if p["launch_gate_passed"] is False}
+    assert gated == LAUNCH_GATED
+    pending = {p["slug"] for p in providers if p["vendor_approval_pending"]}
+    assert pending == VENDOR_APPROVAL_PENDING
 
 
 def test_only_gated_launch_services_are_visible():
     assert {provider["slug"] for provider in get_visible_providers()} == (
-        EXPECTED_LAUNCH_REGISTRY - {"github"}
+        EXPECTED_LAUNCH_REGISTRY - LAUNCH_GATED
     )
+
+
+def test_every_registry_mcp_authorization_server_is_banner_allowlisted():
+    """A registry entry whose consent URL the banner gate rejects cannot be connected.
+
+    The gate exempts OAuth entropy only at an exact ``(host, path)`` in the
+    builtin set, so every provider's advertised authorization server must have
+    an entry there -- gated providers included, because the gate is what a
+    hand-configured MCP server for the same provider hits today.
+    """
+    from urllib.parse import urlsplit
+
+    from kiro_crew.security import _OAUTH_AUTHORIZATION_ENDPOINTS
+
+    allowlisted_hosts = {host for host, _path in _OAUTH_AUTHORIZATION_ENDPOINTS}
+    for provider in get_all_registry_providers():
+        issuer_host = urlsplit(provider["l0_expectations"]["authorization_server"]).hostname
+        assert issuer_host in allowlisted_hosts, provider["slug"]
 
 
 def test_linear_installs_its_read_only_endpoint():
@@ -75,6 +124,35 @@ def test_gitlab_card_copy_admits_its_only_scope_can_write():
 def test_client_id_is_optional_and_unset_for_every_launch_provider():
     """GitHub is the intended first consumer, still pending its app registration."""
     assert all("client_id" not in provider for provider in get_all_registry_providers())
+
+
+def test_every_provider_declares_a_category_from_the_closed_vocabulary():
+    """``category`` feeds the directory-coverage report; a free-text value would
+    let one typo mint a one-provider bucket that report then counts as coverage."""
+    from kiro_crew.connections.registry import PROVIDER_CATEGORIES
+
+    for provider in get_all_registry_providers():
+        assert provider["category"] in PROVIDER_CATEGORIES, provider["slug"]
+
+
+def test_category_outside_the_vocabulary_is_rejected(tmp_path):
+    payload = get_all_registry_providers()
+    payload[0]["category"] = "misc"
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(RegistryValidationError, match="category must be one of"):
+        _load_registry(registry_path)
+
+
+def test_category_stays_optional_for_an_entry_that_predates_it(tmp_path):
+    payload = get_all_registry_providers()
+    del payload[0]["category"]
+    registry_path = tmp_path / "registry.json"
+    registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = {p["slug"]: p for p in _load_registry(registry_path)}
+    assert "category" not in loaded[payload[0]["slug"]]
 
 
 def test_client_id_is_accepted_when_a_provider_declares_one(tmp_path):

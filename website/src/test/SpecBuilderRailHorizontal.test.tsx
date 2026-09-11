@@ -6,7 +6,7 @@
 // does not violate max-two-buttons-per-row), and Settings therefore stays in the
 // expanded rail rather than riding along.
 import { describe, it, expect, vi } from 'vitest'
-import { render, cleanup, fireEvent } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen } from '@testing-library/react'
 import SpecRail from '../apps/spec-builder/components/SpecRail'
 import type { SpecSummary } from '../apps/spec-builder/api'
 
@@ -85,6 +85,58 @@ describe('Spec Builder collapsed rail, horizontal orientation', () => {
     const aside = container.querySelector('aside')
     expect(aside!.className).toMatch(/flex-col/)
     expect(aside!.className).not.toMatch(/w-full/)
+    cleanup()
+  })
+})
+
+describe('Spec Builder expanded rail grouping', () => {
+  it('labels in-progress specs as ACTIVE, not a hardcoded English leftover', () => {
+    const { getByText } = render(
+      <SpecRail
+        specs={[spec({ name: 'login', phase: 'design' }), spec({ name: 'billing', phase: 'tasks' })]}
+        sel="login"
+        setSel={() => {}}
+        onNew={() => {}}
+        width={250}
+      />,
+    )
+    expect(getByText('ACTIVE')).toBeTruthy()
+    expect(getByText('PLAN READY')).toBeTruthy()
+    cleanup()
+  })
+
+  it('says so when the filter matches nothing', () => {
+    const { getByLabelText, getByText } = render(
+      <SpecRail
+        specs={[spec({ name: 'login', phase: 'design' })]}
+        sel="login"
+        setSel={() => {}}
+        onNew={() => {}}
+        width={250}
+      />,
+    )
+    fireEvent.change(getByLabelText(/filter specs by name/i), { target: { value: 'zzzz' } })
+    // The shared FilteredEmpty state echoes the query that excluded everything.
+    expect(getByText(/zzzz/)).toBeTruthy()
+    cleanup()
+  })
+
+  it('keeps archived specs selectable and shows their title', () => {
+    const setSel = vi.fn()
+    renderBar({
+      collapsed: false,
+      horizontal: false,
+      width: 260,
+      setSel,
+      specs: [
+        spec(),
+        spec({ name: 'archived-dark-mode', title: 'Archived dark mode', archived: true }),
+      ],
+    })
+
+    expect(screen.getByText('Archived')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Archived dark mode'))
+    expect(setSel).toHaveBeenCalledWith('archived-dark-mode')
     cleanup()
   })
 })

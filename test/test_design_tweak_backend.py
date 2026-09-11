@@ -14,6 +14,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,10 @@ from typing import Any
 
 import pytest
 
+if sys.platform == "win32":  # pragma: no cover - platform-gated
+    import _winapi
+
+from conftest import requires_symlinks
 from kiro_crew.apps.builtins.design_tweak.backend import server
 from kiro_crew.platform_compat import IS_POSIX
 
@@ -64,6 +69,7 @@ class TestContained:
         with pytest.raises(server._PathEscape):
             server._contained(base, "../app-evil/leak.txt")
 
+    @requires_symlinks
     def test_symlink_escape_rejected(self, tmp_path):
         base = tmp_path / "proj"
         base.mkdir()
@@ -548,24 +554,70 @@ class TestWhatIsWrittenStaysReadable:
         assert still["comments"] == [{"cid": "c1"}]
 
     def test_anything_the_writer_accepts_the_reader_returns(self, isolated_queue):
-        """Round-trip at the boundary, so an off-by-one cannot hide between them."""
-        rid = "1700000000000-atlimit"
-        fp = server._request_file(server.QUEUE_DIR, rid)
-        # Grow a record until the writer refuses, then prove the last accepted
-        # one is still readable — that is the invariant, not any single size.
-        pad = "a" * 1000
-        req: dict = {"id": rid, "notes": []}
-        for _ in range(4000):
-            req["notes"].append(pad)
-            try:
-                server._write_request(fp, req)
-            except server._RecordTooLarge:
-                req["notes"].pop()
-                break
-        else:
-            pytest.fail("never reached the ceiling — the guard may be inert")
+        """Round-trip AT the ceiling, so an off-by-one cannot hide between them.
+
+        The writer refuses `len(data) > max_bytes` and the reader refuses
+        `st_size > MAX_RECORD_BYTES`, so a record serialising to exactly the
+        ceiling is the single input both must accept. Either bound flipping to
+        `>=` rejects it, and no other test in this file writes a record of
+        exactly that size.
+        """
+        fp = server._request_file(server.QUEUE_DIR, _AT_LIMIT_RID)
+        at_ceiling = _record_serialising_to(_AT_LIMIT_RID, server.MAX_RECORD_BYTES)
+        server._write_request(fp, at_ceiling)
+        assert fp.stat().st_size == server.MAX_RECORD_BYTES, (
+            "the record no longer lands on the ceiling, so the boundary is untested"
+        )
         assert server._read_request(fp) is not None, (
             "the largest record the writer accepted is unreadable"
+        )
+
+    def test_one_byte_over_the_ceiling_is_refused(self, isolated_queue):
+        """Pins the ceiling exactly.
+
+        `test_an_oversized_write_is_refused` uses a grossly oversized record, which
+        an off-by-one bound still refuses; only the +1 case can tell the two apart.
+        """
+        fp = server._request_file(server.QUEUE_DIR, _AT_LIMIT_RID)
+        over = _record_serialising_to(_AT_LIMIT_RID, server.MAX_RECORD_BYTES + 1)
+        with pytest.raises(server._RecordTooLarge):
+            server._write_request(fp, over)
+
+    def test_the_boundary_round_trip_stays_inside_an_io_budget(
+        self, isolated_queue, monkeypatch
+    ):
+        """Bound the I/O, because a quadratic probe is invisible to a pass/fail assert.
+
+        Establishing the ceiling by growing a record and calling the real writer at
+        each step costs sum(k) bytes, not O(k): measured at 2081 writer calls and
+        2.03 GiB serialised and written to reach a 2 MiB answer. On windows-latest
+        that overran the 180s per-test timeout, and replacing the killed worker
+        pushed the whole shard past its 40-minute job cap, so every other test in
+        that shard went unreported. The ceiling is arithmetic on the serialised
+        bytes, so candidates must be measured in memory.
+        """
+        offered: list[int] = []
+        real_write_json = server._atomic_write_json
+
+        def counting(path: Path, payload: dict, **kw: Any) -> None:
+            offered.append(len(json.dumps(payload, indent=2).encode("utf-8")))
+            return real_write_json(path, payload, **kw)
+
+        monkeypatch.setattr(server, "_atomic_write_json", counting)
+
+        fp = server._request_file(server.QUEUE_DIR, _AT_LIMIT_RID)
+        server._write_request(
+            fp, _record_serialising_to(_AT_LIMIT_RID, server.MAX_RECORD_BYTES)
+        )
+        assert server._read_request(fp) is not None
+
+        assert len(offered) <= 2, (
+            f"{len(offered)} writer calls to establish one ceiling; a real write per "
+            "candidate size is quadratic and hangs the Windows shard"
+        )
+        assert sum(offered) <= 2 * server.MAX_RECORD_BYTES, (
+            f"the boundary round-trip pushed {sum(offered)} bytes through the writer "
+            f"for a {server.MAX_RECORD_BYTES}-byte answer"
         )
 
     def test_the_writer_bound_covers_every_route(self):
@@ -777,6 +829,7 @@ class TestPreviewSuppliedSourcePathsAreContained:
         )
         assert source_file == str(Path(os.path.realpath(proj)) / "sub" / "index.html")
 
+    @requires_symlinks
     def test_symlink_escape_in_preview_url_is_rejected(self, tmp_path, monkeypatch):
         """A symlink inside the project pointing out of it must not resolve.
 
@@ -923,7 +976,8 @@ class TestProxyAuthDenialIsAudited:
         h = _H()
         assert server.Handler._authorized(h, "GET", b"") is False
         assert h.sent and h.sent[0][0] == 401
-        # Machine-readable code, per AGENTS.md's non-2xx body contract.
+        # Machine-readable code, per the non-2xx body contract in
+        # docs/system-specs/common/code-style.md.
         assert h.sent[0][1].get("code") == "invalid_proxy_signature"
 
         assert len(calls) == 1, "the 401 emitted no audit record"
@@ -1216,6 +1270,7 @@ class TestKiroCrewInternalTreesAreNeverServed:
         assert code == 403
         assert b"xoxb-secret" not in body
 
+    @requires_symlinks
     def test_a_symlink_into_the_crew_home_is_refused(self, tmp_path, monkeypatch):
         """The check realpaths, so a link inside the project cannot launder it."""
         home = tmp_path / "home"
@@ -1266,6 +1321,7 @@ class TestEntryPointCannotLaunderASecret:
     is resolved.
     """
 
+    @requires_symlinks
     def test_index_html_symlinked_to_env_is_not_served(self, tmp_path):
         root = tmp_path / "site"
         root.mkdir()
@@ -1276,6 +1332,7 @@ class TestEntryPointCannotLaunderASecret:
         assert b"live-secret" not in body
         assert code != 200
 
+    @requires_symlinks
     def test_entry_symlinked_into_the_crew_home_is_not_served(self, tmp_path, monkeypatch):
         home = tmp_path / "home"
         crew = home / ".kiro" / "crew"
@@ -1291,6 +1348,7 @@ class TestEntryPointCannotLaunderASecret:
         assert b"signing-key" not in body
         assert code != 200
 
+    @requires_symlinks
     def test_find_entry_skips_a_secret_and_keeps_looking(self, tmp_path):
         """A later legitimate candidate must still be found."""
         root = tmp_path / "site"
@@ -1322,6 +1380,7 @@ class TestHtmlScanDoesNotFollowSymlinks:
     sensitive-path floor exists to withhold.
     """
 
+    @requires_symlinks
     def test_a_symlinked_directory_is_not_enumerated(self, tmp_path):
         secret = tmp_path / "protected"
         secret.mkdir()
@@ -1335,6 +1394,7 @@ class TestHtmlScanDoesNotFollowSymlinks:
         assert "real.html" in found
         assert not any("private-notes" in f for f in found), found
 
+    @requires_symlinks
     def test_a_symlinked_file_is_not_listed(self, tmp_path):
         secret = tmp_path / "protected"
         secret.mkdir()
@@ -1347,6 +1407,7 @@ class TestHtmlScanDoesNotFollowSymlinks:
         found = server._scan_html(root)
         assert found == ["real.html"], found
 
+    @requires_symlinks
     def test_the_404_page_cannot_disclose_a_symlinked_tree(self, tmp_path):
         """End-to-end: a project with NO entry page renders the diagnostic listing."""
         secret = tmp_path / "protected"
@@ -1359,6 +1420,67 @@ class TestHtmlScanDoesNotFollowSymlinks:
         code, _ctype, body = server._static_response(str(root), "/", "/p/")
         assert code == 404
         assert b"private-notes" not in body
+
+    def test_a_junctioned_directory_is_not_enumerated(self, tmp_path, monkeypatch):
+        """A junction is the case that actually reaches a Windows user.
+
+        Every other test in this class is `@requires_symlinks` and therefore skipped
+        on Windows, because a symlink there needs a privilege. A junction needs none
+        — so the one link type a Windows user can plant was the one the guard did not
+        cover. `is_symlink()` does not report a junction and a junction IS a
+        directory, so the walk fell to the `is_dir()` arm and listed the linked tree.
+        """
+        secret = tmp_path / "protected"
+        secret.mkdir()
+        (secret / "private-notes.html").write_text("<h1>secret</h1>")
+        root = tmp_path / "site"
+        root.mkdir()
+        link = root / "docs"
+        link.mkdir()
+        (link / "private-notes.html").write_text("<h1>secret</h1>")
+        (root / "real.html").write_text("<h1>ok</h1>")
+
+        monkeypatch.setattr(server, "is_link_or_junction", lambda p: Path(p) == link)
+        found = server._scan_html(root)
+
+        assert "real.html" in found
+        assert not any("private-notes" in f for f in found), found
+
+    def test_the_scan_consults_the_shared_link_helper(self, tmp_path, monkeypatch):
+        """A junction is only refused if the walk ASKS the shared helper about it —
+        the seam, not the outcome, is what `is_symlink()` got wrong."""
+        root = tmp_path / "site"
+        (root / "public").mkdir(parents=True)
+        (root / "public" / "a.html").write_text("x")
+        seen = []
+
+        def _spy(p):
+            seen.append(Path(p).name)
+            return False
+
+        monkeypatch.setattr(server, "is_link_or_junction", _spy)
+        server._scan_html(root)
+
+        assert "public" in seen
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="junctions are a Windows reparse point"
+    )
+    def test_a_real_windows_junction_is_not_enumerated(self, tmp_path):
+        """No stub and no elevation: the real reparse point, so the stubbed tests
+        above stand in for something rather than for nothing."""
+        secret = tmp_path / "protected"
+        secret.mkdir()
+        (secret / "private-notes.html").write_text("<h1>secret</h1>")
+        root = tmp_path / "site"
+        root.mkdir()
+        (root / "real.html").write_text("<h1>ok</h1>")
+        _winapi.CreateJunction(str(secret), str(root / "docs"))
+
+        found = server._scan_html(root)
+
+        assert "real.html" in found
+        assert not any("private-notes" in f for f in found), found
 
     def test_ordinary_nested_html_is_still_found(self, tmp_path):
         """The refusal must not break the diagnostic page it feeds."""
@@ -2669,6 +2791,29 @@ def _widen_the_race(monkeypatch, delay: float = 0.05):
     monkeypatch.setattr(server, "_write_request", slow_write)
 
 
+_AT_LIMIT_RID = "1700000000000-atlimit"
+
+
+def _record_serialising_to(rid: str, size: int) -> dict:
+    """A queue record whose `json.dumps(..., indent=2)` encoding is exactly `size` bytes.
+
+    Solved, not searched. The writer's ceiling is a property of the serialised
+    bytes, so a candidate can be measured in memory; growing a record and calling
+    the real writer at each step spends O(n^2) bytes of fsynced disk I/O to learn
+    the same number. The pad is `a`, which JSON never escapes, so length is linear
+    in the pad and the correction below lands in one step.
+    """
+    req: dict = {"id": rid, "notes": [""]}
+    for _ in range(3):
+        have = len(json.dumps(req, indent=2).encode("utf-8"))
+        if have == size:
+            return req
+        if len(req["notes"][0]) + size - have < 0:
+            raise AssertionError(f"{size} bytes is below the record skeleton")
+        req["notes"][0] = "a" * (len(req["notes"][0]) + size - have)
+    raise AssertionError(f"could not serialise to exactly {size} bytes")
+
+
 def _submit(project_id: str, text: str, extra: dict | None = None) -> _JsonHandler:
     payload = {
         "type": "visual_edit_request",
@@ -3029,6 +3174,59 @@ class TestDevProxyBodyCaps:
         assert b"hi" in out
         # HTML still gets the overlay injected — the cap did not break the rewrite.
         assert server._OVERLAY_PATH.encode() in out
+
+
+class TestDevProxyContentTypeIsAllowlisted:
+    """A proxied reply carries one of OUR literals, never the upstream's value.
+
+    `_PROXY_CTYPES` and `_safe_upstream_ctype` exist because the dev server is the
+    project's own process but still an unaudited one whose headers land in our
+    response. The selector was written, tested in isolation, and never called:
+    `_relay_http` forwarded every upstream header through `_header_value` alone, so
+    the media type and its charset reached the browser as sent. `_header_value`
+    still stopped response splitting, which is why this survived -- what was lost
+    is the mapping to a closed set.
+    """
+
+    def _relay(self, monkeypatch, upstream_ctype, path="/"):
+        class _Conn:
+            def __init__(self, *a, **k):
+                pass
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                return _FakeUpstreamResponse(b"body", upstream_ctype)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(server.http.client, "HTTPConnection", _Conn)
+        probe = _RelayProbe.__new__(_RelayProbe)
+        _RelayProbe.__init__(probe, path=path)
+        probe._relay_http()
+        assert not probe.errors
+        return {k.lower(): v for k, v in probe.sent_headers}
+
+    def test_upstream_charset_is_normalised(self, monkeypatch):
+        """The one case a verbatim forward actually changed browser behaviour."""
+        sent = self._relay(monkeypatch, "text/html; charset=iso-8859-1")
+        assert sent["content-type"] == "text/html; charset=utf-8"
+
+    def test_unrecognised_media_type_falls_back_to_the_request_path(self, monkeypatch):
+        sent = self._relay(monkeypatch, "bogus/thing", path="/app.css")
+        assert sent["content-type"] == _safe_ctype_for_css()
+
+    def test_a_header_smuggled_into_the_media_type_cannot_survive(self, monkeypatch):
+        sent = self._relay(monkeypatch, "evil/x\r\nSet-Cookie: a=b", path="/x.css")
+        assert sent["content-type"] == _safe_ctype_for_css()
+        assert "set-cookie" not in sent
+
+
+def _safe_ctype_for_css() -> str:
+    """The literal the selector maps an unknown media type on a `.css` path to."""
+    return server._safe_upstream_ctype("bogus/thing", "/x.css")
 
 
 class TestDevProcCrossPlatform:

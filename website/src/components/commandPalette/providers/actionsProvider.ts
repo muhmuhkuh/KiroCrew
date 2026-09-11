@@ -1,20 +1,27 @@
-import { createElement } from 'react'
-import type { ReactNode } from 'react'
-import { useCallback, useMemo } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { useMutation } from '@tanstack/react-query'
-import { Command, MessageSquarePlus, SunMoon, Keyboard, Pin, Sparkles } from 'lucide-react'
+import { createElement } from "react";
+import type { ReactNode } from "react";
+import { useMemo } from "react";
+import { useNavigate } from "react-router-dom";
+import { useMutation } from "@tanstack/react-query";
+import {
+  Command,
+  MessageSquarePlus,
+  SunMoon,
+  Keyboard,
+  Pin,
+} from "lucide-react";
 
-import { useAppDispatch, useAppSelector } from '../../../store'
-import { createSlot } from '../../../store/chatSlice'
-import { api } from '../../../api/client'
-import { type PonytailOverride } from '../../../lib/ponytail'
-import { useSessionActions } from '../../../hooks/useSessionActions'
-import { useTheme } from '../../../hooks/useTheme'
-import { fuzzyMatch, makeScoreThenNameComparator } from '../../../utils/fuzzyMatch'
-import type { ResourceProvider, Result } from '../types'
+import { useAppDispatch, useAppSelector } from "../../../store";
+import { createSlot } from "../../../store/chatSlice";
+import { useSessionActions } from "../../../hooks/useSessionActions";
+import { useTheme } from "../../../hooks/useTheme";
+import {
+  fuzzyMatch,
+  makeScoreThenNameComparator,
+} from "../../../utils/fuzzyMatch";
+import type { ResourceProvider, Result } from "../types";
 
-import { i18nT } from '../../../i18n/t'
+import { i18nT } from "../../../i18n/t";
 
 /**
  * Actions provider (Search Everywhere).
@@ -37,29 +44,30 @@ import { i18nT } from '../../../i18n/t'
  * app shell, mirroring `useKeyboardShortcuts`'s `onToggleShortcutsModal`).
  */
 
-const PROVIDER_ID = 'actions'
+const PROVIDER_ID = "actions";
 /** Catalog KEY for the tab label — not the label itself. This is module scope,
  *  evaluated once at import, so an `i18nT()` call here would freeze the boot
  *  language; the call sits in `createActionsProvider()` below. The label is also
  *  what a typed scope prefix matches against in CommandPalette, so localising it
  *  localises the scope shortcut too (type the translated word, then Tab). */
-const PROVIDER_LABEL_KEY = 'components.commandPalette.providers.actionsProvider.actions'
+const PROVIDER_LABEL_KEY =
+  "components.commandPalette.providers.actionsProvider.actions";
 
 /** Icon convention: lucide element with `lucide-inline` (`use-lucide-icons` lint rule). */
 function inlineIcon(Icon: typeof Command): ReactNode {
-  return createElement(Icon, { className: 'lucide-inline' })
+  return createElement(Icon, { className: "lucide-inline" });
 }
 
 /** A single global action before scoring. */
 interface ActionDef {
   /** Stable key, used to build the result id. */
-  key: string
-  title: string
+  key: string;
+  title: string;
   /** Optional secondary line describing what the action does. */
-  subtitle?: string
-  icon: ReactNode
+  subtitle?: string;
+  icon: ReactNode;
   /** The side effect to run on activation (Enter). */
-  run: () => void
+  run: () => void;
 }
 
 /**
@@ -68,21 +76,19 @@ interface ActionDef {
  */
 export interface ActionsProviderDeps {
   /** Start a fresh chat session (Enter on "New session"). */
-  newSession: () => void
+  newSession: () => void;
   /** Cycle the color mode (light → dark → system). */
-  toggleTheme: () => void
+  toggleTheme: () => void;
   /** Open the keyboard-shortcuts help modal. */
-  openShortcuts: () => void
+  openShortcuts: () => void;
   /** Pin state + toggle for the active session; null when no session is active (action omitted). */
-  pinCurrentSession?: { pinned: boolean; toggle: () => void } | null
-  /** Per-chat Ponytail override; null when no session is active (actions omitted). */
-  ponytail?: { set: (mode: PonytailOverride) => void } | null
+  pinCurrentSession?: { pinned: boolean; toggle: () => void } | null;
 }
 
 const compareResults = makeScoreThenNameComparator<Result>(
   (r) => r.score,
   (r) => r.title,
-)
+);
 
 /**
  * Build the Actions {@link ResourceProvider} from injected side effects. Pure
@@ -92,94 +98,60 @@ const compareResults = makeScoreThenNameComparator<Result>(
  * query yields a neutral score for every action, so the palette shows the full
  * action list before the user types anything.
  */
-export function createActionsProvider(deps: ActionsProviderDeps): ResourceProvider {
+export function createActionsProvider(
+  deps: ActionsProviderDeps,
+): ResourceProvider {
   const actions: ActionDef[] = [
     {
-      key: 'new-session',
-      title: 'New session',
-      subtitle: i18nT('components.commandPalette.providers.actionsProvider.start_a_fresh_chat'),
+      key: "new-session",
+      title: "New session",
+      subtitle: i18nT(
+        "components.commandPalette.providers.actionsProvider.start_a_fresh_chat",
+      ),
       icon: inlineIcon(MessageSquarePlus),
       run: deps.newSession,
     },
     {
-      key: 'toggle-theme',
-      title: 'Toggle theme',
-      subtitle: i18nT('components.commandPalette.providers.actionsProvider.cycle_light_dark_system'),
+      key: "toggle-theme",
+      title: "Toggle theme",
+      subtitle: i18nT(
+        "components.commandPalette.providers.actionsProvider.cycle_light_dark_system",
+      ),
       icon: inlineIcon(SunMoon),
       run: deps.toggleTheme,
     },
     {
-      key: 'open-shortcuts',
-      title: 'Open Shortcuts',
-      subtitle: i18nT('components.commandPalette.providers.actionsProvider.keyboard_shortcuts_help'),
+      key: "open-shortcuts",
+      title: "Open Shortcuts",
+      subtitle: i18nT(
+        "components.commandPalette.providers.actionsProvider.keyboard_shortcuts_help",
+      ),
       icon: inlineIcon(Keyboard),
       run: deps.openShortcuts,
     },
-  ]
+  ];
 
   if (deps.pinCurrentSession) {
-    const { pinned, toggle } = deps.pinCurrentSession
+    const { pinned, toggle } = deps.pinCurrentSession;
     actions.push({
-      key: 'pin-session',
+      key: "pin-session",
       title: pinned
-        ? i18nT('components.commandPalette.providers.actionsProvider.unpin_current_session')
-        : i18nT('components.commandPalette.providers.actionsProvider.pin_current_session'),
+        ? i18nT(
+            "components.commandPalette.providers.actionsProvider.unpin_current_session",
+          )
+        : i18nT(
+            "components.commandPalette.providers.actionsProvider.pin_current_session",
+          ),
       subtitle: pinned
-        ? i18nT('components.commandPalette.providers.actionsProvider.remove_pin_from_this_chat')
-        : i18nT('components.commandPalette.providers.actionsProvider.pin_this_chat_to_the_top'),
+        ? i18nT(
+            "components.commandPalette.providers.actionsProvider.remove_pin_from_this_chat",
+          )
+        : i18nT(
+            "components.commandPalette.providers.actionsProvider.pin_this_chat_to_the_top",
+          ),
       icon: inlineIcon(Pin),
       run: toggle,
-    })
-  }
-
-  if (deps.ponytail) {
-    const ponytailActions: Array<{ key: string; mode: PonytailOverride; title: string; subtitle: string }> = [
-      {
-        key: 'ponytail-enable',
-        mode: 'full',
-        title: i18nT('components.commandPalette.providers.actionsProvider.enable_ponytail'),
-        subtitle: i18nT('components.commandPalette.providers.actionsProvider.enable_ponytail_description'),
-      },
-      {
-        key: 'ponytail-disable',
-        mode: 'off',
-        title: i18nT('components.commandPalette.providers.actionsProvider.disable_ponytail'),
-        subtitle: i18nT('components.commandPalette.providers.actionsProvider.disable_ponytail_description'),
-      },
-      {
-        key: 'ponytail-lite',
-        mode: 'lite',
-        title: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_lite'),
-        subtitle: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_lite_description'),
-      },
-      {
-        key: 'ponytail-full',
-        mode: 'full',
-        title: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_full'),
-        subtitle: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_full_description'),
-      },
-      {
-        key: 'ponytail-ultra',
-        mode: 'ultra',
-        title: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_ultra'),
-        subtitle: i18nT('components.commandPalette.providers.actionsProvider.set_ponytail_ultra_description'),
-      },
-      {
-        key: 'ponytail-global',
-        mode: '',
-        title: i18nT('components.commandPalette.providers.actionsProvider.use_global_ponytail_default'),
-        subtitle: i18nT('components.commandPalette.providers.actionsProvider.use_global_ponytail_default_description'),
-      },
-    ]
-    for (const action of ponytailActions) {
-      actions.push({
-        key: action.key,
-        title: action.title,
-        subtitle: action.subtitle,
-        icon: inlineIcon(Sparkles),
-        run: () => deps.ponytail?.set(action.mode),
-      })
-    }
+    });
   }
 
   return {
@@ -191,13 +163,15 @@ export function createActionsProvider(deps: ActionsProviderDeps): ResourceProvid
     // comment rejecting `key={active}`), and a re-render does not recompute a memo.
     // An accessor moves the lookup to the consumer's render, where the tab strip
     // reads it. Satisfies `ResourceProvider.label: string`.
-    get label() { return i18nT(PROVIDER_LABEL_KEY) },
+    get label() {
+      return i18nT(PROVIDER_LABEL_KEY);
+    },
     icon: inlineIcon(Command),
     search(query: string): Result[] {
-      const results: Result[] = []
+      const results: Result[] = [];
       for (const action of actions) {
-        const match = fuzzyMatch(query, action.title)
-        if (!match) continue
+        const match = fuzzyMatch(query, action.title);
+        if (!match) continue;
         results.push({
           id: `${PROVIDER_ID}:${action.key}`,
           providerId: PROVIDER_ID,
@@ -211,14 +185,14 @@ export function createActionsProvider(deps: ActionsProviderDeps): ResourceProvid
           // distinct behavior (the dispatcher ignores the modifier for this
           // kind). `run` is carried on the action payload so the dispatcher can
           // invoke it directly; `onActivate` mirrors it for the legacy path.
-          enter: { kind: 'invoke', run: action.run },
+          enter: { kind: "invoke", run: action.run },
           onActivate: action.run,
-        })
+        });
       }
-      results.sort(compareResults)
-      return results
+      results.sort(compareResults);
+      return results;
     },
-  }
+  };
 }
 
 /**
@@ -228,47 +202,42 @@ export function createActionsProvider(deps: ActionsProviderDeps): ResourceProvid
  *   palette host because the `ShortcutsModal` open state is owned by the app
  *   shell, not a global store slice (mirrors `useKeyboardShortcuts`).
  */
-export function useActionsProvider(opts: { openShortcuts: () => void }): ResourceProvider {
-  const dispatch = useAppDispatch()
-  const navigate = useNavigate()
-  const { cycle } = useTheme()
-  const { openShortcuts } = opts
+export function useActionsProvider(opts: {
+  openShortcuts: () => void;
+}): ResourceProvider {
+  const dispatch = useAppDispatch();
+  const navigate = useNavigate();
+  const { cycle } = useTheme();
+  const { openShortcuts } = opts;
 
-  const { togglePin } = useSessionActions()
-  const activeSlot = useAppSelector((s) => s.chat.activeSlot)
+  const { togglePin } = useSessionActions();
+  const activeSlot = useAppSelector((s) => s.chat.activeSlot);
   const activePinned = useAppSelector(
-    (s) => s.dashboard.slots.find((slot) => slot.key === activeSlot)?.pinned ?? false,
-  )
-  const setPonytail = useCallback((mode: PonytailOverride) => {
-    if (!activeSlot || typeof api.chatSlotPonytail !== 'function') return
-    api.chatSlotPonytail(activeSlot, mode).catch((err: unknown) => {
-      // eslint-disable-next-line no-console -- surface mode-switch failures for debugging
-      console.warn('Failed to set Ponytail mode', err)
-    })
-  }, [activeSlot])
-
+    (s) =>
+      s.dashboard.slots.find((slot) => slot.key === activeSlot)?.pinned ??
+      false,
+  );
   // "New session" is a write (createSlot); route it through useMutation for
   // error/loading state and consistency with paletteActions.ts's createSlot
   // mutation (`use-react-query` lint rule). onSuccess navigates to /chat so the
   // user lands in the new session rather than staying on the current page.
   const { mutate: doNewSession } = useMutation({
     mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
-    onSuccess: () => navigate('/chat'),
-  })
+    onSuccess: () => navigate("/chat"),
+  });
 
   return useMemo(
     () =>
       createActionsProvider({
         newSession: () => doNewSession(),
         toggleTheme: () => {
-          cycle()
+          cycle();
         },
         openShortcuts,
         pinCurrentSession: activeSlot
           ? { pinned: activePinned, toggle: () => togglePin(activeSlot) }
           : null,
-        ponytail: activeSlot ? { set: setPonytail } : null,
       }),
-    [doNewSession, cycle, openShortcuts, activeSlot, activePinned, togglePin, setPonytail],
-  )
+    [doNewSession, cycle, openShortcuts, activeSlot, activePinned, togglePin],
+  );
 }

@@ -401,7 +401,7 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
     // read worse -- the title then sat inside the cards directly beneath it. The
     // defect was always in the chrome, not in the content column.
     //
-    // Measured budget and the full rationale: website/docs/page-layout.md.
+    // Measured budget and the full rationale: website/docs/narrow-viewport.md.
     <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-2 px-4 md:px-6 pt-2 pb-3" data-testid="page-header">
       <div className="min-w-0">
         <div className="text-2xl font-bold tracking-tight text-text-strong" data-testid="page-title">{title}</div>
@@ -608,6 +608,11 @@ export function Slider({
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
         onPointerLeave={onPointerLeave}
+        // outline-none is CORRECT here and must stay: the knob below already
+        // carries the replacement cue (`group-focus-visible:ring-2`), which
+        // points at the current value instead of boxing the whole track. Letting
+        // the global :focus-visible outline through as well would paint two
+        // indicators on one control.
         className={`group relative h-[18px] flex items-center select-none touch-none outline-none ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
       >
         {/* groove */}

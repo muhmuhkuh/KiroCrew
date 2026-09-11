@@ -84,6 +84,16 @@ function resumed(store: ReturnType<typeof makeStore>, key = 'A') {
 /** Lets queued microtasks (thunk settle + reducer) run. */
 const flush = () => new Promise<void>((r) => setTimeout(r, 0))
 
+// Pin the NARROW walk page size (100): loadOlderMessages sizes its page by
+// viewport (narrow 100 / desktop 300), and these fixtures hold only 300 rows
+// of history -- the desktop size would drain them in one page and leave
+// nothing for the contiguity assertions.
+window.matchMedia = ((q: string) => ({
+  matches: q.includes('max-width'), media: q, onchange: null,
+  addListener: () => {}, removeListener: () => {},
+  addEventListener: () => {}, removeEventListener: () => {},
+  dispatchEvent: () => false,
+})) as unknown as typeof window.matchMedia
 beforeEach(() => {
   olderSignals = []
   releaseOlder = []
@@ -223,11 +233,49 @@ describe('an abort is distinguishable from a real failure', () => {
     const path = await import('node:path')
     const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
 
-    // The catch must return on an abort BEFORE reaching the notice.
+    // The catch must return on an abort BEFORE reaching the notice. A failed
+    // page load is an ERROR (it renders through ErrorNotice via
+    // `setPinLoadError`), distinct from the `setPinNotice` answers.
     const guard = src.indexOf('if (isSupersededPagingRejection(err)) return')
-    const notice = src.indexOf("setPinNotice(i18nT('pages.chat.pins.message_unavailable'))", guard)
+    const notice = src.indexOf('setPinLoadError(loadFailedNotice)', guard)
     expect(guard).toBeGreaterThan(-1)
     expect(notice).toBeGreaterThan(guard)
+  })
+
+  it('picks the notice from the entry point, so the earlier-messages row avoids pin copy', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+
+    // Both entry points must tag themselves; `origin` is a required field, so a
+    // future caller that forgets cannot silently inherit pin wording.
+    expect(src).toContain("origin: 'pin'")
+    expect(src).toContain("origin: 'earlier'")
+    expect(src).toContain("pendingPinnedJump.origin === 'earlier'")
+    expect(src).toContain("i18nT('components.chatPane.earlier_messages_unavailable')")
+
+    // Every notice inside the shared effect resolves through the selection, so
+    // none of them can reach the raw pin string.
+    const effect = src.slice(src.indexOf('if (!pendingPinnedJump) return'))
+    const body = effect.slice(0, effect.indexOf('const handleTogglePinForMessage'))
+    expect(body).not.toContain("setPinNotice(i18nT('pages.chat.pins.message_unavailable'))")
+    // A fetch error is transient. Only the two genuinely-gone branches may claim
+    // the history no longer holds the row; the catch gets its own copy.
+    expect(body.match(/setPinNotice\(notFoundNotice\)/g)).toHaveLength(2)
+    expect(body.match(/setPinLoadError\(loadFailedNotice\)/g)).toHaveLength(1)
+    const catchGuard = body.indexOf('if (isSupersededPagingRejection(err)) return')
+    expect(body.indexOf('setPinNotice(notFoundNotice)', catchGuard)).toBe(-1)
+  })
+
+  it('keeps the pin entry point on its own copy, so the transient string cannot regress it', async () => {
+    const fs = await import('node:fs')
+    const path = await import('node:path')
+    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+
+    // The transient string is scoped to the earlier-messages origin; the pin
+    // origin has no paging-error string, so it falls back to its own wording.
+    expect(src).toContain("? i18nT('components.chatPane.earlier_messages_load_failed')")
+    expect(src).toContain(': notFoundNotice')
   })
 
   it('also covers a refused dispatch, which is not an unreachable pin either', () => {
@@ -380,7 +428,20 @@ describe('a background refresh must not re-validate a cursor a pending switch in
   it('a superseded settle does not release the claim a newer switch holds', async () => {
     holdSwitchDetail = true
     const store = makeStore()
-    resumed(store)
+    // Seeded with an OLD page rather than the newest one, so the switch's window
+    // genuinely sits clear of the cache and the coverage check OBSERVES a hole. With
+    // the newest page cached, every bounded window covers it and no retry is issued
+    // -- correctly, but then this test has only two legs and cannot exercise a claim
+    // outliving one. The shape here is the real case the retry exists for: a tab
+    // holding history from before the conversation moved on.
+    store.dispatch(setActiveSlot('A'))
+    store.dispatch(
+      resumeFromHistory.fulfilled(
+        { ok: true, key: 'A', nextBefore: 0, messages: HISTORY.slice(0, PAGE), hasMore: false, total: TOTAL },
+        'req-resume',
+        { key: 'A', title: 'A' },
+      ),
+    )
 
     store.dispatch(switchSlot('A'))
     await flush()
@@ -394,9 +455,25 @@ describe('a background refresh must not re-validate a cursor a pending switch in
     await flush()
     expect(store.getState().chat.slotSwitchRequestId).not.toBeNull()
 
+    // The second switch's own settle does not end it either, because this slot
+    // carries cached rows with no previously-known server total: a bounded window
+    // cannot be proven to cover the gap, so the switch retries UNBOUNDED. Its
+    // claim has to outlive the bounded leg for the same reason the first release
+    // must not clear it — releasing between the two legs reopens the window.
     releaseSwitch[1]()
     await flush()
     await flush()
+    // A retry WAS issued (the count is not pinned: a superseded leg may retry too,
+    // and its answer is discarded rather than being this test's business).
+    expect(releaseSwitch.length).toBeGreaterThan(2)
+    expect(store.getState().chat.slotSwitchRequestId).not.toBeNull()
+
+    // Drain every remaining leg. Only when nothing is in flight does the claim go.
+    for (let i = 2; i < releaseSwitch.length; i++) {
+      releaseSwitch[i]()
+      await flush()
+      await flush()
+    }
     expect(store.getState().chat.slotSwitchRequestId).toBeNull()
   })
 })

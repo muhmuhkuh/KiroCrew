@@ -1,7 +1,7 @@
 # Auto-Improvement — user manual
 
 An opt-in built-in app that finds and fixes real defects in a GitHub or GitLab repository, then
-opens them as **draft pull requests** for you to review.
+opens them as **draft pull requests or merge requests** for you to review.
 
 Its central idea: **measure before you change, and never let the agent grade its own
 work.** The agent proposes; deterministic Python decides. That is why a run can honestly
@@ -13,11 +13,14 @@ report "I found nothing" — and why a fix that reaches you has already been pro
 
 You need:
 
-* **`git`** and an authenticated **`gh`** (`gh auth status`). An unauthenticated `gh`
-  only fails at the moment a PR is drafted, which is the worst time to discover it — so
-  the app checks up front and refuses to start.
+* **`git`** and an authenticated **`gh` or `glab`** (`gh auth status` / `glab auth status`).
+  An unauthenticated forge CLI only fails at the moment a PR/MR is drafted, which is the
+  worst time to discover it — so the app checks the selected provider up front and refuses
+  to start.
 * **A GitHub or GitLab repository with a Python test suite.** The suite is the app's measuring
-  instrument, so this is a hard requirement, not a nicety.
+  instrument, so this is a hard requirement, not a nicety. The built-in profile currently
+  targets Python/pytest; TypeScript/Bun/Nx repositories can connect and clone successfully,
+  but discovery will intentionally produce no candidates until a matching profile exists.
 * **`ruff`** (optional). Improves defect discovery; the app degrades cleanly without it.
 
 The app is **disabled by default** (`defaultEnabled: false`). Enable it from the Apps
@@ -53,10 +56,12 @@ Two refusals you may hit, both deliberate:
 * **"Only GitHub or allowlisted GitLab URLs are supported"** — GitHub and GitLab
   (public or on the `dashboard.gitlab_hosts` allowlist) are the accepted hosts; the
   list is an allowlist, not a denylist. An authenticated `git`/`gh`/`glab` is required
-  to clone and to draft PRs/MRs.
+  to clone and to draft PRs/MRs. GitLab cloning follows the selected host's `glab`
+  transport setting (`ssh` or `https`), so private projects do not silently fall back
+  to unauthenticated HTTPS.
 * **"Existing clone … has origin X, which does not match Y — refusing to reuse it"** —
-  usually because `gh` switched between HTTPS and SSH. Delete or move the old scratch
-  clone and reconnect. The app will not silently reuse a clone it cannot vouch for.
+  usually because the forge CLI switched between HTTPS and SSH. Delete or move the old
+  scratch clone and reconnect. The app will not silently reuse a clone it cannot vouch for.
 
 Changing repositories clears `branch` and `scopeDiffBase`, because a branch belongs to the
 repository it came from.
@@ -143,7 +148,7 @@ switching either gives you a separate set, and the same defect is never filed tw
 
 ## 6. Draft PRs vs autocommit
 
-**Draft PR (default).** A verified fix is pushed to a generated
+**Draft PR/MR (default).** A verified fix is pushed to a generated
 `auto-improvement/<kind>-<fingerprint>` branch and opened as a **draft**. The app never
 marks a PR ready, never merges, and never enables auto-merge — those stay yours.
 
@@ -226,7 +231,5 @@ Stated plainly, because these are guarantees:
 ## See also
 
 * [`../../../../../../docs/system-specs/modules/auto-improvement.md`](../../../../../../docs/system-specs/modules/auto-improvement.md)
-  — how it works internally (routes, storage, safety controls).
-* [`../../../../../../docs/system-specs/modules/auto-improvement-test-plan.md`](../../../../../../docs/system-specs/modules/auto-improvement-test-plan.md)
-  — how it is verified.
+  — how it works internally (routes, storage, safety controls) and how it is verified.
 * [`PORT_PLAN.md`](PORT_PLAN.md) — historical record of the port.

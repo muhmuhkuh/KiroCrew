@@ -33,21 +33,23 @@ from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.history import is_incognito_transcript
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.loop_lock import LoopBoundLock
 
 logger = logging.getLogger(__name__)
 
 # No model override. Picking one folder from a short list is a trivial
 # classification, and the shared background session this runs on is already the
 # cheap one: the ``kirocrew-lite`` spec's model is ``_background_agent_model()``,
-# which resolves ``agent.role_models['background']`` -> ``agent.model`` ->
-# ``"auto"`` (AGENTS.md → Model selection). Pinning a concrete id here would both
+# which resolves ``agent.role_models['background']`` -> ``"auto"`` and deliberately
+# does NOT inherit ``agent.model``
+# (docs/system-specs/common/model-selection.md). Pinning a concrete id here would both
 # duplicate that resolution and break accounts not entitled to the pinned model,
 # so an operator who wants this on a specific cheap model sets the background
 # role instead.
 
 # Serialized the way generate_emoji_for_name is: several tabs taking their first
 # turn at once must not interleave streams on the shared background session.
-_suggest_lock = asyncio.Lock()
+_suggest_lock = LoopBoundLock()
 
 # Prompt bounds. Every list below scales with the user's workspace, so each is
 # capped rather than trusted — a workspace with 300 folders must not grow the

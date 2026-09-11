@@ -76,11 +76,12 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Callable
 
 from kiro_crew import platform_compat
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
 
 from ...spine import agent_discovery
@@ -271,7 +272,7 @@ def _write_protected_targets() -> tuple[str, ...]:
       by ``os.path.isdir(target)`` — so a FILE path is silently skipped and the mask
       no-ops. (Files are masked through a separate ``SENSITIVE_FILES`` list the public helper
       does not expose.) Measured: passing the file paths left the child able to append to
-      ``~/.kiro/crew/.data-home-ready`` and exit 0; passing the parent blocked it.
+      ``~/.kiro/crew/config.json`` and exit 0; passing the parent blocked it.
     * Only EXISTING directories are returned — the launcher mounts over each target, and a
       mount over a missing path is a needless failure on a fresh install.
 
@@ -324,12 +325,12 @@ def _run(
     # Also MASK Kiro Crew's own write-protected files. `mode="strict"` hides 52 credential
     # paths so agent-authored code cannot READ secrets, but it does not make the rest of the
     # filesystem read-only — measured on this host: a strict-mode child appended to
-    # `~/.kiro/crew/.data-home-ready` and exited 0. Those paths are `security.
+    # `~/.kiro/crew/config.json` and exited 0. Those paths are `security.
     # write_protected_home_paths()`, enforced by the platform HOOK layer, which a sandboxed
     # subprocess never passes through — so the protection was inert for exactly the code that
     # most needs it. Bind-mounting an empty dir over each makes the write fail at the kernel
-    # instead. Scoped to Kiro Crew's OWN control files (config.json, config.local.json,
-    # .data-home-ready under both `.kiro/crew` and `.kirocrew`), i.e. the one-way doors that
+    # instead. Scoped to Kiro Crew's OWN control files (config.json, config.local.json
+    # under both `.kiro/crew` and `.kirocrew`), i.e. the one-way doors that
     # would corrupt the installation; broader hiding is not possible here because the
     # interpreter's own stdlib can live under `$HOME` (measured: hiding `~/.local/share`
     # broke `import platform` outright). Raised by the GPT review of this branch.
@@ -971,7 +972,10 @@ class PytestBuildGate:
         tail = (proc.stdout or proc.stderr or "").strip().splitlines()[-1:] or [""]
         return GateResult(
             passed=False,
-            detail=f"suite red (exit {proc.returncode}): {tail[0][:160]}",
+            # Redact BEFORE the bound: a candidate's test run can echo a credential,
+            # and the slice can cut it mid-match into a fragment no downstream
+            # redaction pass recognises.
+            detail=f"suite red (exit {proc.returncode}): {redact_via_context(tail[0])[:160]}",
             failing_tests=failing,
         )
 
@@ -1375,32 +1379,26 @@ class RepoIsolation:
         gated recording the clone in the first place, so the setup-time check and this
         run-time check cannot drift apart and disagree. Fails CLOSED: any git error,
         timeout, or unreadable url reads as "push is NOT disabled" and the driver
-        refuses to start.
+        refuses to start — except the launcher-crash class below, which raises instead
+        of returning ``False`` (the run still refuses to start).
 
         BOTH urls, not just the push url: a live FETCH url is a live push target
         (``git push "$(git remote get-url origin)" HEAD`` ignores the push url entirely
         and writes to the fetch url — see ``clone_setup._disable_push``). Checking only
         the push url reported "disabled" for a clone that could still write to the remote;
         `_ok` checks both, and this drifted from it. Raised by the GPT review of this branch.
+
+        One nonzero probe exit is NOT read as a live remote: when the probe's own
+        sandbox launcher crashed before git executed, this propagates
+        ``clone_setup.IsolationProbeError`` instead of returning ``False``. The run
+        still refuses to start either way — the exception exists so the surfaced
+        reason names the sandbox failure rather than the misleading
+        "push is not disabled" (#8151).
         """
 
-        def _neutral(args: list[str]) -> bool:
-            try:
-                proc = _run(
-                    ["git", "-C", str(self.clone_path), *args],
-                    cwd=self.clone_path if self.clone_path.exists() else Path.cwd(),
-                    timeout=30,
-                )
-            except (OSError, subprocess.SubprocessError):
-                return False
-            if proc.returncode != 0:
-                return False
-            url = (proc.stdout or "").strip()
-            return (not url) or ("DISABLED" in url.upper()) or ("NO_PUSH" in url.upper())
+        from ...backend.clone_setup import _repository_is_isolated
 
-        return _neutral(["remote", "get-url", "--push", "origin"]) and _neutral(
-            ["remote", "get-url", "origin"]
-        )
+        return _repository_is_isolated(self.clone_path)
 
     def do_not_pollute_paths(self) -> list[Path]:
         """Host paths the spine snapshots around the (no-op) measurement boot.
@@ -1488,16 +1486,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
         baseline_reps: int = 5,
         noise_floor_s: float = 0.25,
         log_dir: Path | None = None,
-        #: Which PR/MR recipe assembles field ⑤. The GitLab profile swaps in
-        #: :class:`..gitlab_repo.pr_recipe.GitLabPRRecipe`; everything else in
-        #: this profile is host-agnostic.
-        recipe_cls: type = GitHubPRRecipe,
-        #: The code-host hostname (gitlab instances) handed to the recipe so it
-        #: can pin its provider CLI. Empty for GitHub (no pinning needed).
-        host: str = "",
     ) -> None:
-        #: Reported by the spine as ``profile_id``; mirrors the registry id.
-        self.id = getattr(recipe_cls, "provider_name", "github") + "-repo"
         self.clone_path = Path(clone_path)
         self.track = track
         #: The ``scopeDiffBase`` ref: when set, discovery and the edit fence are both
@@ -1563,13 +1552,12 @@ class GitHubRepoProfile(ProfileFieldAliases):
         #: reads, so discovery keys off this raw value (see ``discover``).
         self._user_edit_globs = list(allowed_globs) if allowed_globs else None
         self.isolation = RepoIsolation(clone_path=self.clone_path, base_ref=base_ref)  # ④
-        self.pr_recipe = recipe_cls(  # ⑤ — the provider-specific seam field
+        self.pr_recipe = GitHubPRRecipe(  # ⑤ — reused verbatim
             user=user,
             clone_path=self.clone_path,
             pr_queue_dir=Path(pr_queue_dir),
             base_ref=base_ref,
             fetch_url=origin_url or None,
-            host=host or None,
         )
         self.calibration = CalibrationParams(  # ⑥
             # 5–10 reps, not the protocol's 30: each rep is a FULL suite run, so 30
@@ -1796,7 +1784,7 @@ def _resolve_origin_url(cfg: dict) -> str:
     return resolve_origin_url(cfg)
 
 
-def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> GitHubRepoProfile:
+def build_profile(config: dict) -> GitHubRepoProfile:
     """Assemble a :class:`GitHubRepoProfile` from the app's on-disk config.
 
     Reads the same keys the routes write (``clone``, ``branch``, ``scopeDiffBase``,
@@ -1804,9 +1792,6 @@ def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> Git
     resolves the queue/log dirs from :mod:`...backend.store`, so a caller only has to
     hand over the config dict. Raises :class:`ValueError` when no clone is configured
     — a profile pointed at nothing would fail later and less legibly.
-
-    ``profile_cls`` lets the GitLab profile reuse this assembler unchanged — it
-    swaps the PR/MR recipe class via its own constructor default.
     """
     from ...backend import store
 
@@ -1826,7 +1811,7 @@ def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> Git
     else:
         base_ref = f"origin/{branch}"
 
-    return profile_cls(
+    return GitHubRepoProfile(
         clone_path=Path(clone),
         pr_queue_dir=store.pr_queue_dir(),
         user=str(cfg.get("prUser") or cfg.get("user") or ""),
@@ -1843,5 +1828,4 @@ def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> Git
         baseline_reps=int(cfg.get("calibrationReps") or 5),
         noise_floor_s=float(cfg.get("noiseFloorSeconds") or 0.25),
         log_dir=store.logs_dir(),
-        host=str(cfg.get("host") or ""),
     )

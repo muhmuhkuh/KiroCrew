@@ -52,6 +52,18 @@ const petBridgeStub = {
   }),
 }
 vi.mock('../apps/crew-companion/petBridge', () => ({ petBridge: petBridgeStub }))
+// Both harnesses re-import the entry per test with `vi.resetModules()`, and the
+// entry boots through `../i18n/all` — so without this every test would re-fetch the
+// twelve non-English catalogs, 434 ms each. They pin `mc-lang` to `en` and assert
+// English only, so not one of those catalogs is ever read: measured 20.6s -> 3.1s
+// here. Delegating to `../i18n/index` keeps
+// real `initI18n`/`t()` behaviour rather than stubbing them, so the English strings
+// these tests assert on still come from the real catalog.
+//
+// `i18nAllLanguagesEntry.test.ts` independently pins that the entry imports
+// `/all`, so mocking the id here cannot hide a regression in what it boots through.
+vi.mock('../i18n/all', async () => await import('../i18n/index'))
+
 
 /** What the last add resolved to — the panel's own true/false contract. */
 let addResult: boolean | null = null
@@ -466,6 +478,11 @@ describe('what the panel reports back so it is not closed on blur', () => {
 describe('closing the panel', () => {
   it('closes on Escape', async () => {
     await mountPanel()
+    // The card DOM commits before passive effects run. `panelHold(false)` is the
+    // preceding effect in Panel, so observing it proves the effect flush reached
+    // the key-listener registration below it; firing as soon as the card exists
+    // races that registration under a loaded shard.
+    await waitFor(() => expect(api.panelHold).toHaveBeenCalledWith(false))
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(api.panelClose).toHaveBeenCalled()
   })

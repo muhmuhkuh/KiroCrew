@@ -626,7 +626,7 @@ class TestHandleMessage:
 
     @pytest.mark.asyncio
     async def test_trusted_bot_access_disabled(self):
-        """from_trusted_bot is always False — bot messages never bypass owner check."""
+        """from_trusted_bot=False (untrusted bot): error replies are NOT suppressed."""
         from kiro_crew.acp.client import AcpError
 
         class _RaisingProvider(FakeProvider):
@@ -1788,6 +1788,112 @@ class TestPerThreadAgent:
         assert switched
         assert "thread" not in switched[0][1]["text"].lower()
 
+    @pytest.mark.asyncio
+    async def test_reroute_to_a_linked_session_keeps_its_agent(self):
+        """A reroute must carry the new owner's persisted agent, not the default.
+
+        Hydration at entry runs for the ENTRY key. When the thread turns out to
+        be owned by a linked dashboard session, ``session_key`` is reassigned to
+        that owner — and the agent re-resolution immediately after then reads a
+        key that was never hydrated, so a binding the session's own metadata
+        records correctly is silently replaced by the channel or default agent.
+        ``transport_dispatch._resolve_thread_owner`` re-hydrates in the same
+        breath as the reroute; this asserts the inline handler does too.
+        """
+        from unittest.mock import MagicMock
+
+        from kiro_crew.slack.handler import _hydrated_sessions
+
+        owner_key = "dashboard:chat-7-1785861270"
+
+        class LinkedSessions(FakeSessionManager):
+            """The thread index resolves this thread to a dashboard session."""
+
+            def get_session_for_thread(self, thread_ts):
+                return owner_key
+
+        log = MagicMock()
+        log.get_metadata.side_effect = lambda key: (
+            {"agent": "sisyphus"} if key == owner_key else {}
+        )
+
+        slack = MockSlackClient()
+        sessions = LinkedSessions()
+        try:
+            await handle_message(
+                slack,
+                sessions,
+                "C1",
+                "hello",
+                "thread1",
+                "msg1",
+                "U_OWNER",
+                conversation_log=log,
+            )
+
+            assert (
+                owner_key in sessions.keys_seen
+            ), "the turn never rerouted to the session that owns this thread"
+            assert sessions.last_agent == "sisyphus", (
+                f"rerouted turn ran under {sessions.last_agent!r} — the linked "
+                "session's persisted agent binding was discarded"
+            )
+        finally:
+            _hydrated_sessions.discard(owner_key)
+            _hydrated_sessions.discard("slack:thread1")
+            _hydrated_sessions.discard("thread1")
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_reroute_keeps_the_askers_agent(self):
+        """The sibling reassignment, same defect.
+
+        ``route_pinned`` substitutes ``asker_key`` for the entry key on the branch
+        immediately above the linked-thread reroute, and feeds the same agent
+        re-resolution. Hydration at entry ran for the ENTRY key, so without a
+        re-hydration here the pinned answer runs under the channel or default
+        agent instead of the binding the ASKING conversation recorded — and a
+        pinned asker is by construction a different conversation, which is the
+        whole reason its key is substituted.
+        """
+        from unittest.mock import MagicMock
+
+        from kiro_crew.slack.handler import _hydrated_sessions
+
+        asker_key = "cron:9f2c1d40"
+
+        log = MagicMock()
+        log.get_metadata.side_effect = lambda key: (
+            {"agent": "sisyphus"} if key == asker_key else {}
+        )
+
+        slack = MockSlackClient()
+        sessions = FakeSessionManager()
+        try:
+            await handle_message(
+                slack,
+                sessions,
+                "C1",
+                "hello",
+                "thread1",
+                "msg1",
+                "U_OWNER",
+                conversation_log=log,
+                route_pinned=True,
+                asker_key=asker_key,
+            )
+
+            assert (
+                asker_key in sessions.keys_seen
+            ), "the pinned turn never ran under the asking conversation's key"
+            assert sessions.last_agent == "sisyphus", (
+                f"pinned turn ran under {sessions.last_agent!r} — the asking "
+                "conversation's persisted agent binding was discarded"
+            )
+        finally:
+            _hydrated_sessions.discard(asker_key)
+            _hydrated_sessions.discard("slack:thread1")
+            _hydrated_sessions.discard("thread1")
+
 
 class TestStopCommand:
     """Tests for the !stop kill switch."""
@@ -2031,14 +2137,14 @@ class TestAutoTitleSlack:
 
     @pytest.fixture(autouse=True)
     def _clean_titled_threads(self):
-        import kiro_crew.slack.handler as _h
-        from kiro_crew.slack.handler import _titled_threads
+        # The claim LRU and its lock live in `messaging.auto_title`; `reset()` does
+        # both halves, which matters because a test that crashed mid-title leaves
+        # the claim marked AND the permit held.
+        from kiro_crew.messaging import auto_title
 
-        _titled_threads.clear()
-        _h._auto_title_lock = None
+        auto_title.reset()
         yield
-        _titled_threads.clear()
-        _h._auto_title_lock = None
+        auto_title.reset()
 
     @pytest.mark.asyncio
     async def test_auto_title_happy_path(self):
@@ -2054,6 +2160,78 @@ class TestAutoTitleSlack:
         assert len(title_actions) == 1
         assert title_actions[0][1]["title"] == "ETL Debug Session"
         assert "sk1" in _titled_threads
+
+    @pytest.mark.asyncio
+    async def test_auto_title_unexpected_error_surfaces_at_warning(self, caplog):
+        """An unexpected failure is logged at WARNING with the exception type.
+
+        Regression for #4800: this blanket handler runs on a fire-and-forget
+        task, so its log line is the only place a real defect surfaces. At
+        DEBUG it masked a deterministic cross-loop ``RuntimeError`` into three
+        order-dependent CI flake classes (#4177, #4789). The claim must also be
+        released so the next exchange retries.
+        """
+        import logging
+
+        from kiro_crew.slack.handler import _mark_titled, _maybe_auto_title_slack, _titled_threads
+
+        class ExplodingSessionManager(FakeSessionManager):
+            async def get_or_create(self, key, agent=None, channel_id=None):
+                raise RuntimeError("bound to a different event loop")
+
+        slack = MockSlackClient()
+        _mark_titled("sk-err")
+        # The shared module's logger: the blanket handler this pins lives in
+        # `messaging.auto_title` now, and naming the wrong logger is not a harmless
+        # miss — `at_level` also SETS the level, so a DEBUG assertion against a
+        # logger that emits nothing passes vacuously (its sibling below did).
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.messaging.auto_title"):
+            await _maybe_auto_title_slack(
+                slack, ExplodingSessionManager(), "C1", "sk-err", None, "help", "sure"
+            )
+
+        warnings = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "auto-title failed" in r.getMessage()
+        ]
+        assert len(warnings) == 1, "unexpected error must surface at WARNING, not debug"
+        assert "RuntimeError" in warnings[0].getMessage()
+        assert warnings[0].exc_info is not None, "traceback must be attached"
+        # Claim released so the next exchange can retry.
+        assert "sk-err" not in _titled_threads
+        # And nothing was titled.
+        assert not [a for a in slack.actions if a[0] == "set_thread_title"]
+
+    @pytest.mark.asyncio
+    async def test_auto_title_stream_timeout_stays_at_debug(self, caplog):
+        """A title-stream timeout is routine noise, not the masking concern:
+        it must NOT emit the WARNING traceback (one per exchange on a slow
+        model would be log spam), while still releasing the claim for retry."""
+        import logging
+
+        from kiro_crew.slack.handler import _mark_titled, _maybe_auto_title_slack, _titled_threads
+
+        class TimingOutSessionManager(FakeSessionManager):
+            async def get_or_create(self, key, agent=None, channel_id=None):
+                raise asyncio.TimeoutError()
+
+        slack = MockSlackClient()
+        _mark_titled("sk-slow")
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.messaging.auto_title"):
+            await _maybe_auto_title_slack(
+                slack, TimingOutSessionManager(), "C1", "sk-slow", None, "help", "sure"
+            )
+
+        assert not [
+            r for r in caplog.records if r.levelno >= logging.WARNING
+        ], "timeout must not warn"
+        assert [
+            r
+            for r in caplog.records
+            if r.levelno == logging.DEBUG and "timed out" in r.getMessage()
+        ]
+        assert "sk-slow" not in _titled_threads  # claim released for retry
 
     @pytest.mark.asyncio
     async def test_auto_title_skip_removes_claim(self):
@@ -2668,6 +2846,42 @@ class TestCompactCommand:
         assert any("No active session" in t for t in texts)
 
     @pytest.mark.asyncio
+    async def test_compact_declined_on_auto_managed_backend(self):
+        # A backend that cannot serve /compact (the provider names it via
+        # manual_compact_unsupported_backend) gets the informational reply and
+        # compact() is NEVER dispatched (#8156).
+        provider = self._make_provider_with_compact()
+        calls = []
+
+        async def _compact(context=""):
+            calls.append(1)
+
+        provider.compact = _compact
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = self._make_sessions_with_active(provider)
+        slack = MockSlackClient()
+
+        await handle_message(slack, sessions, "C1", "!compact", "thread1", "msg1", "U_OWNER")
+
+        texts = self._posted_texts(slack)
+        assert any("manages compaction automatically" in t for t in texts)
+        assert not any("Compacting context" in t for t in texts)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_compact_none_capability_preserves_dispatch(self):
+        # The ABC's None (supported) default keeps the existing dispatch.
+        provider = self._make_provider_with_compact()
+        provider.manual_compact_unsupported_backend = None
+        sessions = self._make_sessions_with_active(provider)
+        slack = MockSlackClient()
+
+        await handle_message(slack, sessions, "C1", "!compact", "thread1", "msg1", "U_OWNER")
+
+        texts = self._posted_texts(slack)
+        assert any("✅" in t for t in texts)
+
+    @pytest.mark.asyncio
     async def test_compact_failed_reports_error(self):
         provider = self._make_provider_with_compact(
             [
@@ -2841,6 +3055,32 @@ class TestCompactCommand:
         assert any("Still working" in t for t in texts)
         assert not any("Compacting context" in t for t in texts)  # never started
         assert "destroy:thread1" not in sessions.removed
+
+
+class TestStopReasonCompactionFailed:
+    """A COMPACTION_FAILED terminal is synthetic — the backend abandoned the
+    turn after a failed auto-compaction and never sent end_turn, so it still
+    counts the prompt as in progress. The handler must reset the session or
+    the NEXT Slack message collides with "prompt already in progress"."""
+
+    @pytest.mark.asyncio
+    async def test_compaction_failed_resets_the_abandoned_session(self):
+        from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+
+        slack = MockSlackClient()
+        provider = FakeProvider(
+            [
+                LLMEvent(kind="text_chunk", text="partial"),
+                LLMEvent(kind="complete", stop_reason=STOP_REASON_COMPACTION_FAILED),
+            ]
+        )
+        sessions = FakeSessionManager(provider)
+
+        await handle_message(slack, sessions, "C1", "hello", None, "msg1", "U1")
+
+        assert any(
+            r.startswith("reset:") for r in sessions.removed
+        ), f"no session reset after COMPACTION_FAILED: {sessions.removed}"
 
 
 class TestBuildTimingFooter:
@@ -3270,6 +3510,86 @@ class TestToolElapsedTimer:
         # Regression guard: elapsed never leaks into details
         details_list = [str(t[1].get("details", "")) for t in complete_tasks]
         assert all("⏱" not in d for d in details_list), f"⏱ leaked into details: {details_list}"
+
+
+class _TaskCardRefusedSlack(MockSlackClient):
+    """append_task is refused; every other call is healthy.
+
+    The shape of a long tool phase meeting a Slack rate limit: the elapsed-time
+    refresh is the only thing touching the stream and Slack turns it down.
+    """
+
+    async def append_task(self, channel, ts, task_id, title, status, details="", output=""):
+        await super().append_task(
+            channel, ts, task_id, title, status, details=details, output=output
+        )
+        return False
+
+
+class _StreamAppendRefusedOnceSlack(MockSlackClient):
+    """The first append_stream is refused, so real text forces one rotation."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._n_append = 0
+
+    async def append_stream(self, channel, ts, text):
+        self._n_append += 1
+        await super().append_stream(channel, ts, text)
+        return self._n_append > 1
+
+
+class TestTaskCardNeverAbandonsTheStream:
+    """A refused task card must not cost the reader their in-progress message.
+
+    Rotating on a task-card failure stops the stream the reader is watching and
+    continues the same answer in a NEW message, so the thread reads as a reply
+    that failed followed minutes later by an unexplained second reply
+    (issue 8511). A task card is decoration, so skipping it withholds no answer
+    text; ``_append_stream`` still rotates when real text is refused.
+    """
+
+    @pytest.mark.asyncio
+    async def test_refused_task_card_does_not_open_a_second_stream(self):
+        slack = _TaskCardRefusedSlack()
+        slack._stream_enabled = True
+        provider = FakeProvider(
+            [
+                LLMEvent(kind="text_chunk", text="looking"),
+                LLMEvent(kind="tool_call", title="Run Shell", tool_kind="execute"),
+                LLMEvent(kind="text_chunk", text=" done"),
+            ]
+        )
+        sessions = FakeSessionManager(provider)
+        await handle_message(slack, sessions, "C1", "do it", None, "msg1", "U1")
+
+        starts = [a for a in slack.actions if a[0] == "start_stream"]
+        assert len(starts) == 1, slack.actions
+        assert [a for a in slack.actions if a[0] == "append_task"], slack.actions
+        # One stream opened, one stopped: the answer stayed in a single message.
+        stops = [a for a in slack.actions if a[0] == "stop_stream"]
+        assert len(stops) == 1, slack.actions
+        assert stops[0][1]["ts"] == starts[0][1]["ts"], slack.actions
+
+    @pytest.mark.asyncio
+    async def test_refused_real_text_still_rotates_and_says_it_continues(self):
+        """The branch that protects answer delivery is untouched, and the
+        replacement stream opens with the continuation marker so the two
+        messages read as one answer."""
+        slack = _StreamAppendRefusedOnceSlack()
+        slack._stream_enabled = True
+        # Trailing space: StreamRedactor withholds a trailing credential-class
+        # run, so a chunk with no separator never reaches append_stream at all.
+        provider = FakeProvider([LLMEvent(kind="text_chunk", text="hello ")])
+        sessions = FakeSessionManager(provider)
+        await handle_message(slack, sessions, "C1", "hi", None, "msg1", "U1")
+
+        starts = [a for a in slack.actions if a[0] == "start_stream"]
+        assert len(starts) == 2, slack.actions
+        assert starts[0][1]["text"] is None, starts
+        # The literal, not the constant: a test that imports the constant still
+        # passes when the marker is emptied out.
+        assert "continued" in (starts[1][1]["text"] or ""), starts
 
 
 class TestCondenseThinking:

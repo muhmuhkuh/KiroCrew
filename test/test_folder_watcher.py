@@ -261,8 +261,10 @@ class TestFolderWatcherScan:
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
 
         # Mock ingest to create items
-        async def fake_ingest(path, **kwargs):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -320,6 +322,15 @@ class TestFolderWatcherScan:
         source_id = store.add_source("test", "local_folder", str(vault))
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
 
+        # Honor the pipeline contract: on_committed fires on the committing
+        # branch. A mock that ingests without reporting reads as a rollback.
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
+            return "job1"
+        pipeline.ingest_file = fake_ingest
+
         await fw.scan_source(source)
 
         # Modify a file with explicit future mtime (avoids 1s granularity flakiness)
@@ -345,8 +356,10 @@ class TestFolderWatcherScan:
         source_id = store.add_source("test", "local_folder", str(vault))
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder", "properties": "{}"}
 
-        async def fake_ingest(path, **kwargs):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -709,8 +722,10 @@ class TestAsyncToThread:
         source = {"id": source_id, "uri": str(vault),
                   "source_type": "local_folder", "properties": "{}"}
 
-        async def fake_ingest(path, **kwargs):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kwargs):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -1036,8 +1051,10 @@ class TestInterruptedScanRetryCap:
         source = {"id": source_id, "uri": str(vault), "source_type": "local_folder",
                   "properties": "{}"}
 
-        async def fake_ingest(path, **kw):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kw):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -1087,8 +1104,10 @@ class TestInterruptedScanRetryCap:
         doc.write_text("# Rewritten after the cap was spent")
         os.utime(doc, (9999999999, 9999999999))
 
-        async def fake_ingest(path, **kw):
-            store.add_item("title", "content", "doc", source_id=source_id)
+        async def fake_ingest(path, *, on_committed=None, **kw):
+            item_id = store.add_item("title", "content", "doc", source_id=source_id)
+            if on_committed is not None:
+                on_committed([item_id])
             return "job1"
         pipeline.ingest_file = fake_ingest
 
@@ -1227,5 +1246,46 @@ class TestFolderFileStateAttemptsMigration:
                 ("/legacy/doc.md",)).fetchone()
             assert row["status"] == "scanning"
             assert row["attempts"] == 0
+        finally:
+            store.close()
+
+
+class TestDocumentStateTableSchema:
+    """``_migrate`` backfills COLUMNS; ``_init_schema`` owns creating the tables."""
+
+    _STATE_TABLES = ("folder_file_state", "artifact_item_state", "agent_item_state")
+
+    @staticmethod
+    def _columns(store, table: str) -> set[str]:
+        return {r[1] for r in store.db.execute(
+            "SELECT * FROM pragma_table_info(?)", (table,)).fetchall()}
+
+    def test_absent_state_tables_come_back_with_their_full_shape(self, tmp_path):
+        """Opening a database whose document-state tables are gone recreates them.
+
+        ``_migrate`` runs ``PRAGMA table_info`` and then ``ALTER TABLE`` on all
+        three unconditionally, and an ALTER against a missing table raises
+        ``no such table`` -- so what keeps the column backfill safe is
+        ``__init__`` running ``_init_schema`` (whose ``CREATE TABLE IF NOT
+        EXISTS`` carries every column) FIRST. This pins that ordering, which is
+        otherwise only a comment.
+        """
+        db_path = tmp_path / "dropped.db"
+        store = KnowledgeStore(str(db_path))
+        expected = {t: self._columns(store, t) for t in self._STATE_TABLES}
+        store.close()
+        assert all(expected.values()), "fresh schema must define all three tables"
+
+        conn = sqlite3.connect(str(db_path))
+        for table in self._STATE_TABLES:
+            conn.execute(f"DROP TABLE {table}")  # noqa: S608
+        conn.commit()
+        conn.close()
+
+        store = KnowledgeStore(str(db_path))
+        try:
+            for table in self._STATE_TABLES:
+                assert self._columns(store, table) == expected[table], (
+                    f"{table} did not come back with its full column set")
         finally:
             store.close()

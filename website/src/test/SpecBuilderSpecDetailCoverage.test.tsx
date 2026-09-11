@@ -6,8 +6,13 @@
 // surfacing.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import React from 'react'
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, act, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+
+let mobile = false
+
+vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => mobile }))
 
 // The embedded chat, the document renderer and the state panel are all covered
 // by their own tests; stubbing them keeps this file's assertions about
@@ -34,6 +39,7 @@ vi.mock('../apps/spec-builder/components/DocView', () => ({
     addComment: (c: { file: string; quote: string; note: string }) => void
   }) => (
     <div data-testid="doc-view" data-tab={tab} data-running={String(!!running)}>
+      <input data-testid="doc-comment-draft" aria-label="comment draft" />
       <button
         type="button"
         data-testid="add-requirements-comment"
@@ -53,15 +59,15 @@ vi.mock('../apps/spec-builder/components/DocView', () => ({
 }))
 
 vi.mock('../apps/spec-builder/components/SpecStatePanel', () => ({
-  default: ({ sendMessage }: { sendMessage: (msg: string) => Promise<unknown> }) => (
-    <button type="button" data-testid="state-send" onClick={() => { void sendMessage('Decision: one') }}>
+  default: ({ answerDecision }: { answerDecision: (id: string, option: string, msg: string) => Promise<unknown> }) => (
+    <button type="button" data-testid="state-send" onClick={() => { void answerDecision('transport', 'one', 'Decision: one') }}>
       answer
     </button>
   ),
 }))
 
 import SpecDetail from '../apps/spec-builder/components/SpecDetail'
-import { LS } from '../apps/spec-builder/api'
+import { LS, SPEC_DETAIL_FAST_POLL_MS, SPEC_DETAIL_IDLE_POLL_MS } from '../apps/spec-builder/api'
 
 interface Call { url: string; method: string; body: string }
 
@@ -77,6 +83,8 @@ const BASE = {
   spec_dir: '/proj/checkout/.kiro/specs/checkout',
   slot_key: 'spec-builder-checkout-99',
   files: { 'requirements.md': '# r' },
+  docs: { 'requirements.md': { hash: 'a'.repeat(64) } },
+  duplicate_supported: true,
 }
 
 const okRes = (text: string) => ({ ok: true, status: 200, text: () => Promise.resolve(text) })
@@ -99,10 +107,20 @@ function installFetch(
   }))
 }
 
-function renderDetail(name = 'checkout', setErr: (m: string) => void = () => {}) {
+function renderDetail(
+  name = 'checkout',
+  setErr: (m: string) => void = () => {},
+  onDeleted?: () => void,
+  onDuplicated?: (name: string) => void,
+) {
   return render(
     <QueryClientProvider client={queryClient}>
-      <SpecDetail name={name} setErr={setErr} />
+      <SpecDetail
+        name={name}
+        setErr={setErr}
+        onDeleted={onDeleted}
+        onDuplicated={onDuplicated}
+      />
     </QueryClientProvider>,
   )
 }
@@ -122,6 +140,7 @@ beforeEach(() => {
   queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   calls = []
   localStorage.clear()
+  mobile = false
   // The pulsing dots and the poll both schedule work; without fake timers a
   // callback can fire after teardown and throw as an unhandled error.
   vi.useFakeTimers({ shouldAdvanceTime: true })
@@ -163,6 +182,105 @@ describe('SpecDetail header', () => {
     // Executing hides both the approval and the build affordances.
     expect(screen.queryByRole('button', { name: /Approve/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Start building/i })).not.toBeInTheDocument()
+  })
+
+  it('puts duplicate and archive in one overflow menu on mobile', async () => {
+    mobile = true
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    installFetch(BASE)
+    renderDetail()
+
+    const menu = await screen.findByRole('button', { name: /more actions/i })
+    expect(screen.queryByRole('button', { name: /duplicate this spec/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /archive this spec/i })).not.toBeInTheDocument()
+    await user.click(menu)
+    expect(await screen.findByRole('menuitem', { name: /duplicate this spec/i })).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /archive this spec/i })).toBeInTheDocument()
+  })
+
+  it('does not offer duplicate when the backend cannot publish it safely', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    installFetch({ ...BASE, duplicate_supported: false })
+    renderDetail()
+
+    await user.click(await screen.findByRole('button', { name: /more actions/i }))
+
+    expect(screen.queryByRole('menuitem', { name: /duplicate this spec/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: /archive this spec/i })).toBeInTheDocument()
+  })
+
+  it('moves the duplicate form below the fixed header at every pane width', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    installFetch(BASE)
+    renderDetail()
+
+    await user.click(await screen.findByRole('button', { name: /more actions/i }))
+    await user.click(await screen.findByRole('menuitem', { name: /duplicate this spec/i }))
+
+    const form = await screen.findByTestId('duplicate-form')
+    const input = screen.getByRole('textbox', { name: /name for the copy/i })
+    expect(form).toHaveClass('flex-col')
+    expect(form).toContainElement(input)
+    expect(input.closest('header')).toBeNull()
+  })
+
+  it('moves the title editor below the fixed header at every pane width', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    installFetch(BASE)
+    renderDetail()
+
+    await user.click(await screen.findByRole('button', { name: 'checkout' }))
+
+    const form = await screen.findByTestId('title-form')
+    const input = screen.getByRole('textbox', { name: /spec label/i })
+    expect(form).toHaveClass('flex-col')
+    expect(form).toContainElement(input)
+    expect(input.closest('header')).toBeNull()
+  })
+
+  it('keeps the mobile title static and puts rename in the overflow menu', async () => {
+    mobile = true
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    installFetch(BASE)
+    renderDetail()
+
+    await screen.findByText('checkout')
+    expect(screen.queryByRole('button', { name: 'checkout' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /more actions/i }))
+    expect(await screen.findByRole('menuitem', { name: /rename/i })).toBeInTheDocument()
+  })
+
+  it('archives from the overflow menu', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    installFetch(BASE)
+    renderDetail()
+
+    await user.click(await screen.findByRole('button', { name: /more actions/i }))
+    await user.click(await screen.findByRole('menuitem', { name: /archive this spec/i }))
+
+    await waitFor(() => expect(calls.some((c) => c.url.includes('/archive'))).toBe(true))
+    const request = calls.find((c) => c.url.includes('/archive'))
+    expect(JSON.parse(request?.body || '{}').archived).toBe(true)
+  })
+
+  it('names a duplicate inline and selects the completed copy', async () => {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    const onDuplicated = vi.fn()
+    installFetch(BASE, (url) => (url.includes('/duplicate')
+      ? Promise.resolve(okRes('{"name":"checkout-v2"}'))
+      : undefined))
+    renderDetail('checkout', () => {}, undefined, onDuplicated)
+
+    await user.click(await screen.findByRole('button', { name: /more actions/i }))
+    await user.click(await screen.findByRole('menuitem', { name: /duplicate this spec/i }))
+    const input = await screen.findByRole('textbox', { name: /name for the copy/i })
+    fireEvent.change(input, { target: { value: 'checkout-v2' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(calls.some((c) => c.url.includes('/duplicate'))).toBe(true))
+    const request = calls.find((c) => c.url.includes('/duplicate'))
+    expect(JSON.parse(request?.body || '{}').new_name).toBe('checkout-v2')
+    await waitFor(() => expect(onDuplicated).toHaveBeenCalledWith('checkout-v2'))
   })
 })
 
@@ -245,11 +363,32 @@ describe('SpecDetail review overlay', () => {
 
     const dialog = await screen.findByRole('dialog')
     expect(dialog).toHaveAttribute('aria-modal', 'true')
-    // The overlay mounts its own copy of the document pane.
-    expect(screen.getAllByTestId('doc-view')).toHaveLength(2)
+    // One document pane: a second copy behind the overlay doubled markdown
+    // parse cost and ran two selection listeners on the same window selection.
+    expect(screen.getAllByTestId('doc-view')).toHaveLength(1)
 
     fireEvent.keyDown(window, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  it('does not steal focus from the comment composer when the spec poll ticks', async () => {
+    installFetch(BASE)
+    renderDetail()
+
+    await screen.findByTestId('doc-view')
+    fireEvent.click(screen.getByRole('button', { name: 'Expand document for review' }))
+    await screen.findByRole('dialog')
+
+    const draft = screen.getByTestId('doc-comment-draft')
+    draft.focus()
+    expect(draft).toHaveFocus()
+
+    // A poll that returns new object identity re-renders SpecDetail. The overlay
+    // used an inline callback ref that focused the dialog on every such tick.
+    act(() => {
+      queryClient.setQueryData(['spec-builder', 'spec', 'checkout'], { ...BASE, running: true })
+    })
+    expect(draft).toHaveFocus()
   })
 
   it('closes the fullscreen review from its own close button', async () => {
@@ -266,9 +405,32 @@ describe('SpecDetail review overlay', () => {
     fireEvent.keyDown(window, { key: 'Escape' })
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
+
+  it('keeps phase actions reachable in the overlay so a review can approve', async () => {
+    installFetch(BASE)
+    renderDetail()
+
+    await screen.findByTestId('doc-view')
+    fireEvent.click(screen.getByRole('button', { name: 'Expand document for review' }))
+    const dialog = await screen.findByRole('dialog')
+    // The column header hides its copy while the overlay is up, so this is
+    // the only Approve on the page — expanding used to hide the action entirely.
+    expect(dialog).toHaveAccessibleName('Review requirements.md for checkout')
+    expect(screen.getByRole('button', { name: /Approve → Design/ })).toBeInTheDocument()
+  })
 })
 
 describe('SpecDetail phase actions', () => {
+  it('refuses to advance when the reviewed document has no trustworthy hash', async () => {
+    installFetch({ ...BASE, docs: {} })
+    renderDetail()
+
+    const approve = await screen.findByRole('button', { name: /Approve → Design/ })
+    expect(approve).toBeDisabled()
+    fireEvent.click(approve)
+    expect(calls.filter((c) => c.url.includes('/message'))).toHaveLength(0)
+  })
+
   it('sends the phase-approval instruction and locks the button while in flight', async () => {
     let release: (() => void) | undefined
     installFetch(BASE, (url) => (url.includes('/message')
@@ -314,7 +476,12 @@ describe('SpecDetail phase actions', () => {
 
     // Once design.md lands the backend reports the new phase, and the control
     // becomes the next approval rather than staying stuck on "drafting".
-    detail = { ...BASE, phase: 'design', files: { 'requirements.md': '# r', 'design.md': '# d' } }
+    detail = {
+      ...BASE,
+      phase: 'design',
+      files: { 'requirements.md': '# r', 'design.md': '# d' },
+      docs: { ...BASE.docs, 'design.md': { hash: 'b'.repeat(64) } },
+    }
     await waitFor(
       () => expect(screen.getByRole('button', { name: /Approve → Tasks/ })).toBeEnabled(),
       { timeout: 4000 },
@@ -362,12 +529,33 @@ describe('SpecDetail phase actions', () => {
   })
 
   it('offers the tasks approval on the design phase', async () => {
-    installFetch({ ...BASE, phase: 'design', files: { 'requirements.md': '# r', 'design.md': '# d' } })
+    installFetch({
+      ...BASE,
+      phase: 'design',
+      files: { 'requirements.md': '# r', 'design.md': '# d' },
+      docs: { ...BASE.docs, 'design.md': { hash: 'b'.repeat(64) } },
+    })
     renderDetail()
 
-    fireEvent.click(await screen.findByRole('button', { name: /Approve → Tasks/ }))
+    const approve = await screen.findByRole('button', { name: /Approve → Tasks/ })
+    expect(screen.getByTestId('doc-view')).toHaveAttribute('data-tab', 'requirements')
+    expect(approve).toBeDisabled()
+    fireEvent.click(approve)
+    expect(calls.filter((c) => c.url.includes('/approve'))).toHaveLength(0)
+    expect(calls.filter((c) => c.url.includes('/message'))).toHaveLength(0)
+
+    await selectTab('Design')
+    expect(screen.getByTestId('doc-view')).toHaveAttribute('data-tab', 'design')
+    expect(approve).toBeEnabled()
+    fireEvent.click(approve)
     await waitFor(() => expect(calls.filter((c) => c.url.includes('/message'))).toHaveLength(1))
-    expect(JSON.parse(calls[0].body).text).toContain('Design approved')
+    const approval = calls.find((c) => c.url.includes('/approve'))
+    expect(JSON.parse(approval?.body || '{}')).toMatchObject({
+      phase: 'design',
+      hash: 'b'.repeat(64),
+    })
+    const message = calls.find((c) => c.url.includes('/message'))
+    expect(JSON.parse(message?.body || '{}').text).toContain('Design approved')
   })
 
   it('offers no approval for a phase the table does not know', async () => {
@@ -401,13 +589,19 @@ describe('SpecDetail phase actions', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /Pause/ })).not.toBeDisabled())
   })
 
-  it('routes a state-panel answer through the shared message mutation', async () => {
+  it('sends a state-panel answer with its decision id so the backend can lock it', async () => {
     installFetch(BASE)
     renderDetail()
 
     fireEvent.click(await screen.findByTestId('state-send'))
     await waitFor(() => expect(calls.filter((c) => c.url.includes('/message'))).toHaveLength(1))
     expect(JSON.parse(calls[0].body).text).toBe('Decision: one')
+    // Without this the write is an ordinary message and the backend has nothing to
+    // record, so the decision stays re-answerable.
+    expect(JSON.parse(calls[0].body).decision_id).toBe('transport')
+    // The bare option travels separately from the composed prompt: it is what the
+    // backend records and what the card renders back as the answer.
+    expect(JSON.parse(calls[0].body).decision_option).toBe('one')
   })
 
   it('routes a chat message through the shared message mutation', async () => {
@@ -526,6 +720,111 @@ describe('SpecDetail review comment tray', () => {
   })
 })
 
+describe('SpecDetail delete', () => {
+  async function openRemoveConfirmation() {
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    await user.click(await screen.findByRole('button', { name: /more actions/i }))
+    await user.click(await screen.findByRole('menuitem', { name: 'Remove spec checkout' }))
+  }
+
+  it('asks first, then removes the spec and notifies the workspace', async () => {
+    const onDeleted = vi.fn()
+    installFetch(BASE)
+    renderDetail('checkout', () => {}, onDeleted)
+
+    await openRemoveConfirmation()
+    expect(await screen.findByRole('dialog', { name: 'Remove this spec?' })).toBeInTheDocument()
+    expect(screen.getByText(/markdown files stay in the project/i)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove this spec' }))
+    await waitFor(() => expect(onDeleted).toHaveBeenCalledTimes(1))
+    const deleted = calls.filter((c) => c.method === 'DELETE')
+    expect(deleted).toHaveLength(1)
+    expect(deleted[0].url).toContain('/specs/checkout')
+    expect(deleted[0].url).toContain('spec_dir=')
+    expect(deleted[0].url).toContain('slot_key=')
+  })
+
+  it('removes the confirmed spec, not a replacement that landed while the dialog was open', async () => {
+    const onDeleted = vi.fn()
+    installFetch(BASE)
+    renderDetail('checkout', () => {}, onDeleted)
+
+    await openRemoveConfirmation()
+    await screen.findByRole('dialog', { name: 'Remove this spec?' })
+
+    act(() => {
+      queryClient.setQueryData(['spec-builder', 'spec', 'checkout'], {
+        ...BASE,
+        spec_dir: '/proj/other/.kiro/specs/checkout',
+        slot_key: 'spec-builder-checkout-replacement',
+      })
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove this spec' }))
+    await waitFor(() => expect(onDeleted).toHaveBeenCalledTimes(1))
+    const deleted = calls.filter((c) => c.method === 'DELETE')
+    expect(deleted).toHaveLength(1)
+    expect(deleted[0].url).toContain(encodeURIComponent(BASE.spec_dir))
+    expect(deleted[0].url).toContain('spec-builder-checkout-99')
+    expect(deleted[0].url).not.toContain('replacement')
+  })
+
+  it('dismisses the confirm without sending a delete', async () => {
+    installFetch(BASE)
+    renderDetail()
+
+    await openRemoveConfirmation()
+    await screen.findByRole('dialog', { name: 'Remove this spec?' })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove this spec?' })).not.toBeInTheDocument())
+    expect(calls.filter((c) => c.method === 'DELETE')).toHaveLength(0)
+  })
+
+  it('surfaces a refused delete inside the dialog and leaves the spec open', async () => {
+    const setErr = vi.fn()
+    const onDeleted = vi.fn()
+    installFetch(BASE, (url) => (url.includes('/specs/checkout')
+      ? Promise.resolve({ ok: false, status: 409, json: () => Promise.resolve({ error: 'stale client' }) })
+      : undefined))
+    renderDetail('checkout', setErr, onDeleted)
+
+    await openRemoveConfirmation()
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove this spec' }))
+
+    // The failure renders INSIDE the dialog, where focus is trapped. The
+    // page-top banner sits behind the dimmed backdrop, so routing the error
+    // there read as the button silently reverting (#7662).
+    const dialog = screen.getByRole('dialog', { name: 'Remove this spec?' })
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent('Couldn’t remove this spec — try again.')
+    expect(alert).toHaveTextContent('stale client')
+    expect(setErr).not.toHaveBeenCalled()
+    expect(onDeleted).not.toHaveBeenCalled()
+    expect(dialog).toBeInTheDocument()
+  })
+
+  it('opens a fresh dialog without the previous attempt’s failure', async () => {
+    installFetch(BASE, (url) => (url.includes('/specs/checkout')
+      ? Promise.resolve({ ok: false, status: 409, json: () => Promise.resolve({ error: 'stale client' }) })
+      : undefined))
+    renderDetail()
+
+    await openRemoveConfirmation()
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove this spec' }))
+    await within(screen.getByRole('dialog', { name: 'Remove this spec?' })).findByRole('alert')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Remove this spec?' })).not.toBeInTheDocument())
+
+    // Reopening must not greet the user with the failure of an attempt that
+    // belongs to a dialog they already dismissed.
+    await openRemoveConfirmation()
+    expect(await screen.findByRole('dialog', { name: 'Remove this spec?' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
 describe('SpecDetail error surfacing', () => {
   it('reports a failed detail fetch without clearing the pane', async () => {
     const setErr = vi.fn()
@@ -541,5 +840,49 @@ describe('SpecDetail error surfacing', () => {
     // No detail: the chat stays withheld and the phase pill falls back.
     expect(screen.queryByTestId('chat-column')).not.toBeInTheDocument()
     expect(screen.getByText('…')).toBeInTheDocument()
+  })
+})
+
+describe('SpecDetail tasks-panel poll (#5361)', () => {
+  const withTasks = {
+    ...BASE,
+    files: { 'requirements.md': '# r', 'tasks.md': '- [ ] one' },
+    docs: { 'tasks.md': { hash: 'b'.repeat(64) } },
+    tasks: [{ index: 0, text: 'one', done: false, hash: 'c'.repeat(64) }],
+  }
+
+  it('refetches as soon as the Tasks tab opens, then keeps the fast cadence while idle', async () => {
+    let gets = 0
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+      gets += 1
+      return Promise.resolve(okRes(JSON.stringify(withTasks)))
+    }))
+    renderDetail()
+    await screen.findByTestId('chat-column')
+    const afterMount = gets
+
+    await selectTab('Tasks')
+    await waitFor(() => expect(gets).toBeGreaterThan(afterMount))
+    const afterOpen = gets
+
+    await vi.advanceTimersByTimeAsync(SPEC_DETAIL_FAST_POLL_MS)
+    expect(gets).toBeGreaterThan(afterOpen)
+  })
+
+  it('stays on the idle cadence on Requirements when nothing is running', async () => {
+    let gets = 0
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => {
+      gets += 1
+      return Promise.resolve(okRes(JSON.stringify(BASE)))
+    }))
+    renderDetail()
+    await screen.findByTestId('chat-column')
+    const afterMount = gets
+
+    await vi.advanceTimersByTimeAsync(SPEC_DETAIL_FAST_POLL_MS)
+    expect(gets).toBe(afterMount)
+
+    await vi.advanceTimersByTimeAsync(SPEC_DETAIL_IDLE_POLL_MS - SPEC_DETAIL_FAST_POLL_MS)
+    expect(gets).toBeGreaterThan(afterMount)
   })
 })

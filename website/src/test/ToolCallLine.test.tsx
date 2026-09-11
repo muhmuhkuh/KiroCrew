@@ -66,6 +66,39 @@ describe('ToolCallLine simplifiedToolNames', () => {
     renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
     expect(screen.getByText('Running: echo hello')).toBeTruthy()
   })
+
+  it('substitutes a derived summary for a flood-length purpose-less shell label', () => {
+    // No purpose + simplified ON: pickToolLabel falls back to the raw command,
+    // and a multi-line heredoc label is substituted with a command digest. The
+    // collapsed row's CSS truncate bounds VISIBILITY; this bounds MEANING.
+    localStorage.setItem(LS_KEY, JSON.stringify({ simplifiedToolNames: true }))
+    const heredoc = "cat > /tmp/desc.md <<'EOF'\n### Notes\nbody line one\nbody line two\nEOF"
+    const msg = toolMsg({ content: `🔧 Running: ${heredoc}`, meta: { tool_call_id: 'tc_3' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: heredoc, tool_call_id: 'tc_3', output: 'ok', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    expect(screen.getByText('Running: cat → /tmp/desc.md')).toBeTruthy()
+    expect(screen.queryByText(/body line two/)).toBeNull()
+  })
+
+  it('leaves a short raw shell label untouched in simplified mode', () => {
+    localStorage.setItem(LS_KEY, JSON.stringify({ simplifiedToolNames: true }))
+    const msg = toolMsg({ content: '🔧 Running: git status', meta: { tool_call_id: 'tc_5' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{ type: 'tool', text: 'git status', tool_call_id: 'tc_5', output: 'clean', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+    expect(screen.getByText('Running: git status')).toBeTruthy()
+  })
 })
 
 describe('ToolCallLine inline expansion', () => {
@@ -117,24 +150,23 @@ describe('ToolCallLine inline expansion', () => {
     expect(screen.getByText('only-output')).toBeTruthy()
   })
 
-  it('renders both segments with the missing one disabled', () => {
+  it('labels the one available section instead of offering a dead segment', () => {
     const store = createTestStore({
       chat: {
         messages: [toolMsg()],
-        // Output present, no input → Input segment should be disabled, Output active.
+        // Output present, no input → nothing to switch between, so the control
+        // is a label naming what is on screen, not a two-segment capsule with
+        // one segment greyed out.
         toolLog: [{ type: 'tool', text: 'echo hello', purpose: 'Say hello', tool_call_id: 'tc_1', output: 'only-output', ts: 1 }],
         slotRunning: false,
       } as unknown as ChatState,
     })
     renderWithProviders(<ToolCallLine message={toolMsg()} running={false} />, { store })
     fireEvent.click(screen.getByRole('button', { name: /Show details/i }))
-    const inputBtn = screen.getByRole('button', { name: 'Input' })
-    const outputBtn = screen.getByRole('button', { name: 'Output' })
-    expect(inputBtn.hasAttribute('disabled')).toBe(true)
-    expect(outputBtn.hasAttribute('disabled')).toBe(false)
-    expect(inputBtn.getAttribute('title')).toBe('Input not yet available')
-    // Clicking the disabled Input segment must not flip the panel
-    fireEvent.click(inputBtn)
+    expect(screen.queryByRole('button', { name: 'Input' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Output' })).toBeNull()
+    // The section is still named, so the user knows which half they are reading.
+    expect(screen.getByText('Output')).toBeTruthy()
     expect(screen.getByText('only-output')).toBeTruthy()
   })
 
@@ -289,7 +321,7 @@ describe('ToolCallLine inline expansion', () => {
 
 describe('ToolCallLine file-open icon', () => {
   beforeEach(() => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as any
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as unknown as typeof fetch
   })
 
   function fileMsg(overrides: Partial<ChatMessage> = {}): ChatMessage {
@@ -302,7 +334,7 @@ describe('ToolCallLine file-open icon', () => {
         messages: [fileMsg()],
         toolLog: [{ type: 'tool', text: 'Read /etc/hosts', purpose: 'Read a file', tool_call_id: 'tc_file', input, output: 'ok', ts: 1 }],
         slotRunning: false,
-      } as any,
+      } as unknown as ChatState,
     })
   }
 
@@ -354,7 +386,7 @@ describe('ToolCallLine file-open icon', () => {
   })
 
   it('does not render the icon when the file does not exist (HEAD 404)', async () => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 404 })) as any
+    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 404 })) as unknown as typeof fetch
     const store = fileStore('{"path":"/etc/hosts"}')
     renderWithProviders(<ToolCallLine message={fileMsg()} running={false} onFileOpen={vi.fn()} />, { store })
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
@@ -414,6 +446,8 @@ describe('ToolCallLine entrance reveal', () => {
  *  reads as a slide. */
 describe('ToolCallLine row slide', () => {
   it('keeps the shell status line mounted while it collapses, then drops it', async () => {
+    // `ts: 1` puts the command far past the appearance threshold, so the line
+    // is up from the first paint.
     const msg = toolMsg({ meta: { tool_call_id: 'tc_slide_exit' } })
     const store = createTestStore({
       chat: {
@@ -435,6 +469,7 @@ describe('ToolCallLine row slide', () => {
     expect(screen.getByText(/Running ·/)).toBeTruthy()
     // …and gone once the collapse finishes.
     await waitFor(() => expect(screen.queryByText(/Running ·/)).toBeNull())
+    expect(screen.queryByTestId('shell-activity')).toBeNull()
   })
 
   it('grows a first-appearance row from zero height and releases it afterwards', async () => {
@@ -586,7 +621,7 @@ describe('ToolCallLine auto-denied detection', () => {
   // the visible 🔧 pill's tool_call_id when a security-policy deny rule or
   // hook blocks a call. The pill must find that sibling and render amber
   // (warn) instead of the green success state.
-  it('renders warn tone and a standard blocked message when a 🚫 sibling shares the tool_call_id', () => {
+  it('renders warn tone and the deny reason when a 🚫 sibling shares the tool_call_id', () => {
     const pill = toolMsg({ meta: { tool_call_id: 'tc_deny' } })
     const denySibling: ChatMessage = {
       role: 'tool',
@@ -605,11 +640,20 @@ describe('ToolCallLine auto-denied detection', () => {
     // Amber slash icon, not the green success dot
     expect(container.querySelector('.text-warn')).toBeTruthy()
     expect(container.querySelector('.text-ok')).toBeFalsy()
-    // Expanded output shows the standard blocked message — the 🚫 sibling's
-    // content is a redacted title (often just "shell"), not a usable reason —
-    // and never kiro-cli's misleading boilerplate.
+    // The expanded output names WHICH rule fired, taken from the 🚫 sibling's
+    // content — a bare "blocked" line leaves the user unable to tell a policy
+    // deny from any other failure. kiro-cli's misleading boilerplate ("User
+    // denied tool execution", which attributes a host decision to the person)
+    // must never surface.
     fireEvent.click(screen.getByRole('button', { name: /show details/i }))
-    expect(screen.getByText('Blocked by security policy')).toBeTruthy()
+    // The rule is named, WITHOUT the English wire marker: the localized sentence
+    // leads, so repeating "Blocked by security policy:" would hand a non-English
+    // reader untranslated text in front of their own.
+    expect(screen.getByText(/deny rule/)).toBeTruthy()
+    expect(screen.queryByText(/Blocked by security policy:/)).toBeFalsy()
+    // The localized lead is present, so the reader is told what happened in their
+    // own language even when the detail is a raw pattern.
+    expect(screen.getByText(/blocked the call|blocked by security policy/i)).toBeTruthy()
     expect(screen.queryByText('User denied tool execution')).toBeFalsy()
   })
 
@@ -644,6 +688,40 @@ describe('ToolCallLine auto-denied detection', () => {
       chat: {
         messages: [pill, perm, denySibling],
         toolLog: [{ type: 'tool', text: 'rm file', tool_call_id: 'tc_userreject', ts: 1 }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    const { container } = renderWithProviders(<ToolCallLine message={pill} running={false} />, { store })
+    expect(container.querySelector('.text-danger')).toBeTruthy()
+    expect(container.querySelector('.text-warn')).toBeFalsy()
+  })
+
+  // The backend persists the RAW decision token into `meta.resolved`, so a
+  // deny-once reaches this component as `rejected_once`. An equality match on
+  // `'rejected'` fails one-sidedly here: the row stops counting as a user
+  // rejection and falls through to the auto-deny branch, painting the most
+  // deliberate denial a human can make as a security-policy block. That is not
+  // reachable from the live WS frame (which re-broadcasts a plain `rejected`),
+  // only from RELOADED history — which is why a store seeded like the server's
+  // persisted state is the shape that catches it.
+  it('reject-once (resolved rejected_once) stays red, not amber auto-denied', () => {
+    const pill = toolMsg({ meta: { tool_call_id: 'tc_denyonce' } })
+    const denySibling: ChatMessage = {
+      role: 'tool',
+      content: '🚫 Running: rm file (rejected — this call only)',
+      cls: 'msg msg-tool',
+      meta: { tool_call_id: 'tc_denyonce' },
+    }
+    const perm: ChatMessage = {
+      role: 'permission',
+      content: 'Running: rm file',
+      cls: '',
+      meta: { tool_call_id: 'tc_denyonce', resolved: 'rejected_once' },
+    }
+    const store = createTestStore({
+      chat: {
+        messages: [pill, perm, denySibling],
+        toolLog: [{ type: 'tool', text: 'rm file', tool_call_id: 'tc_denyonce', ts: 1 }],
         slotRunning: false,
       } as unknown as ChatState,
     })

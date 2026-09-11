@@ -8,6 +8,7 @@ The network fetch itself is performed by the pipeline via the ``gh`` CLI; this
 module is the deterministic, token-free part: parsing the fetched payload into a
 ``ReviewTarget``.
 """
+
 from __future__ import annotations
 
 import json
@@ -44,7 +45,7 @@ class ReviewTarget:
     """The single normalized shape the review brain consumes."""
 
     platform: str
-    repo_identity: str          # host/org/repo — the learning key
+    repo_identity: str  # host/org/repo — the learning key
     change_id: str
     url: str
     title: str = ""
@@ -53,7 +54,7 @@ class ReviewTarget:
     author: str = ""
     target_branch: str = ""
     revision: str = ""
-    files: list[dict] = field(default_factory=list)        # [{path, diff}]
+    files: list[dict] = field(default_factory=list)  # [{path, diff}]
     existing_comments: list[dict] = field(default_factory=list)
     design_discussion: list[dict] = field(default_factory=list)
     is_fix: bool = False
@@ -72,6 +73,8 @@ class ReviewTarget:
 # URLs.
 _GITHUB_HOST = "github.com"
 _WWW_GITHUB_HOST = "www.github.com"
+_GITLAB_HOST = "gitlab.com"
+_WWW_GITLAB_HOST = "www.gitlab.com"
 
 
 def canonical_host(host: str) -> str:
@@ -80,7 +83,11 @@ def canonical_host(host: str) -> str:
     Persisted identities (``repo_identity``, change ids, reviewed keys) use the
     canonical form so the two spellings of github.com map to one record."""
     h = (host or "").strip().lower()
-    return _GITHUB_HOST if h == _WWW_GITHUB_HOST else h
+    if h == _WWW_GITHUB_HOST:
+        return _GITHUB_HOST
+    if h == _WWW_GITLAB_HOST:
+        return _GITLAB_HOST
+    return h
 
 
 def _urlparse_host_path(text: str) -> tuple[str, str]:
@@ -132,6 +139,59 @@ def allowed_hosts(config: dict | None = None) -> frozenset[str]:
         hosts.add(_GITHUB_HOST)
         hosts.add(_WWW_GITHUB_HOST)
     return frozenset(hosts)
+
+
+def gitlab_allowed_hosts(config: dict | None = None) -> frozenset[str]:
+    """Return the exact set of configured GitLab hosts, including gitlab.com."""
+    cfg = config if config is not None else store.read_config_quiet()
+    raw = cfg.get("gitlab_hosts") if isinstance(cfg, dict) else None
+    hosts = {_GITLAB_HOST, _WWW_GITLAB_HOST}
+    if isinstance(raw, (list, tuple)):
+        for entry in raw:
+            host = str(entry or "").strip().lower()
+            if "://" in host:
+                host = _urlparse_host_path(host)[0]
+            host = host.strip("/").rstrip(".")
+            if host:
+                hosts.add(host)
+    if config is None:
+        try:
+            from kiro_crew.config.loader import KiroCrewConfig
+
+            hosts.update(KiroCrewConfig.load().dashboard.gitlab_hosts)
+        except Exception:
+            pass
+    return frozenset(hosts)
+
+
+def parse_gitlab_repo_ref(link: str, *, config: dict | None = None) -> tuple[str, str, str]:
+    """Parse an allowlisted GitLab URL as ``(host, namespace, project)``."""
+    if not link or not isinstance(link, str):
+        raise UnsupportedPlatform("empty or non-string repo link")
+    host, path = _urlparse_host_path(link)
+    hosts = gitlab_allowed_hosts(config)
+    if host not in hosts:
+        raise UnsupportedPlatform(f"unsupported GitLab repo host: {link!r}")
+    if "/-/" in path:
+        path = path.split("/-/", 1)[0]
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        raise AdapterParseError(f"not a GitLab repo link: {link!r}")
+    parts[-1] = re.sub(r"\.git$", "", parts[-1])
+    segment = re.compile(r"^[A-Za-z0-9._-]+$")
+    if any(part in (".", "..") or not segment.match(part) for part in parts):
+        raise AdapterParseError(f"invalid GitLab namespace/project in {link!r}")
+    return canonical_host(host), "/".join(parts[:-1]), parts[-1]
+
+
+def parse_any_repo_ref(link: str, *, config: dict | None = None) -> tuple[str, str, str, str]:
+    """Parse a GitHub or GitLab repo URL as ``(provider, host, owner, repo)``."""
+    host, _path = _urlparse_host_path(link if isinstance(link, str) else "")
+    if host in allowed_hosts(config):
+        parsed_host, owner, repo = parse_repo_ref(link, config=config)
+        return "github", parsed_host, owner, repo
+    parsed_host, namespace, project = parse_gitlab_repo_ref(link, config=config)
+    return "gitlab", parsed_host, namespace, project
 
 
 def detect_platform(link: str, *, config: dict | None = None) -> str:
@@ -232,12 +292,14 @@ def parse_repo_ref(link: str, *, config: dict | None = None) -> tuple[str, str, 
     if host not in hosts:
         raise UnsupportedPlatform(
             f"unsupported repo host: {link!r} "
-            f"(expected a repo URL on one of: {', '.join(sorted(hosts))})")
+            f"(expected a repo URL on one of: {', '.join(sorted(hosts))})"
+        )
     if "/pull/" in path:
         # A PR URL, not a repo URL — route the user to the paste flow so we don't
         # silently review the PR's whole repo.
         raise AdapterParseError(
-            f"that's a PR URL, not a repo URL: {link!r} (paste it in the PR box)")
+            f"that's a PR URL, not a repo URL: {link!r} (paste it in the PR box)"
+        )
     parts = [p for p in path.split("/") if p]
     if len(parts) < 2:
         raise AdapterParseError(f"not a GitHub repo link: {link!r}")
@@ -255,8 +317,7 @@ def parse_repo_url(link: str) -> tuple[str, str]:
     return owner, repo
 
 
-def github_change_id(owner: str, repo: str, number: str | int,
-                     host: str = "github.com") -> str:
+def github_change_id(owner: str, repo: str, number: str | int, host: str = "github.com") -> str:
     """Filesystem-safe, platform-namespaced change id: ``GH-<owner>-<repo>-<n>``.
     Unlike a raw URL, this is a valid filename.
 
@@ -269,8 +330,7 @@ def github_change_id(owner: str, repo: str, number: str | int,
     return f"{prefix}{_sanitize_seg(owner)}-{_sanitize_seg(repo)}-{number}"
 
 
-def github_review_key(owner: str, repo: str, number: str | int,
-                      host: str = "github.com") -> str:
+def github_review_key(owner: str, repo: str, number: str | int, host: str = "github.com") -> str:
     """Collision-free canonical identity for the durable reviewed-index key.
 
     Distinct from ``github_change_id``: that value ALSO names an on-disk result
@@ -295,6 +355,7 @@ def github_review_key(owner: str, repo: str, number: str | int,
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _first(d: dict, *keys, default=""):
     for k in keys:
@@ -324,6 +385,7 @@ def extract_linked_issue(text: str) -> str:
 # ---------------------------------------------------------------------------
 # GitHub adapter
 # ---------------------------------------------------------------------------
+
 
 def parse_github_payload(raw: dict | str, *, link: str | None = None) -> ReviewTarget:
     """Normalize a GitHub PR payload into a ReviewTarget. The worker assembles
@@ -378,8 +440,7 @@ def parse_github_payload(raw: dict | str, *, link: str | None = None) -> ReviewT
     host = host or "github.com"
 
     if not (owner and repo and number):
-        raise AdapterParseError(
-            "could not determine GitHub owner/repo/number from payload or link")
+        raise AdapterParseError("could not determine GitHub owner/repo/number from payload or link")
 
     description = _first(raw, "body", "description", default="")
     title = _first(raw, "title", default="") or (description.splitlines()[0] if description else "")
@@ -406,10 +467,12 @@ def parse_github_payload(raw: dict | str, *, link: str | None = None) -> ReviewT
     if not author:
         author = _author_alias(raw)
 
-    revision = (_first(head, "sha", default="")
-                or _first(raw, "head_sha", "sha", "revision", default=""))
-    target_branch = (_first(base, "ref", default="")
-                     or _first(raw, "base_ref", "targetBranch", default=""))
+    revision = _first(head, "sha", default="") or _first(
+        raw, "head_sha", "sha", "revision", default=""
+    )
+    target_branch = _first(base, "ref", default="") or _first(
+        raw, "base_ref", "targetBranch", default=""
+    )
 
     comments = raw.get("comments") or raw.get("review_comments") or raw.get("allComments") or []
     if not isinstance(comments, list):

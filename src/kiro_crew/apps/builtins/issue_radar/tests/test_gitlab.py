@@ -13,8 +13,10 @@ loud:
     owner/repo on a different provider or host.
   * Normalization -- the GitLab payloads must arrive in the exact GitHub-shaped
     dicts the routes, caches, and React components already consume.
-  * Client parity -- both modules must expose the same surface, so a route can
-    dispatch without knowing which provider it has.
+  * Client parity -- EVERY client module must expose the same surface, so a route
+    can dispatch without knowing which provider it has. The gate is parameterized
+    over the whole client table (GitHub, GitLab, Azure DevOps), so a new provider
+    is covered by adding one entry rather than a branch per assertion.
 """
 
 from __future__ import annotations
@@ -30,8 +32,10 @@ from unittest import mock
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew.apps.builtins.issue_radar.backend import (
+    azure_client,
     github_client,
     gitlab_client,
+    jira_client,
     provider,
     routes,
     store,
@@ -123,9 +127,9 @@ class TestGitlabUrlParsing(unittest.TestCase):
         one is client input and must arrive as :class:`RepoUrlError` (HTTP 400).
         """
         for bad in (
-            "https://gitlab.com:notaport/g/p",   # port not an integer
-            "https://gitlab.com:99999999/g/p",   # port out of range
-            "https://[bad/g/p",                  # unclosed IPv6 bracket
+            "https://gitlab.com:notaport/g/p",  # port not an integer
+            "https://gitlab.com:99999999/g/p",  # port out of range
+            "https://[bad/g/p",  # unclosed IPv6 bracket
             "https://[::1/g/p",
         ):
             with self.subTest(bad=bad), self.assertRaises(RepoUrlError):
@@ -148,6 +152,7 @@ class TestGitlabUrlParsing(unittest.TestCase):
 
     def test_project_path_encodes_nested_namespace(self):
         self.assertEqual(gitlab_client.project_path("a/b", "c"), "a%2Fb%2Fc")
+        self.assertEqual(gitlab_client.project_path("", "project"), "project")
 
     def test_real_world_self_managed_three_level_namespace(self):
         """A real self-managed URL shape, kept as a fixture.
@@ -214,12 +219,16 @@ class TestGitlabUrlParsing(unittest.TestCase):
 class TestParseRepoUrlDispatch(unittest.TestCase):
     def test_github_url_goes_to_github(self):
         key = provider.parse_repo_url("https://github.com/o/r")
-        self.assertEqual((key.provider, key.host, key.owner, key.repo), ("github", "github.com", "o", "r"))
+        self.assertEqual(
+            (key.provider, key.host, key.owner, key.repo), ("github", "github.com", "o", "r")
+        )
 
     def test_gitlab_url_goes_to_gitlab(self):
         with mock.patch.object(gitlab_client, "allowed_hosts", return_value=frozenset()):
             key = provider.parse_repo_url("https://gitlab.com/g/p")
-        self.assertEqual((key.provider, key.host, key.owner, key.repo), ("gitlab", "gitlab.com", "g", "p"))
+        self.assertEqual(
+            (key.provider, key.host, key.owner, key.repo), ("gitlab", "gitlab.com", "g", "p")
+        )
 
     def test_dispatch_matches_the_host_exactly_not_as_a_substring(self):
         """A URL merely CONTAINING "://github.com/" is not a GitHub URL.
@@ -283,10 +292,9 @@ class TestHostAuthorizationAtSpawn(unittest.TestCase):
     def test_token_withheld_from_self_managed_host(self):
         # GITLAB_TOKEN is a gitlab.com credential with no host binding; sending
         # it to a private instance would hand over every permission it carries.
-        with mock.patch.dict(
-            "os.environ", {"GITLAB_TOKEN": "glpat-secret"}, clear=False
-        ), mock.patch(
-            "kiro_crew.apps.registry.minimal_env", side_effect=lambda **kw: dict(kw)
+        with (
+            mock.patch.dict("os.environ", {"GITLAB_TOKEN": "glpat-secret"}, clear=False),
+            mock.patch("kiro_crew.apps.registry.minimal_env", side_effect=lambda **kw: dict(kw)),
         ):
             self_managed = gitlab_client._glab_env("gitlab.acme.internal")
             public = gitlab_client._glab_env("gitlab.com")
@@ -295,10 +303,13 @@ class TestHostAuthorizationAtSpawn(unittest.TestCase):
         self.assertEqual(public.get("GITLAB_TOKEN"), "glpat-secret")
 
     def test_env_excludes_unrelated_secrets(self):
-        with mock.patch.dict(
-            "os.environ", {"AWS_SECRET_ACCESS_KEY": "nope", "SLACK_BOT_TOKEN": "nope"}, clear=False
-        ), mock.patch(
-            "kiro_crew.apps.registry.minimal_env", side_effect=lambda **kw: dict(kw)
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"AWS_SECRET_ACCESS_KEY": "nope", "SLACK_BOT_TOKEN": "nope"},
+                clear=False,
+            ),
+            mock.patch("kiro_crew.apps.registry.minimal_env", side_effect=lambda **kw: dict(kw)),
         ):
             env = gitlab_client._glab_env("gitlab.com")
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
@@ -464,9 +475,7 @@ class TestConnectedIdentity(unittest.TestCase):
             "group", "Project", provider="gitlab", host="gitlab.com", root=self.root
         )
         gitlab_entries = [
-            r
-            for r in store.list_connected_repos(self.root)
-            if r.get("provider") == "gitlab"
+            r for r in store.list_connected_repos(self.root) if r.get("provider") == "gitlab"
         ]
         self.assertEqual(len(gitlab_entries), 2)
 
@@ -500,11 +509,25 @@ class TestNormalization(unittest.TestCase):
         self.assertEqual(row["body"], "body")
         self.assertIsNone(row["author_association"])
         # The row must carry exactly the keys the GitHub list view produces.
-        self.assertEqual(set(row), {
-            "number", "title", "url", "labels", "comments", "reactions", "thumbs_up",
-            "author_association", "updated_at", "created_at", "state", "author",
-            "assignees", "body",
-        })
+        self.assertEqual(
+            set(row),
+            {
+                "number",
+                "title",
+                "url",
+                "labels",
+                "comments",
+                "reactions",
+                "thumbs_up",
+                "author_association",
+                "updated_at",
+                "created_at",
+                "state",
+                "author",
+                "assignees",
+                "body",
+            },
+        )
 
     def test_locked_state_folds_to_open(self):
         self.assertEqual(gitlab_client._norm_state("locked"), "open")
@@ -515,8 +538,14 @@ class TestNormalization(unittest.TestCase):
 
     def test_merge_request_folds_merged_into_closed_but_keeps_merged_at(self):
         row = gitlab_client._norm_pull(
-            {"iid": 7, "state": "merged", "merged_at": "2026-01-03T00:00:00Z",
-             "source_branch": "feat", "target_branch": "main", "draft": False}
+            {
+                "iid": 7,
+                "state": "merged",
+                "merged_at": "2026-01-03T00:00:00Z",
+                "source_branch": "feat",
+                "target_branch": "main",
+                "draft": False,
+            }
         )
         self.assertEqual(row["state"], "closed")
         self.assertEqual(row["merged_at"], "2026-01-03T00:00:00Z")
@@ -526,7 +555,9 @@ class TestNormalization(unittest.TestCase):
     def test_pipeline_summary_reports_unknown_diff_not_zero(self):
         # Zeros would present an unread diff as a confident "no changes" and be
         # persisted to the list cache.
-        row = gitlab_client._norm_pull({"iid": 1, "state": "opened", "head_pipeline": {"status": "failed"}})
+        row = gitlab_client._norm_pull(
+            {"iid": 1, "state": "opened", "head_pipeline": {"status": "failed"}}
+        )
         self.assertIsNone(row["additions"])
         self.assertIsNone(row["changed_files"])
         self.assertEqual(row["checks_state"], "failure")
@@ -566,16 +597,25 @@ class TestNormalization(unittest.TestCase):
 
     def test_effective_access_level_takes_the_higher_of_project_and_group(self):
         level = gitlab_client._access_level(
-            {"permissions": {"project_access": {"access_level": 20},
-                             "group_access": {"access_level": 40}}}
+            {
+                "permissions": {
+                    "project_access": {"access_level": 20},
+                    "group_access": {"access_level": 40},
+                }
+            }
         )
         self.assertEqual(level, 40)
 
     def test_internal_visibility_counts_as_private(self):
         with mock.patch.object(
-            gitlab_client, "_glab_api",
-            return_value={"path_with_namespace": "g/p", "visibility": "internal",
-                          "open_issues_count": 2, "permissions": {}},
+            gitlab_client,
+            "_glab_api",
+            return_value={
+                "path_with_namespace": "g/p",
+                "visibility": "internal",
+                "open_issues_count": 2,
+                "permissions": {},
+            },
         ):
             summary = gitlab_client.verify_repo_access("g", "p", host="gitlab.com")
         self.assertTrue(summary["private"])
@@ -589,8 +629,12 @@ class TestNormalization(unittest.TestCase):
 
     def test_system_note_becomes_a_typed_event(self):
         event = gitlab_client._norm_note(
-            {"system": True, "body": "assigned to @bob", "created_at": "t",
-             "author": {"username": "alice"}}
+            {
+                "system": True,
+                "body": "assigned to @bob",
+                "created_at": "t",
+                "author": {"username": "alice"},
+            }
         )
         assert event is not None
         self.assertEqual(event["kind"], "assigned")
@@ -703,16 +747,33 @@ class TestRefSummary(unittest.TestCase):
     def test_summary_keys_match_github(self):
         # The frontend reads one shape for both providers; a missing key renders as
         # an empty hover card rather than an error anyone would notice.
-        with mock.patch.object(gitlab_client, "_glab_api", side_effect=[
-            dict(self.RAW), [{"name": "bug", "color": "#d73a4a"}],
-        ]):
+        with mock.patch.object(
+            gitlab_client,
+            "_glab_api",
+            side_effect=[
+                dict(self.RAW),
+                [{"name": "bug", "color": "#d73a4a"}],
+            ],
+        ):
             summary = gitlab_client.get_ref_summary("g", "p", 5, host="gitlab.com")
         self.assertEqual(
             set(summary),
             {
-                "number", "title", "state", "state_reason", "url", "author",
-                "author_association", "created_at", "updated_at", "closed_at",
-                "comments", "is_pr", "draft", "merged_at", "labels",
+                "number",
+                "title",
+                "state",
+                "state_reason",
+                "url",
+                "author",
+                "author_association",
+                "created_at",
+                "updated_at",
+                "closed_at",
+                "comments",
+                "is_pr",
+                "draft",
+                "merged_at",
+                "labels",
             },
         )
         self.assertEqual(summary["number"], 5)
@@ -768,7 +829,10 @@ class TestMrTimelineNotesFetch(unittest.TestCase):
 
     def test_notes_endpoint_is_hit_once(self):
         note = {
-            "id": 1, "system": False, "body": "inline!", "created_at": "2024-01-01T00:00:00Z",
+            "id": 1,
+            "system": False,
+            "body": "inline!",
+            "created_at": "2024-01-01T00:00:00Z",
             "author": {"username": "alice"},
             "position": {"new_path": "a.py", "new_line": 3},
         }
@@ -783,8 +847,10 @@ class TestMrTimelineNotesFetch(unittest.TestCase):
             # resource_label_events / resource_state_events — empty is fine.
             return []
 
-        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake_api), \
-                mock.patch.object(gitlab_client, "list_repo_labels", return_value=[]):
+        with (
+            mock.patch.object(gitlab_client, "_glab_api", side_effect=fake_api),
+            mock.patch.object(gitlab_client, "list_repo_labels", return_value=[]),
+        ):
             events = gitlab_client.list_pr_timeline("g", "p", 7, host="gitlab.com")
 
         notes_calls = [p for p in calls if p.split("?")[0].endswith("/notes")]
@@ -833,9 +899,7 @@ class TestInvestigationNamespace(unittest.TestCase):
             store.write_investigation(
                 "group", "project", 5, {"slot_key": "mr-slot"}, root=root, kind=mr_kind
             )
-            issue_record = store.read_investigation(
-                "group", "project", 5, root, kind=issue_kind
-            )
+            issue_record = store.read_investigation("group", "project", 5, root, kind=issue_kind)
             mr_record = store.read_investigation("group", "project", 5, root, kind=mr_kind)
 
         # The MR write must not have reached the issue's session link.
@@ -881,9 +945,7 @@ class TestHostIsRequiredNotDefaulted(unittest.TestCase):
             # The gitlab.com project IS connected, but a request that named no host
             # must not be authorized against it.
             self.assertFalse(
-                store.is_repo_connected(
-                    "group", "project", root, provider="gitlab", host=""
-                )
+                store.is_repo_connected("group", "project", root, provider="gitlab", host="")
             )
             self.assertTrue(
                 store.is_repo_connected(
@@ -898,7 +960,9 @@ class TestHostIsRequiredNotDefaulted(unittest.TestCase):
     def test_github_host_is_still_pinned(self):
         # GitHub Enterprise is unsupported, so its host is not client-controlled.
         self.assertEqual(provider.key_from_parts("o", "r", "github", None).host, "github.com")
-        self.assertEqual(provider.key_from_parts("o", "r", "github", "evil.test").host, "github.com")
+        self.assertEqual(
+            provider.key_from_parts("o", "r", "github", "evil.test").host, "github.com"
+        )
 
 
 class TestListPagination(unittest.TestCase):
@@ -921,15 +985,11 @@ class TestListPagination(unittest.TestCase):
         return seen[0]
 
     def test_closed_issue_list_asks_for_a_full_page(self):
-        path = self._path_for(
-            lambda: gitlab_client.list_closed_issues("g", "p", host="gitlab.com")
-        )
+        path = self._path_for(lambda: gitlab_client.list_closed_issues("g", "p", host="gitlab.com"))
         self.assertIn("per_page=100", path)
 
     def test_closed_merge_request_list_asks_for_a_full_page(self):
-        path = self._path_for(
-            lambda: gitlab_client.list_closed_pulls("g", "p", host="gitlab.com")
-        )
+        path = self._path_for(lambda: gitlab_client.list_closed_pulls("g", "p", host="gitlab.com"))
         self.assertIn("per_page=100", path)
 
     def test_paginated_lists_do_not_duplicate_per_page(self):
@@ -964,10 +1024,105 @@ class TestMergeRequestSearchState(unittest.TestCase):
         ]
         with mock.patch.object(gitlab_client, "_glab_api", return_value=rows):
             out = gitlab_client.search_pulls(
-                "g", "p", host="gitlab.com", author="amy",
+                "g",
+                "p",
+                host="gitlab.com",
+                author="amy",
                 limit=gitlab_client.PR_SEARCH_MAX + 1,
             )
         self.assertEqual(len(out), gitlab_client.PR_SEARCH_MAX + 1)
+
+
+class TestGitlabAssignees(unittest.TestCase):
+    """GitLab addresses assignees by numeric id, so the editor's usernames have to
+    be resolved against the project roster before the write."""
+
+    MEMBERS = [
+        {"username": "alice", "id": 11, "access_level": 30},
+        {"username": "Bob", "id": 22, "access_level": 40},
+    ]
+
+    def test_resolves_usernames_to_ids_and_sends_assignee_ids(self):
+        calls = []
+
+        def fake(path, **kw):
+            calls.append((path, kw))
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": [{"username": "alice"}]}
+
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake):
+            out = gitlab_client.set_issue_assignees("g", "p", 7, ["alice"], host="gitlab.com")
+
+        write = [c for c in calls if c[1].get("method") == "PUT"][0]
+        self.assertEqual(write[1]["body"], {"assignee_ids": [11]})
+        self.assertEqual(out, ["alice"])
+
+    def test_username_match_is_case_insensitive(self):
+        """The roster spells a username with its own case ("Bob") and the picker
+        passes back exactly what it rendered, while the lookup table is keyed
+        lowercase -- so the LOOKUP side must fold case too. Without that, a real
+        member is refused as a non-member. Both the roster's own casing and a
+        lowercased variant must resolve to the same id."""
+
+        def fake(path, **kw):
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": [{"username": "Bob"}]}
+
+        for spelling in ("Bob", "bob", "BOB"):
+            with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake) as m:
+                gitlab_client.set_issue_assignees("g", "p", 7, [spelling], host="gitlab.com")
+            body = [c.kwargs["body"] for c in m.call_args_list if c.kwargs.get("method") == "PUT"][
+                0
+            ]
+            self.assertEqual(body, {"assignee_ids": [22]}, spelling)
+
+    def test_non_member_is_refused_not_silently_dropped(self):
+        """GitLab does NOT validate assignee_ids the way GitHub validates logins: it
+        ignores an id it will not honour and answers 200. So an unresolvable
+        username must fail before the write -- otherwise the call reports success
+        for an assignment that never happened. It raises the same invalid-input
+        class GitHub's 422 maps to, so the route answers 400 on both providers."""
+
+        def fake(path, **kw):
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": []}
+
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake) as m:
+            with self.assertRaises(gitlab_client.ProviderInvalidInputError) as ctx:
+                gitlab_client.set_issue_assignees(
+                    "g", "p", 7, ["alice", "stranger"], host="gitlab.com"
+                )
+        self.assertIn("stranger", str(ctx.exception))
+        self.assertEqual(ctx.exception.values, ["stranger"])
+        # Refused BEFORE the write: no PUT was issued, so nothing changed.
+        self.assertEqual([c for c in m.call_args_list if c.kwargs.get("method") == "PUT"], [])
+
+    def test_clearing_skips_the_roster_read_and_sends_empty(self):
+        """Clearing needs no ids, so it must not pay a paginated roster fetch --
+        and it must still SEND the empty list, which is how GitLab unassigns."""
+        with mock.patch.object(gitlab_client, "_glab_api", return_value={"assignees": []}) as m:
+            out = gitlab_client.set_issue_assignees("g", "p", 7, [], host="gitlab.com")
+        self.assertEqual(len(m.call_args_list), 1)  # no members call
+        self.assertEqual(m.call_args.kwargs["body"], {"assignee_ids": []})
+        self.assertEqual(out, [])
+
+    def test_returns_what_stuck(self):
+        """GitLab Free keeps only the first of several assignees, so the result is
+        read from the response rather than echoed from the request."""
+
+        def fake(path, **kw):
+            if "members" in path:
+                return list(self.MEMBERS)
+            return {"assignees": [{"username": "alice"}]}
+
+        with mock.patch.object(gitlab_client, "_glab_api", side_effect=fake):
+            out = gitlab_client.set_issue_assignees(
+                "g", "p", 7, ["alice", "Bob"], host="gitlab.com"
+            )
+        self.assertEqual(out, ["alice"])
 
 
 class TestProviderDispatch(unittest.TestCase):
@@ -1011,70 +1166,150 @@ class TestProviderDispatch(unittest.TestCase):
 
 
 class TestClientParity(unittest.TestCase):
-    """Both client modules must expose the same surface.
+    """EVERY client module must expose the same surface.
 
     A module cannot be statically checked against ``provider.ProviderClient``, so
     this is the gate that makes the dispatch safe: if a route calls a function
-    that only GitHub implements, or the two disagree about argument order, it
-    fails here rather than at runtime for a GitLab user.
+    that only GitHub implements, or two clients disagree about argument order, it
+    fails here rather than at runtime for a GitLab or Azure DevOps user.
+
+    Parameterized over :data:`CLIENTS` rather than written pairwise: a fourth
+    provider is then one entry in that table instead of a fourth branch inside
+    every assertion -- which is what a pairwise gate silently invites, since
+    adding a client module without touching this class costs nothing and the gate
+    keeps passing while the new module is never checked at all.
     """
+
+    # Every provider client the dispatch can hand to a route, keyed by the
+    # ``provider`` value that selects it.
+    #
+    # GitHub is the REFERENCE rather than one peer among three: the routes,
+    # caches and React components were all written against its names and
+    # signatures, so a disagreement is always the OTHER client drifting. Comparing
+    # each module against GitHub (not pairwise against each other) also means a
+    # failure names the provider that drifted, instead of only reporting that the
+    # three no longer agree.
+    REFERENCE = "github"
+    CLIENTS = {
+        "github": github_client,
+        "gitlab": gitlab_client,
+        "azure": azure_client,
+    }
+
+    @property
+    def others(self) -> list[str]:
+        """Every client except the reference, in a stable order."""
+        return sorted(set(self.CLIENTS) - {self.REFERENCE})
+
+    def test_the_table_covers_every_registered_provider(self):
+        """A provider registered in ``provider.py`` must be gated here.
+
+        This is what keeps the parameterization honest. Without it, a fourth
+        provider could be added to ``provider.PROVIDERS`` and to the dispatch
+        while this class still compares only three modules -- and every assertion
+        below would keep passing, having never looked at the new client.
+        """
+        self.assertEqual(set(self.CLIENTS) | {provider.JIRA}, set(provider.PROVIDERS))
+        for name, module in self.CLIENTS.items():
+            with self.subTest(provider=name):
+                self.assertIs(provider.client_for(provider.RepoKey(provider=name)), module)
+        self.assertIs(provider.client_for(provider.RepoKey(provider=provider.JIRA)), jira_client)
 
     # Every function the routes reach through the dispatch.
     SURFACE = (
-        "verify_repo_access", "get_repo_permissions", "list_open_issues",
-        "list_open_issues_first_page", "list_closed_issues",
-        "list_recent_open_issues", "list_repo_labels", "list_repo_collaborators",
-        "derive_members", "get_current_login", "list_contributed_repos", "get_issue_detail",
-        "list_issue_timeline", "list_pr_timeline", "list_open_pulls",
-        "list_open_pulls_first_page", "list_closed_pulls",
-        "get_pr_detail", "list_pr_checks", "summarize_checks", "enrich_pulls",
-        "enrich_pulls_by_number", "enrichment_complete", "search_pulls", "add_issue_labels",
-        "remove_issue_label", "set_issue_state", "create_label", "probe_open_list",
-        "build_pr_search_query", "get_ref_summary",
+        "verify_repo_access",
+        "get_repo_permissions",
+        "list_open_issues",
+        "list_open_issues_first_page",
+        "list_closed_issues",
+        "list_recent_open_issues",
+        "list_repo_labels",
+        "list_repo_collaborators",
+        "derive_members",
+        "get_current_login",
+        "list_contributed_repos",
+        "get_issue_detail",
+        "list_issue_timeline",
+        "list_pr_timeline",
+        "list_open_pulls",
+        "list_open_pulls_first_page",
+        "list_closed_pulls",
+        "get_pr_detail",
+        "list_pr_checks",
+        "summarize_checks",
+        "enrich_pulls",
+        "enrich_pulls_by_number",
+        "enrichment_complete",
+        "search_pulls",
+        "add_issue_labels",
+        "remove_issue_label",
+        "set_issue_state",
+        "set_issue_assignees",
+        "create_label",
+        "probe_open_list",
+        "build_pr_search_query",
+        "get_ref_summary",
         # Pull-request actions.
-        "set_pr_state", "submit_pr_review", "add_issue_comment", "add_pr_comment",
-        "merge_pull_request", "enable_auto_merge", "disable_auto_merge",
+        "set_pr_state",
+        "submit_pr_review",
+        "add_issue_comment",
+        "add_pr_comment",
+        "merge_pull_request",
+        "enable_auto_merge",
+        "disable_auto_merge",
         "list_pr_workflow_runs",
-        "cancel_workflow_run", "rerun_workflow_run",
+        "cancel_workflow_run",
+        "rerun_workflow_run",
     )
 
-    def test_both_modules_implement_the_whole_surface(self):
+    def test_every_module_implements_the_whole_surface(self):
         for name in self.SURFACE:
-            with self.subTest(name=name):
-                self.assertTrue(callable(getattr(github_client, name, None)), f"github: {name}")
-                self.assertTrue(callable(getattr(gitlab_client, name, None)), f"gitlab: {name}")
+            for client, module in self.CLIENTS.items():
+                with self.subTest(name=name, provider=client):
+                    self.assertTrue(callable(getattr(module, name, None)), f"{client}: {name}")
+
+    @staticmethod
+    def _positional(module, name: str) -> list[str]:
+        return [
+            p.name
+            for p in inspect.signature(getattr(module, name)).parameters.values()
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
 
     def test_positional_parameters_agree(self):
         """The POSITIONAL parameters must match name-for-name and in order.
 
         Keyword-only parameters are allowed to differ -- that is exactly where
-        ``host`` lives for GitLab and where each client's own timeouts live -- but
-        a positional disagreement would mean a route silently passing the wrong
-        argument (e.g. an issue number where a SHA is expected).
+        ``host`` lives for GitLab and Azure DevOps, and where each client's own
+        timeouts live -- but a positional disagreement would mean a route silently
+        passing the wrong argument (e.g. an issue number where a SHA is expected).
         """
         for name in self.SURFACE:
-            with self.subTest(name=name):
-                gh_params = [
-                    p.name
-                    for p in inspect.signature(getattr(github_client, name)).parameters.values()
-                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                ]
-                gl_params = [
-                    p.name
-                    for p in inspect.signature(getattr(gitlab_client, name)).parameters.values()
-                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-                ]
-                self.assertEqual(gh_params, gl_params, f"{name} positional params differ")
+            reference = self._positional(self.CLIENTS[self.REFERENCE], name)
+            for client in self.others:
+                with self.subTest(name=name, provider=client):
+                    self.assertEqual(
+                        reference,
+                        self._positional(self.CLIENTS[client], name),
+                        f"{name}: {client} positional params differ from {self.REFERENCE}",
+                    )
 
     # Keyword-only parameters that are legitimately provider-local: the target
-    # host (GitLab needs it, GitHub is pinned to github.com) and each client's own
-    # timeout budget. EVERY other keyword-only parameter is caller-supplied and
-    # must match, because the routes pass the same kwargs to whichever client they
-    # hold.
+    # host (GitLab and Azure DevOps need it, GitHub is pinned to github.com) and
+    # each client's own timeout budget. EVERY other keyword-only parameter is
+    # caller-supplied and must match, because the routes pass the same kwargs to
+    # whichever client they hold.
     PROVIDER_LOCAL_KWARGS = frozenset({"host", "timeout"})
 
+    def _caller_kwargs(self, module, name: str) -> set[str]:
+        return {
+            p.name
+            for p in inspect.signature(getattr(module, name)).parameters.values()
+            if p.kind == p.KEYWORD_ONLY
+        } - self.PROVIDER_LOCAL_KWARGS
+
     def test_caller_supplied_keyword_arguments_agree(self):
-        """The kwargs a route passes must exist on BOTH clients.
+        """The kwargs a route passes must exist on EVERY client.
 
         Positional parity alone is not enough: if ``search_pulls`` is reached with
         ``assignee=`` / ``review_requested=`` / ``limit=`` that only the GitHub
@@ -1084,29 +1319,27 @@ class TestClientParity(unittest.TestCase):
         module cast), so it is caught here instead.
         """
         for name in self.SURFACE:
-            with self.subTest(name=name):
-                def kwargs(mod):
-                    return {
-                        p.name
-                        for p in inspect.signature(getattr(mod, name)).parameters.values()
-                        if p.kind == p.KEYWORD_ONLY
-                    } - self.PROVIDER_LOCAL_KWARGS
+            ref_kw = self._caller_kwargs(self.CLIENTS[self.REFERENCE], name)
+            for client in self.others:
+                with self.subTest(name=name, provider=client):
+                    other_kw = self._caller_kwargs(self.CLIENTS[client], name)
+                    self.assertEqual(
+                        ref_kw,
+                        other_kw,
+                        f"{name}: {self.REFERENCE}-only kwargs {sorted(ref_kw - other_kw)}, "
+                        f"{client}-only kwargs {sorted(other_kw - ref_kw)}",
+                    )
 
-                gh_kw, gl_kw = kwargs(github_client), kwargs(gitlab_client)
-                self.assertEqual(
-                    gh_kw,
-                    gl_kw,
-                    f"{name}: GitHub-only kwargs {sorted(gh_kw - gl_kw)}, "
-                    f"GitLab-only kwargs {sorted(gl_kw - gh_kw)}",
-                )
-
-    def test_both_raise_the_same_exception_classes(self):
+    def test_every_module_raises_the_same_exception_classes(self):
         # Aliases, not parallel hierarchies: otherwise routes.py's
-        # `except GhCliError` would miss every GitLab failure and return a 500.
-        self.assertIs(github_client.GhCliError, gitlab_client.GhCliError)
-        self.assertIs(github_client.GhSetupError, gitlab_client.GhSetupError)
-        self.assertIs(github_client.GhPermissionError, gitlab_client.GhPermissionError)
-        self.assertIs(github_client.RepoUrlError, gitlab_client.RepoUrlError)
+        # `except GhCliError` would miss every GitLab or Azure failure and return
+        # a 500 instead of the 502/403 the route intends.
+        reference = self.CLIENTS[self.REFERENCE]
+        for alias in ("GhCliError", "GhSetupError", "GhPermissionError", "RepoUrlError"):
+            expected = getattr(reference, alias)
+            for client in self.others:
+                with self.subTest(alias=alias, provider=client):
+                    self.assertIs(getattr(self.CLIENTS[client], alias, None), expected)
 
 
 class TestConnectParsesOffTheLoop(unittest.TestCase):
@@ -1138,9 +1371,14 @@ class TestRoutesScopeEveryStoreCall(unittest.TestCase):
         """
         source = Path(inspect.getfile(routes)).read_text(encoding="utf-8")
         allowed = {
-            "list_connected_repos", "set_repo_permissions", "remove_connected_repo",
-            "read_repo_settings", "write_repo_settings", "add_setting_label",
-            "add_connected_repo", "is_repo_connected",
+            "list_connected_repos",
+            "set_repo_permissions",
+            "remove_connected_repo",
+            "read_repo_settings",
+            "write_repo_settings",
+            "add_setting_label",
+            "add_connected_repo",
+            "is_repo_connected",
         }
         offenders = [
             name
@@ -1165,30 +1403,35 @@ class TestRefSummaryRoute(unittest.IsolatedAsyncioTestCase):
 
     async def test_returns_the_summary_for_a_connected_repo(self):
         summary = {"number": 5, "title": "t", "is_pr": False}
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(routes, "_scope", return_value=Path(tmp)), \
-                    mock.patch.object(routes, "_connected", return_value=True), \
-                    mock.patch.object(
-                        github_client, "get_ref_summary", return_value=summary
-                    ) as fetch:
-                response = await self._call("owner=acme&repo=widget&number=5")
-                # Second call is served from the cache the first one wrote, which
-                # is the read path that carried the crash.
-                cached = await self._call("owner=acme&repo=widget&number=5")
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(routes, "_scope", return_value=Path(tmp)),
+            mock.patch.object(routes, "_connected", return_value=True),
+            mock.patch.object(github_client, "get_ref_summary", return_value=summary) as fetch,
+        ):
+            response = await self._call("owner=acme&repo=widget&number=5")
+            # Second call is served from the cache the first one wrote, which
+            # is the read path that carried the crash.
+            cached = await self._call("owner=acme&repo=widget&number=5")
 
         self.assertEqual(response.status, 200)
         self.assertEqual(cached.status, 200)
-        self.assertIn(b'"from_cache": true', cached.body)
+        self.assertIn(
+            b'"from_cache": true',
+            cached.body if isinstance(cached.body, bytes) else b"",
+        )
         self.assertEqual(fetch.call_count, 1)
 
     async def test_gitlab_repo_is_dispatched_to_the_gitlab_client(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(routes, "_scope", return_value=Path(tmp)), \
-                    mock.patch.object(routes, "_connected", return_value=True), \
-                    mock.patch.object(github_client, "get_ref_summary") as gh, \
-                    mock.patch.object(
-                        gitlab_client, "get_ref_summary", return_value={"number": 5}
-                    ) as gl:
+            with (
+                mock.patch.object(routes, "_scope", return_value=Path(tmp)),
+                mock.patch.object(routes, "_connected", return_value=True),
+                mock.patch.object(github_client, "get_ref_summary") as gh,
+                mock.patch.object(
+                    gitlab_client, "get_ref_summary", return_value={"number": 5}
+                ) as gl,
+            ):
                 response = await self._call(
                     "owner=group&repo=project&number=5&provider=gitlab&host=gitlab.com"
                 )

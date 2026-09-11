@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from kiro_crew import pinned_fs
+
 from .errors import BenchRefusal
 
 
@@ -117,18 +119,11 @@ def guard_output_dir(path: str | Path, *, what: str) -> Path:
 def _supports_pinned_walk() -> bool:
     """Whether this platform can open relative to a directory descriptor.
 
-    ``O_NOFOLLOW`` is part of the requirement, not an extra: a pinned walk without it
-    would open each ancestor happily through whatever link sits there, which is the
-    hole being closed. Found by the Windows-simulation tests, which delete
-    ``os.O_NOFOLLOW`` and would otherwise have taken this path and crashed.
+    Delegates to :func:`kiro_crew.pinned_fs.supports_pinned_walk`. Kept as a
+    module-level function rather than an alias because the Windows-simulation tests
+    replace this attribute to exercise the fallback branch.
     """
-    import os
-
-    return (
-        hasattr(os, "O_DIRECTORY")
-        and hasattr(os, "O_NOFOLLOW")
-        and os.open in os.supports_dir_fd
-    )
+    return pinned_fs.supports_pinned_walk()
 
 
 def _open_in_pinned_parent(
@@ -136,111 +131,41 @@ def _open_in_pinned_parent(
 ) -> int:
     """Open *name* under *resolved_parent* with the parent chain pinned.
 
-    *name* is opened as given, so a link at the final name is refused by
-    ``O_NOFOLLOW`` in *flags*. See ``_pin_parent`` for what pinning buys.
+    Thin wrapper over :func:`kiro_crew.pinned_fs.open_in_pinned_parent` that keeps
+    this harness's refusal type. See that module for what pinning buys and why the
+    name is opened as given.
     """
-    import os
-
-    dir_fd = _pin_parent(resolved_parent, what=what)
-    try:
-        return os.open(name, flags, mode, dir_fd=dir_fd)
-    finally:
-        os.close(dir_fd)
+    return pinned_fs.open_in_pinned_parent(
+        resolved_parent,
+        name,
+        flags=flags,
+        mode=mode,
+        what=what,
+        refusal=UnsafePathError,
+    )
 
 
 def _pin_parent(resolved_parent: str, *, what: str) -> int:
     """Return a descriptor for *resolved_parent*, refusing a component that is now a link.
 
-    One ``openat`` per component, each relative to the previous component's descriptor
-    and each carrying ``O_NOFOLLOW``. Two properties come out of that:
-
-    * a component that became a symlink after *resolved_parent* was computed fails
-      ``O_NOFOLLOW`` and is refused -- this is the check-to-use swap, and it is the
-      reason a single ``os.open(parent, O_DIRECTORY)`` is not enough: that call follows
-      such a link silently and then pins its target;
-    * once a component is open, its descriptor cannot be re-pointed, so everything
-      already traversed is fixed.
-
-    *resolved_parent* must be resolved by the CALLER, once, before this runs. Resolving
-    it here would re-follow whatever an ancestor points at by now, which is the exact
-    mistake that made an earlier version of this defensible-looking and useless.
-
-    The descriptor is returned OPEN and the caller must close it. Handing it back
-    rather than doing one open inside is what lets a durable write create its
-    temporary file and rename it over the destination through the same pinned
-    directory, so the swap cannot be redirected between the two steps.
-
-    Not closed: a component swapped before *resolved_parent* was computed is followed
-    by that resolution. Refusing every symlinked ancestor would close it and would also
-    break ``--out-dir /tmp/...`` on macOS, where ``/tmp`` is itself a link.
+    Thin wrapper over :func:`kiro_crew.pinned_fs.pin_parent`, which owns the
+    invariants: one ``openat`` per component with ``O_NOFOLLOW``, *resolved_parent*
+    resolved by the caller exactly once, and the descriptor handed back OPEN so a
+    create-then-rename publishes through the same pinned directory.
     """
-    import errno
-    import os
-    from pathlib import PurePath
-
-    parts = PurePath(resolved_parent).parts
-    if not parts:  # pragma: no cover - a resolved path always has parts
-        raise UnsafePathError(f"refusing to open the {what}: empty parent path")
-
-    if os.path.isabs(resolved_parent):
-        dir_fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
-        rest = parts[1:]
-    else:  # pragma: no cover - realpath returns absolute paths
-        dir_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
-        rest = parts
-
-    try:
-        for component in rest:
-            try:
-                nxt = os.open(
-                    component,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=dir_fd,
-                )
-            except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise UnsafePathError(
-                        f"refusing to write the {what}: the directory {component!r} on "
-                        "the way to it became a symbolic link after the path was "
-                        "checked. A parent swapped for a link redirects the write "
-                        "however carefully the final name is opened, so it is refused."
-                    ) from exc
-                raise
-            os.close(dir_fd)
-            dir_fd = nxt
-    except BaseException:
-        os.close(dir_fd)
-        raise
-    return dir_fd
+    return pinned_fs.pin_parent(resolved_parent, what=what, refusal=UnsafePathError)
 
 
 def _refuse_hardlink_alias(fd: int, *, what: str, name: str) -> None:
     """Reject a descriptor that is one of several names for the same inode.
 
-    A hardlink is invisible to every path-based guard: it shares the target's inode,
-    so ``realpath`` yields the alias's own name, ``is_symlink()`` is False, and
-    ``O_NOFOLLOW`` has no link to refuse. A planted alias therefore let an O_TRUNC
-    write destroy a protected file, and let a read hand back its bytes.
-
-    Checked on the DESCRIPTOR rather than the path, which is what makes it
-    race-free: this fd already refers to the inode being judged.
-
-    The cost is honest and small: a corpus file that legitimately has more than one
-    link -- a dedup-ing backup tool, a deliberate alias -- is refused. Copy it or
-    point the cache elsewhere.
+    Thin wrapper over :func:`kiro_crew.pinned_fs.refuse_hardlink_alias`, which owns
+    the reasoning: a hardlink is invisible to every path-based guard, so it is judged
+    on the DESCRIPTOR, which is what makes the check race-free. The descriptor is
+    closed before the refusal is raised, so a caller's ``except BaseException:
+    os.close(fd)`` must not run for it.
     """
-    import os
-
-    links = os.fstat(fd).st_nlink
-    if links > 1:
-        os.close(fd)
-        raise UnsafePathError(
-            f"refusing to use the {what}: {name!r} has {links} hard links, so it is "
-            "another name for a file this command was not pointed at. A path guard "
-            "cannot see that -- the alias shares the target's inode -- so it is "
-            "refused on the open descriptor instead. Remove the extra link or use a "
-            "different path."
-        )
+    pinned_fs.refuse_hardlink_alias(fd, what=what, name=name, refusal=UnsafePathError)
 
 
 def open_write_nofollow(path: str | Path, *, what: str) -> int:
@@ -454,9 +379,7 @@ def write_text_atomic_nofollow(path: str | Path, text: str, *, what: str) -> Non
                     raise
                 # Both ends relative to the pinned directory, so the destination
                 # cannot be redirected between the check above and this swap.
-                os.replace(
-                    tmp_name, as_given.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd
-                )
+                os.replace(tmp_name, as_given.name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
                 _sync_dir(dir_fd)
             finally:
                 os.close(dir_fd)
@@ -558,20 +481,11 @@ def _revalidate_unpinned(as_given: Path, *, what: str) -> None:
 def _is_reparse_point(path: Path) -> bool:
     """True for a symlink or a Windows junction.
 
-    ``os.path.islink`` is False for a junction -- it is a reparse point but not a
-    symlink -- so the tag is checked as well. Comparing ``realpath`` against
-    ``abspath`` would be simpler and wrong: on Windows a temp directory is handed back
-    as an 8.3 short path, which differs from its resolved form with nothing linked
-    anywhere.
+    Thin wrapper over :func:`kiro_crew.pinned_fs.is_reparse_point`, which explains
+    why the reparse tag is checked as well as ``islink`` and why comparing
+    ``realpath`` against ``abspath`` would be wrong on Windows.
     """
-    import os
-
-    if os.path.islink(path):
-        return True
-    try:
-        return bool(getattr(os.lstat(path), "st_reparse_tag", 0))
-    except OSError:  # pragma: no cover - a component that vanished mid-walk
-        return False
+    return pinned_fs.is_reparse_point(path)
 
 
 def _pin_parent_for(as_given: Path, *, what: str) -> int:
@@ -649,40 +563,125 @@ def _sync_dir(dir_fd: int) -> None:
         pass
 
 
-def read_text_nofollow(path: str | Path, *, what: str) -> str:
-    """Read *path* as UTF-8, guarded, refusing to follow a final symlink.
+def read_text_nofollow(path: str | Path, *, what: str, max_bytes: int | None = None) -> str:
+    """Read one regular file as UTF-8 through a single validated descriptor.
 
-    Does what ``hooks.safe_read_file`` does -- canonicalize, re-check the RESOLVED
-    target against ``is_sensitive_path``, open the canonical path with ``O_NOFOLLOW``
-    -- and adds a hardlink rejection on the open descriptor.
+    The path is guarded, resolved and opened once. All properties that must match
+    the bytes returned -- hardlink count, file type and size -- are then checked on
+    that SAME descriptor with ``fstat``. This closes the check/open race that exists
+    when a caller ``stat``s a path and later asks this helper to open it.
 
-    Inlined rather than delegated for exactly that last part: a hardlink alias is only
-    recognisable from the fd (``st_nlink``), and a helper that returns text has
-    already read the bytes by the time it could be judged. ``hooks.safe_read_file``
-    is used repo-wide, so the check lives here instead of widening its contract.
+    Non-regular files are always refused. ``O_NONBLOCK`` keeps opening a FIFO from
+    hanging before the descriptor can be classified; it is inert for regular files.
+    When ``max_bytes`` is set, the helper checks the descriptor's current size AND
+    reads at most ``max_bytes + 1``. The second check is load-bearing: a regular file
+    can grow after ``fstat``, and trusting only ``st_size`` would recreate an
+    unbounded-read window.
+
+    Opening the resolved path (not the path as given) preserves the documented read
+    asymmetry: a symlink to an ordinary file remains readable. ``O_NOFOLLOW`` still
+    protects the resolved name's final component from a last-moment replacement.
     """
     import os
+    import stat
 
     from kiro_crew.security import is_sensitive_path
 
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+
     guard_read_path(path, what=what)
-    # Mirrors `safe_read_file` -- resolve, re-check the RESOLVED target, open the
-    # canonical path with O_NOFOLLOW -- and adds the hardlink rejection, which has to
-    # happen on the descriptor and therefore cannot be delegated to a helper that
-    # returns text. Opening the resolved path (not the path as given) is deliberate:
-    # a link to an ordinary file stays readable, which is the documented read/write
-    # asymmetry.
     try:
         resolved = os.path.realpath(os.path.expanduser(str(path)))
         if is_sensitive_path(resolved):
             raise UnsafePathError(
-                f"refusing to read the {what}: {resolved} is a protected location."
+                f"refusing to read the {what}: {resolved!r} is a protected location."
             )
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        target = Path(resolved)
+        if _supports_pinned_walk():
+            # Re-resolve/re-check the parent immediately before pinning it. A
+            # replacement after the check is then reached component-by-component
+            # with O_NOFOLLOW, and the basename is opened relative to that held fd.
+            resolved_parent = os.path.realpath(target.parent or Path("."))
+            pinned_target = Path(resolved_parent) / target.name
+            guard_read_path(pinned_target, what=what)
+            fd = _open_in_pinned_parent(
+                resolved_parent,
+                target.name,
+                flags=flags,
+                mode=0,
+                what=what,
+            )
+            resolved = str(pinned_target)
+        else:
+            # Windows has no dir_fd walk. Open once, then ask the HANDLE what it
+            # actually reached (GetFinalPathNameByHandleW there). This is an
+            # equivalent descriptor-bound attestation; inability to attest fails
+            # closed rather than trusting a raceable path name.
+            current = os.path.realpath(resolved)
+            guard_read_path(current, what=what)
+            fd = os.open(current, flags)
+            opened_path = pinned_fs.fd_real_path(fd)
+            if opened_path is None:
+                os.close(fd)
+                raise UnsafePathError(
+                    f"refusing to read the {what}: this platform cannot verify "
+                    "the path reached by the opened file descriptor."
+                )
+            opened_real = os.path.realpath(opened_path)
+            if os.path.normcase(opened_real) != os.path.normcase(current):
+                os.close(fd)
+                raise UnsafePathError(
+                    f"refusing to read the {what}: the opened file resolved to a "
+                    "different path than the one that passed validation."
+                )
+            if is_sensitive_path(opened_real):
+                os.close(fd)
+                raise UnsafePathError(
+                    f"refusing to read the {what}: the opened file is in a protected location."
+                )
+            resolved = opened_real
     except UnsafePathError:
         raise
     except OSError as exc:
-        raise UnsafePathError(f"refusing to read the {what}: {exc}") from exc
-    _refuse_hardlink_alias(fd, what=what, name=os.path.basename(resolved))
-    with os.fdopen(fd, "r", encoding="utf-8") as fh:
-        return fh.read()
+        raise UnsafePathError(f"refusing to read the {what}: {exc!r}") from exc
+
+    try:
+        _refuse_hardlink_alias(fd, what=what, name=os.path.basename(resolved))
+    except UnsafePathError:
+        raise  # the helper closed the descriptor before raising
+    except BaseException:
+        os.close(fd)
+        raise
+
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise UnsafePathError(
+                f"refusing to read the {what}: {resolved!r} is not a regular file."
+            )
+        if max_bytes is not None and opened.st_size > max_bytes:
+            raise UnsafePathError(
+                f"refusing to read the {what}: file is too large "
+                f"({opened.st_size} bytes exceeds the {max_bytes}-byte limit)."
+            )
+
+        # Transfer descriptor ownership to the file object before reading; it closes
+        # the fd on success and on decode/read failure. Keep ``fd`` negative so the
+        # outer exception path does not double-close it.
+        fh = os.fdopen(fd, "rb")
+        fd = -1
+        with fh:
+            data = fh.read() if max_bytes is None else fh.read(max_bytes + 1)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        raise
+
+    if max_bytes is not None and len(data) > max_bytes:
+        raise UnsafePathError(
+            f"refusing to read the {what}: content is too large; it exceeds "
+            f"the {max_bytes}-byte limit."
+        )
+    return data.decode("utf-8")

@@ -39,10 +39,12 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         index,
         mounted: true,
         data,
+      farmIsMeasured: () => true,
+      farmRecord: () => true,
       })),
       isAtBottom: true,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
@@ -156,6 +158,8 @@ const pending = { type: 'chat/loadOlder/pending', meta: { arg: 'chat-1', request
 // The real producer of a has-more cursor: its reducer runs setPagingCursor, which
 // writes has-more, the offset and the cursor key as one unit.
 const olderPageLanded = { type: 'chat/loadOlder/fulfilled', payload: { slot: 'chat-1', nextBefore: 20, messages: [], hasMore: true, total: 50 }, meta: { requestId: 'r2', requestStatus: 'fulfilled' } }
+// The last page: has-more false, which is what removes the bar's mount condition.
+const finalPageLanded = { type: 'chat/loadOlder/fulfilled', payload: { slot: 'chat-1', nextBefore: 0, messages: [], hasMore: false, total: 50 }, meta: { requestId: 'r3', requestStatus: 'fulfilled' } }
 const sameKeySwitchPending = { type: 'chat/switchSlot/pending', meta: { arg: 'chat-1', requestId: 's1', requestStatus: 'pending' } }
 const rejected = { type: 'chat/loadOlder/rejected', meta: { arg: 'chat-1', requestId: 'r1', requestStatus: 'rejected' }, error: { message: 'offline' } }
 
@@ -196,10 +200,18 @@ describe('ChatPage – older-messages loading indicator', () => {
     expect(el.style.overflowAnchor).toBe('none')
     // Pinned, not parked at the list top: the only trigger fires from the pins
     // panel, so an unpinned indicator renders off-screen in a long session.
-    expect(el.className).toContain('sticky')
+    // ABSOLUTE overlay with zero layout footprint: a sticky element still
+    // owned flow space, so each loadingOlder flip inserted/removed ~32px
+    // above the content -- a per-landing twitch for a reader parked at the
+    // top (measured on the momentum rig).
+    expect(el.className).toContain('absolute')
+    expect(el.className).not.toContain('sticky')
     expect(el.className).toContain('top-16')
-    // Opaque, or the messages scrolling beneath it show through.
-    expect(el.style.background).not.toBe('')
+    // The container is a transparent zero-footprint overlay; opacity lives
+    // on the BADGE child, or the messages scrolling beneath show through.
+    const badge = el.querySelector('span') as HTMLElement
+    expect(badge).not.toBeNull()
+    expect(badge.style.background).not.toBe('')
   })
 
   it('clears when the older page fails, so it cannot spin forever', async () => {
@@ -244,5 +256,27 @@ describe('ChatPage – older-messages loading indicator', () => {
     expect(store.getState().chat.slotHasMore).toBe(true)
     expect(store.getState().chat.slotCursorKey).toBeNull()
     expect(store.getState().chat.activeSlot).toBe('chat-1')
+  })
+
+  it('hands focus to the transcript when the final page unmounts the bar', async () => {
+    const store = renderChatPage()
+    const scroller = await seed(store)
+    act(() => { store.dispatch(olderPageLanded) })
+    const bar = await screen.findByTestId(BAR)
+    bar.focus()
+    expect(document.activeElement).toBe(bar)
+
+    act(() => { store.dispatch(finalPageLanded) })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId(BAR)).toBeNull()
+    })
+    // Without the hand-off this is <body> -- the stranding the bar's own
+    // aria-disabled choice exists to avoid.
+    expect(document.activeElement).toBe(scroller)
+    // Asserted directly because jsdom's focus() ignores focusability: a real browser
+    // needs the attribute, and the line above passes with or without it.
+    expect(scroller).toHaveAttribute('tabindex', '-1')
+    expect(store.getState().chat.slotHasMore).toBe(false)
   })
 })

@@ -14,18 +14,35 @@ degrades to a numbered text list the user can answer by typing. The cap is
 ENFORCED (see ``test/test_capability_ledger.py``) and pinned per channel by
 the cross-channel contract test in ``test/test_options_cap_contract.py`` —
 a widget-capable renderer that skips the helper fails that test.
-Channels declaring ``max_buttons=0`` render no widget and today strip the
-trailer entirely; the numbered-text fallback for them lands with the
-approval-ladder work.
+Channels declaring ``max_buttons=0`` render no widget and route the whole
+trailer through :func:`render_options_as_text`, which reaches the same helper
+with zero widget slots: every choice becomes a numbered line the user answers by
+typing, rather than being deleted along with the trailer.
+
+Webex is the widget channel that ALSO always ships the numbered text: it declares
+Adaptive Card actions, but the inbound half of a press rides an undocumented
+websocket, so the typed form has to stay answerable on its own. It reaches
+:func:`apply_options_cap` directly — the widget-channel path, which returns the
+kept choices for the card as well as the body — rather than
+:func:`render_options_as_text`, which keeps only the body.
 """
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
+from kiro_crew.constants import (
+    MARKER_CLOSERS,
+    OPTIONS_RE_TRAILER,
+    _leading_wrapper_start,
+    strip_control_comments,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew.messaging.tables import render_tables, render_tables_with_metadata
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -50,11 +67,20 @@ class OutputEvent:
     kind: str
     text: str = ""  # text_chunk / thinking
     tool_call_id: str = ""  # tool_call
-    title: str = ""  # tool_call (tool name / "Running: X")
+    # ``title``/``tool_purpose`` describe a tool on BOTH kinds that carry one:
+    # tool_call announces it, prompt_choice asks permission for it. Carrying them
+    # on the prompt is what lets a renderer name the tool the request is actually
+    # about instead of the last one it happened to see.
+    title: str = ""  # tool_call / prompt_choice (tool name / "Running: X")
     tool_kind: str = ""  # tool_call (e.g. "read"/"execute" — drives phase emoji)
-    tool_purpose: str = ""  # tool_call (human-readable purpose -> task title)
+    tool_purpose: str = ""  # tool_call / prompt_choice (human-readable purpose)
     options: list[dict[str, Any]] = field(default_factory=list)  # prompt_choice
     request_id: str | int = ""  # prompt_choice correlation
+    # prompt_choice: the tool's own arguments, redacted, so a renderer can show
+    # WHAT is being approved rather than only its name. "" when the provider
+    # supplied none, which a renderer must treat as "no detail available" —
+    # never as "no arguments".
+    tool_input: str = ""
     context_usage_pct: float = 0.0  # compaction
     stop_reason: str = ""  # done
 
@@ -67,6 +93,7 @@ class OutputEvent:
             "tool_kind": self.tool_kind,
             "tool_purpose": self.tool_purpose,
             "options": [dict(o) for o in self.options],
+            "tool_input": self.tool_input,
             "request_id": self.request_id,
             "context_usage_pct": self.context_usage_pct,
             "stop_reason": self.stop_reason,
@@ -87,15 +114,53 @@ def chunk_text(text: str, max_chars: int) -> list[str]:
     return [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
 
 
+def chunk_for_transport(text: str, capabilities: TransportCapabilities) -> list[str]:
+    """Split *text* into parts the transport will accept, in ITS unit.
+
+    Prefers ``max_message_bytes`` when the platform declares one, because a
+    character count cannot express a byte cap without being wrong in one
+    direction or the other: the only safe char value is the byte budget over four
+    (the worst case for a 4-byte code point), which cuts an ASCII reply into
+    quarters, while the true char cap would let a CJK reply exceed the byte limit
+    and be truncated on send.
+
+    BOTH paths are fence-aware: the byte path via
+    :func:`~kiro_crew.messaging.split.split_markdown_bytes`, the char path via
+    :func:`~kiro_crew.messaging.split.split_markdown_safe`. A blind fixed-width
+    slice through a code block leaves the second chunk with no opener, so every
+    line in it renders as prose and a channel's markdown-dialect converter
+    rewrites the ``**``/``#``/``- `` INSIDE the code -- and a sub-agent diff or
+    cron log dump is exactly that shape. Callers that want a raw fixed-width cut
+    reach for :func:`chunk_text` directly.
+    """
+    # Local imports: split.py is a heavier pure-Python module and only these
+    # paths need it, so the renderer contract stays cheap to import.
+    #
+    # ``getattr`` with the field's own ``0`` default, not attribute access: the
+    # real ``TransportCapabilities`` always carries ``max_message_bytes``, but a
+    # capabilities-shaped object from before the field existed must degrade to the
+    # char path (``0`` = "no byte cap") rather than raising -- the same honest
+    # default the dataclass declares.
+    max_bytes = getattr(capabilities, "max_message_bytes", 0)
+    if max_bytes > 0:
+        from kiro_crew.messaging.split import split_markdown_bytes
+
+        return split_markdown_bytes(text, max_bytes)
+    from kiro_crew.messaging.split import split_markdown_safe
+
+    return split_markdown_safe(text, capabilities.max_message_chars)
+
+
 def cap_choices(
     choices: list[str], capabilities: TransportCapabilities
 ) -> tuple[list[str], list[str]]:
     """Split a parsed ``[OPTIONS:]`` list at ``capabilities.max_buttons``.
 
-    Returns ``(kept, overflow)``. ``max_buttons <= 0`` keeps nothing (the
-    zero-widget channels own their trailer handling). Pure — callers that
-    must transform choices before display (Slack redacts at the sink) split
-    here and format overflow themselves via :func:`format_overflow`.
+    Returns ``(kept, overflow)``. ``max_buttons <= 0`` keeps nothing and
+    overflows everything, which is what makes a zero-widget channel the
+    all-overflow case rather than a special case. Pure — callers that must
+    transform choices before display (Slack redacts at the sink) split here and
+    format overflow themselves via :func:`format_overflow`.
     """
     n = capabilities.max_buttons
     if n <= 0:
@@ -103,12 +168,73 @@ def cap_choices(
     return choices[:n], choices[n:]
 
 
+def display_safe_for(text: str, capabilities: TransportCapabilities) -> str:
+    """:func:`display_safe`, with the mention defang applied only where it belongs.
+
+    The channel-NEUTRAL proactive sinks (the dashboard's channel-addressed send and
+    the owner-DM leg) render untrusted text into a message body on whichever
+    transport they were handed, so they need the display-form credential redaction
+    unconditionally -- and the broadcast-mention defang only on a platform that
+    actually parses one.
+
+    Webex is why this is a capability rather than a constant: it has no broadcast
+    grammar AND its allow-list IS email addresses, so defanging inserts a
+    zero-width space after every ``@`` and every address the agent prints becomes
+    uncopyable. Its own renderer already avoids that (``webex_display_safe``); the
+    neutral sinks read the declaration instead of importing a channel symbol,
+    which is what keeps them neutral.
+
+    Control-tag comments are stripped first, same as :func:`display_safe` —
+    the deterministic backstop against a dashboard-authored control tag
+    reaching channel users as literal text (#7948).
+    """
+    text = strip_control_comments(text or "")
+    safe, _ = redact_for_display(text, _default_redactor)
+    if not capabilities.mention_grammars:
+        return safe
+    return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
+
+
+def session_provenance_tag(session_key: str) -> str:
+    """A short, stable, non-reversible tag for the session that posted a widget.
+
+    Option buttons can outlive the conversation that rendered them. The tag lets
+    a dispatcher compare the posting session with the conversation's current
+    target before model-authored choice text enters a turn. A digest keeps the
+    internal key out of client-visible callback data; it is deterministic so the
+    check survives a gateway restart. This is an equality gate, not an authority
+    token: forging it grants no capability beyond typing the same text.
+    """
+    if not session_key:
+        return ""
+    return hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:12]
+
+
+def new_approval_nonce() -> str:
+    """A per-prompt token that makes a STALE widget's press unusable.
+
+    Shared because the hazard is: ACP request ids restart at 1 in every provider
+    process, so an approve/deny control still sitting in a chat from a previous run
+    names a request id that is live again for a DIFFERENT tool. Every channel with a
+    clickable approval has to mint one, compare it on resolve, and retire it with the
+    prompt -- and three independent copies of that is how one of them ends up with a
+    weaker token or none at all. The session picker (``PickerRegistry.mint``) mints
+    from here too: a press on a stale list of sessions is the same hazard wearing a
+    different label, so it is not a reason for a second generator.
+
+    ``token_urlsafe(8)`` is ~11 chars of 64 bits, which fits inside Telegram's
+    64-BYTE ``callback_data`` cap alongside the request id and the decision.
+    """
+    return secrets.token_urlsafe(8)
+
+
 def _default_redactor(text: str) -> str:
     """The same pair ``TurnDriver`` streams provider text through.
 
     Module scope on purpose: ``security`` is a pure-regex module with no vendor
-    dependencies, and ``messaging.driver`` already imports it from here, so this
-    adds no import-time cost and nothing that could touch an event loop.
+    dependencies -- the same module ``messaging.driver`` imports directly for its
+    own stream redaction -- so this adds no import-time cost and nothing that
+    could touch an event loop.
     """
     out, _ = redact_exfiltration_urls(text or "")
     out, _ = redact_credentials(out)
@@ -132,12 +258,72 @@ def display_safe(text: str) -> str:
     The defang covers both mention grammars because the callers are
     channel-neutral: ``@`` for Discord/Telegram users and ``@everyone``, ``<!``
     for Slack's ``<!channel>``.
+
+    Control-tag comments are stripped first (fence/inline-code aware): channel
+    formatters render HTML comments literally, so a dashboard-authored
+    ``<!-- keep-visible -->`` (#7948) or ``deliver:``/``plan_task_id:`` tag
+    delivered to a channel would otherwise reach end users as visible text.
+    The prompt rule only contains the emitter; this is the deterministic
+    backstop on the message itself.
     """
-    safe, _ = redact_for_display(text or "", _default_redactor)
+    text = strip_control_comments(text or "")
+    safe, _ = redact_for_display(text, _default_redactor)
     return safe.replace("@", "@\u200b").replace("<!", "<\u200b!")
 
 
-def format_overflow(overflow: list[str], start: int) -> str:
+def credential_redaction_notice(count: int) -> str:
+    """The notice a channel sends after delivering text redaction rewrote.
+
+    Lives beside :func:`display_safe` because it is the other half of the same
+    outbound contract: that function guarantees the credential does not reach the
+    channel, and this one tells the reader it happened. Shared across channels so
+    one sentence cannot drift into per-channel spellings that each have to be
+    reviewed for leaked bytes.
+
+    ``count`` is the number of redaction placeholders standing in the text that
+    actually shipped, so the wording matches what the reader can see above the
+    notice. It carries NO secret bytes: by the time it is built a tag has already
+    replaced them, and only the count is used.
+
+    Says "a redaction placeholder" rather than naming a specific tag, because the
+    redactor emits more than one (``security.CREDENTIAL_REDACTION_TAGS``) and
+    naming one would print a marker the reader cannot find whenever the
+    substitution came from a different pass.
+
+    Plain text with no markup and no emoji, so one string is correct on every
+    channel: Slack renders mrkdwn, iMessage renders nothing. "The message above"
+    holds for both, because every caller sends this as its own message BELOW the
+    answer rather than appending to it.
+
+    The second sentence is deliberately blunt: a redacted command is not a working
+    command. Saying only "a credential was removed" still leaves the reader
+    pasting text that cannot run, which is the reported failure -- an opaque
+    downstream error far from the real cause.
+    """
+    subject = "A credential" if count == 1 else f"{count} credentials"
+    verb = "was" if count == 1 else "were"
+    return (
+        f"Security notice: {subject} in the message above {verb} replaced with a "
+        "redaction placeholder. Any command shown will not work if you paste it "
+        "as-is; supply the secret yourself on the machine where you run it."
+    )
+
+
+def _choice_display_safe(text: str, capabilities: TransportCapabilities | None) -> str:
+    """The choice-label display sink, target-aware when the target is known.
+
+    ``None`` means "no declaration to consult", which defangs unconditionally --
+    the conservative direction, because a needless defang mangles text cosmetically
+    while a missing one lets a prompt-injected ``@everyone`` mass-notify.
+    """
+    if capabilities is None:
+        return display_safe(text)
+    return display_safe_for(text, capabilities)
+
+
+def format_overflow(
+    overflow: list[str], start: int, capabilities: TransportCapabilities | None = None
+) -> str:
     """Number overflow choices continuing after ``start`` widget slots.
 
     Widget + text form ONE list: ``start=3`` yields ``4. …``. The user
@@ -163,8 +349,17 @@ def format_overflow(overflow: list[str], start: int) -> str:
       breaks discord/telegram @-mentions and slack ``<@U…>``; ``<\\u200b!``
       breaks slack broadcast ranges (``<!channel>``, ``<!here>``,
       ``<!everyone>``).
+
+    *capabilities* makes the mention half target-aware. Omitting it defangs
+    unconditionally, which is the safe direction and what the three callers that
+    render onto one known channel already rely on; a caller holding the target's
+    declaration passes it so a platform with no broadcast grammar is not defanged
+    into unusable text (see :func:`display_safe_for`). The credential half is
+    unconditional either way -- no capability turns it off.
     """
-    return "\n".join(f"{start + i + 1}. {display_safe(c)}" for i, c in enumerate(overflow))
+    return "\n".join(
+        f"{start + i + 1}. {_choice_display_safe(c, capabilities)}" for i, c in enumerate(overflow)
+    )
 
 
 def apply_options_cap(
@@ -177,22 +372,41 @@ def apply_options_cap(
     widget, so the cap lives in shared code and the per-channel contract
     test can pin it.
 
-    Returns ``(body, kept_choices)``:
+    Returns ``(body, kept_choices)``: the first ``max_buttons`` choices are kept
+    for the widget and the remainder is appended to ``body`` as a numbered text
+    list, numbering continued after the widget slots, rather than dropped — so
+    the user still learns those choices exist. A list that fits leaves ``body``
+    byte-identical; the kept choices are still redacted (see below).
 
-    * ``len(choices) <= max_buttons`` — byte-identical pass-through.
-    * overflow — the first ``max_buttons`` choices are kept for the widget;
-      the remainder is appended to ``body`` as a numbered text list
-      (numbering continues after the widget slots) rather than dropped, so
-      the user still learns those choices exist.
-    * ``max_buttons <= 0`` — returns ``(body, [])``; zero-widget channels
-      own their trailer handling (today: strip).
+    ``max_buttons <= 0`` needs no branch of its own: :func:`cap_choices` keeps
+    nothing and overflows everything, so a button-less channel is the
+    all-overflow case and every choice becomes a numbered line through the same
+    sanitising sink. Dropping the list there would delete the answers to a
+    question the agent just asked and leave the user no way to see what was
+    offered.
+
+    **The KEPT choices are redacted, not just the overflow.** A choice label is
+    LLM-authored text rendered into a channel, exactly like the overflow list, so
+    redacting only the overflow half would leave a markup-split credential intact
+    on the button -- and again in the press echo, which quotes the label back. On a
+    forum Topic that is every allow-listed participant. Slack redacts at this same
+    point (``slack/format.py``'s ``_redact_choices``); doing it here covers every
+    widget channel at once rather than per renderer, so a channel added later
+    cannot miss it.
+
+    Both halves go through :func:`display_safe_for` rather than :func:`display_safe`,
+    so the mention defang honours ``capabilities.mention_grammars`` -- which this
+    function already holds. Redaction is unconditional; only the defang is target
+    aware. Webex is the case that makes the difference visible: it parses no
+    broadcast grammar and its allow-list IS email addresses, so defanging its
+    Adaptive Card labels and numbered fallback would render every address the agent
+    offers uncopyable, which is the cost the capability exists to avoid.
     """
-    if capabilities.max_buttons <= 0:
-        return body, []
     kept, overflow = cap_choices(choices, capabilities)
+    kept = [display_safe_for(c, capabilities) for c in kept]
     if not overflow:
         return body, kept
-    lines = format_overflow(overflow, start=len(kept))
+    lines = format_overflow(overflow, start=len(kept), capabilities=capabilities)
     if not body:
         sep = ""
     elif body.endswith("\n"):
@@ -202,6 +416,131 @@ def apply_options_cap(
     return f"{body}{sep}{lines}", kept
 
 
+def split_options_trailer(text: str, *, hide_partial: bool = False) -> tuple[str, list[str]]:
+    """Split a trailing ``[OPTIONS:]`` marker off *text* into ``(body, choices)``.
+
+    The ONE parse of that marker. Widget-capable renderers need both halves and
+    :func:`render_options_as_text` returns only the body, so both reach the marker
+    through here rather than every caller repeating the same steps: search the
+    shared trailer regex, ``rstrip`` the body, split the group on ``|``, drop the
+    blanks, and decide what to do with an unfinished marker. A parse duplicated per
+    channel is a parse that drifts per channel, silently, because each copy looks
+    right in isolation.
+
+    Only a COMPLETE, end-anchored marker yields choices, and both halves of that
+    matter:
+
+    * A quoted ``[OPTIONS:`` mid-answer cannot swallow the body between it and
+      some later ``]`` -- the end-of-buffer anchor is what prevents that.
+    * An unfinished ``[OPTIONS`` tail is not a marker yet, so what to do with it
+      is the CALLER's question, which is why it is a parameter rather than a
+      policy baked in here.
+
+    *hide_partial* is that question, and the channels genuinely answer it
+    differently:
+
+    * ``True`` -- a STREAMING surface (Discord, Telegram, Teams, WeCom, and Webex's
+      status frame). The text is still arriving, so a partial marker really may be
+      a marker mid-flight, and showing reserved protocol as raw text is the cost
+      being avoided. Safe there precisely because the frame is transient: the next
+      frame, or the sealed answer, re-renders from the full buffer. Held back is
+      only a tail that can still BECOME the trailer -- ``[OPTIONS`` as the final
+      bytes, or ``[OPTIONS:`` with its content still open. A tail where any other
+      byte follows ``[OPTIONS`` is grammar-dead (the trailer opens ``[OPTIONS:``),
+      so it is quoted prose and is kept even here: cutting it would be the
+      permanent loss described below, wearing a streaming excuse.
+    * ``False`` -- a BUFFERED surface that sends once (Slack's extraction, Webex's
+      final answer, and this module's own zero-widget path). Such a caller cannot
+      tell a live fragment from the assistant's prose, and cutting prose is
+      PERMANENT data loss: a reply ending ``see the [OPTIONS section`` must keep
+      its last four words.
+
+    The default is ``False`` because the two failure directions are not
+    symmetric -- a needless keep flashes reserved markup for one frame, a needless
+    cut deletes text nobody can recover -- so a caller that forgets degrades
+    toward the cosmetic failure. Every streaming caller states ``True``
+    explicitly, which is also what makes the data-loss choice greppable.
+
+    Stripping a genuine steering frame is ``TurnDriver``'s job and happens before
+    a renderer sees the text.
+    """
+    match = OPTIONS_RE_TRAILER.search(text)
+    if match:
+        choices = [c.strip() for c in match.group("labels").split("|") if c.strip()]
+        return text[: match.start()].rstrip(), choices
+    if hide_partial:
+        idx = text.rfind("[OPTIONS")
+        # "Holds no CLOSER at all", over the whole ``MARKER_CLOSERS`` set rather
+        # than ASCII ``]`` alone. A tail that already holds a closer is not in
+        # flight: either it reads as a marker, in which case the search above
+        # took it, or the grammar declined it and it is PROSE -- which is the
+        # rule ``test_hide_partial_does_not_touch_a_closed_bracket_elsewhere``
+        # already pins for ASCII. Spelling it ASCII-only made that rule miss a
+        # marker whose only closers are lookalikes (``[OPTIONS: 【重要】修复 |
+        # 跳过】``), and the cut there is the permanent kind described below:
+        # WeCom's sealed frame and its persisted history entry, and the Discord
+        # and Telegram ``self._buf = [body]`` reseat, would show the leading
+        # prose with the entire option list deleted and no pills to recover it
+        # from. Widening here can only ever KEEP more text, never cut more.
+        #
+        # Not the same question as ``split_trailing_protocol_suffix``'s probe,
+        # which asks "is this tail COMPLETE?" and must stay ASCII-only (see the
+        # comment there): presence of a closer is not completeness, but it is
+        # conclusive evidence of not-in-flight, and only the latter is asked
+        # here. The two checks differ because the questions differ.
+        if idx != -1 and not any(c in text[idx:] for c in MARKER_CLOSERS):
+            # Judge the fragment against the grammar it would have to satisfy,
+            # not by substring presence alone. :data:`OPTIONS_RE_TRAILER` opens
+            # ``[OPTIONS:`` -- once any byte other than ``:`` follows the
+            # substring, no later bytes can complete a marker there, so the
+            # fragment is the assistant's PROSE and holding it back protects
+            # nothing. It costs plenty: the trim point is wherever the quoted
+            # token sits, everything after it to buffer end goes with it, and
+            # when no ``]`` ever arrives the sealed frame re-trims too, so the
+            # transient-frame consolation above does not apply. Locating a
+            # marker by substring without asking whether it READS as one is
+            # the class #8983 fixed at the directive seam; this is the same
+            # rule at the trailer seam. Only the tail-most occurrence can be
+            # mid-flight -- a stream appends, so text after an opener means
+            # that opener was never in flight -- which is why one viability
+            # check here beats walking earlier occurrences.
+            tail = text[idx + len("[OPTIONS") :]
+            if not tail or tail.startswith(":"):
+                # A LINE-LEADING Markdown wrapper run abutting the fragment is
+                # part of the marker-to-be (``**[OPTIONS: A``): cutting at the
+                # ``[`` alone publishes a stray ``**`` on this frame. Widen the
+                # cut with the same rule the grammar and
+                # ``split_trailing_protocol_suffix`` apply, so every backend
+                # partial path agrees; a mid-line run is prose and stays.
+                return text[: _leading_wrapper_start(text, idx)].rstrip(), []
+    return text, []
+
+
+def render_options_as_text(text: str, capabilities: TransportCapabilities) -> str:
+    """Rewrite a trailing ``[OPTIONS:]`` trailer in *text* as numbered text.
+
+    The whole trailer handling for a channel that renders no widget, so every
+    channel that renders none shares one implementation instead of a copy each.
+    Returns the body only; the widget half of :func:`apply_options_cap` has
+    nothing to keep at ``max_buttons == 0``.
+
+    Parsing is :func:`split_options_trailer`, at its buffered default: this path's
+    callers do not stream — they buffer a whole turn and send once — so an
+    unfinished ``[OPTIONS`` tail is the assistant's prose here and is kept. The one
+    zero-widget channel that DOES stream (WeCom) asks for ``hide_partial=True`` in
+    its own ``wecom.renderer._render_options_as_text``, where the cost is a
+    transient flash whose next frame replaces the bubble anyway.
+
+    ``apply_options_cap`` is reached unconditionally rather than behind an
+    ``if not choices`` guard, which would NOT be equivalent: a matched-but-EMPTY
+    trailer (``[OPTIONS: ]``) must still have the marker stripped. With no match
+    ``split_options_trailer`` hands back the text unchanged, and the cap is the
+    identity on an empty choice list, so one call covers all three cases.
+    """
+    body, choices = split_options_trailer(text)
+    return apply_options_cap(body, choices, capabilities)[0]
+
+
 class Renderer(ABC):
     """Maps abstract ``OutputEvent``s onto a transport's native surface."""
 
@@ -209,6 +548,82 @@ class Renderer(ABC):
 
     def __init__(self, capabilities: TransportCapabilities) -> None:
         self.capabilities = capabilities
+
+    def redact_for_target(self, text: str) -> str:
+        """Redact text against the form a target will display."""
+        safe, _ = redact_for_display(text, _default_redactor)
+        return safe
+
+    def render_tables_for_target(
+        self,
+        text: str,
+        *,
+        final: bool = True,
+        policy: str | None = None,
+    ) -> str:
+        """Apply a table policy to text about to be sent to this target.
+
+        Call it on outbound bytes only. The turn's canonical text (what
+        ``TurnDriver.run`` returns, and what the transcript and dashboard show)
+        must not pass through here, or the conversion stops being a
+        per-target presentation choice and becomes a rewrite of the answer.
+
+        ``policy`` normally defaults to this target's declared ``table_mode``.
+        A channel may override it for delivery framing (for example, changing
+        an over-cap generated grid to cards), but must keep that fallback in
+        this helper so post-transform display redaction cannot be bypassed.
+
+        ``final=False`` while a turn is still streaming: a table whose last row
+        may not have arrived yet is left raw rather than frozen half-built.
+        """
+        rendered, _ = self.render_tables_for_target_with_metadata(
+            text,
+            final=final,
+            policy=policy,
+        )
+        return rendered
+
+    def render_tables_for_target_with_metadata(
+        self,
+        text: str,
+        *,
+        final: bool = True,
+        policy: str | None = None,
+    ) -> tuple[str, bool]:
+        """Render tables and report whether conversion generated a grid."""
+        rendered, generated_grid = render_tables_with_metadata(
+            text,
+            policy=self.capabilities.table_mode if policy is None else policy,
+            native_tables=self.capabilities.native_tables,
+            final=final,
+        )
+        if rendered == text:
+            return rendered, generated_grid
+
+        # Cards join headers and values that the stream redactor saw on
+        # separate table lines. Re-scan the display form at this last outbound
+        # transform so a label/value pair cannot assemble an Authorization
+        # header (or a formatted URL) after the channel-neutral pass.
+        return self.redact_for_target(rendered), generated_grid
+
+    def safe_raw_table_fallback(
+        self,
+        text: str,
+        *,
+        final: bool = True,
+        policy: str | None = None,
+    ) -> str | None:
+        """Return display-safe raw text only when rendering reveals no new secret."""
+        safe_raw = self.redact_for_target(text)
+        rendered_safe_raw = render_tables(
+            safe_raw,
+            policy=self.capabilities.table_mode if policy is None else policy,
+            native_tables=self.capabilities.native_tables,
+            final=final,
+        )
+        if self.redact_for_target(rendered_safe_raw) != rendered_safe_raw:
+            return None
+        return safe_raw
 
     async def on_turn_start(self) -> None:
         """Called once before the provider stream begins. Default no-op."""
@@ -259,9 +674,32 @@ class Renderer(ABC):
 
     @abstractmethod
     async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
+        self,
+        options: list[dict[str, Any]],
+        request_id: str | int,
+        tool_title: str = "",
+        tool_purpose: str = "",
+        tool_input: str = "",
     ) -> None:
-        """Render an interactive approval/choice prompt (first-class)."""
+        """Render an interactive approval/choice prompt (first-class).
+
+        ``tool_title`` is the tool THIS request asks about, taken from the
+        permission event itself, and ``tool_purpose`` is the purpose the matching
+        ``tool_call`` declared. Name the tool from these, not from a remembered
+        earlier ``on_tool_call``: a permission is not always immediately preceded
+        by its own titled tool call, so a remembered name is the PREVIOUS tool's,
+        and the operator would be consenting to something other than what they
+        read. Both are defaulted, so a renderer that has no name to show stays
+        valid; a renderer that keeps its own fallback should prefer these when
+        they are non-empty and must not pair a supplied title with a remembered
+        purpose from a different tool.
+
+        ``tool_input`` is the tool's own arguments, already redacted, so a renderer
+        can show WHAT is being approved rather than only its name. Declared with a
+        safe default and passed unconditionally: a renderer that has nowhere to put
+        it ignores the argument, which keeps the call site free of a capability
+        probe. ``""`` means the provider supplied no detail, never "no arguments".
+        """
 
     @abstractmethod
     async def on_compaction(self, context_usage_pct: float) -> None:
@@ -291,7 +729,13 @@ class Renderer(ABC):
                 event.tool_call_id, event.title, event.tool_kind, event.tool_purpose
             )
         elif event.kind == PROMPT_CHOICE:
-            await self.on_prompt_choice(event.options, event.request_id)
+            await self.on_prompt_choice(
+                event.options,
+                event.request_id,
+                event.title,
+                event.tool_purpose,
+                event.tool_input,
+            )
         elif event.kind == COMPACTION:
             await self.on_compaction(event.context_usage_pct)
         elif event.kind == DONE:
@@ -361,7 +805,12 @@ class SilentRenderer(Renderer):
         return None
 
     async def on_prompt_choice(
-        self, options: list[dict[str, Any]], request_id: str | int
+        self,
+        options: list[dict[str, Any]],
+        request_id: str | int,
+        tool_title: str = "",
+        tool_purpose: str = "",
+        tool_input: str = "",
     ) -> None:
         return None
 

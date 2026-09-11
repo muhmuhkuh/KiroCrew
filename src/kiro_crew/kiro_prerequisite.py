@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -50,7 +51,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import platform_compat
+from kiro_crew import hooks, identity_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_files import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
@@ -64,6 +65,7 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     resource_limit_supervisor_argv,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -86,6 +88,25 @@ KIRO_CLI_LOGIN_COMMAND = "kiro-cli login"
 # visual peer of organization SSO, so a user on an SSO plan can sign in to the
 # wrong tier and only discover it when models are missing.
 KIRO_CLI_SSO_LOGIN_COMMAND = "kiro-cli login --use-device-flow --license pro"
+# The command that updates the CLI in place. Unlike the install/sign-in steps
+# above, which Kiro Crew only ever NAMES for the user to run, this one IS run on
+# the user's behalf (see :meth:`KiroPrerequisiteService.update_cli`): it is the
+# CLI's own self-update subcommand, the same one the auto-update path already
+# invokes, so executing it introduces no new privileged surface — it is not a
+# remote installer script, just the installed binary updating itself. Offered
+# when the installed CLI is too old to expose the ``acp`` subcommand Kiro Crew
+# drives every session through. A CODE CONSTANT, never a catalog value: a
+# translated command cannot be typed or executed.
+KIRO_CLI_UPDATE_COMMAND = "kiro-cli update"
+# The subcommand Kiro Crew launches every ACP session through (see
+# ``acp.client.KIRO_CLI_SUBCMD`` / ``acp.runtime.KIRO_CLI_SUBCMD``). Probed by
+# name so the readiness check learns of a rename the same way a spawn would fail.
+_ACP_SUBCOMMAND = "acp"
+# How long the self-update is allowed to run before the probe gives up on it.
+# ``kiro-cli update`` downloads and swaps a binary, so it is far slower than the
+# read-only probes; sized to match the auto-update path's own 120s budget in
+# ``slack/gateway.py`` rather than the 10s probe ceiling.
+_UPDATE_TIMEOUT_SECS = 120
 # Compatibility shim, not live state. Nothing performs an operation any more, but a
 # dashboard loaded BEFORE this change reads ``status.operation.status``
 # unconditionally in its refetch-interval callback — the optional chain there
@@ -130,6 +151,27 @@ _PROBE_TIMEOUT_SECS = 10
 #: treated as acceptance: this module's rule is to report nothing rather than
 #: block a working install behind a repair card it cannot clear.
 _SPEC_REJECTION_MARKER = "is invalid"
+# Substrings that identify an "unknown subcommand" rejection in the captured
+# output of an ``acp --help`` probe. A kiro-cli that HAS the ``acp`` subcommand
+# exits 0 and prints its help; one too old to have it exits nonzero and (being a
+# clap CLI) prints one of these. Matched case-insensitively.
+#
+# This is deliberately a POSITIVE match on the rejection wording rather than
+# "the probe printed something" or "exit was nonzero", for the same reason the
+# spec probe matches its rejection marker: a probe that failed for an unrelated
+# reason (a sandbox denial, a hung binary) also produces a nonzero exit and
+# captured text, and reporting THAT as "your CLI is too old" would push the user
+# to run an update that cannot fix it. Anything unrecognized is therefore treated
+# as supported — the module's rule is to report nothing rather than block a
+# working install behind a card it cannot clear (see :meth:`_probe_acp_support`).
+_ACP_UNSUPPORTED_MARKERS = (
+    "unrecognized subcommand",
+    "unknown subcommand",
+    "unrecognized command",
+    "unknown command",
+    "invalid subcommand",
+    "no such subcommand",
+)
 # The identity probe's own budget, deliberately separate from
 # _PROBE_TIMEOUT_SECS. ``whoami`` is not a local read: when the cached token has
 # expired, Kiro CLI refreshes an OIDC token against the organization's IdP —
@@ -193,7 +235,7 @@ _AUTH_STORE_READ_ERROR = "Kiro identity file could not be read safely"
 # "no such table: history" on first use. Copying every table's DDL (and indexes)
 # while withholding non-identity ROWS keeps the CLI's queries valid and still
 # hands the sandboxed process no transcript content.
-_AUTH_SQLITE_DB = "data.sqlite3"
+_AUTH_SQLITE_DB = identity_stores.AUTH_SQLITE_DB
 _AUTH_IDENTITY_TABLES = ("auth_kv", "migrations")
 # `state` is a mixed key/value table: a few rows describe WHICH identity is signed
 # in (Identity Center region + start URL, CodeWhisperer profile) and the rest is
@@ -205,6 +247,37 @@ _AUTH_IDENTITY_TABLES = ("auth_kv", "migrations")
 _AUTH_STATE_TABLE = "state"
 _AUTH_STATE_KEY_PREFIXES = ("auth.", "api.codewhisperer.")
 _AUTH_SQLITE_FILES = (_AUTH_SQLITE_DB,)
+# What :func:`identity_fingerprint` returns when the store names no identity --
+# signed out, absent, or unreadable. Not a hash, so it can never collide with a
+# real fingerprint.
+_AUTH_FINGERPRINT_ABSENT = ""
+# SEL audit label for the identity-fingerprint read. Registered in
+# hooks._AUDIT_ONLY_READ_IDS; an unregistered id is refused there, and this reader
+# fails closed on that refusal rather than reading unaudited.
+_IDENTITY_FINGERPRINT_READ_ID = "kiro_prerequisite.identity_fingerprint"
+# Blob fields that identify WHICH account is signed in and survive a token
+# refresh. An ALLOWLIST on purpose: the same blobs carry `access_token`,
+# `refresh_token`, `expires_at` and `client_secret`, and a denylist would admit
+# every field a future kiro-cli adds -- letting a new secret into the digest, or a
+# new rotating field cause an account change on every refresh. `client_id` is the
+# OIDC registration, which is replaced when the client re-registers; that costs one
+# cold start on re-registration and is what distinguishes two logins whose
+# start_url is identical.
+_IDENTITY_CLAIM_FIELDS = frozenset(
+    {
+        "client_id",
+        "oauth_flow",
+        "region",
+        "scopes",
+        "start_url",
+    }
+)
+# How long a computed fingerprint may be reused. Bounds both the SQLite reads and
+# the SEL audit events a poll storm can produce (N dashboard tabs poll status every
+# few seconds), so the store is observed per action rather than per poll. Read off
+# time.monotonic() rather than the service's injected clock: this is a real-time
+# rate bound, not part of the probe's testable timing contract.
+_AUTH_FINGERPRINT_CACHE_SECS = 5.0
 # Short: the projection is a handful of small reads against a local file, and a
 # stuck open must not hold up sign-in.
 _AUTH_SQLITE_TIMEOUT_SECS = 5.0
@@ -351,6 +424,26 @@ class PrerequisiteStatus:
     # tier is an explicit choice rather than whichever option the sign-in page
     # happens to make prominent.
     sso_login_command: str = KIRO_CLI_SSO_LOGIN_COMMAND
+    # Whether the installed CLI exposes the ``acp`` subcommand every Kiro Crew
+    # session is launched through. Defaults True so nothing regresses when the
+    # probe cannot answer (a sandbox refusal, a timeout): those are reported by
+    # their own fields, and asserting "too old" off a probe that never ran would
+    # push the user to update a CLI that is fine. Only a CLEAN "unknown
+    # subcommand" verdict from ``acp --help`` sets it False — at which point the
+    # CLI runs and is signed in, but cannot start a single session, so it narrows
+    # ``ready`` exactly like a rejected spec. The remedy is an UPDATE, not a
+    # reinstall: the binary is present and only out of date.
+    acp_supported: bool = True
+    # What the user's CLI is updated with when ``acp_supported`` is False. Unlike
+    # ``login_command`` (which Kiro Crew only names), this one is also run FOR the
+    # user by ``update_cli`` — it is the CLI's own in-place self-update. Served in
+    # the payload so the UI has one source of truth for the string.
+    update_command: str = KIRO_CLI_UPDATE_COMMAND
+    # Exception / failure text from an ``update_cli`` attempt. Empty when no
+    # update was attempted or it succeeded. Shown verbatim, untranslated: it
+    # names why the self-update did not complete, which is what a support
+    # conversation needs.
+    cli_update_error: str = ""
     # A Kiro CLI binary that is present and executable but could not be VERIFIED
     # (verification runs the binary inside the sandbox) is a categorically
     # different condition from a missing binary, and a failed sandbox build
@@ -370,6 +463,17 @@ class PrerequisiteStatus:
     # only show the raw errno, which is the dead end reported in issue #1660: the
     # probe knows the fix is an AppArmor profile and the user cannot tell.
     sandbox_remedy: str = ""
+    # The verification probe hit ``_PROBE_TIMEOUT_SECS`` instead of answering. A
+    # THIRD condition, distinct from both a missing binary and a sandbox refusal:
+    # the spawn was accepted and raised no typed failure, so every ``sandbox_*``
+    # field stays empty and none of them can carry it. Without this the timeout
+    # collapsed into bare ``installed=False`` with all ``sandbox_*`` empty — a
+    # combination that does not merely fail to help, it actively rules out the true
+    # cause and sends the operator to reinstall or re-login, neither of which can
+    # work on a host whose CLI is installed, signed in, and serving turns the whole
+    # time (issue #4577: 4081 SEL ``probe_version`` events, every one
+    # ``outcome=failed error=timeout``, on exactly such a host).
+    probe_timed_out: bool = False
     # Kiro Crew's own agent specs (~/.kiro/agents/kirocrew*.json). ``ready``
     # requires these on disk, not merely a viable binary and a good ``whoami``:
     # without them kiro-cli answers every ``session/set_mode`` with
@@ -406,6 +510,17 @@ class _AuthStoreMapping:
     source: Path
     staged_relative: Path
     filenames: tuple[str, ...]
+    # Mappings sharing a group are ALTERNATE locations of ONE store, only one of
+    # which a given host uses. Staging must abort when a matched store cannot be
+    # read, because a staged home with no identity looks signed-out -- but that
+    # rule is right per LOCATION and wrong across alternates, where a stale
+    # leftover in the root this host abandoned would abort staging from the root
+    # it actually uses. Within a group the abort is therefore deferred: it fires
+    # only when NO alternate yielded an identity. ``None`` means "not an
+    # alternate of anything" and keeps the strict per-location rule -- the AWS
+    # SSO cache is a single location holding several token files, and losing any
+    # one of those must still abort.
+    group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -453,6 +568,23 @@ def _sanitize_detail(text: str) -> str:
     safe, _ = redact_exfiltration_urls(str(text or ""))
     safe, _ = redact_credentials(safe)
     return safe[-_MAX_VISIBLE_DETAIL:]
+
+
+def _terminal_audit_detail(result: ProcessResult, succeeded: bool) -> str:
+    """The terminal audit event's error label for a run that finished or timed out.
+
+    *succeeded* is the verdict the caller already reached, not ``result.ok``, so
+    the label always follows that verdict and can never contradict the
+    ``outcome`` recorded beside it. The update path spells the verdict
+    ``update.ok and not error``, where ``error`` is itself set from this same
+    run, so the two agree there.
+    """
+
+    if succeeded:
+        return ""
+    if result.timed_out:
+        return "timeout"
+    return "nonzero exit"
 
 
 def _canonical_candidate(path: str) -> str:
@@ -734,25 +866,291 @@ def _project_identity_database(source: Path, destination: Path) -> bool:
 
 
 def _atomic_write_secret_bytes(path: Path, content: bytes) -> None:
-    """Atomically stage one bounded Kiro identity file with owner-only mode."""
+    """Atomically stage one bounded Kiro identity file, owner-only from birth.
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    ``restrict_to_owner=True`` locks the staged temp file down BEFORE the
+    identity bytes reach it (``0o600`` on POSIX, an owner-only DACL on
+    Windows), so those bytes never sit in a file readable at the parent's
+    inherited DACL. The default ``restrict_on_error="raise"`` keeps that
+    unconditional: a lockdown failure aborts before the final path is touched,
+    so an unprotectable identity file never exists there at all.
+    """
+
+    atomic_write(path, content, fsync=True, restrict_to_owner=True)
+
+
+def kiro_identity_store_path(
+    platform_name: str,
+    home: Path,
+    environ: MutableMapping[str, str],
+) -> Path:
+    """Return kiro-cli's OWN live identity database path.
+
+    Deliberately not amazon-q's: that store often holds the same account but is a
+    different product's credential, so it cannot answer "which account is this
+    CLI signed in as".
+
+    Every platform resolves among FIXED, home-anchored locations, drawn from the
+    same set as the trusted live-store list in
+    ``dashboard/handlers/kiro_usage_api.py`` (``_CLI_SQLITE_DBS``). No
+    environment variable is consulted -- not ``XDG_DATA_HOME`` on Linux, not
+    ``APPDATA`` or ``LOCALAPPDATA`` on Windows -- because the fence that makes
+    this store unwritable by agent file tools (``_SENSITIVE_HOME_DIRS``) is
+    anchored at exactly these paths. A redirected location either resolves to the
+    same place or falls OUTSIDE the fence, where an agent can author the rows
+    this function reads: it could then forge an identity that keeps matching and
+    the children signed in as the previous account would never be retired. A
+    fixed anchor cannot be pointed at something the agent may write.
+
+    On Windows current kiro-cli writes its store under the local app-data
+    directory (``AppData/Local/kiro-cli``); older layouts used the roaming one
+    (``AppData/Roaming/kiro-cli``). When only one store exists it is chosen;
+    when both exist the most recently written one wins, so a leftover from
+    the other layout never masks the live store's account (the WAL-aware
+    mtime tie-break lives in :func:`identity_stores.selected_store`). Both
+    anchors sit inside the
+    ``_SENSITIVE_HOME_DIRS`` fence, so neither choice widens what an agent
+    can forge. This branch stats the filesystem, so callers on the event loop
+    should resolve the path inside the same worker thread as the read itself.
+
+    The cost is that a host which relocates its data home is read as having no
+    identity, so the change is reported as "absent" -- which errs toward retiring
+    children, never toward trusting them. ``environ`` is kept in the signature so
+    callers need not know which platforms consult it, and so a future platform
+    that genuinely requires it does not change every call site.
+    """
+
+    return identity_stores.selected_store(platform_name, home)
+
+
+def identity_store_is_relocated(
+    platform_name: str,
+    home: Path,
+    environ: MutableMapping[str, str],
+) -> bool:
+    """Whether the CLI's data home is configured somewhere other than our anchor.
+
+    :func:`kiro_identity_store_path` deliberately reads a FIXED path, because the
+    fence that keeps agent file tools out of that store is home-anchored and a
+    redirected path can land outside it. But refusing to follow the redirection is
+    not the same as being safe: if the environment points the CLI elsewhere and a
+    LEFTOVER database still sits at the default location, reading it yields a
+    confident fingerprint of an account nobody is signed into. A logout in the real
+    store would then change nothing we can see, and the old-account child would be
+    reused -- strictly worse than reporting "cannot tell".
+
+    So a configured relocation is reported here, and the caller treats it as
+    absent: no read, no false confidence, and the absent path already means "never
+    reconciled, re-sweep every turn".
+
+    Both variables count, unconditionally. The live store's directory is
+    resolved by the CLI from ``LOCALAPPDATA`` (current layout) or ``APPDATA``
+    (legacy layout), and which generation is writing cannot be observed --
+    so once EITHER variable is redirected, a database at a fixed anchor
+    cannot be attributed to a live writer: it may be the live store of the
+    other generation, or a leftover of either, and reading a leftover yields
+    a confident fingerprint of an account nobody is signed into. Refusing to
+    guess errs toward absent, the module's safe side. The cost is that a
+    host with Group-Policy folder redirection (which targets Roaming)
+    reports absent even when a current-layout Local store is healthy -- the
+    same answer such hosts got when the anchor lived under Roaming, so the
+    posture is status quo there, and the once-per-service log in
+    :meth:`KiroPrerequisiteService.current_identity_fingerprint` makes it
+    diagnosable. A variable set to exactly the default location is not a
+    relocation.
+
+    The (variable, default root) pairs are PROJECTED from
+    :data:`identity_stores.IDENTITY_STORE_ROOTS` -- each kiro-cli row's
+    ``env_var`` against the parent of its home-relative directory -- so this
+    check learns about a new or relocated store row the same way the fence,
+    staging, and state-db discovery do. macOS falls out naturally: its rows
+    carry no ``env_var`` (no standard variable relocates
+    ``~/Library/Application Support``), so no pair is checked there.
+    """
+
+    plat = (
+        identity_stores.Platform(platform_name)
+        if platform_name in ("darwin", "win32")
+        else identity_stores.Platform.POSIX
+    )
+    for root in identity_stores.IDENTITY_STORE_ROOTS:
+        if (
+            root.platform is not plat
+            or root.product is not identity_stores.Product.KIRO_CLI
+            or root.env_var is None
+        ):
+            continue
+        default = home.joinpath(*root.home_relative_dir.split("/")).parent
+        configured = environ.get(root.env_var, "").strip()
+        if configured and Path(configured) != default:
+            return True
+    return False
+
+
+def identity_fingerprint(path: Path) -> str:
+    """Return a digest naming WHICH account an identity store is signed in as.
+
+    Two rules shape what participates.
+
+    **Stable claims only.** The credential blobs mix fields that identify an
+    account with fields that are replaced on every token refresh. Digesting a
+    rotating field would report an account change roughly hourly and retire
+    healthy sessions, so the rotating and secret ones -- ``access_token``,
+    ``refresh_token``, ``expires_at``, ``client_secret`` -- are excluded and the
+    identifying ones are kept: the SSO ``start_url``, ``region``, ``oauth_flow``,
+    ``scopes`` and the OIDC registration's ``client_id``. Key NAMES also
+    participate, so a change of credential kind counts even when no value moved.
+
+    **An allowlist, not a denylist** (:data:`_IDENTITY_CLAIM_FIELDS`). A field
+    added to these blobs by a future kiro-cli cannot join the fingerprint by
+    default -- which keeps both a new secret out of it and a new rotating field
+    from causing spurious retirement.
+
+    Values are hashed, never returned, so the fingerprint carries no credential.
+
+    The read is SEL-audited and FAILS CLOSED: this file holds live credential
+    material, so a read whose audit cannot be recorded returns "absent" rather
+    than an unaudited answer. "Absent" is also what a logout leaves behind, and
+    the caller treats it as "cannot confirm the running children" -- which errs
+    toward retiring them, never toward trusting them.
+    """
+
+    audit_ok = hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "invoked")
+    if not audit_ok:
+        # A logger line is not an SEL audit. Refuse rather than read.
+        logger.warning("Kiro identity fingerprint read denied: audit unavailable")
+        return _AUTH_FINGERPRINT_ABSENT
+    connection = _open_identity_db_readonly(path)
+    if connection is None:
+        hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "unreadable")
+        return _AUTH_FINGERPRINT_ABSENT
+    parts: list[str] = []
     try:
-        with os.fdopen(fd, "wb") as stream:
-            fd = -1
-            platform_compat.fchmod_safe(stream.fileno(), 0o600)
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        platform_compat.restrict_to_owner(str(path))
-    except Exception:
-        if fd >= 0:
-            os.close(fd)
-        with contextlib.suppress(OSError):
-            os.unlink(temporary)
-        raise
+        with contextlib.closing(connection):
+            present = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"  # wokeignore:rule=master
+                ).fetchall()
+            }
+            if "auth_kv" in present:
+                for key, value in connection.execute("SELECT key, value FROM auth_kv").fetchall():
+                    claims = _identity_claims(str(key), value)
+                    if not claims:
+                        # A row carrying NO stable claim is deliberately skipped
+                        # ENTIRELY -- its key name is not recorded either. Recording
+                        # the name alone would make two different accounts stored
+                        # under the same key look identical, which is exactly the
+                        # false confidence to avoid: a social login (GitHub, Google)
+                        # has no SSO start_url, so account A and account B under
+                        # `kirocli:social:token` would fingerprint the same and the
+                        # child authenticated as A would never be retired.
+                        #
+                        # Contributing nothing means such a store can come out
+                        # ABSENT, which is never reconciled (see the caller) and so
+                        # re-sweeps every turn. "Cannot distinguish" is reported as
+                        # "cannot confirm" rather than as "unchanged".
+                        continue
+                    parts.append(f"k:{key}")
+                    parts.extend(claims)
+            if _AUTH_STATE_TABLE in present:
+                predicate = " OR ".join(["key LIKE ?"] * len(_AUTH_STATE_KEY_PREFIXES))
+                rows = connection.execute(
+                    f'SELECT key, value FROM "{_AUTH_STATE_TABLE}" WHERE {predicate}',
+                    tuple(f"{prefix}%" for prefix in _AUTH_STATE_KEY_PREFIXES),
+                ).fetchall()
+                for key, value in rows:
+                    parts.append(f"s:{key}={_claim_digest(value)}")
+    except sqlite3.Error:
+        hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "error")
+        return _AUTH_FINGERPRINT_ABSENT
+    if not parts:
+        # Schema present but zero identity rows reads as signed out, not as an
+        # identity whose fingerprint happens to be the digest of nothing.
+        hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "signed_out")
+        return _AUTH_FINGERPRINT_ABSENT
+    if not hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "success"):
+        # The read HAPPENED and its terminal audit could not be written, so the
+        # answer is unaudited. Discard it rather than let unaudited identity data
+        # drive retirement. The failure-shaped outcomes above need no such guard:
+        # they already return "absent" whatever their audit does.
+        logger.warning("Kiro identity fingerprint discarded: terminal audit unavailable")
+        return _AUTH_FINGERPRINT_ABSENT
+    return hashlib.sha256("\n".join(sorted(parts)).encode()).hexdigest()
+
+
+#: Separator between the kiro-cli store's fingerprint and the Crew vault's in the
+#: combined identity string. Only present when the vault holds an identity, so a
+#: host with no Crew sign-in fingerprints exactly as before.
+_CREW_VAULT_FINGERPRINT_SEP = "+crew:"
+
+
+def _crew_vault_fingerprint() -> str:
+    """The Crew vault's own identity digest, or ``""`` when it holds nothing.
+
+    Deferred import: ``kiro_crew.auth`` brings the ``cryptography`` wheel, which
+    must stay off this module's import graph (it is on the gateway's boot path)
+    and is loaded here on the first identity read instead. Never raises; the
+    bridge helper reports an unreadable vault as empty. Blocking file IO -- the
+    caller already runs on a worker thread.
+    """
+    from kiro_crew.auth.bridge import vault_identity_fingerprint
+
+    return vault_identity_fingerprint()
+
+
+def _combine_identity_fingerprints(cli: str, crew_vault: str) -> str:
+    """One fingerprint over BOTH credential sources a running child may have loaded.
+
+    kiro-cli's store answers for the kiro backend and for a KAS relay spawned
+    cli-owned; the Crew vault answers for a KAS relay spawned Crew-owned
+    (:mod:`kiro_crew.acp.kas_host_auth`). A sign-out in EITHER must read as an
+    identity change, so the per-turn sweep retires -- and keeps re-sweeping until
+    it completes -- children that loaded the previous identity, whichever source
+    it came from. The vault component is appended only when present, so a host
+    with no Crew sign-in keeps the kiro-cli-only fingerprint byte-for-byte and
+    ``""`` still means "no identity anywhere".
+    """
+    if not crew_vault:
+        return cli
+    return f"{cli}{_CREW_VAULT_FINGERPRINT_SEP}{crew_vault}"
+
+
+def _claim_digest(value: object) -> str:
+    """Hash one claim value so no credential material can leave the reader."""
+
+    raw = value if isinstance(value, bytes) else str(value).encode("utf-8", "replace")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _identity_claims(key: str, value: object) -> list[str]:
+    """Return hashed STABLE claims from one ``auth_kv`` blob.
+
+    Anything that is not a JSON object contributes nothing: the row's key name is
+    already recorded by the caller, and guessing at an opaque value risks pulling
+    in a rotating one. Fields outside :data:`_IDENTITY_CLAIM_FIELDS` are skipped
+    whatever their name.
+    """
+
+    try:
+        blob = json.loads(value if isinstance(value, (str, bytes)) else str(value))
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(blob, dict):
+        return []
+    claims: list[str] = []
+    for claim in sorted(_IDENTITY_CLAIM_FIELDS):
+        if claim not in blob:
+            continue
+        raw = blob[claim]
+        # Lists (``scopes``) are order-normalized so a reordered grant of the same
+        # scopes is not mistaken for a different account.
+        if isinstance(raw, list):
+            rendered = ",".join(sorted(str(item) for item in raw))
+        else:
+            rendered = str(raw)
+        claims.append(f"c:{key}:{claim}={_claim_digest(rendered)}")
+    return claims
 
 
 def _auth_store_mappings(
@@ -760,7 +1158,17 @@ def _auth_store_mappings(
     home: Path,
     environ: MutableMapping[str, str],
 ) -> tuple[_AuthStoreMapping, ...]:
-    """Return only Kiro identity stores, never the surrounding credential dirs."""
+    """Return only Kiro identity stores, never the surrounding credential dirs.
+
+    Built over the canonical :func:`identity_stores.store_mappings` projection so
+    the source directories, the env-var source-side honouring
+    (``LOCALAPPDATA`` / ``APPDATA`` / ``XDG_DATA_HOME``), the fixed staged side,
+    and the Local-before-Roaming ordering all come from the single table. This
+    wrapper keeps staging's own concerns: the ``.aws/sso/cache`` token mapping
+    (not an identity store, so not in the table), the ``_AuthStoreMapping`` shape
+    with ``filenames=_AUTH_SQLITE_FILES``, and the ``win32:{app}`` group that
+    defers the abort across a product's two alternate AppData roots.
+    """
 
     mappings = [
         _AuthStoreMapping(
@@ -769,36 +1177,25 @@ def _auth_store_mappings(
             filenames=("kiro-auth-token*.json",),
         )
     ]
-    app_names = ("kiro-cli", "amazon-q")
-    if platform_name == "darwin":
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=home / "Library" / "Application Support" / app_name,
-                    staged_relative=Path("Library") / "Application Support" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
+    for row in identity_stores.store_mappings(platform_name, home, environ):
+        # Both AppData roots of one Windows product are alternates: only one is
+        # this host's live store, so a stale leftover in the unused root must
+        # not abort staging from the used one. A shared group defers the abort
+        # across them; distinct ``staged_relative`` values (from the table) keep
+        # them from overwriting each other. macOS/Linux have a single location
+        # per product, so no group. (The env-var source-side honouring and the
+        # fixed staged side are already applied by ``store_mappings``.)
+        group = (
+            f"win32:{row.product.value}" if platform_name == "win32" else None
+        )
+        mappings.append(
+            _AuthStoreMapping(
+                source=row.source,
+                staged_relative=row.staged_relative,
+                filenames=_AUTH_SQLITE_FILES,
+                group=group,
             )
-    elif platform_name == "win32":
-        local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=local_app_data / app_name,
-                    staged_relative=Path("AppData") / "Local" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
-            )
-    else:
-        data_home = Path(environ.get("XDG_DATA_HOME") or home / ".local" / "share")
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=data_home / app_name,
-                    staged_relative=Path(".local") / "share" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
-            )
+        )
     return tuple(mappings)
 
 
@@ -833,7 +1230,7 @@ def _ensure_auth_staging_parent(home: Path) -> Path:
     if platform_compat.IS_POSIX:
         platform_compat.chmod_safe(str(staging_parent), 0o700)
     else:
-        platform_compat.restrict_to_owner(str(staging_parent))
+        platform_compat.restrict_dir_to_owner(str(staging_parent))
     return staging_parent
 
 
@@ -851,8 +1248,14 @@ def _prepare_auth_workspace(
         if platform_compat.IS_POSIX:
             platform_compat.chmod_safe(str(root), 0o700)
         else:
-            platform_compat.restrict_to_owner(str(root))
+            platform_compat.restrict_dir_to_owner(str(root))
+        # Deferred aborts, keyed by group: a group records its failure and is
+        # judged only after every alternate has been attempted.
+        group_staged: dict[str, bool] = {}
+        group_failed: dict[str, str] = {}
         for mapping in _auth_store_mappings(platform_name, home, environ):
+            if mapping.group is not None:
+                group_staged.setdefault(mapping.group, False)
             for pattern in mapping.filenames:
                 for source in mapping.source.glob(pattern):
                     staged_path = root / mapping.staged_relative / source.name
@@ -860,14 +1263,34 @@ def _prepare_auth_workspace(
                     # every other identity file is a small JSON token copied
                     # under the bounded byte rules. Both abort staging on
                     # failure — never omit a matched store as though absent.
+                    # For a mapping in a GROUP the abort is deferred to the
+                    # group verdict below, because the alternates of one store
+                    # are not each independently required.
                     if source.name == _AUTH_SQLITE_DB:
                         if not _project_identity_database(source, staged_path):
-                            raise OSError(_AUTH_STORE_READ_ERROR)
+                            if mapping.group is None:
+                                raise OSError(_AUTH_STORE_READ_ERROR)
+                            group_failed[mapping.group] = _AUTH_STORE_READ_ERROR
+                            continue
+                        if mapping.group is not None:
+                            group_staged[mapping.group] = True
                         continue
                     content = _read_bounded_regular_file(source)
                     if content is None:
-                        raise OSError(_AUTH_STORE_READ_ERROR)
+                        if mapping.group is None:
+                            raise OSError(_AUTH_STORE_READ_ERROR)
+                        group_failed[mapping.group] = _AUTH_STORE_READ_ERROR
+                        continue
                     _atomic_write_secret_bytes(staged_path, content)
+                    if mapping.group is not None:
+                        group_staged[mapping.group] = True
+
+        # A group that had a readable store in ANY of its alternates is staged.
+        # A group whose every matched store failed is the signed-out-looking
+        # case the strict rule exists for, so it still aborts.
+        for group, message in group_failed.items():
+            if not group_staged.get(group, False):
+                raise OSError(message)
 
         env = dict(base_env)
         env.update(
@@ -1163,12 +1586,14 @@ async def _prepare_sandboxed_spawn(
 ) -> tuple[list[str], dict[str, str], str | None]:
     """Prepare filesystem-heavy sandbox state on a worker thread.
 
-    Cancellation waits for preparation to settle so a launcher/profile created
-    by the worker is still removed instead of becoming an untracked temp file.
+    Delegates to the shared :func:`shielded_prepare_off_loop`, which owns the
+    shield-and-recover pattern (including the repeat-cancellation semantics of
+    #5841) for every async caller of the chokepoint.  The chokepoint call itself
+    stays in this module so the ``mode``/``strip_python_env`` policy — and this
+    module's own seam over ``sandboxed_spawn_argv`` — remain local.
     """
-
-    task = asyncio.create_task(
-        asyncio.to_thread(
+    return await shielded_prepare_off_loop(
+        functools.partial(
             sandboxed_spawn_argv,
             argv,
             mode=mode,
@@ -1178,14 +1603,6 @@ async def _prepare_sandboxed_spawn(
             extra_visible_dirs=extra_visible_dirs,
         )
     )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        cleanup_path: str | None = None
-        with contextlib.suppress(Exception):
-            _, _, cleanup_path = await task
-        await _unlink_off_loop(cleanup_path)
-        raise
 
 
 async def _run_process(
@@ -1658,6 +2075,26 @@ class KiroPrerequisiteService:
         self._last_probe_at = 0.0
         self._has_probed = False
         self._viable_binary = ""
+        # Which account the store named when the latch was last written.
+        # Comparing it against a fresh read is how an out-of-band `kiro-cli
+        # logout` (or a switch to another account) is noticed at all: nothing
+        # else on the host reports it, and the store's mtime is useless because
+        # ordinary chat traffic rewrites the database every few seconds.
+        self._probe_identity = _AUTH_FINGERPRINT_ABSENT
+        # The retirement consumer's own baseline: which account the RUNNING
+        # children were started under. Separate from _probe_identity because two
+        # consumers sharing one baseline means the first to observe a change
+        # advances it and the second never sees it (see
+        # identity_changed_since_sessions). None = never reconciled, which reports
+        # CHANGED: an unknown baseline must not resolve to "the children match".
+        self._session_identity: str | None = None
+        # Real-time cache bounding the store reads and their SEL audit events.
+        self._identity_cache = _AUTH_FINGERPRINT_ABSENT
+        self._identity_cache_at = 0.0
+        # Whether the relocation refusal has been logged. The relocated arm runs
+        # on every identity poll, so the diagnostic logs once per service rather
+        # than flooding; see current_identity_fingerprint.
+        self._relocation_logged = False
 
     @property
     def initial_setup_complete(self) -> bool:
@@ -1930,6 +2367,16 @@ class KiroPrerequisiteService:
             # Nothing has resolved yet (warm-up still pending or it failed).
             # One probe here is the boot probe, just arriving late.
             await self._probe()
+        elif await self.identity_changed_since_probe():
+            # The store now names a different account (or none) than the latch
+            # describes. This is the one condition under which an ORDINARY poll
+            # re-probes: without it the card keeps reporting the account the user
+            # signed out of until they happen to press Check again, and reports
+            # "not signed in" after a terminal sign-in for just as long. It stays
+            # cheap because the trigger is a local read, not a spawn, and it
+            # cannot loop -- the probe stamps the new identity, so the next poll
+            # compares equal.
+            await self._probe(force=True)
         result = await self._agent_spec_overlay(self._snapshot_dict())
 
         # The repair arm deliberately does NOT live here. This is an ``add_get``
@@ -1963,6 +2410,139 @@ class KiroPrerequisiteService:
         # than being served by the short cache off this synthetic transition.
         self._last_probe_at = 0.0
         logger.info("Kiro readiness latched to signed-out after an ACP auth failure")
+
+    async def current_identity_fingerprint(self, *, allow_cached: bool = True) -> str:
+        """Return the store's current identity fingerprint.
+
+        Off-loop: a read-only SQLite open plus a couple of small queries.
+
+        ``allow_cached`` decides whether a value read within
+        :data:`_AUTH_FINGERPRINT_CACHE_SECS` may be reused. The cache exists for
+        ONE caller -- the status surface, which N dashboard tabs poll every few
+        seconds, so without it a poll storm becomes one SQLite read and one SEL
+        audit event per tab per poll.
+
+        Anything ACTING on the answer passes ``allow_cached=False``. A cached
+        value is by definition up to a few seconds old, and a logout inside that
+        window would otherwise be invisible to the turn that follows it -- the
+        stale child would take the turn under the account just signed out. Turns
+        and probes are human-paced, so reading fresh for them costs nothing worth
+        having.
+
+        What this replaces either way is the expensive signal: a ``whoami`` spawn,
+        which is what the boot-only probe exists to keep off the send path.
+        """
+
+        now = time.monotonic()
+        if (
+            allow_cached
+            and self._identity_cache_at
+            and now - self._identity_cache_at < _AUTH_FINGERPRINT_CACHE_SECS
+        ):
+            return self._identity_cache
+
+        def _read() -> str:
+            # Both the relocation guard and the win32 path resolver stat the
+            # filesystem, so the whole resolve-and-read runs in this worker
+            # thread and stats stay off the event loop.
+            if identity_store_is_relocated(self._platform, self._home, self._environ):
+                # Do not read the default path: with the CLI pointed elsewhere, a
+                # leftover database there would fingerprint an account nobody is
+                # signed into, and a logout in the real store would change nothing
+                # we can see. Absent is never reconciled, so this re-sweeps every
+                # turn instead of trusting a stale file.
+                if not self._relocation_logged:
+                    # Once per service: this arm runs on every poll, and without
+                    # the log an absent-because-relocated host is indistinguishable
+                    # from a signed-out user -- the silence that made the identity
+                    # probe's failures undiagnosable without reading source.
+                    self._relocation_logged = True
+                    logger.info(
+                        "Kiro identity store is env-relocated on %s; reporting the "
+                        "identity as absent instead of reading the fixed anchor",
+                        self._platform,
+                    )
+                cli = _AUTH_FINGERPRINT_ABSENT
+            else:
+                cli = identity_fingerprint(
+                    kiro_identity_store_path(self._platform, self._home, self._environ)
+                )
+            return _combine_identity_fingerprints(cli, _crew_vault_fingerprint())
+
+        try:
+            fingerprint = await asyncio.to_thread(_read)
+        except Exception:
+            # An unreadable store reports "no identity", matching
+            # identity_fingerprint's own contract, rather than "unchanged" --
+            # guessing "unchanged" is what keeps a stale account alive.
+            logger.warning("Kiro identity fingerprint could not be read", exc_info=True)
+            fingerprint = _AUTH_FINGERPRINT_ABSENT
+        self._identity_cache = fingerprint
+        self._identity_cache_at = now
+        return fingerprint
+
+    async def identity_changed_since_probe(self) -> bool:
+        """Whether the signed-in account differs from the one the LATCH describes.
+
+        The status surface's consumer. Advancing this baseline is
+        :meth:`_stamp_probe`'s business, so it must never be used to decide
+        whether a running child is stale -- see
+        :meth:`identity_changed_since_sessions` for why.
+
+        False while ``assume_ready`` holds (a test or offline gateway asserts its
+        own readiness and has no store to compare against) and false before the
+        first probe, when there is no recorded identity to differ from.
+        """
+
+        if self._assume_ready or not self._has_probed:
+            return False
+        return await self.current_identity_fingerprint() != self._probe_identity
+
+    async def identity_changed_since_sessions(self) -> tuple[bool, str]:
+        """Whether running children predate the account the store now names.
+
+        Returns ``(changed, live_fingerprint)``.
+
+        This tracks a SEPARATE baseline from :meth:`identity_changed_since_probe`
+        on purpose. One shared baseline has two consumers -- the status card and
+        session retirement -- and whichever observes the change first advances it,
+        so the other never sees it. In practice the dashboard polls status every
+        few seconds while turns are minutes apart, so a single baseline means the
+        poll re-probes, stamps the new identity, and the stale child is then never
+        retired: the cheap half silently consumes the signal the consequential
+        half exists to act on. A baseline per consumer removes the coupling.
+
+        An UNSET baseline reports changed. It means we do not know which account
+        the running children loaded, and "do not know" must not resolve to "they
+        match": readiness is probed a few seconds AFTER boot while a session can be
+        spawned eagerly before that, so a logout landing in the gap would otherwise
+        be recorded as the starting point and the pre-logout child would keep
+        answering as the previous account. Sweeping once when the baseline is unset
+        costs one cold start per gateway lifetime -- the conversation is restored
+        from disk -- and it is the only answer that cannot be silently wrong.
+
+        The baseline is therefore advanced ONLY by
+        :meth:`note_sessions_reconciled`, after a sweep that actually completed.
+        """
+
+        if self._assume_ready:
+            return (False, _AUTH_FINGERPRINT_ABSENT)
+        # Never cached: this answer decides whether a running child may take the
+        # next turn, and a value a few seconds old would let a logout inside that
+        # window pass unnoticed.
+        live = await self.current_identity_fingerprint(allow_cached=False)
+        if self._session_identity is None:
+            return (True, live)
+        return (live != self._session_identity, live)
+
+    def note_sessions_reconciled(self, fingerprint: str) -> None:
+        """Record that running children now match *fingerprint*.
+
+        Advanced ONLY by the retirement path, so no other consumer can retire
+        this baseline's signal on its behalf.
+        """
+
+        self._session_identity = fingerprint
 
     async def verified_ready(self, *, max_age_secs: float) -> bool:
         """Return readiness backed by a probe no older than *max_age_secs*.
@@ -2013,8 +2593,40 @@ class KiroPrerequisiteService:
 
         return bool(self._status.ready)
 
+    def _stamp_probe(self, identity: str) -> None:
+        """Record that the latch was just written, and for which account.
+
+        Every latch write in :meth:`_probe` goes through here so none can record
+        a verdict without the identity it belongs to -- a latch stamped with no
+        identity would read as "account changed" on the very next comparison and
+        retire healthy sessions forever.
+
+        Deliberately does NOT touch the retirement baseline. Seeding it here would
+        look like it anchors that baseline to the identity the running children
+        loaded, but the probe is delayed a few seconds after boot and a session can
+        be spawned eagerly before it, so a logout in that gap would be seeded as the
+        starting point and the pre-logout child would never be retired. That
+        baseline is advanced only by :meth:`note_sessions_reconciled`, after a
+        sweep -- and an unset one reports changed rather than assuming a match.
+        """
+
+        self._last_probe_at = self._clock()
+        self._has_probed = True
+        self._probe_identity = identity
+
     async def _probe(self, *, force: bool = False) -> PrerequisiteStatus:
         async with self._probe_lock:
+            # Read the identity BEFORE running whoami, and stamp that value on
+            # whatever verdict this probe reaches. The order matters: if the store
+            # changes between this read and whoami, the latch records the OLDER
+            # identity, so the next comparison sees a change and re-probes -- one
+            # wasted probe. Reading afterwards would stamp the NEW identity onto a
+            # verdict describing the OLD one, which hides the change instead.
+            probe_identity = (
+                _AUTH_FINGERPRINT_ABSENT
+                if self._assume_ready
+                else await self.current_identity_fingerprint(allow_cached=False)
+            )
             if self._assume_ready:
                 self._status = PrerequisiteStatus(
                     platform=_platform_label(self._platform),
@@ -2023,8 +2635,7 @@ class KiroPrerequisiteService:
                     ready=True,
                     initial_setup_complete=True,
                 )
-                self._last_probe_at = self._clock()
-                self._has_probed = True
+                self._stamp_probe(probe_identity)
                 return self._status
             now = self._clock()
             if self._has_probed and not force and now - self._last_probe_at < _PROBE_CACHE_SECS:
@@ -2108,6 +2719,67 @@ class KiroPrerequisiteService:
                         sandbox_detail=detail,
                         sandbox_remedy=remedy,
                     )
+                    self._stamp_probe(probe_identity)
+                    return self._status
+                if (
+                    version_probe is not None
+                    and version_probe.timed_out
+                    and candidate_runnable
+                ):
+                    # A probe that never answered is not evidence of absence. The
+                    # spawn was accepted and raised no typed failure, so the
+                    # sandbox branch above cannot claim it, and falling through to
+                    # the bare default below asserts installed=False about a binary
+                    # this function just confirmed is present and executable.
+                    #
+                    # Reported as the SAME shape as a sandbox refusal, for the same
+                    # reason: present on disk, verification is what failed. The
+                    # timeout gets its own flag rather than reusing sandbox_* --
+                    # nothing about the sandbox failed here, and a caller that keys
+                    # a userns remedy off sandbox_unavailable must not be handed a
+                    # slow filesystem to fix with an AppArmor profile.
+                    #
+                    # WARNING on the TRANSITION into the condition, DEBUG while it
+                    # persists. This branch runs on EVERY probe, and on an affected
+                    # host that is one probe per ~40s (the readiness gate's 30s
+                    # staleness window plus this probe's own 10s timeout), so ~90
+                    # lines/hour into the dashboard's 1000-entry log ring. A line that
+                    # reports a slow host must not be the thing that evicts the rest of
+                    # the evidence about it.
+                    #
+                    # The latched status IS the transition record, so this needs no
+                    # timestamp and no re-warn floor: every probe rewrites
+                    # ``self._status``, so a recovery re-arms the warning by itself and
+                    # the next timeout speaks up. The dashboard gate needs the extra
+                    # floor only because it has no object to hang state on and its
+                    # clear path depends on a caller happening to observe the recovery.
+                    if self._status.probe_timed_out:
+                        logger.debug(
+                            "Kiro CLI at %s still unverified: probe timed out again "
+                            "after %ss (already reported)",
+                            first_candidate,
+                            _PROBE_TIMEOUT_SECS,
+                        )
+                    else:
+                        logger.warning(
+                            "Kiro CLI at %s is present and executable but could not be "
+                            "verified: the probe timed out after %ss. The CLI may be "
+                            "installed and signed in; this is not evidence it is "
+                            "missing. Further timeouts log at DEBUG until it recovers.",
+                            first_candidate,
+                            _PROBE_TIMEOUT_SECS,
+                        )
+                    self._status = PrerequisiteStatus(
+                        platform=_platform_label(self._platform),
+                        installed=True,
+                        # Unknown, not false: whoami runs through the same probe
+                        # path, and on this host it is never even reached.
+                        authenticated=False,
+                        ready=False,
+                        repair_required=False,
+                        initial_setup_complete=self._initial_setup_complete,
+                        probe_timed_out=True,
+                    )
                     self._last_probe_at = self._clock()
                     self._has_probed = True
                     return self._status
@@ -2115,8 +2787,7 @@ class KiroPrerequisiteService:
                     platform=_platform_label(self._platform),
                     initial_setup_complete=self._initial_setup_complete,
                 )
-                self._last_probe_at = self._clock()
-                self._has_probed = True
+                self._stamp_probe(probe_identity)
                 return self._status
 
             # A viable binary answered ``--version``, so it can be signed into
@@ -2144,24 +2815,29 @@ class KiroPrerequisiteService:
             # answer would not be actionable until sign-in is fixed anyway.
             rejected: list[str] = []
             rejection_detail = ""
+            acp_supported = True
             if whoami.ok:
                 rejected, rejection_detail = await self._probe_spec_acceptance(
                     self._viable_binary
                 )
+                acp_supported = await self._probe_acp_support(self._viable_binary)
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
                 installed=True,
                 authenticated=whoami.ok,
                 # A required spec the CLI refuses fails every turn, exactly like
-                # one that is absent, so it narrows readiness the same way.
-                ready=whoami.ok and not rejected,
+                # one that is absent, so it narrows readiness the same way. A CLI
+                # without the ``acp`` subcommand cannot start ANY session, so it
+                # narrows readiness too — but its remedy is an update, not a spec
+                # rewrite, so it is tracked separately from ``repair_required``.
+                ready=whoami.ok and not rejected and acp_supported,
                 repair_required=bool(rejected),
                 initial_setup_complete=self._initial_setup_complete,
                 rejected_agent_specs=rejected,
                 agent_spec_rejection_detail=rejection_detail,
+                acp_supported=acp_supported,
             )
-            self._last_probe_at = self._clock()
-            self._has_probed = True
+            self._stamp_probe(probe_identity)
             return self._status
 
     async def _probe_spec_acceptance(self, executable: str) -> tuple[list[str], str]:
@@ -2226,6 +2902,167 @@ class KiroPrerequisiteService:
                 detail = _sanitize_detail((result.output or "").strip())
         return rejected, detail
 
+    async def _probe_acp_support(self, executable: str) -> bool:
+        """Ask kiro-cli whether it exposes the ``acp`` subcommand Kiro Crew uses.
+
+        Returns ``True`` when the subcommand is present OR when the probe could
+        not establish otherwise; ``False`` only on a CLEAN "unknown subcommand"
+        rejection.
+
+        Kiro Crew launches every session as ``kiro-cli acp ...`` (see
+        ``acp.client`` / ``acp.runtime``). A CLI too old to have that subcommand
+        runs fine and signs in fine, then fails at session-create with an opaque
+        ``process exited (rc=None)`` — the same class of silent, hard-to-place
+        failure the rest of this module exists to turn into an actionable card.
+        ``acp --help`` is the read-only way to ask: a CLI that HAS the subcommand
+        exits 0 and prints its help, one that lacks it exits nonzero with an
+        "unknown subcommand" line (kiro-cli is a clap CLI).
+
+        The verdict is deliberately conservative in ONE direction. A timeout, a
+        sandbox refusal, or any nonzero exit whose text is not a recognized
+        rejection is treated as SUPPORTED, so a probe that merely failed to run
+        never blocks a working, up-to-date install behind an update card it does
+        not need. The cost is that a genuinely-too-old CLI whose rejection wording
+        is unrecognized would slip through here — but that install then fails at
+        session-create with the pre-existing error, i.e. no worse than before this
+        check existed, whereas a false positive would strand a healthy install.
+
+        A spawn, so it belongs to the probe's boot-and-explicit-action budget and
+        is gated on a successful ``whoami`` by the caller, matching the spec
+        acceptance probe.
+        """
+
+        result = await self._audited_probe(
+            "probe_acp_support",
+            executable,
+            [_ACP_SUBCOMMAND, "--help"],
+        )
+        if result.ok:
+            return True
+        # A probe that could not even run (sandbox refusal, timeout, spawn error)
+        # is not evidence the subcommand is missing. Only a clean rejection counts.
+        if result.timed_out or result.sandbox_failure is not None:
+            return True
+        haystack = (result.output or "").lower()
+        return not any(marker in haystack for marker in _ACP_UNSUPPORTED_MARKERS)
+
+    async def update_cli(self, caller: str = "") -> dict[str, Any]:
+        """Run the CLI's own in-place self-update, then return a fresh snapshot.
+
+        The Update button's action, behind an owner-gated POST so the spawn is
+        origin-checked and audited. This is the ONE place this module runs a Kiro
+        CLI subcommand that is not a read-only probe — justified because
+        ``kiro-cli update`` is the CLI updating ITSELF in place (the same command
+        the auto-update path in ``slack/gateway.py`` already runs unattended), not
+        a remote installer script or a credential-writing flow, so it adds no new
+        privileged surface. It is offered only to remedy a too-old CLI that lacks
+        the ``acp`` subcommand.
+
+        Returns a snapshot with ``cli_update_error`` set — empty on success. The
+        error is returned rather than raised so the gate can render it in place,
+        the same contract as ``repair_agent_specs``. Runs to completion within the
+        request (bounded by :data:`_UPDATE_TIMEOUT_SECS`); a re-probe follows so a
+        successful update clears the card instead of leaving stale state up.
+        """
+
+        del caller  # the SEL record is written by the route's audit middleware
+        if self._assume_ready:
+            # A test / offline gateway asserts its own readiness and has no real
+            # CLI to update; running an update there is meaningless.
+            result = await self._agent_spec_overlay(self._snapshot_dict())
+            result["cli_update_error"] = ""
+            return result
+        # Resolve the binary the way the probe does, off-loop.
+        probe_environment, candidates = await asyncio.to_thread(
+            _probe_filesystem_state,
+            self._platform,
+            self._home,
+            self._environ,
+        )
+        executable = candidates[0] if candidates else ""
+        error = ""
+        if not executable:
+            error = "Kiro CLI could not be found to update."
+        else:
+            # The resolved binary is UNVERIFIED (candidates[0] is whatever sits
+            # first on PATH; an agent that can plant ~/.local/bin/kiro-cli would
+            # otherwise have it run against the real home). Run it under the
+            # strict sandbox — the same posture verification uses for an
+            # unverified candidate — so ~/.aws / ~/.ssh stay hidden even though
+            # the owner clicked Update. Network reach for the self-update comes
+            # from the proxy keys (which govern egress), NOT from the standard
+            # sandbox's real-home exposure; the identity credential is
+            # deliberately omitted because `update` fetches a binary, it does
+            # not authenticate.
+            update_environment = dict(probe_environment)
+            update_environment.update(
+                _allowlisted_env(self._environ, _IDENTITY_PROXY_ENV_KEYS)
+            )
+            await self._audit(
+                action="update_cli",
+                outcome="invoked",
+                caller="gateway-setup",
+                critical=True,
+            )
+            try:
+                update = await self._run(
+                    executable,
+                    ["update"],
+                    env=update_environment,
+                    timeout_secs=_UPDATE_TIMEOUT_SECS,
+                    sandbox_mode=_UNVERIFIED_SANDBOX_MODE,
+                    # _hidden_probe_dirs (not _crew_hidden_dirs) so the unverified
+                    # binary cannot read the Kiro identity token store either — the
+                    # same isolation the read-only probe applies. `update` fetches a
+                    # binary; it has no need for the on-disk identity credential.
+                    extra_hidden_dirs=self._hidden_probe_dirs,
+                )
+            except asyncio.CancelledError:
+                await self._set_terminal_audit(
+                    "update_cli", "failed", "gateway-setup", "cancelled"
+                )
+                raise
+            except Exception as exc:
+                logger.warning("kiro-cli update failed to run", exc_info=True)
+                await self._set_terminal_audit(
+                    "update_cli", "failed", "gateway-setup", "update execution failed"
+                )
+                error = _sanitize_detail(f"{type(exc).__name__}: {exc}")
+            else:
+                if update.timed_out:
+                    error = (
+                        "kiro-cli update did not finish in time. Run "
+                        f"`{KIRO_CLI_UPDATE_COMMAND}` on the gateway host directly."
+                    )
+                elif not update.ok:
+                    error = _sanitize_detail(
+                        (update.output or "").strip()
+                        or f"kiro-cli update exited with code {update.returncode}"
+                    )
+                updated = update.ok and not error
+                await self._set_terminal_audit(
+                    "update_cli",
+                    "completed" if updated else "failed",
+                    "gateway-setup",
+                    _terminal_audit_detail(update, updated),
+                )
+        if not error:
+            # Re-probe so a successful update flips ``acp_supported`` / ``ready``
+            # and the card clears. Explicit-action half of the probe budget.
+            try:
+                await self._probe(force=True)
+            except Exception:  # noqa: BLE001 — stale state beats a 500
+                logger.warning("Re-probe after kiro-cli update failed", exc_info=True)
+        result = await self._agent_spec_overlay(self._snapshot_dict())
+        if not error and not result.get("acp_supported", True):
+            error = (
+                "The update ran but this kiro-cli still has no `acp` command. "
+                f"Update it manually with `{KIRO_CLI_UPDATE_COMMAND}` on the "
+                "gateway host, or reinstall from the setup page."
+            )
+        result["cli_update_error"] = error
+        return result
+
     async def _audited_probe(
         self,
         action: str,
@@ -2264,17 +3101,11 @@ class KiroPrerequisiteService:
                 "probe execution failed",
             )
             return ProcessResult(ok=False, error="Kiro CLI probe could not run")
-        if result.ok:
-            audit_detail = ""
-        elif result.timed_out:
-            audit_detail = "timeout"
-        else:
-            audit_detail = "nonzero exit"
         await self._set_terminal_audit(
             action,
             "completed" if result.ok else "failed",
             "gateway-status",
-            audit_detail,
+            _terminal_audit_detail(result, result.ok),
         )
         return result
 
@@ -2421,30 +3252,29 @@ class KiroPrerequisiteService:
                 "probe execution failed",
             )
             return ProcessResult(ok=False, error="Kiro identity probe could not run")
-        if result.ok:
-            audit_detail = ""
-        elif result.timed_out:
-            audit_detail = "timeout"
-        else:
-            audit_detail = "nonzero exit"
         await self._set_terminal_audit(
             action,
             "completed" if result.ok else "failed",
             "gateway-status",
-            audit_detail,
+            _terminal_audit_detail(result, result.ok),
         )
         return result
 
     def _mark_setup_complete(self) -> None:
         if self._initial_setup_complete:
             return
+        # restrict_to_owner=True locks the staged temp file down before any
+        # content reaches it (0o600 on POSIX, an owner-only DACL on Windows), so
+        # the published marker is owner-only from the instant the rename makes
+        # it visible. The default restrict_on_error="raise" is what makes that
+        # unconditional: a lockdown that fails aborts before the rename instead
+        # of publishing the marker under the parent's inherited DACL.
         atomic_write(
             self._setup_marker,
             "complete\n",
             fsync=True,
-            mode=0o600,
+            restrict_to_owner=True,
         )
-        platform_compat.restrict_to_owner(str(self._setup_marker))
         self._initial_setup_complete = True
 
     async def _set_terminal_audit(

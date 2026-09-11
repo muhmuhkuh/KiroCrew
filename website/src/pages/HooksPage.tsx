@@ -1,17 +1,20 @@
 import { compareText } from '../i18n/format'
-import { useState, useMemo } from 'react'
+import { Fragment, useCallback, useState, useMemo, useRef } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { AlertTriangle, Anchor, Link2, Lock } from 'lucide-react'
+import { AlertTriangle, Anchor, ChevronDown, Link2, Lock, MoreHorizontal, Pencil, Play } from 'lucide-react'
 import { api } from '../api/client'
 import { useProvider } from '../providers'
 import SkillsMultiSelect from '../components/HookSkillsSelect'
 import { Card, CardTitle, PageHeader, StatCard, Btn, SendBtn, Input, Badge, SearchInput, EmptyState } from '../components/ui'
+import ErrorNotice from '../components/ErrorNotice'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../components/ui/dropdown-menu'
 import InfoTip from '../components/InfoTip'
 import SimpleSelect from '../components/SimpleSelect'
 import { esc } from '../api/helpers'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import { useSortableTable } from '../hooks/useSortableTable'
 import { useScrollEdges } from '../hooks/useScrollEdges'
+import { useArmedDelete } from '../hooks/useArmedDelete'
 import SortableHeader from '../components/SortableHeader'
 
 import { i18nT } from '../i18n/t'
@@ -19,7 +22,7 @@ interface Hook {
   id: string; name: string; event: string; matcher: string
   matcher_mode: string; command: string; skills: string[]
   timeout: number; enabled: boolean
-  last_run: number; last_status: string; run_count: number
+  last_run: number; last_status: string; last_error: string; run_count: number
 }
 
 /** Result payload from POST /api/hooks/:id/test. */
@@ -67,6 +70,26 @@ function HookForm({ hook, onSave, onCancel }: {
   const [skills, setSkills] = useState<string[]>(hook?.skills || [])
   const [timeout, setTimeout_] = useState(hook?.timeout || 30)
   const isToolHook = event === 'PreToolUse' || event === 'PostToolUse'
+  // Skills fire only for a standalone skills hook (no command) on
+  // UserPromptSubmit/AgentSpawn — a command makes them inert, and other events
+  // have no consumer for the injected directive.
+  const isSkillsCapable =
+    (event === 'UserPromptSubmit' || event === 'AgentSpawn') && !command.trim()
+  // A legacy/edited hook can arrive with skills that can no longer fire. Show
+  // them read-only with a warning (never silently delete on mount — that would
+  // be data loss the user never asked for). The save sends skills unchanged;
+  // the backend rejects the invalid pairing with an actionable field-level
+  // error, and the warning banner tells the user what to change.
+  const inertSkills = !isSkillsCapable && skills.length > 0
+
+  // Dynamic placeholder text per matcher mode
+  const matcherPlaceholder = isToolHook
+    ? i18nT('pages.hooksPage.matcher_tool_filter_e_g_fs_write_git')
+    : matcherMode === 'regex'
+      ? i18nT('pages.hooksPage.matcher_placeholder_regex')
+      : matcherMode === 'contains'
+        ? i18nT('pages.hooksPage.matcher_placeholder_contains')
+        : i18nT('pages.hooksPage.matcher_optional_e_g_deploy')
 
   return (
     <Card>
@@ -100,7 +123,7 @@ function HookForm({ hook, onSave, onCancel }: {
               breaking, so a sibling that does not fit wraps instead: 231px worst
               case, never below 120px. Same idiom as the tokens row in
               WebhooksPage, which had the identical defect. */}
-          <Input className="basis-full sm:basis-auto" placeholder={isToolHook ? i18nT('pages.hooksPage.matcher_tool_filter_e_g_fs_write_git') : i18nT('pages.hooksPage.matcher_optional_e_g_deploy')} value={matcher} onChange={e => setMatcher(e.target.value)} />
+          <Input className="basis-full sm:basis-auto" placeholder={matcherPlaceholder} value={matcher} onChange={e => setMatcher(e.target.value)} />
           {!isToolHook && (
             <SimpleSelect
               options={MATCHER_MODES}
@@ -115,9 +138,19 @@ function HookForm({ hook, onSave, onCancel }: {
             <span>{i18nT('pages.hooksPage.s')}</span>
           </div>
         </div>
-        <div>
-          <SkillsMultiSelect selected={skills} onChange={setSkills} />
-        </div>
+        {isSkillsCapable && (
+          <div>
+            <SkillsMultiSelect selected={skills} onChange={setSkills} />
+          </div>
+        )}
+        {inertSkills && (
+          <div className="flex items-start gap-2 text-[13px] text-warn bg-warn-subtle border border-warn/30 rounded-lg px-3 py-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>
+              {i18nT('pages.hooksPage.skills_inert_warning', { skills: skills.join(', ') })}
+            </span>
+          </div>
+        )}
         <div className="flex gap-2 items-center">
           <SendBtn onClick={() => onSave({ name, event, matcher, matcher_mode: matcherMode, command, skills, timeout })}>{i18nT('pages.hooksPage.save')}</SendBtn>
           <Btn onClick={onCancel} className="h-9 px-4 text-sm font-semibold rounded-lg">{i18nT('pages.hooksPage.cancel')}</Btn>
@@ -134,30 +167,78 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
     queryFn: () => api.hooks().then((r: { hooks?: Hook[] }) => r.hooks || []),
   })
   const error = hooksErr ? i18nT('pages.hooksPage.failed_to_load_hooks', { error: hooksErr instanceof Error ? hooksErr.message : String(hooksErr) }) : null
-  const { data: providerHooks = {}, error: providerHookErr } = useQuery({
+  const { data: providerHooks = {}, error: providerHookErr, refetch: refetchProviderHooks } = useQuery({
     queryKey: ['provider-hooks', provider.id],
     queryFn: () => provider.fetchProviderHooks(),
     enabled: provider.capabilities.hooks,
   })
-  const providerHookError = providerHookErr ? `Failed to load ${provider.labels.hooksSection.toLowerCase()}` : null
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<string | null>(null)
+  // A HookForm holds unsaved name/command/matcher text while open, and the
+  // agent hand-off unmounts this page — so every ErrorNotice below hands off
+  // only when no form is open.
+  const handoffSafe = !creating && !editing
+  // Which row has its persisted last_error expanded beneath it (one at a time).
+  const [openErrorId, setOpenErrorId] = useState<string | null>(null)
   const [testResult, setTestResult] = useState<{ id: string; data: HookTestResult } | null>(null)
+  // Inline failure state for a rejected hook-test request (network error, 5xx,
+  // etc.). This is distinct from testResult (a completed run, which can itself
+  // report a non-zero exit) and from the global mutError banner: the request
+  // never produced a HookTestResult, so the panel would otherwise render empty.
+  const [testError, setTestError] = useState<{ id: string; message: string } | null>(null)
   const [filter, setFilter] = useState('')
+  // React Query's pending render is asynchronous. Claim request ownership in a
+  // ref before mutate() so two same-tick clicks cannot launch overlapping tests
+  // whose callbacks would race to populate one shared result panel.
+  const testInFlight = useRef(false)
 
   const mutOpts = { onSuccess: () => refresh(), onError: (e: Error) => e }
   const createMut = useMutation({ mutationFn: (data: Partial<Hook>) => api.createHook(data), ...mutOpts, onSuccess: () => { setCreating(false); refresh() } })
   const updateMut = useMutation({ mutationFn: ({ id, data }: { id: string; data: Partial<Hook> }) => api.updateHook(id, data), ...mutOpts, onSuccess: () => { setEditing(null); refresh() } })
-  const deleteMut = useMutation({ mutationFn: (id: string) => api.deleteHook(id), ...mutOpts })
+  const deleteMut = useMutation({
+    mutationFn: (id: string) => api.deleteHook(id),
+    // Refetch BEFORE the armed-delete hook re-enables the row (mutateAsync
+    // resolves only after this settles, and useArmedDelete removes the
+    // pending id after deleteFn resolves): a deleted row must disappear
+    // rather than flash a re-enabled Delete. Deliberately NOT ...mutOpts —
+    // its `onSuccess: () => refresh()` does not await, so it cannot carry
+    // this ordering.
+    onSettled: async () => { await refresh() },
+  })
   const toggleMut = useMutation({ mutationFn: (id: string) => api.toggleHook(id), ...mutOpts })
-  const testMut = useMutation({ mutationFn: (id: string) => api.testHook(id), onSuccess: (r: { result: HookTestResult }, id: string) => { setTestResult({ id, data: r.result }); refresh() } })
+  const testMut = useMutation({
+    mutationFn: (id: string) => api.testHook(id),
+    onSuccess: (r: { result: HookTestResult }, id: string) => { setTestError(null); setTestResult({ id, data: r.result }); refresh() },
+    // Populate the inline panel on rejection so a failed request is not shown as
+    // an empty result. The global mutError banner still fires (testMut.error is
+    // read into it below), so the global error path is preserved, not replaced.
+    onError: (e: Error, id: string) => { setTestError({ id, message: e instanceof Error ? e.message : String(e) }) },
+    onSettled: () => { testInFlight.current = false },
+  })
 
-  const mutError = createMut.error?.message || updateMut.error?.message || deleteMut.error?.message || toggleMut.error?.message || testMut.error?.message || null
+  // Delete is the shared arm→Confirm→decay machine (useArmedDelete, the
+  // CronRowActions convention — SchedulePage consumes it the same way). A
+  // menu that closes on select cannot host the armed state, which is why
+  // Delete stays out of the ⋯ overflow below. Failures surface through
+  // deleteMut.error via the mutError banner, so the rejection confirm
+  // swallows is already reported. mutateAsync is referentially stable, so it
+  // is handed over directly.
+  const { armedId: confirmDeleteId, arm: armDelete, confirm: confirmDelete, isDeleting } = useArmedDelete(deleteMut.mutateAsync)
+
+  // `testMut` is deliberately absent: a failed hook test is owned by the
+  // titled `hook-test-error` notice beside the row, and a second, bare copy
+  // at the top of the page reads as a page-wide outage.
+  const mutError = createMut.error?.message || updateMut.error?.message || deleteMut.error?.message || toggleMut.error?.message || null
   const handleCreate = (data: Partial<Hook>) => createMut.mutate(data)
   const handleUpdate = (id: string, data: Partial<Hook>) => updateMut.mutate({ id, data })
-  const handleDelete = (id: string) => deleteMut.mutate(id)
   const handleToggle = (id: string) => toggleMut.mutate(id)
-  const handleTest = (id: string) => { setTestResult(null); testMut.mutate(id) }
+  const handleTest = (id: string) => {
+    if (testInFlight.current) return
+    testInFlight.current = true
+    setTestResult(null)
+    setTestError(null)
+    testMut.mutate(id)
+  }
 
   const enabled = hooks.filter(h => h.enabled).length
   const totalRuns = hooks.reduce((s, h) => s + h.run_count, 0)
@@ -180,6 +261,26 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
   // the table overflows whenever its container is narrower than the declared
   // column widths, which a resizable nav rail can cause at any viewport size.
   const [attachHooksScroller, hooksTableEdges, , attachHooksTable] = useScrollEdges<HTMLDivElement>()
+  // The scroller's visible width, for the expanded last_error row: the table
+  // can be wider than its scroller (sticky Actions column, #4296), and a row
+  // that simply spanned the columns would paint its far end under that column
+  // and scroll out of view. The row's notice is instead a sticky-left block
+  // exactly as wide as the viewport onto the table, so it reads in full at
+  // any scroll position.
+  const [hooksScrollerWidth, setHooksScrollerWidth] = useState(0)
+  const hooksScrollerRo = useRef<ResizeObserver | null>(null)
+  const attachHooksScrollerMeasured = useCallback((node: HTMLDivElement | null) => {
+    attachHooksScroller(node)
+    hooksScrollerRo.current?.disconnect()
+    hooksScrollerRo.current = null
+    if (!node) return
+    setHooksScrollerWidth(node.clientWidth)
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => setHooksScrollerWidth(node.clientWidth))
+      ro.observe(node)
+      hooksScrollerRo.current = ro
+    }
+  }, [attachHooksScroller])
 
   if (loading) return <div className="p-6 text-muted">{i18nT('pages.hooksPage.loading')}</div>
 
@@ -197,13 +298,22 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
         </div>
 
         {(error || mutError) && (
-          <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
-            <span className="text-danger text-lg shrink-0"><AlertTriangle className="lucide-inline" /></span>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm text-danger font-medium">{i18nT('pages.hooksPage.error')}</div>
-              <div className="text-[13px] text-danger/90 mt-0.5">{error || mutError}</div>
-            </div>
-            <Btn onClick={() => { createMut.reset(); updateMut.reset(); deleteMut.reset(); toggleMut.reset(); testMut.reset() }} className="text-danger/60 hover:text-danger shrink-0">×</Btn>
+          <div className="mb-4 flex items-start gap-2 animate-rise">
+            {/* No hand-off while a HookForm is open (`creating` / `editing`) —
+                its fields are unsaved. With no form open the failures here are
+                the hooks read or an action on an already-saved hook. A failed
+                READ offers Retry and no dismiss (dismissing a query error would
+                only hide a list that is still missing); a failed action offers
+                dismiss and no Retry — so the row never holds more than two
+                controls (max-two-buttons-per-row). */}
+            <ErrorNotice
+              message={error || mutError}
+              onDismiss={hooksErr ? undefined : () => { createMut.reset(); updateMut.reset(); deleteMut.reset(); toggleMut.reset(); testMut.reset() }}
+              askAgent={handoffSafe}
+              className="flex-1"
+              testId="hooks-error"
+            />
+            {hooksErr && <Btn onClick={() => refresh()} className="shrink-0">{i18nT('pages.hooksPage.retry')}</Btn>}
           </div>
         )}
 
@@ -226,7 +336,7 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
           {hooks.length === 0 ? (
             <EmptyState icon={<Anchor className="lucide-inline" />} title={i18nT('pages.hooksPage.no_hooks_yet')} subtitle={i18nT('pages.hooksPage.create_a_hook_to_run_scripts_on_chat_events')} />
           ) : (
-            <div ref={attachHooksScroller} className="overflow-x-auto">
+            <div ref={attachHooksScrollerMeasured} className="overflow-x-auto">
               {/* This table is AUTO layout (`w-full border-collapse`, no
                   table-fixed), so column edges depend on content and a
                   wrapper-anchored cue cannot know where the pinned column
@@ -254,7 +364,13 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                     <SortableHeader label={i18nT('pages.hooksPage.runs')} sortKey="runs" sort={hookSort} onToggle={toggleHookSort} className="w-[60px]" />
                     <SortableHeader label={i18nT('pages.hooksPage.status')} sortKey="status" sort={hookSort} onToggle={toggleHookSort} className="w-[80px]" />
                     <SortableHeader label={i18nT('pages.hooksPage.last_run')} sortKey="lastRun" sort={hookSort} onToggle={toggleHookSort} className="w-[90px]" />
-                    <th className="sticky right-0 bg-card text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium w-[160px]">
+                    {/* Pinned sticky-right per #4296. No width hint: under auto
+                        table layout a specified width is only a preferred width
+                        — the nowrap content's minimum still wins when larger —
+                        and this cell's widest state (the armed "Delete?" label)
+                        varies by locale, so a hint is either redundant or
+                        overridden. */}
+                    <th className="sticky right-0 bg-card text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium">
                       {hooksTableEdges.right && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
                       {hooksTableEdges.right && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
                       {i18nT('pages.hooksPage.actions')}
@@ -265,7 +381,8 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                   {filtered.length === 0 ? (
                     <tr><td colSpan={9} className="text-muted italic px-2.5 py-3.5 text-sm">{i18nT('pages.hooksPage.no_matching_hooks')}</td></tr>
                   ) : sortedHooks.map((h, i) => (
-                    <tr key={h.id} className={`group/hookrow hover:bg-bg-hover transition-colors ${h.enabled ? '' : 'opacity-50'}`}>
+                    <Fragment key={h.id}>
+                    <tr className={`group/hookrow hover:bg-bg-hover transition-colors ${h.enabled ? '' : 'opacity-50'}`}>
                       <td className="px-2.5 py-2 border-b border-border">
                         <button
                           className={`w-9 h-5 rounded-full relative transition-colors cursor-pointer ${h.enabled ? 'bg-accent' : 'bg-border'}`}
@@ -281,10 +398,27 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                       <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{h.matcher ? esc(h.matcher) : <span className="italic">—</span>}</td>
                       <td className="px-2.5 py-2 border-b border-border text-sm font-mono">{h.run_count}</td>
                       <td className="px-2.5 py-2 border-b border-border text-sm">
+                        {/* The persisted last_error is not tooltip-only: the
+                            chevron expands it beneath the row as an ErrorNotice
+                            (the status column is too narrow to hold it inline). */}
                         {!h.last_status ? <span className="text-muted italic">—</span>
                           : h.last_status === 'ok' ? <Badge variant="ok">{i18nT('pages.hooksPage.ok')}</Badge>
-                          : h.last_status === 'error' ? <Badge variant="err">{i18nT('pages.hooksPage.error')}</Badge>
-                          : <Badge variant="warn">{h.last_status}</Badge>}
+                          : (
+                            <span className="inline-flex items-center gap-1">
+                              <Badge variant={h.last_status === 'error' ? 'err' : 'warn'}>{h.last_status === 'error' ? i18nT('pages.hooksPage.error') : h.last_status}</Badge>
+                              {h.last_error && (
+                                <Btn
+                                  type="button"
+                                  className="px-1 py-0 border-transparent text-muted hover:text-text"
+                                  aria-expanded={openErrorId === h.id}
+                                  aria-label={i18nT('pages.hooksPage.show_last_error', { name: h.name })}
+                                  onClick={() => setOpenErrorId(openErrorId === h.id ? null : h.id)}
+                                >
+                                  <ChevronDown size={13} className={`transition-transform ${openErrorId === h.id ? 'rotate-180' : ''}`} aria-hidden="true" />
+                                </Btn>
+                              )}
+                            </span>
+                          )}
                       </td>
                       <td className="px-2.5 py-2 border-b border-border text-sm text-muted">{timeAgo(h.last_run)}</td>
                       {/* Pinned like the header cell, on an OPAQUE `bg-card`.
@@ -293,8 +427,11 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                           mirror `.table-striped`'s translucent `--card-hl` zebra
                           (which outranks the row's hover utility by specificity,
                           so hover is deliberately NOT mirrored there), odd rows
-                          mirror the hover tint via the named row group. */}
-                      <td aria-label={i18nT('pages.hooksPage.actions')} className="sticky right-0 bg-card px-2.5 py-2 border-b border-border text-sm">
+                          mirror the hover tint via the named row group. No
+                          aria-label: the header already names the column, and a
+                          cell label would triple-name the ⋯ trigger for screen
+                          readers. */}
+                      <td className="sticky right-0 bg-card px-2.5 py-2 border-b border-border text-sm whitespace-nowrap">
                         <div aria-hidden className={`absolute inset-0 -z-10 transition-colors ${i % 2 === 1 ? 'bg-[var(--card-hl)]' : 'group-hover/hookrow:bg-bg-hover'}`} />
                         {hooksTableEdges.right && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
                         {/* The fade must ramp toward the surface it abuts: on a
@@ -302,13 +439,64 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
                             (even rows keep from-card — zebra outranks the row's
                             hover utility, so their surface never changes). */}
                         {hooksTableEdges.right && <div aria-hidden="true" className={`pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent ${i % 2 === 1 ? '' : 'group-hover/hookrow:from-bg-hover'}`} />}
-                        <div className="flex gap-1.5">
-                          <Btn onClick={() => handleTest(h.id)} className="bg-accent/10 text-accent border-accent/30 hover:bg-accent/20">{i18nT('pages.hooksPage.test')}</Btn>
-                          <Btn onClick={() => { setEditing(h.id); setCreating(false) }}>{i18nT('pages.hooksPage.edit')}</Btn>
-                          <Btn danger onClick={() => { if (window.confirm(i18nT('pages.hooksPage.delete_hook', { name: h.name }))) handleDelete(h.id) }}>{i18nT('pages.hooksPage.delete')}</Btn>
+                        {/* Two controls plus the overflow menu (max-two-buttons-per-row,
+                            following CronRowActions). Test stays in the row as the
+                            per-glance action; Edit lives in the ⋯ menu. Delete stays a
+                            row-level button — its arm→Confirm state needs the button
+                            visible, and a menu that closes on select cannot host the
+                            armed state. The armed label explains itself IN THE LABEL:
+                            the `title` tooltip is hover-only, so on touch it does not
+                            exist. The visible text is also the accessible name — no
+                            aria-label, which would override the label a sighted user
+                            reads (WCAG 2.5.3, Label in Name); the row names the hook. */}
+                        <div className="flex items-center gap-1.5">
+                          <Btn disabled={testMut.isPending} onClick={() => handleTest(h.id)} className="bg-accent/10 text-accent border-accent/30 hover:bg-accent/20">{i18nT('pages.hooksPage.test')}</Btn>
+                          <Btn
+                            danger
+                            disabled={isDeleting(h.id)}
+                            title={confirmDeleteId === h.id ? i18nT('pages.hooksPage.click_again_to_confirm') : i18nT('pages.hooksPage.delete_hook', { name: h.name })}
+                            onClick={() => { if (confirmDeleteId === h.id) void confirmDelete(h.id); else armDelete(h.id) }}
+                          >{isDeleting(h.id) ? '...' : confirmDeleteId === h.id ? i18nT('pages.hooksPage.confirm_delete_hook') : i18nT('pages.hooksPage.delete')}</Btn>
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Btn
+                                className="!px-1.5"
+                                aria-label={i18nT('pages.hooksPage.more_actions')}
+                                title={i18nT('pages.hooksPage.more_actions')}
+                              >
+                                <MoreHorizontal size={14} />
+                              </Btn>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" className="min-w-[160px]">
+                              {/* Test is also in the row; repeated here so the menu is a
+                                  complete account of what can be done to the hook. */}
+                              <DropdownMenuItem disabled={testMut.isPending} onSelect={() => handleTest(h.id)}>
+                                <Play size={13} className="shrink-0 text-accent" />
+                                <span>{i18nT('pages.hooksPage.test')}</span>
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onSelect={() => { setEditing(h.id); setCreating(false) }}>
+                                <Pencil size={13} className="shrink-0 text-muted" />
+                                <span>{i18nT('pages.hooksPage.edit')}</span>
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         </div>
                       </td>
                     </tr>
+                    {openErrorId === h.id && h.last_error && (
+                      <tr>
+                        <td colSpan={9} className="p-0 border-b border-border">
+                          {/* Sticky-left, scroller-wide: see hooksScrollerWidth. */}
+                          <div className="sticky left-0 px-2.5 py-2" style={hooksScrollerWidth ? { width: hooksScrollerWidth } : undefined}>
+                            {/* No hand-off while a HookForm is open (`creating` /
+                                `editing`) — its fields are unsaved. Otherwise the
+                                last_error is persisted server-side; nothing to lose. */}
+                            <ErrorNotice message={h.last_error} askAgent={handoffSafe} />
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   ))}
                 </tbody>
               </table>
@@ -319,23 +507,54 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
             return (
               <div className="mt-3 bg-bg-elevated border border-border rounded-lg p-4 animate-scale-in">
                 <div className="flex items-center gap-3 mb-2">
-                  <span className="text-sm font-medium text-text">{i18nT('pages.hooksPage.test_result')}{h ? `: ${h.name}` : ''}</span>
+                  <span className="min-w-0 break-words text-sm font-medium text-text">{i18nT('pages.hooksPage.test_result')}{h ? `: ${h.name}` : ''}</span>
                   <Badge variant={testResult.data.exit_code === 0 ? 'ok' : 'err'}>{testResult.data.exit_code === 0 ? 'OK' : `exit ${testResult.data.exit_code}`}</Badge>
                   <span className="text-[12px] text-muted font-mono">{testResult.data.duration_ms}{i18nT('pages.hooksPage.ms')}</span>
-                  <Btn onClick={() => setTestResult(null)} className="ml-auto">×</Btn>
+                  <Btn aria-label={i18nT('app.dismiss')} onClick={() => setTestResult(null)} className="ml-auto shrink-0">×</Btn>
                 </div>
-                {testResult.data.error && <div className="text-[13px] text-danger mb-1">{testResult.data.error}</div>}
+                {/* No hand-off while a HookForm is open (`creating` / `editing`) —
+                    its fields are unsaved. Otherwise the test ran against a saved
+                    hook and nothing is lost. */}
+                <ErrorNotice variant="inline" message={testResult.data.error} askAgent={handoffSafe} className="mb-1" />
                 {testResult.data.stdout && <pre className="whitespace-pre-wrap text-[12px] font-mono text-text/80 bg-bg border border-border rounded-md p-3 max-h-[200px] overflow-auto">{testResult.data.stdout}</pre>}
                 {testResult.data.stderr && <pre className="whitespace-pre-wrap text-[12px] font-mono text-warn bg-bg border border-border rounded-md p-3 max-h-[100px] overflow-auto mt-2">{testResult.data.stderr}</pre>}
               </div>
+            )
+          })()}
+          {testError && (() => {
+            const h = hooks.find(x => x.id === testError.id)
+            return (
+              <>
+                {/* Same draft decision as the banner: no hand-off while a HookForm
+                    (`creating` / `editing`) is open, otherwise safe. */}
+                <ErrorNotice
+                  title={h ? i18nT('pages.hooksPage.test_failed_for', { name: h.name }) : i18nT('pages.hooksPage.test_failed')}
+                  message={testError.message}
+                  onDismiss={() => setTestError(null)}
+                  askAgent={handoffSafe}
+                  className="mt-3 animate-scale-in"
+                  testId="hook-test-error"
+                />
+              </>
             )
           })()}
         </Card>
         {provider.capabilities.hooks && (
         <Card>
           <CardTitle>{provider.labels.hooksSection} <InfoTip text={i18nT('pages.hooksPage.read_only_view_of_provider_hooks', { path: provider.labels.configFile || i18nT('pages.hooksPage.config') })} /></CardTitle>
-          {providerHookError ? (
-            <EmptyState icon={<AlertTriangle className="lucide-inline text-warning" />} title={i18nT('pages.hooksPage.failed_to_load', { section: provider.labels.hooksSection.toLowerCase() })} subtitle={i18nT('pages.hooksPage.check_your_connection_or_configuration_and_try_a')} />
+          {providerHookErr ? (
+            <div className="flex items-start gap-2">
+              {/* A read failure dressed as an empty state hid the cause. No
+                  hand-off while a HookForm (`creating` / `editing`) is open;
+                  otherwise this read-only view holds nothing to lose. */}
+              <ErrorNotice
+                title={i18nT('pages.hooksPage.failed_to_load', { section: provider.labels.hooksSection.toLowerCase() })}
+                message={providerHookErr instanceof Error ? providerHookErr.message : String(providerHookErr)}
+                askAgent={handoffSafe}
+                className="flex-1"
+              />
+              <Btn onClick={() => refetchProviderHooks()} className="shrink-0">{i18nT('pages.hooksPage.retry')}</Btn>
+            </div>
           ) : Object.values(providerHooks).some(entries => entries.length > 0) ? (
             // Focusable, named scrollport. This table is read-only — every cell
             // is plain text — and its columns reserve 700px, so at phone width
@@ -356,6 +575,7 @@ export default function HooksPage({ embedded }: { embedded?: boolean } = {}) {
             // redundant Tab press between every row.
             <div
               className="overflow-x-auto"
+              // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- the tab stop IS the a11y fix, per the note above: a scrollport whose content holds no focusable child is unreachable by keyboard in every engine but Chromium >=130, and axe/IBM still require the explicit stop. `role="region"` + `aria-label` are what keep it from announcing as an anonymous div.
               tabIndex={0}
               role="region"
               aria-label={provider.labels.hooksSection}

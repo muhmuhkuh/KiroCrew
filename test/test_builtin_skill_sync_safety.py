@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import skills as skills_mod
 from kiro_crew.skills import (
     _PROVENANCE_MARKER,
@@ -160,6 +161,7 @@ class TestNameCollisionPreservation:
         second = _backup_skill_md(base / ".deploy.user-backup.2")
         assert "USER second" in second.read_text(encoding="utf-8")
 
+    @requires_symlinks
     def test_dangling_symlink_at_backup_name_is_not_overwritten(
         self, builtin_root: Path, base: Path
     ) -> None:
@@ -349,6 +351,144 @@ class TestLegitimateUpdatesStillHappen:
         assert not (user / _PROVENANCE_MARKER).exists()
         assert "USER own" in (user / "SKILL.md").read_text(encoding="utf-8")
 
+    def test_script_only_package_update_reaches_the_install(
+        self, builtin_root: Path, base: Path
+    ) -> None:
+        # The manifest is NOT a version stamp for the skill. A release that
+        # only touches a bundled script leaves SKILL.md byte-identical with its
+        # packaged mtime, and a manifest-only update gate then reports "up to
+        # date" forever -- the install keeps executing superseded code. Broke
+        # prepare-pr in practice: its extractor was fixed in the package while
+        # every install kept the previous copy and failed against CI's current
+        # workflow.
+        src = _make_skill(builtin_root, "helper", "v1", {"scripts/tool.py": "# v1"})
+        _ensure_builtin_skills(base)
+        assert (base / "helper" / "scripts" / "tool.py").read_text(encoding="utf-8") == "# v1"
+
+        script = src / "scripts" / "tool.py"
+        script.write_text("# v2", encoding="utf-8")
+        _bump_mtime(script)
+        manifest_mtime = (src / "SKILL.md").stat().st_mtime
+
+        _ensure_builtin_skills(base)
+
+        assert (base / "helper" / "scripts" / "tool.py").read_text(encoding="utf-8") == "# v2"
+        # The manifest genuinely never moved, so the update cannot have come
+        # from the manifest arm of the gate.
+        assert (src / "SKILL.md").stat().st_mtime == manifest_mtime
+        assert not os.path.lexists(base / ".helper.user-backup")
+
+    def test_provenance_marker_mtime_cannot_suppress_an_update(
+        self, builtin_root: Path, base: Path
+    ) -> None:
+        # The marker is written AFTER the copy, so its mtime is install time.
+        # Counting it would make every destination newer than the package it
+        # came from and the tree arm would never fire again.
+        src = _make_skill(builtin_root, "helper", "v1", {"scripts/tool.py": "# v1"})
+        _ensure_builtin_skills(base)
+        _bump_mtime(base / "helper" / _PROVENANCE_MARKER, seconds=600.0)
+
+        script = src / "scripts" / "tool.py"
+        script.write_text("# v2", encoding="utf-8")
+        _bump_mtime(script)
+
+        _ensure_builtin_skills(base)
+
+        assert (base / "helper" / "scripts" / "tool.py").read_text(encoding="utf-8") == "# v2"
+
+    def test_unchanged_install_is_not_recopied_each_sync(
+        self, builtin_root: Path, base: Path
+    ) -> None:
+        # Widening the gate must not make a steady state churn: copytree copies
+        # with copy2, so an untouched install is mtime-equal to its package and
+        # nothing is due. A re-copy would rotate the retirement slot on every
+        # startup, quietly discarding the previous cycle's parked tree.
+        _make_skill(
+            builtin_root,
+            "helper",
+            "v1",
+            # A script NEWER than the manifest is the ordinary packaged shape,
+            # and the one that would loop if the tree arm compared the source's
+            # newest file against the destination's manifest.
+            {"scripts/tool.py": "# v1"},
+        )
+        _bump_mtime(builtin_root / "helper" / "scripts" / "tool.py")
+        _ensure_builtin_skills(base)
+
+        _ensure_builtin_skills(base)
+
+        assert not os.path.lexists(base / ".helper.superseded")
+
+    def test_first_source_root_owns_a_colliding_name(
+        self, builtin_root: Path, base: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Two source roots shipping one name must not race each other's copy
+        # inside a single run. Once the project pass installs, the destination is
+        # this run's own output rather than user data, so letting the packaged
+        # pass replace it decides the winner by comparing mtimes across two
+        # unrelated trees -- and a project skill loses to a packaged one that
+        # merely carries a newer auxiliary file.
+        project = tmp_project = base.parent / "project-skills"
+        project.mkdir()
+        _make_skill(project, "helper", "PROJECT", {"scripts/tool.py": "# project"})
+        packaged = _make_skill(
+            builtin_root, "helper", "PACKAGED", {"scripts/tool.py": "# packaged"}
+        )
+        # Both the manifest arm and the tree arm would otherwise fire.
+        _bump_mtime(packaged / "SKILL.md")
+        _bump_mtime(packaged / "scripts" / "tool.py")
+        monkeypatch.setattr(skills_mod, "_project_skills_dir", lambda: tmp_project)
+
+        _ensure_builtin_skills(base)
+
+        installed = (base / "helper" / "SKILL.md").read_text(encoding="utf-8")
+        assert "PROJECT" in installed, installed
+        assert (
+            base / "helper" / "scripts" / "tool.py"
+        ).read_text(encoding="utf-8") == "# project"
+
+    def test_destination_vanishing_mid_sync_does_not_abort_the_run(
+        self, builtin_root: Path, base: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The gateway and the CLI sync the same home concurrently, so the
+        # destination can be claimed between the exists() check and the manifest
+        # comparison -- a window the tree walks widened. An unguarded stat raises
+        # FileNotFoundError out of the startup sync, losing every skill queued
+        # behind it, so the vanished destination must read as update-due instead.
+        _make_skill(builtin_root, "aaa-helper", "v1")
+        _make_skill(builtin_root, "zzz-later", "v1")
+        _ensure_builtin_skills(base)
+
+        real_stat = Path.stat
+        vanished = base / "aaa-helper" / "SKILL.md"
+        seen = [0]
+
+        def _vanish(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+            # The FIRST stat of the destination is the sync's own exists()
+            # probe, which must succeed -- otherwise the manifest comparison is
+            # never reached and this test proves nothing. Every stat after it
+            # raises, which is the real race: the destination was claimed while
+            # the tree walks ran in between.
+            if self == vanished:
+                seen[0] += 1
+                if seen[0] > 1:
+                    raise FileNotFoundError(2, "No such file or directory", str(self))
+            return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "stat", _vanish)
+        (builtin_root / "zzz-later" / "SKILL.md").write_text(
+            "---\nname: zzz-later\n---\nv2\n", encoding="utf-8"
+        )
+        _bump_mtime(builtin_root / "zzz-later" / "SKILL.md")
+
+        _ensure_builtin_skills(base)  # must not raise
+        monkeypatch.undo()
+
+        # The comparison past the exists() probe was actually reached.
+        assert seen[0] > 1, f"manifest comparison never stat'd the destination ({seen[0]})"
+        # The skill queued after the vanished one was still processed.
+        assert "v2" in (base / "zzz-later" / "SKILL.md").read_text(encoding="utf-8")
+
 
 class TestFingerprint:
     """The fingerprint covers the full tree, excludes only the marker, and can
@@ -380,6 +520,7 @@ class TestFingerprint:
         _record_builtin_provenance(a)
         assert _skill_tree_fingerprint(a) == before
 
+    @requires_symlinks
     def test_symlink_target_participates(self, tmp_path: Path) -> None:
         # A symlink is hashed by its target TEXT, never followed: retargeting
         # it diverges the tree, and outside file content can't leak into the
@@ -391,6 +532,7 @@ class TestFingerprint:
         os.symlink("target-two", a / "link")
         assert _skill_tree_fingerprint(a) != one
 
+    @requires_symlinks
     def test_symlink_and_regular_file_with_same_bytes_differ(self, tmp_path: Path) -> None:
         a = _make_skill(tmp_path, "a", "same")
         b = _make_skill(tmp_path, "b", "same")
@@ -445,6 +587,7 @@ class TestFingerprint:
 class TestMarkerHardening:
     """The provenance marker is data the sync wrote, never a path to follow."""
 
+    @requires_symlinks
     def test_marker_symlink_is_not_followed_on_write(
         self, builtin_root: Path, base: Path, tmp_path: Path
     ) -> None:
@@ -462,6 +605,7 @@ class TestMarkerHardening:
 
         assert victim.read_text(encoding="utf-8") == "do not touch"
 
+    @requires_symlinks
     def test_marker_symlink_reads_as_no_provenance(self, tmp_path: Path) -> None:
         # A symlink at the marker path is not a marker: the directory counts
         # as user-authored ("no provenance") instead of trusting content read
@@ -498,6 +642,7 @@ class TestVerificationBounds:
         os.link(outside, a / "innocuous.txt")
         assert _skill_tree_fingerprint(a) is None
 
+    @requires_symlinks
     def test_link_root_is_unprovable(self, tmp_path: Path) -> None:
         real = _make_skill(tmp_path, "real", "content")
         link = tmp_path / "linked"
@@ -556,6 +701,7 @@ class TestVerificationBounds:
         )
         assert preserved
 
+    @requires_symlinks
     def test_linked_dest_is_quarantined_without_following(
         self, builtin_root: Path, base: Path, tmp_path: Path
     ) -> None:
@@ -652,8 +798,15 @@ class TestConcurrentSync:
         )
 
 
+@pytest.mark.real_builtin_skills_sync
 class TestEventLoopGuard:
-    """Loader construction on a running event loop must not run the sync."""
+    """Loader construction on a running event loop must not run the sync.
+
+    Both tests construct the loader with its REAL default (``install_builtins``
+    omitted, so ``True``): the rootdir conftest floor that defaults an omitted
+    argument to ``False`` for every other test is switched off here by the
+    marker, because the default is exactly what these two assert on.
+    """
 
     def test_sync_skipped_on_running_loop(
         self, builtin_root: Path, base: Path

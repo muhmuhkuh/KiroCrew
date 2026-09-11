@@ -1,6 +1,7 @@
 """Unit tests for the code-enforced two-stage review driver (gap A + phase switch)."""
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import unittest
@@ -219,7 +220,75 @@ class TestReviewDriver(unittest.TestCase):
             return {"ok": True, "output": "", "error": ""}
         out = D.run_review(["CR-7"], dispatch=no_record, generate_report=False, root=self.root, post=True)
         self.assertEqual(out["deep_reviewed"], 0)
+        # The residual "turn completed, nothing written" case keeps this value;
+        # environment failures carry their own discriminated reasons instead.
         self.assertEqual(out["per_change"][0]["skipped_reason"], "no_review_recorded")
+        self.assertFalse(out["per_change"][0]["result_recorded"])
+
+    def test_incomplete_record_is_discriminated_from_no_record(self):
+        # A worker that writes a record but never marks the review complete is a
+        # DIFFERENT detectable cause than one that writes nothing — the two must
+        # not collapse into one reason (that ambiguity is what made the failure
+        # untriageable).
+        errors: dict = {}
+
+        def prog(cid, phase, extra=None):
+            if phase == "failed":
+                errors[cid] = (extra or {}).get("error", "")
+
+        def partial(task, timeout=0):
+            results.write_result({
+                "schema": "code-review-sage-result", "version": 1, "change_id": "CR-8",
+                "platform": "github", "repo_identity": "github.com/o/r", "revision": "1",
+                "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+                "blast_radius": {"rating": "SMALL", "signals": {}},
+                "counts": {"red": 0, "yellow": 0}, "findings": [],
+                "deep_reviewed": False, "title": "CR-8",
+                "files_covered": [], "coverage_complete": True,
+            }, self.root)
+            return {"ok": True, "output": "", "error": ""}
+
+        out = D.run_review(["CR-8"], dispatch=partial, generate_report=False,
+                           root=self.root, post=True, progress=prog)
+        rec = out["per_change"][0]
+        self.assertEqual(rec["skipped_reason"], "review_record_incomplete")
+        self.assertTrue(rec["result_recorded"])
+        self.assertIn("never completed", errors["CR-8"])
+        self.assertNotIn("no result record", errors["CR-8"])
+
+    def test_preflight_failure_fails_fast_and_never_dispatches(self):
+        # A failed runtime preflight must produce its own discriminated reason,
+        # name the missing runtime in the progress error, and return BEFORE any
+        # reviewer session is dispatched.
+        errors: dict = {}
+
+        def prog(cid, phase, extra=None):
+            errors[cid] = (phase, (extra or {}).get("error", ""))
+
+        out = D.run_review(
+            ["CR-1", "CR-2"], dispatch=self._fake_dispatch(),
+            generate_report=False, root=self.root, post=True, progress=prog,
+            preflight=lambda: "the reviewer cannot run: no kiro-cli executable "
+                              "was found on this host")
+        self.assertEqual(self.calls, [])            # nothing was dispatched
+        self.assertFalse(out["ok"])
+        self.assertIn("kiro-cli", out["error"])
+        self.assertEqual(out["changes"], 2)
+        self.assertEqual(out["result_records"], 0)
+        for rec in out["per_change"]:
+            self.assertEqual(rec["skipped_reason"], "runtime_unavailable")
+            self.assertIn("kiro-cli", rec["deep_error"])
+        self.assertEqual(errors["CR-1"][0], "failed")
+        self.assertIn("kiro-cli", errors["CR-1"][1])
+
+    def test_passing_preflight_runs_the_review(self):
+        # "" means the runtime is available — the run proceeds normally.
+        out = D.run_review(["CR-1"], dispatch=self._fake_dispatch(),
+                           generate_report=False, root=self.root, post=True,
+                           preflight=lambda: "")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["deep_reviewed"], 1)
+        self.assertGreater(len(self.calls), 0)
 
     def test_each_task_is_single_change(self):
         D.run_review(["CR-1", "CR-2"], dispatch=self._fake_dispatch(), archiver=self._archiver,
@@ -245,6 +314,97 @@ class TestReviewDriver(unittest.TestCase):
     def test_empty_change_set(self):
         out = D.run_review([], dispatch=self._fake_dispatch(), root=self.root, post=True)
         self.assertFalse(out["ok"])
+
+    # ── The per-change progress entry must name its cause as a TOKEN ──
+    # Every failure path below already puts the token on its per_change RECORD
+    # (`skipped_reason`), but the record is driver-internal: what the dashboard
+    # reads is the `progress` entry, which carried prose only. So the cause had to
+    # be recognized by its wording, and rewording any message below silently
+    # reverted the card to untranslated pass-through with no test going red.
+    # These assert the token travels with the sentence on the entry itself, and
+    # that it AGREES with the record on the same path.
+
+    def _failed_entry(self, cid: str, **kw) -> dict:
+        """Drive ``run_review`` and return the `failed` progress entry for ``cid``."""
+        entries: dict = {}
+
+        def prog(c, phase, extra=None):
+            if phase == "failed":
+                entries[c] = dict(extra or {})
+
+        out = D.run_review([cid], generate_report=False, root=self.root,
+                           post=True, progress=prog, **kw)
+        self.out = out
+        return entries.get(cid, {})
+
+    def test_progress_entry_names_no_review_recorded(self):
+        entry = self._failed_entry(
+            "CR-7", dispatch=lambda task, timeout=0: {"ok": True, "output": "", "error": ""})
+        self.assertEqual(entry.get("reason"), "no_review_recorded")
+        # The sentence is unchanged -- the token is carried BESIDE it.
+        self.assertEqual(entry.get("error"), "review produced no result record")
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
+
+    def test_progress_entry_names_review_record_incomplete(self):
+        def partial(task, timeout=0):
+            results.write_result({
+                "schema": "code-review-sage-result", "version": 1, "change_id": "CR-8",
+                "platform": "github", "repo_identity": "github.com/o/r", "revision": "1",
+                "phase1": {"gate_verdict": "PASS", "design_risk": "low",
+                           "criticality": "low"},
+                "blast_radius": {"rating": "SMALL", "signals": {}},
+                "counts": {"red": 0, "yellow": 0}, "findings": [],
+                "deep_reviewed": False, "title": "CR-8",
+                "files_covered": [], "coverage_complete": True,
+            }, self.root)
+            return {"ok": True, "output": "", "error": ""}
+
+        entry = self._failed_entry("CR-8", dispatch=partial)
+        self.assertEqual(entry.get("reason"), "review_record_incomplete")
+        self.assertIn("never completed", entry.get("error", ""))
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
+
+    def test_progress_entry_names_review_failed(self):
+        entry = self._failed_entry(
+            "CR-9",
+            dispatch=lambda task, timeout=0: {"ok": False, "output": "", "error": "boom"})
+        self.assertEqual(entry.get("reason"), "review_failed")
+        # The spawn's own text, which for this cause is the information: it can be
+        # a missing-agent-spec message carrying its own repair command, so the
+        # sentence must survive alongside the (generic) token.
+        self.assertEqual(entry.get("error"), "boom")
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
+
+    def test_progress_entry_names_runtime_unavailable(self):
+        entries: dict = {}
+
+        def prog(cid, phase, extra=None):
+            if phase == "failed":
+                entries[cid] = dict(extra or {})
+
+        out = D.run_review(
+            ["CR-1", "CR-2"], dispatch=self._fake_dispatch(),
+            generate_report=False, root=self.root, post=True, progress=prog,
+            preflight=lambda: "the reviewer cannot run: no kiro-cli executable "
+                              "was found on this host")
+        # Every change of a preflight-failed run, not just the first.
+        for cid, rec in zip(("CR-1", "CR-2"), out["per_change"]):
+            self.assertEqual(entries[cid].get("reason"), "runtime_unavailable")
+            self.assertIn("kiro-cli", entries[cid].get("error", ""))
+            self.assertEqual(rec["skipped_reason"], entries[cid].get("reason"))
+
+    def test_progress_entry_names_a_refused_host_as_review_failed(self):
+        # `build_review_task` fails CLOSED when the link's host no longer
+        # revalidates. Patched rather than reached through a crafted URL so the
+        # test pins THIS site's payload, not the host-allowlist rules.
+        def refuse(link):
+            raise D.pipeline.adapters.AdapterError("host is not allowed")
+
+        with mock.patch.object(D, "build_review_task", refuse):
+            entry = self._failed_entry("CR-6", dispatch=self._fake_dispatch())
+        self.assertEqual(entry.get("reason"), "review_failed")
+        self.assertIn("refusing to review", entry.get("error", ""))
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
 
     def test_review_task_covers_design_and_is_single_pass(self):
         task = D.build_review_task("https://github.com/o/r/pull/7")
@@ -410,10 +570,10 @@ class TestReviewDriver(unittest.TestCase):
 
 
 class TestWorkerPromptScriptPaths(unittest.TestCase):
-    """Guard: every ``python3 <path>`` the worker prompts instruct must point at a
-    script that actually ships in the app. This catches a rename (e.g. the
-    ``lib`` -> ``sage_lib`` move) that misses a prompt string — which would make
-    the worker run a non-existent path and silently produce no verdict."""
+    """Guard: every script path the worker prompts instruct must point at a script
+    that actually ships in the app. This catches a rename (e.g. the ``lib`` ->
+    ``sage_lib`` move) that misses a prompt string — which would make the worker
+    run a non-existent path and silently produce no verdict."""
 
     def test_prompts_reference_existing_script_paths(self):
         app_root = Path(__file__).resolve().parents[1]
@@ -421,11 +581,118 @@ class TestWorkerPromptScriptPaths(unittest.TestCase):
                    D.build_review_followup_task("CR-12345678")]
         refs = set()
         for p in prompts:
-            refs.update(re.findall(r"python3 ([\w./-]+\.py)", p))
+            refs.update(re.findall(r"(sage_lib/[\w./-]+\.py)", p))
         self.assertTrue(refs, "expected the worker prompts to reference a script")
         for rel in sorted(refs):
             self.assertTrue((app_root / rel).is_file(),
                             f"worker prompt references a missing path: {rel}")
+
+
+class TestWorkerPromptInterpreter(unittest.TestCase):
+    """The worker runs the app's scripts through a shell on an unknown host, so the
+    prompts must name an interpreter that exists there. ``python3`` does not on
+    Windows — the name is a Microsoft Store app-execution alias, not an
+    interpreter — and the failure is silent: the command runs no Python, no result
+    record is written, and the review ends with no verdict."""
+
+    LINK = "https://github.com/o/r/pull/12345678"
+
+    def _prompts(self):
+        return [D.build_review_task(self.LINK), D.build_review_followup_task(self.LINK)]
+
+    def test_no_prompt_names_a_bare_interpreter(self):
+        # Both needles are anchored on the opening backtick of an inline code
+        # span: python_command() legitimately embeds the absolute
+        # sys.executable, which can itself end in "python3" (issue #8205), so
+        # an unanchored needle would fire on the correct path. Unbackticked
+        # prose is covered only by the span test below
+        # (test_every_script_command_carries_the_resolved_interpreter).
+        for p in self._prompts():
+            self.assertNotIn("`python3 ", p)
+            self.assertNotIn("`python ", p)
+
+    def test_every_script_command_carries_the_resolved_interpreter(self):
+        py = D.python_command()
+        for p in self._prompts():
+            for cmd in re.findall(r"`([^`]*sage_lib/[\w./-]+\.py[^`]*)`", p):
+                self.assertTrue(cmd.startswith(py + " "),
+                                f"script command does not name the interpreter: {cmd}")
+
+    def test_prompt_states_the_interpreter_for_the_skill_commands(self):
+        # The shipped skills write their commands as `<python> ...`; the prompt is
+        # the only place that can tell the worker what to substitute.
+        for p in self._prompts():
+            self.assertIn("<python>", p)
+            self.assertIn(D.python_command(), p)
+
+    def test_resolved_interpreter_is_an_absolute_path(self):
+        self.assertTrue(Path(D.python_command()).is_absolute())
+
+    def test_the_interpreter_is_never_taken_from_a_worker_writable_path(self):
+        """``store.app_root()`` is under ``KIROCREW_HOME``, which the review worker
+        writes into and which a prompt injection therefore controls. Resolving the
+        interpreter through it would let a planted ``.venv/Scripts/python.exe`` be
+        executed by the NEXT review. Any reintroduction of that lookup fails here.
+        """
+        with mock.patch.object(
+            D.store,
+            "app_root",
+            side_effect=AssertionError("python_command must not consult app_root"),
+        ):
+            self.assertEqual(D.python_command(), sys.executable)
+
+
+class TestInterpreterIsHandedOverRaw(unittest.TestCase):
+    """The prompts do NOT shell-quote the interpreter, and that is deliberate.
+
+    Quoting needs the worker's shell, which is not pinned: a Windows session may
+    get PowerShell or cmd, and a form valid in one is a syntax error in the
+    other. Three separate defects came out of guessing (``$`` expanding inside a
+    double-quoted PowerShell string, ``\\`` consumed as an escape by a POSIX
+    shell, and the PowerShell call operator breaking cmd), so the responsibility
+    moved to the worker, which knows its own shell.
+    """
+
+    LINK = "https://github.com/o/r/pull/12345678"
+
+    def test_the_resolved_path_is_not_quoted_or_escaped(self):
+        # Injected at the seam the interpreter now comes from: the gateway's own
+        # ``sys.executable``. Whatever it contains -- a space, a ``$``, a backslash
+        # run -- must arrive verbatim, since each of those was a separate defect.
+        for exe in (r"C:\Program Files\Py\python.exe",
+                    r"C:\tools\$python v2\python.exe",
+                    "/home/u/my py/bin/python3",
+                    r"/home/u/kiro\home/bin/python3"):
+            with mock.patch.object(D.sys, "executable", exe):
+                self.assertEqual(D.python_command(), exe)
+
+    def test_the_prompt_tells_the_worker_to_quote_for_its_own_shell(self):
+        # Without this instruction a space-containing path -- ordinary on Windows,
+        # where profiles are named "First Last" -- would be split by the shell and
+        # the command would run nothing, which is the failure this PR removes.
+        for prompt in (D.build_review_task(self.LINK),
+                       D.build_review_followup_task(self.LINK)):
+            self.assertIn("quote it as YOUR shell requires", prompt)
+
+
+class TestShippedSkillsNameNoBareInterpreter(unittest.TestCase):
+    """The skills ship in the wheel and the worker is told to load them, so a
+    ``python3`` command left in one reaches the worker exactly as a prompt string
+    would — the prompt guard above cannot see it."""
+
+    def test_no_skill_command_names_a_bare_interpreter(self):
+        # Matches an interpreter name followed by a script path ANYWHERE in the
+        # line, not just at its start: the one surviving `python3` in these files
+        # was inside a `>` blockquote, which a line-anchored pattern cannot see.
+        # The lookbehind keeps `<python> foo.py` (the placeholder) from matching.
+        bare = re.compile(r"(?<![<\w])python3?\s+\S*\.py\b")
+        skills = Path(__file__).resolve().parents[1] / "skills"
+        found = list(skills.glob("*/SKILL.md"))
+        self.assertTrue(found, "expected the app to ship skills")
+        for md in found:
+            for i, line in enumerate(md.read_text(encoding="utf-8").splitlines(), 1):
+                self.assertNotRegex(line, bare,
+                                    f"{md.name}:{i} names a bare interpreter")
 
 
 class TestDeterministicPosting(unittest.TestCase):

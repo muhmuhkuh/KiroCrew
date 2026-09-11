@@ -1,12 +1,12 @@
 /** Provider-aware link building for the auto-improvement UI. */
 
 /** A short commit sha, as the direct-commit path records it in the ledger's `cr`. */
-export const SHA_RE = /^[0-9a-f]{7,40}$/i
+export const SHA_RE = /^[0-9a-f]{7,40}$/i;
 
 /** The minimal finding shape the link builders read (ledger rows). */
 export interface FindingLike {
-  pr?: string | null
-  cr?: string | null
+ pr?: string | null;
+ cr?: string | null;
 }
 
 /**
@@ -19,19 +19,19 @@ export interface FindingLike {
  * so the link is correct for GitHub and GitLab without guessing a host.
  */
 export function commitUrlOf(
-  finding: FindingLike,
-  repo: string,
-  provider?: string,
-  host?: string,
+ finding: FindingLike,
+ repo: string,
+ provider?: string,
+ host?: string,
 ): string | null {
-  const sha = (finding.pr || finding.cr || '').trim()
-  if (!SHA_RE.test(sha)) return null
-  // Only build a url for an owner/name we recognize; never guess a host. GitLab
-  // namespaces may be nested, so accept 2+ path segments.
-  if (!/^[\w.-]+(?:\/[\w.-]+)+$/.test(repo)) return null
-  if (provider === 'gitlab') {
-    const h = host && host !== 'github.com' ? host : 'gitlab.com'
-    return `https://${h}/${repo}/-/commit/${sha}`
-  }
-  return `https://github.com/${repo}/commit/${sha}`
+ const sha = (finding.pr || finding.cr || "").trim();
+ if (!SHA_RE.test(sha)) return null;
+ // Only build a url for an owner/name we recognize; never guess a host. GitLab
+ // namespaces may be nested, so accept 2+ path segments.
+ if (!/^[\w.-]+(?:\/[\w.-]+)+$/.test(repo)) return null;
+ if (provider === "gitlab") {
+  const h = host && host !== "github.com" ? host : "gitlab.com";
+  return `https://${h}/${repo}/-/commit/${sha}`;
+ }
+ return `https://github.com/${repo}/commit/${sha}`;
 }

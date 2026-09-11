@@ -17,7 +17,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from tmpdir_helpers import short_tmp_base
@@ -85,6 +85,15 @@ class TestSafeReadSnapshot:
         f = tmp_path / "file.txt"
         f.write_text("hello\nworld\n")
         assert _safe_read_snapshot(str(f)) == "hello\nworld\n"
+
+    def test_reads_with_explicit_utf8_encoding(self, tmp_path: Path):
+        f = tmp_path / "unicode.txt"
+        f.write_text("こんにちは", encoding="utf-8")
+
+        with patch.object(Path, "read_text", return_value="こんにちは") as read_text:
+            assert _safe_read_snapshot(str(f)) == "こんにちは"
+
+        read_text.assert_called_once_with(encoding="utf-8", errors="replace")
 
     def test_returns_none_for_missing_file(self, tmp_path: Path):
         assert _safe_read_snapshot(str(tmp_path / "ghost")) is None
@@ -275,6 +284,51 @@ class TestFlushFileChanges:
         _flush_file_changes(slot)
         changes = slot.messages[-1]["meta"]["file_changes"]
         assert "AKIAIOSFODNN7EXAMPLE" not in changes[0]["before"]
+
+    def test_an_unchanged_credential_line_is_not_turned_into_a_phantom_diff(
+        self, tmp_path: Path
+    ) -> None:
+        """Redaction must not decide changed-ness.
+
+        Both sides go through the SAME pass, so a line the redactor rewrites is
+        rewritten identically on both — an untouched line stays equal and the UI
+        renders no diff. Redacting one side only (or twice on one side) would
+        render an unchanged docs line as
+        ``- Bearer <value>`` / ``+ [REDACTED: credential]``: a phantom
+        modification, with the real text hidden on the very surface meant to
+        review it.
+        """
+        f = tmp_path / "AGENTS.md"
+        unchanged = '  "headers": { "Authorization": "Bearer lp_dummy_placeholder_value" }\n'
+        f.write_text(unchanged, encoding="utf-8")
+        slot = _make_slot_with_assistant_message()
+        # Same bytes on both sides: the turn touched the file without changing
+        # this line (the reported case is a docs/config example).
+        slot._file_changes = [{"path": str(f), "content": unchanged}]
+        _flush_file_changes(slot)
+        changes = slot.messages[-1]["meta"]["file_changes"]
+        assert (
+            changes[0]["before"] == changes[0]["after"]
+        ), "identical text redacted asymmetrically -> the UI shows a diff on an unchanged line"
+        # The guard is only meaningful because the redactor DID fire here.
+        assert "lp_dummy_placeholder_value" not in changes[0]["after"]
+
+    def test_a_real_change_beside_a_credential_line_still_redacts_both_sides(
+        self, tmp_path: Path
+    ) -> None:
+        """The symmetry guard must not be satisfiable by skipping redaction."""
+        cred = '  "Authorization": "Bearer lp_dummy_placeholder_value"\n'
+        f = tmp_path / "conf.json"
+        f.write_text(cred + "changed-line\n", encoding="utf-8")
+        slot = _make_slot_with_assistant_message()
+        slot._file_changes = [{"path": str(f), "content": cred + "original-line\n"}]
+        _flush_file_changes(slot)
+        changes = slot.messages[-1]["meta"]["file_changes"]
+        assert "lp_dummy_placeholder_value" not in changes[0]["before"]
+        assert "lp_dummy_placeholder_value" not in changes[0]["after"]
+        # The genuine change survives redaction on both sides.
+        assert "original-line" in changes[0]["before"]
+        assert "changed-line" in changes[0]["after"]
 
     def test_synthetic_message_created_when_no_assistant_text(self, short_tmp_dir: Path):
         """User stopped before any assistant chunk: still surface modified files."""

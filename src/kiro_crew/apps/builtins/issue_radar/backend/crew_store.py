@@ -101,10 +101,26 @@ TERMINAL_PHASES = frozenset({"resolved", "skipped", "yielded", "handed-back", "p
 TTL_ACTIVE_PHASES = frozenset({"claimed", "investigating", "implementing"})
 EDITING_PHASES = frozenset({"implementing", "addressing-review"})
 
+#: ``sweep`` is the one kind that does NOT belong to an issue: it records that the
+#: crew looked at the queue and took nothing, which is the only step in the
+#: protocol with no work item behind it. Every other kind names something done TO
+#: an item, so those lines carry a number and ``sweep`` lines do not (see
+#: :func:`append_event`). Without it a crew that found an empty queue could only
+#: report the cycle by attributing it to some issue it did not act on.
 EVENT_KINDS = (
     "claim", "investigate", "reply", "implement", "ci",
-    "review", "conflict", "merge", "handback", "skip", "yield",
+    "review", "conflict", "merge", "handback", "skip", "yield", "sweep",
 )
+
+#: The one kind that records a crew-level step rather than one issue's. It is the
+#: only kind :func:`append_event` accepts without a number, and the only one the
+#: write route accepts with no work-item patch. A named constant rather than a set
+#: of one: the frontend already tests `kind === 'sweep'` by equality, and a
+#: collection whose only justification is a second member that does not exist
+#: reads as generality this app has not earned. A second crew-level kind turns
+#: these three equality tests into a membership test then, against a set that has
+#: two real members.
+CREW_LEVEL_EVENT_KIND = "sweep"
 
 #: Why an issue was passed over, as a closed vocabulary. Two things need it to be
 #: closed rather than free prose: a crew reads the recent-skip list to calibrate
@@ -390,7 +406,9 @@ def _skip_lock_path(owner: str, repo: str, number: int, root: Path | None = None
 def _skip_lock(owner: str, repo: str, number: int, root: Path | None = None):
     """Hold :func:`_skip_lock_path` for *number*. See it for why, and the module
     docstring for where this sits in the lock order."""
-    with open(_skip_lock_path(owner, repo, number, root), "w") as fd:
+    lock_path = _skip_lock_path(owner, repo, number, root)
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
 
@@ -480,8 +498,8 @@ def read_settings(owner: str, repo: str, root: Path | None = None) -> dict[str, 
     out = dict(DEFAULT_SETTINGS)
     if path.is_file():
         try:
-            stored = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return out
         if isinstance(stored, dict):
             ttl = _validated_ttl_hours(stored.get("claim_ttl_hours"))
@@ -499,7 +517,8 @@ def write_settings(
 ) -> dict[str, Any]:
     """Merge *patch* into the repo's protocol settings. Returns the stored doc."""
     lock_path = crews_dir(owner, repo, root) / "settings.lock"
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             record = read_settings(owner, repo, root)
             if "claim_ttl_hours" in patch:
@@ -538,8 +557,8 @@ def list_crews(
         if not is_crew_id(path.stem):
             continue
         try:
-            rec = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -557,8 +576,8 @@ def read_crew(
     if not path.is_file():
         return None
     try:
-        rec = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return _coerce_crew(rec) if isinstance(rec, dict) else None
 
@@ -642,7 +661,8 @@ def create_crew(
         raise CrewStoreError("a crew needs a name")
 
     lock_path = _records_lock_path(owner, repo, root)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             if name in taken_names(owner, repo, root):
                 raise CrewStoreError(f"crew name {name!r} is already taken in this repo")
@@ -703,7 +723,8 @@ def update_crew(
     those crews. See ``_records_lock_path``.
     """
     lock_path = _records_lock_path(owner, repo, root)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             record = read_crew(owner, repo, crew_id, root)
             if record is None:
@@ -751,7 +772,8 @@ def retire_crew(
     its work log all survive."""
     record = update_crew(owner, repo, crew_id, {"enabled": False}, root)
     lock_path = _records_lock_path(owner, repo, root)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             record = read_crew(owner, repo, crew_id, root) or record
             record["retired_at"] = store._now_iso()
@@ -769,8 +791,8 @@ def read_work_item(
     if not path.is_file():
         return None
     try:
-        rec = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        rec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return rec if isinstance(rec, dict) else None
 
@@ -784,8 +806,8 @@ def list_work_items(
         return out
     for path in sorted(d.glob("*.json")):
         try:
-            rec = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -839,7 +861,8 @@ def upsert_work_item(
     same thread blocks on itself forever rather than nesting.
     """
     lock_path = _crew_lock_path(owner, repo, crew_id, root)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             return _upsert_work_item_locked(owner, repo, crew_id, number, patch, root)
 
@@ -993,9 +1016,74 @@ def _editing_item(
 # ── event ledger ────────────────────────────────────────────────────────────
 
 
-def _event_id(ts: str, crew_id: str, number: int, kind: str, text: str) -> str:
-    raw = f"{ts}|{crew_id}|{number}|{kind}|{text}".encode()
+def _event_id(ts: str, crew_id: str, number: int | None, kind: str, text: str) -> str:
+    """Content-addressed id for one ledger line.
+
+    ``number`` is ``None`` for a crew-level line. It renders as the empty string
+    so the formula for a NUMBERED line is byte-identical to what it has always
+    been -- changing that would give every existing line a new id and defeat the
+    merge-on-read dedupe for the whole ledger. The empty string cannot collide
+    with a real number, so the two families stay distinct.
+    """
+    shown = "" if number is None else int(number)
+    raw = f"{ts}|{crew_id}|{shown}|{kind}|{text}".encode()
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _event_entry(
+    crew_id: str,
+    number: int | None,
+    kind: str,
+    text: str,
+    *,
+    phase: str | None = None,
+) -> dict[str, Any]:
+    """Validate one ledger line and build it. The ONLY place a line is shaped.
+
+    Both writers go through here -- :func:`append_event` for an issue's line and
+    :func:`record_crew_checkpoint` for a crew-level one -- so the vocabulary
+    check, the number/kind pairing and the key order are stated once. Two
+    builders would let the numberless line drift from the numbered one, which is
+    the drift the pairing exists to prevent.
+
+    The pairing is enforced in BOTH directions: a numberless line must carry a
+    crew-level kind, and a crew-level kind must not carry a number. ``number`` is
+    typed ``int | None`` here and ``int`` on :func:`append_event`, so the
+    numberless case is unreachable through the public issue-line writer by type
+    as well as by this check.
+
+    CALL THIS UNDER THE EVENTS LOCK, immediately before writing the line. It
+    stamps ``ts``, and the stamp must be taken in the same order the lines are
+    appended: a caller that built its entry first and then blocked on the lock
+    would write a line whose timestamp PRECEDES the line already above it. That
+    inverts file order against timestamp order, and the two readers disagree ---
+    :func:`_latest_crew_event` walks the file backwards, so it would keep
+    coalescing onto that trailing sweep, while the crew page sorts by ``ts`` and
+    would never see it as the newest line. The idle stretch would then stay
+    hidden for as long as the crew kept idling, which is precisely what the
+    ongoing-stretch wording exists to show.
+    """
+    if kind not in EVENT_KINDS:
+        raise CrewStoreError(f"unknown event kind {kind!r}")
+    if number is None and kind != CREW_LEVEL_EVENT_KIND:
+        raise CrewStoreError(f"event kind {kind!r} needs an issue number")
+    if number is not None and kind == CREW_LEVEL_EVENT_KIND:
+        raise CrewStoreError(f"event kind {kind!r} is crew-level and takes no issue number")
+    ts = store._now_iso()
+    # Built in the original key order so a NUMBERED line serializes exactly as it
+    # always has; the numberless line simply omits the key in place.
+    entry: dict[str, Any] = {
+        "id": _event_id(ts, crew_id, number, kind, text),
+        "ts": ts,
+        "crew_id": crew_id,
+    }
+    if number is not None:
+        entry["number"] = int(number)
+    entry["kind"] = kind
+    entry["text"] = text
+    if phase is not None:
+        entry["phase"] = phase
+    return entry
 
 
 def append_event(
@@ -1006,8 +1094,10 @@ def append_event(
     kind: str,
     text: str,
     root: Path | None = None,
+    *,
+    phase: str | None = None,
 ) -> dict[str, Any]:
-    """Append one progress line.
+    """Append one issue's progress line.
 
     The id is content-addressed so a duplicated line merges on read rather than
     conflicting — the same discipline as ops-mission-control's ledger, whose own
@@ -1017,25 +1107,146 @@ def append_event(
     ``<details>`` block of the claim comment on the forge. Callers must keep
     absolute paths, host names and anything else environment-specific out of it;
     worktree paths belong in the work item's own fields.
+
+    A line that belongs to NO issue is written by
+    :func:`record_crew_checkpoint`, not here: that case has to read the crew's
+    tail and decide whether to append at all, under the same lock hold. This
+    function therefore requires a number, and the shared builder refuses a
+    crew-level kind through it.
+
+    ``phase`` is the work item's phase AFTER this write, and it is the sole datum
+    that makes a per-phase dwell fold possible (:func:`crew_routes` folds it).
+    Recorded because ``kind`` is NOT it: :data:`EVENT_KINDS` is not 1:1 with
+    :data:`PHASES` (a ``ci`` line can leave an item in ``awaiting-ci`` or move it to
+    ``addressing-review``), so the phase cannot be recovered from the kind. It is
+    keyword-only and defaults to ``None`` — ``None`` is OMITTED from the stored line
+    rather than written as a null, because a write that carried no phase (the id is
+    content-addressed and does not depend on it) should leave a line indistinguishable
+    from the pre-feature lines the fold already has to tolerate. Not part of the
+    event id: two lines that differ only in the phase they record are still the same
+    logged reason, and folding one in twice must still merge.
     """
-    if kind not in EVENT_KINDS:
-        raise CrewStoreError(f"unknown event kind {kind!r}")
-    ts = store._now_iso()
-    entry = {
-        "id": _event_id(ts, crew_id, int(number), kind, text),
-        "ts": ts,
-        "crew_id": crew_id,
-        "number": int(number),
-        "kind": kind,
-        "text": text,
-    }
-    path = events_path(owner, repo, root)
     lock_path = crews_dir(owner, repo, root) / "events.lock"
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
-            with open(path, "a", encoding="utf-8") as out:
-                out.write(json.dumps(entry) + "\n")
+            entry = _event_entry(crew_id, number, kind, text, phase=phase)
+            _write_event_line(owner, repo, entry, root)
     return entry
+
+
+def _write_event_line(
+    owner: str, repo: str, entry: dict[str, Any], root: Path | None = None
+) -> None:
+    """Append one already-built line. CALLER MUST HOLD the events lock.
+
+    Split out so a writer that has to READ the tail before deciding whether to
+    append can do both inside ONE lock hold (see :func:`record_crew_checkpoint`).
+    Re-entering :func:`append_event` there would take the lock on a second
+    descriptor and block on the hold this frame already has.
+    """
+    with open(events_path(owner, repo, root), "a", encoding="utf-8") as out:
+        out.write(json.dumps(entry) + "\n")
+
+
+def _latest_crew_event(
+    owner: str, repo: str, crew_id: str, root: Path | None = None
+) -> dict[str, Any] | None:
+    """This crew's newest ledger line, or ``None``. CALLER MUST HOLD the lock.
+
+    Reads through :func:`read_events`, so it inherits that function's tolerance of
+    a torn tail and its duplicate collapse rather than re-parsing the file here.
+    """
+    recent = read_events(owner, repo, root, crew_id=crew_id, limit=1)
+    return recent[0] if recent else None
+
+
+def record_crew_checkpoint(
+    owner: str,
+    repo: str,
+    crew_id: str,
+    event_text: str,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Append one crew-level ledger line -- a step that belongs to no issue.
+
+    TAKES NO KIND. There is exactly one crew-level kind, and the route that calls
+    this already 400s anything else on the numberless path, so a parameter here
+    could only ever carry :data:`CREW_LEVEL_EVENT_KIND` -- a value to be re-checked
+    and rejected rather than a choice a caller makes. Writing the constant directly
+    removes the argument and the guard that policed it; :func:`_event_entry` still
+    enforces the number/kind pairing, so the shape is validated in one place either
+    way.
+
+    Returns the same ``{"item", "event", "skip"}`` shape as
+    :func:`commit_work_progress`, with ``item`` and ``skip`` as ``None``, so the
+    write route answers one shape and no caller has to branch on which kind of
+    write it made. ``coalesced`` says whether a line was actually written.
+
+    CONSECUTIVE SWEEPS COALESCE, and this is the whole reason the function reads
+    before it writes. "I checked and took nothing" is a recurring LATEST-VALUE
+    fact, not an event: an idle crew is nudged on a timer, so appending one line
+    per cycle would add an unbounded run of them. Every ledger read is capped and
+    discards the OLDEST line first (:data:`crew_routes._DEFAULT_EVENTS` is 200), so
+    a crew idling for a couple of hundred cycles would push its entire real work
+    history out of its own work log -- the feature would bury exactly what the log
+    exists to show. Recording the TRANSITION rather than the state is the same
+    discipline :func:`commit_work_progress` already applies to ``phase``, which is
+    stamped only when an item is created or actually moves.
+
+    So the FIRST sweep after real work is written, and a sweep whose crew already
+    has one as its newest line is answered with that existing line. The crew still
+    sees its checkpoint acknowledged; the log just does not grow a duplicate. The
+    timestamp therefore marks when the idle stretch BEGAN, which is the more useful
+    of the two readings -- "nothing to take since 09:12" beats "nothing to take as
+    of one minute ago", and how long the stretch has run is the question a human
+    opening a quiet crew is asking.
+
+    WHAT THE SURVIVING TIMESTAMP DOES NOT MEAN. It records when this crew last
+    REPORTED an empty queue, and nothing about the present: consecutive reports
+    fold, and a crew that stops -- an operator pause, a crash, a lost nudge timer
+    -- stops reporting without saying so, because nothing on the crew record
+    evidences liveness. So the ledger cannot distinguish a crew still checking from
+    one that quietly died mid-stretch, and the crew page therefore renders this line
+    as the past instant it is rather than as a claim about now. An earlier revision
+    qualified it as "checking since ...", which read as present-tense activity and
+    so masked exactly the failure an operator opens that page to notice. Closing
+    that properly needs a real last-seen datum, which is a separate change.
+
+    Deliberately NOT a branch inside :func:`commit_work_progress`. That function
+    exists to make three durable writes all-or-nothing, and every line of its lock
+    ordering and rollback is about reconciling an item, a repo-wide skip entry and
+    a ledger line. A crew-level line has nothing to reconcile and nothing to roll
+    back, so threading a ``None`` number through that transaction would add
+    branches to the most order-sensitive code in the store to describe a case that
+    has no transaction in it.
+
+    ``event_text`` BECOMES PUBLIC on the crew page under the same rule as any other
+    line -- see :func:`append_event`. Unlike an item line it is not rendered into a
+    claim comment, because a crew-level step has no issue to comment on.
+    """
+    # ONE lock hold spans the read and the write. Checking the tail and appending
+    # under two separate holds is a check-then-act: two crew turns waking together
+    # would both see no trailing sweep and both append, which is the exact run of
+    # duplicates this exists to prevent.
+    #
+    # COST, stated because the hold is exclusive: the tail read goes through
+    # `read_events`, which reads the WHOLE repo-wide events file and then walks it
+    # backwards to the first matching line. Nothing compacts that file today, so
+    # the hold grows with total ledger volume, not with this crew's share of it.
+    # Coalescing is what keeps an idle crew from being the thing that grows it --
+    # an idle crew appends once per stretch, not once per wake -- but a compaction
+    # story is still owed if the file becomes large enough to matter here.
+    lock_path = crews_dir(owner, repo, root) / "events.lock"
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
+        with platform_compat.file_lock(fd.fileno(), exclusive=True):
+            latest = _latest_crew_event(owner, repo, crew_id, root)
+            if latest is not None and latest.get("kind") == CREW_LEVEL_EVENT_KIND:
+                return {"item": None, "event": latest, "skip": None, "coalesced": True}
+            entry = _event_entry(crew_id, None, CREW_LEVEL_EVENT_KIND, event_text)
+            _write_event_line(owner, repo, entry, root)
+    return {"item": None, "event": entry, "skip": None, "coalesced": False}
 
 
 def read_events(
@@ -1045,10 +1256,19 @@ def read_events(
     *,
     crew_id: str = "",
     limit: int = 200,
+    require_phase: bool = False,
 ) -> list[dict[str, Any]]:
     """Newest first, duplicate ids collapsed. A malformed line is skipped rather
     than failing the whole read — the ledger is append-only and a torn tail must
-    not hide the history in front of it."""
+    not hide the history in front of it.
+
+    ``require_phase`` keeps only lines that carry a ``phase``. It exists for the
+    fabric fold, whose ``limit`` would otherwise be spent on lines it discards:
+    the cap drops the OLDEST events, so a lane parked in one phase for a long
+    time is exactly the one whose entry line falls outside the window — and the
+    longer it stalls, the more certain that is. Filtering to the phase-bearing
+    subset makes the cap bound real transitions instead of write volume.
+    """
     path = events_path(owner, repo, root)
     if not path.is_file():
         return []
@@ -1072,6 +1292,8 @@ def read_events(
         if rid and rid in seen:
             continue
         if crew_id and rec.get("crew_id") != crew_id:
+            continue
+        if require_phase and not rec.get("phase"):
             continue
         seen.add(rid)
         out.append(rec)
@@ -1113,8 +1335,8 @@ def read_skips(owner: str, repo: str, root: Path | None = None) -> dict[str, dic
     if not path.is_file():
         return {}
     try:
-        stored = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
     if not isinstance(stored, dict):
         return {}
@@ -1202,7 +1424,8 @@ def record_skip(
         "decided_at": store._now_iso(),
     }
     lock_path = _records_lock_path(owner, repo, root)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             index = read_skips(owner, repo, root)
             existing = index.get(key)
@@ -1240,7 +1463,8 @@ def unrecord_skip(
     """
     key = str(int(number))
     lock_path = _records_lock_path(owner, repo, root)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             index = read_skips(owner, repo, root)
             if index.get(key) != entry:
@@ -1358,7 +1582,8 @@ def commit_work_progress(
     """
     number = int(number)
     lock_path = _crew_lock_path(owner, repo, crew_id, root)
-    with open(lock_path, "w") as fd:
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "r+") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             # Under the lock that also guards the write, so no writer can land
             # between the two and leave this holding a value that is already stale.
@@ -1396,8 +1621,42 @@ def commit_work_progress(
                         )
                         if created:
                             own_skip = skip
+                    # The event line carries `phase` ONLY when this transaction
+                    # created the item or actually moved it, because a reader can
+                    # only treat "an event line carrying a phase" as "an ENTRY into
+                    # that phase" if a no-move write stays silent about it.
+                    #
+                    # Stamping it on every write looks harmless and is not. Most
+                    # writes here do not move the item -- a CI round lands
+                    # `ci_state`/`ci_passed` while the phase stays `awaiting-ci` --
+                    # so the ledger would gain a fresh phase-bearing line every few
+                    # minutes, and the fabric's open dwell (the MOST RECENT entry
+                    # into the current phase, which is what a round-trip legitimately
+                    # restarts) would reset to each of them. An item parked in
+                    # `awaiting-ci` for nine hours would read as minutes old, and
+                    # `longestWait` with it: the item being polled most often is
+                    # exactly the one whose stall gets hidden, which inverts the one
+                    # question the pipeline view exists to answer.
+                    prev_phase = None
+                    if before:
+                        with contextlib.suppress(ValueError, TypeError):
+                            snapshot = json.loads(before)
+                            # isinstance, not a truthiness test: a corrupted or
+                            # hand-edited item file can hold any JSON shape, and a
+                            # non-empty list or a bare string is TRUTHY, so `or {}`
+                            # would let `.get` raise AttributeError -- which this
+                            # suppress does not catch, so the write would 500. The
+                            # rollback then restores the same bad file, making every
+                            # retry fail the same way. Treating an unreadable snapshot
+                            # as "no previous phase" degrades to recording the phase,
+                            # which is the safe direction: an extra entry is a visible
+                            # dwell reset, a missing one loses the entry entirely.
+                            if isinstance(snapshot, dict):
+                                prev_phase = snapshot.get("phase")
+                    moved = before is None or prev_phase != item.get("phase")
                     event = append_event(
-                        owner, repo, crew_id, number, event_kind, event_text, root
+                        owner, repo, crew_id, number, event_kind, event_text, root,
+                        phase=item.get("phase") if moved else None,
                     )
                 except BaseException:
                     _rollback_work_progress(
@@ -1510,3 +1769,262 @@ def _rollback_work_progress(
             "its phase may have moved with no event explaining it",
             crew_id, number, exc_info=True,
         )
+
+
+# ── crew fabric fold ─────────────────────────────────────────────────────────
+#
+# The "pipeline" dashboard view draws every crew work item as a lane across the
+# phase enum. The fold that turns a crew's ledger into that drawing is SERVER-SIDE
+# and unit-testable in Python precisely so the three mistakes a naive version makes
+# (below) are pinned by tests rather than re-made in TypeScript.
+
+#: Bump on any incompatible change to :func:`fold_fabric`'s item shape. Its own
+#: field, not :data:`CREW_SCHEMA`: the fabric payload is derived, not stored, so it
+#: versions on its own cadence.
+FABRIC_SCHEMA = 1
+
+#: The phases that form the drawn SPINE, in topological order. It is
+#: :data:`PHASES` minus the off-spine ones, and ``resolved`` is the ONLY terminal
+#: left on it — the other terminals are alternate endings, not later stages, so
+#: giving them a column would imply a skipped item got further than a claimed one
+#: (PLAN design decision #2). ``awaiting-reply`` is off-spine for the same reason:
+#: the crew is not the actor, it has handed the issue back to a human.
+SPINE_PHASES = (
+    "selected",
+    "claimed",
+    "investigating",
+    "implementing",
+    "awaiting-ci",
+    "addressing-review",
+    "awaiting-merge",
+    "resolved",
+)
+
+#: Phases that render as a stub OFF the lane, not as a column. Every phase not on
+#: the spine, computed from :data:`PHASES` so a phase added to one set can never be
+#: silently absent from the other.
+OFF_SPINE_PHASES = frozenset(PHASES) - frozenset(SPINE_PHASES)
+
+
+def _fold_one_item(
+    record: dict[str, Any],
+    events: list[dict[str, Any]],
+    title_hints: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    """Fold ONE work item and its phase-bearing ledger lines into a fabric item.
+
+    *events* are this item's lines in TIME order (oldest first). Each contributes a
+    ``phase`` only if it carries one — a pre-feature line, or a write that carried
+    no phase, simply has no key and is skipped here, which degrades the drawing to
+    L0/L1 for that item rather than failing the fold.
+
+    *title_hints* maps issue/PR ``number`` to the issue's REAL title, seeded from
+    the issues and pulls list caches (:func:`_fabric_title_hints`). The crew ledger
+    stores NO title — a work item carries ``number`` and ``phase``, not what the
+    issue is called — so the title has to come from the same list caches Issue
+    Radar already keeps, at zero extra API cost. A number with no cached title
+    (never fetched, or aged out) folds to ``""`` and the lane shows its id only,
+    rather than mislabelling the lane with the crew's resumable ``next`` intent.
+
+    Three things a naive fold gets wrong, each pinned by a test:
+
+    * **The live phase is the record's, authoritative — never the max timeline
+      index.** A review round-trip (``awaiting-ci -> addressing-review ->
+      awaiting-ci``) ends LEFT of where it has been, so keying the head off the
+      furthest column reached puts the item in a phase it already left. This
+      function reads ``phase`` straight off the record and returns it as its own
+      field; ``timeline`` is only the history.
+
+    * **Off-spine phases are an ``exit``, not a timeline entry.** ``skipped`` /
+      ``yielded`` / ``handed-back`` / ``preempted`` / ``awaiting-reply`` leave the
+      spine's topology intact. ``exit`` is the LAST off-spine line seen — but it is
+      cleared the moment a later on-spine line reopens the item, so it stands only
+      when the item's live phase is itself off-spine. (The record's live phase is
+      the tie-breaker: a torn ledger that ends off-spine while the record is on-spine
+      still clears the exit.)
+
+    * **Re-entering a phase after an exit is a reopen, and each restarts the dwell
+      clock.** ``reopens`` counts an on-spine line landing on an already-visited
+      phase while an exit was standing — the store clears ``outcome``/``finished_at``
+      on exactly that transition, so it is a real second life, not churn.
+    """
+    timeline: list[dict[str, Any]] = []
+    seen_spine: set[str] = set()
+    exit_entry: dict[str, str] | None = None
+    reopens = 0
+
+    for ev in events:
+        ph = ev.get("phase")
+        if not isinstance(ph, str) or ph not in PHASES:
+            continue
+        at = str(ev.get("ts") or "")
+        if ph in OFF_SPINE_PHASES:
+            exit_entry = {"phase": ph, "at": at}
+            continue
+        # An on-spine line.
+        if ph in seen_spine and exit_entry is not None:
+            # Came back to a phase already visited, AND an exit was standing — this
+            # is a genuine reopen (the store cleared the terminal fields to make it
+            # one), not a review round-trip within the spine.
+            reopens += 1
+        if exit_entry is not None:
+            # Reopened: the exit no longer holds, whatever it was.
+            exit_entry = None
+        seen_spine.add(ph)
+        timeline.append({"phase": ph, "at": at})
+
+    live_phase = record.get("phase")
+    if not isinstance(live_phase, str) or live_phase not in PHASES:
+        live_phase = "selected"
+    # The record is authoritative. If it says the item is on-spine, no stale exit
+    # from a torn tail may stand; if it says off-spine, that is the exit even when
+    # the fold's own last line disagreed.
+    if live_phase in OFF_SPINE_PHASES:
+        if exit_entry is None or exit_entry.get("phase") != live_phase:
+            exit_entry = {
+                "phase": live_phase,
+                "at": str(record.get("finished_at") or record.get("last_progress_at") or ""),
+            }
+    else:
+        exit_entry = None
+
+    number = record.get("number")
+    hint_number = number if isinstance(number, int) and not isinstance(number, bool) else None
+    title = ""
+    if title_hints is not None and hint_number is not None:
+        title = str(title_hints.get(hint_number) or "")
+    # ``next`` is the crew's RESUMABLE INTENT ("add the Windows branch to
+    # _safe_chmod"), not what the issue is called — it stays available under its
+    # own name for a view that wants to show what the crew is about to do, but it
+    # is NEVER the title. The title is the issue's real title from the list caches.
+    return {
+        "number": number,
+        "crew_id": record.get("crew_id"),
+        "title": title,
+        "next": str(record.get("next") or ""),
+        "pr_number": _finite_int(record.get("pr_number")),
+        "phase": live_phase,
+        # No `ci_state` here. It had no reader -- the app declared a type for it and
+        # never touched the value -- and it was the one field in this payload carrying
+        # an arbitrary nested dict straight from the record. `json.dumps` writes a
+        # non-finite float as bare `NaN`, which is not JSON, so one hand-edited or
+        # restored record could make `GET /crew/fabric` unparseable and the browser
+        # would drop EVERY lane, not just that item. `pr_number` above already goes
+        # through `_finite_int` for exactly this reason; an unread field does not earn
+        # a sanitiser, it earns deletion.
+        "timeline": timeline,
+        "exit": exit_entry,
+        "reopens": reopens,
+    }
+
+
+#: Ceiling on the ledger read the fabric fold joins against. The fold reads the
+#: WHOLE repo's ledger (every crew, every item) in one pass, unlike the per-crew
+#: ``GET /crew`` read, so its bound is larger — but still bounded, because the
+#: ledger is append-only and a repo that has run crews for months has thousands of
+#: lines that would otherwise all land in RAM on a page open.
+_FABRIC_PHASE_EVENT_LIMIT = 200_000
+
+
+def _fabric_title_hints(owner: str, repo: str, root: Path | None = None) -> dict[int, str]:
+    """``number -> issue/PR title``, seeded from the issues and pulls list caches.
+
+    The crew ledger records no title — a work item is ``number`` + ``phase`` — so
+    the lane's real title comes from the SAME list caches Issue Radar already
+    keeps, at ZERO extra API cost: this reads whatever is cached and never fetches.
+    A number that was never cached (or whose cache aged out) simply has no hint,
+    and its lane degrades to showing the id alone rather than being mislabelled.
+
+    Both open AND closed states are read, because a crew work item outlives the
+    issue's open state — an item can be ``resolved``/``skipped`` while its issue is
+    closed, so the open cache alone would drop exactly the finished lanes. Issues
+    are read first and pulls layered on top: a work item that has become a PR is
+    keyed by the ISSUE number it was claimed under, and the PR title is the more
+    specific label for that lane once one exists, so it wins on a collision.
+
+    Never raises: each cache read already tolerates an absent/torn/stale-schema
+    file by returning ``None`` (treated as empty here), so a repo with no caches
+    yields ``{}`` and every lane falls back to its id.
+    """
+    hints: dict[int, str] = {}
+
+    def _absorb(rows: list[dict[str, Any]] | None) -> None:
+        if not rows:
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            num = row.get("number")
+            if not isinstance(num, int) or isinstance(num, bool):
+                continue
+            title = row.get("title")
+            if isinstance(title, str) and title.strip():
+                hints[num] = title.strip()
+
+    # A cache read that fails must cost the TITLES, not the endpoint. These files are
+    # Issue Radar's, written by its own refresh, so a refresh landing between the
+    # reader's existence check and its read raises rather than returning empty -- and
+    # a 500 for a failed title lookup contradicts the degradation this join already
+    # promises everywhere else, where a number with no cached title simply renders as
+    # its id. Broad on purpose: any unreadable cache means "no hints from that cache".
+    for reader in (store.read_issues_cache, store.read_pulls_cache):
+        for state in ("open", "closed"):
+            try:
+                _absorb(reader(owner, repo, root, state=state))
+            except Exception:
+                logger.debug(
+                    "fabric title hints: %s cache unreadable for %s/%s (%s)",
+                    reader.__name__, owner, repo, state, exc_info=True,
+                )
+    return hints
+
+
+def fold_fabric(owner: str, repo: str, root: Path | None = None) -> list[dict[str, Any]]:
+    """Every crew work item in this repo, folded into a fabric lane, newest first.
+
+    ONE pass over the repo's crews and their work items, joined to the phase-bearing
+    slice of the append-only ledger. The join is per ``(crew_id, number)``: a work
+    item's lane is drawn from its own lines only, and a line with no ``phase`` (a
+    pre-feature line) contributes nothing, so an old ledger degrades the drawing
+    rather than breaking the fold.
+
+    Ordered newest-progress-first — the same order the crew page lists items in — so
+    an operator scanning the pipeline sees the freshly-moved lanes at the top.
+    """
+    # Group phase-bearing events by (crew_id, number), oldest first. read_events
+    # returns newest-first with duplicate ids already collapsed; reverse once here
+    # so each item's slice is in TIME order for the fold. The read is filtered to
+    # phase-bearing lines because the cap discards the OLDEST events: spending it
+    # on writes this fold ignores is what would truncate a long-stalled lane's
+    # entry line, and the lane that has sat in one phase longest is the one the
+    # board exists to show.
+    by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for ev in reversed(
+        read_events(owner, repo, root, limit=_FABRIC_PHASE_EVENT_LIMIT, require_phase=True)
+    ):
+        cid = ev.get("crew_id")
+        num = ev.get("number")
+        if not isinstance(cid, str) or not isinstance(num, int) or isinstance(num, bool):
+            continue
+        by_key.setdefault((cid, num), []).append(ev)
+
+    # Real issue/PR titles from the list caches Issue Radar already keeps — one
+    # read per cache for the WHOLE fold, not per lane.
+    title_hints = _fabric_title_hints(owner, repo, root)
+
+    items: list[dict[str, Any]] = []
+    for crew in list_crews(owner, repo, root, include_retired=True):
+        cid = str(crew.get("id") or "")
+        if not cid:
+            continue
+        for rec in list_work_items(owner, repo, cid, root):
+            num = rec.get("number")
+            if not isinstance(num, int) or isinstance(num, bool):
+                continue
+            events = by_key.get((cid, num), [])
+            item = _fold_one_item(rec, events, title_hints)
+            item["_sort"] = str(rec.get("last_progress_at") or "")
+            items.append(item)
+
+    items.sort(key=lambda it: it.pop("_sort"), reverse=True)
+    return items

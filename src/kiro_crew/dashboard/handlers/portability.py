@@ -5,15 +5,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import uuid
 from pathlib import Path
 
 from aiohttp import web
 from aiohttp.multipart import BodyPartReader
 
+from kiro_crew.dashboard import part_stream
 from kiro_crew.portability import apply_import_zip, create_export_zip, validate_import_zip
 from kiro_crew.sel import sel as _sel_fn  # circular import — sel imports lazily
 
 logger = logging.getLogger(__name__)
+
+#: Ceiling for an uploaded state archive, aligned with the bomb guard that
+#: already governs this path: `portability._MAX_IMPORT_UNCOMPRESSED` admits 2 GiB
+#: *uncompressed*, so a compressed archive under 2 GiB cannot be refused here
+#: without the two limits contradicting each other.
+#:
+#: A tighter ceiling (512 MB, say) is a NEW restriction rather than a restored
+#: one -- the upload streams to disk, so nothing downstream needs it -- and it
+#: would 413 a legitimate export exactly when the source machine may be gone.
+#: The cap exists only so an unbounded upload cannot fill the disk, and 2 GiB is
+#: the largest value consistent with the guard downstream.
+_MAX_IMPORT_BYTES = 2 * 1024**3
 
 
 def _sel():
@@ -27,19 +41,22 @@ async def _read_upload_file(request: web.Request) -> tuple[Path | None, web.Resp
     if part is None or not isinstance(part, BodyPartReader) or part.name != "file":
         return None, web.json_response({"error": "file field required"}, status=400)
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    # A single path rather than a scratch directory: the callers below already
+    # own the returned file and unlink it in their `finally`, so a directory
+    # would be a second thing to clean and nobody is cleaning it.
+    dest = Path(tempfile.gettempdir()) / f"kc_import_{uuid.uuid4().hex}.zip"
     try:
-        while True:
-            chunk = await part.read_chunk(65536)
-            if not chunk:
-                break
-            tmp.write(chunk)
-        tmp.close()
-        return Path(tmp.name), None
-    except Exception:
-        tmp.close()
-        Path(tmp.name).unlink(missing_ok=True)
-        raise
+        await part_stream.stream_part_to_file(part, dest, max_bytes=_MAX_IMPORT_BYTES)
+    except part_stream.PartTooLarge:
+        limit_mb = _MAX_IMPORT_BYTES // (1024 * 1024)
+        return None, web.json_response(
+            {
+                "error": f"archive too large (max {limit_mb} MB)",
+                "code": "import_archive_too_large",
+            },
+            status=413,
+        )
+    return dest, None
 
 
 async def api_portability_export(request: web.Request) -> web.Response:
@@ -106,11 +123,24 @@ async def api_portability_import(request: web.Request) -> web.Response:
 
         summary = await asyncio.to_thread(apply_import_zip, zip_path, mode)
 
+        # `staging` is recorded here, not only returned. Nothing renders it, and
+        # whether an import was pinned, mixed or unpinned is a security property of the
+        # operation, so the audit trail is where it belongs more than a UI badge does. The
+        # response still carries it for whatever renders it later.
+        #
+        # A refused component merge (the cron merge can refuse and import nothing)
+        # is logged as `partial`, not `ok` -- a flat ok would make the audit trail
+        # agree with a summary that claims a merge that never happened.
+        refused = summary.get("refused_merges") or []
         _sel().log_api_access(
             caller=caller,
             operation="portability.import",
-            outcome="ok",
-            resources=f"mode={mode},items={len(summary.get('items', []))}",
+            outcome="partial" if refused else "ok",
+            resources=(
+                f"mode={mode},items={len(summary.get('items', []))},"
+                f"staging={summary.get('staging', 'unknown')}"
+                + (f",refused={';'.join(refused)}" if refused else "")
+            ),
         )
 
         return web.json_response({"ok": True, "summary": summary, "manifest": manifest})

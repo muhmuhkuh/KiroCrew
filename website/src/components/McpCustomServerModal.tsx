@@ -18,6 +18,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Check, Loader2 } from 'lucide-react'
 import { api, ApiError } from '../api/client'
 import Modal from './Modal'
+import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
 import type { McpCustomSpec } from '../types'
 
@@ -219,11 +220,14 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
             <Loader2 size={13} className="animate-spin" aria-hidden="true" /> {i18nT('components.mcpCustomServerModal.loading_current_spec')}
           </span>
         )}
+        {/* No hand-off: the spec JSON textarea below is unsaved. */}
         {editing && specQuery.isError && (
-          <span className="flex items-center gap-1 text-xs text-amber-400" role="alert">
-            <AlertTriangle size={13} aria-hidden="true" />
-            {specQuery.error instanceof Error ? specQuery.error.message : i18nT('components.mcpCustomServerModal.failed_to_load_spec')}
-          </span>
+          <ErrorNotice
+            variant="inline"
+            className="text-xs"
+            message={specQuery.error instanceof Error && specQuery.error.message ? specQuery.error.message : i18nT('components.mcpCustomServerModal.failed_to_load_spec')}
+            testId="mcp-custom-spec-load-error"
+          />
         )}
         {editing && !!specQuery.data && Object.keys(specQuery.data.spec.headers ?? {}).length > 0 && (
           <p className="text-xs text-text m-0" role="note">
@@ -237,7 +241,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
           placeholder={editing ? '' : PLACEHOLDER}
           spellCheck={false}
           aria-label={editing ? i18nT('components.mcpCustomServerModal.server_spec_json') : i18nT('components.mcpCustomServerModal.servers_json')}
-          className={`w-full ${editing ? 'min-h-[220px]' : 'min-h-[400px]'} rounded-md border border-border bg-bg px-3 py-2 font-mono text-[12px] text-text focus:outline-none focus:ring-1 focus:ring-accent resize-y`}
+          className={`w-full ${editing ? 'min-h-[220px]' : 'min-h-[400px]'} rounded-md border border-border bg-bg px-3 py-2 font-mono text-[12px] text-text focus:outline-none focus-visible:ring-1 focus-visible:ring-accent resize-y`}
         />
 
         {parsed && !parsed.ok && (
@@ -255,7 +259,7 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
             onChange={(e) => setBareName(e.target.value)}
             placeholder={i18nT('components.mcpCustomServerModal.server_name')}
             aria-label={i18nT('components.mcpCustomServerModal.server_name_2')}
-            className="w-60 rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-text focus:outline-none focus:ring-1 focus:ring-accent"
+            className="w-60 rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-text focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
           />
         )}
 
@@ -273,11 +277,15 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
           </div>
         )}
 
-        {submitError && (
-          <span className="flex items-center gap-1 text-xs text-amber-400" role="alert">
-            <AlertTriangle size={13} aria-hidden="true" /> {submitError}
-          </span>
-        )}
+        {/* No hand-off: the spec JSON textarea (and the bare-server name) is
+            unsaved — the save that failed is exactly what it holds. The
+            client-side parse hint above stays plain validation text. */}
+        <ErrorNotice
+          variant="inline"
+          className="text-xs"
+          message={submitError}
+          testId="mcp-custom-submit-error"
+        />
 
         <div className="flex items-center justify-between gap-3 pt-1">
           {!editing ? (
@@ -285,6 +293,11 @@ export default function McpCustomServerModal({ open, onClose, editName }: Props)
               <input
                 type="checkbox"
                 checked={enableNow}
+                // Named from the SAME key as the visible text beside it: the
+                // wrapping label makes that text a click target, this names the
+                // control, and the muted sentence after it is elaboration the
+                // name deliberately leaves out.
+                aria-label={i18nT('components.mcpCustomServerModal.enable_immediately')}
                 onChange={(e) => setEnableNow(e.target.checked)}
                 className="accent-[var(--accent)]"
               />

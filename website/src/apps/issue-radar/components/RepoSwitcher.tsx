@@ -5,6 +5,8 @@ import {
 } from '../../../components/ui/dropdown-menu'
 import { ProviderLogo, ProviderHostTag } from './ProviderBadge'
 import { useIssueRadar } from '../context'
+import { repoScopeKey, sameRepoRef } from '../lib/links'
+import type { RepoRef } from '../api'
 import ReadOnlyTag, { isReadOnly } from './ReadOnlyTag'
 
 import { i18nT } from '../../../i18n/t'
@@ -77,16 +79,12 @@ export default function RepoSwitcher() {
   // Matched on the full identity, not just owner/repo: on a mixed install the
   // same slug can exist on two providers, and matching loosely would badge the
   // active repo with the other one's permissions.
-  const sameRepo = (r: { owner: string; repo: string; provider?: string; host?: string }) =>
-    r.owner === active.owner
-    && r.repo === active.repo
-    && (r.provider || 'github') === (active.provider || 'github')
-    && (r.host || 'github.com') === (active.host || 'github.com')
+  const sameRepo = (r: RepoRef) => sameRepoRef(r, active)
   const activeEntry = repos.find(sameRepo)
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border border-border-strong bg-bg-elevated shadow-sm hover:border-accent hover:bg-bg-hover cursor-pointer outline-none transition-colors">
+        <button className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border border-border-strong bg-bg-elevated shadow-sm hover:border-accent hover:bg-bg-hover cursor-pointer transition-colors">
           <ProviderLogo repoRef={active} size={18} />
           <RepoPathLabel
             owner={active.owner}
@@ -95,7 +93,7 @@ export default function RepoSwitcher() {
             repoClassName="font-semibold text-text"
           />
           <ProviderHostTag repoRef={active} />
-          {isReadOnly(activeEntry?.permissions) && <ReadOnlyTag />}
+          {isReadOnly(activeEntry?.permissions) && <ReadOnlyTag repoRef={activeEntry} />}
           <ChevronDown size={15} className="text-muted flex-shrink-0" />
         </button>
       </DropdownMenuTrigger>
@@ -107,7 +105,7 @@ export default function RepoSwitcher() {
             <DropdownMenuItem
               // Keyed on the full identity so two same-slug repos on different
               // providers are distinct rows rather than a React key collision.
-              key={`${r.provider || 'github'}:${r.host || 'github.com'}:${r.owner}/${r.repo}`}
+              key={repoScopeKey(r)}
               onSelect={() => switchRepo({
                 owner: r.owner,
                 repo: r.repo,
@@ -124,7 +122,7 @@ export default function RepoSwitcher() {
                   repoClassName="font-medium"
                 />
                 <ProviderHostTag repoRef={r} />
-                {isReadOnly(r.permissions) && <ReadOnlyTag />}
+                {isReadOnly(r.permissions) && <ReadOnlyTag repoRef={r} />}
               </div>
               {isActive && <Check size={13} className="text-accent flex-shrink-0" />}
             </DropdownMenuItem>

@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
 
-from . import deps, progress, runner
+from . import deps, progress, runner, store
 
 #: JSON-RPC 2.0 error codes used here.
 _METHOD_NOT_FOUND = -32601
@@ -185,9 +186,14 @@ def _tool_get_progress(_args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_get_deps(_args: dict[str, Any]) -> dict[str, Any]:
-    """Which external tools a run needs and whether they are present."""
+    """Which external tools the configured forge needs and whether they are present."""
 
-    return deps.check_deps()
+    config = store.read_json(store.config_path(), {})
+    config = config if isinstance(config, dict) else {}
+    return deps.check_deps(
+        str(config.get("provider") or "github"),
+        str(config.get("host") or ""),
+    )
 
 
 #: Read-only tools, with the minimal schema ``tools/list`` needs. Every one is
@@ -230,7 +236,7 @@ def _input_schema(name: str) -> dict[str, Any]:
 
 def _schema() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for name, (_fn, description, props) in TOOLS.items():
+    for name, (_fn, description, _props) in TOOLS.items():
         out.append(
             {
                 "name": name,

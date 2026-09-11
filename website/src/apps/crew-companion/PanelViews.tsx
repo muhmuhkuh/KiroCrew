@@ -21,6 +21,7 @@ import { BREAK_MIN_MINS, BREAK_MAX_MINS } from './constants'
 import type { Reminder } from './types'
 import { ReminderInput } from './ReminderInput'
 import { petBridge } from './petBridge'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 const api = petBridge
 
@@ -208,7 +209,6 @@ const Toggle: React.FC<{
 }> = ({ on, onChange, label, hint }) => {
   const skin = useSkin()
   return (
-    // eslint-disable-next-line jsx-a11y/label-has-for -- input IS nested inside this label; nesting provides the association
     <label style={{
       display: 'flex', alignItems: 'flex-start', gap: 9, padding: '9px 10px',
       // No background/radius of its own: a Toggle may sit alone or grouped with
@@ -268,6 +268,7 @@ const Toggle: React.FC<{
 }
 
 export const SettingsView: React.FC = () => {
+  const ime = useImeGuard()
   // The interval picker below styles itself from the skin. Omitting this threw
   // `ReferenceError: skin is not defined` on render, which unmounted the whole card.
   const skin = useSkin()
@@ -367,17 +368,24 @@ export const SettingsView: React.FC = () => {
               placeholder={i18nT('apps.crewCompanion.view.everyMinShort')}
               value={customDraft !== null ? customDraft
                 : BREAK_PRESETS.includes(breakMins) ? '' : String(breakMins)}
-              onFocus={() => setCustomDraft(
-                BREAK_PRESETS.includes(breakMins) ? '' : String(breakMins),
-              )}
+              {...ime.bindComposition({
+                onFocus: () => setCustomDraft(
+                  BREAK_PRESETS.includes(breakMins) ? '' : String(breakMins),
+                ),
+                onBlur: () => {
+                  const next = clampBreakMins(customDraft ?? '')
+                  setCustomDraft(null)
+                  if (next === null) return
+                  setBreakMins(next)
+                  api?.updateConfig?.({ breakReminderMins: next })
+                },
+              })}
               onChange={(e) => setCustomDraft(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-              onBlur={() => {
-                const next = clampBreakMins(customDraft ?? '')
-                setCustomDraft(null)
-                if (next === null) return
-                setBreakMins(next)
-                api?.updateConfig?.({ breakReminderMins: next })
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter') return
+                // Early-return BEFORE the blur: a committing IME Enter must not commit.
+                if (ime.isComposing(e)) return
+                ;(e.target as HTMLInputElement).blur()
               }}
               style={{
                 width: 42, height: 24, borderRadius: 999, textAlign: 'center',

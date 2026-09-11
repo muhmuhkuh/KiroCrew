@@ -12,7 +12,10 @@ import { sageApi } from '../api'
 import { useSage } from '../context'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
+import { useImeGuard } from '../../../hooks/useImeGuard'
 export default function LearningRail() {
+  const ime = useImeGuard()
   const { selectedNamespace, selectNamespace } = useSage()
   const qc = useQueryClient()
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
@@ -90,9 +93,7 @@ export default function LearningRail() {
           <div className="px-1 py-1 text-[12px] text-muted">{i18nT('apps.codeReviewSage.components.learningRail.loading')}</div>
         )}
         {nsQuery.error && (
-          <div className="px-1 py-1 text-[12px] text-danger">
-            {(nsQuery.error as Error).message}
-          </div>
+          <ErrorNotice message={(nsQuery.error as Error).message} variant="inline" askAgent className="px-1 py-1" />
         )}
 
         {nsQuery.data?.namespaces.map((ns) => {
@@ -197,13 +198,13 @@ export default function LearningRail() {
               value={newName}
               autoFocus
               onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && newName.trim()) createMut.mutate(newName.trim())
-                if (e.key === 'Escape') { setAdding(false); setNewName('') }
-              }}
+              {...ime.bindEnter({
+                onEnter: () => { if (newName.trim()) createMut.mutate(newName.trim()) },
+                onEscape: () => { setAdding(false); setNewName('') },
+              })}
               aria-label={i18nT('apps.codeReviewSage.components.learningRail.new_namespace_name')}
               placeholder={i18nT('apps.codeReviewSage.components.learningRail.new_namespace_2')}
-              className="flex-1 min-w-0 rounded-md border border-border bg-bg-elevated px-2 py-1 font-mono text-[12px] text-text outline-none focus:border-accent"
+              className="flex-1 min-w-0 rounded-md border border-border bg-bg-elevated px-2 py-1 font-mono text-[12px] text-text outline-none focus-visible:border-accent"
             />
             <button
               type="button"
@@ -216,7 +217,8 @@ export default function LearningRail() {
             </button>
           </div>
         )}
-        {err && <div className="px-1 text-[11.5px] text-danger">{err.message}</div>}
+        {/* No hand-off: the new-namespace name input above is unsaved. */}
+        {err && <ErrorNotice message={err.message} variant="inline" className="px-1" />}
       </div>
     </div>
   )

@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { MessageSquare, MessageSquarePlus, X, Pencil, Check, Send } from 'lucide-react'
 import { SendBtn } from './ui'
+import { offlineProps } from '../utils/offline'
 import { useImeGuard } from '../hooks/useImeGuard'
 
 import { i18nT } from '../i18n/t'
@@ -85,8 +86,8 @@ function CommentPopover({ x, y, onSubmit, onCancel, containerRef, scrollRef }: {
           value={text}
           rows={1}
           onChange={e => { setText(e.target.value); autoGrow(e.target) }}
-          {...ime.composition}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e) && text.trim()) { e.preventDefault(); e.stopPropagation(); onSubmit(text.trim()) } if (e.key === 'Escape') { ime.reset(); e.preventDefault(); e.stopPropagation(); onCancel() } }}
+          {...ime.bindComposition()}
+          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey && text.trim()) { if (ime.claimEnter(e)) { e.stopPropagation(); onSubmit(text.trim()) } } if (e.key === 'Escape') { ime.reset(); e.preventDefault(); e.stopPropagation(); onCancel() } }}
           className="bg-bg-elevated border border-border rounded-md pl-3 pr-8 py-2 text-text text-sm font-body outline-none w-full transition-colors focus-ring resize-none leading-[21px] overflow-hidden"
         />
         <button
@@ -131,12 +132,11 @@ function CommentRow({ comment, onEdit, onRemove }: {
         <div className="text-muted text-[11px] font-mono truncate" title={comment.anchor}>"{comment.anchor.slice(0, 60)}{comment.anchor.length > 60 ? '…' : ''}"</div>
         {editing ? (
           <input ref={inputRef} value={draft} onChange={e => setDraft(e.target.value)}
-            {...ime.composition}
+            {...ime.bindComposition<HTMLInputElement>({ onBlur: commitEdit })}
             onKeyDown={e => {
-              if (e.key === 'Enter' && !ime.isComposing(e) && draft.trim()) commitEdit()
+              if (e.key === 'Enter' && draft.trim()) { if (ime.claimEnter(e)) commitEdit() }
               if (e.key === 'Escape') { ime.reset(); cancelledRef.current = true; setDraft(comment.text); setEditing(false) }
             }}
-            onBlur={commitEdit}
             className="bg-bg border border-border rounded px-1.5 py-0.5 text-text text-[13px] w-full outline-none focus-ring" />
         ) : (
           <div
@@ -165,8 +165,12 @@ function CommentRow({ comment, onEdit, onRemove }: {
  *  single (comment) input box rather than two competing inputs. Its value is
  *  passed to `onSubmitAll` alongside the comments only when it was opened, and
  *  it collapses again after submit. */
-function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPrompt }: {
+function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPrompt, connected = true }: {
   comments: InlineComment[]; onEdit: (id: string, text: string) => void; onRemove: (id: string) => void; onSubmitAll: (extraPrompt?: string) => void; enableExtraPrompt?: boolean
+  /** Gateway connection flag — mirrors ChatInput's Send gating so a batch
+   *  submit can't fire (and clear pending comments) while the send path would
+   *  silently refuse it. Defaults true for non-chat embeddings. */
+  connected?: boolean
 }) {
   const [extraPrompt, setExtraPrompt] = useState('')
   const [showExtraPrompt, setShowExtraPrompt] = useState(false)
@@ -189,7 +193,7 @@ function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPromp
             ><MessageSquarePlus className="lucide-inline" /> {i18nT('components.commentOverlay.add_instruction')}</button>
           )}
         </div>
-        <SendBtn onClick={() => { onSubmitAll(enableExtraPrompt && showExtraPrompt ? extraPrompt : undefined); setExtraPrompt(''); setShowExtraPrompt(false) }}>{i18nT('components.commentOverlay.submit_all')} <Send className="lucide-inline" /></SendBtn>
+        <SendBtn disabled={!connected} {...offlineProps(connected, i18nT('utils.offline.submit_comments'), i18nT('components.commentOverlay.submit_all'))} onClick={() => { onSubmitAll(enableExtraPrompt && showExtraPrompt ? extraPrompt : undefined); setExtraPrompt(''); setShowExtraPrompt(false) }}>{i18nT('components.commentOverlay.submit_all')} <Send className="lucide-inline" /></SendBtn>
       </div>
       <div className="space-y-1.5 max-h-[200px] overflow-y-auto">
         {comments.map(c => <CommentRow key={c.id} comment={c} onEdit={onEdit} onRemove={onRemove} />)}

@@ -12,6 +12,11 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers, ws
+from kiro_crew.feature_videos import (
+    api_feature_videos_feedback,
+    api_feature_videos_next,
+    api_feature_videos_status,
+)
 from kiro_crew.suggestions import api_suggestions
 from kiro_crew.tips import api_tips_feedback, api_tips_next, api_tips_status
 
@@ -20,6 +25,11 @@ def register(app: web.Application) -> None:
     """Register the realtime routes on *app*."""
     app.router.add_get("/", handlers.index)
     app.router.add_get("/logo.png", handlers.logo)
+    # A long tail of clients (bookmark managers, in-app browsers, uptime
+    # monitors) never parse <link rel="icon"> and fetch /favicon.ico directly.
+    # Without this route the request falls through to the SPA fallback and
+    # returns 200 text/html, which fails image decoding downstream.
+    app.router.add_get("/favicon.ico", handlers.logo)
     app.router.add_get(
         "/{name:manifest\\.json|sw\\.js|icon-\\d+\\.png|pcm-worklet\\.js}", handlers.pwa_file
     )
@@ -41,10 +51,18 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/system/session-storage/cleanup", handlers.api_session_storage_cleanup)
     app.router.add_post("/api/system/session-storage/restore", handlers.api_session_storage_restore)
     app.router.add_post("/api/system/session-storage/empty", handlers.api_session_storage_empty)
+    # Progress for the empty above. A GET on the same path, because it reports on
+    # exactly the operation that POST starts.
+    app.router.add_get(
+        "/api/system/session-storage/empty", handlers.api_session_storage_empty_status
+    )
     app.router.add_get("/api/stream", handlers.api_stream)
     app.router.add_get("/api/sso-ttl", handlers.api_sso_ttl)
     app.router.add_get("/api/dashboard/branding", handlers.api_branding)
     app.router.add_get("/api/health", handlers.api_health)
+    # Authenticated, NOT a probe path: the version-equality gate for remote
+    # execution reads it over an instance tunnel with the dashboard cookie.
+    app.router.add_get("/api/version", handlers.api_version)
     app.router.add_get("/api/live", handlers.api_live)
     app.router.add_get("/api/ready", handlers.api_ready)
     app.router.add_get("/api/theme/boot", handlers.api_theme_boot)
@@ -60,6 +78,33 @@ def register(app: web.Application) -> None:
         "/api/kiro-prerequisite/repair-specs",
         handlers.api_kiro_prerequisite_repair_specs,
     )
+    # POST for the same reason as repair-specs above: it spawns `kiro-cli update`
+    # on the host, so it must be origin-checked and audited.
+    app.router.add_post(
+        "/api/kiro-prerequisite/update-cli",
+        handlers.api_kiro_prerequisite_update_cli,
+    )
+
+    # KAS-mode interactive login (no kiro-cli): status is a read; the device-code
+    # begin/poll/logout mutations are POSTs so they stay origin-checked and audited.
+    # The kas_login module (and the auth subsystem behind it) is imported on the
+    # FIRST request, never at boot — route registration must add no gateway-boot
+    # work for a subsystem most launches never touch. Python caches the module
+    # after that first import, so the per-request cost is a dict lookup.
+    def _lazy_kas(handler_name: str):
+        async def _dispatch(request):
+            from kiro_crew.dashboard.handlers import kas_login
+
+            return await getattr(kas_login, handler_name)(request)
+
+        return _dispatch
+
+    app.router.add_get("/api/kas-login", _lazy_kas("api_kas_login_status"))
+    app.router.add_post("/api/kas-login/device", _lazy_kas("api_kas_login_begin_device"))
+    app.router.add_post("/api/kas-login/loopback", _lazy_kas("api_kas_login_begin_loopback"))
+    app.router.add_post("/api/kas-login/poll", _lazy_kas("api_kas_login_poll"))
+    app.router.add_post("/api/kas-login/cancel", _lazy_kas("api_kas_login_cancel"))
+    app.router.add_post("/api/kas-login/logout", _lazy_kas("api_kas_login_logout"))
     app.router.add_get("/api/governance/channels", handlers.api_governance_channels)
 
     # Suggestions (pre-computed contextual prompts)
@@ -69,3 +114,8 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/tips/next", api_tips_next)
     app.router.add_get("/api/tips/status", api_tips_status)
     app.router.add_post("/api/tips/feedback", api_tips_feedback)
+
+    # Feature videos (deterministic feature-intro clips, sibling of tips above)
+    app.router.add_get("/api/feature-videos/next", api_feature_videos_next)
+    app.router.add_get("/api/feature-videos/status", api_feature_videos_status)
+    app.router.add_post("/api/feature-videos/feedback", api_feature_videos_feedback)

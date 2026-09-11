@@ -18,7 +18,11 @@ from typing import Any
 
 import pytest
 
-from kiro_crew.apps.builtins.auto_improvement.backend import pr_checks, pr_watchers, store
+from kiro_crew.apps.builtins.auto_improvement.backend import (
+    pr_checks,
+    pr_watchers,
+    store,
+)
 
 WAIT_S = 10.0
 
@@ -794,7 +798,13 @@ class TestCloneLifecycleAndExport:
             max_nudges=3,
             interval_s=0.0,
         )
-        _await_status(reg, "fp-once", {pr_watchers.STATUS_EXHAUSTED})
+        # Three times the file-wide budget, named: this test runs a REAL clone and
+        # then three passes that are each several git subprocesses on Windows-speed
+        # process spawns, on a host shared with five other workers. One full run
+        # in five saw every pass complete ("pass 3/3") with only the exhausted
+        # transition still outstanding at WAIT_S -- a bounded wait asserting too
+        # early, not a stuck watcher.
+        _await_status(reg, "fp-once", {pr_watchers.STATUS_EXHAUSTED}, timeout=WAIT_S * 3)
         assert marks == [False, True, True], "the clone must persist across passes"
 
 
@@ -845,31 +855,3 @@ class TestWorkItems:
 
     def test_clean_status_has_no_work_items(self) -> None:
         assert pr_watchers._work_items(_status(failing=[])) == []
-
-
-class TestNudgePromptGitLab:
-    """A watched GitLab MR must be taught glab verbs and glab's own limits."""
-
-    @staticmethod
-    def _prompt(pr: str) -> str:
-        st = pr_watchers.WatcherState(fp="fp", pr=pr)
-        return pr_watchers.build_nudge_prompt(st, "/tmp/clone", _status())
-
-    def test_gitlab_mr_uses_glab_verbs(self) -> None:
-        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
-        assert "glab mr view" in prompt
-        assert "glab ci status" in prompt
-        assert "gh pr view" not in prompt
-
-    def test_gitlab_limits_forbid_merging_and_ready(self) -> None:
-        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
-        low = prompt.lower()
-        assert "glab mr merge" in low
-        assert "glab mr update --ready" in low
-        assert "never push" in low
-        assert "gh pr ready" not in low
-
-    def test_github_prompt_still_uses_gh(self) -> None:
-        prompt = self._prompt("https://github.com/owner/repo/pull/7")
-        assert "gh pr view" in prompt
-        assert "glab mr view" not in prompt

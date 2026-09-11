@@ -1,12 +1,15 @@
+import { isValidLoopbackReturnAddress, normalizeLoopbackReturnAddress } from '../utils/loopbackReturnAddress'
 import { describe, expect, it } from 'vitest'
+import type { ConnectionStatus } from '../api/client'
 import type { ChatMessage, McpServer } from '../types'
 import {
+  confirmedGrantPresent,
   connectionStateFor,
   disconnectFeedback,
   effectiveOAuth,
-  isValidLoopbackReturnAddress,
   latestOAuthByServer,
   mintOutcome,
+  probeIndicatesConnected,
   uninstallOnCancel,
   withMintedUrl,
   type OAuthState,
@@ -22,7 +25,26 @@ const server = (status: string): McpServer => ({
   enabled: true,
 })
 
+/** One entry of the /api/connections/status authorization feed. */
+const status = (over: Partial<ConnectionStatus> = {}): ConnectionStatus => ({
+  slug: 'notion',
+  status: 'connected',
+  grantPresent: true,
+  ...over,
+})
+
 describe('Connections card states', () => {
+  it('lets a confirmed absent grant override a cached-ok probe', () => {
+    // `ok` is a cached reachability verdict and outlives revocation; a CONFIRMED
+    // absent grant is the fresher authorization fact and must win.
+    expect(connectionStateFor(server('ok'), undefined, false, false)).toBe('not-verified')
+    expect(connectionStateFor(server('ok'), undefined, false, true)).toBe('connected')
+    // Indeterminate / not-yet-loaded (undefined) keeps the prior behaviour.
+    expect(connectionStateFor(server('ok'), undefined, false, undefined)).toBe('connected')
+    // A flow completed in THIS session outranks a possibly-lagging status poll.
+    expect(connectionStateFor(server('ok'), { completed: true }, false, false)).toBe('connected')
+  })
+
   it('covers not connected, waiting, connected, and needs-attention states', () => {
     expect(connectionStateFor(undefined, undefined)).toBe('not-connected')
     expect(connectionStateFor(server('unknown'), undefined)).toBe('waiting-for-approval')
@@ -38,6 +60,60 @@ describe('Connections card states', () => {
    */
   it('reports needs_auth as not-verified rather than an error card', () => {
     expect(connectionStateFor(server('needs_auth'), undefined)).toBe('not-verified')
+  })
+
+  it('keeps the waiting card across a refresh while the backend mint is in flight', () => {
+    // A reload mid-consent drops every per-tab signal (locallyWaiting, the chat
+    // oauth message), but the backend's awaiting_consent verdict survives it —
+    // the card must keep waiting, not silently fall back to Connect.
+    expect(connectionStateFor(undefined, undefined, false, undefined, true))
+      .toBe('waiting-for-approval')
+    expect(connectionStateFor(server('needs_auth'), undefined, false, false, true))
+      .toBe('waiting-for-approval')
+    // A live mint attempt now outranks a cached-ok probe too: the mint side of
+    // this fix validates an existing grant before ever reporting `granted`, so a
+    // genuinely fresh `awaitingConsent` here means the old grant did not hold up
+    // and a real consent flow is in progress. Claiming Connected from the stale
+    // probe over that is the exact defect this fix closes.
+    expect(connectionStateFor(server('ok'), undefined, false, true, true))
+      .toBe('waiting-for-approval')
+    // And a refused grant is still a real failure, not a spinner.
+    expect(connectionStateFor(server('needs_auth'), {
+      completed: false, failed: true, oauthUrl: '', error: 'denied', timestamp: 1,
+    }, false, false, true)).toBe('needs-attention')
+  })
+
+  /**
+   * The reported defect: clicking Connect on Stripe or Vercel (an already
+   * -configured provider whose `/api/mcp` probe answers `ok` from a cached
+   * handshake) flipped the card to Connected instantly, before the mint had
+   * validated whether that old grant still worked. Test then forced kiro-cli's
+   * real refresh, the pair turned out dead, and the card fell to not-authorized
+   * — an authorization claim the card made with nothing behind it.
+   *
+   * A fresh mint attempt in THIS tab (`locallyWaiting`) or one the backend's
+   * mint table reports in flight (`awaitingConsent`) must hold the card in the
+   * waiting state regardless of what the 30-second status poll cached, until
+   * the mint itself resolves the attempt one way or the other.
+   */
+  it('holds the waiting card through a fresh Connect click even over a cached-ok probe', () => {
+    // The exact shape of the bug: server.status is the stale cached 'ok', and
+    // this tab just started its own attempt. The click, not the cache, owns
+    // the card until the mint answers.
+    expect(connectionStateFor(server('ok'), undefined, true)).toBe('waiting-for-approval')
+    // Same shape via the backend's mint table rather than local tab state —
+    // covers a second tab watching the same provider's attempt.
+    expect(connectionStateFor(server('ok'), undefined, false, true, true))
+      .toBe('waiting-for-approval')
+    // Once the flow completes in THIS session, completed evidence still wins
+    // over everything, exactly as it always has.
+    expect(connectionStateFor(server('ok'), { completed: true }, true))
+      .toBe('connected')
+    // And a refusal during that same attempt is a real failure, not a spinner
+    // that quietly reverts to the stale cached 'ok'.
+    expect(connectionStateFor(server('ok'), {
+      completed: false, failed: true, oauthUrl: '', error: 'denied', timestamp: 1,
+    }, true)).toBe('needs-attention')
   })
 
   it('lets live OAuth evidence outrank a tokenless needs_auth probe', () => {
@@ -302,15 +378,18 @@ describe('disconnect feedback', () => {
 })
 
 describe('loopback OAuth return-address validation', () => {
-  it('accepts only an IP-literal loopback callback with a port and code', () => {
+  it('accepts the loopback host set the backend admits, with a port and code', () => {
     expect(isValidLoopbackReturnAddress('http://127.0.0.1:43123/?code=one-time&state=s')).toBe(true)
     expect(isValidLoopbackReturnAddress('http://[::1]:43123/callback?code=one-time')).toBe(true)
+    // kiro-cli's callback URL can be localhost-shaped; the backend accepts it,
+    // so the client pre-check must not reject the exact paste the flow needs.
+    expect(isValidLoopbackReturnAddress('http://localhost:43123/?code=one-time')).toBe(true)
   })
 
   it.each([
     'https://127.0.0.1:43123/?code=x',
-    'http://localhost:43123/?code=x',
     'http://10.0.0.5:43123/?code=x',
+    'http://example.com:43123/?code=x',
     'http://127.0.0.1/?code=x',
     'http://127.0.0.1:43123/',
     'http://user@127.0.0.1:43123/?code=x',
@@ -318,5 +397,106 @@ describe('loopback OAuth return-address validation', () => {
     'http://127.0.0.1:43123/?code=x#fragment',
   ])('rejects unsafe or incomplete return address %s', value => {
     expect(isValidLoopbackReturnAddress(value)).toBe(false)
+  })
+
+  // #7406: iOS Safari copies address-bar URLs without the scheme; the
+  // scheme-less paste must normalize to http:// and validate.
+  it.each([
+    '127.0.0.1:43123/?code=one-time&state=s',
+    'localhost:43123/callback?code=one-time',
+    '[::1]:43123/?code=one-time',
+  ])('accepts a scheme-less loopback paste %s via the http default', value => {
+    expect(normalizeLoopbackReturnAddress(value)).toBe(`http://${value}`)
+    expect(isValidLoopbackReturnAddress(value)).toBe(true)
+  })
+
+  it.each([
+    // The http default must not widen containment beyond the strict form.
+    '10.0.0.5:43123/?code=x',
+    'evil.example:43123/?code=x',
+    '127.0.0.1/?code=x',
+    // An explicit non-http scheme stays rejected — no rewrite to http.
+    'ftp://127.0.0.1:43123/?code=x',
+  ])('scheme default still rejects %s', value => {
+    expect(isValidLoopbackReturnAddress(value)).toBe(false)
+  })
+
+  it('leaves an already-schemed value untouched', () => {
+    expect(normalizeLoopbackReturnAddress(' http://127.0.0.1:43123/?code=x '))
+      .toBe('http://127.0.0.1:43123/?code=x')
+  })
+})
+
+describe('the authorization axis resolves the needs_auth ambiguity', () => {
+  // A tokenless probe answers `needs_auth` for BOTH a server nobody authorized
+  // and one authorized outside the dashboard. `grantPresent` from
+  // /api/connections/status is the fact that separates them.
+  it('reads needs_auth with a grant on disk as connected', () => {
+    expect(connectionStateFor(server('needs_auth'), undefined, false, true)).toBe('connected')
+  })
+
+  it('keeps needs_auth without a grant honest as not-verified', () => {
+    expect(connectionStateFor(server('needs_auth'), undefined, false, false)).toBe('not-verified')
+  })
+
+  it('preserves the pre-status behaviour when the feed has not answered yet', () => {
+    // Undefined is "not known", not "no grant": the card must not change meaning
+    // on the first render before the status query resolves.
+    expect(connectionStateFor(server('needs_auth'), undefined, false, undefined)).toBe('not-verified')
+    expect(connectionStateFor(server('needs_auth'), undefined)).toBe('not-verified')
+  })
+
+  it('does not let a grant override a live attempt or a real failure', () => {
+    const oauth = (over: Partial<OAuthState>): OAuthState => ({
+      completed: false, failed: false, oauthUrl: '', error: '', timestamp: 1, ...over,
+    })
+    // A pending attempt still owns the card, grant or not.
+    expect(connectionStateFor(server('needs_auth'), undefined, true, true)).toBe('waiting-for-approval')
+    // A refused grant stays a failure: the artifacts existing does not make it work.
+    expect(connectionStateFor(server('needs_auth'), oauth({ failed: true }), false, true))
+      .toBe('needs-attention')
+    // A grant says nothing about an endpoint that is actually broken.
+    expect(connectionStateFor(server('error'), undefined, false, true)).toBe('needs-attention')
+  })
+})
+
+describe('one probe reading serves both the badge and the Test button', () => {
+  // The badge and the Test button used to fold the SAME probe answer twice, and
+  // disagreed: a connected provider showed Connected beside a "test failed".
+  // This is the single predicate both now consume, so the truth table is pinned
+  // here rather than inferred from either surface.
+  it('reads a tokenless needs_auth beside a grant as connected', () => {
+    expect(probeIndicatesConnected('needs_auth', true)).toBe(true)
+  })
+
+  it('refuses needs_auth when no grant is held', () => {
+    // Absent AND indeterminate: neither is a grant, so neither may claim health.
+    expect(probeIndicatesConnected('needs_auth', false)).toBe(false)
+    expect(probeIndicatesConnected('needs_auth', undefined)).toBe(false)
+  })
+
+  it('accepts ok unless the grant is CONFIRMED absent', () => {
+    // Reachability is cached, so it outlives revocation — only a confirmed
+    // absence is a fresher fact than it. Indeterminate keeps the prior verdict.
+    expect(probeIndicatesConnected('ok', true)).toBe(true)
+    expect(probeIndicatesConnected('ok', undefined)).toBe(true)
+    expect(probeIndicatesConnected('ok', false)).toBe(false)
+  })
+
+  it('never lets a grant launder a broken or unknown probe', () => {
+    for (const status of ['error', 'disabled', 'unknown', 'probing', 'outdated']) {
+      expect(probeIndicatesConnected(status, true)).toBe(false)
+      expect(probeIndicatesConnected(status, undefined)).toBe(false)
+    }
+  })
+
+  it('collapses an indeterminate grant lookup to the honest hedge', () => {
+    // `grantPresent: false` from a lookup that FAILED means "could not look" —
+    // it must not reach either surface as a confirmed absence.
+    expect(confirmedGrantPresent(undefined)).toBeUndefined()
+    expect(confirmedGrantPresent(status({ grantPresent: false, grantIndeterminate: true })))
+      .toBeUndefined()
+    expect(confirmedGrantPresent(status({ grantPresent: false }))).toBe(false)
+    expect(confirmedGrantPresent(status({ grantPresent: true }))).toBe(true)
   })
 })

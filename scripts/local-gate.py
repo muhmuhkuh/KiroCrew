@@ -12,13 +12,16 @@ the diff costs, not what the repo costs.
 
 Contract (identical to CI's, fail-open everywhere)
 --------------------------------------------------
-Every changed file lands in exactly ONE bucket, mirroring ci.yml's
-``changes`` job:
+Every changed file lands in exactly ONE bucket -- or, for ignored evidence
+media, none -- mirroring ci.yml's ``changes`` job:
 
 - ``frontend``: ``website/**``
 - ``meta``:     ``.github/**``, ``scripts/**``
-- ``backend``:  everything else (a CATCH-ALL -- an unrecognised path counts as
-  backend, so a new file can never silently ride along under a narrowed run)
+- ``backend``:  everything else except the ignored prefixes (a CATCH-ALL -- an
+  unrecognised path counts as backend, so a new file can never silently ride
+  along under a narrowed run)
+- ignored:      ``temp-screenshots/**`` (evidence media; NO bucket, so an
+  ignored-only diff runs the full gate)
 
 Narrowing happens only when exactly one of frontend/backend changed and meta
 did not:
@@ -49,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -56,10 +60,27 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SELECTOR = _REPO_ROOT / "scripts" / "ci-surface-tests.py"
 
+# The selector's stdout becomes argv for pytest and vitest, so it is validated
+# with the SAME helper `run_scoped_tests.py` uses rather than a second copy of
+# the rule -- two spellings of one admission check drift, and this one would
+# drift silently because nothing here would fail when it did.
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+from run_scoped_tests import (  # noqa: E402  (path set immediately above)
+    SelectionUntrustworthy,
+    validated_targets,
+)
+
 # Bucket rules -- MUST mirror ci.yml's `changes` job filters. test_local_gate.py
 # pins this against the workflow file so drift fails a test instead of shipping.
 _FRONTEND_PREFIXES = ("website/",)
 _META_PREFIXES = (".github/", "scripts/")
+# Evidence media ci.yml excludes from EVERY bucket (#8027): temp-screenshots/**
+# is never packaged or imported, so it must not drag a frontend-only diff into
+# the backend matrix. A path here sets NO flag; a diff that is ONLY ignored
+# paths classifies all-False and build_plan() runs the full gate (fail-open),
+# matching CI's full matrix for a screenshots-only PR.
+_IGNORED_PREFIXES = ("temp-screenshots/",)
+_NODE_LAUNCHERS = frozenset({"npm", "npx"})
 
 
 def classify(paths: list[str]) -> tuple[bool, bool, bool]:
@@ -67,12 +88,16 @@ def classify(paths: list[str]) -> tuple[bool, bool, bool]:
 
     Backend is the catch-all: any path that is neither frontend nor meta counts
     as backend, including paths that do not exist yet (adds) or any unexpected
-    shape. There is deliberately NO "unknown" outcome.
+    shape. There is deliberately NO "unknown" outcome. The one carve-out is
+    ``_IGNORED_PREFIXES`` (screenshot evidence), which sets no flag at all --
+    mirroring ci.yml, where those paths match no bucket.
     """
     frontend = meta = backend = False
     for raw in paths:
         p = raw.strip().replace("\\", "/")
         if not p:
+            continue
+        if p.startswith(_IGNORED_PREFIXES):
             continue
         if p.startswith(_FRONTEND_PREFIXES):
             frontend = True
@@ -89,21 +114,31 @@ def changed_files(base: str) -> list[str] | None:
     Includes uncommitted work (staged + unstaged + untracked) -- the local gate
     verifies the working tree, not just commits. Any git failure returns None,
     which the caller maps to the full gate (fail-open).
+
+    BOTH endpoints of a rename are collected: ``--no-renames`` makes git report
+    a rename as a delete plus an add (the same contract run_scoped_tests.py
+    documents, and the same one dorny/paths-filter applies in CI), so renaming
+    a real file INTO an ignored evidence path cannot hide the old path's
+    bucket from classification.
     """
     try:
         merge_base = subprocess.run(
             ["git", "merge-base", "HEAD", base],
-            cwd=_REPO_ROOT, capture_output=True, text=True, timeout=30,
+            cwd=_REPO_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         if merge_base.returncode != 0:
             return None
         committed = subprocess.run(
-            ["git", "diff", "--name-only", merge_base.stdout.strip(), "HEAD"],
-            cwd=_REPO_ROOT, capture_output=True, text=True, timeout=30,
+            ["git", "diff", "--name-only", "--no-renames",
+             merge_base.stdout.strip(), "HEAD"],
+            cwd=_REPO_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         working = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=_REPO_ROOT, capture_output=True, text=True, timeout=30,
+            ["git", "status", "--porcelain", "--no-renames"],
+            cwd=_REPO_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
         )
         if committed.returncode != 0 or working.returncode != 0:
             return None
@@ -111,10 +146,13 @@ def changed_files(base: str) -> list[str] | None:
         return None
     paths = [line for line in committed.stdout.splitlines() if line.strip()]
     for line in working.stdout.splitlines():
-        # porcelain: "XY path" or "XY old -> new" for renames; take the new name.
-        entry = line[3:].split(" -> ")[-1].strip().strip('"')
-        if entry:
-            paths.append(entry)
+        # porcelain: "XY path". Renames cannot appear (--no-renames above), but
+        # parse the "old -> new" arrow defensively and keep BOTH sides -- the
+        # old path's bucket must not vanish just because the file moved.
+        for part in line[3:].split(" -> "):
+            entry = part.strip().strip('"')
+            if entry:
+                paths.append(entry)
     return paths
 
 
@@ -123,7 +161,8 @@ def selector_must_run(surface: str) -> list[str] | None:
     try:
         proc = subprocess.run(
             [sys.executable, str(_SELECTOR), "--surface", surface],
-            cwd=_REPO_ROOT, capture_output=True, text=True, timeout=120,
+            cwd=_REPO_ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -155,6 +194,23 @@ def _frontend_full(plan: Plan) -> None:
     plan.add("frontend (full)", ["npm", "test"], _REPO_ROOT / "website")
 
 
+def _resolve_command(cmd: list[str]) -> list[str]:
+    """Resolve Node's platform launcher before passing argv to subprocess.
+
+    npm installs ``npm.cmd`` / ``npx.cmd`` on Windows.  ``subprocess.run`` with
+    ``shell=False`` does not apply the shell's PATHEXT lookup, so a bare
+    ``"npx"`` raises ``FileNotFoundError`` even though the same command works
+    at an interactive prompt.  ``shutil.which`` performs the portable lookup
+    and still preserves list argv / no-shell execution.
+    """
+    if not cmd or cmd[0] not in _NODE_LAUNCHERS:
+        return cmd
+    launcher = shutil.which(cmd[0])
+    if launcher is None:
+        raise FileNotFoundError(f"required launcher {cmd[0]!r} was not found on PATH")
+    return [launcher, *cmd[1:]]
+
+
 def build_plan(args: argparse.Namespace) -> Plan:
     if args.full:
         plan = Plan("--full requested")
@@ -176,6 +232,12 @@ def build_plan(args: argparse.Namespace) -> Plan:
 
     frontend, meta, backend = classify(paths)
 
+    if not (frontend or meta or backend):
+        plan = Plan("only ignored evidence paths changed -- full gate (fail-open)")
+        _backend_full(plan)
+        _frontend_full(plan)
+        return plan
+
     if meta or (frontend and backend):
         plan = Plan(
             "meta or both surfaces touched -- full gate"
@@ -192,13 +254,22 @@ def build_plan(args: argparse.Namespace) -> Plan:
             _backend_full(plan)
             _frontend_full(plan)
             return plan
+        try:
+            must_run = validated_targets(must_run, _REPO_ROOT)
+        except SelectionUntrustworthy as exc:
+            plan = Plan(f"selector target refused -- full gate (fail-open): {exc}")
+            _backend_full(plan)
+            _frontend_full(plan)
+            return plan
         plan = Plan(f"frontend-only diff -- full frontend + {len(must_run)} backend guard file(s)")
         _frontend_full(plan)
         if must_run:
             plan.add(
                 "backend (cross-surface guards)",
+                # `--` ends option parsing, matching `run_scoped_tests.backend_argv`.
+                # Belt and braces: `validated_targets` already refuses a leading `-`.
                 [sys.executable, "-m", "pytest", "-q", "-n", "auto", "--dist", "loadgroup",
-                 *must_run],
+                 "--", *must_run],
                 _REPO_ROOT,
             )
         return plan
@@ -215,11 +286,22 @@ def build_plan(args: argparse.Namespace) -> Plan:
     # CI's frontend-test scope step does.
     vitest_targets = [p for p in must_run if not p.startswith("website/electron/")]
     vitest_rel = [p.removeprefix("website/") for p in vitest_targets]
+    try:
+        vitest_rel = validated_targets(vitest_rel, _REPO_ROOT / "website")
+    except SelectionUntrustworthy as exc:
+        plan = Plan(f"selector target refused -- full gate (fail-open): {exc}")
+        _backend_full(plan)
+        _frontend_full(plan)
+        return plan
     plan = Plan(f"backend-only diff -- full backend + {len(vitest_rel)} frontend guard spec(s)")
     _backend_full(plan)
     if vitest_rel:
         plan.add(
             "frontend (cross-surface guards)",
+            # Deliberately NO `--` here: `vitest run -- <paths>` stops treating the
+            # positionals as filters and runs the whole suite, which would report a
+            # narrow scope while running everything. `run_scoped_tests.frontend_argv`
+            # carries the measurement; `validated_targets` is the real protection.
             ["npx", "vitest", "run", *vitest_rel],
             _REPO_ROOT / "website",
         )
@@ -246,7 +328,11 @@ def main(argv: list[str] | None = None) -> int:
 
     for label, cmd, cwd in plan.commands:
         print(f"local-gate: running [{label}]", file=sys.stderr)
-        proc = subprocess.run(cmd, cwd=cwd)
+        try:
+            proc = subprocess.run(_resolve_command(cmd), cwd=cwd)
+        except OSError as exc:
+            print(f"local-gate: [{label}] FAILED to start: {exc}", file=sys.stderr)
+            return 127
         if proc.returncode != 0:
             print(f"local-gate: [{label}] FAILED (rc={proc.returncode})", file=sys.stderr)
             return proc.returncode

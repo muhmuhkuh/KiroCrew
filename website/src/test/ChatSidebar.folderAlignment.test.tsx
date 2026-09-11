@@ -44,9 +44,10 @@
  *
  * jsdom has no layout engine, so this file asserts the INPUTS to the geometry,
  * never measured x's. That is a real limit: an input-level assertion stayed green
- * through the very gutter change that broke guide 2, because the pad it checked
- * had not moved. Hence the gutter's out-of-flow-ness is asserted too (that being
- * the thing that actually moved the content), and hence the rule — when any of
+ * through the very status-gutter change that broke guide 2, because the pad it
+ * checked had not moved. Hence the assertion that nothing occupies the row's left
+ * pad in flow (that being the thing that actually moved the content), and hence
+ * the rule — when any of
  * these numbers moves, re-measure with
  * `website/scripts/capture-folder-glyph.mjs` under `MEASURE=1`. Do not re-derive
  * on paper: #1211, #3766, #3903 and two paper estimates during this fix were all
@@ -70,21 +71,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -108,8 +109,10 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
+import type { ChatFolder, ChatSlot } from '../types'
 
-function renderSidebar(slots: any[], folders: any[]) {
+function renderSidebar(slots: ChatSlot[], folders: ChatFolder[]) {
   const store = createTestStore({
     dashboard: {
       status: {}, connected: true, slots, approvalMode: 'normal',
@@ -117,8 +120,8 @@ function renderSidebar(slots: any[], folders: any[]) {
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, workflowRuns: {} } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null, slotStatusDetail: {}, subagents: {}, slotActivity: {}, workflowRuns: {} } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity, refetchOnMount: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], folders)
@@ -215,9 +218,11 @@ describe('chat sidebar — folder header alignment geometry', () => {
     expect(hasClass(body, 'border-l')).toBe(true)
 
     // GUIDE 2 — the row's `pl-3.5` (14px) is its WHOLE content offset, which holds
-    // only while the status gutter stays OUT of the content flow. The gutter being
-    // an in-flow flex child is what added 12px + a gap and broke this in #3766;
-    // see ChatSidebar.statusGutter.test.tsx, which pins it as absolute.
+    // only while NOTHING lives in that pad in flow. A status gutter as an in-flow
+    // flex child is what added 12px + a gap and broke this in #3766; the gutter is
+    // gone entirely now (the marker leads the secondary line — see
+    // ChatSidebar.statusMarker.test.tsx, which pins that no absolutely-positioned
+    // box returns to the row's left edge either).
     expect(hasClass(row, 'pl-3.5')).toBe(true)
     expect(hasClass(row, 'pr-3')).toBe(true)
     expect(hasClass(row, 'pl-1')).toBe(false)

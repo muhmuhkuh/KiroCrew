@@ -1,7 +1,9 @@
 /**
- * InstancesPanel — Settings → Instances. Set up and manage remote KiroCrew
- * instances reachable over SSH tunnels (add / edit / connect / disconnect /
- * diagnose). This panel is the *control plane* only — it does not
+ * InstancesPanel — legacy control plane for remote Kiro Crew instances
+ * reachable over SSH tunnels (add / edit / connect / disconnect / diagnose).
+ * No longer routed as a settings tab: Settings → Remote Instances renders
+ * RemoteCrewPanel, which reuses AddInstanceForm and StatusBadge from this
+ * file. This panel is the *control plane* only — it does not
  * embed remote dashboards. Once an instance is connected here, switch into it
  * from the tab strip in the top header (see InstanceTabBar).
  *
@@ -10,7 +12,7 @@
  * tab strip can obtain the iframe token independently without sharing in-memory
  * state with this panel.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Server,
@@ -26,8 +28,8 @@ import {
 } from 'lucide-react'
 import { api, ApiError, type InstanceView, type InstanceTunnelStatus } from '../../api/client'
 import { Card, Btn } from '../../components/ui'
-import { useAppDispatch } from '../../store'
-import { removeWarm } from '../../store/instancesSlice'
+import { useAppDispatch, useAppSelector } from '../../store'
+import { removeWarm, setCrewAddForm } from '../../store/instancesSlice'
 
 import { i18nT } from '../../i18n/t'
 import { fmtDuration, fmtUnit } from '../../i18n/format'
@@ -38,11 +40,12 @@ import { SettingRef } from '../../components/settingRef/SettingRef'
 import {
   InstanceFormFields,
   useInstanceFormState,
+  isBlankInstanceForm,
   EMPTY_INSTANCE_FORM,
 } from './InstanceFormFields'
 const STATE_DOT: Record<InstanceTunnelStatus['state'], string> = {
-  connected: 'bg-success',
-  connecting: 'bg-warning',
+  connected: 'bg-ok',
+  connecting: 'bg-warn',
   error: 'bg-danger',
   stopped: 'bg-muted',
   disconnected: 'bg-muted',
@@ -64,17 +67,45 @@ export function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
     <span className="inline-flex items-center gap-1.5 text-[13px] text-muted">
       <span className={`inline-block w-2 h-2 rounded-full ${dot}`} aria-hidden />
       <span className="capitalize">{status.state}</span>
-      {status.error ? <span className="text-danger truncate max-w-[240px]">— {status.error}</span> : null}
+      {/* The tunnel's own error from the backend. `askAgent` is safe: the crew
+          record is already persisted, and every draft either host holds (the
+          add form here, the add/edit forms in RemoteCrewPanel) lives in the
+          store, so the hand-off's navigation loses nothing. Props are unchanged
+          on purpose — RemoteCrewPanel renders this badge on its rows too. */}
+      <ErrorNotice variant="inline" className="max-w-[240px]" message={status.error} askAgent />
     </span>
   )
 }
 
-export function AddInstanceForm({ onAdded, usedPorts }: { onAdded: () => void; usedPorts: number[] }) {
-  const form = useInstanceFormState(EMPTY_INSTANCE_FORM, usedPorts)
+export function AddInstanceForm({ onAdded }: { onAdded: () => void }) {
+  // Resume what the user typed before a hand-off navigated them away. Read once
+  // per mount: a later read would fight the live form state.
+  const dispatch = useAppDispatch()
+  const stored = useAppSelector(s => s.instances.crewForms?.add ?? null)
+  const [restored] = useState(() => stored)
+  const form = useInstanceFormState(EMPTY_INSTANCE_FORM, restored)
+
+  // Hold the values on every change, not only when this card's own banner hands
+  // off. The navigation unmounts the WHOLE panel, so the crew rows above carry
+  // their own "Ask the agent" links that destroy this form just as thoroughly — as
+  // does a sidebar click or the browser's back button. Making this a property of
+  // the form rather than of one button covers every exit instead of the one wired.
+  //
+  // Undebounced deliberately: there is no write to batch. This is a store dispatch
+  // rather than storage, so running per keystroke costs a reducer call — while any
+  // debounce window is a window where a sibling row's button loses the fields.
+  useEffect(() => {
+    // Erasing the form erases the held values, or navigating away and back would
+    // restore text the user deliberately cleared.
+    dispatch(setCrewAddForm(isBlankInstanceForm(form.values) ? null : { ...form.values }))
+  }, [form.values, dispatch])
 
   const addMutation = useMutation({
     mutationFn: () => api.addInstance(form.body()),
     onSuccess: () => {
+      // The values described a crew that now exists; keeping them would pre-fill
+      // the next add with the one just created.
+      dispatch(setCrewAddForm(null))
       form.reset(EMPTY_INSTANCE_FORM)
       onAdded()
     },
@@ -91,7 +122,15 @@ export function AddInstanceForm({ onAdded, usedPorts }: { onAdded: () => void; u
         <Plus className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.add_instance')}
       </div>
       <InstanceFormFields idPrefix="add-instance" form={form} />
-      <ErrorNotice message={err} className="mt-3" />
+      {/* `askAgent` is safe here BECAUSE the typed values live above the route: the
+          hand-off navigates away and unmounts this form, and a first-time user has
+          just typed up to nine fields by hand. Nothing has to be persisted at click
+          time, so there is no failure to veto — coming back re-seeds from the store. */}
+      <ErrorNotice
+        message={err}
+        className="mt-3"
+        askAgent
+      />
       <div className="mt-3">
         <Btn primary onClick={() => addMutation.mutate()} disabled={addMutation.isPending || !form.valid}>
           {addMutation.isPending ? i18nT('pages.settings.instancesPanel.adding') : i18nT('pages.settings.instancesPanel.add_remote_crew')}
@@ -136,8 +175,11 @@ function InstanceRow({
           {typeof ttl === 'number' ? ' ' + i18nT('pages.settings.instancesPanel.token_left', { time: humanizeSecs(ttl) }) : ''}
         </div>
         <div className="mt-1"><StatusBadge status={inst.status} /></div>
+        {/* The backend's diagnosis of a failed tunnel — same family as
+            `status.error` above, same reasoning for `askAgent`: nothing on this
+            row is an unsaved draft. */}
         {diag && !diag.ok ? (
-          <div className="mt-1 text-[12px] text-warning"><AlertTriangle size={12} className="lucide-inline" /> {diag.reason}</div>
+          <ErrorNotice variant="inline" className="mt-1" message={diag.reason} askAgent />
         ) : null}
       </div>
       <div className="flex items-center gap-2 shrink-0">
@@ -288,7 +330,7 @@ export function InstancesPanel() {
           {i18nT('pages.settings.instancesPanel.enable_it_to_let_this_gateway_open_ssh_tunnels_t')}
         </p>
         {restartPending && (
-          <div role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-warning/10 text-warning border border-warning/30">
+          <div role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-warn/10 text-warn border border-warn/30">
             <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
             <span>
               {i18nT('pages.settings.instancesPanel.disabled_in_config_restart_the_gateway')}<code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>){' '}
@@ -299,7 +341,7 @@ export function InstancesPanel() {
         <Btn primary onClick={() => setEnabledMutation.mutate(true)} disabled={setEnabledMutation.isPending}>
           <Power className="lucide-inline" /> {setEnabledMutation.isPending ? i18nT('pages.settings.instancesPanel.enabling') : i18nT('pages.settings.instancesPanel.enable_remote_crew_management')}
         </Btn>
-        <ErrorNotice message={actionErr} className="mt-2" />
+        <ErrorNotice message={actionErr} askAgent className="mt-2" />
         <p className="mt-2 text-[12px] text-muted">
           <Trans
             i18nKey="pages.settings.instancesPanel.enable_via_setting"
@@ -319,7 +361,7 @@ export function InstancesPanel() {
           config; `active` reflects whether the SSH manager is actually running. */}
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-[13px]">
-          <span className={`inline-block w-2 h-2 rounded-full ${active ? 'bg-success' : 'bg-warning'}`} aria-hidden />
+          <span className={`inline-block w-2 h-2 rounded-full ${active ? 'bg-ok' : 'bg-warn'}`} aria-hidden />
           <span className="text-muted">
             {i18nT('pages.settings.instancesPanel.multi_instance_management_is')} <span className="text-text font-medium">{i18nT('pages.settings.instancesPanel.enabled')}</span>
             {active ? '' : ' — not active until restart'}
@@ -330,7 +372,7 @@ export function InstancesPanel() {
         </Btn>
       </div>
       {!active && (
-        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-warning/10 text-warning border border-warning/30">
+        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-warn/10 text-warn border border-warn/30">
           <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
           <span>
             {i18nT('pages.settings.instancesPanel.enabled_but_not_active_yet_restart_the_gateway')}<code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>){' '}
@@ -339,29 +381,31 @@ export function InstancesPanel() {
         </div>
       )}
       {connectedNote && (
-        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-success/10 text-success border border-success/30">
+        <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-ok/10 text-ok border border-ok/30">
           <Plug size={14} className="lucide-inline mt-0.5 shrink-0" />
           <span className="flex-1 break-words">{connectedNote}</span>
           <button type="button" aria-label={i18nT('pages.settings.instancesPanel.dismiss')} className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setConnectedNote(null)}><X size={12} /></button>
         </div>
       )}
-      {actionErr && (
-        <div role="alert" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-danger/10 text-danger border border-danger/30">
-          <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
-          <span className="flex-1 break-words">{actionErr}</span>
-          <button type="button" aria-label={i18nT('pages.settings.instancesPanel.dismiss_error')} className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setActionErr(null)}><X size={12} /></button>
-        </div>
+      {/* Action failures (connect / disconnect / remove / diagnose / toggle).
+          `askAgent` is safe: every input on this page is either persisted (the
+          crew records) or store-backed (the add form's values). */}
+      <ErrorNotice message={actionErr} onDismiss={() => setActionErr(null)} askAgent />
+      {/* A `warn` diagnosis is a failure report — its text is the backend's
+          `diagnosis.reason` or the tunnel's `error` — so it goes through
+          ErrorNotice. `ok` / `info` describe a state that has not gone wrong
+          (healthy, or simply not connected) and stay a status note. */}
+      {diagNote?.kind === 'warn' && (
+        <ErrorNotice message={diagNote.text} onDismiss={() => setDiagNote(null)} askAgent />
       )}
-      {diagNote && (
+      {diagNote && diagNote.kind !== 'warn' && (
         <div
           role="status"
           className={
             'flex items-start gap-2 px-3 py-2 text-[13px] rounded-md border ' +
             (diagNote.kind === 'ok'
-              ? 'bg-success/10 text-success border-success/30'
-              : diagNote.kind === 'info'
-                ? 'bg-accent/10 text-accent border-accent/30'
-                : 'bg-warning/10 text-warning border-warning/30')
+              ? 'bg-ok/10 text-ok border-ok/30'
+              : 'bg-accent/10 text-accent border-accent/30')
           }
         >
           <Stethoscope size={14} className="lucide-inline mt-0.5 shrink-0" />
@@ -378,7 +422,10 @@ export function InstancesPanel() {
         </Card>
       ) : error ? (
         <Card>
-          <div className="text-danger text-sm">{error}</div>
+          {/* Nothing to lose on a failed list load: the add form below is not
+              mounted in this branch. Retry stays as a sibling — it covers a
+              momentary drop, the hand-off covers everything else. */}
+          <ErrorNotice message={error} askAgent />
           <div className="mt-2">
             <Btn onClick={() => reload()}>
               <RefreshCw className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.retry')}
@@ -422,7 +469,7 @@ export function InstancesPanel() {
               </div>
             </Card>
           )}
-          <AddInstanceForm onAdded={reload} usedPorts={instances.map(i => i.remote_port)} />
+          <AddInstanceForm onAdded={reload} />
         </>
       )}
     </div>

@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Lock, MonitorCog, Blocks } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect } from '../../components/settings'
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '../../components/ui/select'
 import { Toggle } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 import { api } from '../../api/client'
 import type { NotificationChannel } from '../../types'
 import {
@@ -53,27 +55,31 @@ const overrideLabels = (): string[] => [
  *  description are catalog keys below, resolved per render for the same reason
  *  `PRESET_LABEL_KEY` holds keys. */
 const CATEGORY_ROWS: SoundCategory[] = [
-  'all', 'turn', 'cron', 'approval', 'hook', 'heartbeat', 'subagent', 'taskrunner',
+  'all', 'turn', 'agent', 'cron', 'approval', 'hook', 'heartbeat', 'subagent', 'taskrunner', 'skills',
 ]
 const CATEGORY_LABEL_KEY: Record<SoundCategory, string> = {
   all: 'pages.settings.notificationsPanel.category_all',
   turn: 'pages.settings.notificationsPanel.category_turn',
+  agent: 'pages.settings.notificationsPanel.category_agent',
   cron: 'pages.settings.notificationsPanel.category_cron',
   approval: 'pages.settings.notificationsPanel.category_approval',
   hook: 'pages.settings.notificationsPanel.category_hook',
   heartbeat: 'pages.settings.notificationsPanel.category_heartbeat',
   subagent: 'pages.settings.notificationsPanel.category_subagent',
   taskrunner: 'pages.settings.notificationsPanel.category_taskrunner',
+  skills: 'pages.settings.notificationsPanel.category_skills',
 }
 const CATEGORY_DESCRIPTION_KEY: Record<SoundCategory, string> = {
   all: 'pages.settings.notificationsPanel.category_all_description',
   turn: 'pages.settings.notificationsPanel.category_turn_description',
+  agent: 'pages.settings.notificationsPanel.category_agent_description',
   cron: 'pages.settings.notificationsPanel.category_cron_description',
   approval: 'pages.settings.notificationsPanel.category_approval_description',
   hook: 'pages.settings.notificationsPanel.category_hook_description',
   heartbeat: 'pages.settings.notificationsPanel.category_heartbeat_description',
   subagent: 'pages.settings.notificationsPanel.category_subagent_description',
   taskrunner: 'pages.settings.notificationsPanel.category_taskrunner_description',
+  skills: 'pages.settings.notificationsPanel.category_skills_description',
 }
 
 /** Sentinel for "this channel has no priority override". It is the select's
@@ -90,51 +96,83 @@ const CATEGORY_DESCRIPTION_KEY: Record<SoundCategory, string> = {
 const PRIORITY_SENTINEL = 'Channel default'
 const PRIORITY_OPTIONS = [PRIORITY_SENTINEL, 'critical', 'default', 'passive']
 
+/** Shared style for the sound-preview buttons: the Sound card's "Test
+ *  notification" button and the per-category "Test" buttons must stay
+ *  visually identical, so both compose from this one string. */
+const TEST_BTN_CLASS = 'px-3 py-1.5 rounded-md border border-border text-[12px] font-medium cursor-pointer bg-transparent text-muted hover:text-text hover:border-border-strong disabled:opacity-40 disabled:cursor-not-allowed transition-all font-body'
+
 /** Human label for a channel within its group (drop the source prefix apps
  *  and system channels share with their group header). */
 function channelLabel(c: NotificationChannel): string {
   return c.channel.startsWith(`${c.source}.`) ? c.channel.slice(c.source.length + 1) : c.channel
 }
 
+type ChannelsData = { channels?: NotificationChannel[] }
+type ChannelPatch = { muted?: boolean; priority?: string | null }
+const CHANNELS_KEY = ['notification-channels'] as const
+
 /** Per-channel notification settings: mute + priority override,
  *  grouped by source (System first, then apps). Protected channels render
  *  locked. Channels with stored settings but no live registration (app
  *  disabled) stay visible so mutes remain editable. */
 function ChannelsSection() {
-  const [channels, setChannels] = useState<NotificationChannel[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const qc = useQueryClient()
+  const channelsQuery = useQuery<ChannelsData>({
+    queryKey: CHANNELS_KEY,
+    queryFn: api.notificationChannels,
+  })
+  const channels = channelsQuery.data?.channels
 
-  useEffect(() => {
-    let cancelled = false
-    api.notificationChannels()
-      .then((d: { channels?: NotificationChannel[] }) => { if (!cancelled) setChannels(d.channels || []) })
-      .catch(() => { if (!cancelled) setError(i18nT('pages.settings.notificationsPanel.failed_to_load_channels')) })
-    return () => { cancelled = true }
-  }, [])
+  const patchMut = useMutation({
+    mutationFn: ({ channel, settings }: { channel: string; settings: ChannelPatch }) =>
+      api.updateNotificationChannelSettings(channel, settings),
+    // Optimistic update; the PUT is authoritative — a failure rolls the cache
+    // back to the snapshot and the refetch below re-syncs with the server.
+    onMutate: ({ channel, settings }) => {
+      const snap = qc.getQueryData<ChannelsData>(CHANNELS_KEY)
+      qc.setQueryData<ChannelsData>(CHANNELS_KEY, prev => prev && {
+        ...prev,
+        channels: prev.channels?.map(c => {
+          if (c.channel !== channel) return c
+          const next = { ...c.settings }
+          if (settings.muted !== undefined) { if (settings.muted) next.muted = true; else delete next.muted }
+          if ('priority' in settings) { if (settings.priority) next.priority = settings.priority; else delete next.priority }
+          return { ...c, settings: next }
+        }),
+      })
+      return { snap }
+    },
+    onError: (_err, _vars, ctx) => { if (ctx?.snap) qc.setQueryData(CHANNELS_KEY, ctx.snap) },
+    onSettled: () => qc.invalidateQueries({ queryKey: CHANNELS_KEY }),
+  })
+  const patch = (channel: string, settings: ChannelPatch) => patchMut.mutate({ channel, settings })
 
-  const patch = (channel: string, settings: { muted?: boolean; priority?: string | null }) => {
-    // Optimistic update; the PUT is authoritative and a failure reloads.
-    setChannels(prev => prev?.map(c => {
-      if (c.channel !== channel) return c
-      const next = { ...c.settings }
-      if (settings.muted !== undefined) { if (settings.muted) next.muted = true; else delete next.muted }
-      if ('priority' in settings) { if (settings.priority) next.priority = settings.priority; else delete next.priority }
-      return { ...c, settings: next }
-    }) ?? null)
-    api.updateNotificationChannelSettings(channel, settings).catch(() => {
-      api.notificationChannels().then((d: { channels?: NotificationChannel[] }) => setChannels(d.channels || [])).catch(() => {})
-    })
+  if (channelsQuery.isError) {
+    return (
+      <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')}>
+        {/* askAgent on: a failed list load — the page holds no draft. */}
+        <ErrorNotice message={i18nT('pages.settings.notificationsPanel.failed_to_load_channels')} askAgent />
+      </SettingsSection>
+    )
   }
-
-  if (error) return <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')}><div className="text-[12px] text-muted">{error}</div></SettingsSection>
-  if (channels === null || channels.length === 0) return null
+  if (channels === undefined || channels.length === 0) return null
 
   const sources = Array.from(new Set(channels.map(c => c.source)))
     .sort((a, b) => (a === 'system' ? -1 : b === 'system' ? 1 : a.localeCompare(b)))
 
   return (
     <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')}>
-      <div className="text-[12px] text-muted -mt-1 mb-2">{i18nT('pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio')}</div>
+      <div className="text-[12px] text-muted -mt-1 mb-2" data-setting-label={i18nT('pages.settings.notificationsPanel.sources')}>{i18nT('pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio')}</div>
+      {/* askAgent on: mute/priority are toggle-only and the optimistic value was
+          already rolled back to the persisted one, so nothing is left to lose. */}
+      {patchMut.isError && (
+        <ErrorNotice
+          className="mb-2"
+          message={i18nT('pages.settings.notificationsPanel.failed_to_save_channel_setting')}
+          onDismiss={() => patchMut.reset()}
+          askAgent
+        />
+      )}
       {sources.map((source, i) => (
         <SettingsCard key={source} index={i}>
           <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[.05em] text-muted pb-1 border-b border-border">
@@ -238,9 +276,8 @@ export function NotificationsPanel() {
             checked={settings.enabled}
             onChange={v => update({ enabled: v })}
           />
-          <div className="flex flex-col gap-1.5 py-1.5">
+          <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.notificationsPanel.volume')}>
             {/* Slider is correctly associated via htmlFor+id (a range input can't be nested); label-has-for's nesting requirement is a false positive here. */}
-            {/* eslint-disable-next-line jsx-a11y/label-has-for */}
             <label htmlFor="mc-volume-slider" className="text-[13px] font-semibold text-text">{i18nT('pages.settings.notificationsPanel.volume')}</label>
             <div className="text-[12px] text-muted">{Math.round(settings.volume * 100)}%</div>
             <input
@@ -252,6 +289,30 @@ export function NotificationsPanel() {
               disabled={!settings.enabled}
               className="w-full accent-[var(--accent)]"
             />
+          </div>
+          {/* Plays the fallback ('all') preset at the current volume — the same
+              sample a real notification with no category override would play —
+              so the user can dial in volume without triggering a real event.
+              Labelled "Test sound", not "Test notification": no notification is
+              created or delivered, and a user debugging missing notifications
+              must not conclude delivery works because a tone played. Disabled
+              conditions mirror the per-category Test buttons below: sound off,
+              fallback set to none, or volume at zero all mean a click would be
+              a silent no-op. The Default (all categories) row below keeps its
+              own trailing Test button even though it runs the same action:
+              that one serves in-place audition while choosing sounds in the
+              per-category grid, this one serves volume dialing next to the
+              slider — removing either forces a scroll across cards mid-task
+              (maintainer decision on PR review). */}
+          <div className="py-1.5">
+            <button
+              type="button"
+              onClick={() => playPreset(fallback, settings.volume)}
+              disabled={!settings.enabled || fallback === 'none' || settings.volume === 0}
+              className={TEST_BTN_CLASS}
+            >
+              {i18nT('pages.settings.notificationsPanel.test_sound')}
+            </button>
           </div>
         </SettingsCard>
       </SettingsSection>
@@ -293,7 +354,7 @@ export function NotificationsPanel() {
                   type="button"
                   onClick={() => playPreset(effective, settings.volume)}
                   disabled={!settings.enabled || effective === 'none' || settings.volume === 0}
-                  className="mb-2 px-3 py-1.5 rounded-md border border-border text-[12px] font-medium cursor-pointer bg-transparent text-muted hover:text-text hover:border-border-strong disabled:opacity-40 disabled:cursor-not-allowed transition-all font-body"
+                  className={`mb-2 ${TEST_BTN_CLASS}`}
                 >
                   {i18nT('pages.settings.notificationsPanel.test')}
                 </button>

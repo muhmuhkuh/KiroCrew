@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Send, MessageSquare, RotateCcw } from 'lucide-react'
+import { MessageCircleQuestionMark, RotateCcw } from 'lucide-react'
 import { useMutation } from '@tanstack/react-query'
 import { api } from '../../api/client'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { sideClose, sideOptimisticAppend, sideOptimisticRollback, sseSideQueue, sideReleaseConsumed, queueEditBroadcastAt } from '../../store/chatSlice'
 import QueueStack from '../../components/QueueStack'
+import { useChatScrollFollow } from '../../app-sdk/useChatScrollFollow'
 import ChatMessageList from '../../app-sdk/ChatMessageList'
 import FollowUpBar from '../../components/FollowUpBar'
 import { deriveFollowUpOptions } from '../../app-sdk/protocol'
 import { useComposerDraft, draftByteSize } from '../../app-sdk/useComposerDraft'
-import BusySendButton, { useBusySendMode } from '../../components/BusySendButton'
-import type { SideMessage } from '../../store/chatSlice'
+import ChatInput from '../../components/ChatInput'
+import ErrorNotice from '../../components/ErrorNotice'
+import { SlotProvider } from '../../providers/SlotContext'
+import { useConnected } from '../../hooks/useConnected'
+import type { SideMessage, SideQueueEntry } from '../../store/chatSlice'
 import type { ChatMessage } from '../../types'
 
 import { i18nT } from '../../i18n/t'
@@ -22,6 +26,13 @@ const MAX_INPUT_H = 240
 // not a state, so leaving it until the next submit would let it sit beside a later
 // turn it has nothing to do with.
 const NOTICE_TTL_MS = 8_000
+// Stable fallbacks for a slot with no side buffer yet. An inline `?? []` allocates
+// a fresh array every render, so the transcript map, the queue cards and the
+// blocked-id set would all recompute on every render of an EMPTY panel — the one
+// case where there is provably nothing to recompute. Never mutated: both are read
+// only through `.length`, indexing and `.map`.
+const EMPTY_SIDE_MESSAGES: SideMessage[] = []
+const EMPTY_SIDE_QUEUE: SideQueueEntry[] = []
 
 /** One composer submit. `steer` and `optimistic` are decided at submit time and
  *  carried along, so a mutation callback that runs later never re-derives them
@@ -54,6 +65,7 @@ function relativeTime(iso: string): string | null {  const diff = Date.now() - n
 }
 
 export default function SideChat({ slot }: { slot: string }) {
+  const connected = useConnected()
   const dispatch = useAppDispatch()
   const reduxSide = useAppSelector(s => s.chat.slotSide[slot])
   const parentTurnCount = useAppSelector(s =>
@@ -70,15 +82,19 @@ export default function SideChat({ slot }: { slot: string }) {
     const t = setTimeout(() => setLocalNotice(null), NOTICE_TTL_MS)
     return () => clearTimeout(t)
   }, [localNotice])
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const isNearBottomRef = useRef(true)
+  // Stick-to-bottom follow shared with ChatPane/ChatEmbed (FollowController
+  // semantics): the RO on the content wrapper re-pins on growth ANYWHERE in
+  // the transcript and on collapse shrink, and only a genuine user scroll up
+  // releases it.
+  const follow = useChatScrollFollow({ resetKey: slot })
+  const scrollRef = follow.scrollerRef
 
-  const messages = reduxSide?.messages ?? []
+  const messages = reduxSide?.messages ?? EMPTY_SIDE_MESSAGES
   const isPending = reduxSide?.pending ?? false
-  const queue = reduxSide?.queue ?? []
-  // Same slot key as the main composer, so the side panel and the main chat of
-  // ONE session share the mode while other sessions keep their own.
-  const [busySendMode, setBusySendMode] = useBusySendMode(slot)
+  const queue = reduxSide?.queue ?? EMPTY_SIDE_QUEUE
+  // Steer-vs-queue mode lives inside ChatInput's own split button, keyed by the
+  // same slot as the main composer — the side panel and the main chat of ONE
+  // session share the mode while other sessions keep their own.
   // A turn is in flight, so a submit can no longer just start one. Derived from
   // the same signal the thinking indicator uses, so the composer's affordance and
   // what the server will actually do can't disagree.
@@ -103,7 +119,27 @@ export default function SideChat({ slot }: { slot: string }) {
   )
 
   /** Derived from the same helper the main chat uses, so "options only after the answer
-   *  settles" and "a later user message clears them" behave identically. */
+   *  settles" and "a later user message clears them" behave identically.
+   *
+   *  `followUpIsPlan` is DELIBERATELY dropped here (#6754; sibling issue #6057 covers
+   *  the same drop in ChatEmbed): this side panel is not a plan-capable host, so a
+   *  plan-shaped chip stays on the composer-draft path instead of dispatching
+   *  POST /api/chat/slots/{slot}/plan-action. Why that is a recorded exclusion rather
+   *  than a live mis-dispatch:
+   *  - A side turn runs as an aside to the parent session, never as an orchestrator
+   *    turn, so a plan-shaped answer in the side buffer is conversational output, not
+   *    a plan awaiting dispatch; `useComposerDraft` owning the chip (pick → edits the
+   *    draft, amendable before send) is therefore the correct behaviour, not a
+   *    fallback.
+   *  - The dispatch path gates on the HOST slot's mode (ChatPage reads
+   *    `effectiveMode === 'orchestrator'` off the slot record before dispatching).
+   *    This panel does not read the host slot's mode today — its transcript is the
+   *    side buffer, a private mini-conversation beside the parent slot — and wiring
+   *    `usePlanActionMutation` in would first need that mode selector added, gating
+   *    on the PARENT's mode for a conversation that is not the parent's.
+   *  - An unconditional dispatch (no mode gate) would let any plan-shaped side
+   *    answer cancel or advance the parent's real plan.
+   *  Pinned by src/test/SideChat.planExclusion.test.tsx. */
   const { followUpOptions } = useMemo(
     () => deriveFollowUpOptions(transcript, isStreaming),
     [transcript, isStreaming]
@@ -115,9 +151,14 @@ export default function SideChat({ slot }: { slot: string }) {
    *  here from `followUpOptions`, so the hook has to be called after that. */
   const composer = useComposerDraft({ followUpOptions, maxBytes: MAX_QUESTION_BYTES, maxHeight: MAX_INPUT_H })
   const {
-    draft, setDraft, textareaRef, composition,
-    picked: pickedOptions, toggleOption, mergeIntoDraft, exceedsByteLimit, submitOnEnter,
+    draft, setDraft,
+    picked: pickedOptions, toggleOption, mergeIntoDraft, exceedsByteLimit,
   } = composer
+
+  /** Wrapper around the native composer; the Select-to-Ask seed resolves the
+   *  textarea through it (`textarea[data-composer-input]`) instead of a
+   *  dedicated ref prop on ChatInput. */
+  const composerWrapRef = useRef<HTMLDivElement | null>(null)
 
   // Drain any text a cancel released, from EITHER convergence path. Merged, not
   // replaced: the released text has no other home once the server let it go, and
@@ -425,19 +466,8 @@ export default function SideChat({ slot }: { slot: string }) {
     },
   })
 
-  const handleScroll = useCallback(() => {
-    const el = scrollRef.current
-    if (!el) return
-    isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
-  }, [])
-
-  const lastMessageContent = messages[messages.length - 1]?.content
-  useEffect(() => {
-    const el = scrollRef.current
-    if (el && isNearBottomRef.current) {
-      requestAnimationFrame(() => { el.scrollTop = el.scrollHeight })
-    }
-  }, [messages.length, lastMessageContent])
+  // Scroll follow lives in useChatScrollFollow (wired on the scroller below);
+  // no tail-keyed effect — the hook's ResizeObserver sees every height change.
 
   // Select-to-Ask seed: when the user clicks "Ask" in the selection toolbar,
   // ChatPage opens this panel and fires a `side-seed` CustomEvent carrying the
@@ -453,7 +483,7 @@ export default function SideChat({ slot }: { slot: string }) {
       setDraft(prev => (prev.trim() ? `${prev.trimEnd()}\n\n${quoted}\n\n` : `${quoted}\n\n`))
       // Focus + place caret at the end so the user immediately types the question.
       requestAnimationFrame(() => {
-        const el = textareaRef.current
+        const el = composerWrapRef.current?.querySelector<HTMLTextAreaElement>('textarea[data-composer-input]')
         if (el) {
           el.focus()
           const len = el.value.length
@@ -466,9 +496,9 @@ export default function SideChat({ slot }: { slot: string }) {
     }
     window.addEventListener('side-seed', onSeed)
     return () => window.removeEventListener('side-seed', onSeed)
-    // `setDraft` and `textareaRef` come from the SDK hook now, so their stability is
-    // no longer something the linter can see for itself — declared rather than assumed.
-  }, [setDraft, textareaRef])
+    // `setDraft` comes from the SDK hook, so its stability is not something the
+    // linter can see for itself — declared rather than assumed.
+  }, [setDraft])
 
   // Auto-grow of the input is the SDK hook's job — the `min-h-[52px]` class below
   // still floors an empty box at ~2 rows, so this surface keeps its own resting size.
@@ -476,7 +506,7 @@ export default function SideChat({ slot }: { slot: string }) {
   /** `override` carries the text a follow-up chip's send arrow supplies; without it the draft
    *  is the source of truth. Every call site wraps this in an arrow, so a click event can never
    *  arrive here as the override. */
-  const send = useCallback((override?: string) => {
+  const send = useCallback((override?: string, steerRequested = false) => {
     const q = (override ?? draft).trim()
     if (!q || sendMutation.isPending || !slot) return
     if (exceedsByteLimit(q)) {
@@ -498,19 +528,14 @@ export default function SideChat({ slot }: { slot: string }) {
       }))
       return
     }
-    // While a turn runs, the split button decides: steer injects into it, queue
-    // defers. From idle both collapse to "start a turn", so the flag is dropped.
-    // An optimistic bubble belongs only to a turn this submit STARTS — a steer's
-    // bubble has to land above the streaming answer and a queued one is a card,
-    // so the server frame places both.
-    const steer = isBusy && busySendMode === 'steer'
+    // While a turn runs, ChatInput's split button decides: steer injects into
+    // it, queue defers. From idle both collapse to "start a turn", so the flag
+    // is dropped. An optimistic bubble belongs only to a turn this submit
+    // STARTS — a steer's bubble has to land above the streaming answer and a
+    // queued one is a card, so the server frame places both.
+    const steer = isBusy && steerRequested
     sendMutation.mutate({ q, steer, optimistic: !isBusy, slot, override: override != null })
-  }, [draft, slot, sendMutation, isBusy, busySendMode, exceedsByteLimit])
-
-  const onKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => submitOnEnter(e, () => { void send() }),
-    [submitOnEnter, send],
-  )
+  }, [draft, slot, sendMutation, isBusy, exceedsByteLimit])
 
   const sendErr = sendMutation.error
   const displayError = sendErr
@@ -522,14 +547,18 @@ export default function SideChat({ slot }: { slot: string }) {
   const showBanner = !!reduxSide && messages.length > 0
   const isStale = turnsBehind >= 10 || (reduxSide?.createdAt && Date.now() - new Date(reduxSide.createdAt).getTime() >= 4 * 3600_000)
 
+  // `slot` is read in the body, so it is declared. No stale capture is being fixed
+  // here: `refreshMutation` is already a dep and `useMutation` hands back a fresh
+  // object every render, so this callback is rebuilt every render either way and has
+  // no stability worth protecting. `send` above declares it for the same reason.
   const handleRefresh = useCallback(() => {
     refreshMutation.mutate({ slot })
-  }, [refreshMutation])
+  }, [refreshMutation, slot])
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {showBanner && (
-        <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warning/10 text-warning' : 'bg-bg-hover/50 text-muted'}`}>
+        <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warn/10 text-warn' : 'bg-bg-hover/50 text-muted'}`}>
           <span className="italic">
             {i18nT('pages.chat.sideChat.context_from')} {i18nT('pages.chat.sideChat.turn', { count: turnsBehind })} {i18nT('pages.chat.sideChat.ago')}{age ? ` · ${age}` : ''}
           </span>
@@ -555,10 +584,14 @@ export default function SideChat({ slot }: { slot: string }) {
           </button>
         </div>
       )}
-      <div ref={scrollRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-3 py-2 space-y-2">
+      <div ref={scrollRef} onScroll={follow.onScroll} className="flex-1 overflow-y-auto px-3 py-2">
+        <div ref={follow.contentRef} className="space-y-2">
         {messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-muted/30 gap-2 py-8">
-            <span className="text-[24px]"><MessageSquare className="lucide-inline" /></span>
+          <div className="flex flex-col items-center justify-center h-full text-muted gap-2 py-8">
+            {/* The icon is decoration and stays faint; the sentence is the only
+                place the UI states that this transcript is discarded, so it reads
+                at full muted contrast rather than inheriting the icon's /30. */}
+            <span className="text-[24px] text-muted/30"><MessageCircleQuestionMark className="lucide-inline" /></span>
             <span className="text-[13px]">{i18nT('pages.chat.sideChat.ask_a_side_question_main_agent_keeps_working')}</span>
           </div>
         ) : (
@@ -574,9 +607,15 @@ export default function SideChat({ slot }: { slot: string }) {
             <span className="text-[12px] streaming-indicator">{i18nT('pages.chat.sideChat.thinking')}</span>
           </div>
         )}
+        </div>
       </div>
       {displayError && (
-        <div className="px-3 py-1 text-[12px] text-danger border-t border-border">{displayError}</div>
+        <div className="px-3 py-1 border-t border-border">
+          {/* No hand-off: the side-chat composer draft (the failed question is
+              merged back into it by the mutation's onError) is unsaved local
+              state — a navigation would discard it. */}
+          <ErrorNotice variant="inline" message={displayError} />
+        </div>
       )}
       {!displayError && localNotice && (
         <div className="px-3 py-1 text-[12px] text-muted border-t border-border" role="status">{localNotice}</div>
@@ -602,37 +641,33 @@ export default function SideChat({ slot }: { slot: string }) {
           />
         </div>
       )}
-      <div className="border-t border-border p-2 flex items-end gap-2 shrink-0">
-        <textarea
-          ref={textareaRef}
-          {...composition}
-          value={draft}
-          onChange={e => setDraft(e.target.value)}
-          onKeyDown={onKeyDown}
-          aria-label={i18nT('pages.chat.sideChat.ask_a_side_question')}
-          placeholder={i18nT('pages.chat.sideChat.ask_a_side_question_2')}
-          rows={2}
-          style={{ maxHeight: MAX_INPUT_H }}
-          className="flex-1 resize-none overflow-y-auto min-h-[52px] rounded-md border border-border bg-bg px-2 py-1.5 text-[13px] text-text focus:outline-none focus:border-accent disabled:opacity-60"
-        />
-        {isBusy ? (
-          <BusySendButton
-            mode={busySendMode}
-            onModeChange={setBusySendMode}
-            onFire={() => void send()}
-            disabled={!draft.trim() || sendMutation.isPending}
+      {/* The REAL native composer, scoped to this session's slot. The wrapper
+          carries the Select-to-Ask mount signal (an attribute, not the
+          aria-label: the label is translated, so a selector built from its
+          English text matches in one language out of twelve); the seed handler
+          resolves the textarea through a wrapper query. Capability shaping is by
+          omission: no upload/voice/agent/model props, so the slim surface
+          renders none of that chrome — same component, fewer capabilities. */}
+      <div ref={composerWrapRef} data-side-chat-input="" className="border-t border-border p-2 shrink-0">
+        <SlotProvider slotId={slot}>
+          <ChatInput
+            value={draft}
+            onChange={setDraft}
+            onSend={() => { void send() }}
+            canSteer
+            onSteer={() => { void send(undefined, true) }}
+            isRunning={isBusy}
+            placeholder={i18nT('pages.chat.sideChat.ask_a_side_question_2')}
+            inputAriaLabel={i18nT('pages.chat.sideChat.ask_a_side_question')}
+            typedCommandMenus={false}
+            slotApprovalChrome={false}
+            promptOptimizer={false}
+            connected={connected}
           />
-        ) : (
-          <button
-            onClick={() => void send()}
-            disabled={sendMutation.isPending || !draft.trim()}
-            className="shrink-0 px-2.5 py-1.5 rounded-md bg-accent text-accent-fg text-[12px] font-medium cursor-pointer hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed border-none"
-            title={i18nT('pages.chat.sideChat.send')}
-            aria-label={i18nT('pages.chat.sideChat.send')}
-          >
-            <Send size={13} />
-          </button>
-        )}
+          <div role="note" className="px-1 pt-1.5 text-[11px] leading-4 text-muted">
+            {i18nT('pages.chat.sideChat.context_only_tools_unavailable')}
+          </div>
+        </SlotProvider>
       </div>
     </div>
   )

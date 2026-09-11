@@ -14,6 +14,10 @@ import pytest
 from kiro_crew.llm_helpers import LLMEvent
 from kiro_crew.slack.handler import _PendingApproval
 
+# ``SubagentManager.spawn`` refuses -- registering no task -- while the host
+# looks short of memory, which is the runner's state, not this test's input.
+pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
 
 def _make_gateway():
     from kiro_crew.slack.gateway import GatewayOrchestrator
@@ -207,10 +211,21 @@ class TestSubagentPassesParentKey:
 
         info = manager.spawn("check oncall", parent_session_key="1775113012.860459")
         assert info is not None
+        assert not info.done and not info.error, (
+            f"spawn refused instead of registering a task: error={info.error!r} "
+            f"(host-memory guard? id={info.id})"
+        )
+        assert info.id in manager._tasks, (
+            "spawn did not schedule _spawn_with_approval — no task registered "
+            f"under id={info.id}; approval callback would never be awaited"
+        )
 
-        # Await the spawned task directly (deterministic, no sleep)
-        with contextlib.suppress(Exception):
-            await manager._tasks[info.id]
+        # Await the spawned task directly (deterministic, no sleep). Do not
+        # swallow the outcome: a broad `except Exception` here would turn a
+        # genuine race (e.g. the task raising before appending to
+        # captured_args) into a silent no-op, surfacing only as a confusing
+        # `len(captured_args) == 0` two lines down.
+        await manager._tasks[info.id]
 
         assert len(captured_args) == 1
         assert captured_args[0][2] == "1775113012.860459"

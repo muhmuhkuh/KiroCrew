@@ -16,10 +16,25 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 if TYPE_CHECKING:
-    from kiro_crew.platform.interfaces import McpScope
+    from kiro_crew.publish_provider import PublishProvider
+    from kiro_crew.platform.interfaces import (
+        ImportSource,
+        InboundToken,
+        McpScope,
+        SessionPrincipal,
+        WorkloadIdentity,
+    )
+    from kiro_crew.security import DeniedCommandRule
+    from kiro_crew.skill_providers.base import SkillProvider
+    from kiro_crew.tips_pool import TipsPool
 
 from kiro_crew import security, sso_status
-from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
+from kiro_crew.platform.interfaces import (
+    CapabilityResult,
+    InterceptDecision,
+    MobileConnectMethod,
+    OtlpDestination,
+)
 
 # ``agent``, ``sandbox``, ``embeddings``, ``apps.registry`` and ``slack.enterprise``
 # import ``kiro_crew.platform`` at module-load time, so importing them at the top
@@ -36,29 +51,72 @@ from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
 
 
 class DefaultProviderRegistry:
-    """Kiro-CLI-ACP only.  Leaves the dormant ACP_BACKEND_CLAUDE seam untouched."""
+    """Registers nothing: every KNOWN backend is already in the baseline."""
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
         return cfg.create_provider_factory()
 
     def register_acp_backends(self) -> None:
-        # The public edition registers no extra ACP backends.  The companion
-        # re-registers a Claude backend here via the acp/client.py:_is_claude
-        # seam.
+        # Nothing to register, and nothing this seam could register: the baseline now
+        # covers every id in ``ACP_BACKENDS_KNOWN``, and
+        # ``register_selectable_backend`` rejects an id outside that set, so there is
+        # no id it accepts that is not already selectable. The seam stays because the
+        # ProviderRegistry protocol declares it and an edition overrides this method;
+        # an edition adding a genuinely new harness has to widen
+        # ``ACP_BACKENDS_KNOWN`` as well, which is a core change, not an extension
+        # point this hook opens on its own.
         return None
 
 
 class DefaultPublishRegistry:
-    """Registers no publish provider — the public edition has no artifact-publish
-    destination.  The ``publish_provider`` registry stays empty, so
-    ``get_provider`` raises ``PublishUnavailableError`` (→ 503) and
-    ``list_providers`` returns ``[]`` (dashboard shows "publishing unavailable")
-    with no core branching.  A companion registers its concrete providers here
-    via the ``publish_provider.register_provider`` side effect — the structural
-    twin of ``DefaultProviderRegistry.register_acp_backends``."""
+    """Registers the personal cloud drive as an OPT-IN publish destination.
+
+    The seam itself stays destination-agnostic: this registry is the ONLY place the
+    public edition names a concrete provider, and ``publish_sync`` reaches it through
+    the neutral ``publish_provider`` registry, so a companion edition that registers a
+    different destination never loads this code.  The structural twin of
+    ``DefaultProviderRegistry.register_acp_backends``.
+
+    The drive registers under its OWN key, not ``DEFAULT_PROVIDER``, so it is available
+    and selectable without being the edition's default: ``publish_sync`` resolves an
+    unnamed destination through the default key, which stays unregistered here, so a
+    publish that names nothing still gets a 503.  What holds the default back is a
+    cross-store contract for whether a publication exists, which is being built
+    separately -- see ``personal_drive.PERSONAL_DRIVE_PROVIDER``.  Whether a publish is
+    PERMITTED remains the orthogonal decision of the governance ceiling
+    (``capabilities.publish``) and the operator's ``publish.allowed_destinations``
+    narrowing knob; this seam only decides who implements the transfer.
+    """
+
+    #: The key the drive registers under, spelled here so bootstrap does not have to
+    #: import the provider module to learn it. It is deliberately duplicated rather than
+    #: imported, and `test_boot_does_not_import_the_publish_stack` pins that this literal
+    #: still equals `personal_drive.PERSONAL_DRIVE_PROVIDER`, so the copy cannot drift.
+    _PERSONAL_DRIVE_KEY = "personal-drive"
 
     def register_publish_providers(self) -> None:
-        return None
+        """Register the drive's FACTORY without importing the provider module.
+
+        `no-new-work-on-gateway-boot-path`: this runs inside platform bootstrap, before
+        the socket is bound, so anything imported here is added to every gateway's
+        time-to-ready. Importing the provider eagerly costs ~0.5s of cumulative import
+        (it reaches the deploy engine's profile registry, the artifact store and the
+        validation stack), for a destination most installs never select -- the drive is
+        opt-in, so a publish that does not name it never touches this code at all.
+
+        The registry is already factory-based and instantiates lazily, so only the IMPORT
+        needed moving: it now happens on first selection, inside the closure. The import
+        also has to stay deferred for the original reason, which is unchanged -- the
+        provider reaches config-resolving code that installs this very platform context.
+        """
+        from kiro_crew.publish_provider import register_provider
+
+        def _build() -> PublishProvider:
+            from kiro_crew.publish import personal_drive
+
+            return personal_drive.PersonalDriveProvider()
+
+        register_provider(self._PERSONAL_DRIVE_KEY, _build)
 
 
 class DefaultAgentRuntime:
@@ -123,7 +181,13 @@ class DefaultCredentialPolicy:
 
 
 class DefaultSlackEnterpriseGate:
-    """Default-open gate delegating to ``slack/enterprise.py``."""
+    """Default-open gate delegating to ``slack/enterprise.py``.
+
+    ``extra_ids`` is accepted for protocol compatibility and IGNORED: the module
+    re-reads ``slack.allowed_enterprise_ids`` itself, which is the same key the
+    callers derive this value from, so a passed set is at best a duplicate and
+    at worst an older copy naming ids the operator removed.
+    """
 
     def validate_enterprise(self, bot_token: str, *, extra_ids: "set[str] | None" = None) -> bool:
         # deferred: defaults.py loads at platform-init (bootstrap imports it);
@@ -192,6 +256,41 @@ class DefaultIdentityProvider:
         return []
 
 
+class DefaultAgentIdentityProvider:
+    """Disabled agent-identity seam — standalone has no workload or Gateway.
+
+    ``enabled()`` is False so every public call site is a no-op. Other methods
+    return the disabled answer (``None`` / ``{}`` / the input principal) so a
+    ``safe_context_call`` fallback that degrades to the same values cannot
+    flip the seam on.
+    """
+
+    def enabled(self) -> bool:
+        return False
+
+    def workload_identity(self) -> "WorkloadIdentity | None":
+        return None
+
+    def status(self) -> Dict[str, object]:
+        # Display-only. Never token material — a token-like key here would
+        # leak bearer into the dashboard status payload.
+        return {}
+
+    def gateway_mcp_spec(self) -> Dict[str, object] | None:
+        return None
+
+    async def annotate_principal(self, principal: "SessionPrincipal") -> "SessionPrincipal":
+        return principal
+
+    async def vend_workload_access_token(self, principal: "SessionPrincipal") -> str | None:
+        return None
+
+    async def vend_gateway_inbound_token(
+        self, principal: "SessionPrincipal"
+    ) -> "InboundToken | None":
+        return None
+
+
 class DefaultEmbeddingSource:
     """Bundled in-process model (vendored llama.cpp), unsigned local inference.
 
@@ -245,6 +344,38 @@ class DefaultPromptSourceProvider:
         return []
 
 
+class DefaultSkillDiscoveryProvider:
+    """No edition skill discovery providers — the built-in catalog only."""
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        return []
+
+
+class DefaultTipsProvider:
+    """No edition tip pool — the public curated file + docs-scan catalog.
+
+    ``None`` is the "public pool unchanged" answer, so the standalone edition is
+    behaviorally identical to before the seam existed.
+    """
+
+    def tips_pool(self) -> "Optional[TipsPool]":
+        return None
+
+
+class DefaultDeniedRuleProvider:
+    """No edition denied-command rules — the built-in catalog only."""
+
+    def denied_rules(self) -> List["DeniedCommandRule"]:
+        return []
+
+
+class DefaultImportSourceProvider:
+    """No edition import sources — the onboarding importer offers the builtins only."""
+
+    def import_sources(self) -> List["ImportSource"]:
+        return []
+
+
 class DefaultCapabilityManager:
     """Unavailable capability manager — the public edition ships no external
     package manager, so ``/api/capability/*`` report 503. Every operation is a
@@ -262,7 +393,7 @@ class DefaultCapabilityManager:
     async def uninstall_mcp(self, server_id: str) -> "CapabilityResult":
         return CapabilityResult(ok=False, message="capability manager not available")
 
-    async def registry(self) -> List[Dict[str, Any]]:
+    async def registry(self, query: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
     async def list_skills(self) -> List[Dict[str, Any]]:
@@ -348,6 +479,12 @@ class DefaultAppsLoader:
         # apps/app-registry.json. A companion returns its internal catalog rows.
         return []
 
+    def default_registries(self) -> List[Dict[str, Any]]:
+        # The public edition pins no external registry: the only registries are
+        # the ones the operator typed into config.registries. A companion returns
+        # its organisation's official registry.
+        return []
+
 
 class DefaultPackageManager:
     """Public brew/curl/pip install strategy (delegated to cli_doctor logic).
@@ -412,6 +549,24 @@ class DefaultTelemetryProvider:
     def frontend_rum_config(self) -> Optional[dict]:
         return None
 
+    def otlp_destinations(self, cfg: Any) -> "tuple[OtlpDestination, ...]":
+        # Byte-identical to the endpoint-only OTLP exporter this seam replaced:
+        # ONE destination when telemetry.otlp_endpoint is a non-empty string,
+        # NONE otherwise — so egress stays off by default and the standalone
+        # build reaches exactly the collector it reached before. Read with
+        # getattr so any telemetry-config shape works, and never logged here:
+        # the value can carry credentials in userinfo or query parameters.
+        endpoint = str(getattr(cfg, "otlp_endpoint", "") or "").strip()
+        if not endpoint:
+            return ()
+        return (
+            OtlpDestination(
+                name="telemetry.otlp_endpoint",
+                endpoint=endpoint,
+                signals=frozenset({"metrics"}),
+            ),
+        )
+
 
 class DefaultKnowledgeProvider:
     """No extra connectors — the public edition ships only the built-in set."""
@@ -469,3 +624,20 @@ class DefaultJailProvider:
     def maybe_reexec_into_jail(self, argv: List[str], mode: str) -> Optional[int]:
         # None → no re-exec; the command runs in-process exactly as today.
         return None
+
+
+class DefaultMobileConnectProvider:
+    """The personal-install phone-connection pair.
+
+    ``tailnet_qr`` rides the existing tailnet publish + QR mint surface
+    (``/api/tailnet/mobile/*``); ``login_link`` rides the one-time mobile
+    sign-in link (``/api/auth/mobile-link``).  Descriptors only — each method's
+    own endpoint keeps its full guard stack.  An enterprise companion replaces
+    this list via ``dataclasses.replace(ctx, mobile_connect=...)``.
+    """
+
+    def connect_methods(self) -> List[MobileConnectMethod]:
+        return [
+            MobileConnectMethod(id="tailnet_qr", kind="tailnet_qr"),
+            MobileConnectMethod(id="login_link", kind="login_link"),
+        ]

@@ -50,11 +50,13 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 
 import { Input } from '../../../../components/ui'
+import ErrorNotice from '../../../../components/ErrorNotice'
 import {
   issueRadarApi,
   type CrewSettings, type CrewSettingsPatch, type CrewSettingsResponse, type RepoRef,
 } from '../../api'
 import { repoScopeKey } from '../../lib/links'
+import { useImeGuard } from '../../../../hooks/useImeGuard'
 
 /** The free-text fields. Both commit the same way — trim, refuse a blank, send
  *  one key — so they share one renderer and one branch in `commit`. */
@@ -84,6 +86,8 @@ export default function CrewProtocolSettings({
    *  tell a real edit from a no-op. */
   settings: CrewSettings | undefined
 }) {
+  // One instance covers every field render; the binding's focus/blur reset makes sharing safe.
+  const ime = useImeGuard()
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const scope = repoScopeKey(repoRef)
@@ -327,8 +331,7 @@ export default function CrewProtocolSettings({
             aria-invalid={message ? true : undefined}
             aria-describedby={message ? errorId : undefined}
             onChange={(e) => edit(field, e.target.value)}
-            onBlur={() => commit(field)}
-            onKeyDown={(e) => { if (e.key === 'Enter') commit(field) }}
+            {...ime.bindEnter({ onEnter: () => commit(field), onBlur: () => commit(field) })}
             disabled={!settings}
             className="max-w-[140px] flex-none"
             data-testid={testId}
@@ -364,8 +367,7 @@ export default function CrewProtocolSettings({
           aria-invalid={message ? true : undefined}
           aria-describedby={message ? errorId : undefined}
           onChange={(e) => edit(field, e.target.value)}
-          onBlur={() => commit(field)}
-          onKeyDown={(e) => { if (e.key === 'Enter') commit(field) }}
+          {...ime.bindEnter({ onEnter: () => commit(field), onBlur: () => commit(field) })}
           disabled={!settings}
           className={`w-full${mono ? ' font-mono' : ''}`}
           data-testid={testId}
@@ -417,7 +419,11 @@ export default function CrewProtocolSettings({
         data-state={save.isPending ? 'saving' : error ? 'failed' : saved ? 'saved' : 'idle'}
       >
         {save.isPending && <span className="text-muted">{t('apps.issueRadar.views.crews.desk.settings_saving')}</span>}
-        {!save.isPending && error && <span className="text-danger">{t('apps.issueRadar.views.crews.desk.settings_failed', { error })}</span>}
+        {/* No hand-off: the protocol text fields above (needs-human label, commit
+            trailer) hold the unsaved value this failure is about. */}
+        {!save.isPending && error && (
+          <ErrorNotice message={t('apps.issueRadar.views.crews.desk.settings_failed', { error })} variant="inline" />
+        )}
         {!save.isPending && !error && saved && <span className="text-ok">{t('apps.issueRadar.views.crews.desk.settings_saved')}</span>}
       </div>
     </div>

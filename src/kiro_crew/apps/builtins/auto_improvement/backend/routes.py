@@ -17,22 +17,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
+from collections.abc import Awaitable, Callable
 from functools import wraps
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from aiohttp import web
 
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.security import redact
 
+from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
 from ..spine.push_policy import normalize_branch
 from . import (
     clone_setup,
-)
-from . import commit as commit_mod
-from . import (
     deps,
     ledger_admin,
     pr_checks,
@@ -43,6 +41,7 @@ from . import (
     sse,
     store,
 )
+from . import commit as commit_mod
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +69,6 @@ _CONFIG_WRITABLE = frozenset(
         "bandCapMs",
         "forceBugSeeds",
         "autoDraftPr",
-        #: Display-only label for the GitLab namespace — neither this nor
-        #: ``githubUser`` decides where a push lands (``provider``/``host`` only
-        #: move through setup-clone).
-        "gitlabUser",
         # Opt-in: mark a fully-green DRAFT pull request ready-for-review. Safe to
         # expose because it can only ever flip a draft to ready — it never merges,
         # never enables auto-merge, and the gate (pr_watchers.auto_publish_gate) is
@@ -263,10 +258,26 @@ def _redact_tree(value: Any) -> Any:
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
-    """Parse a JSON object body, tolerating an empty one."""
+    """Parse a JSON object body, tolerating an empty one.
+
+    Diverges DELIBERATELY from the dashboard contract
+    (``dashboard/handlers/_shared.read_bounded_json``, which answers 400 for a
+    non-object): every call site here treats the result as a config *patch* and
+    only ever reads known keys off it (``set(patch)``, ``patch.items()``,
+    ``body.get(...)``), so an empty object is a legitimate no-op request. A
+    malformed OR non-object body therefore collapses to ``{}`` (an empty patch)
+    on purpose rather than a 400 — there is no field whose absence widens an
+    operation here, unlike ``session_storage._json_body``.
+
+    The catch is narrowed to the client-input failure set
+    (``LookupError`` from an unknown ``charset=`` codec, ``RecursionError`` from a
+    deeply nested body, ``ValueError``/``UnicodeDecodeError`` from undecodable or
+    non-JSON bytes) so a mid-read transport error (a client disconnect) still
+    propagates rather than being mislabelled a client mistake.
+    """
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is a client error, not a crash
+    except (LookupError, RecursionError, ValueError):
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -326,12 +337,12 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
-    """Validate a GitHub or GitLab URL, clone it push-disabled, record the target.
+    """Validate a GitHub URL, clone it push-disabled, and record it as the target.
 
-    This is the ONLY path that may set ``clone``/``target_url`` (and, with them,
-    ``provider``/``host``) in config — ``PUT /config`` deliberately cannot,
-    because these decide which repository the agent is turned loose on. The
-    clone itself is a blocking git subprocess, so it runs off the event loop.
+    This is the ONLY path that may set ``clone``/``target_url`` in config —
+    ``PUT /config`` deliberately cannot, because these decide which repository
+    the agent is turned loose on. The clone itself is a blocking git subprocess,
+    so it runs off the event loop.
     """
     body = await _json_body(request)
     url = str(body.get("url") or "").strip()
@@ -345,7 +356,7 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
         return busy
 
     def _clone() -> tuple[dict, str]:
-        return clone_setup.setup_safe_clone(url, store.scratch_dir())
+        return clone_setup.setup_safe_clone(url, store.scratch_path())
 
     # `result` is a PARAMETER, not a closure read. It used to be a free variable of this
     # handler, which broke the moment clone+persist moved inside `_clone_and_persist` to take
@@ -365,13 +376,6 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
         # this setup path.
         current["origin_url"] = str(result.get("origin_url") or "")
         current["target_display"] = result["display"]
-        # The code host (github/gitlab) and instance host are derived from the
-        # validated URL at setup time and persisted here — NOT in
-        # ``_CONFIG_WRITABLE`` — because they decide which forge a push/PR targets.
-        # Every downstream consumer (profile dispatch, recipe factory, frontend
-        # link builder) reads these rather than re-guessing.
-        current["provider"] = str(result.get("provider") or "github")
-        current["host"] = str(result.get("host") or "")
         if retargeted:
             # A branch belongs to the repo it came from. Carrying it across a retarget
             # leaves config naming a branch that does not exist in the NEW clone — the
@@ -748,33 +752,6 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
     return web.json_response({"finding": _redact_tree(detail)})
 
 
-def _recipe_for(config: dict, *, clone: str, pr_queue_dir: Path):
-    """Build the PR/MR recipe the draft path should use.
-
-    Picks the recipe by the persisted ``provider`` (github default) so the same
-    publish path drafts a GitHub PR or a GitLab MR without knowing which forge
-    the operator configured. The provider/host came from the validated setup
-    URL (Stage 2), never from free text here.
-    """
-    from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
-    from ..profiles.gitlab_repo.pr_recipe import GitLabPRRecipe
-
-    provider = str((config or {}).get("provider") or "github").lower()
-    cls = GitLabPRRecipe if provider == "gitlab" else GitHubPRRecipe
-    user = str(
-        config.get("gitlabUser") if provider == "gitlab" else config.get("githubUser")
-    )
-    return cls(
-        user=user,
-        clone_path=Path(clone),
-        pr_queue_dir=pr_queue_dir,
-        base_ref=str(config.get("branch") or "origin/main"),
-        # From config, not the clone — see clone_setup._disable_push.
-        fetch_url=clone_setup.resolve_origin_url(config) or None,
-        host=str(config.get("host") or "") or None,
-    )
-
-
 async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     """Draft (or re-draft) a pull request for a finding already in the queue.
 
@@ -820,6 +797,13 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         clone = str(config.get("clone") or "").strip()
         if not clone:
             return {"ok": False, "error": "no repository configured"}
+        try:
+            isolated = clone_setup._repository_is_isolated(Path(clone))
+        except clone_setup.IsolationProbeError as exc:
+            # Sandbox failure, not an isolation verdict — name it (#8151).
+            return {"ok": False, "error": str(exc)}
+        if not isolated:
+            return {"ok": False, "error": "repository isolation check failed — re-run setup"}
 
         body = body_path.read_text(encoding="utf-8")
         # The queued body leads with the summary as an H1; the recipe wants the
@@ -878,7 +862,14 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
                 ),
             }
 
-        recipe = _recipe_for(config, clone=clone, pr_queue_dir=queue)
+        recipe = GitHubPRRecipe(
+            user=str(config.get("githubUser") or ""),
+            clone_path=Path(clone),
+            pr_queue_dir=queue,
+            base_ref=str(config.get("branch") or "origin/main"),
+            # From config, not the clone — see clone_setup._disable_push.
+            fetch_url=clone_setup.resolve_origin_url(config) or None,
+        )
         try:
             ref = recipe.draft(
                 summary=summary,
@@ -969,65 +960,35 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     if result.get("ok"):
         return web.json_response(result, status=200)
     return web.json_response(
-        {"code": "draft_pr_failed", "error": str(result.get("detail") or "")},
+        {
+            "code": "draft_pr_failed",
+            # `_draft()`'s failure dicts carry `error`; `detail` is kept as the
+            # legacy fallback. Reading only `detail` serialized every failure —
+            # including the sandbox-launcher diagnosis this route now surfaces —
+            # as an empty string. Raised by the GPT review of this branch.
+            "error": _redact_for_display(str(result.get("error") or result.get("detail") or "")),
+        },
         status=400,
     )
 
 
 def ledger_admin_record(fp: str, pr_ref: str) -> None:
-    """Append a ``filed`` ledger row carrying the pull-request reference.
+    """Record a manually-drafted ``filed`` pull request in the ledger.
 
-    Append-only rather than a rewrite: the ledger is the run's audit trail, and
-    the latest row for a fingerprint is what readers treat as current, so adding
-    a row records the new fact without mutating history.
+    Delegates to :func:`ledger_admin.record_filed`, which appends the row while holding
+    the module's ``_LEDGER_LOCK`` — the SAME lock ``forget`` / ``purge`` hold across their
+    read → decide → append. Sharing that one lock domain is load-bearing: a filed write
+    that appended outside it could land its row between a concurrent ``forget``'s read and
+    its ``purged`` append, and ``purged`` (last-write-wins) would then hide the just-filed
+    pull request and re-open the locus, so the loop drafts a SECOND PR for a change already
+    up for review. The helper also carries ``kind``/``target`` and writes ``cr`` (never
+    ``pr``) so the row survives ``spine.ledger.LedgerEntry(**row)`` and enters the dedup
+    index; see its docstring for why that shape matters.
 
-    The reference goes in ``cr``, and ``kind``/``target`` are always present, because
-    ``spine.ledger.Ledger._load()`` does ``LedgerEntry(**row)`` inside a bare
-    ``except: continue`` that exists to tolerate a torn final line. ``LedgerEntry`` is a
-    fixed-field dataclass with ``cr`` and REQUIRED ``kind``/``target``, so a row spelled
-    ``pr``, or one missing either field, raises ``TypeError`` and is silently discarded:
-    this ``filed`` marker would never enter the dedup index, and after the retry cooldown
-    the loop would re-discover the locus and draft a SECOND pull request for a change
-    already filed. ``backend/ledger_admin.py`` documents the same hazard for its purge
-    event, and ``_purged_event`` is the shape followed here. Readers accept both
-    spellings (``progress.read_findings``, ``prUrlOf``), so the UI link still renders.
+    A write failure is logged inside the helper and swallowed here: the pull request is
+    already published, so a bookkeeping miss must not surface as a caller error.
     """
-
-    row: dict[str, Any] = {
-        "fp": fp,
-        "status": "filed",
-        "cr": pr_ref,
-        "note": "manually drafted from the queued change",
-        "ts": time.time(),
-    }
-    path = store.ledger_path()
-    existing = ""
-    if path.exists():
-        try:
-            existing = path.read_text(encoding="utf-8")
-        except OSError:
-            existing = ""
-    # Preserve the target/kind from the finding's prior rows so the new row is
-    # still identifiable in the list view.
-    for line in reversed(existing.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            prior = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(prior, dict) and str(prior.get("fp") or "") == fp:
-            row.setdefault("kind", prior.get("kind") or "")
-            row.setdefault("target", prior.get("target") or "")
-            break
-    # Unconditionally, even when no prior row was found: `kind` and `target` are
-    # REQUIRED dataclass fields, so omitting them fails `LedgerEntry(**row)` exactly
-    # like the wrong key spelling would, and the row would be dropped just as silently.
-    row.setdefault("kind", "")
-    row.setdefault("target", "")
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row) + "\n")
+    ledger_admin.record_filed(fp, pr_ref)
 
 
 # ── per-PR watcher sessions ──────────────────────────────────────────────────
@@ -1359,11 +1320,12 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
             sha=str(result.get("sha") or ""),
         )
         return web.json_response(result, status=200)
-    # Redacted, like every sibling error response here. `commit.py` builds its `error` from
-    # `(proc.stderr or '')[:160]` — raw git stderr, which quotes the ref, the path, and
-    # anything a repository's own hook printed. Latent while nothing rendered it; D-97 started
-    # showing it at the finding row, which made it a live egress path to the browser.
-    # Raised by the GPT review.
+    # Redacted, like every sibling error response here. `commit.py` builds its `error`
+    # from git stderr — which quotes the ref, the path, and anything a repository's own
+    # hook printed — scrubbed at the source with `redact_via_context` so its bound can
+    # never cut a credential mid-match. Latent while nothing rendered it; D-97 started
+    # showing it at the finding row, which made it a live egress path to the browser, so
+    # this pass stays as the output-boundary backstop. Raised by the GPT review.
     return web.json_response(
         {"code": "request_failed", "error": _redact_for_display(str(result.get("error") or ""))},
         status=400,
@@ -1411,6 +1373,7 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
     repo or a wider budget than what the config endpoints allow. Building the driver
     is blocking (git, provider probe), so the whole call runs off the event loop.
     """
+
     # Read the config INSIDE the lock, together with the start it feeds. Read outside, a
     # retarget landing between the read and the start means the run operates on the repo
     # that was just replaced while the UI shows the new one. `_build_driver` re-enters the
@@ -1422,6 +1385,14 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
 
     try:
         result = await asyncio.to_thread(_start)
+    except clone_setup.IsolationProbeError as exc:
+        # Before the generic clause: this subclasses RuntimeError, but it is a
+        # sandbox-launcher failure, not a config/state conflict — a distinct
+        # `code` so a UI branching on it does not render the misleading
+        # push-isolation guidance (#8151). The message is the actionable part.
+        return web.json_response(
+            {"code": "sandbox_launcher_failed", "error": str(exc)}, status=409
+        )
     except (RuntimeError, ValueError, PermissionError) as exc:
         # Already running / no repository configured / push not disabled — all three are
         # "the request conflicts with current state", all three are user-fixable, and the
@@ -1515,12 +1486,32 @@ def register_routes(app: web.Application) -> None:
         except Exception:  # pragma: no cover - defensive
             logger.warning("%s: watcher shutdown failed", store.APP_NAME, exc_info=True)
 
+    async def _stop_run(_app: web.Application) -> None:
+        """Wind down an in-flight run on gateway shutdown.
+
+        The supervisor's worker thread is a daemon and does not block exit, but the
+        agent/measurer SUBPROCESS it spawns is not — left running it outlives the
+        gateway, holding the clone lock and spending budget after the process that
+        owned it is gone. ``stop`` is idempotent (a no-op when idle) and bounded: it
+        signals the run and joins for at most ``STOP_JOIN_TIMEOUT_S``, since the spine
+        stops between candidates. A measurement already in flight can exceed that
+        window — the join then returns with the run still ``stopping`` — but asking it
+        to stop at all is the improvement over leaving it entirely unsignalled. Run
+        off the event loop because that join blocks.
+        """
+        try:
+
+            await asyncio.to_thread(runner.get_supervisor().stop)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("%s: run shutdown failed", store.APP_NAME, exc_info=True)
+
     # Guarded: register_routes runs before the runner freezes its signal lists,
     # so appending is safe — but a failure here must never break gateway startup.
     try:
         app.on_startup.append(_bind_watcher_loop)
         app.on_cleanup.append(_stop_watchers)
+        app.on_cleanup.append(_stop_run)
     except Exception:  # pragma: no cover - defensive
-        logger.warning("%s: could not register watcher lifecycle hooks", store.APP_NAME)
+        logger.warning("%s: could not register lifecycle hooks", store.APP_NAME)
 
     logger.info("%s backend routes registered", store.APP_NAME)

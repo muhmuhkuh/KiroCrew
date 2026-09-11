@@ -1,9 +1,9 @@
 """Dependency preflight — reports rather than repairs.
 
-The interesting behaviour is entirely in the failure shapes: ``gh`` present but not
-logged in must be distinguishable from ``gh`` absent (the first is a `gh auth login`,
-the second an install), and only ``ruff`` may ever be installed — never a system-wide
-install and never an authenticated CLI.
+The interesting behaviour is entirely in the failure shapes: the selected forge CLI
+being present but not logged in must be distinguishable from it being absent (the first
+is an auth-login hint, the second an install), and only ``ruff`` may ever be installed
+— never a system-wide install and never an authenticated CLI.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ class TestGhAuthenticated:
 
         monkeypatch.setattr(deps.subprocess, "run", _boom)
         ok, detail = deps._gh_authenticated()
-        assert ok is False
+        assert not ok
         assert detail == "gh is not on PATH"
 
     def test_a_live_login_is_authenticated(
@@ -92,7 +92,7 @@ class TestGhAuthenticated:
         which["gh"] = _stub_bin("gh")
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1))
         ok, detail = deps._gh_authenticated()
-        assert ok is False
+        assert not ok
         assert "gh auth login" in detail
 
     @pytest.mark.parametrize(
@@ -109,24 +109,43 @@ class TestGhAuthenticated:
 
         monkeypatch.setattr(deps.subprocess, "run", _run)
         ok, detail = deps._gh_authenticated()
-        assert ok is False
+        assert not ok
         assert detail.startswith("could not run gh auth status:")
 
 
 class TestCheckDeps:
+    def test_gitlab_target_checks_glab_instead_of_gh(
+        self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        which.update({"git": _stub_bin("git"), "glab": _stub_bin("glab")})
+        seen: dict[str, Any] = {}
+
+        def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            seen["cmd"] = cmd
+            seen["env"] = kwargs.get("env")
+            return _proc(0)
+
+        monkeypatch.setattr(deps.subprocess, "run", _run)
+        report = deps.check_deps("gitlab", "gitlab.example.com")
+        by_id = {d["id"]: d for d in report["deps"]}
+        assert report["ok"]
+        assert set(by_id) == {"git", "glab", "ruff"}
+        assert seen["cmd"] == ["glab", "auth", "status"]
+        assert seen["env"]["GITLAB_HOST"] == "gitlab.example.com"
+
     def test_everything_present_is_ok_with_nothing_blocking(
         self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         which.update({"git": _stub_bin("git"), "gh": _stub_bin("gh"), "ruff": _stub_bin("ruff")})
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
-        assert report["ok"] is True
+        assert report["ok"]
         assert report["blocking"] == []
         by_id = {d["id"]: d for d in report["deps"]}
         assert set(by_id) == {"git", "gh", "ruff"}
         assert by_id["git"]["detail"] == _stub_bin("git")
-        assert by_id["ruff"]["installable"] is True
-        assert by_id["gh"]["installable"] is False
+        assert by_id["ruff"]["installable"]
+        assert not by_id["gh"]["installable"]
 
     def test_a_missing_required_binary_blocks_the_run(
         self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
@@ -134,10 +153,10 @@ class TestCheckDeps:
         which["gh"] = _stub_bin("gh")
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
-        assert report["ok"] is False
+        assert not report["ok"]
         assert report["blocking"] == ["git"]
         by_id = {d["id"]: d for d in report["deps"]}
-        assert by_id["git"]["ok"] is False
+        assert not by_id["git"]["ok"]
         assert by_id["git"]["detail"] == "not found on PATH"
 
     def test_a_missing_optional_binary_only_narrows_discovery(
@@ -146,11 +165,11 @@ class TestCheckDeps:
         which.update({"git": _stub_bin("git"), "gh": _stub_bin("gh")})
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
-        assert report["ok"] is True
+        assert report["ok"]
         assert report["blocking"] == []
         ruff = next(d for d in report["deps"] if d["id"] == "ruff")
-        assert ruff["ok"] is False
-        assert ruff["required"] is False
+        assert not ruff["ok"]
+        assert not ruff["required"]
         assert "compile check" in ruff["detail"]
 
     def test_both_required_entries_can_block_at_once(
@@ -159,7 +178,7 @@ class TestCheckDeps:
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
         assert report["blocking"] == ["git", "gh"]
-        assert report["ok"] is False
+        assert not report["ok"]
 
 
 class TestInstallDeps:
@@ -223,6 +242,60 @@ class TestInstallDeps:
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1, stderr="x" * 500))
         out = deps.install_deps()
         assert out["error"] == "pip failed: " + "x" * 200
+
+    def test_a_pip_failure_does_not_leak_index_credentials_to_the_payload(
+        self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The child pip inherits the gateway env, so an authenticated private
+        index reaches it; on an auth failure pip echoes the raw request URL —
+        token and all — to stderr. That tail line is returned in the handler's
+        ``error`` payload, which surfaces in the dashboard, so the token must
+        never survive into it.
+        """
+        token = "s3cr3t-index-token"  # a fake secret, only asserted absent
+        stderr = (
+            "WARNING: Retrying (Retry(total=0)) after connection broken\n"
+            f"ERROR: Could not install ruff from "
+            f"https://ci-bot:{token}@pypi.internal.example.com/simple/ruff/\n"
+        )
+        monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1, stderr=stderr))
+        out = deps.install_deps()
+        assert out["ok"] is False
+        assert out["installed"] == []
+        assert token not in out["error"]
+        assert "[REDACTED" in out["error"]
+
+    def test_a_pip_failure_credential_is_redacted_before_it_is_bounded(
+        self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Redact-before-bound invariant: the credential is laid out so the
+        200-char bound falls INSIDE the token. Bound-before-redact would keep
+        an unredacted token prefix that no longer matches the credential regex
+        — the exact fragment shape the serving route's own redaction pass
+        cannot recognise — so this test goes red if the redact and the bound
+        are ever reordered.
+        """
+        token = "TOKENedge9876543210"  # a fake secret, only asserted absent
+        userinfo = "https://ci-bot:"
+        # Lay the token out to START at index 190 of the tail line, so the
+        # 200-char bound cuts ten characters into it.
+        pad = "x" * (190 - len("ERROR: ") - len(userinfo))
+        line = f"ERROR: {pad}{userinfo}{token}@pypi.internal.example.com/simple/ruff/"
+        stderr = f"warming up\n{line}\n"
+        # Premise guards: the guarded line must be the tail line the bound is
+        # actually applied to, and the token must straddle the boundary — or
+        # this test silently stops pinning the invariant.
+        assert stderr.strip().splitlines()[-1] == line
+        start = line.index(token)
+        assert start < 200 < start + len(token)
+        monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1, stderr=stderr))
+        out = deps.install_deps()
+        assert out["ok"] is False
+        assert token not in out["error"]
+        # The exact fragment a bound-before-redact implementation would leak —
+        # everything of the token left of the bound — must be absent too.
+        leaked_prefix = token[: 200 - start]
+        assert leaked_prefix and leaked_prefix not in out["error"]
 
     @pytest.mark.parametrize(
         "exc",

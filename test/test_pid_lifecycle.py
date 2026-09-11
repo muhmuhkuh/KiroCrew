@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 from collections import deque
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
@@ -383,6 +384,11 @@ class TestResetStateUntracksParentPid:
         client._stderr_lines = deque(["some error"], maxlen=20)
         client._pending_oauth_requests = []
         client._oauth_emitted_servers = set()
+        # _reset_state restarts the per-process cost baseline on this object
+        # (always present in production: __init__ assigns it unconditionally).
+        from kiro_crew.acp.types import AcpPromptStats
+
+        client.last_prompt_stats = AcpPromptStats()
         mock_task = Mock()
         mock_task.done.return_value = False
         client._stderr_task = mock_task
@@ -471,9 +477,7 @@ class TestFindOrphanMcpCandidates:
         assert len(records) == 1
         assert records[0].exc_info is None
 
-    def test_unexpected_probe_error_keeps_traceback(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_unexpected_probe_error_keeps_traceback(self, caplog: pytest.LogCaptureFixture) -> None:
         """A genuinely unexpected probe failure still logs exc_info."""
         from kiro_crew.session_pid import find_orphan_mcp_candidates
 
@@ -658,6 +662,20 @@ class TestFindOrphanMcpCandidates:
 @_POSIX_ONLY
 class TestKillOrphanMcps:
     """Tests for kill_orphan_mcps (kill confirmed orphans)."""
+
+    @pytest.fixture(autouse=True)
+    def _stable_root_identity(self) -> Iterator[None]:
+        """Give synthetic PIDs a start token so the recycle guard passes.
+
+        `kill_orphan_mcps` captures the root's `_pid_start_token` before the
+        subtree scan and re-confirms it before signalling, so a PID whose
+        identity cannot be read is skipped by design. These tests use synthetic
+        PIDs that have no `/proc` entry; a stable token states the thing they
+        already assume -- that the PID was not recycled mid-sweep. See
+        test_orphan_mcp_subtree.TestRootRecycleGuard for the guard's own cover.
+        """
+        with patch("kiro_crew.session_pid._pid_start_token", return_value="tok-stable"):
+            yield
 
     def test_uses_killpg_when_pgid_differs(self) -> None:
         """If orphan is its own group leader, kill via killpg."""
@@ -1279,6 +1297,12 @@ class TestEnvHasKirocrewMarker:
 
 
 class TestMarkedLauncherSweepIntegration:
+    @pytest.fixture(autouse=True)
+    def _stable_root_identity(self) -> Iterator[None]:
+        """See TestKillOrphanMcps._stable_root_identity."""
+        with patch("kiro_crew.session_pid._pid_start_token", return_value="tok-stable"):
+            yield
+
     """find + kill phases honor the marked-launcher positive-ID path."""
 
     def test_find_includes_marked_npx_orphan(self) -> None:
@@ -1392,8 +1416,7 @@ class TestIsSweepableOrphanWork:
         from kiro_crew.session_pid import _is_sweepable_orphan_work
 
         worker = (
-            b"/repo/.venv/bin/python\x00-u\x00-c"
-            b"\x00import sys;exec(eval(sys.stdin.readline()))"
+            b"/repo/.venv/bin/python\x00-u\x00-c" b"\x00import sys;exec(eval(sys.stdin.readline()))"
         )
         with (
             patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
@@ -1522,9 +1545,7 @@ class TestIsSweepableOrphanWork:
         assert _ORPHAN_WORK_MIN_AGE_SECONDS > _ORPHAN_MIN_AGE_SECONDS
         with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
             assert (
-                _is_sweepable_orphan_work(
-                    1234, self._PYTEST_CMDLINE, _ORPHAN_MIN_AGE_SECONDS + 1
-                )
+                _is_sweepable_orphan_work(1234, self._PYTEST_CMDLINE, _ORPHAN_MIN_AGE_SECONDS + 1)
                 is False
             )
 
@@ -1541,9 +1562,7 @@ class TestIsSweepableOrphanWork:
 
         with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
             assert (
-                _is_sweepable_orphan_work(
-                    1234, b"/usr/local/bin/kiro-cli\x00chat\x00--acp", 700.0
-                )
+                _is_sweepable_orphan_work(1234, b"/usr/local/bin/kiro-cli\x00chat\x00--acp", 700.0)
                 is False
             )
             assert _is_sweepable_orphan_work(1234, b"claude\x00--print", 700.0) is False
@@ -1932,9 +1951,7 @@ class TestPidStartTokenIdentityGuard:
         assert entry in session_pid_file.read_text(encoding="utf-8")
 
     @_POSIX_ONLY
-    def test_session_roots_subreaper_reparent_still_killed(
-        self, session_pid_file: Path
-    ) -> None:
+    def test_session_roots_subreaper_reparent_still_killed(self, session_pid_file: Path) -> None:
         """A recorded start token that MATCHES proves identity on its own.
 
         Orphans do not always reparent to init: a process placed in its own
@@ -1968,9 +1985,10 @@ class TestPidStartTokenIdentityGuard:
         ):
             cleanup_orphaned_session_roots()
 
-        assert (99998, platform_compat.SIGKILL) in kills, (
-            "a token-verified orphan adopted by a subreaper was not reaped"
-        )
+        assert (
+            99998,
+            platform_compat.SIGKILL,
+        ) in kills, "a token-verified orphan adopted by a subreaper was not reaped"
         # And it must not be silently untracked, which is what leaks it forever.
         assert entry not in session_pid_file.read_text(encoding="utf-8")
 
@@ -2365,3 +2383,703 @@ class TestPidFileRewriteIsAtomic:
             "mid-write silently drops entries and leaks their runtimes until "
             "the host reboots."
         )
+
+
+# ── Untracked managed-agent runtime orphan (REPORT-ONLY, issue #2930) ──
+
+
+@pytest.fixture()
+def reset_untracked_report_dedup() -> Iterator[None]:
+    """Clear the module-level report dedup set around each test.
+
+    The detector keeps reported PIDs in module state so a persisting orphan is
+    logged once rather than once per sweep tick; leaking that between tests
+    would make assertions order-dependent.
+    """
+    import kiro_crew.session_pid as sp
+
+    sp._reported_untracked_agent_pids.clear()
+    yield
+    sp._reported_untracked_agent_pids.clear()
+
+
+def _agent_cmdline(argv0: str = "/opt/kiro/bin/kiro-cli") -> bytes:
+    """A managed agent runtime cmdline in Linux /proc (NUL-separated) form."""
+    return b"\x00".join([argv0.encode(), b"chat", b"--no-interactive"])
+
+
+class TestTrackedAgentPids:
+    """_tracked_agent_pids unions the PIDs both tracking files claim."""
+
+    def test_no_files_yields_empty_set(self, pid_file: Path, session_pid_file: Path) -> None:
+        from kiro_crew.session_pid import _tracked_agent_pids
+
+        assert _tracked_agent_pids() == set()
+
+    def test_session_entry_collects_child_not_gateway_or_identity_field(
+        self, pid_file: Path, session_pid_file: Path
+    ) -> None:
+        """Only the child is reapable through a session entry.
+
+        The gateway field names the OWNER whose death makes the entry sweepable,
+        never a process reclaimed through it, and the third field is a
+        start-time identity (numeric on Linux). Counting either would let a
+        stale entry suppress a genuine report.
+        """
+        from kiro_crew.session_pid import _tracked_agent_pids
+
+        session_pid_file.write_text("4100:4200:987654321\n", encoding="utf-8")
+
+        assert _tracked_agent_pids() == {4200}
+
+    def test_child_parent_entry_collects_child_not_parent(
+        self, pid_file: Path, session_pid_file: Path
+    ) -> None:
+        """``_cleanup_orphaned_mcp_servers`` kills the child, not the parent."""
+        from kiro_crew.session_pid import _tracked_agent_pids
+
+        pid_file.write_text("5100:5200\n", encoding="utf-8")
+
+        assert _tracked_agent_pids() == {5100}
+
+    def test_bare_line_names_its_own_process_in_either_file(
+        self, pid_file: Path, session_pid_file: Path
+    ) -> None:
+        from kiro_crew.session_pid import _tracked_agent_pids
+
+        session_pid_file.write_text("5300\n", encoding="utf-8")
+        pid_file.write_text("5400\n", encoding="utf-8")
+
+        assert _tracked_agent_pids() == {5300, 5400}
+
+    def test_both_files_union(self, pid_file: Path, session_pid_file: Path) -> None:
+        """Each file contributes its own reapable field, at its own index."""
+        from kiro_crew.session_pid import _tracked_agent_pids
+
+        session_pid_file.write_text("10:11\n", encoding="utf-8")
+        pid_file.write_text("20:21\n", encoding="utf-8")
+
+        assert _tracked_agent_pids() == {11, 20}
+
+    def test_malformed_and_non_positive_fields_are_skipped(
+        self, pid_file: Path, session_pid_file: Path
+    ) -> None:
+        """A partially-appended or hand-edited line must not raise."""
+        from kiro_crew.session_pid import _tracked_agent_pids
+
+        session_pid_file.write_text("garbage\n0:-3\n:\n77:78\n", encoding="utf-8")
+
+        assert _tracked_agent_pids() == {78}
+
+    def test_unreadable_file_is_tolerated(self, pid_file: Path, session_pid_file: Path) -> None:
+        """Report-only: an OSError costs a log line at worst, never a raise."""
+        from kiro_crew.session_pid import _tracked_agent_pids
+
+        pid_file.write_text("31:32\n", encoding="utf-8")
+        with patch.object(Path, "read_text", side_effect=OSError("boom")):
+            assert _tracked_agent_pids() == set()
+
+
+class TestIsUntrackedManagedAgentOrphan:
+    """Positive identity for the report-only detector."""
+
+    def test_untracked_marked_runtime_is_detected(self) -> None:
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
+            assert _is_untracked_managed_agent_orphan(900, _agent_cmdline(), set()) is True
+
+    def test_tracked_runtime_is_not_detected(self) -> None:
+        """A PID either file claims is already reachable by a reaper."""
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
+            assert _is_untracked_managed_agent_orphan(900, _agent_cmdline(), {900}) is False
+
+    def test_unmarked_process_is_not_detected(self) -> None:
+        """A user's own kiro-cli (no environ marker) is never reported."""
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=False):
+            assert _is_untracked_managed_agent_orphan(901, _agent_cmdline(), set()) is False
+
+    def test_claude_runtime_basename_also_detected(self) -> None:
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
+            assert (
+                _is_untracked_managed_agent_orphan(
+                    902, _agent_cmdline("/usr/local/bin/claude"), set()
+                )
+                is True
+            )
+
+    def test_peer_gateway_is_not_detected(self) -> None:
+        """A gateway/CLI entrypoint is not an agent runtime."""
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        cmdline = b"kiro-cli\x00-m\x00kiro_crew.mcp_gateway.gatewayd"
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
+            assert _is_untracked_managed_agent_orphan(903, cmdline, set()) is False
+
+    def test_non_runtime_basename_is_not_detected(self) -> None:
+        """A marked pytest orphan belongs to the work sweep, not this arm."""
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        cmdline = b"/venv/bin/pytest\x00-x"
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
+            assert _is_untracked_managed_agent_orphan(904, cmdline, set()) is False
+
+    def test_empty_cmdline_is_not_detected(self) -> None:
+        """Kernel thread / zombie — no argv to identify."""
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True):
+            assert _is_untracked_managed_agent_orphan(905, b"", set()) is False
+
+    def test_no_environ_read_when_shape_already_declines(self) -> None:
+        """Cheap gates run first — the /proc environ read is the last resort."""
+        from kiro_crew.session_pid import _is_untracked_managed_agent_orphan
+
+        with patch("kiro_crew.session_pid._env_has_kirocrew_marker") as mock_env:
+            assert (
+                _is_untracked_managed_agent_orphan(906, b"/venv/bin/pytest\x00-x", set()) is False
+            )
+        mock_env.assert_not_called()
+
+
+class TestUntrackedRuntimeReportIntegration:
+    """find_orphan_mcp_candidates reports the orphan and terminates nothing."""
+
+    def test_reports_at_error_and_never_returns_as_candidate(
+        self,
+        pid_file: Path,
+        session_pid_file: Path,
+        reset_untracked_report_dedup: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The regression this fixes: the leak was previously silent.
+
+        Every existing reaper declines an untracked runtime, so before this arm
+        the sweep produced no candidate AND no diagnostic. The report must
+        appear, and the PID must stay out of ``candidates`` — this arm has no
+        kill authority.
+        """
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4242]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_agent_cmdline()),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=3600.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            caplog.at_level(logging.ERROR, logger="kiro_crew.session_pid"),
+        ):
+            mock_sys.platform = "linux"
+            result = find_orphan_mcp_candidates(active_pids=set())
+
+        assert result == []  # report-only: nothing handed to the kill phase
+        records = [r for r in caplog.records if "4242" in r.getMessage()]
+        assert len(records) == 1
+        assert records[0].levelno == logging.ERROR
+        message = records[0].getMessage()
+        assert "kiro-cli" in message
+        assert "NEITHER PID file" in message
+        assert "report only" in message
+
+    def test_argv0_control_characters_cannot_forge_log_lines(
+        self,
+        pid_file: Path,
+        session_pid_file: Path,
+        reset_untracked_report_dedup: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """argv0 is set by the process itself, so it is untrusted input.
+
+        A newline in it would otherwise forge whole lines in gateway.log and
+        through /api/logs, which read as if the gateway had emitted them.
+        """
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        hostile = b"\x00".join([b"/tmp/kiro-cli\nERROR forged line", b"chat"])
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4848]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=hostile),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=3600.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            caplog.at_level(logging.ERROR, logger="kiro_crew.session_pid"),
+        ):
+            mock_sys.platform = "linux"
+            result = find_orphan_mcp_candidates(active_pids=set())
+
+        assert result == []
+        records = [r for r in caplog.records if "4848" in r.getMessage()]
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert "\n" not in message  # the whole report stays one line
+        assert "\\nERROR forged line" in message  # escaped, not interpreted
+
+    def test_report_is_logged_once_across_repeated_sweeps(
+        self,
+        pid_file: Path,
+        session_pid_file: Path,
+        reset_untracked_report_dedup: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A persisting orphan must not re-log on every sweep tick."""
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4343]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_agent_cmdline()),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=3600.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            caplog.at_level(logging.ERROR, logger="kiro_crew.session_pid"),
+        ):
+            mock_sys.platform = "linux"
+            find_orphan_mcp_candidates(active_pids=set())
+            find_orphan_mcp_candidates(active_pids=set())
+            find_orphan_mcp_candidates(active_pids=set())
+
+        assert len([r for r in caplog.records if "4343" in r.getMessage()]) == 1
+
+    def test_vanished_pid_re_arms_the_report(
+        self,
+        pid_file: Path,
+        session_pid_file: Path,
+        reset_untracked_report_dedup: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Dedup state is scoped to PIDs still detected, so it cannot grow."""
+        import kiro_crew.session_pid as sp
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_agent_cmdline()),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=3600.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            caplog.at_level(logging.ERROR, logger="kiro_crew.session_pid"),
+        ):
+            mock_sys.platform = "linux"
+            with patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4444]):
+                find_orphan_mcp_candidates(active_pids=set())
+            with patch("kiro_crew.session_pid._our_orphan_pids", return_value=[]):
+                find_orphan_mcp_candidates(active_pids=set())
+                assert sp._reported_untracked_agent_pids == set()
+            with patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4444]):
+                find_orphan_mcp_candidates(active_pids=set())
+
+        assert len([r for r in caplog.records if "4444" in r.getMessage()]) == 2
+
+    def test_tracked_runtime_is_not_reported(
+        self,
+        pid_file: Path,
+        session_pid_file: Path,
+        reset_untracked_report_dedup: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A runtime the session file records is reachable — no diagnostic."""
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        session_pid_file.write_text("7:4545:99999\n", encoding="utf-8")
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4545]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_agent_cmdline()),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=3600.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            caplog.at_level(logging.ERROR, logger="kiro_crew.session_pid"),
+        ):
+            mock_sys.platform = "linux"
+            result = find_orphan_mcp_candidates(active_pids=set())
+
+        assert result == []
+        assert [r for r in caplog.records if "4545" in r.getMessage()] == []
+
+    def test_recycled_owner_pid_does_not_suppress_the_report(
+        self,
+        pid_file: Path,
+        session_pid_file: Path,
+        reset_untracked_report_dedup: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A stale entry's OWNER field must not shadow a real leak.
+
+        The gateway field of a session entry and the parent field of a
+        child entry name processes no reaper terminates through that entry.
+        Once such an owner has died and its PID has been recycled into a leaked
+        runtime, treating the field as tracked would return the sweep to the
+        exact silence issue #2930 reports.
+        """
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        # 4747 appears only as a dead gateway (session) and a dead parent (child).
+        session_pid_file.write_text("4747:11:99999\n", encoding="utf-8")
+        pid_file.write_text("12:4747\n", encoding="utf-8")
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4747]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_agent_cmdline()),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=3600.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            caplog.at_level(logging.ERROR, logger="kiro_crew.session_pid"),
+        ):
+            mock_sys.platform = "linux"
+            result = find_orphan_mcp_candidates(active_pids=set())
+
+        assert result == []  # still report-only
+        assert len([r for r in caplog.records if "4747" in r.getMessage()]) == 1
+
+    def test_young_orphan_is_not_reported(
+        self,
+        pid_file: Path,
+        session_pid_file: Path,
+        reset_untracked_report_dedup: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Below the age floor the tracking append may simply not have landed."""
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[4646]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_agent_cmdline()),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=5.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            caplog.at_level(logging.ERROR, logger="kiro_crew.session_pid"),
+        ):
+            mock_sys.platform = "linux"
+            result = find_orphan_mcp_candidates(active_pids=set())
+
+        assert result == []
+        assert [r for r in caplog.records if "4646" in r.getMessage()] == []
+
+
+# ── Orphaned playwright-cli browser daemon sweep (issue #5986) ───────────────
+
+#: A realistic NUL-separated cliDaemon argv. playwright-core spawns the daemon
+#: as ``node <...>/entry/cliDaemon.js <sessionName> [flags]`` (see
+#: cli-client/session.js ``startDaemon``), so the session name is the argv
+#: element immediately after the entry script.
+_DAEMON_CMDLINE = (
+    b"/usr/bin/node\x00"
+    b"/home/u/.npm/_npx/e41f/node_modules/playwright-core/lib/entry/cliDaemon.js\x00"
+    b"kc-1a2b3c4d\x00--headed"
+)
+_OPERATOR_DAEMON_CMDLINE = (
+    b"/usr/bin/node\x00"
+    b"/home/u/.npm/_npx/e41f/node_modules/playwright-core/lib/entry/cliDaemon.js\x00"
+    b"chrome"
+)
+
+
+class TestBrowserDaemonSessionArg:
+    """Structural extraction of the generated session name from daemon argv."""
+
+    def test_extracts_generated_session_name(self) -> None:
+        from kiro_crew.session_pid import _browser_daemon_session_arg
+
+        assert _browser_daemon_session_arg(_DAEMON_CMDLINE) == b"kc-1a2b3c4d"
+
+    def test_rejects_operator_named_session(self) -> None:
+        """Only Kiro-Crew-generated ``kc-<8hex>`` names are ever sweepable."""
+        from kiro_crew.session_pid import _browser_daemon_session_arg
+
+        assert _browser_daemon_session_arg(_OPERATOR_DAEMON_CMDLINE) is None
+
+    def test_rejects_space_joined_cmdline(self) -> None:
+        """A ps-style space-joined cmdline cannot delimit argv safely."""
+        from kiro_crew.session_pid import _browser_daemon_session_arg
+
+        assert _browser_daemon_session_arg(_DAEMON_CMDLINE.replace(b"\x00", b" ")) is None
+
+    def test_rejects_non_daemon_cmdline(self) -> None:
+        from kiro_crew.session_pid import _browser_daemon_session_arg
+
+        assert _browser_daemon_session_arg(b"/usr/bin/node\x00server.js\x00kc-1a2b3c4d") is None
+
+    def test_session_env_name_matches_launch_module(self) -> None:
+        """Drift ratchet: the local constant must track the real env var."""
+        from kiro_crew.browser_cli.launch import SESSION_ENV
+        from kiro_crew.session_pid import _BROWSER_SESSION_ENV
+
+        assert _BROWSER_SESSION_ENV == SESSION_ENV
+
+
+class TestBrowserDaemonOrphanSweep:
+    """A stranded generated-session daemon is reclaimed; a live one never is."""
+
+    def test_dead_owner_daemon_is_a_candidate(self) -> None:
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[800]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_DAEMON_CMDLINE),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=900.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            patch("kiro_crew.session_pid._env_value", return_value=b"kc-1a2b3c4d"),
+            patch(
+                "kiro_crew.session_pid._browser_session_owner_alive",
+                return_value=False,
+            ),
+        ):
+            mock_sys.platform = "linux"
+            assert find_orphan_mcp_candidates(active_pids=set()) == [800]
+
+    def test_live_owner_daemon_is_never_a_candidate(self) -> None:
+        """The safety invariant: a live agent's browser is never reclaimed."""
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[801]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_DAEMON_CMDLINE),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=900.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            patch("kiro_crew.session_pid._env_value", return_value=b"kc-1a2b3c4d"),
+            patch(
+                "kiro_crew.session_pid._browser_session_owner_alive",
+                return_value=True,
+            ),
+        ):
+            mock_sys.platform = "linux"
+            assert find_orphan_mcp_candidates(active_pids=set()) == []
+
+    def test_operator_session_daemon_is_never_a_candidate(self) -> None:
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[802]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_OPERATOR_DAEMON_CMDLINE),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=900.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            patch("kiro_crew.session_pid._env_value", return_value=b"chrome"),
+            patch(
+                "kiro_crew.session_pid._browser_session_owner_alive",
+                return_value=False,
+            ),
+        ):
+            mock_sys.platform = "linux"
+            assert find_orphan_mcp_candidates(active_pids=set()) == []
+
+    def test_unmarked_daemon_is_never_a_candidate(self) -> None:
+        """No ``KIROCREW_SPAWNED`` marker means we did not spawn this tree."""
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[803]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_DAEMON_CMDLINE),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=900.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=False),
+            patch("kiro_crew.session_pid._env_value", return_value=b"kc-1a2b3c4d"),
+            patch(
+                "kiro_crew.session_pid._browser_session_owner_alive",
+                return_value=False,
+            ),
+        ):
+            mock_sys.platform = "linux"
+            assert find_orphan_mcp_candidates(active_pids=set()) == []
+
+    def test_young_daemon_is_never_a_candidate(self) -> None:
+        """The work-class age floor applies: a fresh daemon is never raced."""
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[804]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_DAEMON_CMDLINE),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=200.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            patch("kiro_crew.session_pid._env_value", return_value=b"kc-1a2b3c4d"),
+            patch(
+                "kiro_crew.session_pid._browser_session_owner_alive",
+                return_value=False,
+            ),
+        ):
+            mock_sys.platform = "linux"
+            assert find_orphan_mcp_candidates(active_pids=set()) == []
+
+    def test_env_argv_session_mismatch_is_never_a_candidate(self) -> None:
+        """argv name must be the generated name this process was exec'd with."""
+        from kiro_crew.session_pid import find_orphan_mcp_candidates
+
+        with (
+            patch("kiro_crew.session_pid._our_orphan_pids", return_value=[805]),
+            patch("kiro_crew.session_pid.sys") as mock_sys,
+            patch.object(Path, "read_bytes", return_value=_DAEMON_CMDLINE),
+            patch("os.getpid", return_value=1),
+            patch("kiro_crew.session_pid._linux_pid_age", return_value=900.0),
+            patch("kiro_crew.session_pid._env_has_kirocrew_marker", return_value=True),
+            patch("kiro_crew.session_pid._env_value", return_value=b"kc-99999999"),
+            patch(
+                "kiro_crew.session_pid._browser_session_owner_alive",
+                return_value=False,
+            ),
+        ):
+            mock_sys.platform = "linux"
+            assert find_orphan_mcp_candidates(active_pids=set()) == []
+
+
+class TestBrowserSessionOwnerAlive:
+    """The ownership probe reads only exec-time environ, never on-disk state."""
+
+    def test_live_peer_holding_the_session_reads_as_alive(self) -> None:
+        from kiro_crew import session_pid as sp
+
+        with (
+            patch.object(sp, "sys") as mock_sys,
+            patch.object(Path, "iterdir", return_value=[Path("/proc/900"), Path("/proc/901")]),
+            patch.object(Path, "stat", return_value=Mock(st_uid=os.getuid())),
+            patch.object(sp, "_linux_pid_sid", return_value=1),
+            patch.object(sp, "_env_value", return_value=b"kc-1a2b3c4d"),
+        ):
+            mock_sys.platform = "linux"
+            assert sp._browser_session_owner_alive(900, b"kc-1a2b3c4d") is True
+
+    def test_only_the_daemons_own_tree_reads_as_dead(self) -> None:
+        """Chromium children share the daemon's SID and are not owners."""
+        from kiro_crew import session_pid as sp
+
+        with (
+            patch.object(sp, "sys") as mock_sys,
+            patch.object(Path, "iterdir", return_value=[Path("/proc/900"), Path("/proc/901")]),
+            patch.object(Path, "stat", return_value=Mock(st_uid=os.getuid())),
+            patch.object(sp, "_linux_pid_sid", return_value=900),
+            patch.object(sp, "_env_value", return_value=b"kc-1a2b3c4d"),
+        ):
+            mock_sys.platform = "linux"
+            assert sp._browser_session_owner_alive(900, b"kc-1a2b3c4d") is False
+
+    def test_unreadable_peer_fails_closed_to_alive(self) -> None:
+        from kiro_crew import session_pid as sp
+
+        def _boom(pid: int, key: str) -> bytes | None:
+            raise PermissionError("inconclusive")
+
+        with (
+            patch.object(sp, "sys") as mock_sys,
+            patch.object(Path, "iterdir", return_value=[Path("/proc/901")]),
+            patch.object(Path, "stat", return_value=Mock(st_uid=os.getuid())),
+            patch.object(sp, "_linux_pid_sid", return_value=1),
+            patch.object(sp, "_env_value", side_effect=_boom),
+        ):
+            mock_sys.platform = "linux"
+            assert sp._browser_session_owner_alive(900, b"kc-1a2b3c4d") is True
+
+    def test_non_linux_fails_closed_to_alive(self) -> None:
+        from kiro_crew import session_pid as sp
+
+        with patch.object(sp, "sys") as mock_sys:
+            mock_sys.platform = "darwin"
+            assert sp._browser_session_owner_alive(900, b"kc-1a2b3c4d") is True
+
+
+class TestAcquiringAPidLockDoesNotTruncateTheLockFile:
+    """A lock file must be opened WRITABLE but never TRUNCATING.
+
+    ``msvcrt.locking`` needs a writable handle, so the fd cannot be opened
+    ``"r"``. But ``"w"`` truncates at open, and on Windows a truncating open of a
+    lock file whose first byte another holder already locked raises a sharing
+    violation instead of waiting — so the contending acquirer crashes with a bare
+    ``OSError`` *before* it reaches ``file_lock``, and the serialisation the lock
+    exists to provide never happens. POSIX ``flock`` tolerates the truncate, which
+    is why the defect is invisible on Linux and reddened only the Windows shards.
+
+    Issue #9248; same defect and same fix as ``work_ledger._open_lock`` (PR #9237)
+    and ``dashboard/handlers/mcp.py``'s ``_McpFileLock``, which was already
+    written this way.
+
+    Truncation is the direct, PLATFORM-INDEPENDENT observable, and that is what
+    these assert: seed the lock file with bytes, take and release the lock, and
+    require the bytes to have survived. Under the old ``open(lock_path, "w")``
+    every one of these fails on every platform, so the guard does not depend on
+    running the suite on Windows to have teeth.
+    """
+
+    SEED = b"lock-file-content-that-must-survive"
+
+    def test_session_pid_file_lock_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        from kiro_crew.session_pid import _session_pid_file_lock, _session_pid_file_path
+
+        lock_path = _session_pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _session_pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_pid_file_lock_preserves_the_lock_file(self, pid_file: Path) -> None:
+        from kiro_crew.session_pid import _pid_file_lock, _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        with _pid_file_lock():
+            pass
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_periodic_sweep_preserves_the_lock_file(self, session_pid_file: Path) -> None:
+        """The sweep is the site most likely to feel this in production.
+
+        It runs on a timer while ``_track_session_pid`` contends for the same
+        lock, which is exactly the interleaving a truncating open turns into a
+        crash rather than a wait.
+        """
+        from kiro_crew.session_pid import _periodic_pid_sweep, _session_pid_file_path
+
+        path = _session_pid_file_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # The sweep returns early unless the pid file exists, so it must exist
+        # for the lock to be reached at all.
+        path.write_text(f"{os.getpid()}:999999\n", encoding="utf-8")
+        lock_path = path.with_suffix(".lock")
+        lock_path.write_bytes(self.SEED)
+
+        _periodic_pid_sweep(os.getpid(), set())
+
+        assert lock_path.read_bytes() == self.SEED
+
+    def test_the_lock_is_still_actually_acquired(self, pid_file: Path) -> None:
+        """Guard the guard: a non-truncating open that never locks would pass above.
+
+        ``file_lock`` is asked for the lock through the same helper the production
+        path uses, so this fails if the fd stopped being writable — the failure
+        mode a naive ``"r"`` fix would introduce, and the reason ``"r+"`` rather
+        than ``"r"`` is the answer.
+        """
+        from kiro_crew.session_pid import _pid_file_path
+
+        lock_path = _pid_file_path().with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_bytes(self.SEED)
+
+        lock_path.touch(exist_ok=True)
+        with open(lock_path, "r+") as fd:
+            with platform_compat.file_lock(fd.fileno(), exclusive=True):
+                pass
+        assert lock_path.read_bytes() == self.SEED
