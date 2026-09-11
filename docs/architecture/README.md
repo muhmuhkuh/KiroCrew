@@ -13,6 +13,7 @@ they explain structure and rationale and link out to
 | [followup-suggestions-trust-model.md](followup-suggestions-trust-model.md) | The gates behind the follow-up card: argument validation, the branch-name filter, and the sandboxed `git` invocation. |
 | [security-deep-dive.md](security-deep-dive.md) | The security model as a whole: threat model, trust boundaries, and how the layers compose. |
 | [resource-protection.md](resource-protection.md) | Process limits, sandbox resource controls, and rate limiting. |
+| [adr-autonomous-goal-owner.md](adr-autonomous-goal-owner.md) | Goal / Project Owner architecture decision and boundaries between app lifecycle and existing execution primitives. |
 
 `design-notes/` holds narrow design records that have no owning module spec: see
 [its index](design-notes/README.md).
