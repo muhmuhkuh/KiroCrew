@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from kiro_crew import pi_support
 from kiro_crew.pi_support import _PiModeCompletion, resolve_pi_mode_resources
 
 
-def test_mode_resources_require_both_packages(tmp_path, monkeypatch):
+def test_mode_resources_use_bundled_caveman_and_installed_ponytail(tmp_path, monkeypatch):
     monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
     with pytest.raises(RuntimeError, match="pi install npm:"):
         resolve_pi_mode_resources()
@@ -15,16 +18,27 @@ def test_mode_resources_require_both_packages(tmp_path, monkeypatch):
     ponytail = root / "@dietrichgebert" / "ponytail"
     files = (
         ponytail / "pi-extension" / "index.js",
-        root / "pi-caveman" / "extensions" / "caveman.ts",
+        Path(pi_support.__file__).resolve().parent / "config" / "pi-caveman.ts",
     )
-    for path in files:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
+    files[0].parent.mkdir(parents=True, exist_ok=True)
+    files[0].write_text("", encoding="utf-8")
     with pytest.raises(RuntimeError):
         resolve_pi_mode_resources()
     skills = ponytail / "skills"
     skills.mkdir()
     assert resolve_pi_mode_resources() == (*files, skills)
+    # An npm install/update cannot replace the chosen Caveman source.
+    npm_caveman = root / "pi-caveman" / "extensions" / "caveman.ts"
+    npm_caveman.parent.mkdir(parents=True)
+    npm_caveman.write_text("throw new Error('must not load npm copy')", encoding="utf-8")
+    assert resolve_pi_mode_resources() == (*files, skills)
+
+
+def test_missing_bundled_caveman_requires_crew_reinstall(tmp_path, monkeypatch):
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    monkeypatch.setattr(pi_support, "__file__", str(tmp_path / "pi_support.py"))
+    with pytest.raises(RuntimeError, match="Reinstall Kiro Crew"):
+        resolve_pi_mode_resources()
 
 
 @pytest.mark.parametrize(

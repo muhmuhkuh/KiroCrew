@@ -434,19 +434,21 @@ def resolve_pi_mcp_adapter() -> Path | None:
 
 
 def resolve_pi_mode_resources() -> tuple[Path, Path, Path]:
-    """Resolve only the two explicitly trusted native mode packages."""
+    """Resolve installed Ponytail and Crew's versioned native Caveman copy."""
     agent_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")))
     root = agent_dir.expanduser().absolute() / "npm" / "node_modules"
     ponytail = root / "@dietrichgebert" / "ponytail"
     resources = (
         ponytail / "pi-extension" / "index.js",
-        root / "pi-caveman" / "extensions" / "caveman.ts",
+        Path(__file__).resolve().parent / "config" / "pi-caveman.ts",
         ponytail / "skills",
     )
-    if not all(path.is_file() for path in resources[:2]) or not resources[2].is_dir():
+    if not resources[1].is_file():
+        raise RuntimeError("Bundled Caveman extension is missing. Reinstall Kiro Crew.")
+    if not resources[0].is_file() or not resources[2].is_dir():
         raise RuntimeError(
-            "Native Pi modes are required. Run `pi install npm:@dietrichgebert/ponytail` "
-            "and `pi install npm:pi-caveman`, then retry."
+            "Native Pi modes require Ponytail. "
+            "Run `pi install npm:@dietrichgebert/ponytail`, then retry."
         )
     return resources
 

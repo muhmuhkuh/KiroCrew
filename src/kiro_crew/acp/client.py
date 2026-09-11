@@ -341,7 +341,7 @@ def _is_safe_oauth_url(url: str) -> bool:
     if not url:
         return False
     lower = url.lower()
-    return lower.startswith("https://") or lower.startswith("http://")
+    return lower.startswith(("https://", "http://"))
 
 
 def _normalize_exe_casing(path: str | None) -> str | None:
@@ -1284,9 +1284,10 @@ def _mentions_skill_file(raw_params: dict | None, command: str | None) -> bool:
         if isinstance(value, str):
             if _SKILL_FILE_BASENAME in value:
                 return True
-        elif isinstance(value, (list, tuple)):
-            if any(isinstance(v, str) and _SKILL_FILE_BASENAME in v for v in value):
-                return True
+        elif isinstance(value, (list, tuple)) and any(
+            isinstance(v, str) and _SKILL_FILE_BASENAME in v for v in value
+        ):
+            return True
     return False
 
 
@@ -1647,9 +1648,12 @@ def compaction_failure_is_transient(params: dict) -> bool:
         if key == "httpStatusCode":
             # ``bool`` is an ``int`` subclass, so a stray True would otherwise
             # compare as 1 and read as a status code.
-            if isinstance(value, int) and not isinstance(value, bool):
-                if value == 429 or 500 <= value < 600:
-                    return True
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and (value == 429 or 500 <= value < 600)
+            ):
+                return True
             continue
         if not isinstance(value, str):
             continue
@@ -2989,35 +2993,26 @@ def _select_tool_title(
     *,
     is_shell: bool | None = None,
 ) -> str | None:
-    """Pick the pill label, preferring a human-readable `description` when present.
+    """Pick a safe pill label for one tool call.
 
-    Some backends' Bash tool emits a `description` field alongside `command`
-    (e.g. "List KiroCrew ACP module files" rather than `ls /workplace/...`).
-    We surface it on the pill when supplied, then the literal shell command for
-    a shell tool, and only then the SDK-provided `title`. Used by both
-    `_extract_tool_event` (initial tool_call) and
-    `_extract_tool_call_refinement` (the second-phase tool_call_update from
-    claude-agent-acp) so the title rule stays consistent across both events.
-
-    The command outranks `title` because backends disagree on what `title`
-    holds for a shell call: some send the invocation itself, others a generic
-    kind label ("Run Command") that names no command at all. A genuinely
-    human-readable label arrives as `description`, which still wins.
+    Shell backends may emit a human-readable `description` alongside
+    `command`. Use that description only after the provider has established
+    that this is a shell call. For non-shell tools, `description` is commonly
+    a real argument (for example Jira issue text), not a display label.
 
     `is_shell` overrides the kind-derived classification for a caller holding a
     RESOLVED signal — a tool_call_update may omit `kind` entirely, and reading
     that absence as non-shell would put the generic title back on a pill the
     initial tool_call had already labelled with its command.
     """
-    if isinstance(raw_input, dict):
+    kind_str = kind if isinstance(kind, str) else None
+    shell = _is_shell_kind(kind_str) if is_shell is None else is_shell
+    if shell and isinstance(raw_input, dict):
         desc = raw_input.get("description")
         if isinstance(desc, str) and desc.strip():
             return desc
-    kind_str = kind if isinstance(kind, str) else None
-    shell = _is_shell_kind(kind_str) if is_shell is None else is_shell
-    # Shell kinds only, so an fs tool's operation name ("strReplace") is never
-    # mistaken for a command.
-    if shell and isinstance(raw_input, dict):
+        # Shell kinds only, so an fs tool's operation name ("strReplace") is
+        # never mistaken for a command.
         cmd = raw_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
             return cmd
@@ -3173,6 +3168,7 @@ class AcpClient:
         self._sandbox_cleanup: str | None = None
         self._bound_workspace_fd: int | None = None
         self._spawn_work_dir = str(self._work_dir)
+        self._pi_mcp_config_path: Path | None = None
         self._pi_state_path: Path | None = None
         self._pi_effort_path: Path | None = None
         self._pi_startup_info = ""
@@ -4874,10 +4870,8 @@ class AcpClient:
         ``self._sandbox_cleanup``).
         """
         if self._sandbox_cleanup:
-            try:
+            with suppress(OSError):
                 os.remove(self._sandbox_cleanup)
-            except OSError:
-                pass
             self._sandbox_cleanup = None
 
     async def _discard_bound_workspace(self) -> None:
@@ -5517,10 +5511,8 @@ class AcpClient:
         # Close pipes first to unblock any pending reads/writes
         for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
             if pipe:
-                try:
+                with suppress(Exception):
                     pipe.close()  # type: ignore[union-attr]
-                except Exception:
-                    pass
 
         # Snapshot child PIDs before killing — children in different
         # process groups survive killpg (kiro-cli-chat acp leak).
@@ -5539,7 +5531,7 @@ class AcpClient:
             )
 
         if not force:
-            try:
+            with suppress(ProcessLookupError, OSError):
                 # POSIX: killpg(getpgid) tears down the whole group (setsid at
                 # spawn). Windows: taskkill /T /F walks the child tree instead
                 # (no process groups) — platform_compat dispatches both. Async
@@ -5547,8 +5539,6 @@ class AcpClient:
                 # subprocess_executor so the event loop keeps ticking while
                 # taskkill.exe runs.
                 await platform_compat.kill_process_tree_async(pid, platform_compat.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
             try:
                 await asyncio.wait_for(self._process.wait(), timeout=3.0)
                 # _kill_escaped_children -> _is_our_child -> _get_start_time/
@@ -5561,10 +5551,8 @@ class AcpClient:
         try:
             await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
         except (ProcessLookupError, OSError):
-            try:
+            with suppress(ProcessLookupError, OSError):
                 self._process.kill()
-            except (ProcessLookupError, OSError):
-                pass
         await _loop.run_in_executor(subprocess_executor(), _kill_escaped_children, merged)
         try:
             await asyncio.wait_for(self._process.wait(), timeout=1.0)
@@ -5743,10 +5731,8 @@ class AcpClient:
         if self._process:
             for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
                 if pipe:
-                    try:
+                    with suppress(Exception):
                         pipe.close()  # type: ignore[union-attr]
-                    except Exception:
-                        pass
         # Clean up sandbox temp files (macOS seatbelt profile)
         self._discard_sandbox_cleanup()
         pi_mcp_config_path = getattr(self, "_pi_mcp_config_path", None)
@@ -6388,9 +6374,8 @@ class AcpClient:
         self._last_activity = time.monotonic()
 
     async def _read_message(self, timeout: float = _READ_TIMEOUT) -> JsonRpcMessage | None:
-        if self._cancelled:
-            if time.monotonic() - self._cancel_ts > self._cancel_grace_secs:
-                raise AcpError("Cancel grace window exceeded; agent unresponsive")
+        if self._cancelled and time.monotonic() - self._cancel_ts > self._cancel_grace_secs:
+            raise AcpError("Cancel grace window exceeded; agent unresponsive")
 
         if self._buffer:
             return self._buffer.popleft()
@@ -6431,10 +6416,8 @@ class AcpClient:
             # EOF — process likely died or closing. Check and avoid busy-loop.
             if self._process and self._process.returncode is not None:
                 if self._stderr_task and not self._stderr_task.done():
-                    try:
+                    with suppress(Exception, asyncio.CancelledError):
                         await asyncio.wait_for(self._stderr_task, timeout=0.5)
-                    except (Exception, asyncio.CancelledError):
-                        pass
                 stderr_tail = "; ".join(self._stderr_lines) if self._stderr_lines else ""
                 if stderr_tail:
                     from kiro_crew.security import (
@@ -8981,10 +8964,8 @@ class AcpClient:
         if isinstance(metering, list):
             for entry in metering:
                 if isinstance(entry, dict) and entry.get("unit") == "credit":
-                    try:
+                    with suppress(TypeError, ValueError):
                         self.last_prompt_stats.credits += float(entry.get("value", 0) or 0)
-                    except (TypeError, ValueError):
-                        pass
 
     def _handle_compaction_status(self, msg: JsonRpcMessage) -> None:
         """Log a ``_kiro.dev/compaction/status`` notification and, on

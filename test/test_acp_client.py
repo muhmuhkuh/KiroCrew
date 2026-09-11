@@ -12244,7 +12244,10 @@ class TestCompactionFailureDetail:
         assert "failed" in detail
 
     def test_is_bounded_and_redacted(self):
-        from kiro_crew.acp.client import _COMPACTION_DETAIL_MAX_CHARS, compaction_failure_detail
+        from kiro_crew.acp.client import (
+            _COMPACTION_DETAIL_MAX_CHARS,
+            compaction_failure_detail,
+        )
 
         detail = compaction_failure_detail({"status": {"type": "failed", "error": "x" * 5000}})
         assert len(detail) == _COMPACTION_DETAIL_MAX_CHARS
@@ -12357,7 +12360,7 @@ class TestCompactionVerdictReachesTheConsumer:
         from kiro_crew.providers.acp import AcpProvider
 
         prov = AcpProvider.__new__(AcpProvider)
-        prov._client = SimpleNamespace(last_compaction_transient=True)
+        object.__setattr__(prov, "_client", SimpleNamespace(last_compaction_transient=True))
         assert prov.last_compaction_transient is True
 
     def test_the_session_provider_forwards_the_verdict_from_its_handle(self):
@@ -12366,7 +12369,7 @@ class TestCompactionVerdictReachesTheConsumer:
         from kiro_crew.acp.session_provider import AcpSessionProvider
 
         sess = AcpSessionProvider.__new__(AcpSessionProvider)
-        sess._handle = SimpleNamespace(last_compaction_transient=True)
+        object.__setattr__(sess, "_handle", SimpleNamespace(last_compaction_transient=True))
         assert sess.last_compaction_transient is True
 
     def test_a_client_without_the_fields_reads_as_permanent(self):
@@ -12377,7 +12380,7 @@ class TestCompactionVerdictReachesTheConsumer:
         from kiro_crew.providers.acp import AcpProvider
 
         prov = AcpProvider.__new__(AcpProvider)
-        prov._client = SimpleNamespace()
+        object.__setattr__(prov, "_client", SimpleNamespace())
         assert prov.last_compaction_transient is False
 
     def test_a_truthy_stand_in_is_not_a_verdict(self):
@@ -12390,7 +12393,7 @@ class TestCompactionVerdictReachesTheConsumer:
         from kiro_crew.providers.acp import AcpProvider
 
         prov = AcpProvider.__new__(AcpProvider)
-        prov._client = SimpleNamespace(last_compaction_transient=MagicMock())
+        object.__setattr__(prov, "_client", SimpleNamespace(last_compaction_transient=MagicMock()))
         assert prov.last_compaction_transient is False
 
 

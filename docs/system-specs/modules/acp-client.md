@@ -73,13 +73,38 @@ cancelled caller still lets the worker settle).
 
 ## Native Pi prompt modes
 
-The Pi launcher explicitly loads `@dietrichgebert/ponytail` and `pi-caveman`,
-plus Ponytail's packaged skills, alongside the mandatory approval gate and MCP
-adapter. Automatic extension, skill, template and context discovery remains off.
-Install the two packages with `pi install npm:@dietrichgebert/ponytail` and
-`pi install npm:pi-caveman`; missing resources fail Pi startup with those hints.
-Packages resolve under `PI_CODING_AGENT_DIR/npm/node_modules` (default
-`~/.pi/agent/npm/node_modules`). No package is downloaded during startup.
+The Pi launcher explicitly loads installed `@dietrichgebert/ponytail` and Crew's
+versioned Caveman copy (`src/kiro_crew/config/pi-caveman.ts`), plus Ponytail's
+packaged skills, alongside the mandatory approval gate and MCP adapter.
+Automatic extension, skill, template and context discovery remains off.
+Install Ponytail with `pi install npm:@dietrichgebert/ponytail`; it resolves under
+`PI_CODING_AGENT_DIR/npm/node_modules` (default `~/.pi/agent/npm/node_modules`).
+Caveman is bundled in Crew's wheel/sdist, derived from `pi-caveman` 1.0.8 with
+its MIT notice retained in the source. The npm Caveman copy is not loaded, so
+npm updates cannot overwrite Crew's prompt adjustments. Missing bundled Caveman
+requires repairing the Crew installation. No package is downloaded during startup.
+
+The local changes sharpen `full` (direct fragments, no redundant explanation or
+unnecessary code examples, no fixed line limit) and `ultra` (simple questions
+usually 1–3 short lines). Explicit detail requests, required output formats,
+complete code and safety/clarity take precedence. These remain model instructions,
+not output truncation or a guaranteed length limit. Native commands, config and
+session state remain compatible. Review upstream changes against this copy when
+upgrading; returning to npm resolution requires carrying the prompt adjustments
+upstream first. Existing Pi processes must restart to load the bundled copy;
+existing session entries can be resumed without clearing history.
+
+For `full` and `ultra`, a `context` hook also appends a transient style reminder
+immediately before each model call. It uses the same native mode state and prompt
+text. The hook only changes the context copy, never the stored conversation;
+`off` adds neither system instructions nor a reminder. This counters anchoring
+on verbose earlier assistant replies without leaving stale directives after a
+mode switch. Other levels retain system-prompt-only injection.
+
+Offline extension check (Pi installed, no model call):
+`pi -ne -ns -np -nc --no-tools --no-session -e test/pi_caveman_check.js -p /check-caveman`.
+The Python resolver/launcher checks live in `test/test_pi_native_modes.py` and
+`test/test_pi_backend.py`.
 
 Use `/ponytail lite|full|ultra|off` and `/caveman lite|full|ultra|off` in chat.
 The native extensions own prompt injection and mode persistence in Pi session
