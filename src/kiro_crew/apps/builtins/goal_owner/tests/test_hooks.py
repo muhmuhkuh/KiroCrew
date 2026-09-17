@@ -56,6 +56,19 @@ async def test_startup_is_idempotent_and_shutdown_clears_runtime(tmp_path: Path)
     assert hooks.get_runtime() is None
 
 
+async def test_startup_ignores_worker_gateway_injection(tmp_path: Path) -> None:
+    hooks._reset_for_tests()
+    ctx = _ctx(tmp_path, _Cron())
+    ctx.worker_gateway = object()
+
+    await hooks.on_startup(ctx)
+
+    runtime = hooks.get_runtime()
+    assert runtime is not None
+    assert not hasattr(runtime, "worker_gateway")
+    await hooks.on_shutdown(ctx)
+
+
 async def test_startup_reconciles_existing_running_goal(tmp_path: Path) -> None:
     hooks._reset_for_tests()
     cron = _Cron()

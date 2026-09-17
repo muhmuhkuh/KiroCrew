@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GoalRuntime:
-    """App-local runtime shared by lifecycle diagnostics and future cycles."""
+    """App-local runtime shared by lifecycle diagnostics and scheduling."""
 
     store: GoalStore
     scheduler: GoalScheduler | None = None

@@ -1,10 +1,10 @@
 ---
 title: Autonomous Goal / Project Owner — modular control plane
 status: accepted
-revision: v1
+revision: v2
 author: Kiro Crew
 created: 2026-09-10
-last-audited: 2026-09-10
+last-audited: 2026-09-17
 audited-at: 50d9a7713b204aa17d96668484b3540071107b37
 doc-pr:
 implementation-prs: []
@@ -17,8 +17,8 @@ superseded-by: []
 - **Decision:** build the first Goal / Project Owner as an opt-in first-party
   built-in app named `goal-owner` (provisional app id), not as a new core
   orchestrator or a new scheduler.
-- **Scope:** architecture and upstream-compatibility decision only. This ADR
-  introduces no runtime behavior.
+- **Scope:** architecture, upstream compatibility, and current runtime boundary.
+  This ADR adds no core runtime behavior.
 - **Primary rule:** the app owns goal lifecycle; existing ledgers own work
   truth; existing sessions, workers, acceptance checks, and scheduler own
   execution mechanics.
@@ -66,6 +66,21 @@ control plane. In-process hooks can use the existing gateway lifecycle and
 app-scoped SDKs. A separate backend process would not share gateway-side
 `JobSDK` runner registration or session ownership and would create a second
 recovery problem for no benefit.
+
+### Approved live-dispatch boundary
+
+The current slice keeps core unchanged and live worker dispatch blocked. The
+host exposes no generic app-owned API that returns durable worker-session keys.
+`SpawnSDK` identifiers and dashboard session-control routes are different
+identity domains and must not be substituted. Goal Owner therefore declares no
+session permission, accepts no worker gateway through lifecycle hooks, and
+performs no live session creation or delivery. Its app-local dispatch/recovery
+logic remains isolated and testable, but unreachable from routes, cron hooks,
+and `GoalRuntime`.
+
+A future activation requires a separate ADR decision for a generic host seam,
+app ownership, durable-key recovery, idempotent create/send, permissions, and
+integration tests. It must not add a `goal-owner` branch to core.
 
 The first owner agent reuses the semantics of `goal-ledger-conductor`: it
 reads the work ledger, dispatches explicit child agents, verifies `done`
@@ -117,7 +132,8 @@ flowchart LR
     H --> C
 ```
 
-The normal cycle is:
+The target cycle below describes later live execution. Current implementation
+stops before worker session creation and reports the missing gateway fail-closed.
 
 1. The app route validates goal input, creates a `GoalRecord`, and creates one
    app-owned recurring cron job with `CronSDK.add_job_if_absent_async`.
@@ -209,7 +225,7 @@ failing integration test and must not encode `goal-owner` names in core.
 | Lifecycle | Existing `on_app_enable`, `on_gateway_startup`, `on_app_disable` | 0 |
 | Persistence | App `AppStorage`; existing atomic writes and app-owned data dir | 0 |
 | Scheduling | Existing `CronSDK` with app ownership and add-if-absent | 0 |
-| Worker execution | Existing conductor/worker agents and session-control gates | 0 |
+| Worker execution | Deferred; no live worker-session gateway in this slice | 0 |
 | Work truth | Existing `work_ledger` and `accept_eval.py` | 0 |
 | Owner recovery | Existing persistent cron session plus `session_ledger` | 0 |
 | UI | Manifest page and `@kirocrew/app-sdk` hooks, optional | 0 |

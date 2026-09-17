@@ -28,6 +28,7 @@ def test_manifest_validates_and_is_discovered() -> None:
 def test_app_is_opt_in_and_declares_own_surface() -> None:
     raw = _raw()
     assert raw["defaultEnabled"] is False
+    assert set(raw["permissions"]) == {"api", "storage", "cron"}
     assert raw["permissions"]["api"] == [
         "/api/apps/goal-owner",
         "/api/apps/goal-owner/*",

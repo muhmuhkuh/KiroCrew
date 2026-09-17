@@ -38,6 +38,13 @@ MAX_EVIDENCE_ITEMS = 128
 MAX_REFERENCE_CHARS = 500
 MAX_AGENT_CHARS = 128
 MAX_ID_CHARS = 128
+MAX_DISPATCH_REQUEST_CHARS = 512
+MAX_DISPATCH_RESERVATIONS = 64
+
+DISPATCH_RESERVED = "reserved"
+DISPATCH_BOUND = "bound"
+DISPATCH_SEEDED = "seeded"
+VALID_DISPATCH_STATES = frozenset({DISPATCH_RESERVED, DISPATCH_BOUND, DISPATCH_SEEDED})
 
 DEFAULT_MAX_CYCLES = 24
 DEFAULT_MAX_WORKER_DISPATCHES = 64
@@ -388,6 +395,46 @@ class OwnerSession:
 
 
 @dataclass
+class DispatchReservation:
+    """Durable idempotency record for one owner-to-worker dispatch."""
+
+    item_id: str = ""
+    request_id: str = ""
+    state: str = DISPATCH_RESERVED
+    session_key: str = ""
+    reserved_at: str = ""
+
+    def __post_init__(self) -> None:
+        self.item_id = _text(self.item_id, MAX_TASK_REF_CHARS).strip()
+        self.request_id = _text(self.request_id, MAX_DISPATCH_REQUEST_CHARS).strip()
+        self.state = _text(self.state, 32, DISPATCH_RESERVED).strip().lower()
+        if self.state not in VALID_DISPATCH_STATES:
+            self.state = DISPATCH_RESERVED
+        self.session_key = _text(self.session_key, MAX_AGENT_CHARS).strip()
+        self.reserved_at = _text(self.reserved_at, 64)
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "item_id": self.item_id,
+            "request_id": self.request_id,
+            "state": self.state,
+            "session_key": self.session_key,
+            "reserved_at": self.reserved_at,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> DispatchReservation:
+        data = _mapping(raw)
+        return cls(
+            item_id=_text(data.get("item_id"), MAX_TASK_REF_CHARS),
+            request_id=_text(data.get("request_id"), MAX_DISPATCH_REQUEST_CHARS),
+            state=_text(data.get("state"), 32, DISPATCH_RESERVED),
+            session_key=_text(data.get("session_key"), MAX_AGENT_CHARS),
+            reserved_at=_text(data.get("reserved_at"), 64),
+        )
+
+
+@dataclass
 class DecisionRecord:
     """Structured owner decision, kept as bounded history."""
 
@@ -704,6 +751,7 @@ class GoalRecord:
     budgets: GoalBudgets = field(default_factory=GoalBudgets)
     timestamps: GoalTimestamps = field(default_factory=GoalTimestamps)
     owner_session: OwnerSession = field(default_factory=OwnerSession)
+    dispatch_reservations: list[DispatchReservation] = field(default_factory=list)
     decisions: list[DecisionRecord] = field(default_factory=list)
     replan_reasons: list[ReplanRecord] = field(default_factory=list)
     blockers: list[BlockerRecord] = field(default_factory=list)
@@ -736,6 +784,11 @@ class GoalRecord:
             self.timestamps = GoalTimestamps.from_dict(self.timestamps)
         if not isinstance(self.owner_session, OwnerSession):
             self.owner_session = OwnerSession.from_dict(self.owner_session)
+        self.dispatch_reservations = [
+            item if isinstance(item, DispatchReservation) else DispatchReservation.from_dict(item)
+            for item in self.dispatch_reservations[:MAX_DISPATCH_RESERVATIONS]
+            if isinstance(item, (DispatchReservation, Mapping))
+        ]
         self.decisions = [
             item if isinstance(item, DecisionRecord) else DecisionRecord.from_dict(item)
             for item in self.decisions[:MAX_HISTORY_ITEMS]
@@ -832,6 +885,14 @@ class GoalRecord:
             budgets=GoalBudgets.from_dict(data.get("budgets")),
             timestamps=GoalTimestamps.from_dict(data.get("timestamps")),
             owner_session=OwnerSession.from_dict(data.get("owner_session")),
+            dispatch_reservations=(
+                [
+                    DispatchReservation.from_dict(item)
+                    for item in data.get("dispatch_reservations", [])
+                ]
+                if isinstance(data.get("dispatch_reservations"), list)
+                else []
+            ),
             decisions=(
                 [DecisionRecord.from_dict(item) for item in data.get("decisions", [])]
                 if isinstance(data.get("decisions"), list)
@@ -897,6 +958,16 @@ class GoalRecord:
             errors.append("task_refs must be unique")
         if any(not _TASK_REF_RE.fullmatch(ref) for ref in self.task_refs):
             errors.append("task_refs contain an unsafe identifier")
+        reservation_ids = [item.item_id for item in self.dispatch_reservations]
+        if len(set(reservation_ids)) != len(reservation_ids):
+            errors.append("dispatch_reservations must be unique by item_id")
+        for reservation in self.dispatch_reservations:
+            if not _TASK_REF_RE.fullmatch(reservation.item_id):
+                errors.append("dispatch reservation has unsafe item_id")
+            if not reservation.request_id:
+                errors.append("dispatch reservation needs request_id")
+            if reservation.state not in VALID_DISPATCH_STATES:
+                errors.append("dispatch reservation has invalid state")
         if self.status is GoalStatus.BLOCKED and not self.blocker_fingerprint:
             errors.append("blocked goal requires blocker_fingerprint")
         if self.status is GoalStatus.COMPLETED and not self.has_valid_completion_evidence:
@@ -1113,6 +1184,9 @@ class GoalRecord:
             "budgets": self.budgets.to_dict(),
             "timestamps": self.timestamps.to_dict(),
             "owner_session": self.owner_session.to_dict(),
+            "dispatch_reservations": [
+                item.to_dict() for item in self.dispatch_reservations[-MAX_DISPATCH_RESERVATIONS:]
+            ],
             "decisions": [item.to_dict() for item in self.decisions[-MAX_HISTORY_ITEMS:]],
             "replan_reasons": [item.to_dict() for item in self.replan_reasons[-MAX_HISTORY_ITEMS:]],
             "blockers": [item.to_dict() for item in self.blockers[-MAX_HISTORY_ITEMS:]],
@@ -1134,9 +1208,13 @@ __all__ = [
     "COMPLETION_FAIL",
     "COMPLETION_PASS",
     "COMPLETION_UNKNOWN",
+    "DISPATCH_BOUND",
+    "DISPATCH_RESERVED",
+    "DISPATCH_SEEDED",
     "CompletionCheck",
     "CompletionEvidence",
     "DecisionRecord",
+    "DispatchReservation",
     "GoalAssessment",
     "GoalBudgets",
     "GoalCounters",
