@@ -198,6 +198,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.useFakeTimers({ shouldAdvanceTime: true })
   sessionStorage.clear()
+  localStorage.clear()
   listApps.mockResolvedValue([BUILTIN_OFF, SECRETARY])
   listRegistry.mockResolvedValue({ apps: [...REGISTRY_APPS, builtinServerRow('pets', 'Pets')] })
   listRegistries.mockResolvedValue({
@@ -431,20 +432,37 @@ describe('AppsPage — Library actions', () => {
     expect(screen.queryByText(/re-enable it from the Discover/)).toBeNull()
   })
 
-  it('lists a builtin that is already disabled, with Enable in its overflow menu', async () => {
-    // The reachability property itself: a disabled builtin is in Library at
-    // all. Its Enable verb lives in the tile's overflow menu (the launchpad
-    // grid caps direct actions at two peers).
+  it('a disabled builtin is reachable via the show-all view, with Enable in its overflow menu', async () => {
+    // The reachability property: a disabled builtin can be reached and enabled
+    // from Library. It lives behind the show-all view now, so the seed is what
+    // makes the row render; its Enable verb is in the tile's overflow menu (the
+    // launchpad grid caps direct actions at two peers).
+    localStorage.setItem('mc-apps-library-show-all', '1')
     listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: false }])
     renderLibrary()
     await openTileMenu('Pets')
     expect(await screen.findByRole('menuitem', { name: 'Enable' })).toBeInTheDocument()
   })
 
+  it('the default view hides a disabled builtin behind the labelled reveal control', async () => {
+    // The new default: a disabled builtin does NOT fill the fresh-visit list. No
+    // seed, so this asserts the shipped default. The row is filtered, not gone —
+    // the "Show 1 disabled" control names the hidden count so it stays reachable
+    // (the reachability a hard hide would break).
+    listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: false }])
+    renderLibrary()
+    expect(await screen.findByRole('button', { name: 'Show 1 disabled app' })).toBeInTheDocument()
+    expect(screen.queryByTestId('launchpad-tile-pets')).toBeNull()
+    // Clicking the control reveals the row: reachable, just not the default.
+    fireEvent.click(screen.getByRole('button', { name: 'Show 1 disabled app' }))
+    expect(await screen.findByTestId('launchpad-tile-pets')).toBeInTheDocument()
+  })
+
   it('orders enabled rows above disabled ones', async () => {
-    // Listing disabled builtins adds ~20 rows on a fresh install and Library has
-    // only a search box, so ordering is what keeps the apps in use on top. The
+    // Subject is the ordering of BOTH groups, which only the show-all view
+    // renders — the seed is what puts the disabled group on screen to order. The
     // gateway returns them disabled-first here, so a pass-through would fail.
+    localStorage.setItem('mc-apps-library-show-all', '1')
     listApps.mockResolvedValue([
       { ...BUILTIN_OFF, name: 'zeta-off', displayName: 'Zeta Off', enabled: false },
       { ...BUILTIN_OFF, name: 'alpha-on', displayName: 'Alpha On', enabled: true },
@@ -469,7 +487,7 @@ describe('AppsPage — Library actions', () => {
     // Discover's Updates sub-tab, whose page owns the error notice surface.
     renderUpdates()
     fireEvent.click(await screen.findByRole('button', { name: 'Update All' }))
-    expect(await screen.findByText('Failed to update: secretary')).toBeInTheDocument()
+    expect(await screen.findByText('Failed to update: Secretary')).toBeInTheDocument()
   })
 
   it('reports success after Update All and shows no error', async () => {
@@ -609,6 +627,41 @@ describe('AppsPage — uninstall dialog', () => {
     fireEvent.click(second)
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm uninstall' })).toBeNull())
     expect(uninstallApp).not.toHaveBeenCalled()
+  })
+
+  it('fetches the preview over the real client URL and renders the panel from it', async () => {
+    // Every other test here stubs `uninstallPreview` at the module boundary,
+    // which is exactly how the never-registered route (#10880) stayed
+    // invisible to this suite. This one routes through the REAL
+    // `api.uninstallPreview` and stubs only `fetch`, so it exercises the URL
+    // in `client.ts` and the `j()` non-OK throw: if the client ever fetches a
+    // path the backend does not register, the 404 body below turns into a
+    // rejection and the panel assertion fails.
+    const actual = await vi.importActual<typeof import('../api/client')>('../api/client')
+    const fetchSpy = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) !== '/api/apps/secretary/uninstall/preview') {
+        return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
+      }
+      return new Response(JSON.stringify({
+        app: 'secretary',
+        resources: { agents: [], skills: [], crons: [] },
+        dependencies: {
+          removable: [{ id: 'skills/mochi-slack', type: 'skill', reason: 'installed with this app' }],
+          shared: [],
+          userInstalled: [],
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    })
+    vi.stubGlobal('fetch', fetchSpy)
+    try {
+      uninstallPreview.mockImplementation((...a: unknown[]) => actual.api.uninstallPreview(a[0] as string))
+      const dialog = await openDialog()
+      expect(fetchSpy).toHaveBeenCalledWith('/api/apps/secretary/uninstall/preview')
+      expect(await within(dialog).findByText('Dependencies:')).toBeInTheDocument()
+      expect(within(dialog).getByText('installed with this app')).toBeInTheDocument()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })
 
@@ -756,6 +809,9 @@ describe('AppsPage — Library enable and update', () => {
   })
 
   it('enables a switched-off installed app from the Library', async () => {
+    // Subject is the enable action on a disabled app; the row lives behind the
+    // show-all view now, so the seed is what renders it to act on.
+    localStorage.setItem('mc-apps-library-show-all', '1')
     listApps.mockResolvedValue([{ ...SECRETARY, enabled: false }])
     renderLibrary()
     await openTileMenu('Secretary')
@@ -766,6 +822,9 @@ describe('AppsPage — Library enable and update', () => {
   it('opens consent from the Library using the installed record when the catalog has no row', async () => {
     // origin `local` and absent from the registry, so `trustTarget` has to fall
     // back to the installed record for the name shown in the consent dialog.
+    // The app is disabled, so the seed renders it behind the show-all view for
+    // the Enable click that triggers consent.
+    localStorage.setItem('mc-apps-library-show-all', '1')
     listApps.mockResolvedValue([{
       ...SECRETARY, name: 'localapp', displayName: 'Local App', enabled: false, origin: 'local',
     }])

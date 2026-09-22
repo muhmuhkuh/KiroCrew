@@ -4,6 +4,7 @@ import { api, ApiError } from '../api/client'
 import { store, useAppDispatch } from '../store'
 import { deleteSlot, switchSlot } from '../store/chatSlice'
 import { updateSlotPin, updateSlot, markSlotRead, markSlotUnread } from '../store/dashboardSlice'
+import { emitSlotRead } from '../lib/slotReadRelay'
 import { copySessionLink } from '../utils/shareUrl'
 import { useMoveSlotToFolder } from './useMoveSlotToFolder'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
@@ -192,7 +193,13 @@ export function useSessionActions(mode?: string): SessionActions {
         const current = store.getState().dashboard.slots.find(slot => slot.key === key)?.pinned ?? false
         if (current !== pinned) dispatch(updateSlotPin({ key, pinned }))
       }
-      queryClient.invalidateQueries({ queryKey: ['chat-slots'] })
+      // No server re-read is attempted here, on purpose: this branch IS the
+      // failed re-read, and the authoritative pinned state arrives without one.
+      // Every accepted `PATCH /api/chat/slots/{slot}/pin` ends in
+      // `push_slots_update()`, and a websocket reconnect refetches the whole
+      // list. The `invalidateQueries({ queryKey: ['chat-slots'] })` this branch
+      // used to end with was never that retry -- no query is registered on that
+      // key, so it refreshed nothing (#10204).
     }
   }, [dispatch, queryClient])
 
@@ -291,6 +298,14 @@ export function useSessionActions(mode?: string): SessionActions {
   const toggleRead = useCallback((slotKey: string) => {
     const isUnread = store.getState().dashboard.unreadSlots.includes(slotKey)
     dispatch(isUnread ? markSlotRead(slotKey) : markSlotUnread(slotKey))
+    // Read direction relays to other windows (a deliberate "I've seen this"),
+    // watermarked at the slot's newest known message ts. The unread direction
+    // stays window-local — markSlotUnread's string form records the manual
+    // sentinel, so no other window's relayed read can clear the reminder.
+    if (isUnread) {
+      const slotTs = store.getState().dashboard.slots.find(s => s.key === slotKey)?.last_ts
+      emitSlotRead(slotKey, slotTs)
+    }
   }, [dispatch])
 
   const togglePin = useCallback((slotKey: string) => {

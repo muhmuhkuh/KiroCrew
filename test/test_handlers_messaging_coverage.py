@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,7 +34,7 @@ from kiro_crew.subagent import AGENT_NOT_FOUND_CODE
 
 
 class _Req:
-    """Request double: ``app["state"]``, ``json()``, ``match_info``, ``query``."""
+    """Request double: state, JSON body, route/query fields and headers."""
 
     def __init__(
         self,
@@ -49,6 +50,7 @@ class _Req:
         self._body = body
         self.match_info = match_info or {}
         self.query = query or {}
+        self.headers: dict[str, str] = {}
         self.remote = remote
         self._extra = {"app": "", **(extra or {})}
 
@@ -113,6 +115,10 @@ def _info(**kw: Any) -> Any:
         "last_tool": "fs_read",
         "parent_session_key": "dashboard:chat-1",
         "agent": "kirocrew",
+        # The retry path reuses this alongside the context triple: a retry must
+        # not widen a delegated run to the global store.
+        "memory_store": "",
+        "crew": "",
         "user_stopped": False,
         "outcome": "",
         "max_turns": 0,
@@ -121,6 +127,7 @@ def _info(**kw: Any) -> Any:
         "reasoning_effort": "",
         "approval_mode": "",
         "silent": False,
+        "delegation": {},
         "_raw_task": "",
         "include_memory": True,
         "include_lessons": True,
@@ -236,6 +243,7 @@ class TestApiSpawn:
             "task": "build it",
             "status": "spawned",
             "conversation": "a9",
+            "parent_work_supported": False,
         }
         kwargs = mgr.spawn.call_args.kwargs
         assert kwargs["silent"] is True
@@ -248,6 +256,82 @@ class TestApiSpawn:
         req = _Req(_state(subagents=mgr), {"task": "x", "batch_total": "many"})
         assert _run(mod.api_spawn, req).status == 200
         assert mgr.spawn.call_args.kwargs["batch_total"] == 0
+
+    @pytest.mark.parametrize("source", ["crew", "subagent"])
+    @pytest.mark.parametrize("unavailable", [False, True])
+    def test_execution_record_lookup_runs_off_loop_before_spawn(
+        self, monkeypatch, source: str, unavailable: bool
+    ) -> None:
+        from kiro_crew.execution_context import read_session_execution
+        from kiro_crew.memory_stores import UnknownMemoryStore, provision_member_memory
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        cfg = loader.KiroCrewConfig.load()
+        cfg.agents["worker"] = loader.KiroCrewAgentConfig(kiro_agent="kirocrew", triggers="work")
+        store = provision_member_memory(cfg, "worker")
+        cfg.save()
+        mgr = _mgr()
+        mgr.spawn.return_value = _info()
+        state = _state(subagents=mgr, conversation_log=None, sessions=SimpleNamespace(_pool_cwd=""))
+        body = {"task": "read the assigned memory"}
+        loop_thread = threading.get_ident()
+        lookup_threads = []
+
+        if source == "crew":
+            body["crew"] = "worker"
+
+            def load_config():
+                lookup_threads.append(threading.get_ident())
+                if unavailable:
+                    raise UnknownMemoryStore("member memory cannot be read")
+                return cfg
+
+            monkeypatch.setattr(loader.KiroCrewConfig, "load", load_config)
+        else:
+            run_id = "offloop-parent"
+            create_agent_folder(run_id, memory_store=store)
+            body["parent_session"] = f"subagent:{run_id}"
+
+            def inherited(session_key):
+                lookup_threads.append(threading.get_ident())
+                assert session_key == f"subagent:{run_id}"
+                if unavailable:
+                    raise UnknownMemoryStore("member memory cannot be read")
+                return read_session_execution(session_key)
+
+            monkeypatch.setattr("kiro_crew.execution_context.read_session_execution", inherited)
+
+        response = _run(mod.api_spawn, _Req(state, body))
+
+        # A parent's privacy admission reads its execution before spawn derives
+        # the child's identity. An unreadable parent stops at that first gate.
+        expected_lookups = 2 if source == "subagent" and not unavailable else 1
+        assert len(lookup_threads) == expected_lookups
+        assert all(thread != loop_thread for thread in lookup_threads)
+        if unavailable:
+            assert response.status == 409
+            if source == "subagent":
+                assert _payload(response) == {
+                    "code": "memory_unavailable",
+                    "error": "The originating session's memory mode is unavailable.",
+                }
+            else:
+                assert _payload(response) == {
+                    "code": "member_identity_unavailable",
+                    "error": "member memory cannot be read",
+                }
+            mgr.spawn.assert_not_called()
+        else:
+            assert response.status == 200
+            mgr.spawn.assert_called_once()
+            assert mgr.spawn.call_args.kwargs["memory_store"] == store
+            assert (
+                mgr.spawn.call_args.kwargs["_execution_context"]["member_id"]
+                == cfg.agents["worker"].member_id
+            )
+            assert mgr.spawn.call_args.kwargs["parent_session_key"] == body.get(
+                "parent_session", ""
+            )
 
 
 # ── api_spawn_continue ──
@@ -652,6 +736,13 @@ class TestApiSpawnList:
 
 class TestApiSpawnRetry:
     def _req(self, mgr: Any, agent_id: str = "a1") -> _Req:
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        old = mgr.get.return_value
+        if isinstance(old, SimpleNamespace):
+            old.execution_context = ExecutionContext(
+                None, MemoryStoreRef("default"), "template", "kirocrew"
+            )
         return _Req(_state(subagents=mgr), None, match_info={"agent_id": agent_id})
 
     def test_503_without_manager(self) -> None:
@@ -723,6 +814,7 @@ class TestApiSpawnRetry:
             _raw_task="t",
             include_memory=False,
             include_project=False,
+            crew="coding",
         )
         mgr.spawn.return_value = _info(id="new")
         _run(mod.api_spawn_retry, self._req(mgr))
@@ -730,6 +822,7 @@ class TestApiSpawnRetry:
         assert kwargs["include_memory"] is False
         assert kwargs["include_lessons"] is True
         assert kwargs["include_project"] is False
+        assert kwargs["crew"] == "coding"
 
 
 class TestApiSpawnDelete:
@@ -774,18 +867,6 @@ class TestApiSpawnDelete:
         req = _Req(_state(subagents=mgr), None, match_info={"agent_id": "a1"})
         assert _payload(_run(mod.api_spawn_delete, req))["cancelled"] is False
         assert mgr._agents == {} and mgr._tasks == {}
-
-
-class TestApiSpawnClear:
-    def test_ok_without_manager(self) -> None:
-        assert _payload(_run(mod.api_spawn_clear, _Req(_state()))) == {"ok": True}
-
-    def test_clears_only_finished_agents(self) -> None:
-        mgr = _mgr(all_agents=[_info(id="run", done=False), _info(id="fin", done=True)])
-        mgr._agents = {"run": _info(), "fin": _info()}
-        resp = _run(mod.api_spawn_clear, _Req(_state(subagents=mgr)))
-        assert _payload(resp) == {"ok": True, "cleared": 1}
-        assert list(mgr._agents) == ["run"]
 
 
 class TestApiSpawnStopAll:
@@ -1901,7 +1982,6 @@ def test_module_exposes_every_route_handler_under_test() -> None:
         "api_spawn_list",
         "api_spawn_retry",
         "api_spawn_delete",
-        "api_spawn_clear",
         "api_notification_channels",
         "api_notification_channel_settings",
         "api_slack_pins",
@@ -1911,6 +1991,7 @@ def test_module_exposes_every_route_handler_under_test() -> None:
         "api_browser_install_start",
         "api_browser_view_get",
         "api_browser_view_start",
+        "api_browser_open",
         "api_teams_config_save",
     ):
         assert callable(getattr(mod, name)), name

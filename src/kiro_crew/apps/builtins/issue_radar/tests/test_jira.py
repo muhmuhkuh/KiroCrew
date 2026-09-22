@@ -173,7 +173,7 @@ class JiraOAuthRequestTests(unittest.TestCase):
         )
         with (
             mock.patch.dict(
-                "os.environ", {"JIRA_EMAIL": "a@b.c", "JIRA_API_TOKEN": "tok"}, clear=True
+                "os.environ", {"JIRA_EMAIL": "a@b.c", "JIRA_API_TOKEN": "tok"}, clear=False
             ),
             mock.patch.object(jira.urllib.request, "urlopen", side_effect=error),
             self.assertRaises(ProviderCliError) as raised,
@@ -190,7 +190,7 @@ class JiraOAuthRequestTests(unittest.TestCase):
         response.read.return_value = b'{"issues": [], "isLast": true}'
         with (
             mock.patch.dict(
-                "os.environ", {"JIRA_EMAIL": "a@b.c", "JIRA_API_TOKEN": "tok"}, clear=True
+                "os.environ", {"JIRA_EMAIL": "a@b.c", "JIRA_API_TOKEN": "tok"}, clear=False
             ),
             mock.patch.object(jira.urllib.request, "urlopen", return_value=response) as opened,
         ):
@@ -264,7 +264,7 @@ class JiraOAuthTests(unittest.TestCase):
     def test_complete_stores_secret_free_status_and_uses_resource_cloud_id(self):
         token_path = self.root / "jira_oauth_tokens.json"
         with (
-            mock.patch.dict("os.environ", self._env(), clear=True),
+            mock.patch.dict("os.environ", self._env(), clear=False),
             mock.patch.object(jira_oauth, "_token_path", return_value=token_path),
             mock.patch.object(jira_oauth, "_audit"),
             mock.patch.object(

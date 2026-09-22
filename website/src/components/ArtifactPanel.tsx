@@ -12,13 +12,16 @@ import { ArtifactBodyNative, ArtifactBodyIframe, ArtifactBodyImage } from './Art
 import { useFileArtifactComments } from './FileArtifactComments'
 import { formatArtifactCommentsMessage } from './CommentOverlay'
 import { copyToClipboard } from '../utils/clipboard'
+import { safeSetItem } from '../utils/safeStorage'
 import { offlineProps } from '../utils/offline'
 import { api } from '../api/client'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useArtifactLiveReload } from '../hooks/useArtifactLiveReload'
 import type { Artifact } from '../types'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { isEditableTarget } from '../utils/editableTarget'
 interface Props {
   slug: string
   /** Kind captured at open time; the live query overrides it once loaded. */
@@ -34,8 +37,11 @@ interface Props {
   active?: boolean
   /** Mirror of the local-file submit path: sends a formatted USER message to
    *  the chat session the panel was opened from (panel.slot). When omitted the
-   *  submit-to-chat affordance is hidden (read-only embedding). */
-  onSubmitComments?: (message: string) => void
+   *  submit-to-chat affordance is hidden (read-only embedding). The return is
+   *  an optional delivery verdict: an explicit `false` (or a promise of one)
+   *  means the message was NOT delivered, so the batch must stay pending; any
+   *  other return counts as delivered. */
+  onSubmitComments?: (message: string) => void | boolean | Promise<void | boolean>
   /** Gateway connection flag. Gates the submit-to-chat affordance (mirrors
    *  ChatInput's Send gating) so a batch submit can't fire while the chat
    *  send path would silently refuse it. Defaults true for embeddings
@@ -51,6 +57,14 @@ interface Props {
 }
 
 const BODY_HEIGHT_STYLE: React.CSSProperties = { height: '100%', minHeight: 0 }
+
+/** Sent-to-chat comment ids for one artifact — see "submitted-to-chat
+ *  tracking" in the component. A corrupt/absent entry reads as "nothing
+ *  sent yet", which only ever over-counts the pending batch. */
+const readSentIds = (key: string): Set<string> => {
+  try { return new Set<string>(JSON.parse(localStorage.getItem(key) || '[]')) }
+  catch { return new Set<string>() }
+}
 // Non-fullscreen sidebar stacks below content (not beside it) and is
 // height-capped so content stays the primary region in the narrow panel.
 const STACKED_SIDEBAR_CLASS = 'w-full shrink-0 flex flex-col rounded-xl border border-border bg-card overflow-hidden'
@@ -58,8 +72,11 @@ const STACKED_SIDEBAR_STYLE: React.CSSProperties = { maxHeight: 280, minHeight: 
 
 /** Submit-to-chat bar with an optional "Add instruction" affordance. The
  *  free-form note is threaded through as the `extraPrompt` arg only when the
- *  toggle is open, and cleared after submit. */
-function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
+ *  toggle is open, and cleared after submit.
+ *
+ *  Exported so the standalone artifact page can put the SAME bar in the comments
+ *  sidebar's footer, rather than growing a second one that drifts. */
+export function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = true }: {
   count: number; submitting: boolean; onSubmit: (extraPrompt?: string) => void
   /** Bleed to the panel edges (non-fullscreen, inside the negative-margin
    *  content wrapper). Fullscreen uses its own padding, so omit it there. */
@@ -103,7 +120,7 @@ function SubmitBar({ count, submitting, onSubmit, bleed = false, connected = tru
           value={extraPrompt}
           onChange={e => setExtraPrompt(e.target.value)}
           rows={2}
-          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-none resize-none focus-ring leading-[18px]"
+          className="mt-2 w-full bg-bg-elevated border border-border rounded-md px-2.5 py-1.5 text-text text-[13px] font-body outline-hidden resize-none focus-ring leading-[18px]"
         />
       )}
     </div>
@@ -146,6 +163,10 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     staleTime: 10_000,
   })
   const artifact = detailQuery.data
+  // File-backed artifacts: an agent rewriting the backing file never passes
+  // through a handler, so the artifact_update WS event does not fire for it.
+  // Watch the live pointer and refetch through the shared cache instead.
+  useArtifactLiveReload(slug, artifact?.source_path)
   const effectiveKind = artifact?.kind ?? kind
   const effectiveContent = artifact?.content ?? content
   const name = artifact?.name ?? slug
@@ -174,18 +195,37 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     active.requestAnchoredComment()
     window.getSelection()?.removeAllRanges()
   }, [active])
-  const handleCopyAction = useCallback((text: string) => { if (text) copyToClipboard(text) }, [])
+  // Returns the clipboard result so the toolbar's checkmark is truthful; a
+  // blank selection is ignored (nothing to copy, nothing to report).
+  const handleCopyAction = useCallback((text: string) => (text ? copyToClipboard(text) : undefined), [])
   const selectionActions: SelectionAction[] = useMemo(() => [
     { id: 'comment', icon: <MessageSquarePlus size={12} />, label: 'Comment', onClick: handleCommentAction },
     // Icon only — a text "Copy" label would render as "Copy Copy" beside the label.
     { id: 'copy', icon: <Copy size={12} />, label: 'Copy', onClick: handleCopyAction },
   ], [handleCommentAction, handleCopyAction])
 
-  // Human-only: agent comments are filtered out here AND defensively inside
-  // formatArtifactCommentsMessage (which applies the hardened esc()).
-  const humanComments = useMemo(
-    () => fa.comments.filter(c => !c.is_agent),
-    [fa.comments],
+  // ── submitted-to-chat tracking ──
+  // Durable artifact comments survive a chat submission (unlike the local-file
+  // pending list, which the submit clears), so without per-id tracking every
+  // Submit would re-send the whole comment history and the "N comments to send"
+  // count would never reset — the bar reads as stuck on the previous batch and
+  // newly added comments are indistinguishable inside the stale total. Sent ids
+  // are persisted per artifact (mirroring the `mc-cmt-read:` key in
+  // useFileArtifactComments) so a slot switch / remount doesn't resurrect an
+  // already-sent batch.
+  // ponytail: append-only like the read-tracking key — ids of since-deleted
+  // comments linger harmlessly (pruning against a possibly-stale comment list
+  // could resurrect sent ids); cross-window sync is on remount only; an edit
+  // to an already-sent comment does not re-queue it.
+  const sentKey = `mc-cmt-sent:${slug}`
+  const [sentIds, setSentIds] = useState<Set<string>>(() => readSentIds(sentKey))
+  // Re-read when the panel is reused for a different artifact.
+  useEffect(() => { setSentIds(readSentIds(sentKey)) }, [sentKey])
+  // Pending = human-authored AND not yet submitted. Agent comments are filtered
+  // out here AND defensively inside formatArtifactCommentsMessage (hardened esc()).
+  const pendingComments = useMemo(
+    () => fa.comments.filter(c => !c.is_agent && !sentIds.has(c.id)),
+    [fa.comments, sentIds],
   )
   const [submitting, setSubmitting] = useState(false)
   // Tracks the "submitting" reset timer so it can be cancelled on unmount —
@@ -197,16 +237,39 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     // Bail while offline: the chat send path silently refuses messages in
     // that state, so firing the fake "submitting" spinner would just mislead.
     // The Submit button is disabled offline too — this is the backstop.
-    if (!connected || !onSubmitComments || humanComments.length === 0) return
+    if (!connected || !onSubmitComments || pendingComments.length === 0) return
     setSubmitting(true)
+    const batch = pendingComments
+    // The send itself fires synchronously; only the MARKING waits for the
+    // host's delivery verdict. An explicit `false` (or a throw/rejection)
+    // means the chat send was refused, so the batch stays pending and Submit
+    // re-offers it — sent ids are append-only, so marking an undelivered
+    // batch would silently drop it with no re-surface path. A void-returning
+    // host counts as delivered (embeddings without a verdict keep the
+    // clear-on-submit behavior).
+    let verdict: void | boolean | Promise<void | boolean>
     try {
-      onSubmitComments(formatArtifactCommentsMessage(slug, name, humanComments, extraPrompt))
-    } finally {
-      // Brief guard against double-fire.
-      clearTimeout(submitResetTimer.current)
-      submitResetTimer.current = setTimeout(() => setSubmitting(false), 400)
+      verdict = onSubmitComments(formatArtifactCommentsMessage(slug, name, batch, extraPrompt))
+    } catch {
+      verdict = false
     }
-  }, [connected, onSubmitComments, humanComments, slug, name])
+    Promise.resolve(verdict)
+      .then(delivered => {
+        if (delivered === false) return
+        setSentIds(prev => {
+          const next = new Set(prev)
+          for (const c of batch) next.add(c.id)
+          safeSetItem(sentKey, JSON.stringify([...next]))
+          return next
+        })
+      })
+      .catch(() => { /* undelivered — keep the batch pending */ })
+      .finally(() => {
+        // Brief guard against double-fire, released after the verdict settles.
+        clearTimeout(submitResetTimer.current)
+        submitResetTimer.current = setTimeout(() => setSubmitting(false), 400)
+      })
+  }, [connected, onSubmitComments, pendingComments, slug, name, sentKey])
   useEffect(() => () => clearTimeout(submitResetTimer.current), [])
 
   // Esc closes fullscreen first, then the panel; lock body scroll while the
@@ -222,8 +285,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
       // Don't hijack Esc while the user is in an editable field (e.g. the
       // add-instruction textarea) — let the field handle it instead of
       // closing/exiting the panel out from under them.
-      const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target as HTMLElement)?.isContentEditable) return
+      if (isEditableTarget(e)) return
       if (fullscreen) setFullscreen(false); else onClose()
     }
     document.addEventListener('keydown', h)
@@ -237,7 +299,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
 
   // Submit-to-chat is the side-panel analog of the detail page's companion
   // chat. Only rendered when the host actually supplies a submit channel.
-  const showSubmitBar = !!onSubmitComments && humanComments.length > 0
+  const showSubmitBar = !!onSubmitComments && pendingComments.length > 0
 
   // `flush` drops the native body's card chrome so a markdown artifact in the
   // side panel looks like a markdown FILE in the side panel — same edge-to-edge
@@ -375,7 +437,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
           <div className="mt-3 pr-2 shrink-0">{fa.sidebar}</div>
         )}
         {showSubmitBar && (
-          <SubmitBar count={humanComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} bleed />
+          <SubmitBar count={pendingComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} bleed />
         )}
       </div>
       {!usesIframe && !fullscreen && <SelectionToolbar containerRef={scrollRef} actions={selectionActions} />}
@@ -436,7 +498,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
         {faFull.popovers}
         {showSubmitBar && (
           <div className="shrink-0 px-16 pb-3">
-            <SubmitBar count={humanComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} />
+            <SubmitBar count={pendingComments.length} submitting={submitting} onSubmit={submitToChat} connected={connected} />
           </div>
         )}
         <Clickable className="shrink-0 flex items-center px-16 h-6 text-[11px] text-muted font-mono truncate cursor-pointer hover:text-text transition-colors" title={i18nT('components.artifactPanel.click_to_copy_slug')} onClick={() => copyToClipboard(slug)}>{i18nT('components.artifactPanel.artifacts')}{slug}</Clickable>

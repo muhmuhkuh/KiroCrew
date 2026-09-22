@@ -2,10 +2,10 @@
 """Pasting a PULL REQUEST link into the add-repo field.
 
 That field is the only place in the app you can type, so a URL from the clipboard
-lands there whatever it points at. It used to reject a PR link and tell the user to
-use the paste-PR box — which only exists once a repo is already picked, i.e. the
-thing they were trying to do. Now the PR's repo is pinned and the PR is reported
-back so the caller can open it.
+lands there whatever it points at. A PR link pins that PR's repo and reports the
+PR back so the caller can open it, rather than being refused in favour of the
+paste-PR box — which only exists once a repo is already picked, i.e. the thing the
+user is trying to do.
 """
 from __future__ import annotations
 
@@ -60,6 +60,21 @@ class TestPullRequestRef(unittest.TestCase):
         self.assertIsNone(routes._pull_request_ref("https://github.com/pull/777"))
         self.assertIsNone(routes._pull_request_ref("https://evil.test/o/r/pull/1"))
 
+    def test_parses_a_gitlab_mr_url(self):
+        ref = routes._pull_request_ref(
+            "https://gitlab.com/kirodotdev/KiroCrew/-/merge_requests/42")
+        assert ref is not None
+        self.assertEqual(ref["namespace"], "kirodotdev/KiroCrew")
+        self.assertEqual(ref["iid"], 42)
+        self.assertEqual(ref["change_id"], "GL-kirodotdev_KiroCrew-42")
+
+    def test_parses_a_nested_gitlab_group_mr(self):
+        ref = routes._pull_request_ref(
+            "https://gitlab.com/org/team/sub/Proj/-/merge_requests/7")
+        assert ref is not None
+        self.assertEqual(ref["namespace"], "org/team/sub/Proj")
+        self.assertEqual(ref["change_id"], "GL-org_team_sub_Proj-7")
+
     def test_extra_path_segments_do_not_confuse_it(self):
         ref = routes._pull_request_ref(
             "https://github.com/kirodotdev/KiroCrew/pull/777/files#r123")
@@ -102,8 +117,8 @@ class TestRepoEndpointWithPullRequest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("pull_request", _text(resp))
 
     async def test_reports_which_repo_was_added(self):
-        # The caller previously guessed repos[0], which is only right if the store
-        # happens to prepend.
+        # repos[0] is only the added repo if the store happens to prepend, so the
+        # response names it.
         await routes._handle_repos(_FakeRequest(  # type: ignore[arg-type]
             {"repo": "https://github.com/first/one"}))
         resp = await routes._handle_repos(_FakeRequest(  # type: ignore[arg-type]

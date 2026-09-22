@@ -140,6 +140,15 @@ def _drive_live_build(tmp_path, monkeypatch, readings=None):
     fidelity assertion compare them rather than restate a fixed list.
     """
     monkeypatch.setenv("KIROCREW_TELEMETRY", "1")
+    # The MODULE-scoped `exported` fixture drives this before the function-scoped
+    # rootdir floor has pinned KIROCREW_HOME for the first test, and the live build
+    # reads config through config_dir(), which then created the operator's real
+    # ~/.kiro/crew (third side-effect audit). A fixture outside the floor pins what
+    # it resolves itself.
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "kirocrew-home"))
+    import kiro_crew.config.paths as _paths
+
+    monkeypatch.setattr(_paths, "_resolved_home", None)
     for name, value in (readings if readings is not None else _PINNED_READINGS).items():
         if value is _REAL:
             continue
@@ -194,14 +203,17 @@ def exported(tmp_path_factory):
     and forces an export; doing that once and asserting many things about the
     result is both faster and closer to how a real export cycle behaves than
     rebuilding per test.
-    """
-    from _pytest.monkeypatch import MonkeyPatch
 
-    mp = MonkeyPatch()
-    try:
-        yield _drive_live_build(tmp_path_factory.mktemp("otlp-e2e"), mp)
-    finally:
-        mp.undo()
+    The patches the build needs (``KIROCREW_HOME``, ``KIROCREW_TELEMETRY``, the
+    pinned readers) are undone BEFORE the value is handed out, not at module
+    teardown. Only the parsed shards are shared; the build tears its provider
+    down before returning, so nothing downstream reads that environment. Holding
+    the patches for the module's lifetime instead leaves both variables changed
+    across the first and the last test this module runs on a worker -- an
+    environment leak into whatever unrelated test runs next.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        return _drive_live_build(tmp_path_factory.mktemp("otlp-e2e"), mp)
 
 
 def test_every_declared_instrument_reaches_the_exporter(exported):

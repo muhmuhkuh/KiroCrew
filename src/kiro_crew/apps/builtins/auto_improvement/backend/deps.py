@@ -18,9 +18,9 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 from typing import Any
 
+from kiro_crew import platform_compat
 from kiro_crew.security import redact_and_truncate
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ def install_deps() -> dict[str, Any]:
     """
     if _which("ruff"):
         return {"ok": True, "installed": [], "detail": "ruff already present"}
-    cmd = [sys.executable, "-m", "pip", "install", "--quiet", "ruff"]
+    cmd = platform_compat.isolated_python_argv("-m", "pip", "install", "--quiet", "ruff")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300.0)
     except (OSError, subprocess.SubprocessError) as exc:

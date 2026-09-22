@@ -130,13 +130,15 @@ const TabsTrigger = React.forwardRef<
       )}
       {...props}
     >
-      {isActive && (
-        <motion.span
-          layoutId={ctx?.layoutId}
-          aria-hidden="true"
-          className={TABS_INDICATOR_CLASS}
-          transition={reduceMotion ? { duration: 0 } : TABS_INDICATOR_SPRING}
-        />
+      {/* Reduced motion also excludes shared-layout projection, not only its duration. */}
+      {isActive && (reduceMotion
+        ? <span aria-hidden="true" className={TABS_INDICATOR_CLASS} />
+        : <motion.span
+            layoutId={ctx?.layoutId}
+            aria-hidden="true"
+            className={TABS_INDICATOR_CLASS}
+            transition={TABS_INDICATOR_SPRING}
+          />
       )}
       {children}
     </TabsPrimitive.Trigger>
@@ -154,7 +156,7 @@ const TabsContent = React.forwardRef<
       // Radix puts `tabindex=0` on the panel so the rail's one tab stop leads
       // into it; that makes the panel itself focusable, and the global outline
       // would then ring the entire page body.
-      className={cn('focus-visible:outline-none', className)}
+      className={cn('focus-visible:outline-hidden', className)}
       {...props}
     />
   )

@@ -21,10 +21,11 @@ import os
 import re as _re
 import shutil
 import stat as _stat
+import sys
 import threading
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, MutableMapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -34,9 +35,16 @@ from urllib.parse import urlsplit as _urlsplit  # noqa: F401 - compatibility fac
 # FROZEN pre-split alias snapshot (test_loader_reexports_historical_snapshot_by_identity),
 # so new resolution helpers are reached through the module, not re-exported.
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import __version__, model_registry, platform_compat, windows_acl
-from kiro_crew.agent_sdk.backends import ACP_BACKENDS_ACP_RUNTIME
+from kiro_crew import (
+    __version__,
+    model_registry,
+    model_scope,
+    pinned_fs,
+    platform_compat,
+    windows_acl,
+)
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_for
+from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text
 
 # Leaf module (stdlib + platform_compat only) — no import cycle with config.
 from kiro_crew.atomic_write import atomic_write, on_event_loop
@@ -174,6 +182,7 @@ from kiro_crew.config.sections import (  # noqa: F401
     FOLDER_INGEST_CHUNK_BUDGET_MAX,
     FORWARD_DECLARED_ENV_DEFAULT,
     IMESSAGE_SERVICES,
+    IMPORT_CHUNK_BUDGET_MAX,
     JAIL_MODE_AUTO,
     JAIL_MODE_OFF,
     JAIL_MODE_ON,
@@ -212,6 +221,7 @@ from kiro_crew.config.sections import (  # noqa: F401
     ComputerUseConfig,
     CronHistoryConfig,
     DashboardConfig,
+    DecisionsConfig,
     DiscordConfig,
     ExternalRegistryConfig,
     FeishuConfig,
@@ -226,6 +236,7 @@ from kiro_crew.config.sections import (  # noqa: F401
     MemoryConfig,
     MemoryStoreConfig,
     MessagingConfig,
+    MonitoringConfig,
     OrchestratorConfig,
     PublishConfig,
     ResolvedBindings,
@@ -301,9 +312,18 @@ from kiro_crew.config.sections import (  # noqa: F401
     yolo_duration_to_secs,
 )
 
-# Superseded-default reporting (#5244). Leaf module: stdlib only, so importing it
+# Superseded-default reporting. Leaf module: stdlib only, so importing it
 # here creates no cycle.
-from kiro_crew.config.superseded_defaults import drift_summary, superseded_default_drift
+# The same module owns the one-shot adoption of the entries that opt into it.
+from kiro_crew.config.superseded_defaults import (
+    SupersededDefault,
+    auto_adoptable,
+    drift_summary,
+    drop_drifted_keys,
+    record_adoptions,
+    stored_value_or_none,
+    superseded_default_drift,
+)
 
 # Schema validation + the validated-data cache live in ``config.validation``.
 # Re-exported here for backward compatibility — callers and tests still
@@ -327,6 +347,7 @@ from kiro_crew.config.validation import (  # noqa: F401
 )
 from kiro_crew.config.validation import validate_config_data as _validate_config_data  # noqa: F401
 from kiro_crew.constants import (
+    DEFAULT_SUBAGENT_MAX_TURNS,
     SUBAGENT_TIMEOUT_MAX,
     SUBAGENT_TIMEOUT_MIN,
     SUBAGENT_TIMEOUT_SECS,
@@ -341,6 +362,13 @@ from kiro_crew.instances.constants import DEFAULT_SSH_COMPRESSION as _DEFAULT_SS
 from kiro_crew.instances.constants import DEFAULT_TUNNEL_BASE_PORT as _DEFAULT_TUNNEL_BASE_PORT
 from kiro_crew.instances.constants import DEFAULT_WARM_SET_CAP as _DEFAULT_WARM_SET_CAP
 from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
+
+# The memory-store shape rule, applied to store NAMES at load. Leaf module:
+# stdlib only at module scope (it imports this one lazily), so no cycle.
+from kiro_crew.memory_stores import (
+    DEFAULT_MEMORY_STORE,
+    memory_store_name_defect,
+)
 
 # The speech-to-text defaults and the model catalog come from the package that
 # owns them, so the model menu this schema advertises cannot name a model that
@@ -378,13 +406,21 @@ CRED_WEIXIN_TOKEN = "WEIXIN_TOKEN"  # iLink bot credential from the Settings QR 
 CRED_FEISHU_APP_ID = "FEISHU_APP_ID"  # Feishu custom-app id (developer console)
 CRED_FEISHU_APP_SECRET = "FEISHU_APP_SECRET"
 CRED_JIRA_API_TOKEN = "JIRA_API_TOKEN"  # Jira Cloud/Server API token (resolved from .env)
+CRED_WAKATIME_API_KEY = "WAKATIME_API_KEY"  # vault-only; never loaded from .env
+CRED_AZURE_DEVOPS_EXT_PAT = "AZURE_DEVOPS_EXT_PAT"
+CRED_BITBUCKET_EMAIL = "BITBUCKET_EMAIL"
+CRED_BITBUCKET_API_TOKEN = "BITBUCKET_API_TOKEN"
+MANAGED_VAULT_FIXED_CONSUMERS = {
+    CRED_JIRA_API_TOKEN: "jira_api_token",
+    CRED_WAKATIME_API_KEY: "wakatime_api_key",
+}
 # kiro-cli's OWN model credential. Unlike the gateway-owned channel tokens
 # above, its rightful consumer is the agent subprocess itself (and the whoami
 # identity probe), so it is deliberately NOT in sandbox._AGENT_DENIED_ENV_KEYS:
 # the spawn paths re-inject it from the .env file after the Docker entrypoint
 # scrubs it out of the gateway's /proc/<pid>/environ.
 CRED_KIRO_API_KEY = "KIRO_API_KEY"
-_CREDENTIAL_KEYS = (
+CREDENTIAL_KEYS = (
     CRED_SLACK_APP_TOKEN,
     CRED_SLACK_BOT_TOKEN,
     CRED_OWNER_ID,
@@ -400,6 +436,9 @@ _CREDENTIAL_KEYS = (
     CRED_FEISHU_APP_ID,
     CRED_FEISHU_APP_SECRET,
     CRED_JIRA_API_TOKEN,
+    CRED_AZURE_DEVOPS_EXT_PAT,
+    CRED_BITBUCKET_EMAIL,
+    CRED_BITBUCKET_API_TOKEN,
     CRED_KIRO_API_KEY,
 )
 
@@ -408,6 +447,24 @@ _CREDENTIAL_KEYS = (
 # injected via multiline env values from reaching the eval-based value reader
 # in the Docker entrypoint.
 _JIRA_TOKEN_RE = _re.compile(r"^JIRA_TOKEN_[0-9A-Fa-f]+$")
+
+
+def normalize_jira_host(host: str) -> str:
+    """Normalize a Jira host exactly as auth lookup and managed-slot discovery do."""
+    return host.strip().lower().removesuffix(":443")
+
+
+def jira_host_token_name(host: str) -> str:
+    """Return the collision-free per-host Jira token name for *host*."""
+    normalized = normalize_jira_host(host)
+    return f"JIRA_TOKEN_{normalized.encode().hex().upper()}"
+
+
+def jira_global_token_applicable(entries: Iterable[JiraAuthEntry]) -> bool:
+    """Whether the global Jira token may serve one valid configured host."""
+    raw_entries = list(entries)
+    return len(raw_entries) == 1 and bool(normalize_jira_host(raw_entries[0].host))
+
 
 # Keys from .env that were already warned about (fire once per gateway boot).
 _warned_env_keys: set[str] = set()
@@ -500,6 +557,63 @@ def config_local_path() -> Path:
     return config_dir() / "config.local.json"
 
 
+def unsandboxed_exec_platform_default() -> bool:
+    """What an UNDECLARED ``agent.sandbox_allow_unsandboxed_exec`` resolves to here.
+
+    True on Windows, where Kiro Crew has no native OS wrapper to apply — no Linux
+    user namespace, no macOS ``sandbox-exec``, and nothing installable that would
+    produce one, so fail-closing there refuses every script cron, hook, app
+    backend, MCP probe and provider CLI on the platform in perpetuity, with no
+    operator action able to satisfy the check.
+
+    False everywhere else. A backend-less Linux or macOS host is one whose backend
+    is BROKEN or one AppArmor profile away from working, so it keeps fail-closing
+    and ``sandbox``'s guidance names the profile that restores isolation; running
+    unconfined there would hide a repairable host.
+
+    Resolved HERE, into the dataclass value, rather than downstream from whether
+    the key is present. Presence cannot carry the meaning safely:
+    :meth:`KiroCrewConfig.save` publishes the whole in-memory snapshot through
+    ``to_dict()`` -> ``asdict(self.agent)``, so every full-document write (the boot
+    default-config write, CLI one-shots) materializes this key. Were the effective
+    policy keyed on presence, that write would silently turn "never decided" into a
+    declared lockdown and re-brick every Windows spawn. Resolving into the value
+    makes such a round-trip write ``true`` on Windows, which changes nothing.
+
+    A function rather than a module constant so tests can pin the verdict without
+    patching ``sys.platform`` process-wide.
+    """
+    return sys.platform == "win32"
+
+
+def unsandboxed_exec_declared() -> bool:
+    """Whether the operator explicitly DECLARED ``agent.sandbox_allow_unsandboxed_exec``.
+
+    Reports key PRESENCE, in either state, in ``config.json`` or the
+    ``config.local.json`` overlay that deep-merges over it.
+
+    DIAGNOSTIC ONLY — it must never gate execution. The effective policy is the
+    resolved dataclass value (see :func:`unsandboxed_exec_platform_default`); this
+    exists so a message can tell "you set this to false" apart from "you never set
+    it", and so the audit event can name an operator grant rather than a platform
+    one. Because a full-document ``save()`` materializes the key, a host that never
+    answered can read as declared afterwards — acceptable for a label, and the
+    reason this must not decide anything.
+
+    An unreadable or non-object document contributes nothing: a corrupt config is
+    not a declaration.
+    """
+    for path in (config_path(), config_local_path()):
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        agent = doc.get("agent") if isinstance(doc, dict) else None
+        if isinstance(agent, dict) and "sandbox_allow_unsandboxed_exec" in agent:
+            return True
+    return False
+
+
 def _inside_data_home(path: Path) -> bool:
     """Whether *path* lives in ``config_dir()``, the one directory we own.
 
@@ -574,6 +688,11 @@ MIGRATE_WORKSPACES = "workspaces"
 MIGRATE_AGENTS = "agents"
 MIGRATE_DEFAULT_AGENT = "default_agent"
 MIGRATE_CONNECTIONS_UI = "connections_ui"
+#: Un-materialize the stored values that still hold a superseded default an entry
+#: marked ``auto_adopt``. Unlike the three above, this one carries a payload: the
+#: keys the load decided on travel separately in ``adopt_keys``, because the set is
+#: per-install rather than a fixed schema shape.
+MIGRATE_SUPERSEDED_DEFAULTS = "superseded_defaults"
 
 #: Sidecar marker recording that the one-shot ``connections_ui`` launch
 #: migration ran. Pre-launch builds materialized ``connections_ui: false`` into
@@ -593,6 +712,8 @@ def _apply_document_migrations(
     *,
     overlay_kiro_agent: str | None,
     default_kiro_agent: str,
+    adopt_keys: frozenset[str] = frozenset(),
+    recorded_adoptions: list[str] | None = None,
 ) -> bool:
     """Apply the pending write-back migrations to a raw config document in place.
 
@@ -684,6 +805,41 @@ def _apply_document_migrations(
                 data["default_agent"] = "default"
             changed = data["default_agent"] != stored_default or changed
 
+    # Un-materialize the auto-adopting superseded defaults this load found. Four
+    # properties are load-bearing and all four live here rather than at the call
+    # site, because this is the only code that runs inside the config write lock:
+    #
+    # * RE-DETECTED against *data*, so a value another writer changed since this
+    #   load's read is left alone -- the same rule every migration above follows,
+    #   and the reason a live ``config set`` is never clobbered;
+    # * the ledger is written BEFORE the removal is reported as done. A removal
+    #   whose record did not land would repeat on the next load, and repeating is
+    #   the one failure that can override a value the operator restored. A failing
+    #   record therefore propagates and aborts the whole migration write;
+    # * every key it records is reported back through *recorded_adoptions*, because
+    #   writing the ledger first leaves a known residual: if the config write then
+    #   fails, the key is marked adopted while the stale value is still stored, and
+    #   the one-shot filter never revisits it. Nothing rolls the ledger back -- see
+    #   ``record_adoptions`` for why that residual is the one chosen -- so the caller
+    #   uses the list only to decide which keys the IN-MEMORY half may apply: those
+    #   whose removal it saw land, and no others;
+    # * ``drop_drifted_keys`` REMOVES the key rather than writing the new number, so
+    #   the field resolves through ``data.get(key, DEFAULT)`` until the next full
+    #   rewrite of the document re-materializes it.
+    #
+    # Lock order is config-then-ack, matching ``record_acks`` -- the only two sites
+    # that nest these locks, and they nest them the same way.
+    if MIGRATE_SUPERSEDED_DEFAULTS in pending and adopt_keys:
+        fresh = [
+            entry.dotted_key for entry in auto_adoptable(data) if entry.dotted_key in adopt_keys
+        ]
+        if fresh:
+            record_adoptions({key: stored_value_or_none(data, key) for key in fresh})
+            if recorded_adoptions is not None:
+                recorded_adoptions.extend(fresh)
+            if drop_drifted_keys(data, fresh):
+                changed = True
+
     return changed
 
 
@@ -722,13 +878,15 @@ def _persist_config_migration(
     pending: frozenset[str],
     *,
     default_kiro_agent: str,
+    adopt_keys: frozenset[str] = frozenset(),
+    confirmed_adoptions: list[str] | None = None,
 ) -> bool:
     """Write the pending migrations to *path* as a read-modify-write.
 
-    Replaces the ``cfg.save()`` this used to be. ``save()`` re-serializes the
-    WHOLE snapshot the load parsed, and that snapshot was read before this call:
-    a dashboard PATCH or ``kirocrew config set`` landing in between was silently
-    dropped, because nothing ordered the two (#7793). ``load()`` already runs off
+    Writes as a read-modify-write rather than ``cfg.save()``. ``save()``
+    re-serializes the WHOLE snapshot the load parsed, and that snapshot was read
+    before this call: a dashboard PATCH or ``kirocrew config set`` landing in
+    between is silently dropped, because nothing orders the two. ``load()`` already runs off
     the event loop in places (``chat_runner``'s stop-hook nudge-cap site awaits
     ``asyncio.to_thread(KiroCrewConfig.load)``), so the interleave is reachable.
 
@@ -791,46 +949,121 @@ def _persist_config_migration(
     # taken from the load's snapshot so the seed reflects the file as it is now.
     overlay_kiro_agent = _overlay_kiro_agent()
 
+    # Keys the migration recorded in the ledger before removing them. Only the ones
+    # whose write LANDED are reported back, so the in-memory half never runs ahead of
+    # the stored document. Nothing is undone on the failure path: see
+    # ``record_adoptions`` for why the marker deliberately goes first and what the
+    # residual is.
+    recorded_adoptions: list[str] = []
+
+    # ``applied`` means the delta was computed and the backup taken; ``wrote`` means
+    # the ATOMIC WRITE returned. They are separate because the write happens AFTER
+    # ``_mutate`` returns -- ``update_config_locked`` performs it -- so a flag set
+    # inside the callback would report a write that had not happened yet, and the
+    # ``finally`` below would then confirm an adoption whose removal never reached
+    # disk, letting the in-memory half run ahead of the stored document. Neither
+    # call site guards ``write_config_atomically``, so a failed write propagates and
+    # ``wrote`` correctly stays False.
+    applied = False
+
     def _mutate(current: dict) -> dict | None:
-        nonlocal wrote
+        nonlocal applied
         if not _apply_document_migrations(
             current,
             pending,
             overlay_kiro_agent=overlay_kiro_agent,
             default_kiro_agent=default_kiro_agent,
+            adopt_keys=adopt_keys,
+            recorded_adoptions=recorded_adoptions,
         ):
             # Nothing left to migrate -- another writer got here first. Returning
             # None skips the write, so we do not rewrite a file we agree with.
             return None
         _write_migration_backup(path)
-        wrote = True
+        applied = True
         return current
 
-    if _inside_data_home(_lock_target(path)):
-        try:
-            update_config_locked(path, mutate=_mutate, wait_for_lock=False)
-        except BlockingIOError:
-            # POSIX reports a contended single-shot acquire this way. Not a
-            # failure worth a warning: info, because the migration simply moves
-            # to the next load and nothing was written or lost.
-            logger.info(
-                "config: migration deferred -- another writer holds %s.lock; "
-                "the next load will migrate",
-                path.name,
-            )
-            return False
-    else:
-        # read_config_for_update fails CLOSED on an unreadable or non-object
-        # file, and that exception reaches load()'s except: the file is left
-        # alone and the migration retries. Same contract as the locked path.
-        result = _mutate(read_config_for_update(path))
-        if result is not None:
-            write_config_atomically(path, stamp_config_meta(result))
+    try:
+        if _inside_data_home(_lock_target(path)):
+            try:
+                update_config_locked(path, mutate=_mutate, wait_for_lock=False)
+            except BlockingIOError:
+                # POSIX reports a contended single-shot acquire this way. Not a
+                # failure worth a warning: info, because the migration simply moves
+                # to the next load and nothing was written or lost.
+                logger.info(
+                    "config: migration deferred -- another writer holds %s.lock; "
+                    "the next load will migrate",
+                    path.name,
+                )
+                return False
+            # Reached only when the locked read-modify-write completed, so an
+            # ``applied`` delta is now on disk.
+            wrote = applied
+        else:
+            # read_config_for_update fails CLOSED on an unreadable or non-object
+            # file, and that exception reaches load()'s except: the file is left
+            # alone and the migration retries. Same contract as the locked path.
+            result = _mutate(read_config_for_update(path))
+            if result is not None:
+                write_config_atomically(path, stamp_config_meta(result))
+                wrote = True
+    finally:
+        # ``wrote`` is the single fact that decides both halves, and it is read in a
+        # ``finally`` because the write can be skipped WITHOUT an exception too (the
+        # deferral return above, a concurrent writer that already migrated).
+        #
+        # Only a key whose removal actually LANDED is reported back for the in-memory
+        # half, so the running config never holds a value the stored document does not
+        # agree with.
+        if recorded_adoptions and wrote and confirmed_adoptions is not None:
+            confirmed_adoptions.extend(recorded_adoptions)
     if wrote:
         # Same reason save() did: drop the validated-data cache so the next load
         # re-reads this write even where the filesystem mtime resolution is coarse.
         _invalidate_config_cache()
+        _notify_live_watch()
     return wrote
+
+
+def _overlay_supplies(local_data: dict, dotted_key: str) -> bool:
+    """True when ``config.local.json`` itself carries *dotted_key*.
+
+    The overlay wins the deep-merge, so where it names a field the base cannot be
+    the effective value. Adopting such a key in memory would replace the operator's
+    live overlay choice with a default -- the one thing an automatic adoption must
+    never do.
+    """
+    section, _, field = dotted_key.partition(".")
+    section_data = local_data.get(section)
+    return isinstance(section_data, dict) and field in section_data
+
+
+def _adopt_in_memory(cfg: KiroCrewConfig, dotted_key: str, old_default: object) -> None:
+    """Move one parsed field from *old_default* to the LIVE dataclass default.
+
+    The dataclass default is read rather than the registry's ``new_default`` on
+    purpose. Both sides of a registry row are history, so on a key whose default
+    moved twice the matching row's ``new_default`` is an intermediate value, while
+    the field's own default is what the removal on disk will resolve to. Reading it
+    here keeps memory and disk agreeing on one number.
+
+    The guard is exact-value, not just key presence: a field whose parsed value
+    differs from *old_default* was clamped or coerced on the way in, and replacing
+    that would discard the loader's own correction rather than a stale default.
+    """
+    section, _, field = dotted_key.partition(".")
+    target = getattr(cfg, section, None)
+    if target is None:
+        return
+    fields_map = getattr(type(target), "__dataclass_fields__", {})
+    spec = fields_map.get(field)
+    if spec is None or getattr(target, field, None) != old_default:
+        return
+    live_default = spec.default
+    if live_default is MISSING:
+        return
+    setattr(target, field, live_default)
 
 
 def denied_commands_path() -> Path:
@@ -912,6 +1145,30 @@ def aws_consent_path() -> Path:
     return config_dir() / "aws_service_consent.json"
 
 
+def decisions_consent_path() -> Path:
+    """Return path to decisions_consent.json — consent to send conversation state to Jev.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: enabling the decision
+    seam sends message text and skill descriptions to an external, paid provider,
+    which is an egress authorization, not a preference. Kept out of the
+    agent-writable ``config.json`` so a prompt-injected shell cannot flip it and
+    have the live config watcher start the egress; ``is_sensitive_path`` blocks
+    the tool path and the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"enabled": bool, "endpoint": str}`` -- the switch and the provider
+    address the owner consented to; every read fails soft to NOT CONSENTED (see
+    ``decisions.consent``). The only writer is the authenticated, browser-only
+    dashboard ``PUT /api/decisions/consent`` handler, which opens the path
+    directly rather than through this gate. Respects ``KIROCREW_HOME``.
+
+    The ``decisions`` section of ``config.json`` deliberately carries NO
+    ``enabled`` field: sampling share and provider knobs only, so there is exactly
+    one place the seam can be switched on and it is not one the agent can reach.
+    """
+    return config_dir() / "decisions_consent.json"
+
+
 def file_delivery_consent_path() -> Path:
     """Return path to file_delivery_consent.json -- flagged-file delivery consent.
 
@@ -934,6 +1191,33 @@ def file_delivery_consent_path() -> Path:
     take. Respects ``KIROCREW_HOME``.
     """
     return config_dir() / "file_delivery_consent.json"
+
+
+def ssh_auth_sock_consent_path() -> Path:
+    """Return path to ssh_auth_sock_consent.json -- the SSH-agent forward consent.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path` and
+    :func:`file_delivery_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: keeping
+    ``SSH_AUTH_SOCK`` in the agent subprocess environment grants USE of the
+    operator's ssh-agent keys -- signing, git-over-SSH, and any authentication
+    the socket reaches -- for the lifetime of the session. That is an
+    authorization, not a preference. Stored in the agent-readable ``config.json``
+    it would be writable by any auto-approved agent shell, so a prompt-injected
+    agent could flip its own forwarding on and a subagent it spawns would then
+    authenticate as the operator with keys the sandbox exists to keep out of its
+    reach. ``is_sensitive_path`` blocks the tool path and the OS sandbox mounts
+    the keystone read-only for the agent's shell, so the consent is
+    un-flippable from inside the sandbox.
+
+    Holds ``{"enabled": bool, "granted_at": str}``; every read fails soft to
+    DISABLED (see ``ssh_auth_sock_consent.is_granted``). The only writer is the
+    authenticated, OWNER-gated dashboard handler, which opens the path directly
+    rather than through this gate. There is deliberately NO CLI verb -- a
+    terminal command that records the grant on request is a grant an automated
+    caller can take. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "ssh_auth_sock_consent.json"
 
 
 def read_local_secret(port: int) -> str:
@@ -974,7 +1258,12 @@ def read_local_secret(port: int) -> str:
 
 
 def _raw_config() -> dict:
-    """Load raw config.json as dict (cached per process)."""
+    """Load raw config.json as a dict, re-reading the file on every call.
+
+    Uncached on purpose: callers want the bytes on disk right now, and the
+    validated-config cache is keyed for :meth:`KiroCrewConfig.load`, not for
+    this raw view. An absent or unreadable file reads as ``{}``.
+    """
     p = config_path()
     if not p.exists():
         return {}
@@ -1053,14 +1342,11 @@ def write_config_atomically(path: Path, data: dict, *, fsync: bool = False) -> N
     ``atomic_write``'s ``mode`` routes through ``fchmod_safe``, which applies the
     mode on POSIX and is a documented no-op on Windows.
 
-    **Windows gets a real owner-only DACL, not just the inert mode.** This used
-    to deliberately skip ``platform_compat.restrict_to_owner`` because that helper
-    shelled out to ``icacls`` — a blocking subprocess this function could not
-    afford, being called from ``async`` request handlers and from
-    ``KiroCrewConfig.save()``. That constraint no longer exists: the lockdown is
-    applied in-process through ``advapi32`` (measured at 0.24 ms, against 313 ms
-    for the subprocess it replaced), so it is safe on the event loop and the
-    reason to omit it is gone. Since ``config.json`` can carry inline provider
+    **Windows gets a real owner-only DACL, not just the inert mode.** The lockdown
+    is applied in-process through ``advapi32`` (measured at 0.24 ms, against 313 ms
+    for the ``icacls`` subprocess), so it is safe on the event loop even though this
+    function is called from ``async`` request handlers and from
+    ``KiroCrewConfig.save()``. Since ``config.json`` can carry inline provider
     tokens and API keys, applying it is the correct default rather than a duty
     pushed onto each caller.
 
@@ -1251,9 +1537,8 @@ def update_config_locked(
     ``write_config_atomically(config_path())`` caller outside this module, and
     the required path for new ``config.json`` mutations.  **No such caller
     remains** -- the dashboard agents endpoint, ``security.py``, the apps manager
-    and the CLI setup wizard were the last of them and are converted (#8032);
-    ``memory.py`` was converted earlier and reaches this function through
-    ``dashboard/chat_utils.run_config_write``.
+    and the CLI setup wizard all route through the locked path, and ``memory.py``
+    reaches this function through ``dashboard/chat_utils.run_config_write``.
     ``TestEveryConfigWriterIsLocked`` in
     ``test/test_config_rmw_preserves_settings.py`` is the ratchet that keeps the
     list from regrowing.
@@ -1261,25 +1546,30 @@ def update_config_locked(
     Read "direct caller outside this module" strictly: it is the exact set the
     ratchet checks, and it is NOT the same as "every writer that reaches
     ``config.json``".  :meth:`KiroCrewConfig.save` calls
-    :func:`write_config_atomically` and does NOT come through here -- but since
-    #4767 it holds the SAME sidecar lock (via :func:`_config_write_lock`), so
-    its rename can no longer land inside this function's read-modify-write.
+    :func:`write_config_atomically` and does NOT come through here -- but it holds
+    the SAME sidecar lock (via :func:`_config_write_lock`), so its rename cannot
+    land inside this function's read-modify-write.
     ``save`` is still a whole-document publish of in-memory state, not an RMW:
     a stale snapshot saved after a locked update overwrites it with older
     values.  The lock fixes interleaving, not staleness.
 
-    A SECOND family of writers still bypasses this lock, and the ratchet does
-    NOT reach it: writers that reach ``config_path()`` through
-    ``kiro_crew.agent._atomic_json_write`` (``messaging.py``'s per-channel
-    savers, ``core.py``'s STT PUT, ``mcp.py``'s gateway-enable). The ratchet
-    matches calls to :func:`write_config_atomically`, and these make none.
+    A SECOND family of writers still bypasses this lock: writers that reach
+    ``config_path()`` through ``kiro_crew.agent._atomic_json_write``
+    (``messaging.py``'s per-channel savers, ``core.py``'s STT PUT, ``mcp.py``'s
+    gateway-enable). ``TestEveryConfigWriterIsLocked`` does not reach them --
+    it matches calls to :func:`write_config_atomically`, and these make none --
+    so they have their own ratchet,
+    ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted`` in the same file, which
+    pins that family to a baseline that may only SHRINK.
 
     That family relies on the in-process asyncio ``_get_config_lock()`` only,
     which serializes same-loop callers and nothing else, so it can still
-    interleave with a holder of this lock.  Converting it is follow-up work; do
-    not read the ratchet's green as covering it, and note that an ALIASED
-    import of :func:`write_config_atomically` would evade it for the same
-    matching reason.
+    interleave with a holder of this lock.  Converting the remaining members is
+    follow-up work (``api_feishu_config_save`` and ``api_imessage_config_save``
+    are already through here and are the shape to copy); do not read either
+    ratchet's green as meaning the family is converted, only that it cannot
+    grow, and note that an ALIASED import of :func:`write_config_atomically`
+    would evade the sibling ratchet for the same matching reason.
 
     Contract:
 
@@ -1377,7 +1667,27 @@ def update_config_locked(
         if stamp_meta:
             result = stamp_config_meta(result)
         write_config_atomically(p, result, fsync=fsync)
+        # A same-size replacement can retain an indistinguishable fingerprint
+        # on a coarse-timestamp filesystem. Clear eagerly before reporting the
+        # write complete so the next load cannot serve the pre-write snapshot,
+        # and wake the process watcher so the hot-apply path runs now rather
+        # than on its next poll.
+        _invalidate_config_cache()
+        _notify_live_watch()
         return result
+
+
+def _notify_live_watch() -> None:
+    """Wake the process config watcher after a write landed on ``config.json``.
+
+    Every writer in this module ends here so the dashboard, ``kirocrew config
+    set`` and a boot-time migration all reach the hot-apply path the same way.
+    The import is lazy because ``config.live`` imports this module for its
+    loads; a no-op in a process that never started a watcher (the CLI).
+    """
+    from kiro_crew.config import live
+
+    live.notify_config_written()
 
 
 # Keys already warned about in this process. The gateway loads config repeatedly
@@ -1386,7 +1696,7 @@ def update_config_locked(
 _REPORTED_SUPERSEDED_KEYS: set[str] = set()
 
 
-def _report_superseded_defaults(base_data: dict) -> None:
+def _report_superseded_defaults(base_data: dict, *, skip: set[str] | None = None) -> None:
     """Warn once when stored base values still hold a superseded default.
 
     *base_data* is the ``config.json`` document as read, BEFORE the
@@ -1412,11 +1722,17 @@ def _report_superseded_defaults(base_data: dict) -> None:
     config many times says it once. An acknowledged key is not reported at all --
     ``superseded_default_drift`` filters it -- which is what makes this line
     answerable instead of permanent.
+
+    *skip* names the keys this load is ADOPTING. They are excluded because the line
+    tells the operator to run a command, and pointing them at a command for a key
+    that is being fixed in the same load is worse than saying nothing: by the time
+    they read it the key is already gone from the file.
     """
+    skipped = skip or set()
     drifted = [
         e
         for e in superseded_default_drift(base_data)
-        if e.dotted_key not in _REPORTED_SUPERSEDED_KEYS
+        if e.dotted_key not in _REPORTED_SUPERSEDED_KEYS and e.dotted_key not in skipped
     ]
     if not drifted:
         return
@@ -1466,8 +1782,8 @@ def refresh_config_meta_stamp() -> bool:
     upgrade that never touches ``config.json`` leaves ``lastTouchedVersion``
     naming the *previous* build indefinitely. That contradicts the field's
     documented meaning ("the build that wrote the bytes now on disk") and
-    sends anyone debugging a version question chasing a build that is no
-    longer installed (#3102). Called once per gateway start, off the boot
+    sends anyone debugging a version question chasing a build that is not
+    installed. Called once per gateway start, off the boot
     path: a version check on one small file, a rewrite only when it differs.
 
     Deliberately a plain field refresh, not a migration hook: the stamp is
@@ -1527,31 +1843,176 @@ def refresh_config_meta_stamp() -> bool:
         return False
     if wrote:
         _invalidate_config_cache()
+        _notify_live_watch()
     return wrote
+
+
+class WorkspaceDirUnusable(Exception):
+    """A workspace ``dir`` cannot be materialized as a directory.
+
+    ``code`` is the stable token both writers map onto their own error contract
+    (the dashboard's 409 body ``code``; the CLI's exit-1 message):
+    ``workspace_dir_not_a_directory`` when the path exists as something that is
+    not a directory, ``workspace_dir_uncreatable`` for everything else (a missing
+    parent, a parent swapped for a link, a permission error).
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _PinnedCreateRefusal(Exception):
+    """pinned_fs's refusal for the workspace create, mapped by the caller."""
+
+
+def materialize_workspace_dir(validated: Path, *, display: str) -> None:
+    """Make *validated* exist as a directory: adopt one that is there, create one that is not.
+
+    One writer-side rule shared by the dashboard handler and the CLI: a published
+    workspace must name a usable directory for provider cwd and project documents.
+
+    *validated* is the path AS THE CALLER'S VALIDATION RESOLVED IT (``Path.resolve()``
+    at validation time). This function never resolves it again: resolving here would
+    follow whatever a parent component points at by now, which is the exact swap the
+    pinned create exists to refuse (see :func:`pinned_fs.pin_parent`).
+
+    An existing DIRECTORY is adopted untouched (pointing a new workspace at a folder
+    the owner already keeps is the normal case for an absolute ``dir``). Anything
+    else that exists at the name is refused, as is a missing PARENT: only the final
+    component is ever created, so a mistyped nested ``dir`` fails here instead of
+    committing an entry that breaks an unrelated member later.
+
+    Adoption AND creation are judged through the PINNED parent where the platform
+    can pin: every parent component is opened with ``O_NOFOLLOW`` relative to the
+    previous one, and the final name is inspected or made relative to that
+    descriptor. A component swapped for a link after validation is therefore
+    refused rather than followed. That is the discipline every other write under a
+    validated path in this product keeps (:mod:`kiro_crew.pinned_fs`). Where nothing
+    can be pinned (Windows: no ``dir_fd``, no ``O_NOFOLLOW``), both checks are by
+    name, which is that module's documented limit, not a silent substitute.
+
+    Not a rollback site: the directory this makes is left in place when the
+    caller's config write later fails. It is reachable only through the entry
+    written in the same locked section, and a concurrent create can already have
+    adopted it, so deleting it is the unsafe option.
+    """
+    if pinned_fs.supports_pinned_walk():
+        try:
+            parent_fd = pinned_fs.pin_parent(
+                str(validated.parent),
+                what=f"workspace directory {display!r}",
+                refusal=_PinnedCreateRefusal,
+            )
+            try:
+                st = pinned_fs.stat_at(parent_fd, validated.name)
+                if st is None:
+                    try:
+                        os.mkdir(validated.name, dir_fd=parent_fd)
+                        return
+                    except FileExistsError:
+                        st = pinned_fs.stat_at(parent_fd, validated.name)
+                if st is not None and _stat.S_ISDIR(st.st_mode):
+                    return
+                raise WorkspaceDirUnusable(
+                    "workspace_dir_not_a_directory",
+                    f"'{display}' exists and is not a directory; "
+                    "choose another dir or remove it first",
+                )
+            finally:
+                os.close(parent_fd)
+        except _PinnedCreateRefusal as exc:
+            raise WorkspaceDirUnusable(
+                "workspace_dir_uncreatable", f"Directory '{display}' could not be created: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceDirUnusable(
+                "workspace_dir_uncreatable",
+                f"Directory '{display}' could not be created: {exc.strerror or exc}",
+            ) from exc
+
+    if validated.is_dir():
+        return
+    try:
+        os.mkdir(validated)
+    except FileExistsError as exc:
+        # EEXIST is the filesystem itself saying something is at the name: a
+        # racer's directory is the state this create wanted, while a file, a
+        # socket, a dangling link or a symlink cannot serve as a workspace, and
+        # registering one writes back exactly the unusable entry this prevents.
+        if validated.is_dir() and not validated.is_symlink():
+            return
+        raise WorkspaceDirUnusable(
+            "workspace_dir_not_a_directory",
+            f"'{display}' exists and is not a directory; choose another dir or remove it first",
+        ) from exc
+    except OSError as exc:
+        raise WorkspaceDirUnusable(
+            "workspace_dir_uncreatable",
+            f"Directory '{display}' could not be created: {exc.strerror or exc}",
+        ) from exc
 
 
 def workspace_dir_for(workspace: str | None = None) -> Path:
     """Resolve a named workspace to its directory path.
 
-    Reads the ``dir`` field from ``WorkspaceConfig`` objects (new structured
-    format) or falls back to raw string values (legacy flat format).
+    Reads the LOADED config's ``workspaces`` table, not the raw bytes on disk, so
+    this and ``resolve_agent_bindings`` cannot answer the same question two ways:
+    the loaded table is the one the validator has repaired and the write-back
+    migration has normalized, and it is what every other consumer already reads.
 
     Values starting with ``/`` or ``~`` are treated as absolute paths.
     Otherwise the value is relative to ``config_dir()`` (``~/.kiro/crew/``).
-    Unmapped workspace names fall back to ``"workspace"``.
-    """
-    data = _raw_config()
-    ws = workspace or data.get("default_workspace", "default")
-    mapping = data.get("workspaces", {})
-    raw_value = mapping.get(ws, "workspace")
 
-    # Extract the directory string from either format
-    if isinstance(raw_value, dict):
-        dirname = raw_value.get("dir", "workspace")
-    elif isinstance(raw_value, str):
-        dirname = raw_value
-    else:
-        dirname = "workspace"
+    An unmapped name falls back to the ``WorkspaceConfig`` default directory —
+    NOT to ``default_workspace``'s directory, which could be an absolute path
+    outside the data home — and the fall-through is LOGGED. Two DISTINCT names
+    both resolving to the same ``<home>/workspace`` is how a workspace split
+    turns into a shared tree nobody notices, so that case warns. An install that
+    simply has no ``workspaces`` section yet is the ordinary fresh state and logs
+    at debug — it is one workspace, not a collision.
+
+    Never raises. ``default_project_dir`` and the workspace-identity block are
+    built on this, so a raise here would break a fresh install and take both
+    with it; a config that cannot be loaded resolves to the default directory.
+    """
+    mapping: dict[str, WorkspaceConfig] = {}
+    ws = workspace or ""
+    configured_default = ""
+    try:
+        cfg = KiroCrewConfig.load()
+        mapping = cfg.workspaces
+        configured_default = cfg.default_workspace
+        ws = workspace or configured_default
+    except Exception:
+        logger.warning(
+            "could not load config to resolve workspace %r; using the default directory",
+            workspace,
+            exc_info=True,
+        )
+
+    entry = mapping.get(ws)
+    if entry is None:
+        # An unmapped name resolves to the BASE workspace directory, never to the
+        # configured default's directory. That distinction is the boundary: this
+        # answer becomes a filesystem root, and one caller
+        # (``dashboard/handlers/files.py``'s ``?workspace=``) takes the name from a
+        # request without the ``is_sensitive_path`` check its ``?project=`` sibling
+        # applies. Hopping to ``default_workspace`` would let an unrecognized name
+        # reach whatever absolute ``dir`` that workspace declares, so an unmapped
+        # name stays inside the data home by construction.
+        #
+        # It is still a fail-OPEN worth naming: two DISTINCT declared-looking names
+        # both landing here share one tree, which is how a workspace split becomes a
+        # shared tree nobody notices. An install with no ``workspaces`` section is
+        # the ordinary fresh state and is one workspace, not a collision.
+        report = logger.debug if ws == configured_default else logger.warning
+        report(
+            "workspace %r is not declared in workspaces; falling back to the base "
+            "workspace directory",
+            ws,
+        )
+    dirname = entry.dir if entry is not None and entry.dir else WorkspaceConfig().dir
 
     p = Path(dirname).expanduser()
     if p.is_absolute():
@@ -1613,7 +2074,7 @@ def read_env_file_credential(key: str, env_file: Path | None = None) -> str:
 def inject_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
     """Ensure *env* carries kiro-cli's own model credential (``KIRO_API_KEY``).
 
-    The Docker entrypoint scrubs :data:`_CREDENTIAL_KEYS` out of the gateway's
+    The Docker entrypoint scrubs :data:`CREDENTIAL_KEYS` out of the gateway's
     process environment into the data home's ``.env`` (mode 600) so they never
     reside in a long-lived ``/proc/<pid>/environ``. Every other credential is
     consumed in-process from :meth:`KiroCrewConfig.load_credentials`, but this
@@ -1643,8 +2104,8 @@ def strip_kiro_cli_api_key(env: MutableMapping[str, str]) -> MutableMapping[str,
     raw ``os.environ`` snapshot would ride into an agent process that has no use
     for it.
 
-    "Foreign process" is no longer the right framing for KAS: Crew reaches it
-    through kiro-cli's ACP relay, so the child IS a kiro-cli. The strip still
+    For KAS the child IS a kiro-cli: Crew reaches it through kiro-cli's ACP relay.
+    The strip still
     applies because the v3 engine resolves its tokens either from kiro-cli's
     OIDC store (``--auth-method cli``) or from Crew's own vault over its
     ``_kiro/auth/getAccessToken`` callback, and an API key in its environment
@@ -1763,6 +2224,14 @@ def _subagent_timeout_from(raw: object) -> int:
     """
     value = _safe_int(raw, SUBAGENT_TIMEOUT_SECS, 0, SUBAGENT_TIMEOUT_MAX)
     return value if value == 0 else max(SUBAGENT_TIMEOUT_MIN, value)
+
+
+_DEFAULT_MEMORY_MODES = frozenset({"persistent", "incognito", "temporary"})
+
+
+def _default_memory_mode_from(raw: object) -> str:
+    """Normalize a stored dashboard default without failing open on corruption."""
+    return raw if isinstance(raw, str) and raw in _DEFAULT_MEMORY_MODES else "temporary"
 
 
 # (section, key, min, max) for each bounded field clamped at load time. The
@@ -1977,15 +2446,27 @@ def _clamp_security_bounds(data: dict) -> None:
 def _config_fingerprint() -> tuple:
     """Cheap signature of the config files — changes whenever either is edited.
 
-    Uses st_mtime_ns + st_size + st_mode for both config.json and
-    config.local.json so any edit, truncation, or replacement busts the cache.
-    A missing file contributes a sentinel so create/delete also busts it.
+    Includes replacement identity (device + inode) and change time in addition
+    to mtime, size, and mode. Dashboard/CLI writers publish with atomic rename;
+    on a coarse-timestamp filesystem an Incognito→Temporary replacement can
+    otherwise keep the same mtime and size, making another process's cache look
+    current. A missing file contributes a sentinel so create/delete also busts.
     """
     sig: list = []
     for p in (config_path(), config_local_path()):
         try:
             st = p.stat()
-            sig.append((str(p), st.st_mtime_ns, st.st_size, st.st_mode))
+            sig.append(
+                (
+                    str(p),
+                    st.st_dev,
+                    st.st_ino,
+                    st.st_ctime_ns,
+                    st.st_mtime_ns,
+                    st.st_size,
+                    st.st_mode,
+                )
+            )
         except OSError:
             sig.append((str(p), None))
     return tuple(sig)
@@ -2006,9 +2487,20 @@ def _cached_validated_data(fp: tuple | None = None) -> dict | None:
     return _CONFIG_CACHE.get(fp if fp is not None else _config_fingerprint())
 
 
-def _store_validated_data(data: dict, fp: tuple, sidecar: dict | None = None) -> None:
-    """Cache a deep copy of *data* (+ *sidecar*) under *fp* (see ConfigCache.store)."""
-    _CONFIG_CACHE.store(data, fp, sidecar)
+def _store_validated_data(
+    data: dict,
+    fp: tuple,
+    sidecar: dict | None = None,
+    *,
+    expected_generation: int | None = None,
+) -> None:
+    """Cache validated data unless a write invalidated its disk-read generation."""
+    _CONFIG_CACHE.store(
+        data,
+        fp,
+        sidecar,
+        expected_generation=expected_generation,
+    )
 
 
 #: Sidecar key under which the loader caches the pre-overlay base values of the
@@ -2035,7 +2527,7 @@ def _shadowed_base_sections(base: dict, overlay: dict) -> dict:
 
     Only sections the overlay names are kept (an overlay normally touches a few),
     and only their base copy — the loader already has the merged copy. This rides
-    in the cache sidecar so a cache hit, where the overlay is no longer in scope,
+    in the cache sidecar so a cache hit, where the overlay is not in scope,
     can still capture correctly.
     """
     return {k: copy.deepcopy(base[k]) for k in overlay if k in base}
@@ -2047,6 +2539,1155 @@ def _invalidate_config_cache() -> None:
 
 
 # Compatibility facade: section DTOs remain importable from this module.
+
+
+# Build each section in its own frame: the large inline constructor amplifies
+# line-tracing cost on every load. These helpers create fresh values, never
+# cache configuration, and leave resolution and admission checks unchanged.
+def _build_agent_config(agent_data: dict) -> AgentConfig:
+    return AgentConfig(
+        approval_mode=agent_data.get("approval_mode", "auto"),
+        streaming=agent_data.get("streaming", True),
+        model=agent_data.get("model", DEFAULT_MODEL),
+        role_models=coerce_role_models(agent_data.get("role_models")),
+        role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
+        fallback_model=coerce_fallback_model(agent_data.get("fallback_model", "auto")),
+        refusal_fallback_model=_sections.coerce_refusal_fallback_model(
+            agent_data.get("refusal_fallback_model", "")
+        ),
+        reasoning_effort=agent_data.get("reasoning_effort", ""),
+        provider=agent_data.get("provider", "acp"),
+        mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
+        mcp_quarantine_after_failures=_safe_int(
+            agent_data.get("mcp_quarantine_after_failures", 3), 3
+        ),
+        acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
+        member_acp_backend=_normalize_acp_backend(agent_data.get("member_acp_backend", "kas")),
+        default_agent=agent_data.get("default_agent", ""),
+        sweep_agents_backups=_safe_bool(agent_data.get("sweep_agents_backups", False), False),
+        sandbox=agent_data.get("sandbox", "auto"),
+        sandbox_allow_no_isolation=bool(agent_data.get("sandbox_allow_no_isolation", False)),
+        sandbox_allow_unsandboxed_exec=bool(
+            agent_data.get(
+                "sandbox_allow_unsandboxed_exec",
+                unsandboxed_exec_platform_default(),
+            )
+        ),
+        apps_allow_third_party=_safe_bool(agent_data.get("apps_allow_third_party", False), False),
+        apps_trusted=(
+            [a for a in _trusted if isinstance(a, str) and a]
+            if isinstance(_trusted := agent_data.get("apps_trusted"), list)
+            else []
+        ),
+        apps_trusted_local=(
+            [a for a in _trusted_local if isinstance(a, str) and a]
+            if isinstance(_trusted_local := agent_data.get("apps_trusted_local"), list)
+            else []
+        ),
+        apps_trusted_repositories=(
+            {
+                name: repository
+                for name, repository in _trusted_repositories.items()
+                if isinstance(name, str) and isinstance(repository, str) and name and repository
+            }
+            if isinstance(
+                _trusted_repositories := agent_data.get("apps_trusted_repositories"),
+                dict,
+            )
+            else {}
+        ),
+        apps_ui_stream_timeout_secs=_safe_int(
+            agent_data.get("apps_ui_stream_timeout_secs", 30), 30, 5, 600
+        ),
+        jail=_normalize_jail(agent_data.get("jail", "auto")),
+        dangerously_skip_permissions=_read_skip_permissions(agent_data),
+        yolo_duration=_normalize_yolo_duration(agent_data.get("yolo_duration")),
+        notify_override_expiry=agent_data.get("notify_override_expiry", True),
+        tool_search=bool(agent_data.get("tool_search", True)),
+        tool_search_min_pct=_safe_int(agent_data.get("tool_search_min_pct", 5), 5),
+        tool_search_min_tokens=_safe_int(agent_data.get("tool_search_min_tokens", 50000), 50000),
+        session_sharing=bool(agent_data.get("session_sharing", True)),
+        max_subagents=_safe_int(
+            agent_data.get("max_subagents", 0), 0, 0, SUBAGENT_AUTO_MAX_CEILING
+        ),
+        max_stop_hook_nudges=_safe_int(agent_data.get("max_stop_hook_nudges", 100), 100, 0),
+        subagent_mem_buffer_pct=_safe_int(agent_data.get("subagent_mem_buffer_pct", 20), 20),
+        chat_turn_timeout_secs=_safe_int(
+            agent_data.get("chat_turn_timeout_secs", 14400),
+            14400,
+            CHAT_TURN_TIMEOUT_MIN,
+            CHAT_TURN_TIMEOUT_MAX,
+        ),
+        session_start_timeout_secs=_safe_int(
+            agent_data.get("session_start_timeout_secs", 90),
+            90,
+            SESSION_START_TIMEOUT_MIN,
+            SESSION_START_TIMEOUT_MAX,
+        ),
+        tool_approval_timeout_secs=_safe_int(
+            agent_data.get("tool_approval_timeout_secs", 600),
+            600,
+            TOOL_APPROVAL_TIMEOUT_MIN,
+            TOOL_APPROVAL_TIMEOUT_MAX,
+        ),
+        # Absent means ON. The grant that decides who may reach a peer
+        # session is the AGENT CONFIG, not this switch: the tools come
+        # from the `kirocrew-dashboard` MCP server, so an agent that does
+        # not mount it never has them -- the same rule as every other MCP
+        # server. This stays as a single withdrawal for an operator who
+        # wants the capability gone from every agent at once without
+        # editing each spec, so an EXPLICIT `false` must still disable it.
+        # A present-but-malformed value -- the quoted `"false"` an operator
+        # writes by mistake -- is coerced to False upstream, BEFORE schema
+        # validation, so it cannot ride the missing-field default back to
+        # true; see the normalization above the `_validate_config_data`
+        # call. `_safe_bool` here is the final guard for a real bool.
+        session_control=_safe_bool(agent_data.get("session_control", True), True),
+        # Default true preserves the zero-configuration member-dispatch
+        # grant (today's behaviour) for a MISSING key. A present-but-
+        # malformed value was already coerced to False upstream, BEFORE
+        # schema validation, so it cannot ride the missing-field default
+        # back to true — see the `member_dispatch` normalization above
+        # the `_validate_config_data` call. `_safe_bool` here is the
+        # final guard for a real bool.
+        member_dispatch=_safe_bool(agent_data.get("member_dispatch", True), True),
+        subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
+        subagent_cpu_cost_cores=_safe_float(agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0),
+        subagent_auto_max=_safe_int(
+            agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
+        ),
+        subagent_spawn_stagger_secs=_safe_float(
+            agent_data.get("subagent_spawn_stagger_secs", 0.25), 0.25
+        ),
+        spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
+        resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
+        resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
+        admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
+        # Durable task queue keys, adjacent to admission_gate because a
+        # gated spawn is what the queue defers instead of refusing.
+        task_queue_enabled=_safe_bool(agent_data.get("task_queue_enabled"), True),
+        task_dispatch_window=_safe_int(agent_data.get("task_dispatch_window", 64), 64, 1, 4096),
+        task_store_journal_mode=(
+            str(agent_data.get("task_store_journal_mode") or "auto").lower()
+            if str(agent_data.get("task_store_journal_mode") or "auto").lower()
+            in ("auto", "wal", "delete")
+            else "auto"
+        ),
+        admit_wait_secs=_safe_int(agent_data.get("admit_wait_secs", 30), 30, 1, 3600),
+        start_collect_timeout_secs=_safe_int(
+            agent_data.get("start_collect_timeout_secs", 300), 300, 10, 3600
+        ),
+        # Fairness lanes (taskq/lanes.py): weights shape the share of
+        # picks; the reserve keeps children startable under full parents.
+        lane_weights=(
+            {
+                lane: _safe_int(weight, 1, 1, 64)
+                for lane, weight in _lane_weights.items()
+                if isinstance(lane, str) and lane
+            }
+            if isinstance(_lane_weights := agent_data.get("lane_weights"), dict)
+            else {}
+        ),
+        child_reserve=_safe_int(agent_data.get("child_reserve", 1), 1, 0, 8),
+        # Shared recovery ladder schedule (recovery/policy.py bounds).
+        recovery_backoff_base_secs=_safe_float(
+            agent_data.get("recovery_backoff_base_secs", 2.0), 2.0, 0.1, 60.0
+        ),
+        recovery_backoff_max_secs=_safe_float(
+            agent_data.get("recovery_backoff_max_secs", 120.0), 120.0, 1.0, 3600.0
+        ),
+        # Session-start gate (acp/runtime.py SessionStartGate).
+        session_start_concurrency=_safe_int(
+            agent_data.get("session_start_concurrency", 2), 2, 1, 64
+        ),
+        # Adaptive controller (adaptive/policy.py params_from_config).
+        adaptive_concurrency=_safe_bool(agent_data.get("adaptive_concurrency"), True),
+        adaptive_concurrency_mode=(
+            "fixed" if agent_data.get("adaptive_concurrency_mode") == "fixed" else "aimd"
+        ),
+        adaptive_floor=_safe_int(agent_data.get("adaptive_floor", 1), 1, 1, 64),
+        adaptive_initial=_safe_int(agent_data.get("adaptive_initial", 4), 4, 1, 64),
+        adaptive_slow_start=_safe_bool(agent_data.get("adaptive_slow_start"), True),
+        controller_sample_secs=_safe_int(agent_data.get("controller_sample_secs", 5), 5, 1, 300),
+        # Dependency coordinator (taskq/dependency.py coordinator_from_config).
+        dependency_max_attempts=_safe_int(
+            agent_data.get("dependency_max_attempts", 20), 20, 1, 1000
+        ),
+        dependency_wait_deadline_secs=_safe_int(
+            agent_data.get("dependency_wait_deadline_secs", 3600), 3600, 0, 86400
+        ),
+        dependency_wake_per_tick=_safe_int(
+            agent_data.get("dependency_wake_per_tick", 0), 0, 0, 4096
+        ),
+        dependency_wake_spacing_secs=_safe_float(
+            agent_data.get("dependency_wake_spacing_secs", 1.0), 1.0, 0.0, 60.0
+        ),
+        # Tool-stall watchdog (acp/session_handle.py WatchdogSettings).
+        interactive_command_policy=(
+            "wait" if agent_data.get("interactive_command_policy") == "wait" else "cancel"
+        ),
+        subagent_max_turns=_safe_int(
+            agent_data.get("subagent_max_turns", DEFAULT_SUBAGENT_MAX_TURNS),
+            DEFAULT_SUBAGENT_MAX_TURNS,
+            1,
+            SUBAGENT_MAX_TURNS_CEILING,
+        ),
+        subagent_timeout_secs=_subagent_timeout_from(
+            agent_data.get("subagent_timeout_secs", SUBAGENT_TIMEOUT_SECS)
+        ),
+        subagent_stall_idle_secs=_safe_int(agent_data.get("subagent_stall_idle_secs", 120), 120),
+        completion_keep=_validated_completion_keep(agent_data.get("completion_keep", "head")),
+        completion_keep_chars=_safe_int(
+            agent_data.get("completion_keep_chars", 3000),
+            3000,
+            COMPLETION_KEEP_CHARS_MIN,
+            COMPLETION_KEEP_CHARS_MAX,
+        ),
+        subagent_result_ttl_secs=_safe_int(agent_data.get("subagent_result_ttl_secs", 3600), 3600),
+        # Same band workflows/service.py clamp_run_timeout enforces, so a
+        # hand-edited file and the live-bound setter agree.
+        workflow_run_timeout_secs=_safe_int(
+            agent_data.get("workflow_run_timeout_secs", 3600), 3600, 60, 21600
+        ),
+        subagent_cwd_allowed_roots=(
+            [r for r in _roots if isinstance(r, str)]
+            if isinstance(_roots := agent_data.get("subagent_cwd_allowed_roots"), list)
+            else list(DEFAULT_CWD_ALLOWED_ROOTS)
+        ),
+        log_level=(
+            lvl.upper()
+            if isinstance(lvl := agent_data.get("log_level", "WARNING"), str)
+            else "WARNING"
+        ),
+        bot_name=_sanitize_bot_name(agent_data.get("bot_name", "")),
+        max_channels=agent_data.get("max_channels", 1),
+        max_channel_agents=agent_data.get("max_channel_agents", 3),
+        soft_stop_budget_secs=max(
+            SOFT_STOP_BUDGET_MIN,
+            min(
+                SOFT_STOP_BUDGET_MAX,
+                _safe_float(agent_data.get("soft_stop_budget_secs", 10.0), 10.0),
+            ),
+        ),
+    )
+
+
+def _build_session_config(session_data: dict) -> SessionConfig:
+    return SessionConfig(
+        # The only field in this group whose site had no `_safe_int` at all, so
+        # it is added here for consistency -- but NOT because the type was
+        # unhandled. Verified: on the base revision a hand-edited `"abc"` or
+        # `true` already loaded as the 3600 default, because
+        # `_validate_config_data` runs over the raw dict before section
+        # extraction and owns type handling. What was missing for this field, as
+        # for the other ten, is the RANGE: an int of 999999999 loaded verbatim.
+        timeout_secs=_safe_int(
+            session_data.get("timeout_secs", DEFAULT_SESSION_TIMEOUT),
+            DEFAULT_SESSION_TIMEOUT,
+            SESSION_TIMEOUT_MIN,
+            SESSION_TIMEOUT_MAX,
+        ),
+        empty_response_auto_continue=bool(session_data.get("empty_response_auto_continue", True)),
+        # RANGE-clamped like the other session ints: a hand-edited 0
+        # or 999 must load as a sane budget, never disable recovery or
+        # arm an unbounded ladder. Type handling is owned by
+        # `_validate_config_data` upstream of section extraction. The
+        # bounds are referenced via the module handle rather than
+        # imported: this module's top-level names are a FROZEN
+        # compatibility facade (test_loader_reexports_historical
+        # _snapshot_by_identity), so a new re-export may not be added.
+        empty_response_max_continues=_safe_int(
+            session_data.get("empty_response_max_continues", 1),
+            1,
+            _sections.EMPTY_RESPONSE_MAX_CONTINUES_MIN,
+            _sections.EMPTY_RESPONSE_MAX_CONTINUES_MAX,
+        ),
+        autocompact_pct=_safe_float(
+            session_data.get("autocompact_pct", DEFAULT_AUTOCOMPACT_PCT),
+            DEFAULT_AUTOCOMPACT_PCT,
+            lo=AUTOCOMPACT_PCT_MIN,
+            hi=AUTOCOMPACT_PCT_MAX,
+        ),
+        pool_size=_safe_int(
+            session_data.get("pool_size", DEFAULT_POOL_SIZE),
+            DEFAULT_POOL_SIZE,
+            0,
+            POOL_SIZE_MAX,
+        ),
+        pool_agent=str(session_data.get("pool_agent", "")),
+        pool_ttl_secs=_safe_int(
+            session_data.get("pool_ttl_secs", 1800),
+            1800,
+            POOL_TTL_SECS_MIN,
+            POOL_TTL_SECS_MAX,
+        ),
+        eager_spawn=bool(session_data.get("eager_spawn", True)),
+        archive_retention_days=_archive_retention_days(session_data),
+        watchdog_rss_max_mb=_safe_int(
+            session_data.get("watchdog_rss_max_mb", _sections.DEFAULT_WATCHDOG_RSS_MAX_MB),
+            _sections.DEFAULT_WATCHDOG_RSS_MAX_MB,
+        ),
+    )
+
+
+def _build_taskrunner_config(taskrunner_data: dict) -> TaskRunnerConfig:
+    return TaskRunnerConfig(
+        max_parallel_steps=taskrunner_data.get("max_parallel_steps", DEFAULT_MAX_PARALLEL_STEPS),
+        workspace_dir=str(taskrunner_data.get("workspace_dir", "")),
+    )
+
+
+def _build_cron_history_config(cron_history_data: dict) -> CronHistoryConfig:
+    return CronHistoryConfig(
+        cron_summary_cap=_safe_int(cron_history_data.get("cron_summary_cap", 200), 200),
+        cron_trace_cap_kb=_safe_int(cron_history_data.get("cron_trace_cap_kb", 50), 50),
+        cron_max_records_per_job=_safe_int(
+            cron_history_data.get("cron_max_records_per_job", 100), 100
+        ),
+        cron_max_index_records=_safe_int(
+            cron_history_data.get("cron_max_index_records", 2000), 2000
+        ),
+    )
+
+
+def _build_messaging_config(messaging_data: dict) -> MessagingConfig:
+    return MessagingConfig(
+        use_transport=bool(messaging_data.get("use_transport", True)),
+        dm_scope=str(messaging_data.get("dm_scope", "per-channel-peer")),
+        idle_reset_minutes=_coerce_int(messaging_data.get("idle_reset_minutes"), 0),
+        daily_reset_hour=_coerce_int(messaging_data.get("daily_reset_hour"), -1),
+        queue_mode=str(messaging_data.get("queue_mode", "steer")),
+    )
+
+
+def _build_orchestrator_config(orchestrator_data: dict) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        stage_timeout_seconds=_safe_int(orchestrator_data.get("stage_timeout_seconds", 1800), 1800),
+        # Default read off the dataclass rather than imported: the loader's
+        # re-export list from config.sections is a frozen boundary snapshot
+        # (test_config_module_boundaries), and this keeps
+        # DEFAULT_MAX_PLAN_DURATION as the single source of truth without
+        # adding an alias to it.
+        max_plan_duration_seconds=_safe_int(
+            orchestrator_data.get(
+                "max_plan_duration_seconds",
+                OrchestratorConfig.max_plan_duration_seconds,
+            ),
+            OrchestratorConfig.max_plan_duration_seconds,
+        ),
+    )
+
+
+def _build_watchdog_config(watchdog_data: dict) -> WatchdogConfig:
+    return WatchdogConfig(
+        check_after_secs=_safe_float(watchdog_data.get("check_after_secs", 60.0), 60.0),
+        stale_window_secs=_safe_float(watchdog_data.get("stale_window_secs", 600.0), 600.0),
+        tool_stall_suspect_secs=_safe_float(
+            watchdog_data.get("tool_stall_suspect_secs", 5400.0), 5400.0
+        ),
+        tool_stall_hard_cap_secs=_safe_float(
+            watchdog_data.get("tool_stall_hard_cap_secs", 7200.0), 7200.0
+        ),
+        model_silent_probe_secs=_safe_float(
+            watchdog_data.get("model_silent_probe_secs", 1800.0), 1800.0
+        ),
+        wellness_sample_secs=_safe_float(watchdog_data.get("wellness_sample_secs", 3.0), 3.0),
+    )
+
+
+def _build_telemetry_config(telemetry_data: dict) -> TelemetryConfig:
+    return TelemetryConfig(
+        enabled=bool(telemetry_data.get("enabled", False)),
+        local_dir=str(telemetry_data.get("local_dir", "")),
+        export_interval_seconds=_safe_int(telemetry_data.get("export_interval_seconds", 60), 60),
+        retention_days=_safe_int(telemetry_data.get("retention_days", 0), 0),
+        max_total_mb=_safe_int(telemetry_data.get("max_total_mb", 0), 0),
+        otlp_endpoint=str(telemetry_data.get("otlp_endpoint", "")),
+        beacon_enabled=bool(telemetry_data.get("beacon_enabled", True)),
+        beacon_endpoint=str(telemetry_data.get("beacon_endpoint", _DEFAULT_BEACON_ENDPOINT)),
+    )
+
+
+def _build_memory_config(memory_data: dict) -> MemoryConfig:
+    return MemoryConfig(
+        embedding_provider=_coerce_embedding_provider(
+            memory_data.get("embedding_provider", "llama_cpp")
+        ),
+        embedding_dim=memory_data.get("embedding_dim", 1024),
+        embedding_threads=_safe_int(memory_data.get("embedding_threads", 4), 4, 1, 256),
+        # 0 is the documented "inherit embedding_threads" sentinel, so the
+        # floor is 0 rather than 1 — clamping it to 1 would erase a
+        # deliberate opt-in to the interactive pool.
+        embedding_bulk_threads=_safe_int(memory_data.get("embedding_bulk_threads", 1), 1, 0, 256),
+        embedding_bulk_duty=_safe_float(
+            memory_data.get("embedding_bulk_duty", 0.2), 0.2, 0.05, 1.0
+        ),
+        embed_model_url=memory_data.get("embed_model_url", ""),
+        embed_model_path=memory_data.get("embed_model_path", ""),
+        embed_model_id=memory_data.get("embed_model_id", ""),
+        embed_model_stamp=memory_data.get("embed_model_stamp", []),
+        embed_model_legacy_ids=memory_data.get("embed_model_legacy_ids", []),
+        embed_rebuild_generation=memory_data.get("embed_rebuild_generation", ""),
+        semantic_confidence_threshold=_safe_float(
+            memory_data.get("semantic_confidence_threshold", 0.8), 0.8, 0.0, 1.0
+        ),
+        episodic_dedup_threshold=_safe_float(
+            memory_data.get("episodic_dedup_threshold", 0.88), 0.88, 0.0, 1.0
+        ),
+        episodic_max_results=_safe_int(memory_data.get("episodic_max_results", 8), 8, 1, None),
+        episodic_max_count=_safe_int(
+            memory_data.get("episodic_max_count", 10_000), 10_000, 0, None
+        ),
+        decay_rates=(dr if isinstance(dr := memory_data.get("decay_rates", {}), dict) else {}),
+        semantic_keys=memory_data.get("semantic_keys", []),
+        history_idle_hours=memory_data.get("history_idle_hours", 3.0),
+        history_max_days=_safe_nonnegative_int(memory_data.get("history_max_days", 365), 365),
+        backup_enabled=_safe_bool(memory_data.get("backup_enabled", True), True),
+        backup_keep=_safe_int(memory_data.get("backup_keep", 7), 7, 1, None),
+        migrated=memory_data.get("migrated", False),
+    )
+
+
+def _build_knowledge_config(knowledge_data: dict) -> KnowledgeConfig:
+    return KnowledgeConfig(
+        auto_ingest_artifacts=bool(knowledge_data.get("auto_ingest_artifacts", False)),
+        auto_ingest_artifact_kinds=[
+            k
+            for k in knowledge_data.get(
+                "auto_ingest_artifact_kinds",
+                DEFAULT_AUTO_INGEST_ARTIFACT_KINDS,
+            )
+            if isinstance(k, str)
+        ],
+        max_ingest_file_mb=(
+            float(mb)
+            if isinstance(
+                (mb := knowledge_data.get("max_ingest_file_mb", 100.0)),
+                (int, float),
+            )
+            and not isinstance(mb, bool)
+            and mb >= 0
+            else 100.0
+        ),
+        embed_timeout_secs=_safe_float(knowledge_data.get("embed_timeout_secs", 10.0), 10.0),
+        embed_content_budget=_safe_int(knowledge_data.get("embed_content_budget", 0), 0),
+        pool_idle_ttl_secs=_safe_nonnegative_int(
+            knowledge_data.get("pool_idle_ttl_secs", 300),
+            300,
+        ),
+        auto_add_documents=_read_auto_add_documents(knowledge_data),
+        folder_ingest_chunk_budget=_safe_nonnegative_int(
+            knowledge_data.get("folder_ingest_chunk_budget", 300),
+            300,
+            FOLDER_INGEST_CHUNK_BUDGET_MAX,
+        ),
+        dedup_every_n_sweeps=_safe_nonnegative_int(
+            knowledge_data.get("dedup_every_n_sweeps", 12),
+            12,
+            DEDUP_EVERY_N_SWEEPS_MAX,
+        ),
+        doc_ingest_hosts=[
+            str(h)
+            for h in knowledge_data.get("doc_ingest_hosts", [])
+            if isinstance(h, str) and h.strip()
+        ],
+        sweep_chunk_budget=_safe_nonnegative_int(
+            knowledge_data.get("sweep_chunk_budget", 500),
+            500,
+            SWEEP_CHUNK_BUDGET_MAX,
+        ),
+        import_chunk_budget=_safe_nonnegative_int(
+            knowledge_data.get("import_chunk_budget", 0),
+            0,
+            IMPORT_CHUNK_BUDGET_MAX,
+        ),
+        embed_rate_limit=_safe_nonnegative_int(
+            knowledge_data.get("embed_rate_limit", 120), 120, EMBED_RATE_LIMIT_MAX
+        ),
+        extraction_model=str(knowledge_data.get("extraction_model", "")).strip(),
+        extraction_pool_size=max(
+            EXTRACTION_POOL_SIZE_MIN,
+            min(
+                EXTRACTION_POOL_SIZE_MAX,
+                _safe_nonnegative_int(knowledge_data.get("extraction_pool_size", 3), 3),
+            ),
+        ),
+    )
+
+
+def _build_telegram_config(telegram_data: dict) -> TelegramConfig:
+    return TelegramConfig(
+        session_folder=_coerce_session_folder(telegram_data.get("session_folder")),
+        enabled=bool(telegram_data.get("enabled", False)),
+        bot_token=str(telegram_data.get("bot_token", "")),
+        allowed_user_ids=_coerce_int_ids(telegram_data.get("allowed_user_ids")),
+        soft_threshold_pct=_threshold_pct(telegram_data.get("soft_threshold_pct"), 80),
+        show_thinking=bool(telegram_data.get("show_thinking", False)),
+        allow_forum=bool(telegram_data.get("allow_forum", False)),
+        voice_replies=bool(telegram_data.get("voice_replies", False)),
+        forum_activation=_validate_telegram_activation(
+            str(telegram_data.get("forum_activation", "") or ACTIVATION_ALWAYS)
+        ),
+        allowed_forum_chat_ids=_coerce_int_ids(telegram_data.get("allowed_forum_chat_ids")),
+        accounts=_parse_telegram_accounts(telegram_data.get("accounts")),
+    )
+
+
+def _build_weixin_config(weixin_data: dict) -> WeixinConfig:
+    return WeixinConfig(
+        session_folder=_coerce_session_folder(weixin_data.get("session_folder")),
+        enabled=bool(weixin_data.get("enabled", False)),
+        token=str(weixin_data.get("token", "")),
+        account_id=str(weixin_data.get("account_id", "")),
+        base_url=str(weixin_data.get("base_url", "") or "https://ilinkai.weixin.qq.com"),
+        dm_policy=str(weixin_data.get("dm_policy", "allowlist") or "allowlist"),
+        allowed_user_ids=_coerce_opaque_str_ids(weixin_data.get("allowed_user_ids")),
+        soft_threshold_pct=_threshold_pct(weixin_data.get("soft_threshold_pct"), 80),
+        hard_threshold_pct=_threshold_pct(weixin_data.get("hard_threshold_pct"), 95),
+    )
+
+
+def _build_whatsapp_config(whatsapp_data: dict) -> WhatsAppConfig:
+    return WhatsAppConfig(
+        session_folder=_coerce_session_folder(whatsapp_data.get("session_folder")),
+        enabled=bool(whatsapp_data.get("enabled", False)),
+        dm_policy=str(whatsapp_data.get("dm_policy", "self") or "self"),
+        allowed_wa_ids=_coerce_str_ids(whatsapp_data.get("allowed_wa_ids")),
+        groups=_coerce_whatsapp_groups(whatsapp_data.get("groups")),
+        db_path=str(whatsapp_data.get("db_path", "")),
+        soft_threshold_pct=_threshold_pct(whatsapp_data.get("soft_threshold_pct"), 80),
+        hard_threshold_pct=_threshold_pct(whatsapp_data.get("hard_threshold_pct"), 95),
+    )
+
+
+def _build_discord_config(discord_data: dict) -> DiscordConfig:
+    return DiscordConfig(
+        session_folder=_coerce_session_folder(discord_data.get("session_folder")),
+        enabled=bool(discord_data.get("enabled", False)),
+        bot_token=str(discord_data.get("bot_token", "")),
+        # Discord user IDs are numeric snowflakes that exceed 2^53 —
+        # keep them as strings (JSON round-trip safe, matches the
+        # transport's string comparison).
+        allowed_user_ids=_coerce_str_ids(discord_data.get("allowed_user_ids")),
+        allowed_thread_ids=_coerce_str_ids(discord_data.get("allowed_thread_ids")),
+        allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
+        auto_thread=bool(discord_data.get("auto_thread", True)),
+        soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),
+        reactions_enabled=bool(discord_data.get("reactions_enabled", True)),
+        show_thinking=bool(discord_data.get("show_thinking", False)),
+    )
+
+
+def _build_webex_config(webex_data: dict) -> WebexConfig:
+    return WebexConfig(
+        session_folder=_coerce_session_folder(webex_data.get("session_folder")),
+        enabled=bool(webex_data.get("enabled", False)),
+        bot_token=str(webex_data.get("bot_token", "")),
+        allowed_emails=(
+            [e for e in webex_data.get("allowed_emails", []) if isinstance(e, str) and e]
+            if isinstance(webex_data.get("allowed_emails", []), list)
+            else []
+        ),
+        # Group spaces are a SECURITY decision, so the read is as explicit
+        # as the write: a field the loader forgets is not merely lost, it
+        # silently reverts to the safe default on the next restart while
+        # the settings panel keeps showing the saved value it read from
+        # config.json — the operator sees an enabled space allow-list and
+        # the gateway answers nobody.
+        allow_group_rooms=bool(webex_data.get("allow_group_rooms", False)),
+        allowed_room_ids=[
+            r for r in _safe_list(webex_data.get("allowed_room_ids")) if isinstance(r, str) and r
+        ],
+        reply_in_thread=bool(webex_data.get("reply_in_thread", True)),
+        wdm_base=str(webex_data.get("wdm_base", "") or ""),
+        soft_threshold_pct=_threshold_pct(webex_data.get("soft_threshold_pct"), 80),
+        hard_threshold_pct=_threshold_pct(webex_data.get("hard_threshold_pct"), 95),
+    )
+
+
+def _build_wakatime_config(wakatime_data: dict) -> WakaTimeConfig:
+    return WakaTimeConfig(
+        enabled=bool(wakatime_data.get("enabled", False)),
+        api_base_url=str(wakatime_data.get("api_base_url", "") or ""),
+    )
+
+
+def _build_imessage_config(imessage_data: dict) -> IMessageConfig:
+    return IMessageConfig(
+        session_folder=_coerce_session_folder(imessage_data.get("session_folder")),
+        enabled=bool(imessage_data.get("enabled", False)),
+        db_path=str(imessage_data.get("db_path", "")),
+        allowed_handles=[
+            h for h in _safe_list(imessage_data.get("allowed_handles")) if isinstance(h, str) and h
+        ],
+        service=str(imessage_data.get("service", "") or "imessage"),
+        soft_threshold_pct=_threshold_pct(imessage_data.get("soft_threshold_pct"), 80),
+        hard_threshold_pct=_threshold_pct(imessage_data.get("hard_threshold_pct"), 95),
+    )
+
+
+def _build_teams_config(teams_data: dict) -> TeamsConfig:
+    return TeamsConfig(
+        session_folder=_coerce_session_folder(teams_data.get("session_folder")),
+        enabled=bool(teams_data.get("enabled", False)),
+        app_id=str(teams_data.get("app_id", "")),
+        # Secret is env-only (MICROSOFT_APP_PASSWORD). Never sourced from
+        # config.json, which the agent can read — keeps the Azure Bot
+        # credential out of any agent-readable file.
+        app_password="",
+        tenant_id=str(teams_data.get("tenant_id", "")),
+        allowed_emails=(
+            [e for e in teams_data.get("allowed_emails", []) if isinstance(e, str) and e]
+            if isinstance(teams_data.get("allowed_emails", []), list)
+            else []
+        ),
+        soft_threshold_pct=_threshold_pct(teams_data.get("soft_threshold_pct"), 80),
+        hard_threshold_pct=_threshold_pct(teams_data.get("hard_threshold_pct"), 95),
+    )
+
+
+def _build_slack_config(slack_data: dict) -> SlackConfig:
+    return SlackConfig(
+        session_folder=_coerce_session_folder(slack_data.get("session_folder")),
+        allowed_users=[
+            u
+            for u in slack_data.get("allowed_users", [])
+            if isinstance(u, dict) and u.get("slack_id")
+        ],
+        tracking_channels=_validate_tracking_channels(slack_data.get("tracking_channels", [])),
+        open_channels=[c for c in slack_data.get("open_channels", []) if isinstance(c, str)],
+        command=slack_data.get("command", "kirocrew"),
+        forward_to_agent_callback=str(slack_data.get("forward_to_agent_callback") or "").strip(),
+        trusted_bot_ids={
+            b for b in _safe_list(slack_data.get("trusted_bot_ids")) if isinstance(b, str)
+        },
+        trusted_bot_turn_limit=_safe_int(slack_data.get("trusted_bot_turn_limit", 5), 5, lo=1),
+        allowed_enterprise_ids=[
+            e
+            for e in slack_data.get("allowed_enterprise_ids", [])
+            if isinstance(e, str) and (e.startswith("E") or e.startswith("T"))
+        ],
+        reactions={
+            k: v
+            for k, v in _safe_dict(slack_data.get("reactions")).items()
+            if isinstance(k, str) and (v is None or (isinstance(v, str) and v))
+        },
+        reactions_enabled=bool(slack_data.get("reactions_enabled", True)),
+        use_tunnel_url=bool(slack_data.get("use_tunnel_url", False)),
+        show_thinking=bool(slack_data.get("show_thinking", True)),
+        home_tab_sessions_per_kind=_safe_int(slack_data.get("home_tab_sessions_per_kind", 5), 5),
+    )
+
+
+def _build_publish_config(_dests_raw: list, publish_data: dict) -> PublishConfig:
+    return PublishConfig(
+        allowed_destinations=[d for d in _dests_raw if isinstance(d, str) and d],
+        relocate_roots=[
+            r for r in publish_data.get("relocate_roots", []) if isinstance(r, str) and r.strip()
+        ],
+    )
+
+
+def _build_wecom_config(wecom_data: dict) -> WeComConfig:
+    return WeComConfig(
+        session_folder=_coerce_session_folder(wecom_data.get("session_folder")),
+        # _safe_bool, not bool(): `bool("false")` is True, so a JSON string
+        # would read the operator's "off" as "on" -- enabling a channel,
+        # or opening it to every org member, from a config value that says the
+        # opposite. A non-bool must read as the default, not as truthy.
+        enabled=_safe_bool(wecom_data.get("enabled"), False),
+        allowed_users=[
+            u
+            for u in _safe_list(wecom_data.get("allowed_users"))
+            if isinstance(u, dict) and u.get("userid")
+        ],
+        allow_all_users=_safe_bool(wecom_data.get("allow_all_users"), False),
+        ws_url=str(wecom_data.get("ws_url", "wss://openws.work.weixin.qq.com")),
+        soft_threshold_pct=_threshold_pct(wecom_data.get("soft_threshold_pct"), 80),
+        hard_threshold_pct=_threshold_pct(wecom_data.get("hard_threshold_pct"), 95),
+    )
+
+
+def _build_feishu_config(feishu_data: dict) -> FeishuConfig:
+    return FeishuConfig(
+        enabled=_safe_bool(feishu_data.get("enabled"), False),
+        allowed_open_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_open_ids")),
+        # Shape-safe coercion rather than bool() / a raw comprehension:
+        # the schema type check already substitutes the default for a
+        # wrong-typed value, and these helpers keep the guarantee local
+        # to the parse (and dedupe + strip the opaque ou_/oc_ ids).
+        allow_group=_safe_bool(feishu_data.get("allow_group"), False),
+        allowed_group_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_group_ids")),
+        soft_threshold_pct=_safe_int(feishu_data.get("soft_threshold_pct", 80), 80),
+        hard_threshold_pct=_safe_int(feishu_data.get("hard_threshold_pct", 95), 95),
+        session_folder=_coerce_session_folder(feishu_data.get("session_folder")),
+    )
+
+
+def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> DashboardConfig:
+    return DashboardConfig(
+        url=dashboard_data.get("url", ""),
+        tailscale=_tailscale_config_from(
+            dashboard_data.get("tailscale"),
+            _degraded,
+            key_present="tailscale" in dashboard_data,
+        ),
+        restore_sessions=dashboard_data.get("restore_sessions", False),
+        qr_session_until_restart=_safe_bool(dashboard_data.get("qr_session_until_restart"), True),
+        qr_session_persist_across_restart=_safe_bool(
+            dashboard_data.get("qr_session_persist_across_restart"), False
+        ),
+        restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
+        surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
+        bot_name=dashboard_data.get("bot_name", ""),
+        avatar=dashboard_data.get("avatar", ""),
+        merge_queued_messages=dashboard_data.get("merge_queued_messages", False),
+        mcp_probe_timeout_secs=_safe_int(
+            dashboard_data.get("mcp_probe_timeout_secs", 15),
+            15,
+            MCP_PROBE_TIMEOUT_MIN,
+            MCP_PROBE_TIMEOUT_MAX,
+        ),
+        loop_stall_exit_after_secs=(
+            None
+            if dashboard_data.get("loop_stall_exit_after_secs") is None
+            else _safe_int(
+                dashboard_data.get("loop_stall_exit_after_secs"),
+                LOOP_STALL_EXIT_AFTER_DEFAULT,
+                LOOP_STALL_EXIT_AFTER_MIN,
+                LOOP_STALL_EXIT_AFTER_MAX,
+            )
+        ),
+        chat_entry_cache_max_entries=_safe_int(
+            dashboard_data.get("chat_entry_cache_max_entries", CHAT_ENTRY_CACHE_ENTRIES_DEFAULT),
+            CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
+            CHAT_ENTRY_CACHE_ENTRIES_MIN,
+            CHAT_ENTRY_CACHE_ENTRIES_MAX,
+        ),
+        chat_entry_cache_max_bytes=_safe_int(
+            dashboard_data.get("chat_entry_cache_max_bytes", CHAT_ENTRY_CACHE_BYTES_DEFAULT),
+            CHAT_ENTRY_CACHE_BYTES_DEFAULT,
+            CHAT_ENTRY_CACHE_BYTES_MIN,
+            CHAT_ENTRY_CACHE_BYTES_MAX,
+        ),
+        cautious_boot=_safe_bool(dashboard_data.get("cautious_boot"), True),
+        auto_open_browser=dashboard_data.get("auto_open_browser", True),
+        prevent_sleep=_safe_bool(dashboard_data.get("prevent_sleep"), False),
+        quick_send=dashboard_data.get("quick_send", False),
+        model_picker_configured=(
+            _safe_bool(dashboard_data.get("model_picker_configured"), False)
+            if "model_picker_configured" in dashboard_data
+            else any(
+                isinstance(raw, str) and raw.strip() not in ("", "auto")
+                for raw in _safe_list(dashboard_data.get("model_picker_hidden_models"))
+            )
+        ),
+        model_picker_hidden_models=list(
+            dict.fromkeys(
+                model
+                for raw in _safe_list(dashboard_data.get("model_picker_hidden_models"))
+                if isinstance(raw, str) and (model := raw.strip()) and model != "auto"
+            )
+        ),
+        session_grid=dashboard_data.get("session_grid", False),
+        mcp_app_panel=dashboard_data.get("mcp_app_panel", False),
+        auto_open_git_panel=_safe_bool(dashboard_data.get("auto_open_git_panel"), False),
+        session_card_source_links=_safe_bool(dashboard_data.get("session_card_source_links"), True),
+        default_memory_mode=_default_memory_mode_from(
+            dashboard_data.get("default_memory_mode", "persistent")
+        ),
+        widget_density=dashboard_data.get("widget_density", "more"),
+        use_builtin_browser=_safe_bool(dashboard_data.get("use_builtin_browser"), True),
+        browser_view_port=_port_or_unset(dashboard_data.get("browser_view_port", 0)),
+        verbosity=dashboard_data.get("verbosity", "default"),
+        link_previews=_safe_bool(dashboard_data.get("link_previews"), False),
+        usage_text_scrape_enabled=_safe_bool(
+            dashboard_data.get("usage_text_scrape_enabled"), False
+        ),
+        tail_fork_enabled=dashboard_data.get("tail_fork_enabled", False),
+        terminal=dashboard_data.get("terminal", {"enabled": True}),
+        default_project=dashboard_data.get("default_project", ""),
+        theme_mode=dashboard_data.get("theme_mode", ""),
+        sso_login_flags=str(dashboard_data.get("sso_login_flags", "")),
+        theme_color=dashboard_data.get("theme_color", ""),
+        language=str(dashboard_data.get("language", "")),
+        recent_tint_count=_safe_int(
+            dashboard_data.get("recent_tint_count", 0),
+            0,
+            RECENT_TINT_COUNT_MIN,
+            RECENT_TINT_COUNT_MAX,
+        ),
+        update_nudge=(
+            dashboard_data.get("update_nudge", {})
+            if isinstance(dashboard_data.get("update_nudge"), dict)
+            else {}
+        ),
+        onboarded=bool(dashboard_data.get("onboarded", False)),
+        import_onboarded=_safe_bool(
+            dashboard_data.get("import_onboarded"),
+            _safe_bool(dashboard_data.get("onboarded"), False),
+        ),
+        # Falls back to `onboarded`: a user who finished first run before
+        # this chapter existed has already reached the product, and
+        # re-gating their heartbeat on a screen they will never be shown
+        # would suppress it forever.
+        privacy_acked=_safe_bool(
+            dashboard_data.get("privacy_acked"),
+            _safe_bool(dashboard_data.get("onboarded"), False),
+        ),
+        user_role=str(dashboard_data.get("user_role", "")),
+        user_role_other=str(dashboard_data.get("user_role_other", "")),
+        user_technical_level=str(dashboard_data.get("user_technical_level", "")),
+        tips_enabled=bool(dashboard_data.get("tips_enabled", True)),
+        feature_videos_enabled=_safe_bool(dashboard_data.get("feature_videos_enabled"), False),
+        feature_videos_cache_max_mb=_safe_float(
+            dashboard_data.get("feature_videos_cache_max_mb", 500.0), 500.0, lo=0.0
+        ),
+        folder_suggestions_enabled=bool(dashboard_data.get("folder_suggestions_enabled", True)),
+        tips_cadence_hours=_safe_float(dashboard_data.get("tips_cadence_hours", 6.0), 6.0, lo=0.0),
+        tips_snooze_hours=_safe_float(dashboard_data.get("tips_snooze_hours", 48.0), 48.0, lo=0.0),
+        tips_recency_decay=_safe_float(
+            dashboard_data.get("tips_recency_decay", 0.6), 0.6, lo=0.0, hi=1.0
+        ),
+        tips_model=str(dashboard_data.get("tips_model", "auto")),
+        tips_explore_ratio=_safe_float(
+            dashboard_data.get("tips_explore_ratio", 0.2), 0.2, lo=0.0, hi=1.0
+        ),
+        gitlab_hosts=_coerce_gitlab_hosts(dashboard_data.get("gitlab_hosts")),
+        jira_hosts=_coerce_jira_hosts(dashboard_data.get("jira_hosts")),
+        link_patterns=_sections._coerce_link_patterns(dashboard_data.get("link_patterns")),
+        jira_auth=[
+            JiraAuthEntry(
+                host=str(entry.get("host", "")),
+                email=str(entry.get("email", "")),
+            )
+            for entry in (dashboard_data.get("jira_auth") or [])
+            if isinstance(entry, dict) and entry.get("host")
+        ],
+    )
+
+
+def _build_tunnel_config(tunnel_data: dict) -> TunnelConfig:
+    return TunnelConfig(
+        enabled=bool(tunnel_data.get("enabled", False)),
+        name_mode=str(tunnel_data.get("name_mode", "username")),
+        name_override=str(tunnel_data.get("name_override", "")),
+    )
+
+
+def _build_stt_config(stt_data: dict) -> SttConfig:
+    return SttConfig(
+        enabled=_safe_bool(stt_data.get("enabled"), True),
+        provider=_validated_stt_provider(stt_data.get("provider", STT_PROVIDER_LOCAL)),
+        model=_validated_stt_model(stt_data.get("model", _STT_DEFAULT_MODEL)),
+        language_code=stt_data.get("language_code", _sections.STT_LANGUAGE_AUTO),
+        streaming=_safe_bool(stt_data.get("streaming"), True),
+        silence_ms=_safe_int(
+            stt_data.get("silence_ms"),
+            _STT_DEFAULT_SILENCE_MS,
+            lo=_STT_MIN_SILENCE_MS,
+            hi=_STT_INTERVAL_MS_MAX,
+        ),
+        partial_interval_ms=_safe_int(
+            stt_data.get("partial_interval_ms"),
+            _STT_DEFAULT_PARTIAL_INTERVAL_MS,
+            lo=_STT_MIN_PARTIAL_INTERVAL_MS,
+            hi=_STT_INTERVAL_MS_MAX,
+        ),
+        idle_evict_secs=_safe_int(
+            stt_data.get("idle_evict_secs"),
+            _STT_DEFAULT_IDLE_EVICT_SECS,
+            lo=_STT_IDLE_EVICT_SECS_MIN,
+            hi=_STT_IDLE_EVICT_SECS_MAX,
+        ),
+        endpointing=_safe_bool(stt_data.get("endpointing"), False),
+        dictation_panel=_safe_bool(stt_data.get("dictation_panel"), True),
+        timeout_secs=_safe_int(
+            stt_data.get("timeout_secs"),
+            _STT_DEFAULT_TIMEOUT_SECS,
+            lo=_STT_MIN_TIMEOUT_SECS,
+            hi=_STT_MAX_TIMEOUT_SECS,
+        ),
+        transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
+        transcribe_profile=stt_data.get("transcribe_profile", ""),
+    )
+
+
+def _build_computer_use_config(computer_use_data: dict) -> ComputerUseConfig:
+    return ComputerUseConfig(
+        max_tree_nodes=min(
+            _CU_MAX_TREE_NODES,
+            max(
+                1,
+                _safe_int(
+                    computer_use_data.get("max_tree_nodes", _CU_DEFAULT_MAX_TREE_NODES),
+                    _CU_DEFAULT_MAX_TREE_NODES,
+                ),
+            ),
+        ),
+        max_tree_depth=min(
+            _CU_MAX_TREE_DEPTH,
+            max(
+                1,
+                _safe_int(
+                    computer_use_data.get("max_tree_depth", _CU_DEFAULT_MAX_TREE_DEPTH),
+                    _CU_DEFAULT_MAX_TREE_DEPTH,
+                ),
+            ),
+        ),
+        text_limit=min(
+            _CU_MAX_TEXT_LIMIT,
+            max(
+                1,
+                _safe_int(
+                    computer_use_data.get("text_limit", _CU_DEFAULT_TEXT_LIMIT),
+                    _CU_DEFAULT_TEXT_LIMIT,
+                ),
+            ),
+        ),
+        attach_screenshot=_safe_bool(
+            computer_use_data.get("attach_screenshot", _CU_DEFAULT_ATTACH_SCREENSHOT),
+            _CU_DEFAULT_ATTACH_SCREENSHOT,
+        ),
+        screenshot_max_px=min(
+            _CU_MAX_SCREENSHOT_MAX_PX,
+            max(
+                _CU_MIN_SCREENSHOT_MAX_PX,
+                _safe_int(
+                    computer_use_data.get("screenshot_max_px", _CU_DEFAULT_SCREENSHOT_MAX_PX),
+                    _CU_DEFAULT_SCREENSHOT_MAX_PX,
+                ),
+            ),
+        ),
+        screenshot_jpeg_quality=min(
+            100,
+            max(
+                1,
+                _safe_int(
+                    computer_use_data.get(
+                        "screenshot_jpeg_quality", _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY
+                    ),
+                    _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY,
+                ),
+            ),
+        ),
+        # Default False: a missing or unparseable value must mean "do not
+        # draw on the operator's screen", never the reverse.
+        cursor_motion=_safe_bool(computer_use_data.get("cursor_motion", False), False),
+    )
+
+
+def _build_mcp_gateway_config(mcp_gateway_data: dict) -> McpGatewayConfig:
+    _spawn_min = max(1, _safe_int(mcp_gateway_data.get("spawn_concurrency_min", 1), 1))
+    _spawn_max = max(_spawn_min, _safe_int(mcp_gateway_data.get("spawn_concurrency_max", 8), 8))
+    return McpGatewayConfig(
+        enabled=bool(mcp_gateway_data.get("enabled", False)),
+        # Absent -> True so installs that never configured this keep
+        # rendering. A malformed value cannot be distinguished here: the
+        # schema validator REMOVES an invalid value before the loader
+        # parses (see config/validation.py ``_apply_field_default``), so a
+        # hand-edited ``"false"`` arrives as absent and resolves to True,
+        # with a warning logged naming the field. ``_safe_bool`` is
+        # belt-and-braces for a schema gap, not the acting guard — the
+        # acting guard against a truthy string is the validator, since
+        # ``bool("false")`` is True. The write path is where an opt-out is
+        # actually enforced: the endpoint rejects any non-boolean body.
+        apps_enabled=_safe_bool(mcp_gateway_data.get("apps_enabled", True), True),
+        # ON by default. The forwarded set is a strict subset of the
+        # hashed set and gatewayd re-hashes the sidecar at spawn,
+        # forwarding nothing on mismatch, so a forwarded key is one every
+        # co-tenant of that backend declared identically. With it off, one
+        # ordinary declared key costs the whole server its pooling.
+        #
+        # Both arguments are True on purpose. A malformed value never
+        # reaches this call: ``config.validation`` type-checks first and
+        # ``_apply_field_default`` strips a non-boolean so the dataclass
+        # default applies, which is why the log says "using default". The
+        # fallback here is defence in depth for a bypassed validator, and
+        # giving it a different answer than the schema would only put two
+        # disagreeing defaults in the file.
+        forward_declared_env=_safe_bool(
+            mcp_gateway_data.get("forward_declared_env", FORWARD_DECLARED_ENV_DEFAULT),
+            FORWARD_DECLARED_ENV_DEFAULT,
+        ),
+        socket_path=str(mcp_gateway_data.get("socket_path", "")),
+        overlay_dir=str(mcp_gateway_data.get("overlay_dir", "")),
+        idle_timeout_secs=max(10, _safe_int(mcp_gateway_data.get("idle_timeout_secs", 300), 300)),
+        # 0 is meaningful (re-resolve every pass), so the floor is 0 and
+        # not the usual "at least something" clamp.
+        resolve_once_refresh_hours=max(
+            0, _safe_int(mcp_gateway_data.get("resolve_once_refresh_hours", 24), 24)
+        ),
+        max_backends=max(1, _safe_int(mcp_gateway_data.get("max_backends", 64), 64)),
+        # Admission keys. Clamps mirror the dataclass defaults: floor
+        # >= 1, ceiling >= floor, initial inside the band; 0 keeps the
+        # "auto" meaning on the host-budget ceilings.
+        spawn_concurrency_min=_spawn_min,
+        spawn_concurrency_max=_spawn_max,
+        spawn_concurrency_initial=min(
+            _spawn_max,
+            max(
+                _spawn_min,
+                _safe_int(mcp_gateway_data.get("spawn_concurrency_initial", 4), 4),
+            ),
+        ),
+        spawn_queue_wait_secs=max(
+            1, _safe_int(mcp_gateway_data.get("spawn_queue_wait_secs", 600), 600)
+        ),
+        initialize_timeout_secs=max(
+            1, _safe_int(mcp_gateway_data.get("initialize_timeout_secs", 10), 10)
+        ),
+        host_budget_max_procs=max(
+            0, _safe_int(mcp_gateway_data.get("host_budget_max_procs", 0), 0)
+        ),
+        host_budget_max_rss_mb=max(
+            0, _safe_int(mcp_gateway_data.get("host_budget_max_rss_mb", 0), 0)
+        ),
+        host_budget_max_fds=max(0, _safe_int(mcp_gateway_data.get("host_budget_max_fds", 0), 0)),
+        poolable_servers=[
+            s for s in mcp_gateway_data.get("poolable_servers", []) if isinstance(s, str)
+        ],
+        stub_servers=_resolve_stub_servers(mcp_gateway_data),
+        # The operator's deviations, kept ALONGSIDE the resolved set above
+        # rather than folded away: ``stub_servers`` here is already the
+        # effective answer, so a writer that wants to record a new
+        # decision needs to see which ones are decisions and which came
+        # from the roster. Shares the resolver with the runtime so a
+        # non-bool value is dropped in exactly one place.
+        stub_overrides=_resolve_stub_overrides(mcp_gateway_data),
+        # The file's own roster, carried so ``save()`` can put it back
+        # instead of flattening it to the effective set above. See the
+        # field's own comment for why that flattening is a data loss.
+        _stub_roster=_resolve_stub_roster(mcp_gateway_data),
+        # Hand-editable list of env NAMES; keep only strings and drop
+        # blanks so a stray null or nested object cannot reach the
+        # hashing layer as a key. Not deduplicated here — every consumer
+        # builds a frozenset from it.
+        pool_identity_env=[
+            s.strip()
+            for s in mcp_gateway_data.get("pool_identity_env", [])
+            if isinstance(s, str) and s.strip()
+        ],
+        prewarm_count=max(0, _safe_int(mcp_gateway_data.get("prewarm_count", 0), 0)),
+        read_buffer_limit_bytes=max(
+            1024,
+            _safe_int(
+                mcp_gateway_data.get("read_buffer_limit_bytes", 64 * 1024 * 1024),
+                64 * 1024 * 1024,
+            ),
+        ),
+        response_spill_threshold_bytes=max(
+            0,
+            _safe_int(
+                mcp_gateway_data.get("response_spill_threshold_bytes", 256 * 1024),
+                256 * 1024,
+            ),
+        ),
+    )
+
+
+def _build_instances_config(
+    connect_timeout_raw: object, instances_data: dict, mint_timeout_raw: object
+) -> InstancesConfig:
+    return InstancesConfig(
+        enabled=bool(instances_data.get("enabled", False)),
+        warm_set_cap=_safe_int(
+            instances_data.get("warm_set_cap", _DEFAULT_WARM_SET_CAP), _DEFAULT_WARM_SET_CAP
+        ),
+        tunnel_base_port=_safe_int(
+            instances_data.get("tunnel_base_port", _DEFAULT_TUNNEL_BASE_PORT),
+            _DEFAULT_TUNNEL_BASE_PORT,
+        ),
+        ssh_compression=bool(instances_data.get("ssh_compression", _DEFAULT_SSH_COMPRESSION)),
+        connect_timeout_secs=(
+            _safe_float(connect_timeout_raw, _DEFAULT_CONNECT_TIMEOUT)
+            if connect_timeout_raw is not None
+            else None
+        ),
+        mint_timeout_secs=(
+            _safe_float(mint_timeout_raw, _DEFAULT_MINT_TIMEOUT)
+            if mint_timeout_raw is not None
+            else None
+        ),
+        max_recovery_attempts=_safe_int(
+            instances_data.get("max_recovery_attempts", _DEFAULT_MAX_RECOVERY),
+            _DEFAULT_MAX_RECOVERY,
+        ),
+        recover_backoff_max_secs=_safe_float(
+            instances_data.get("recover_backoff_max_secs", _DEFAULT_BACKOFF_MAX),
+            _DEFAULT_BACKOFF_MAX,
+        ),
+        probe_failure_threshold=_safe_int(
+            instances_data.get("probe_failure_threshold", _DEFAULT_PROBE_FAILS),
+            _DEFAULT_PROBE_FAILS,
+        ),
+    )
+
+
+def _build_skills_config(skills_data: dict) -> SkillsConfig:
+    # Every default here is READ FROM THE DATACLASS, never written a second time.
+    # A config.json omits any key it predates, so a literal in this function is a
+    # second declaration of the same default that can drift from the first and then
+    # answer with the opposite value, silently, for exactly the installs that have
+    # not touched the setting.
+    d = SkillsConfig()
+    return SkillsConfig(
+        max_triggered=_safe_int(skills_data.get("max_triggered", d.max_triggered), d.max_triggered),
+        lazy_load=_safe_bool(skills_data.get("lazy_load", d.lazy_load), d.lazy_load),
+        auto_create_from_sessions=_safe_bool(
+            skills_data.get("auto_create_from_sessions", d.auto_create_from_sessions),
+            d.auto_create_from_sessions,
+        ),
+        auto_refine_on_deviation=_safe_bool(
+            skills_data.get("auto_refine_on_deviation", d.auto_refine_on_deviation),
+            d.auto_refine_on_deviation,
+        ),
+        auto_min_tool_calls=_safe_int(
+            skills_data.get("auto_min_tool_calls", d.auto_min_tool_calls), d.auto_min_tool_calls
+        ),
+        auto_similarity_threshold=_safe_float(
+            skills_data.get("auto_similarity_threshold", d.auto_similarity_threshold),
+            d.auto_similarity_threshold,
+        ),
+        approval_required=_safe_bool(
+            skills_data.get("approval_required", d.approval_required), d.approval_required
+        ),
+        max_auto_skills=_safe_int(
+            skills_data.get("max_auto_skills", d.max_auto_skills), d.max_auto_skills
+        ),
+        stale_after_days=_safe_int(
+            skills_data.get("stale_after_days", d.stale_after_days), d.stale_after_days
+        ),
+        archive_after_days=_safe_int(
+            skills_data.get("archive_after_days", d.archive_after_days), d.archive_after_days
+        ),
+        pending_ttl_days=_safe_int(
+            skills_data.get("pending_ttl_days", d.pending_ttl_days), d.pending_ttl_days
+        ),
+        generate_scripts=_safe_bool(
+            skills_data.get("generate_scripts", d.generate_scripts), d.generate_scripts
+        ),
+        judge_model=str(skills_data.get("judge_model", d.judge_model) or d.judge_model),
+        extra_paths=[p for p in _safe_list(skills_data.get("extra_paths")) if isinstance(p, str)],
+        # Security off-switch: malformed values must not become truthy
+        # through Python coercion (for example, the string "false").
+        project_skills_enabled=(
+            skills_data.get("project_skills_enabled", d.project_skills_enabled) is True
+        ),
+    )
+
+
+def _build_session_summary_config(session_summary_data: dict) -> SessionSummaryConfig:
+    return SessionSummaryConfig(
+        enabled=bool(session_summary_data.get("enabled", False)),
+        min_user_turns=_safe_int(session_summary_data.get("min_user_turns", 2), 2),
+        regenerate_after_turns=_safe_int(session_summary_data.get("regenerate_after_turns", 1), 1),
+        max_intents=_safe_int(session_summary_data.get("max_intents", 50), 50),
+        max_constraints=_safe_int(session_summary_data.get("max_constraints", 50), 50),
+        assistant_excerpt_chars=_safe_int(
+            session_summary_data.get("assistant_excerpt_chars", 400), 400
+        ),
+    )
 
 
 @dataclass
@@ -2133,6 +3774,26 @@ class KiroCrewConfig:
     heartbeat: HeartbeatConfig = field(
         default_factory=HeartbeatConfig,
         metadata=_meta("Heartbeat", "Heartbeat background task queue delivery defaults."),
+    )
+    monitoring: MonitoringConfig = field(
+        default_factory=MonitoringConfig,
+        metadata=_meta(
+            "Monitoring",
+            "How a session's choice between the two monitoring paths is framed. "
+            "Neither path is gated by this section; both are armable with it at "
+            "its default.",
+        ),
+    )
+    decisions: DecisionsConfig = field(
+        default_factory=DecisionsConfig,
+        metadata=_meta(
+            "Decisions",
+            "Decision seam — typed decisions asked of a System One model at "
+            "named points. Off until the dashboard owner consents in Settings > "
+            "Developer > Feature Previews (the keystone decisions_consent.json, "
+            "not a key here); until then every point returns None with no "
+            "network call and no log write.",
+        ),
     )
     watchdog: WatchdogConfig = field(
         default_factory=WatchdogConfig,
@@ -2299,7 +3960,7 @@ class KiroCrewConfig:
     #: right for an ordinary consumer and dangerous for one reading a SECURITY
     #: value out of a section: a coerced-away section is indistinguishable from
     #: "the operator configured nothing", so a narrowing silently becomes
-    #: allow-all (#4057, and the same shape as #3945).
+    #: allow-all.
     #:
     #: A consumer cannot recover this by re-reading the file, which is why the
     #: signal has to live here: ``load()`` runs a migration that REWRITES
@@ -2362,7 +4023,7 @@ class KiroCrewConfig:
     # an older config written by a newer edition) would otherwise erase the
     # operator's value on the next save() of any kind, with no backup on that
     # path. Shape: {section: {key: value}}. Populated only from disk, and only
-    # ever used to fill a key the emitted section LACKS, so it cannot clobber a
+    # ever fills a key the emitted section LACKS, so it cannot clobber a
     # live value. See resolution.capture_extra_section_keys for what counts as
     # unknown (a schema-modelled key that validation rejected stays dropped).
     _extra_keys: dict = field(default_factory=dict)
@@ -2406,7 +4067,7 @@ class KiroCrewConfig:
         # a config read on that side would stat/read/validate config.json on the
         # loop. Done here rather than inside _load_resolved so EVERY return path
         # publishes -- including the defaults path taken when neither config file
-        # could be read, which must CLEAR a previously published snapshot rather
+        # could be read, which must CLEAR an already-published snapshot rather
         # than leave a deleted directory resolving commands. Lazy import: env
         # must stay off this module's import graph.
         try:
@@ -2423,7 +4084,7 @@ class KiroCrewConfig:
         # config.json itself. Here rather than in _load_resolved so EVERY return
         # path publishes -- including the degraded-defaults path, which must
         # overwrite a richer previous snapshot rather than leave the resolver
-        # honoring aliases that no longer load.
+        # honoring aliases that do not load.
         try:
             publish_agent_alias_snapshot(cfg)
         except Exception as e:  # pragma: no cover - defensive
@@ -2491,14 +4152,24 @@ class KiroCrewConfig:
         # disk path below; read from the sidecar on a cache hit. Empty when there
         # is no overlay, in which case the merged document IS the base.
         base_shadow: dict = {}
+        # Bound BEFORE the cache branch, because only the reading branch can decide
+        # an adoption: a cache HIT means no base document was read this load, and a
+        # load that did not look at the file must not adopt from it. Empty is
+        # therefore the correct answer on the hot path, not a missing one -- the load
+        # that populated the cache already adopted.
+        adoptable: list[SupersededDefault] = []
         if cached is not None:
             data, sidecar = cached
             base_shadow = sidecar.get(_SIDECAR_BASE_SHADOW, {})
         else:
+            # Capture the invalidation generation BEFORE disk I/O. A successful
+            # write advances it, so this read cannot repopulate pre-write data
+            # after the writer clears the cache even if the filesystem's coarse
+            # timestamp and unchanged size leave the fingerprint identical.
+            read_generation = _CONFIG_CACHE.generation()
             # fp was captured BEFORE reading, so a write landing during the read
-            # is detected: we cache under it, it won't match the post-write
-            # on-disk stat, and the next load() re-reads instead of serving
-            # content read mid-write (read->store TOCTOU).
+            # is detected: the fingerprint normally changes, and the generation
+            # fence covers filesystems where a same-size replacement does not.
             # _store_validated_data documents this contract.
             pre_read_fp = fp
             data = {}
@@ -2519,15 +4190,25 @@ class KiroCrewConfig:
                     logger.warning("Failed to load config from %s: %s", path, e)
                     _mark_file_degraded(path)
 
-            # Report -- never correct -- a stored BASE value that still holds a
-            # superseded default (issue #5244), before the overlay merge below:
-            # the overlay is the operator's live choice and says nothing about
-            # what the base materialized. Read-only by design; a key with a
-            # documented escape hatch cannot be corrected automatically, because
-            # a stale default and a deliberate opt-out are the same bytes.
-            # Skipped when no base file loaded -- nothing is stored to report on.
+            # Report -- and, for the entries that opt in, ADOPT -- a stored BASE
+            # value that still holds a superseded default, before the overlay merge
+            # below: the overlay is the operator's live choice and says nothing about
+            # what the base materialized.
+            #
+            # The two halves differ in what they may touch. Reporting is read-only
+            # and covers every drifted key, because a key with a documented escape
+            # hatch cannot be corrected automatically -- a stale default and a
+            # deliberate opt-out are the same bytes. Adoption covers only the
+            # entries whose ``auto_adopt`` says the value has no second meaning, and
+            # happens at most once per key per install; ``auto_adoptable`` owns both
+            # filters plus the acknowledgment one.
+            #
+            # Skipped when no base file loaded -- nothing is stored to adopt or
+            # report on.
+            adoptable = []
             if loaded_base:
-                _report_superseded_defaults(data)
+                adoptable = auto_adoptable(data)
+                _report_superseded_defaults(data, skip={e.dotted_key for e in adoptable})
 
             # Deep-merge config.local.json overlay (user-owned, never touched by setup)
             local_data: dict = {}
@@ -2580,8 +4261,13 @@ class KiroCrewConfig:
                 # genuinely absent one, and the two are opposite claims for a
                 # security gate: "the operator configured nothing" versus "we
                 # could not read what they configured". Carry the observation
-                # through so the caller can tell them apart (#4057).
+                # through so the caller can tell them apart.
                 cfg = cls(_degraded_sections=frozenset(_OBSERVED_DEGRADED_SECTIONS))
+                if (
+                    DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
+                    or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
+                ):
+                    cfg.dashboard.default_memory_mode = "temporary"
                 cfg.skills.project_skills_enabled = (
                     data.get("skills", {}).get("project_skills_enabled", True) is True
                 )
@@ -2611,19 +4297,49 @@ class KiroCrewConfig:
                 data["resource_limits"] = asdict(
                     ResourceLimitsConfig.from_raw(data["resource_limits"])
                 )
-            # Same fail-closed-before-validation reason for the member-dispatch
-            # ceiling. `agent.member_dispatch` gates whether a crew member
-            # bypasses `session_control`; its safe direction is FALSE (bypass
-            # off). Schema validation pops a present-but-malformed value and the
-            # missing-field default is TRUE, so a quoted `"false"` — a routine
-            # operator quoting mistake — would silently ride that default back
-            # to an authorized bypass. Coerce a present non-bool to False HERE,
-            # so validation sees a valid bool and keeps it; a genuinely absent
-            # key is left absent and still defaults to true (today's behaviour).
+            # Same fail-closed-before-validation reason for the two agent
+            # switches whose safe direction is FALSE.
+            # `agent.session_control` is the operator's single withdrawal of
+            # cross-session control, and `agent.member_dispatch` gates whether
+            # a crew member bypasses that withdrawal. Schema validation pops a
+            # present-but-malformed value and the missing-field default is TRUE
+            # for both, so a quoted `"false"` — a routine operator quoting
+            # mistake — would silently ride that default back to the
+            # capability staying enabled. Coerce a present non-bool to False
+            # HERE, so validation sees a valid bool and keeps it; a genuinely
+            # absent key is left absent and still defaults to true (today's
+            # behaviour). One loop, so neither switch can keep the guard while
+            # the other loses it.
+            #
+            # Say so out loud. The coercion resolves a malformed value one way,
+            # and an operator who meant the other way has no other signal:
+            # validation sees the repaired bool and stays quiet. The line names
+            # the key, the type it found and the JSON it wanted, so the fix is
+            # the next thing the operator does rather than a capability they
+            # find missing later.
             _agent_section = data.get("agent")
-            if isinstance(_agent_section, dict) and "member_dispatch" in _agent_section:
-                if not isinstance(_agent_section["member_dispatch"], bool):
-                    _agent_section["member_dispatch"] = False
+            if isinstance(_agent_section, dict):
+                for _fail_closed_key in ("session_control", "member_dispatch"):
+                    if _fail_closed_key in _agent_section and not isinstance(
+                        _agent_section[_fail_closed_key], bool
+                    ):
+                        logger.warning(
+                            "agent.%s is %s, not a boolean; reading it as the safe "
+                            "value false (the capability is OFF). Write true or false "
+                            "without quotes to choose.",
+                            _fail_closed_key,
+                            type(_agent_section[_fail_closed_key]).__name__,
+                        )
+                        _agent_section[_fail_closed_key] = False
+            # Keep a genuinely absent default backward-compatible with older
+            # configs, but normalize a PRESENT malformed value before advisory
+            # schema validation can delete it and turn corruption into the
+            # missing-field Persistent default.
+            _dashboard_section = data.get("dashboard")
+            if isinstance(_dashboard_section, dict) and "default_memory_mode" in _dashboard_section:
+                _dashboard_section["default_memory_mode"] = _default_memory_mode_from(
+                    _dashboard_section["default_memory_mode"]
+                )
             # Validate against JSON Schema (advisory — never fatal)
             _validate_config_data(data)
             # Clamp security-relevant resource-limit knobs to their API ceilings
@@ -2631,11 +4347,17 @@ class KiroCrewConfig:
             # exceeds a ceiling cannot drive resource exhaustion (DoS). Runs only
             # on the disk-read path; cache hits below already serve clamped values.
             _clamp_security_bounds(data)
-            # Cache the validated, merged dict under the PRE-read fingerprint so
-            # a mid-read write self-heals (next load misses and re-reads). The
-            # base shadow rides along so a hit can capture unknown keys from the
-            # base document exactly as this disk read did.
-            _store_validated_data(data, pre_read_fp, {_SIDECAR_BASE_SHADOW: base_shadow})
+            # Cache under the PRE-read fingerprint and generation. A mid-read
+            # write either changes the fingerprint or advances the generation;
+            # both paths force the next load to re-read. The base shadow rides
+            # along so a hit can capture unknown keys from the base document
+            # exactly as this disk read did.
+            _store_validated_data(
+                data,
+                pre_read_fp,
+                {_SIDECAR_BASE_SHADOW: base_shadow},
+                expected_generation=read_generation,
+            )
 
         # Collected during the parse that discards them — the only moment the
         # evidence exists, since the migration below rewrites config.json in
@@ -2659,7 +4381,7 @@ class KiroCrewConfig:
         slack_data = _coerced_section(data, "slack", _degraded)
         publish_data = _coerced_section(data, "publish", _degraded)
         # A malformed allowed_destinations is the same class as a malformed
-        # section one level down (#4057), in two shapes. A non-LIST value:
+        # section one level down, in two shapes. A non-LIST value:
         # iterating it either crashes load() with a TypeError (a scalar — a
         # config typo must not abort gateway startup) or yields garbage (a
         # dict iterates as its keys, a string as its characters). A list with
@@ -2701,6 +4423,17 @@ class KiroCrewConfig:
         _wecom_key = "wecom" if "wecom" in data else "wechat"
         wecom_data = _coerced_section(data, _wecom_key, _degraded)
         dashboard_data = _coerced_section(data, "dashboard", _degraded)
+        # Persistent is the compatibility default only when a readable config
+        # genuinely omits this field. If the dashboard section or either config
+        # file was unreadable, the missing value may have been a privacy choice
+        # we could not recover, so new chats must fail closed to Temporary until
+        # the operator fixes the file and restarts the gateway.
+        if (
+            "dashboard" in _degraded
+            or "dashboard" in _OBSERVED_DEGRADED_SECTIONS
+            or DEGRADED_WHOLE_CONFIG in _OBSERVED_DEGRADED_SECTIONS
+        ):
+            dashboard_data["default_memory_mode"] = "temporary"
         stt_data = _coerced_section(data, "stt", _degraded)
         computer_use_data = _coerced_section(data, "computer_use", _degraded)
         instances_data = _coerced_section(data, "instances", _degraded)
@@ -2714,6 +4447,19 @@ class KiroCrewConfig:
         )
         if heartbeat_default_deliver not in ("slack", "dashboard"):
             heartbeat_default_deliver = "slack"
+        # A stored document written before this key existed has no "monitoring"
+        # object at all, and that is the case that must keep working: the miss
+        # resolves to the dataclass default, which is the off position. So an
+        # already-installed gateway needs nothing written to be correct here --
+        # only a gateway that wants the key ON writes it, and Settings does
+        # that. (The hazard this avoids belongs to a SHIPPED DEFAULT that
+        # CHANGES: config.json materializes every key, so the stored value
+        # outranks the new default forever. Adding a key has no stored value to
+        # outrank it.)
+        monitoring_data = _coerced_section(data, "monitoring", _degraded)
+        monitoring_prefer_structured_arming = _safe_bool(
+            monitoring_data.get("prefer_structured_arming"), False
+        )
         tunnel_data = _coerced_section(data, "tunnel", _degraded)
         skills_data = _coerced_section(data, "skills", _degraded)
         session_summary_data = _coerced_section(data, "session_summary", _degraded)
@@ -2721,6 +4467,7 @@ class KiroCrewConfig:
         telemetry_data = _coerced_section(data, "telemetry", _degraded)
         orchestrator_data = _coerced_section(data, "orchestrator", _degraded)
         watchdog_data = _coerced_section(data, "watchdog", _degraded)
+        decisions_data = _coerced_section(data, "decisions", _degraded)
         resource_limits_data = _coerced_section(data, "resource_limits", _degraded)
 
         # Parse agents section into dict[str, KiroCrewAgentConfig]
@@ -2739,6 +4486,7 @@ class KiroCrewConfig:
                     # not survive load — select_crew's roster calls .strip() on it.
                     raw_triggers = entry.get("triggers", "")
                     agents[name] = KiroCrewAgentConfig(
+                        member_id=entry.get("member_id", ""),
                         kiro_agent=entry.get("kiro_agent", ""),
                         workspace=entry.get("workspace", "default"),
                         memory_store=entry.get("memory_store", "default"),
@@ -2781,26 +4529,62 @@ class KiroCrewConfig:
             raw_workspaces = {}
         workspaces = _migrate_workspaces(raw_workspaces)
 
-        # Parse memory_stores; synthesize default if missing
+        # Parse memory_stores; synthesize default if missing.
+        #
+        # A store NAME becomes a single path segment under
+        # ``memory_stores.MEMORY_STORES_DIR_NAME``, so the shape rule is applied
+        # here too — at BOOT, where the operator can see it — rather than only at
+        # the first memory write. Reported, never REPAIRED: the entry is kept
+        # verbatim so a ``to_dict()``/``save()`` round-trip cannot erase the
+        # operator's own declaration, and no name is rewritten into a usable one,
+        # because sanitizing ``../work`` or ``Work`` into ``work`` is the one
+        # thing that would merge two crews' memory into one directory.
+        #
+        # Kept, but not usable: ``memory_stores.usable_store_names`` drops a
+        # malformed name from the resolvable set, so a crew bound to it degrades
+        # at ``resolve_agent_bindings`` instead of carrying the name to a
+        # resolver that would raise on it.
         raw_stores = data.get("memory_stores", {})
         memory_stores: dict[str, MemoryStoreConfig] = {}
         if isinstance(raw_stores, dict) and raw_stores:
             for name, entry in raw_stores.items():
-                if isinstance(entry, dict):
-                    memory_stores[name] = MemoryStoreConfig(
-                        description=entry.get("description", ""),
-                        embedding_provider=entry.get("embedding_provider", ""),
+                if not isinstance(entry, dict):
+                    continue
+                defect = memory_store_name_defect(name)
+                if defect is not None:
+                    logger.warning(
+                        "memory_stores: store name %r is unusable (%s); any crew "
+                        "bound to it cannot resolve a memory directory",
+                        name,
+                        defect,
                     )
+                memory_stores[name] = MemoryStoreConfig(
+                    owner_member_id=entry.get("owner_member_id", ""),
+                    description=entry.get("description", ""),
+                    embedding_provider=entry.get("embedding_provider", ""),
+                    owner_member=entry.get("owner_member", ""),
+                    memory_version=entry.get("memory_version", 1),
+                )
         if not memory_stores:
-            memory_stores["default"] = MemoryStoreConfig()
+            memory_stores[DEFAULT_MEMORY_STORE] = MemoryStoreConfig()
 
         # Parse top-level default_agent and default_memory_store
         default_agent_val = data.get("default_agent", "")
         if not isinstance(default_agent_val, str):
             default_agent_val = ""
-        default_memory_store_val = data.get("default_memory_store", "default")
+        default_memory_store_val = data.get("default_memory_store", DEFAULT_MEMORY_STORE)
         if not isinstance(default_memory_store_val, str):
-            default_memory_store_val = "default"
+            default_memory_store_val = DEFAULT_MEMORY_STORE
+        # Reported, not repaired, for the same reason as the store names above.
+        # Legacy default_memory_store is retained for V1 compatibility. Member
+        # member resolution never uses it as a fallback or a filesystem path.
+        elif memory_store_name_defect(default_memory_store_val) is not None:
+            logger.warning(
+                "default_memory_store %r is not a usable store name (%s); preserved "
+                "for V1 compatibility but not used for member memory resolution",
+                default_memory_store_val,
+                memory_store_name_defect(default_memory_store_val),
+            )
 
         # Capture unknown top-level sections verbatim so a section this core does
         # not model (e.g. an edition-contributed section written by a companion)
@@ -2822,720 +4606,36 @@ class KiroCrewConfig:
         }
 
         cfg = cls(
-            agent=AgentConfig(
-                approval_mode=agent_data.get("approval_mode", "auto"),
-                streaming=agent_data.get("streaming", True),
-                model=agent_data.get("model", DEFAULT_MODEL),
-                role_models=coerce_role_models(agent_data.get("role_models")),
-                role_efforts=coerce_role_efforts(agent_data.get("role_efforts")),
-                fallback_model=coerce_fallback_model(agent_data.get("fallback_model", "auto")),
-                reasoning_effort=agent_data.get("reasoning_effort", ""),
-                provider=agent_data.get("provider", "acp"),
-                mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
-                mcp_quarantine_after_failures=_safe_int(
-                    agent_data.get("mcp_quarantine_after_failures", 3), 3
-                ),
-                acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
-                member_acp_backend=_normalize_acp_backend(
-                    agent_data.get("member_acp_backend", "kas")
-                ),
-                default_agent=agent_data.get("default_agent", ""),
-                sweep_agents_backups=_safe_bool(
-                    agent_data.get("sweep_agents_backups", False), False
-                ),
-                sandbox=agent_data.get("sandbox", "auto"),
-                sandbox_allow_no_isolation=bool(
-                    agent_data.get("sandbox_allow_no_isolation", False)
-                ),
-                sandbox_allow_unsandboxed_exec=bool(
-                    agent_data.get("sandbox_allow_unsandboxed_exec", False)
-                ),
-                apps_allow_third_party=_safe_bool(
-                    agent_data.get("apps_allow_third_party", False), False
-                ),
-                apps_trusted=(
-                    [a for a in _trusted if isinstance(a, str) and a]
-                    if isinstance(_trusted := agent_data.get("apps_trusted"), list)
-                    else []
-                ),
-                apps_trusted_local=(
-                    [a for a in _trusted_local if isinstance(a, str) and a]
-                    if isinstance(_trusted_local := agent_data.get("apps_trusted_local"), list)
-                    else []
-                ),
-                apps_trusted_repositories=(
-                    {
-                        name: repository
-                        for name, repository in _trusted_repositories.items()
-                        if isinstance(name, str)
-                        and isinstance(repository, str)
-                        and name
-                        and repository
-                    }
-                    if isinstance(
-                        _trusted_repositories := agent_data.get("apps_trusted_repositories"),
-                        dict,
-                    )
-                    else {}
-                ),
-                jail=_normalize_jail(agent_data.get("jail", "auto")),
-                dangerously_skip_permissions=_read_skip_permissions(agent_data),
-                yolo_duration=_normalize_yolo_duration(agent_data.get("yolo_duration")),
-                notify_override_expiry=agent_data.get("notify_override_expiry", True),
-                conductor_skill=agent_data.get("conductor_skill", False),
-                tool_search=bool(agent_data.get("tool_search", True)),
-                tool_search_min_pct=_safe_int(agent_data.get("tool_search_min_pct", 5), 5),
-                tool_search_min_tokens=_safe_int(
-                    agent_data.get("tool_search_min_tokens", 50000), 50000
-                ),
-                session_sharing=bool(agent_data.get("session_sharing", True)),
-                max_subagents=_safe_int(
-                    agent_data.get("max_subagents", 0), 0, 0, SUBAGENT_AUTO_MAX_CEILING
-                ),
-                max_stop_hook_nudges=_safe_int(agent_data.get("max_stop_hook_nudges", 100), 100, 0),
-                subagent_mem_buffer_pct=_safe_int(
-                    agent_data.get("subagent_mem_buffer_pct", 20), 20
-                ),
-                chat_turn_timeout_secs=_safe_int(
-                    agent_data.get("chat_turn_timeout_secs", 14400),
-                    14400,
-                    CHAT_TURN_TIMEOUT_MIN,
-                    CHAT_TURN_TIMEOUT_MAX,
-                ),
-                session_start_timeout_secs=_safe_int(
-                    agent_data.get("session_start_timeout_secs", 90),
-                    90,
-                    SESSION_START_TIMEOUT_MIN,
-                    SESSION_START_TIMEOUT_MAX,
-                ),
-                tool_approval_timeout_secs=_safe_int(
-                    agent_data.get("tool_approval_timeout_secs", 600),
-                    600,
-                    TOOL_APPROVAL_TIMEOUT_MIN,
-                    TOOL_APPROVAL_TIMEOUT_MAX,
-                ),
-                # Absent means ON. The grant that decides who may reach a peer
-                # session is the AGENT CONFIG, not this switch: the tools come
-                # from the `kirocrew-dashboard` MCP server, so an agent that does
-                # not mount it never has them -- the same rule as every other MCP
-                # server. This stays as a single withdrawal for an operator who
-                # wants the capability gone from every agent at once without
-                # editing each spec, so an EXPLICIT `false` must still disable it:
-                # `bool("false")` is `True`, and `_safe_bool` is what keeps a
-                # quoted opt-out from loading as enabled.
-                session_control=_safe_bool(agent_data.get("session_control", True), True),
-                # Default true preserves the zero-configuration member-dispatch
-                # grant (today's behaviour) for a MISSING key. A present-but-
-                # malformed value was already coerced to False upstream, BEFORE
-                # schema validation, so it cannot ride the missing-field default
-                # back to true — see the `member_dispatch` normalization above
-                # the `_validate_config_data` call. `_safe_bool` here is the
-                # final guard for a real bool.
-                member_dispatch=_safe_bool(agent_data.get("member_dispatch", True), True),
-                subagent_cost_gb=_safe_float(agent_data.get("subagent_cost_gb", 0.5), 0.5),
-                subagent_cpu_cost_cores=_safe_float(
-                    agent_data.get("subagent_cpu_cost_cores", 1.0), 1.0
-                ),
-                subagent_auto_max=_safe_int(
-                    agent_data.get("subagent_auto_max", 32), 32, 3, SUBAGENT_AUTO_MAX_CEILING
-                ),
-                subagent_spawn_stagger_secs=_safe_float(
-                    agent_data.get("subagent_spawn_stagger_secs", 2.0), 2.0
-                ),
-                spawn_min_memory_gb=_safe_float(agent_data.get("spawn_min_memory_gb", 4.0), 4.0),
-                resource_pressure_gb=_safe_float(agent_data.get("resource_pressure_gb", 4.0), 4.0),
-                resource_critical_gb=_safe_float(agent_data.get("resource_critical_gb", 2.0), 2.0),
-                admission_gate=_safe_bool(agent_data.get("admission_gate"), True),
-                subagent_max_turns=_safe_int(
-                    agent_data.get("subagent_max_turns", 100), 100, 1, SUBAGENT_MAX_TURNS_CEILING
-                ),
-                subagent_timeout_secs=_subagent_timeout_from(
-                    agent_data.get("subagent_timeout_secs", SUBAGENT_TIMEOUT_SECS)
-                ),
-                subagent_stall_idle_secs=_safe_int(
-                    agent_data.get("subagent_stall_idle_secs", 120), 120
-                ),
-                completion_keep=_validated_completion_keep(
-                    agent_data.get("completion_keep", "head")
-                ),
-                completion_keep_chars=_safe_int(
-                    agent_data.get("completion_keep_chars", 3000),
-                    3000,
-                    COMPLETION_KEEP_CHARS_MIN,
-                    COMPLETION_KEEP_CHARS_MAX,
-                ),
-                subagent_result_ttl_secs=_safe_int(
-                    agent_data.get("subagent_result_ttl_secs", 3600), 3600
-                ),
-                workflow_run_timeout_secs=_safe_int(
-                    agent_data.get("workflow_run_timeout_secs", 3600), 3600
-                ),
-                subagent_cwd_allowed_roots=(
-                    [r for r in _roots if isinstance(r, str)]
-                    if isinstance(_roots := agent_data.get("subagent_cwd_allowed_roots"), list)
-                    else list(DEFAULT_CWD_ALLOWED_ROOTS)
-                ),
-                log_level=(
-                    lvl.upper()
-                    if isinstance(lvl := agent_data.get("log_level", "WARNING"), str)
-                    else "WARNING"
-                ),
-                bot_name=_sanitize_bot_name(agent_data.get("bot_name", "")),
-                max_channels=agent_data.get("max_channels", 1),
-                max_channel_agents=agent_data.get("max_channel_agents", 3),
-                soft_stop_budget_secs=max(
-                    SOFT_STOP_BUDGET_MIN,
-                    min(
-                        SOFT_STOP_BUDGET_MAX,
-                        _safe_float(agent_data.get("soft_stop_budget_secs", 10.0), 10.0),
-                    ),
-                ),
-            ),
-            session=SessionConfig(
-                # The only field in this group whose site had no `_safe_int` at all, so
-                # it is added here for consistency -- but NOT because the type was
-                # unhandled. Verified: on the base revision a hand-edited `"abc"` or
-                # `true` already loaded as the 3600 default, because
-                # `_validate_config_data` runs over the raw dict before section
-                # extraction and owns type handling. What was missing for this field, as
-                # for the other ten, is the RANGE: an int of 999999999 loaded verbatim.
-                timeout_secs=_safe_int(
-                    session_data.get("timeout_secs", DEFAULT_SESSION_TIMEOUT),
-                    DEFAULT_SESSION_TIMEOUT,
-                    SESSION_TIMEOUT_MIN,
-                    SESSION_TIMEOUT_MAX,
-                ),
-                empty_response_auto_continue=bool(
-                    session_data.get("empty_response_auto_continue", True)
-                ),
-                autocompact_pct=_safe_float(
-                    session_data.get("autocompact_pct", DEFAULT_AUTOCOMPACT_PCT),
-                    DEFAULT_AUTOCOMPACT_PCT,
-                    lo=AUTOCOMPACT_PCT_MIN,
-                    hi=AUTOCOMPACT_PCT_MAX,
-                ),
-                pool_size=_safe_int(
-                    session_data.get("pool_size", DEFAULT_POOL_SIZE),
-                    DEFAULT_POOL_SIZE,
-                    0,
-                    POOL_SIZE_MAX,
-                ),
-                pool_agent=str(session_data.get("pool_agent", "")),
-                pool_ttl_secs=_safe_int(
-                    session_data.get("pool_ttl_secs", 1800),
-                    1800,
-                    POOL_TTL_SECS_MIN,
-                    POOL_TTL_SECS_MAX,
-                ),
-                eager_spawn=bool(session_data.get("eager_spawn", True)),
-                archive_retention_days=_archive_retention_days(session_data),
-                watchdog_rss_max_mb=_safe_int(session_data.get("watchdog_rss_max_mb", 0), 0),
-            ),
-            taskrunner=TaskRunnerConfig(
-                max_parallel_steps=taskrunner_data.get(
-                    "max_parallel_steps", DEFAULT_MAX_PARALLEL_STEPS
-                ),
-                workspace_dir=str(taskrunner_data.get("workspace_dir", "")),
-            ),
-            cron_history=CronHistoryConfig(
-                cron_summary_cap=_safe_int(cron_history_data.get("cron_summary_cap", 200), 200),
-                cron_trace_cap_kb=_safe_int(cron_history_data.get("cron_trace_cap_kb", 50), 50),
-                cron_max_records_per_job=_safe_int(
-                    cron_history_data.get("cron_max_records_per_job", 100), 100
-                ),
-                cron_max_index_records=_safe_int(
-                    cron_history_data.get("cron_max_index_records", 2000), 2000
-                ),
-            ),
-            messaging=MessagingConfig(
-                use_transport=bool(messaging_data.get("use_transport", True)),
-                dm_scope=str(messaging_data.get("dm_scope", "per-channel-peer")),
-                idle_reset_minutes=_coerce_int(messaging_data.get("idle_reset_minutes"), 0),
-                daily_reset_hour=_coerce_int(messaging_data.get("daily_reset_hour"), -1),
-                queue_mode=str(messaging_data.get("queue_mode", "steer")),
-            ),
+            agent=_build_agent_config(agent_data),
+            session=_build_session_config(session_data),
+            taskrunner=_build_taskrunner_config(taskrunner_data),
+            cron_history=_build_cron_history_config(cron_history_data),
+            messaging=_build_messaging_config(messaging_data),
             # orchestrator/watchdog are advertised in config-baseline.json,
             # served by /api/config/schema, and read by real consumers
             # (acp/session_handle.py, dashboard/chat_orchestrator.py), so load()
             # passes these kwargs — without them config.json values would be
             # silently ignored and the dataclass defaults would always win.
-            orchestrator=OrchestratorConfig(
-                stage_timeout_seconds=_safe_int(
-                    orchestrator_data.get("stage_timeout_seconds", 1800), 1800
-                ),
-                # Default read off the dataclass rather than imported: the loader's
-                # re-export list from config.sections is a frozen boundary snapshot
-                # (test_config_module_boundaries), and this keeps
-                # DEFAULT_MAX_PLAN_DURATION as the single source of truth without
-                # adding an alias to it.
-                max_plan_duration_seconds=_safe_int(
-                    orchestrator_data.get(
-                        "max_plan_duration_seconds",
-                        OrchestratorConfig.max_plan_duration_seconds,
-                    ),
-                    OrchestratorConfig.max_plan_duration_seconds,
-                ),
-            ),
-            watchdog=WatchdogConfig(
-                check_after_secs=_safe_float(watchdog_data.get("check_after_secs", 60.0), 60.0),
-                stale_window_secs=_safe_float(watchdog_data.get("stale_window_secs", 600.0), 600.0),
-                tool_stall_suspect_secs=_safe_float(
-                    watchdog_data.get("tool_stall_suspect_secs", 5400.0), 5400.0
-                ),
-                tool_stall_hard_cap_secs=_safe_float(
-                    watchdog_data.get("tool_stall_hard_cap_secs", 7200.0), 7200.0
-                ),
-                model_silent_probe_secs=_safe_float(
-                    watchdog_data.get("model_silent_probe_secs", 1800.0), 1800.0
-                ),
-                wellness_sample_secs=_safe_float(
-                    watchdog_data.get("wellness_sample_secs", 3.0), 3.0
-                ),
-            ),
+            orchestrator=_build_orchestrator_config(orchestrator_data),
+            watchdog=_build_watchdog_config(watchdog_data),
             resource_limits=ResourceLimitsConfig.from_raw(resource_limits_data),
-            telemetry=TelemetryConfig(
-                enabled=bool(telemetry_data.get("enabled", False)),
-                local_dir=str(telemetry_data.get("local_dir", "")),
-                export_interval_seconds=_safe_int(
-                    telemetry_data.get("export_interval_seconds", 60), 60
-                ),
-                retention_days=_safe_int(telemetry_data.get("retention_days", 0), 0),
-                max_total_mb=_safe_int(telemetry_data.get("max_total_mb", 0), 0),
-                otlp_endpoint=str(telemetry_data.get("otlp_endpoint", "")),
-                beacon_enabled=bool(telemetry_data.get("beacon_enabled", True)),
-                beacon_endpoint=str(
-                    telemetry_data.get("beacon_endpoint", _DEFAULT_BEACON_ENDPOINT)
-                ),
-            ),
-            memory=MemoryConfig(
-                embedding_provider=_coerce_embedding_provider(
-                    memory_data.get("embedding_provider", "llama_cpp")
-                ),
-                embedding_dim=memory_data.get("embedding_dim", 1024),
-                embedding_threads=_safe_int(memory_data.get("embedding_threads", 4), 4, 1, 256),
-                # 0 is the documented "inherit embedding_threads" sentinel, so the
-                # floor is 0 rather than 1 — clamping it to 1 would erase a
-                # deliberate opt-in to the interactive pool.
-                embedding_bulk_threads=_safe_int(
-                    memory_data.get("embedding_bulk_threads", 1), 1, 0, 256
-                ),
-                embedding_bulk_duty=_safe_float(
-                    memory_data.get("embedding_bulk_duty", 0.2), 0.2, 0.05, 1.0
-                ),
-                embed_model_url=memory_data.get("embed_model_url", ""),
-                embed_model_path=memory_data.get("embed_model_path", ""),
-                embed_model_id=memory_data.get("embed_model_id", ""),
-                semantic_confidence_threshold=_safe_float(
-                    memory_data.get("semantic_confidence_threshold", 0.8), 0.8, 0.0, 1.0
-                ),
-                episodic_dedup_threshold=_safe_float(
-                    memory_data.get("episodic_dedup_threshold", 0.88), 0.88, 0.0, 1.0
-                ),
-                episodic_max_results=_safe_int(
-                    memory_data.get("episodic_max_results", 8), 8, 1, None
-                ),
-                episodic_max_count=_safe_int(
-                    memory_data.get("episodic_max_count", 10_000), 10_000, 0, None
-                ),
-                decay_rates=(
-                    dr if isinstance(dr := memory_data.get("decay_rates", {}), dict) else {}
-                ),
-                semantic_keys=memory_data.get("semantic_keys", []),
-                history_idle_hours=memory_data.get("history_idle_hours", 3.0),
-                history_max_days=_safe_nonnegative_int(
-                    memory_data.get("history_max_days", 365), 365
-                ),
-                migrated=memory_data.get("migrated", False),
-            ),
-            knowledge=KnowledgeConfig(
-                auto_ingest_artifacts=bool(knowledge_data.get("auto_ingest_artifacts", False)),
-                auto_ingest_artifact_kinds=[
-                    k
-                    for k in knowledge_data.get(
-                        "auto_ingest_artifact_kinds",
-                        DEFAULT_AUTO_INGEST_ARTIFACT_KINDS,
-                    )
-                    if isinstance(k, str)
-                ],
-                max_ingest_file_mb=(
-                    float(mb)
-                    if isinstance(
-                        (mb := knowledge_data.get("max_ingest_file_mb", 100.0)),
-                        (int, float),
-                    )
-                    and not isinstance(mb, bool)
-                    and mb >= 0
-                    else 100.0
-                ),
-                embed_timeout_secs=_safe_float(
-                    knowledge_data.get("embed_timeout_secs", 10.0), 10.0
-                ),
-                embed_content_budget=_safe_int(knowledge_data.get("embed_content_budget", 0), 0),
-                pool_idle_ttl_secs=_safe_nonnegative_int(
-                    knowledge_data.get("pool_idle_ttl_secs", 300),
-                    300,
-                ),
-                auto_add_documents=_read_auto_add_documents(knowledge_data),
-                folder_ingest_chunk_budget=_safe_nonnegative_int(
-                    knowledge_data.get("folder_ingest_chunk_budget", 300),
-                    300,
-                    FOLDER_INGEST_CHUNK_BUDGET_MAX,
-                ),
-                dedup_every_n_sweeps=_safe_nonnegative_int(
-                    knowledge_data.get("dedup_every_n_sweeps", 12),
-                    12,
-                    DEDUP_EVERY_N_SWEEPS_MAX,
-                ),
-                doc_ingest_hosts=[
-                    str(h)
-                    for h in knowledge_data.get("doc_ingest_hosts", [])
-                    if isinstance(h, str) and h.strip()
-                ],
-                sweep_chunk_budget=_safe_nonnegative_int(
-                    knowledge_data.get("sweep_chunk_budget", 500),
-                    500,
-                    SWEEP_CHUNK_BUDGET_MAX,
-                ),
-                embed_rate_limit=_safe_nonnegative_int(
-                    knowledge_data.get("embed_rate_limit", 120), 120, EMBED_RATE_LIMIT_MAX
-                ),
-                extraction_model=str(knowledge_data.get("extraction_model", "")).strip(),
-                extraction_pool_size=max(
-                    EXTRACTION_POOL_SIZE_MIN,
-                    min(
-                        EXTRACTION_POOL_SIZE_MAX,
-                        _safe_nonnegative_int(knowledge_data.get("extraction_pool_size", 3), 3),
-                    ),
-                ),
-            ),
-            telegram=TelegramConfig(
-                session_folder=_coerce_session_folder(telegram_data.get("session_folder")),
-                enabled=bool(telegram_data.get("enabled", False)),
-                bot_token=str(telegram_data.get("bot_token", "")),
-                allowed_user_ids=_coerce_int_ids(telegram_data.get("allowed_user_ids")),
-                soft_threshold_pct=_threshold_pct(telegram_data.get("soft_threshold_pct"), 80),
-                show_thinking=bool(telegram_data.get("show_thinking", False)),
-                allow_forum=bool(telegram_data.get("allow_forum", False)),
-                voice_replies=bool(telegram_data.get("voice_replies", False)),
-                forum_activation=_validate_telegram_activation(
-                    str(telegram_data.get("forum_activation", "") or ACTIVATION_ALWAYS)
-                ),
-                allowed_forum_chat_ids=_coerce_int_ids(telegram_data.get("allowed_forum_chat_ids")),
-                accounts=_parse_telegram_accounts(telegram_data.get("accounts")),
-            ),
-            weixin=WeixinConfig(
-                session_folder=_coerce_session_folder(weixin_data.get("session_folder")),
-                enabled=bool(weixin_data.get("enabled", False)),
-                token=str(weixin_data.get("token", "")),
-                account_id=str(weixin_data.get("account_id", "")),
-                base_url=str(weixin_data.get("base_url", "") or "https://ilinkai.weixin.qq.com"),
-                dm_policy=str(weixin_data.get("dm_policy", "allowlist") or "allowlist"),
-                allowed_user_ids=_coerce_opaque_str_ids(weixin_data.get("allowed_user_ids")),
-                soft_threshold_pct=_threshold_pct(weixin_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_threshold_pct(weixin_data.get("hard_threshold_pct"), 95),
-            ),
-            whatsapp=WhatsAppConfig(
-                session_folder=_coerce_session_folder(whatsapp_data.get("session_folder")),
-                enabled=bool(whatsapp_data.get("enabled", False)),
-                dm_policy=str(whatsapp_data.get("dm_policy", "self") or "self"),
-                allowed_wa_ids=_coerce_str_ids(whatsapp_data.get("allowed_wa_ids")),
-                groups=_coerce_whatsapp_groups(whatsapp_data.get("groups")),
-                db_path=str(whatsapp_data.get("db_path", "")),
-                soft_threshold_pct=_threshold_pct(whatsapp_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_threshold_pct(whatsapp_data.get("hard_threshold_pct"), 95),
-            ),
-            discord=DiscordConfig(
-                session_folder=_coerce_session_folder(discord_data.get("session_folder")),
-                enabled=bool(discord_data.get("enabled", False)),
-                bot_token=str(discord_data.get("bot_token", "")),
-                # Discord user IDs are numeric snowflakes that exceed 2^53 —
-                # keep them as strings (JSON round-trip safe, matches the
-                # transport's string comparison).
-                allowed_user_ids=_coerce_str_ids(discord_data.get("allowed_user_ids")),
-                allowed_thread_ids=_coerce_str_ids(discord_data.get("allowed_thread_ids")),
-                allowed_channel_ids=_coerce_str_ids(discord_data.get("allowed_channel_ids")),
-                auto_thread=bool(discord_data.get("auto_thread", True)),
-                soft_threshold_pct=_threshold_pct(discord_data.get("soft_threshold_pct"), 80),
-                reactions_enabled=bool(discord_data.get("reactions_enabled", True)),
-                show_thinking=bool(discord_data.get("show_thinking", False)),
-            ),
-            webex=WebexConfig(
-                session_folder=_coerce_session_folder(webex_data.get("session_folder")),
-                enabled=bool(webex_data.get("enabled", False)),
-                bot_token=str(webex_data.get("bot_token", "")),
-                allowed_emails=(
-                    [e for e in webex_data.get("allowed_emails", []) if isinstance(e, str) and e]
-                    if isinstance(webex_data.get("allowed_emails", []), list)
-                    else []
-                ),
-                # Group spaces are a SECURITY decision, so the read is as explicit
-                # as the write: a field the loader forgets is not merely lost, it
-                # silently reverts to the safe default on the next restart while
-                # the settings panel keeps showing the saved value it read from
-                # config.json — the operator sees an enabled space allow-list and
-                # the gateway answers nobody.
-                allow_group_rooms=bool(webex_data.get("allow_group_rooms", False)),
-                allowed_room_ids=[
-                    r
-                    for r in _safe_list(webex_data.get("allowed_room_ids"))
-                    if isinstance(r, str) and r
-                ],
-                reply_in_thread=bool(webex_data.get("reply_in_thread", True)),
-                wdm_base=str(webex_data.get("wdm_base", "") or ""),
-                soft_threshold_pct=_threshold_pct(webex_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_threshold_pct(webex_data.get("hard_threshold_pct"), 95),
-            ),
-            wakatime=WakaTimeConfig(
-                enabled=bool(wakatime_data.get("enabled", False)),
-                api_base_url=str(wakatime_data.get("api_base_url", "") or ""),
-            ),
-            imessage=IMessageConfig(
-                session_folder=_coerce_session_folder(imessage_data.get("session_folder")),
-                enabled=bool(imessage_data.get("enabled", False)),
-                db_path=str(imessage_data.get("db_path", "")),
-                allowed_handles=[
-                    h
-                    for h in _safe_list(imessage_data.get("allowed_handles"))
-                    if isinstance(h, str) and h
-                ],
-                service=str(imessage_data.get("service", "") or "imessage"),
-                soft_threshold_pct=_threshold_pct(imessage_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_threshold_pct(imessage_data.get("hard_threshold_pct"), 95),
-            ),
-            teams=TeamsConfig(
-                session_folder=_coerce_session_folder(teams_data.get("session_folder")),
-                enabled=bool(teams_data.get("enabled", False)),
-                app_id=str(teams_data.get("app_id", "")),
-                # Secret is env-only (MICROSOFT_APP_PASSWORD). Never sourced from
-                # config.json, which the agent can read — keeps the Azure Bot
-                # credential out of any agent-readable file.
-                app_password="",
-                tenant_id=str(teams_data.get("tenant_id", "")),
-                allowed_emails=(
-                    [e for e in teams_data.get("allowed_emails", []) if isinstance(e, str) and e]
-                    if isinstance(teams_data.get("allowed_emails", []), list)
-                    else []
-                ),
-                soft_threshold_pct=_threshold_pct(teams_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_threshold_pct(teams_data.get("hard_threshold_pct"), 95),
-            ),
-            slack=SlackConfig(
-                session_folder=_coerce_session_folder(slack_data.get("session_folder")),
-                allowed_users=[
-                    u
-                    for u in slack_data.get("allowed_users", [])
-                    if isinstance(u, dict) and u.get("slack_id")
-                ],
-                tracking_channels=_validate_tracking_channels(
-                    slack_data.get("tracking_channels", [])
-                ),
-                open_channels=[
-                    c for c in slack_data.get("open_channels", []) if isinstance(c, str)
-                ],
-                command=slack_data.get("command", "kirocrew"),
-                forward_to_agent_callback=str(
-                    slack_data.get("forward_to_agent_callback") or ""
-                ).strip(),
-                trusted_bot_ids={
-                    b for b in _safe_list(slack_data.get("trusted_bot_ids")) if isinstance(b, str)
-                },
-                trusted_bot_turn_limit=_safe_int(
-                    slack_data.get("trusted_bot_turn_limit", 5), 5, lo=1
-                ),
-                allowed_enterprise_ids=[
-                    e
-                    for e in slack_data.get("allowed_enterprise_ids", [])
-                    if isinstance(e, str) and (e.startswith("E") or e.startswith("T"))
-                ],
-                reactions={
-                    k: v
-                    for k, v in _safe_dict(slack_data.get("reactions")).items()
-                    if isinstance(k, str) and (v is None or (isinstance(v, str) and v))
-                },
-                reactions_enabled=bool(slack_data.get("reactions_enabled", True)),
-                use_tunnel_url=bool(slack_data.get("use_tunnel_url", False)),
-                show_thinking=bool(slack_data.get("show_thinking", True)),
-                home_tab_sessions_per_kind=_safe_int(
-                    slack_data.get("home_tab_sessions_per_kind", 5), 5
-                ),
-            ),
-            publish=PublishConfig(
-                allowed_destinations=[d for d in _dests_raw if isinstance(d, str) and d],
-                relocate_roots=[
-                    r
-                    for r in publish_data.get("relocate_roots", [])
-                    if isinstance(r, str) and r.strip()
-                ],
-            ),
-            wecom=WeComConfig(
-                session_folder=_coerce_session_folder(wecom_data.get("session_folder")),
-                # _safe_bool, not bool(): `bool("false")` is True, so a JSON string
-                # would read the operator's "off" as "on" -- enabling a channel,
-                # or opening it to every org member, from a config value that says the
-                # opposite. A non-bool must read as the default, not as truthy.
-                enabled=_safe_bool(wecom_data.get("enabled"), False),
-                allowed_users=[
-                    u
-                    for u in _safe_list(wecom_data.get("allowed_users"))
-                    if isinstance(u, dict) and u.get("userid")
-                ],
-                allow_all_users=_safe_bool(wecom_data.get("allow_all_users"), False),
-                ws_url=str(wecom_data.get("ws_url", "wss://openws.work.weixin.qq.com")),
-                soft_threshold_pct=_threshold_pct(wecom_data.get("soft_threshold_pct"), 80),
-                hard_threshold_pct=_threshold_pct(wecom_data.get("hard_threshold_pct"), 95),
-            ),
-            feishu=FeishuConfig(
-                enabled=_safe_bool(feishu_data.get("enabled"), False),
-                allowed_open_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_open_ids")),
-                # Shape-safe coercion rather than bool() / a raw comprehension:
-                # the schema type check already substitutes the default for a
-                # wrong-typed value, and these helpers keep the guarantee local
-                # to the parse (and dedupe + strip the opaque ou_/oc_ ids).
-                allow_group=_safe_bool(feishu_data.get("allow_group"), False),
-                allowed_group_ids=_coerce_opaque_str_ids(feishu_data.get("allowed_group_ids")),
-                soft_threshold_pct=_safe_int(feishu_data.get("soft_threshold_pct", 80), 80),
-                hard_threshold_pct=_safe_int(feishu_data.get("hard_threshold_pct", 95), 95),
-                session_folder=_coerce_session_folder(feishu_data.get("session_folder")),
-            ),
-            dashboard=DashboardConfig(
-                url=dashboard_data.get("url", ""),
-                tailscale=_tailscale_config_from(
-                    dashboard_data.get("tailscale"),
-                    _degraded,
-                    key_present="tailscale" in dashboard_data,
-                ),
-                restore_sessions=dashboard_data.get("restore_sessions", False),
-                qr_session_until_restart=_safe_bool(
-                    dashboard_data.get("qr_session_until_restart"), True
-                ),
-                qr_session_persist_across_restart=_safe_bool(
-                    dashboard_data.get("qr_session_persist_across_restart"), False
-                ),
-                restore_window_minutes=dashboard_data.get("restore_window_minutes", 30),
-                surface_channel_sessions=dashboard_data.get("surface_channel_sessions", True),
-                bot_name=dashboard_data.get("bot_name", ""),
-                avatar=dashboard_data.get("avatar", ""),
-                merge_queued_messages=dashboard_data.get("merge_queued_messages", False),
-                mcp_probe_timeout_secs=_safe_int(
-                    dashboard_data.get("mcp_probe_timeout_secs", 15),
-                    15,
-                    MCP_PROBE_TIMEOUT_MIN,
-                    MCP_PROBE_TIMEOUT_MAX,
-                ),
-                loop_stall_exit_after_secs=(
-                    None
-                    if dashboard_data.get("loop_stall_exit_after_secs") is None
-                    else _safe_int(
-                        dashboard_data.get("loop_stall_exit_after_secs"),
-                        LOOP_STALL_EXIT_AFTER_DEFAULT,
-                        LOOP_STALL_EXIT_AFTER_MIN,
-                        LOOP_STALL_EXIT_AFTER_MAX,
-                    )
-                ),
-                chat_entry_cache_max_entries=_safe_int(
-                    dashboard_data.get(
-                        "chat_entry_cache_max_entries", CHAT_ENTRY_CACHE_ENTRIES_DEFAULT
-                    ),
-                    CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
-                    CHAT_ENTRY_CACHE_ENTRIES_MIN,
-                    CHAT_ENTRY_CACHE_ENTRIES_MAX,
-                ),
-                chat_entry_cache_max_bytes=_safe_int(
-                    dashboard_data.get(
-                        "chat_entry_cache_max_bytes", CHAT_ENTRY_CACHE_BYTES_DEFAULT
-                    ),
-                    CHAT_ENTRY_CACHE_BYTES_DEFAULT,
-                    CHAT_ENTRY_CACHE_BYTES_MIN,
-                    CHAT_ENTRY_CACHE_BYTES_MAX,
-                ),
-                cautious_boot=_safe_bool(dashboard_data.get("cautious_boot"), True),
-                auto_open_browser=dashboard_data.get("auto_open_browser", True),
-                prevent_sleep=_safe_bool(dashboard_data.get("prevent_sleep"), False),
-                quick_send=dashboard_data.get("quick_send", False),
-                session_grid=dashboard_data.get("session_grid", False),
-                mcp_app_panel=dashboard_data.get("mcp_app_panel", False),
-                auto_open_git_panel=_safe_bool(dashboard_data.get("auto_open_git_panel"), False),
-                session_card_source_links=_safe_bool(
-                    dashboard_data.get("session_card_source_links"), True
-                ),
-                widget_density=dashboard_data.get("widget_density", "more"),
-                use_builtin_browser=_safe_bool(dashboard_data.get("use_builtin_browser"), True),
-                browser_view_port=_port_or_unset(dashboard_data.get("browser_view_port", 0)),
-                verbosity=dashboard_data.get("verbosity", "default"),
-                link_previews=_safe_bool(dashboard_data.get("link_previews"), False),
-                usage_text_scrape_enabled=_safe_bool(
-                    dashboard_data.get("usage_text_scrape_enabled"), False
-                ),
-                tail_fork_enabled=dashboard_data.get("tail_fork_enabled", False),
-                terminal=dashboard_data.get("terminal", {"enabled": True}),
-                default_project=dashboard_data.get("default_project", ""),
-                theme_mode=dashboard_data.get("theme_mode", ""),
-                sso_login_flags=str(dashboard_data.get("sso_login_flags", "")),
-                theme_color=dashboard_data.get("theme_color", ""),
-                language=str(dashboard_data.get("language", "")),
-                recent_tint_count=_safe_int(
-                    dashboard_data.get("recent_tint_count", 0),
-                    0,
-                    RECENT_TINT_COUNT_MIN,
-                    RECENT_TINT_COUNT_MAX,
-                ),
-                update_nudge=(
-                    dashboard_data.get("update_nudge", {})
-                    if isinstance(dashboard_data.get("update_nudge"), dict)
-                    else {}
-                ),
-                onboarded=bool(dashboard_data.get("onboarded", False)),
-                import_onboarded=_safe_bool(
-                    dashboard_data.get("import_onboarded"),
-                    _safe_bool(dashboard_data.get("onboarded"), False),
-                ),
-                # Falls back to `onboarded`: a user who finished first run before
-                # this chapter existed has already reached the product, and
-                # re-gating their heartbeat on a screen they will never be shown
-                # would suppress it forever.
-                privacy_acked=_safe_bool(
-                    dashboard_data.get("privacy_acked"),
-                    _safe_bool(dashboard_data.get("onboarded"), False),
-                ),
-                user_role=str(dashboard_data.get("user_role", "")),
-                user_role_other=str(dashboard_data.get("user_role_other", "")),
-                user_technical_level=str(dashboard_data.get("user_technical_level", "")),
-                tips_enabled=bool(dashboard_data.get("tips_enabled", True)),
-                feature_videos_enabled=_safe_bool(
-                    dashboard_data.get("feature_videos_enabled"), False
-                ),
-                folder_suggestions_enabled=bool(
-                    dashboard_data.get("folder_suggestions_enabled", True)
-                ),
-                tips_cadence_hours=_safe_float(
-                    dashboard_data.get("tips_cadence_hours", 6.0), 6.0, lo=0.0
-                ),
-                tips_snooze_hours=_safe_float(
-                    dashboard_data.get("tips_snooze_hours", 48.0), 48.0, lo=0.0
-                ),
-                tips_recency_decay=_safe_float(
-                    dashboard_data.get("tips_recency_decay", 0.6), 0.6, lo=0.0, hi=1.0
-                ),
-                tips_model=str(dashboard_data.get("tips_model", "auto")),
-                tips_explore_ratio=_safe_float(
-                    dashboard_data.get("tips_explore_ratio", 0.2), 0.2, lo=0.0, hi=1.0
-                ),
-                gitlab_hosts=_coerce_gitlab_hosts(dashboard_data.get("gitlab_hosts")),
-                jira_hosts=_coerce_jira_hosts(dashboard_data.get("jira_hosts")),
-                jira_auth=[
-                    JiraAuthEntry(
-                        host=str(entry.get("host", "")),
-                        email=str(entry.get("email", "")),
-                    )
-                    for entry in (dashboard_data.get("jira_auth") or [])
-                    if isinstance(entry, dict) and entry.get("host")
-                ],
-            ),
-            tunnel=TunnelConfig(
-                enabled=bool(tunnel_data.get("enabled", False)),
-                name_mode=str(tunnel_data.get("name_mode", "username")),
-                name_override=str(tunnel_data.get("name_override", "")),
-            ),
+            telemetry=_build_telemetry_config(telemetry_data),
+            memory=_build_memory_config(memory_data),
+            knowledge=_build_knowledge_config(knowledge_data),
+            telegram=_build_telegram_config(telegram_data),
+            weixin=_build_weixin_config(weixin_data),
+            whatsapp=_build_whatsapp_config(whatsapp_data),
+            discord=_build_discord_config(discord_data),
+            webex=_build_webex_config(webex_data),
+            wakatime=_build_wakatime_config(wakatime_data),
+            imessage=_build_imessage_config(imessage_data),
+            teams=_build_teams_config(teams_data),
+            slack=_build_slack_config(slack_data),
+            publish=_build_publish_config(_dests_raw, publish_data),
+            wecom=_build_wecom_config(wecom_data),
+            feishu=_build_feishu_config(feishu_data),
+            dashboard=_build_dashboard_config(_degraded, dashboard_data),
+            tunnel=_build_tunnel_config(tunnel_data),
             hooks=data.get("hooks", {}),
             agents=agents,
             default_agent=default_agent_val,
@@ -3548,109 +4648,13 @@ class KiroCrewConfig:
             # neither config file exists, so a disagreement gives one field two
             # different defaults depending on whether a config.json is present, and
             # the schema, the docs and the doctor can only describe one of them.
-            stt=SttConfig(
-                enabled=_safe_bool(stt_data.get("enabled"), True),
-                provider=_validated_stt_provider(stt_data.get("provider", STT_PROVIDER_LOCAL)),
-                model=_validated_stt_model(stt_data.get("model", _STT_DEFAULT_MODEL)),
-                language_code=stt_data.get("language_code", _sections.STT_LANGUAGE_AUTO),
-                streaming=_safe_bool(stt_data.get("streaming"), True),
-                silence_ms=_safe_int(
-                    stt_data.get("silence_ms"),
-                    _STT_DEFAULT_SILENCE_MS,
-                    lo=_STT_MIN_SILENCE_MS,
-                    hi=_STT_INTERVAL_MS_MAX,
-                ),
-                partial_interval_ms=_safe_int(
-                    stt_data.get("partial_interval_ms"),
-                    _STT_DEFAULT_PARTIAL_INTERVAL_MS,
-                    lo=_STT_MIN_PARTIAL_INTERVAL_MS,
-                    hi=_STT_INTERVAL_MS_MAX,
-                ),
-                idle_evict_secs=_safe_int(
-                    stt_data.get("idle_evict_secs"),
-                    _STT_DEFAULT_IDLE_EVICT_SECS,
-                    lo=_STT_IDLE_EVICT_SECS_MIN,
-                    hi=_STT_IDLE_EVICT_SECS_MAX,
-                ),
-                endpointing=_safe_bool(stt_data.get("endpointing"), False),
-                dictation_panel=_safe_bool(stt_data.get("dictation_panel"), True),
-                timeout_secs=_safe_int(
-                    stt_data.get("timeout_secs"),
-                    _STT_DEFAULT_TIMEOUT_SECS,
-                    lo=_STT_MIN_TIMEOUT_SECS,
-                    hi=_STT_MAX_TIMEOUT_SECS,
-                ),
-                transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
-                transcribe_profile=stt_data.get("transcribe_profile", ""),
-            ),
+            stt=_build_stt_config(stt_data),
             # Every numeric knob is clamped to the same ceiling the MCP tool
             # schemas enforce, so a hand-edited config.json cannot ask for an
             # unbounded accessibility walk or a full-resolution screenshot.
             # There is deliberately NO ``enabled`` key read here — see
             # ComputerUseConfig's docstring and computer_use_state_path().
-            computer_use=ComputerUseConfig(
-                max_tree_nodes=min(
-                    _CU_MAX_TREE_NODES,
-                    max(
-                        1,
-                        _safe_int(
-                            computer_use_data.get("max_tree_nodes", _CU_DEFAULT_MAX_TREE_NODES),
-                            _CU_DEFAULT_MAX_TREE_NODES,
-                        ),
-                    ),
-                ),
-                max_tree_depth=min(
-                    _CU_MAX_TREE_DEPTH,
-                    max(
-                        1,
-                        _safe_int(
-                            computer_use_data.get("max_tree_depth", _CU_DEFAULT_MAX_TREE_DEPTH),
-                            _CU_DEFAULT_MAX_TREE_DEPTH,
-                        ),
-                    ),
-                ),
-                text_limit=min(
-                    _CU_MAX_TEXT_LIMIT,
-                    max(
-                        1,
-                        _safe_int(
-                            computer_use_data.get("text_limit", _CU_DEFAULT_TEXT_LIMIT),
-                            _CU_DEFAULT_TEXT_LIMIT,
-                        ),
-                    ),
-                ),
-                attach_screenshot=_safe_bool(
-                    computer_use_data.get("attach_screenshot", _CU_DEFAULT_ATTACH_SCREENSHOT),
-                    _CU_DEFAULT_ATTACH_SCREENSHOT,
-                ),
-                screenshot_max_px=min(
-                    _CU_MAX_SCREENSHOT_MAX_PX,
-                    max(
-                        _CU_MIN_SCREENSHOT_MAX_PX,
-                        _safe_int(
-                            computer_use_data.get(
-                                "screenshot_max_px", _CU_DEFAULT_SCREENSHOT_MAX_PX
-                            ),
-                            _CU_DEFAULT_SCREENSHOT_MAX_PX,
-                        ),
-                    ),
-                ),
-                screenshot_jpeg_quality=min(
-                    100,
-                    max(
-                        1,
-                        _safe_int(
-                            computer_use_data.get(
-                                "screenshot_jpeg_quality", _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY
-                            ),
-                            _CU_DEFAULT_SCREENSHOT_JPEG_QUALITY,
-                        ),
-                    ),
-                ),
-                # Default False: a missing or unparseable value must mean "do not
-                # draw on the operator's screen", never the reverse.
-                cursor_motion=_safe_bool(computer_use_data.get("cursor_motion", False), False),
-            ),
+            computer_use=_build_computer_use_config(computer_use_data),
             auto_update=data.get("auto_update", True),
             connections_ui=_safe_bool(data.get("connections_ui", True), True),
             _degraded_sections=frozenset(_degraded | _OBSERVED_DEGRADED_SECTIONS),
@@ -3679,87 +4683,7 @@ class KiroCrewConfig:
                 for r in (data.get("registries") or [])
                 if isinstance(r, dict) and r.get("repo")
             ],
-            mcp_gateway=McpGatewayConfig(
-                enabled=bool(mcp_gateway_data.get("enabled", False)),
-                # Absent -> True so installs that never configured this keep
-                # rendering. A malformed value cannot be distinguished here: the
-                # schema validator REMOVES an invalid value before the loader
-                # parses (see config/validation.py ``_apply_field_default``), so a
-                # hand-edited ``"false"`` arrives as absent and resolves to True,
-                # with a warning logged naming the field. ``_safe_bool`` is
-                # belt-and-braces for a schema gap, not the acting guard — the
-                # acting guard against a truthy string is the validator, since
-                # ``bool("false")`` is True. The write path is where an opt-out is
-                # actually enforced: the endpoint rejects any non-boolean body.
-                apps_enabled=_safe_bool(mcp_gateway_data.get("apps_enabled", True), True),
-                # ON by default. The forwarded set is a strict subset of the
-                # hashed set and gatewayd re-hashes the sidecar at spawn,
-                # forwarding nothing on mismatch, so a forwarded key is one every
-                # co-tenant of that backend declared identically. With it off, one
-                # ordinary declared key costs the whole server its pooling.
-                #
-                # Both arguments are True on purpose. A malformed value never
-                # reaches this call: ``config.validation`` type-checks first and
-                # ``_apply_field_default`` strips a non-boolean so the dataclass
-                # default applies, which is why the log says "using default". The
-                # fallback here is defence in depth for a bypassed validator, and
-                # giving it a different answer than the schema would only put two
-                # disagreeing defaults in the file.
-                forward_declared_env=_safe_bool(
-                    mcp_gateway_data.get("forward_declared_env", FORWARD_DECLARED_ENV_DEFAULT),
-                    FORWARD_DECLARED_ENV_DEFAULT,
-                ),
-                socket_path=str(mcp_gateway_data.get("socket_path", "")),
-                overlay_dir=str(mcp_gateway_data.get("overlay_dir", "")),
-                idle_timeout_secs=max(
-                    10, _safe_int(mcp_gateway_data.get("idle_timeout_secs", 300), 300)
-                ),
-                # 0 is meaningful (re-resolve every pass), so the floor is 0 and
-                # not the usual "at least something" clamp.
-                resolve_once_refresh_hours=max(
-                    0, _safe_int(mcp_gateway_data.get("resolve_once_refresh_hours", 24), 24)
-                ),
-                max_backends=max(1, _safe_int(mcp_gateway_data.get("max_backends", 64), 64)),
-                poolable_servers=[
-                    s for s in mcp_gateway_data.get("poolable_servers", []) if isinstance(s, str)
-                ],
-                stub_servers=_resolve_stub_servers(mcp_gateway_data),
-                # The operator's deviations, kept ALONGSIDE the resolved set above
-                # rather than folded away: ``stub_servers`` here is already the
-                # effective answer, so a writer that wants to record a new
-                # decision needs to see which ones are decisions and which came
-                # from the roster. Shares the resolver with the runtime so a
-                # non-bool value is dropped in exactly one place.
-                stub_overrides=_resolve_stub_overrides(mcp_gateway_data),
-                # The file's own roster, carried so ``save()`` can put it back
-                # instead of flattening it to the effective set above. See the
-                # field's own comment for why that flattening is a data loss.
-                _stub_roster=_resolve_stub_roster(mcp_gateway_data),
-                # Hand-editable list of env NAMES; keep only strings and drop
-                # blanks so a stray null or nested object cannot reach the
-                # hashing layer as a key. Not deduplicated here — every consumer
-                # builds a frozenset from it.
-                pool_identity_env=[
-                    s.strip()
-                    for s in mcp_gateway_data.get("pool_identity_env", [])
-                    if isinstance(s, str) and s.strip()
-                ],
-                prewarm_count=max(0, _safe_int(mcp_gateway_data.get("prewarm_count", 0), 0)),
-                read_buffer_limit_bytes=max(
-                    1024,
-                    _safe_int(
-                        mcp_gateway_data.get("read_buffer_limit_bytes", 64 * 1024 * 1024),
-                        64 * 1024 * 1024,
-                    ),
-                ),
-                response_spill_threshold_bytes=max(
-                    0,
-                    _safe_int(
-                        mcp_gateway_data.get("response_spill_threshold_bytes", 256 * 1024),
-                        256 * 1024,
-                    ),
-                ),
-            ),
+            mcp_gateway=_build_mcp_gateway_config(mcp_gateway_data),
             mcp=McpConfig(
                 # Kept as authored strings — validation (absolute-only, ``~``
                 # expansion, dedup) belongs to the consumer,
@@ -3772,77 +4696,16 @@ class KiroCrewConfig:
                     d for d in _safe_list(mcp_data.get("extra_path_dirs", [])) if isinstance(d, str)
                 ],
             ),
-            instances=InstancesConfig(
-                enabled=bool(instances_data.get("enabled", False)),
-                warm_set_cap=_safe_int(
-                    instances_data.get("warm_set_cap", _DEFAULT_WARM_SET_CAP), _DEFAULT_WARM_SET_CAP
-                ),
-                tunnel_base_port=_safe_int(
-                    instances_data.get("tunnel_base_port", _DEFAULT_TUNNEL_BASE_PORT),
-                    _DEFAULT_TUNNEL_BASE_PORT,
-                ),
-                ssh_compression=bool(
-                    instances_data.get("ssh_compression", _DEFAULT_SSH_COMPRESSION)
-                ),
-                connect_timeout_secs=(
-                    _safe_float(connect_timeout_raw, _DEFAULT_CONNECT_TIMEOUT)
-                    if connect_timeout_raw is not None
-                    else None
-                ),
-                mint_timeout_secs=(
-                    _safe_float(mint_timeout_raw, _DEFAULT_MINT_TIMEOUT)
-                    if mint_timeout_raw is not None
-                    else None
-                ),
-                max_recovery_attempts=_safe_int(
-                    instances_data.get("max_recovery_attempts", _DEFAULT_MAX_RECOVERY),
-                    _DEFAULT_MAX_RECOVERY,
-                ),
-                recover_backoff_max_secs=_safe_float(
-                    instances_data.get("recover_backoff_max_secs", _DEFAULT_BACKOFF_MAX),
-                    _DEFAULT_BACKOFF_MAX,
-                ),
-                probe_failure_threshold=_safe_int(
-                    instances_data.get("probe_failure_threshold", _DEFAULT_PROBE_FAILS),
-                    _DEFAULT_PROBE_FAILS,
-                ),
+            instances=_build_instances_config(
+                connect_timeout_raw, instances_data, mint_timeout_raw
             ),
             heartbeat=HeartbeatConfig(default_deliver=heartbeat_default_deliver),
-            skills=SkillsConfig(
-                max_triggered=_safe_int(skills_data.get("max_triggered", 0), 0),
-                lazy_load=bool(skills_data.get("lazy_load", False)),
-                auto_create_from_sessions=bool(skills_data.get("auto_create_from_sessions", False)),
-                auto_refine_on_deviation=bool(skills_data.get("auto_refine_on_deviation", False)),
-                auto_min_tool_calls=_safe_int(skills_data.get("auto_min_tool_calls", 5), 5),
-                auto_similarity_threshold=_safe_float(
-                    skills_data.get("auto_similarity_threshold", 0.85), 0.85
-                ),
-                approval_required=bool(skills_data.get("approval_required", True)),
-                max_auto_skills=_safe_int(skills_data.get("max_auto_skills", 100), 100),
-                stale_after_days=_safe_int(skills_data.get("stale_after_days", 30), 30),
-                archive_after_days=_safe_int(skills_data.get("archive_after_days", 90), 90),
-                pending_ttl_days=_safe_int(skills_data.get("pending_ttl_days", 30), 30),
-                generate_scripts=bool(skills_data.get("generate_scripts", True)),
-                judge_model=str(skills_data.get("judge_model", "auto") or "auto"),
-                extra_paths=[
-                    p for p in _safe_list(skills_data.get("extra_paths")) if isinstance(p, str)
-                ],
-                # Security off-switch: malformed values must not become truthy
-                # through Python coercion (for example, the string "false").
-                project_skills_enabled=(skills_data.get("project_skills_enabled", True) is True),
+            monitoring=MonitoringConfig(
+                prefer_structured_arming=monitoring_prefer_structured_arming
             ),
-            session_summary=SessionSummaryConfig(
-                enabled=bool(session_summary_data.get("enabled", False)),
-                min_user_turns=_safe_int(session_summary_data.get("min_user_turns", 2), 2),
-                regenerate_after_turns=_safe_int(
-                    session_summary_data.get("regenerate_after_turns", 1), 1
-                ),
-                max_intents=_safe_int(session_summary_data.get("max_intents", 50), 50),
-                max_constraints=_safe_int(session_summary_data.get("max_constraints", 50), 50),
-                assistant_excerpt_chars=_safe_int(
-                    session_summary_data.get("assistant_excerpt_chars", 400), 400
-                ),
-            ),
+            decisions=DecisionsConfig.from_raw(decisions_data),
+            skills=_build_skills_config(skills_data),
+            session_summary=_build_session_summary_config(session_summary_data),
             slack_channels={
                 ch_id: ChannelConfig.from_dict(ch_data)
                 for ch_id, ch_data in (
@@ -3878,10 +4741,17 @@ class KiroCrewConfig:
         #
         # The in-memory half below mutates `cfg` and RECORDS which migrations it
         # decided on; the on-disk half re-reads config.json inside the write lock
-        # and applies exactly those as a delta (see _persist_config_migration).
-        # It used to be `cfg.save()`, which re-serialized this load's whole
-        # snapshot and so dropped any config write that landed after this load's
-        # read (#7793).
+        # and applies exactly those as a delta (see _persist_config_migration),
+        # rather than `cfg.save()`, which would re-serialize this load's whole
+        # snapshot and drop any config write that landed after this load's read.
+        #
+        # Bound BEFORE the try: the ``finally`` at the end reads them, and an
+        # exception raised before their assignments would turn a logged write-back
+        # failure into a NameError out of load().
+        adopt_keys: set[str] = set()
+        adoption_landed = False
+        confirmed_adoptions: list[str] = []
+
         try:
             pending: set[str] = set()
             # Flat workspace strings → need migration to {"dir": ...}
@@ -3923,22 +4793,64 @@ class KiroCrewConfig:
                     pending.add(MIGRATE_CONNECTIONS_UI)
                 connections_migrating = True
 
+            # Adopt the auto-adopting superseded defaults. The in-memory half is
+            # applied BELOW, after the write is confirmed -- never here. Applying it
+            # eagerly would let a failed write leave the running config holding a
+            # value the stored document does not agree with, invisibly: the operator
+            # reads 1800 in config.json while the gateway runs 10800.
+            #
+            # In memory still matters as much as the file, which is why it happens at
+            # all: the gateway reads these budgets once at startup, so a disk-only
+            # fix would leave the very run that performed it still on the old value,
+            # and "upgraded, restarted, nothing changed" is the complaint.
+            adopt_keys = {e.dotted_key for e in adoptable}
+            if adopt_keys:
+                pending.add(MIGRATE_SUPERSEDED_DEFAULTS)
+
             needs_migration = bool(pending)
 
             persisted = True
+            # Tracked SEPARATELY from ``persisted``, which starts True so the
+            # connections_ui marker still lands on a load that needed no migration
+            # at all. This one starts False and is set only where the adoption
+            # actually reached disk, so every OTHER way out -- a contended-lock
+            # deferral, the degraded-sections branch below, an exception caught by
+            # the handler at the end -- leaves it False and drops the cache in the
+            # ``finally``.
             if needs_migration and not cfg._degraded_sections:
                 persisted = _persist_config_migration(
                     path,
                     frozenset(pending),
                     default_kiro_agent=cfg.agent.default_agent or "kirocrew",
+                    adopt_keys=frozenset(adopt_keys),
+                    confirmed_adoptions=confirmed_adoptions,
                 )
+                adoption_landed = persisted
+                # In memory only for keys the migration CONFIRMED it removed, and
+                # only where the overlay does not supply the field: there the stale
+                # base bytes are cleared like any other, but the effective value
+                # belongs to ``config.local.json`` and is the operator's live choice.
+                by_key = {e.dotted_key: e for e in adoptable}
+                for key in confirmed_adoptions:
+                    entry = by_key.get(key)
+                    if entry is not None:
+                        logger.warning(
+                            "config: adopted current default for %s; removed stored value %r. "
+                            "To restore it: kirocrew config set %s %s",
+                            key,
+                            entry.old_default,
+                            key,
+                            entry.old_default,
+                        )
+                    if entry is not None and not _overlay_supplies(local_data, key):
+                        _adopt_in_memory(cfg, key, entry.old_default)
             elif needs_migration:
                 # This load DISCARDED something (a malformed section, an
                 # unreadable file). The write-back serializes only the parsed
                 # fields, so writing back here would replace the operator's
                 # malformed narrowing with clean defaults — erasing the only
                 # on-disk evidence and turning the denial into silent
-                # allow-all at the next restart (#4057). Keep the malformed
+                # allow-all at the next restart. Keep the malformed
                 # bytes; every future process re-observes and re-denies until
                 # the operator actually fixes the file. Migration re-runs on
                 # the first clean load.
@@ -3975,6 +4887,28 @@ class KiroCrewConfig:
         except Exception as e:
             # Migration write-back is best-effort; never block startup.
             logger.warning("Config write-back failed: %s", e)
+        finally:
+            # An adoption that did NOT reach disk must not be frozen behind the
+            # validated-data cache. Only a load that READS the base document can
+            # decide an adoption (``adoptable`` is empty on a cache hit, by design),
+            # so a read-and-skip that left its document cached would have every
+            # later load serve the stale value and never retry -- the ceiling the
+            # operator upgraded to fix would come back and stay. In a ``finally``
+            # rather than beside the write, because the write is skipped by more
+            # than one path (a contended lock, an exception) and each leaves the
+            # same stale cache entry.
+            #
+            # The degraded-sections branch is the exception, and it is excluded on
+            # purpose. Its retry condition is not "the next load" but "the operator
+            # fixes the file and restarts the gateway" -- degradation observations
+            # are sticky for the life of a process (``_OBSERVED_DEGRADED_SECTIONS``),
+            # so until then the write is refused every time, and dropping the cache
+            # buys nothing except a full re-read and re-parse of config.json on
+            # EVERY load for as long as the two conditions coexist. After the
+            # restart the fixed file's fingerprint misses the (empty) cache and the
+            # adoption retries on that first load -- no invalidation needed.
+            if adopt_keys and not adoption_landed and not cfg._degraded_sections:
+                _invalidate_config_cache()
 
         return cfg, ticket
 
@@ -4020,6 +4954,8 @@ class KiroCrewConfig:
             "cron_history": asdict(self.cron_history),
             "knowledge": asdict(self.knowledge),
             "heartbeat": asdict(self.heartbeat),
+            "monitoring": asdict(self.monitoring),
+            "decisions": asdict(self.decisions),
             "skills": asdict(self.skills),
             "session_summary": asdict(self.session_summary),
             "telemetry": asdict(self.telemetry),
@@ -4046,6 +4982,15 @@ class KiroCrewConfig:
         if isinstance(_gw_section, dict):
             _gw_section["stub_servers"] = list(self.mcp_gateway.stub_roster)
             _gw_section.pop("_stub_roster", None)
+        # ``telegram.accounts`` is deprecated and inert. It is kept on disk ONLY
+        # so an operator's named-account tokens survive the next save(); an
+        # empty map protects nothing, and writing it back materializes a
+        # deprecated key into every config Kiro Crew has ever saved -- which
+        # validation then announces as a deprecation on every launch, to an
+        # operator who never wrote it. Emit the map only when it holds accounts.
+        _tg_section = d.get("telegram")
+        if isinstance(_tg_section, dict) and not _tg_section.get("accounts"):
+            _tg_section.pop("accounts", None)
         # Re-emit unknown/edition-contributed top-level sections captured at
         # load() so save()/PATCH does not silently drop them. A known section
         # never appears here (only keys absent from d are restored), so this can
@@ -4086,7 +5031,7 @@ class KiroCrewConfig:
         output to prevent overlay settings from leaking into the base file.
 
         **The write happens under the sidecar advisory lock** — the same
-        ``<config>.lock`` that :func:`update_config_locked` holds (#4767).
+        ``<config>.lock`` that :func:`update_config_locked` holds.
         Without it, this whole-document rename could land INSIDE another
         writer's read-modify-write (a CLI ``update_config_locked`` holder, a
         boot refresh, a second gateway), and whichever renamed second
@@ -4104,18 +5049,42 @@ class KiroCrewConfig:
         write. Every read-modify-write flow, and every dashboard/coroutine
         caller, belongs on :func:`update_config_locked` (via
         ``dashboard/chat_utils.run_config_write``), which holds the flock
-        across the WHOLE read-mutate-write transaction; as of #4767 no
-        coroutine in the tree calls ``save()`` at all
-        (``TestNoInlineSaveOnTheEventLoop`` pins that structurally).
+        across the WHOLE read-mutate-write transaction; no coroutine in the tree
+        calls ``save()`` at all (``TestNoInlineSaveOnTheEventLoop`` pins that
+        structurally).
 
         **Async callers must offload.** A contended POSIX ``flock`` blocks
         the calling thread for as long as the holder keeps it, which on the
-        event-loop thread stalls the whole gateway — the exact failure that
-        reverted the first attempt at this lock (#4371).
+        event-loop thread stalls the whole gateway.
         """
 
         d = self.to_dict()
 
+        # Strip the no-backend exec permission when the operator never DECLARED it.
+        #
+        # ``sandbox_allow_unsandboxed_exec`` is the one field whose ABSENCE is
+        # load-bearing: an absent key resolves through
+        # ``unsandboxed_exec_platform_default()`` (allow where no backend can be
+        # installed, fail-closed elsewhere), and absence is also what tells
+        # ``kirocrew setup`` there is still a decision to surface and the SEL audit
+        # that the platform rather than an operator permitted the spawn. Publishing
+        # a whole-document snapshot materializes every field, so without this strip
+        # any ``save()`` — the boot default-config write, a CLI one-shot — would
+        # freeze the resolved value in as a DECLARATION: writing ``false`` on such a
+        # host refuses every agent subprocess nobody asked to refuse, and writing
+        # ``true`` fakes a consent that was never given, skipping the very prompt
+        # that makes the posture explicit.
+        #
+        # Declaration is read from disk rather than tracked in memory because that is
+        # the same question every other consumer asks
+        # (``unsandboxed_exec_declared()``), so the writer cannot disagree with the
+        # reader about one host. On a fresh install there is no file yet, which reads
+        # as undeclared and is exactly right: the document this call creates should
+        # not contain the key at all.
+        if not unsandboxed_exec_declared():
+            agent_section = d.get("agent")
+            if isinstance(agent_section, dict):
+                agent_section.pop("sandbox_allow_unsandboxed_exec", None)
         # Strip overlay-owned values so they don't leak into config.json
         local_path = config_local_path()
         if local_path.is_file():
@@ -4165,6 +5134,7 @@ class KiroCrewConfig:
         # mtime-keying already detects the change; this makes it immediate even
         # if the filesystem mtime resolution is coarse.
         _invalidate_config_cache()
+        _notify_live_watch()
 
     @staticmethod
     def _resolve_agent_model() -> str:
@@ -4202,6 +5172,7 @@ class KiroCrewConfig:
         agent: str | None,
         model_override: str | None,
         global_model: str | None = None,
+        namespace: str | None = None,
     ) -> str:
         """The model id the ACP factory selects — what its effort gate keys on.
 
@@ -4247,18 +5218,44 @@ class KiroCrewConfig:
             global_model = self.agent.model
             if global_model == DEFAULT_MODEL:
                 global_model = self._resolve_agent_model()
+        # Kiro's namespace is ``acp``, so a supplied member route is unambiguous.
+        if namespace is None:
+            namespace = capabilities_for(self.agent.acp_backend).model_id_namespace
+        candidates: list[tuple[str, str]] = []
         if model_override:
-            m: str = model_override
-        elif not agent or agent == "kirocrew":
-            m = global_model
+            candidates.append((model_override, "model_override"))
+        if agent and agent != "kirocrew":
+            candidates.append((self._resolve_named_agent_model(agent), f"agent spec {agent}"))
+        candidates.append((global_model, "agent.model"))
+        # A pin says WHAT was picked, never for WHICH harness, so a backend switch
+        # hands the next session a model the new harness never served. Scope each
+        # precedence tier to the namespace that will run it and let an out-of-scope
+        # tier defer to the next candidate. The surviving pin is scoped BEFORE
+        # translation because translating a foreign id can make it look native.
+        for candidate, pin_source in candidates:
+            m = model_scope.scoped_pin(candidate, namespace, source=pin_source)
+            if m:
+                break
         else:
-            m = self._resolve_named_agent_model(agent) or global_model
-        if not m:
             return ""
-        namespace = capabilities_for(self.agent.acp_backend).model_id_namespace
-        if namespace != MODEL_NAMESPACE_ACP:
-            return model_registry.to_provider_id(m, namespace)
-        return model_registry.to_acp_id(m)
+        if m == DEFAULT_MODEL:
+            # The empty string is the nothing-pinned spelling every tier below reads.
+            return ""
+        # ``to_acp_id``, not ``to_provider_id``, is the kiro-family choice because
+        # kiro serves the registry aliases as distinct real models.
+        translated = (
+            model_registry.to_acp_id(m)
+            if namespace == MODEL_NAMESPACE_ACP
+            else model_registry.to_provider_id(m, namespace)
+        )
+        # Translation may RE-SPELL a pin, never RE-POINT it at another model. A
+        # different id from a namespace whose vocabulary does not claim this pin
+        # is an alias folding onto a substitute, and a pin the user picked
+        # outranks a substitution they cannot see. A namespace the registry does
+        # not model answers identically, so it re-points nothing.
+        if translated != m and not model_registry.namespace_vocabulary(m, namespace):
+            return m
+        return translated
 
     def crew_pinned_effort(self, agent: str | None, crew_agent: str | None = None) -> str:
         """The reasoning effort THIS CREW pins, or ``""`` when it pins none.
@@ -4331,20 +5328,51 @@ class KiroCrewConfig:
         ``model`` slot only; ``""`` when the agent declares none, so the caller
         falls back to the global. ``agents_dir`` overrides the lookup directory
         (a dependency-injection seam for tests); defaults to ``kiro_agents_dir()``.
+
+        Reads the ``agent_discovery.parsed_agent_specs`` snapshot -- the same
+        stat-signature-revalidated cache behind ``agent_skill_globs`` -- rather
+        than re-parsing every spec per call. This runs SYNCHRONOUSLY on the event
+        loop from the provider factory (every session start, every background
+        recycle), and a per-call scan of a ~125-file agents directory is ~125
+        ``realpath`` calls plus twice as many ``is_sensitive_path`` round trips
+        through the two-worker ``mc-pathres`` pool; when that pool is also
+        serving the skill scanner's bulk traffic, those waits queue and their
+        sum crosses the loop-stall watchdog. A warm call now costs one
+        ``scandir``. On the loop, cold or changed snapshots refresh in the
+        ``mc-discovery`` pool while this lookup serves previous rows (or no
+        pin until the first refresh lands). Off-loop callers parse inline.
+
+        JSON-first precedence is kept: with two live specs of DIFFERENT stems
+        both declaring this name, the ``.json`` one wins, as the unordered
+        first-match scan this replaces guaranteed (``iter_agent_spec_files``
+        lists JSON entries first). Never raises -- a failure to import, walk or
+        parse is "no pin here", never an exception into model resolution.
         """
         if not agent:
             return ""
         base = agents_dir if agents_dir is not None else kiro_agents_dir()
-        for af in base.glob("*.json"):
-            ad = _read_hardened_agent_spec(af)
-            if ad is None:
-                continue
+        try:
+            # Deferred import: agent_discovery imports kiro_crew.hooks, whose
+            # closure reaches back into this module (see _project_declares_agent).
+            from kiro_crew.agent_discovery import cached_agent_specs, parsed_agent_specs
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                rows = parsed_agent_specs(base, operation="load_config", source="unknown")
+            else:
+                rows = cached_agent_specs(base, operation="load_config", source="unknown")
+        except Exception:
+            return ""
+        # Stable sort: JSON rows first, filename order preserved within each group.
+        rows.sort(key=lambda row: row[1].suffix.lower() != ".json")
+        for ad, af in rows:
             # Skip stray non-object JSON a user may have dropped in the dir.
             if isinstance(ad, dict) and (ad.get("name") == agent or af.stem == agent):
                 return ad.get("model") or ""
         return ""
 
-    def load_credentials(self) -> dict[str, str]:
+    def load_credentials(self, *, propagate: bool = True) -> dict[str, str]:
         """Load credentials from ~/.kiro/crew/.env and environment variables.
 
         .env format: KEY=VALUE (one per line, # comments, no quotes required).
@@ -4358,8 +5386,8 @@ class KiroCrewConfig:
             # toggles the read-only attribute and succeeds without narrowing
             # who can read), and the real owner-only lockdown --
             # ``platform_compat.restrict_to_owner`` -- is not applied on this
-            # READ path. It no longer spawns a subprocess, so the reason is no
-            # longer cost: it is that a reader has no business rewriting a
+            # READ path. The reason is not cost: it is that a reader has no
+            # business rewriting a
             # descriptor it did not create, and doing so here would apply the
             # DACL of whichever process happened to read the file next.
             # Windows enforcement therefore lives where the file is WRITTEN --
@@ -4383,19 +5411,18 @@ class KiroCrewConfig:
             # settings), but the warning makes the behavior visible rather than
             # silently surprising.  The encrypted vault (PR 1+) will provide a
             # proper agent-isolated path for secrets.
-            unknown = set(creds) - set(_CREDENTIAL_KEYS) - _warned_env_keys
+            unknown = set(creds) - set(CREDENTIAL_KEYS) - _warned_env_keys
             if unknown:
                 _warned_env_keys.update(unknown)
                 for uk in sorted(unknown):
                     logger.warning(
                         "Unknown key %s in .env is not a recognised credential"
                         " -- it will propagate to child processes but is NOT"
-                        " agent-isolated. Recognised keys: %s",
+                        " agent-isolated.",
                         uk,
-                        ", ".join(sorted(_CREDENTIAL_KEYS)),
                     )
 
-        for key in _CREDENTIAL_KEYS:
+        for key in CREDENTIAL_KEYS:
             val = os.environ.get(key)
             if val:
                 creds[key] = val
@@ -4410,19 +5437,20 @@ class KiroCrewConfig:
         # credentials from the process environ (setting _KIROCREW_CREDS_SCRUBBED=1),
         # re-injecting them here would leak into /proc/<pid>/environ — the exact
         # attack surface the entrypoint closed. The scrub covers only credential
-        # keys, so the skip is scoped to _CREDENTIAL_KEYS: every other .env entry
+        # keys, so the skip is scoped to CREDENTIAL_KEYS: every other .env entry
         # (operator-added settings such as proxy or feature variables) still
         # propagates so children behave identically in and out of Docker.
         # Children that need the withheld credentials get them via their own
         # .env read or via an explicit env= kwarg on Popen (the sandbox and ACP
         # spawners already do this).
-        scrubbed = bool(os.environ.get("_KIROCREW_CREDS_SCRUBBED"))
-        for k, v in creds.items():
-            if not v:
-                continue
-            if scrubbed and (k in _CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)):
-                continue
-            os.environ.setdefault(k, v)
+        if propagate:
+            scrubbed = bool(os.environ.get("_KIROCREW_CREDS_SCRUBBED"))
+            for k, v in creds.items():
+                if not v:
+                    continue
+                if scrubbed and (k in CREDENTIAL_KEYS or _JIRA_TOKEN_RE.match(k)):
+                    continue
+                os.environ.setdefault(k, v)
 
         return creds
 
@@ -4433,6 +5461,7 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
         """
+        from kiro_crew.acp_backends import ACP_BACKEND_PI
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
@@ -4505,7 +5534,37 @@ class KiroCrewConfig:
             # gate actually keys on. (Why the translation is keyed on the
             # backend, and why to_acp_id is the non-claude choice, is documented
             # on that method.)
-            m = self.acp_effective_model(agent, model_override, global_model=model)
+            # Per-session backend selection -- ONE call to the selection gate's
+            # per-session half (members.select_provider_backend: member-DM
+            # auto-route > configured default). The factory body carries no
+            # branching of its own, so the kiro construction path gains no
+            # second check (harness-parity H3/H13); resolve_selected_backend
+            # inside the helper applies the same governance/selectability gate
+            # as the persisted field, so a denied or unknown value degrades to
+            # kiro -- the member thread then runs as plain chat and the mount
+            # step logs why.
+            # circular import: members sits above config in the layering.
+            from kiro_crew.members import select_provider_backend
+
+            _backend = select_provider_backend(
+                session_key,
+                self.agent.member_acp_backend,
+                self.agent.acp_backend,
+            )
+            is_pi = _backend == ACP_BACKEND_PI
+            # Resolved BEFORE the model, and threaded into the resolution: the
+            # model's namespace translation and its pin-scope check both have to
+            # key on the backend this session actually gets, not on the
+            # configured default. A member-DM thread auto-routed to another
+            # harness runs a backend the config does not name, so keying either
+            # on the configured field judges the pin for a namespace that
+            # session never reaches.
+            m = self.acp_effective_model(
+                agent,
+                model_override,
+                global_model=model,
+                namespace=capabilities_for(_backend).model_id_namespace,
+            )
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
             # kiro cold start (or the handler's reset-then-respawn) would only
@@ -4518,19 +5577,13 @@ class KiroCrewConfig:
             # dashboard slot's effort, or a sub-agent's resolved "subagent"
             # effort) still wins over all of it.
             _eff = reasoning_effort_override or self.resolve_session_effort(agent, crew_agent)
-            if (
-                m
-                and _eff
-                and is_valid_effort(_eff)
-                and (
-                    model_supports_effort(m)
-                    or (
-                        m == DEFAULT_MODEL
-                        and capabilities_for(self.agent.acp_backend).effort_via_config_option
-                    )
-                )
+            # Pi owns model selection when no concrete pin survives scope, but
+            # still needs its native effort override keyed by the auto sentinel.
+            _eff_model = m or (DEFAULT_MODEL if is_pi else "")
+            if _eff_model and _eff and is_valid_effort(_eff) and (
+                is_pi or model_supports_effort(_eff_model)
             ):
-                _eff_per_model[m] = _eff
+                _eff_per_model[_eff_model] = _eff
             elif _eff and is_valid_effort(_eff):
                 # Single-authority drop warning: a valid requested effort is
                 # being dropped because the resolved model is empty or not
@@ -4563,23 +5616,6 @@ class KiroCrewConfig:
                         session_key or "?",
                         m or "auto",
                     )
-            # Per-session backend selection — ONE call to the selection gate's
-            # per-session half (members.select_provider_backend: member-DM
-            # auto-route > configured default). The factory body carries no
-            # branching of its own, so the kiro construction path gains no
-            # second check (harness-parity H3/H13); resolve_selected_backend
-            # inside the helper applies the same governance/selectability gate
-            # as the persisted field, so a denied or unknown value degrades to
-            # kiro — the member thread then runs as plain chat and the mount
-            # step logs why.
-            # circular import: members sits above config in the layering.
-            from kiro_crew.members import select_provider_backend
-
-            _backend = select_provider_backend(
-                session_key,
-                self.agent.member_acp_backend,
-                self.agent.acp_backend,
-            )
             return AcpProvider(
                 work_dir=wdir,
                 model=m,
@@ -4591,13 +5627,9 @@ class KiroCrewConfig:
                 extra_env=extra_env,
                 acp_backend=_backend,
                 effort_per_model=_eff_per_model,
-                tool_search=(tool_search if _backend in ACP_BACKENDS_ACP_RUNTIME else None),
-                tool_search_min_pct=(
-                    tool_search_min_pct if _backend in ACP_BACKENDS_ACP_RUNTIME else None
-                ),
-                tool_search_min_tokens=(
-                    tool_search_min_tokens if _backend in ACP_BACKENDS_ACP_RUNTIME else None
-                ),
+                tool_search=None if is_pi else tool_search,
+                tool_search_min_pct=None if is_pi else tool_search_min_pct,
+                tool_search_min_tokens=None if is_pi else tool_search_min_tokens,
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_socket=_gw_socket,
             )
@@ -4677,11 +5709,14 @@ _MATERIALIZED_AGENTS_LOCK = threading.Lock()
 def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
     """Every agent name declared by the kiro agent configs in *agents_dir*.
 
-    Both spellings are emitted: the config's ``name`` field and the filename stem
-    (mirroring :meth:`_resolve_named_agent_model`), since an app's agent is
-    registered under a namespaced filename while its config keeps the app's bare
-    name. Unreadable or non-object entries are skipped. Performs the glob and the
-    per-file reads, so callers must invoke it OFF the event loop.
+    Each config contributes its DECLARED ``name`` field; the filename stem is
+    used only as a fallback when a config declares no name, since it is then the
+    only identifier available. An app's agent is registered under a namespaced
+    filename (``<app>--<agent>.json``) while its config keeps the app's bare
+    name, so the stem of a named config is deliberately NOT emitted — kiro-cli
+    enumerates agents by declared name and would not resolve it (see the inline
+    comment below). Unreadable or non-object entries are skipped. Performs the
+    glob and the per-file reads, so callers must invoke it OFF the event loop.
     """
     names: set[str] = set()
     # Deferred import: `hooks` reaches back into this module for config paths, so
@@ -4691,7 +5726,7 @@ def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
     from kiro_crew.hooks import safe_read_file
 
     try:
-        candidates = sorted(agents_dir.glob("*.json"))
+        candidates = iter_agent_spec_files(agents_dir)
     except OSError:
         return frozenset()
     for af in candidates:
@@ -4702,7 +5737,7 @@ def _scan_materialized_agents(agents_dir: Path) -> frozenset[str]:
             # refresh. safe_read_file re-checks the RESOLVED target and raises
             # PermissionError for a refused path — an OSError subclass, so a
             # refused entry is skipped by the same handler as an unreadable one.
-            data = json.loads(safe_read_file(str(af)))
+            data = parse_agent_spec_text(safe_read_file(str(af)), af)
         except (ValueError, OSError):
             continue
         # Skip stray non-object JSON a user may have dropped in the dir. The
@@ -4954,7 +5989,7 @@ def publish_agent_alias_snapshot(config: "KiroCrewConfig") -> None:
     Pure in-memory rebind — safe from anywhere, including the event loop. Called
     from :meth:`KiroCrewConfig.load` so every successful load refreshes it,
     including the degraded-defaults path (which must OVERWRITE a richer previous
-    snapshot rather than leave a resolver claiming aliases that no longer load).
+    snapshot rather than leave a resolver claiming aliases that do not load).
     """
     global _CONFIG_AGENT_ALIAS_SNAPSHOT
     aliases = frozenset(str(n) for n in config.agents if isinstance(n, str) and n)
@@ -4995,7 +6030,7 @@ def agent_alias_snapshot() -> tuple[frozenset[str], str, bool]:
 # files LOWERS that maximum, and so does restoring a backup with ``cp -p`` or any
 # other writer that preserves timestamps; each one makes the current state of the
 # filesystem look like an older read, so the publish that should win is dropped
-# and the live gate keeps a threshold the files no longer say. A ticket is
+# and the live gate keeps a threshold the current files do not carry. A ticket is
 # independent of the filesystem, so a deletion and a timestamp-preserving restore
 # both order as what they are: the newest read.
 _CONFIG_AUTOCOMPACT_PCT: float = DEFAULT_AUTOCOMPACT_PCT
@@ -5122,7 +6157,7 @@ def publish_config_timezone(config: "KiroCrewConfig", ticket: int | None = None)
     reader sees either the whole previous value or the whole new one. Called from
     :meth:`KiroCrewConfig.load` so every successful load refreshes it, including
     the degraded-defaults path, which must OVERWRITE a previous snapshot rather
-    than leave a zone the files no longer name.
+    than leave a zone the files do not name.
 
     *ticket* orders this publish against concurrent ones and carries the same
     contract as :func:`publish_autocompact_pct`: it must come from
@@ -5339,10 +6374,51 @@ def resolve_crew_identity(
     return ""
 
 
+def _resolve_agent_selection(config, agent_name=None, project_dir=None, *, selection_kind=""):
+    """Select a config record/template without accessing any memory files."""
+    alias_hit = selection_kind != "template" and bool(agent_name) and agent_name in config.agents
+    passthrough = (
+        ""
+        if alias_hit or selection_kind == "member"
+        else _materialized_kiro_agent(agent_name, project_dir)
+    )
+    requested_resolved = (not agent_name) or alias_hit or bool(passthrough)
+    if alias_hit:
+        alias = agent_name
+    elif config.default_agent in config.agents:
+        alias = config.default_agent
+    elif config.agents:
+        alias = next(iter(config.agents))
+        logger.warning("default_agent %r not found; using %r", config.default_agent, alias)
+    else:
+        alias = ""
+    return config.agents.get(alias), alias, passthrough, requested_resolved
+
+
+def resolve_agent_identity(config, agent_name=None, *, selection_kind="") -> tuple[str, str, str]:
+    """Alias, provider template and model pin for display/configuration only.
+
+    This does not authorize memory access. Runtime callers must resolve the full
+    bindings; a model chip remains inspectable while learned memory is unavailable.
+    """
+    record, alias, passthrough, _ = _resolve_agent_selection(
+        config, agent_name, selection_kind=selection_kind
+    )
+    return (
+        alias,
+        passthrough or (record.kiro_agent if record else config.agent.default_agent),
+        normalize_agent_model(record.model) if record else "",
+    )
+
+
 def resolve_agent_bindings(
     config: KiroCrewConfig,
     agent_name: str | None = None,
     project_dir: str | None = None,
+    *,
+    validate_memory_files: bool = True,
+    selection_kind: str = "",
+    execution_context=None,
 ) -> ResolvedBindings:
     """Resolve workspace, memory store, and kiro agent for a session.
 
@@ -5363,44 +6439,18 @@ def resolve_agent_bindings(
     """
     import dataclasses as _dc
 
-    # An app agent is resolvable by kiro-cli but is not a KiroCrew alias, so it
-    # takes the default's workspace/memory bindings while still dispatching
-    # ITSELF. Computed only when the name is not an alias — the lookup touches
-    # the filesystem.
-    alias_hit = bool(agent_name) and agent_name in config.agents
-    passthrough = "" if alias_hit else _materialized_kiro_agent(agent_name, project_dir)
-    # A non-empty name that matched NEITHER an alias nor a materialized config is
-    # about to be answered by the default agent. Reported so callers that store
-    # the requested name never advertise a binding that is not running.
-    requested_resolved = (not agent_name) or alias_hit or bool(passthrough)
-
-    # Step 1: explicit agent_name
-    if agent_name and agent_name in config.agents:
-        agent_cfg = config.agents[agent_name]
-        resolved_alias = agent_name
-    elif config.default_agent and config.default_agent in config.agents:
-        # Step 2: default_agent (guaranteed valid by load())
-        agent_cfg = config.agents[config.default_agent]
-        resolved_alias = config.default_agent
-    elif config.agents:
-        # Defensive: default_agent not in agents, use first available
-        first_name = next(iter(config.agents))
-        logger.warning(
-            "default_agent '%s' not found in agents, using '%s'",
-            config.default_agent,
-            first_name,
-        )
-        agent_cfg = config.agents[first_name]
-        resolved_alias = first_name
-    else:
-        # No agents at all — return safe defaults
+    agent_cfg, resolved_alias, passthrough, requested_resolved = _resolve_agent_selection(
+        config, agent_name, project_dir, selection_kind=selection_kind
+    )
+    if agent_cfg is None:
         logger.warning("No agents configured, using bare defaults")
         return ResolvedBindings(
             workspace_dir=Path("workspace"),
-            memory_store_name=config.default_memory_store,
+            memory_store_name=DEFAULT_MEMORY_STORE,
             effective_memory_config=_dc.asdict(config.memory),
             kiro_agent=passthrough or config.agent.default_agent,
             requested_resolved=requested_resolved,
+            selection_kind="template" if passthrough else "",
         )
 
     # Resolve workspace
@@ -5416,17 +6466,27 @@ def resolve_agent_bindings(
         fallback_ws = config.workspaces.get(config.default_workspace)
         ws_dir = Path(fallback_ws.dir) if fallback_ws else Path("workspace")
 
-    # Resolve memory store
-    store_name = agent_cfg.memory_store
-    if store_name not in config.memory_stores:
-        logger.warning(
-            "Agent memory_store '%s' not found, falling back to '%s'",
-            store_name,
-            config.default_memory_store,
-        )
-        store_name = config.default_memory_store
+    from kiro_crew.memory_stores import require_member_memory_store
 
-    kiro_agent = passthrough or agent_cfg.kiro_agent
+    # Existing V1 members keep their exact configured store binding.
+    # Canonical member/store mismatches are rejected before legacy use.
+    store_name = (
+        execution_context.store.store_id
+        if execution_context is not None
+        else (
+            DEFAULT_MEMORY_STORE
+            if passthrough
+            else require_member_memory_store(
+                config, resolved_alias, require_directory=validate_memory_files
+            )
+        )
+    )
+
+    kiro_agent = (
+        execution_context.template_id
+        if execution_context is not None
+        else passthrough or agent_cfg.kiro_agent
+    )
 
     # Build effective memory config via dict-level merge
     store_cfg = config.memory_stores.get(store_name)
@@ -5435,6 +6495,7 @@ def resolve_agent_bindings(
     effective_memory = resolve_memory_store_config(top_level_memory, store_dict)
 
     return ResolvedBindings(
+        execution_context=execution_context,
         workspace_dir=ws_dir,
         memory_store_name=store_name,
         effective_memory_config=effective_memory,
@@ -5442,12 +6503,15 @@ def resolve_agent_bindings(
         model=normalize_agent_model(agent_cfg.model),
         requested_resolved=requested_resolved,
         resolved_alias=resolved_alias,
+        selection_kind="template" if passthrough else "member",
     )
 
 
 def resolve_effective_model(
     config: KiroCrewConfig,
     agent_name: str | None = None,
+    *,
+    selection_kind: str = "",
 ) -> str:
     """Return the model a new session on *agent_name* would start with.
 
@@ -5464,23 +6528,38 @@ def resolve_effective_model(
     A per-session pick outranks all of these and is NOT considered here — the
     caller holds it. Returns ``""`` when every tier defers, meaning the backend
     picks (kiro-cli's own ``chat.defaultModel``).
-    """
-    bindings = resolve_agent_bindings(config, agent_name)
-    if bindings.model:
-        return bindings.model
 
-    kiro_agent = bindings.kiro_agent
+    Every tier is scoped to the namespace of the backend that would run the
+    session, the same gate ``create_provider_factory`` applies to the value it
+    sends. Without that the chip and the wire disagree in the one case the scope
+    exists for: after a backend switch the chip kept naming the previous
+    harness's pin while every turn ran on the new harness's default. A tier whose
+    pin the active harness cannot claim is skipped, so the next tier down answers
+    -- exactly as if that tier were unset.
+    """
+    namespace = capabilities_for(config.agent.acp_backend).model_id_namespace
+
+    def _in_scope(pin: str) -> str:
+        return model_scope.scoped_pin(
+            pin, namespace, source="resolve_effective_model", log_level=logging.DEBUG
+        )
+
+    _, kiro_agent, model_pin = resolve_agent_identity(
+        config, agent_name, selection_kind=selection_kind
+    )
+    if _in_scope(model_pin):
+        return model_pin
     if kiro_agent and kiro_agent != "kirocrew":
         pinned = normalize_agent_model(config._resolve_named_agent_model(kiro_agent))
-        if pinned:
+        if _in_scope(pinned):
             return pinned
 
     configured = normalize_agent_model(config.agent.model)
-    if configured:
+    if _in_scope(configured):
         return configured
     # agent.model is "auto"/unset: fall through to the installed agent file the
     # factory would read, so the chip shows what will actually be used.
-    return normalize_agent_model(config._resolve_agent_model())
+    return _in_scope(normalize_agent_model(config._resolve_agent_model()))
 
 
 def validate_kiro_agent_references(

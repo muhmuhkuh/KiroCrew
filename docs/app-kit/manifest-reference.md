@@ -42,15 +42,26 @@ resolves it so the server starts under the interpreter its dependencies were
 installed against:
 
 - **A bare Python launcher** (`python`, `python3`, `py`, or the same with `.exe`)
-  resolves to the app's own venv interpreter (`.venv/bin/python3`, or
-  `.venv\Scripts\python.exe` on Windows) when it exists as a runnable file, else
-  to the gateway's own interpreter — never a PATH lookup. Exception: a server
-  whose `args` launch a `kiro_crew` module (`-m kiro_crew...`) always gets the
-  gateway's interpreter, since app venvs cannot import `kiro_crew`.
+  resolves to the gateway's own interpreter whenever the gateway has
+  provisioned the app's `requirements.txt` (a `pip install --target` into
+  `data/.kirocrew-deps/`; python launchers run through a `site.addsitedir`
+  shim so `.pth` files are processed, other commands see the dir on
+  `PYTHONPATH`; under `data/` so app updates keep the last good install) - those
+  wheels are built by that interpreter, so it is the only ABI-consistent
+  choice. Without an active provisioned tree (never provisioned, or
+  provisioning failed), it resolves to the app's own venv
+  interpreter (`.venv/bin/python3`, or `.venv\Scripts\python.exe` on Windows)
+  when it exists as a runnable file created by the same Python minor version
+  as the gateway, else again to the gateway's own interpreter - never a PATH
+  lookup. Exception: a server whose `args` launch a `kiro_crew` module
+  (`-m kiro_crew...`) always gets the gateway's interpreter and never the
+  app deps on `PYTHONPATH`, so an app cannot shadow the gateway's own code.
 - **Any other bare name** (no path separator, no drive qualifier) is rewritten
-  only when the app's venv provides that exact binary as a runnable file (a pip
-  console script — invisible to PATH because the venv is never activated). Note
-  this means a venv-provided binary shadows a same-named PATH dependency.
+  only when the app's provisioned deps dir or its venv provides that exact
+  binary as a runnable file (a pip console script - invisible to PATH because
+  neither layout is ever activated; the venv is consulted only when no deps
+  dir was provisioned). Note this means an app-provided binary shadows a
+  same-named PATH dependency.
   `node`, `npx`, `docker` and friends are otherwise left for PATH, as declared.
 - **A command carrying a path** (absolute or relative) is never rewritten. If it
   does not point at a runnable file at registration time, a warning naming the
@@ -562,7 +573,7 @@ icon; an unrecognised or absent name renders a generic panel glyph.
 |-------|------|---------|-------------|
 | `backend.entryPoint` | string | | Script to run (relative to app root), or a dotted Python module path launched via `python -m` (used by built-in apps like `file-explorer`, e.g. `kiro_crew.apps.builtins.file_explorer.server`) |
 | `backend.port` | string | `"auto"` | Port number or `"auto"` for auto-assignment |
-| `backend.healthCheck` | string | `"/health"` | Absolute health-check path beginning with `/`; unsafe or ambiguous paths are refused. Polled until it answers at startup, then re-polled for the life of the backend — keep the handler cheap and dependency-free. A backend that stops answering it is dropped from the reverse proxy and its MCP servers are deregistered until it answers again. |
+| `backend.healthCheck` | string | `"/health"` | Absolute health-check path beginning with `/`; unsafe or ambiguous paths are refused. Polled until it answers at startup, then re-polled for the life of the backend — keep the handler cheap and dependency-free. A backend that stops answering it is dropped from the reverse proxy and its MCP servers are deregistered until it answers again. **The route must answer an UNSIGNED loopback GET directly with a 2xx** — the probe sends no proxy credential and follows no redirect, so a path behind the backend's own auth (401/403) and a path that redirects (3xx) both fail forever and the app never becomes reachable (the gateway then returns `app '<name>' has no reachable backend`). The gateway log names the observed status. |
 | `backend.routes` | string | | Base route path for the backend |
 | `backend.type` | string | `""` | Backend runtime: `"python"`, `"asgi"`, `"node"`, `"exec"` (execute the entry point file as-is), or `""` (auto-detect from `entryPoint` — a `.sh` file or an extensionless executable with a non-Python shebang is treated as a shell launcher) |
 
@@ -605,13 +616,12 @@ Gateway** -- the dashboard's enable action (`on_app_enable`), also re-run at
 gateway startup (`on_gateway_startup`) -- so on that path they go live without
 waiting for a Gateway restart.
 
-`kirocrew app enable` is not that path. The CLI is a separate process with no
-handle on a running Gateway's imported modules, so it cannot load or replace
-hooks: a Gateway that is already up keeps executing the hook module it imported
-earlier, even though the command succeeds and `app info` reports the new
-version. Restart the Gateway, or disable and re-enable the app from the
-dashboard, for hook changes to take effect. The CLI prints this reminder after
-enabling any app that declares `backend.hooks`.
+`kirocrew app enable` and `kirocrew app disable` apply live when a running
+Gateway is reachable through the CLI's owner-only Unix socket (POSIX only),
+including starting or stopping the backend. Otherwise the CLI records the change
+for the next Gateway start. On that file-only path, enabling an app that declares
+`backend.hooks` also prints the hooks reminder so the delayed activation is
+explicit.
 
 **Importing your own modules.** Hook entry files are loaded from their file path
 into a synthetic package named after the app, never via `sys.path`, so use a
@@ -631,6 +641,43 @@ symlinked sibling resolves wherever it points. Do not use a bare
 shipping a `config.py` would end up sharing one module. `from kiro_crew...`
 absolute imports are for built-in apps only.
 
+**Python dependencies.** Runtime `requirements.txt` provisioning — the
+`data/.kirocrew-deps/` tree described in the stdio `command`-resolution passage
+above (see #7878 / #7901 for the mechanism) — runs only where app code executes
+as its own process: the `backend.entryPoint` spawn path (a real file entry
+point in the app's own tree) and stdio MCP server registration. Hook code gets
+nothing from it: the tree reaches processes **spawned on the app's behalf** —
+through a `site`-processing launch shim for Python commands, on `PYTHONPATH`
+for ABI-matched others — and is never placed on the Gateway's own import path,
+because hooks run inside the Gateway process, where an app-controlled tree
+ahead of the trusted modules could shadow the Gateway's own code. That is the
+same rule that keeps `-m kiro_crew...` servers off the app deps, and it binds
+your hook code too: do not push your own tree onto `sys.path` ahead of the
+Gateway's modules from inside a hook.
+
+What serves hooks instead is the **install-time build step**: a registry
+install (which clones the app's git source) runs `pip install .` (or
+`pip install -r requirements.txt` when there is no `pyproject.toml`/`setup.py`)
+into the Gateway's own interpreter — the one that imports your hooks (see the
+publishing guide's install flow) — but only when the app's source directory
+(the `subdirectory` when one is declared) has no `package.json`, which takes
+precedence and routes the build to npm instead. Two caveats: the desktop app's
+bundled interpreter fails the build step outright, and a failed `pip` run —
+including a Gateway interpreter that has no `pip` module — fails the install
+rather than skipping the build. An app installed by other means, one whose
+`package.json` routed the build to npm, or one declaring no
+`requirements.txt`/`pyproject.toml`/`setup.py` at all, imports only the stdlib
+plus whatever the Gateway's environment already provides.
+
+If you create a directory to hold your own dependencies, do **not** name it
+`.venv`. Interpreter resolution (`resolve_app_python`) runs only for spawned
+surfaces — a backend entry point or a stdio MCP server — so a purely
+hooks-only app never triggers it; but the moment your app also declares one of
+those (now or in a later version), a real, probe-usable virtual environment at
+`<app>/.venv` becomes the interpreter for anything spawned on the app's
+behalf whenever no provisioned deps tree is active, even when it holds no
+packages at all.
+
 ## Permissions
 
 ### `permissions` — Declared Capabilities
@@ -645,6 +692,7 @@ absolute imports are for built-in apps only.
     "cron": true,
     "memory": "app-scoped",
     "network": false,
+    "sessionApproval": false,
     "spawn": false
   }
 }
@@ -659,6 +707,7 @@ absolute imports are for built-in apps only.
 | `permissions.cron` | boolean | Can create cron jobs |
 | `permissions.memory` | string | Memory access: `""` (none), `"app-scoped"`, or `"shared"` |
 | `permissions.network` | boolean | Can make external network requests |
+| `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices), approve or deny pending tool requests, and change approval modes within the limits below |
 | `permissions.spawn` | boolean | May start a background agent through the host's subagent manager (`ctx.spawn`) |
 
 #### `permissions.spawn` — Background Agents
@@ -678,7 +727,26 @@ the platform does not rate-limit spawns per app today.
 API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 `SpawnError`.
 
-> **Advisory today, not enforced in-process.** These fields are **not** a runtime sandbox. The validator functions in `apps/permissions.py` (`validate_permissions`, `format_permissions_summary`) are currently **not wired into the install or runtime path** — they are only exercised by unit tests — so the manifest `permissions` block is neither enforced nor even surfaced today: `mcpTools` is not gated at tool dispatch and an empty `mcpTools` list is treated as unrestricted. What actually confines an app today is the HTTP app-token scope (`permissions.api` allowlist, deny-by-default — see `security.md`) plus the OS sandbox. Install-time path traversal is blocked separately by `_check_path_safety(name)` + `manifest.validate()`, not by the permission validator. Full in-process enforcement is tracked in [rfc-app-sandbox-isolation.md](../request-for-change/rfc-app-sandbox-isolation.md).
+> **Not an in-process sandbox.** Most fields remain advisory for app code loaded
+> inside the gateway. The validator functions in `apps/permissions.py`
+> (`validate_permissions`, `format_permissions_summary`) are still **not wired
+> into the install or runtime path** -- they are only exercised by unit tests, so
+> they carry no `sessionApproval` text. `permissions.sessionApproval` is shown on the app detail
+> page and in the install or enable consent dialog. It is enforced for app-token
+> user-session calls, in addition to `permissions.api`. The app must be enabled.
+> The grant reaches existing local user-owned sessions only; cron, system, remote,
+> member-mode, and other apps' sessions are denied. Apps retain their pre-existing
+> access to their own slots. Mode changes must name a live allowed slot and are
+> limited to Normal, Reads and Trust; YOLO is a process-global override and stays
+> dashboard-only. An update that newly adds the flag disables the app until the user
+> enables it again from the detail page, which shows why (this re-gate is specific
+> to `sessionApproval`; see issue #11212 for the other live-enforced fields).
+> Official catalog entries mirror this flag so users see it before
+> install even when the store skips fetching the app manifest. Install-time path
+> traversal is blocked separately by
+> `_check_path_safety(name)` plus `manifest.validate()`. Full in-process
+> enforcement is tracked in
+> [rfc-app-sandbox-isolation.md](../request-for-change/rfc-app-sandbox-isolation.md).
 
 ## Setup Hooks
 
@@ -847,10 +915,12 @@ Two things decide whether your app can honestly claim `windows`:
    it is unaffected by the item below. An app with a `backend.entryPoint` is
    spawned through `sandbox.wrap_argv` without the first-party carve-out, and
    Kiro Crew has no native Windows sandbox backend — so on native Windows that
-   spawn needs the operator's `agent.sandbox_allow_unsandboxed_exec=true` (or
-   `agent.sandbox='off'`). That is a documented prerequisite, not a reason to
-   publish "does not run here": state it in your app's `configuration` copy so
-   the dependency is not a surprise. See `docs/guides/windows-install.md` and
+   spawn runs unconfined under this platform's default, since no backend is
+   installable here; it is refused only where the operator declared
+   `agent.sandbox_allow_unsandboxed_exec=false` or a governance
+   `sandbox.min_level` floor is pinned. Say so in your app's `configuration`
+   copy rather than publishing "does not run here", so a locked-down host is
+   not a surprise. See `docs/guides/windows-install.md` and
    `docs/system-specs/common/platform-compat.md`.
 
 When `installMode` is `"client"`, the App Store shows copy-paste terminal

@@ -1,11 +1,9 @@
-"""Regression guard for issue #1050: module-scope ``kiro_crew.agent`` imports.
+"""Module-scope ``kiro_crew.agent`` imports stay at module scope.
 
-The four modules below historically used function-local
-``from kiro_crew.agent import ...`` statements, several justified by
-``# circular import`` comments that misstated the real import graph
-(``kiro_crew.agent`` imports nothing from ``kiro_crew.dashboard.*`` or
-``kiro_crew.session``).  The imports were hoisted to module scope; these
-tests keep them there and prove no cycle exists in either load order.
+The four modules below import ``from kiro_crew.agent import ...`` at module
+scope. ``kiro_crew.agent`` imports nothing from ``kiro_crew.dashboard.*`` or
+``kiro_crew.session``, so no import cycle exists; these tests keep the imports
+at module scope and prove no cycle exists in either load order.
 
 Order-dependent cycles only surface in a fresh interpreter, not under a
 bare import in an already-warm test process — hence the subprocess runs.
@@ -42,8 +40,7 @@ def _fresh_import(statements: str) -> None:
         timeout=120,
     )
     assert res.returncode == 0, (
-        f"fresh-interpreter import failed (a hoisted import created a cycle?):\n"
-        f"{res.stderr}"
+        f"fresh-interpreter import failed (a hoisted import created a cycle?):\n" f"{res.stderr}"
     )
 
 
@@ -58,9 +55,7 @@ def test_hoisted_modules_import_agent_first_fresh() -> None:
     A cycle between ``agent`` and these modules would be order-dependent:
     it can pass in one load order and raise ImportError in the other.
     """
-    _fresh_import(
-        "; ".join(["import kiro_crew.agent"] + [f"import {m}" for m in _HOISTED_MODULES])
-    )
+    _fresh_import("; ".join(["import kiro_crew.agent"] + [f"import {m}" for m in _HOISTED_MODULES]))
 
 
 def test_no_function_local_agent_imports_remain() -> None:
@@ -90,4 +85,27 @@ def test_no_function_local_agent_imports_remain() -> None:
     assert not offenders, (
         f"function-local kiro_crew.agent imports reintroduced: {offenders}; "
         f"import at module scope instead (no cycle exists — see issue #1050)"
+    )
+
+
+def test_members_and_artifacts_import_first_fresh() -> None:
+    """``kiro_crew.members`` (and so ``memory_stores.provision_member_memory``)
+    must load in a process whose FIRST ``kiro_crew`` import reaches ``artifacts``.
+
+    ``artifacts`` imports ``hooks`` at module scope, and ``hooks`` ->
+    ``webhooks`` -> ``validation``; when ``validation`` read its content cap
+    from ``artifacts`` that edge closed a cycle which raised ImportError in
+    exactly this load order (the gateway and CLI dodged it only by importing
+    ``validation`` first). The cap now lives in the ``constants`` leaf.
+    """
+    _fresh_import("import kiro_crew.members; import kiro_crew.artifacts")
+    _fresh_import("import kiro_crew.artifacts; import kiro_crew.members")
+
+
+def test_validation_is_a_leaf_that_never_imports_artifacts() -> None:
+    """The closing edge stays deleted: loading ``validation`` must not pull
+    ``artifacts`` in, or the cycle above is one hoisted import from returning."""
+    _fresh_import(
+        "import sys; import kiro_crew.validation; "
+        "assert 'kiro_crew.artifacts' not in sys.modules, 'validation imports artifacts'"
     )

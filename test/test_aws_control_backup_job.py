@@ -1,10 +1,9 @@
 """AWS Control backups as durable Job SDK runs.
 
-What moved: starting a backup used to execute it inside the request and return
-its terminal record, so "a backup of mine is running" lived only in the React
-component that started it -- a reload or a navigation destroyed the fact while
-the work kept going. The route now claims a server-owned run and returns its
-id, and the browser follows it on the shared ``_jobs`` surface.
+The route claims a server-owned run and returns its id, and the browser follows
+it on the shared ``_jobs`` surface. Because the run is server-owned, "a backup of
+mine is running" survives a reload or a navigation instead of living only in the
+React component that started it and dying with it while the work keeps going.
 
 The cases here are the ones that shape the design rather than merely cover it:
 
@@ -62,7 +61,7 @@ class TestNoAwsCallBeforeTheGate:
     def test_discovery_never_runs_when_the_gate_refuses(self):
         order: list[str] = []
 
-        def _gate(account, profile, region, *, caller):
+        def _gate(account, profile, region, *, caller, payload_kind):
             order.append("gate")
             raise PermissionError("consent withdrawn; upload refused")
 
@@ -144,7 +143,13 @@ class TestEveryUploadRefusalIsAudited:
         with ExitStack() as stack:
             sel_factory = self._arrange(stack, **over)
             with pytest.raises(RuntimeError, match="upload refused"):
-                backup._authorize_upload(ACCOUNT, PROFILE, REGION, caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    PROFILE,
+                    REGION,
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
             sel_factory.return_value.log_api_access.assert_called_once()
             kwargs = sel_factory.return_value.log_api_access.call_args.kwargs
@@ -183,7 +188,13 @@ class TestEveryUploadRefusalIsAudited:
         with ExitStack() as stack:
             sel_factory = self._arrange(stack, granted=(False, "revoked_by_owner"))
             with pytest.raises(RuntimeError, match="upload refused"):
-                backup._authorize_upload(ACCOUNT, PROFILE, REGION, caller=chosen)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    PROFILE,
+                    REGION,
+                    caller=chosen,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
             kwargs = sel_factory.return_value.log_api_access.call_args.kwargs
             assert kwargs["caller"] == expected
@@ -197,7 +208,12 @@ class TestEveryUploadRefusalIsAudited:
         """
         assert backup.CALLER_OWNER != backup.CALLER_SCHEDULED
         assert "CALLER_OWNER" in inspect.getsource(backup.make_job_runner)
-        assert "CALLER_SCHEDULED" in inspect.getsource(hooks._run_once)
+        # The nightly names its caller in `_push_nightly`, the per-kind helper
+        # `_run_once` delegates each due push to, rather than in `_run_once`
+        # itself. What the loop actually passes is pinned behaviourally in
+        # test_aws_control_nightly_sessions.py, which reads the runner's kwargs;
+        # this half only asserts the two entry points name different constants.
+        assert "CALLER_SCHEDULED" in inspect.getsource(hooks._push_nightly)
 
     def test_teardown_is_recorded_but_not_as_an_access_denial(self) -> None:
         """Every refusal leaves a record; only access decisions are denials.
@@ -210,7 +226,13 @@ class TestEveryUploadRefusalIsAudited:
         with ExitStack() as stack:
             sel_factory = self._arrange(stack, stopping=True)
             with pytest.raises(RuntimeError, match="shutting down"):
-                backup._authorize_upload(ACCOUNT, PROFILE, REGION, caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    PROFILE,
+                    REGION,
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
             sel_factory.return_value.log_api_access.assert_called_once()
             kwargs = sel_factory.return_value.log_api_access.call_args.kwargs
@@ -492,6 +514,11 @@ def sdk(tmp_path: Path):
 @pytest.fixture(autouse=True)
 def _isolated_backup_state(tmp_path, monkeypatch):
     monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+    # A successful push ends with the retention sweep, which LISTS the drive. The
+    # sweep swallows its own failures by design, so an unstubbed run here would
+    # attempt a real CLI call and the test would still pass. Retention's own
+    # behaviour lives in test_aws_control_backup_retention.py.
+    monkeypatch.setattr(backup.storage, "list_object_versions", lambda *a, **k: [])
     backup.clear_stop()
     yield
     backup.clear_stop()
@@ -787,7 +814,7 @@ class TestRunnerAuthorization:
 
 class TestReconcile:
     def _write_orphan(self, data_dir: Path, *, status: str = job_sdk.RUNNING) -> str:
-        """A record from a process that no longer exists (a FOREIGN origin)."""
+        """A record from a process that does not exist (a FOREIGN origin)."""
         run_id = "d" * 32
         runs = data_dir / "jobs"
         runs.mkdir(parents=True, exist_ok=True)
@@ -961,7 +988,7 @@ class TestLedgerSurvives:
             mock.patch.object(backup.storage, "find_drive", return_value=BUCKET),
             mock.patch.object(backup, "snapshot_main", side_effect=fake_snapshot),
             mock.patch.object(backup, "_authorize_upload"),
-            mock.patch.object(backup.storage, "put_file"),
+            mock.patch.object(backup.storage, "put_file", return_value="v-test"),
         ):
             run_id = sdk.start(backup.KIND_SNAPSHOT, dedupe_key=ACCOUNT)
             run = _await_terminal(sdk, run_id)

@@ -122,7 +122,7 @@ function createIpcRegistrar({
     ipcMain.on("focus-mode-chrome", (event, visible) =>
       windows.chrome.focusMode(event.sender, visible));
     ipcMain.on("window-control", (event, action) =>
-      windows.chrome.windowControl(event.sender, action));
+      windows.chrome.windowControl(event.sender, action, event.senderFrame));
     ipcMain.on("theme-mode-changed", (_event, pref) =>
       windows.chrome.setThemeMode(pref));
     ipcMain.on("titlebar-overlay-theme", (_event, mode) =>
@@ -410,6 +410,10 @@ function createIpcRegistrar({
     // this bridge never exposes a raw CDP method to the renderer.
     ipcMain.handle("browser:control", (event, panelId, op, args) =>
       windows.browser.control(event.sender, panelId, op, args));
+    // Element annotation on the native page (human-initiated; closed op set,
+    // not a control op -- it takes no agent ownership of the view).
+    ipcMain.handle("browser:annotate", (event, panelId, op, args) =>
+      windows.browser.annotate(event.sender, panelId, op, args));
 
     ipcMain.on("mic:denied", () => windows.security.micDenied());
 

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import bisect
 import fnmatch
+import hashlib as _hashlib
 import ipaddress
 import json
 import logging
@@ -42,6 +43,15 @@ from kiro_crew.identity_stores import (
     AUTH_SQLITE_SIDECAR_SUFFIXES,
     fenced_home_dirs,
 )
+from kiro_crew.memory_stores import (
+    DEFAULT_MEMORY_STORE,
+    MEMORY_STORES_DIR_NAME,
+)
+from kiro_crew.memory_stores import declared_store_names as memory_stores_declared_names
+from kiro_crew.memory_stores import (
+    named_store_of_db,
+    resolve_store_path,
+)
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
 from kiro_crew.trust_patterns import ENV_ASSIGNMENT_RE
 
@@ -51,6 +61,7 @@ from . import (
     diagnostics,
     exfil,
     helpers,
+    inline_payload,
     paths,
     redaction,
     shell_normalizer,
@@ -60,12 +71,15 @@ from .argv_floor import (
     _AMBIGUOUS_REFS,
     _AMBIGUOUS_REFSPEC_RE,
     _DEV_MODE_CONFIRM_FLAG,
+    _EXPANSION_DEFAULT_RE,
     _GIT_ARG_FLAGS,
     _GIT_PUBLISH_DENY_LABEL,
     _GIT_PUBLISH_GLUE_RE,
     _GIT_PUBLISH_RE,
     _GIT_PUBLISH_SUBST_PROGRAM_RE,
-    _INLINE_DYNAMIC_EXEC_RE,
+    _HOSTNAME_SUBSTITUTION_HINTS,
+    _HOSTNAME_VARIABLE_FORMS,
+    _LOOPBACK_HOST_NAMES,
     _PROCESS_SUBSTITUTION_SAFE_CHARS,
     _PROTECTED_BRANCHES,
     _PUSH_ALL_BRANCHES_OPTS,
@@ -74,7 +88,9 @@ from .argv_floor import (
     _PUSH_REPO_OPTS,
     _PUSH_VALUE_OPTS,
     _PUSH_VALUE_SHORTS,
+    _QUOTED_SEP_SENTINELS,
     _RAW_ASSIGNMENT_RE,
+    _RSYNC_RSH_ASSIGN_RE,
     _SELF_CLOUD_DESTRUCTIVE_VERBS,
     _SELF_FLOOR_MACHINERY_RE,
     _SELF_FLOOR_NAME_HINT_RE,
@@ -82,12 +98,15 @@ from .argv_floor import (
     _SELF_IMPORT_RE,
     _SELF_MODULE_SPELLINGS,
     _SHELL_RESERVED_WORDS,
-    _backtick_closer,
+    _SSH_COMMAND_OPTION_KEYS,
+    _SSH_FAMILY_VERBS,
+    _SSH_FORWARD_OPT_LETTERS,
+    _SSH_ROUTING_OPTION_KEYS,
     _bare_kill_raw_bodies,
     _git_publish_floor_tags,
     _git_push_args,
     _has_self_importing_inline_program,
-    _inline_payload_reaches_cli,
+    _host_is_self,
     _is_credential_mint,
     _is_dev_mode_out_of_root_confirm,
     _is_git_publish,
@@ -95,19 +114,31 @@ from .argv_floor import (
     _is_kill_by_name_program,
     _is_push_to_protected_branch,
     _is_self_cloud_destructive,
+    _is_self_file_delivery,
     _is_self_gateway_restart,
     _is_self_kill,
     _is_self_module_flag,
     _is_self_module_invocation,
     _is_self_restart,
     _is_self_update,
+    _is_ssh_to_self,
     _kill_prefix_keeps_anchor,
+    _mask_quoted_separators,
     _matches_self_subcommand,
     _normalize_ref,
+    _operand_targets_self,
     _operands_lead_with,
+    _own_host_names,
+    _own_host_seed,
+    _own_interface_addresses,
     _process_substitution_word_is_opaque,
+    _proxyjump_value_targets_self,
     _push_segment_targets_protected,
     _python_reads_stdin,
+    _resolve_own_host_names,
+    _resolve_own_host_names_into_cache,
+    _routing_option_key_value_targets_self,
+    _routing_option_value_targets_self,
     _self_cli_operands,
     _self_floor_can_fire,
     _self_module_flag_scan,
@@ -116,9 +147,11 @@ from .argv_floor import (
     _self_token_frames,
     _SelfModuleScan,
     _shell_payload_sources,
+    _ssh_family_verb,
     _static_substitution_output,
     _stdin_program_text,
     _stdin_redirect_carriers,
+    _unmask_separators,
 )
 from .denied_rules import (
     _AWS_SECRET_VAR_NAMES,
@@ -276,6 +309,10 @@ from .helpers import (
     contains_injection,
     resource_limit_spec,
 )
+from .inline_payload import (
+    _INLINE_DYNAMIC_EXEC_RE,
+    _inline_payload_reaches_cli,
+)
 from .paths import (
     _CREW_HOME_PREFIXES,
     _CREW_SECRET_LEAVES,
@@ -295,6 +332,7 @@ from .paths import (
     DENIED_ROOT_PARTS,
     MAX_SCANNABLE_COMMAND_CHARS,
     MAX_SCANNABLE_SOURCE_BODY_CHARS,
+    UNVERIFIABLE_PATH_PREFIX,
     PathResolutionStalled,
     _candidate_forms,
     _expanded_env_root,
@@ -325,10 +363,13 @@ from .paths import (
     crew_home_prefixes,
     is_sensitive_bash_command,
     is_sensitive_path,
+    is_sensitive_resolved_path,
     is_sensitive_write_path,
+    is_unverifiable_path_refusal,
     path_contains_sensitive,
     sandbox_credential_targets,
     sensitive_home_dirs,
+    sensitive_path_refusal,
     write_protected_home_paths,
 )
 from .redaction import (
@@ -352,8 +393,12 @@ from .redaction import (
     _SECRET_ENTROPY_MIN,
     _SECRET_KEY_LEN,
     _SECRET_MAX_LOWER_RUN,
+    _SECRET_MAX_SLASHES,
     _SECRET_MAX_VOWEL_RATIO,
     _SECRET_PRINTABLE_DECODE_RATIO,
+    _TOKEN_PARAM_PARTIAL_RE,
+    _TOKEN_PARAM_RE,
+    _TOKEN_PARAM_VALUE_CLASS,
     _VOWELS,
     CREDENTIAL_REDACTION_TAGS,
     REDACTED_CREDENTIAL_TAG,
@@ -372,6 +417,7 @@ from .redaction import (
     get_credential_patterns,
     redact_credentials,
     redact_local_paths,
+    redact_path_segments,
 )
 from .shell_normalizer import (
     _AMBIGUOUS_EXPANSION_RE,
@@ -423,6 +469,7 @@ from .shell_normalizer import (
     _VAR_USE_RE,
     _argv_programs,
     _array_assignments,
+    _backtick_closer,
     _continuation_width,
     _cut_at_operator,
     _data_consumer_command_disqualified,
@@ -507,6 +554,8 @@ from .vocabulary import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
+
+    from kiro_crew.vector_memory import VectorMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -630,9 +679,9 @@ def sanitized_oauth_endpoint(url: str) -> tuple[str, str] | None:
     """Best-effort ``(host, path)`` of an OAuth URL, safe to surface to users.
 
     :func:`oauth_url_contains_credential` answers only a boolean, so its
-    callers historically could not tell the user WHICH endpoint tripped the
-    scanner — the remedy (``oauth_endpoints.json``) needs an exact host+path to
-    be actionable. This sibling names the endpoint without weakening the
+    callers cannot tell the user WHICH endpoint tripped the scanner — and the
+    remedy (``oauth_endpoints.json``) needs an exact host+path to be
+    actionable. This sibling names the endpoint without weakening the
     rejection:
 
     * only the lowercase hostname and the path are returned — NEVER the query,
@@ -734,11 +783,36 @@ BINARY_MIME_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 
+def redact_with_findings(text: str) -> tuple[str, list[str], list[str]]:
+    """Apply all redaction passes, reporting what each one removed.
+
+    The same passes in the same order as :func:`redact`, which is the point of
+    it living here: exfiltration URLs run FIRST because that pass matches whole
+    URLs, and a credential replaced ahead of it leaves a placeholder inside one,
+    which the URL matcher then fails to recognise as the shape it is there to
+    catch. A caller that wants the found lists would otherwise hand-sequence
+    the two calls and own that ordering separately -- which several already do,
+    in the reverse order.
+
+    Returns ``(text, credential_warnings, url_warnings)``. Both lists hold the
+    WARNING strings the underlying passes report (``"Redacted credential pattern
+    (20 chars)"``), never the removed values, so a caller can tell the user their
+    content was altered -- and log that fact -- without handling a secret.
+
+    This is the companion-BLIND baseline, like every ``security.redact*`` entry
+    point: it consults no active :class:`CredentialPolicy`. An egress site must
+    finish the text through ``platform.context.redact_via_context`` so a loaded
+    companion's extra patterns apply; use this one for the warnings, or where the
+    baseline is deliberately the subject.
+    """
+    text, urls = redact_exfiltration_urls(text)
+    text, credentials = redact_credentials(text)
+    return text, list(credentials), list(urls)
+
+
 def redact(text: str) -> str:
     """Apply all redaction passes (exfiltration URLs + credentials)."""
-    text = redact_exfiltration_urls(text)[0]
-    text = redact_credentials(text)[0]
-    return text
+    return redact_with_findings(text)[0]
 
 
 # ── Streaming redaction (pentest issue 3) ──
@@ -787,6 +861,22 @@ _PEM_HOLD_RE = re.compile(
 # is rejoined before emission while still keeping the buffer bounded.
 _STREAM_HOLDBACK_JWT_MAX = 4096
 
+# A sticky discard consumes only bytes that the ARMING anchor defines as value
+# bytes. These two classes are the existing classes from the partial JWT and
+# Bearer anchors below, named so the anchors and discard cannot drift apart.
+_JWT_SEGMENT_VALUE_CLASS = r"[A-Za-z0-9_-]"
+_BEARER_VALUE_CLASS = r"[A-Za-z0-9._~+/=-]"
+_STREAM_DISCARD_RUN_RES = {
+    "token-param": re.compile(rf"{_TOKEN_PARAM_VALUE_CLASS}*"),
+    "jwt": re.compile(rf"(?:{_JWT_SEGMENT_VALUE_CLASS}|\.)*"),
+    "bearer": re.compile(rf"{_BEARER_VALUE_CLASS}*"),
+}
+# Bytes of terminator-less continuation dropped silently between two tags. It is
+# NOT an exit: at the bound the discard re-emits the tag, zeroes the counter and
+# keeps dropping, so the counter stays O(1) and a credential's continuation never
+# resumes raw. Only a byte outside the arming anchor's value class ends the discard.
+_STREAM_DISCARD_MAX = 1 << 20
+
 # The withheld tail is a partial JWT/JWE when it ends with the `eyJ` base64url
 # header prefix optionally followed by up to FOUR `.`-separated base64url segments
 # (the final segment may be empty mid-stream). Three segments = a JWS/JWT
@@ -794,7 +884,9 @@ _STREAM_HOLDBACK_JWT_MAX = 4096
 # `{0,4}` trailing quantifier admits the full JWE shape too — matching the batch
 # `_CREDENTIAL_PATTERNS` JWE ceiling — instead of bisecting a >512-char JWE at the
 # 512 floor. Anchored to the buffer end (`\Z`).
-_PARTIAL_JWT_TAIL_RE = re.compile(r"eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*){0,4}\Z")
+_PARTIAL_JWT_TAIL_RE = re.compile(
+    rf"eyJ{_JWT_SEGMENT_VALUE_CLASS}+(?:\.{_JWT_SEGMENT_VALUE_CLASS}*){{0,4}}\Z"
+)
 
 # Trailing (possibly incomplete) `Authorization: Bearer <token>` anchor at the end
 # of the stream buffer. Unlike a bare credential run, this anchor embeds WHITESPACE
@@ -823,9 +915,22 @@ _PARTIAL_JWT_TAIL_RE = re.compile(r"eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*){0,4}\Z
 # and stream its raw tail.
 _BEARER_ANCHOR_PARTIAL_RE = re.compile(
     r"""Authorization["']?\s*[:=]\s*["']?"""
-    r"(?:Bearer(?:\s+[A-Za-z0-9._~+/=-]*)?|Beare|Bear|Bea|Be|B)?\Z",
+    rf"(?:Bearer(?:\s+{_BEARER_VALUE_CLASS}*)?|Beare|Bear|Bea|Be|B)?\Z",
     re.IGNORECASE,
 )
+
+
+def _complete_token_match_crossing(
+    matches: tuple[re.Match[str], ...], cut: int
+) -> re.Match[str] | None:
+    """Return the first token-parameter value strictly bisected by *cut*, if any."""
+    for match in matches:
+        # A cut at end(1) or end(1)+1 leaves the whole separator-name-equals-
+        # value inside the commit, where the batch pass redacts it whole. Only a
+        # cut inside the value strands an anchor-less suffix.
+        if match.start() < cut < match.end(1):
+            return match
+    return None
 
 
 class StreamRedactor:
@@ -839,60 +944,197 @@ class StreamRedactor:
     character, while a credential is a contiguous credential-class run.
     """
 
-    __slots__ = ("_buf", "_redact")
+    __slots__ = ("_buf", "_redact", "_discarding", "_discard_kind", "_discarded")
 
     def __init__(self, redactor: "Callable[[str], str] | None" = None) -> None:
         self._buf = ""
         # Resolve at call time so module-load order is irrelevant.
         self._redact = redactor or redact
+        self._discarding = False
+        self._discard_kind: str | None = None
+        self._discarded = 0
 
     def feed(self, chunk: str) -> str:
         """Accept a chunk; return the redacted prefix that is safe to emit now."""
         if not chunk:
             return ""
         self._buf += chunk
-        # Start of the maximal trailing credential-class run.
-        i = len(self._buf)
-        while i > 0 and self._buf[i - 1] in _CRED_CLASS:
-            i -= 1
+
+        # Invariant: `_buf` is always "" on entry when `_discarding` is true;
+        # this chunk is solely the continuation of the already-tagged drop.
+        # Only a terminator byte exits the discard. Reaching the bound with no
+        # terminator re-emits the tag and resets the counter but stays armed:
+        # clearing the flag there would hand the credential's remaining bytes
+        # to Phase A as an anchorless run, which the 512 floor streams raw.
+        if self._discarding:
+            assert self._discard_kind is not None
+            run_match = _STREAM_DISCARD_RUN_RES[self._discard_kind].match(self._buf)
+            assert run_match is not None
+            run = run_match.end()
+            self._discarded += run
+            if run == len(self._buf):
+                self._buf = ""
+                if self._discarded < _STREAM_DISCARD_MAX:
+                    return ""
+                self._discarded = 0
+                return _REDACTED_CREDENTIAL_TAG
+            self._discarding = False
+            self._discard_kind = None
+            self._buf = self._buf[run:]
+
+        # PHASE A -- SAFETY CUT.
+        # Invariant: every candidate can only move the cut backward. Bytes before
+        # the minimum do not bisect any known in-progress credential anchor.
+        natural_cut = len(self._buf)
+        while natural_cut > 0 and self._buf[natural_cut - 1] in _CRED_CLASS:
+            natural_cut -= 1
+        partial_jwt = _PARTIAL_JWT_TAIL_RE.search(self._buf)
+        safety_cuts = [natural_cut]
+
+        # Canonical credential tags are fixed points only when a batch-redaction
+        # call sees the WHOLE tag. Their interior space is outside `_CRED_CLASS`,
+        # so a chunk boundary inside a tag can otherwise commit its head and let
+        # token-parameter pass 4 re-redact that fragment. Hold only a STRICT tag
+        # prefix ending at the buffer tail. The nested search examines at most
+        # the longest module-owned tag and only defers the cut: it is not a
+        # credential anchor and therefore cannot escalate a cap or authorize a
+        # fail-closed drop.
+        partial_tag_start: int | None = None
+        for tag in CREDENTIAL_REDACTION_TAGS:
+            max_prefix = min(len(self._buf), len(tag) - 1)
+            for prefix_len in range(max_prefix, 0, -1):
+                if self._buf.endswith(tag[:prefix_len]):
+                    start = len(self._buf) - prefix_len
+                    partial_tag_start = (
+                        start if partial_tag_start is None else min(partial_tag_start, start)
+                    )
+                    break
         # PEM header hold-back (ported from the upstream project): the
-        # multi-word phrase "BEGIN RSA PRIVATE KEY" splits on whitespace.  If the
+        # multi-word phrase "BEGIN RSA PRIVATE KEY" splits on whitespace. If the
         # tail of the commit window contains an in-progress PEM header prefix,
         # refuse to commit at this boundary.
-        if i > 0 and _PEM_HOLD_RE.search(self._buf[max(0, i - 50) : i]):
-            i = 0
-        # Also withhold from the start of any trailing (possibly incomplete)
-        # `Authorization: Bearer <token>` anchor. Its embedded whitespace is not in
-        # _CRED_CLASS, so the run scan above would otherwise commit the anchor
-        # prefix and the opaque token in separate chunks — leaking the token, since
-        # the batch Bearer pattern only fires on the joined anchor.
-        anchor = _BEARER_ANCHOR_PARTIAL_RE.search(self._buf)
-        if anchor is not None:
-            i = min(i, anchor.start())
-        # Escalate the holdback cap to the JWT ceiling when the withheld tail is
-        # (the start of) a credential that legitimately exceeds the 512-char DoS
-        # floor: a partial JWT/JWE (`eyJ…`) OR a trailing `Authorization: Bearer`
-        # anchor. Bearer must be included alongside JWT — an opaque OAuth/refresh/
-        # SSO Bearer token > 512 chars has no `eyJ` prefix, so keying escalation on
-        # `_PARTIAL_JWT_TAIL_RE` alone left its 512-char tail streaming raw. Still
-        # bounded: a run with no credential anchor stays on the 512 floor.
-        cred_anchored = _PARTIAL_JWT_TAIL_RE.search(self._buf) is not None or anchor is not None
+        if natural_cut > 0 and _PEM_HOLD_RE.search(
+            self._buf[max(0, natural_cut - 50) : natural_cut]
+        ):
+            safety_cuts.append(0)
+
+        # Bearer anchors are STRONG: their embedded whitespace is not in
+        # _CRED_CLASS, so the natural cut could otherwise split anchor and value.
+        bearer_anchor = _BEARER_ANCHOR_PARTIAL_RE.search(self._buf)
+        if bearer_anchor is not None:
+            safety_cuts.append(bearer_anchor.start())
+
+        # A token-name prefix without '=' is WEAK. It still needs a short
+        # holdback so a chunk boundary cannot split the name, but it is not yet a
+        # credential and must never escalate the cap or authorize data loss.
+        token_anchor = _TOKEN_PARAM_PARTIAL_RE.search(self._buf)
+        weak_token_anchor = None
+        strong_token_anchor = False
+        if token_anchor is not None:
+            safety_cuts.append(token_anchor.start())
+            strong_token_anchor = token_anchor.group("eq") is not None
+            if not strong_token_anchor:
+                weak_token_anchor = token_anchor
+
+        i = min(safety_cuts)
+        complete_token_matches = tuple(_TOKEN_PARAM_RE.finditer(self._buf))
+        # Invariant: the complete-match crossing predicate is re-evaluated after
+        # every assignment to `i`; both Phase A and the Phase B floor call the
+        # same helper rather than letting their predicate copies drift.
+        complete_token_crossing = _complete_token_match_crossing(complete_token_matches, i)
+        if complete_token_crossing is not None:
+            i = min(i, complete_token_crossing.start())
+
+        strong_anchored = (
+            partial_jwt is not None
+            or bearer_anchor is not None
+            or complete_token_crossing is not None
+            or strong_token_anchor
+        )
+
+        # A partial canonical tag is already-redacted material. It lowers only
+        # the safety cut and is deliberately applied AFTER STRONG classification,
+        # so the tag prefix itself can neither raise a cap nor authorize a drop.
+        if partial_tag_start is not None:
+            i = min(i, partial_tag_start)
+
+        # PHASE B -- BOUNDS.
+        # Invariant: STRONG anchors may fail closed instead of exposing a secret;
+        # WEAK name prefixes never drop data. Any forced cut is repaired before
+        # emission so it cannot strand an anchor-less token-value suffix.
         cap = _STREAM_HOLDBACK_MAX
-        if len(self._buf) - i > cap and cred_anchored:
+        if len(self._buf) - i > cap and strong_anchored:
             cap = _STREAM_HOLDBACK_JWT_MAX
         if len(self._buf) - i > cap:
-            if cred_anchored:
-                # Fail closed: a credential-anchored tail (JWT/JWE/Bearer) has blown
-                # past the 4096 ceiling. Bisecting here would emit the token's head
-                # raw, so instead redact+emit the safe prefix, append the tag, and
-                # DROP the oversized tail. A plain cred-class run with no credential
-                # anchor falls through to the bisect below and is committed
-                # (bisecting an opaque non-credential run cannot leak a structured
-                # secret and preserves the DoS bound with no data loss).
-                commit, self._buf = self._buf[:i], ""
+            if strong_anchored:
+                # Preserve the fail-closed ceiling for a real credential anchor:
+                # redact the safe prefix, tag the event, and drop the oversized
+                # tail rather than bisecting it and exposing the token head.
+                # Only STRONG evidence arms the sticky discard. A WEAK trailing
+                # name prefix (`&tok`, no `=`) is held by the safety cut but is
+                # not yet a credential: it authorizes no drop and names no value
+                # class to drop with.
+                credential_reaches_end = (
+                    partial_jwt is not None
+                    or bearer_anchor is not None
+                    or strong_token_anchor
+                    or (
+                        complete_token_crossing is not None
+                        and complete_token_crossing.end(1) == len(self._buf)
+                    )
+                )
+                self._discarding = credential_reaches_end
+                self._discard_kind = None
+                if credential_reaches_end:
+                    # Every arming term above maps to exactly one kind, carrier
+                    # first: a STRONG token anchor or a complete crossing ending
+                    # the buffer -> "token-param"; a Bearer anchor -> "bearer";
+                    # a partial JWT -> "jwt". No other term can arm, so the
+                    # final `else` holds a true invariant.
+                    # Prefer an enclosing carrier over a token shape inside its
+                    # value: its value class defines where that credential ends.
+                    token_param_reaches_end = strong_token_anchor or (
+                        complete_token_crossing is not None
+                        and complete_token_crossing.end(1) == len(self._buf)
+                    )
+                    if token_param_reaches_end:
+                        self._discard_kind = "token-param"
+                    elif bearer_anchor is not None:
+                        self._discard_kind = "bearer"
+                    else:
+                        assert partial_jwt is not None
+                        self._discard_kind = "jwt"
+                self._discarded = 0
+                # A complete value may cross the safety cut yet end before a
+                # benign suffix in the same buffer. Drop only through the value;
+                # the suffix remains buffered for normal processing. Sticky
+                # discard is reserved for credential material that reaches the
+                # buffer end, where a continuation can still arrive.
+                drop_end = len(self._buf)
+                if complete_token_crossing is not None and not credential_reaches_end:
+                    drop_end = complete_token_crossing.end(1)
+                commit, self._buf = self._buf[:i], self._buf[drop_end:]
                 out = self._redact(commit) if commit else ""
                 return out + _REDACTED_CREDENTIAL_TAG
+
             i = len(self._buf) - cap
+
+            # The floor was computed after Phase A, so re-check complete token
+            # parameters against the actual cut. Advancing through the value is
+            # safe because the whole parameter reaches one batch-redaction call,
+            # and it shrinks the buffer rather than weakening the DoS bound.
+            floor_crossing = _complete_token_match_crossing(complete_token_matches, i)
+            if floor_crossing is not None:
+                i = floor_crossing.end(1)
+
+            # Repair the complete-match cut first, then preserve a trailing WEAK
+            # prefix if that repair crossed it. An encoded separator is at most
+            # 14 bytes and a name letter at most 42 (three `&#x0{0,8}HH;` slots),
+            # so the clamp is <=224 bytes -- still under
+            # `_STREAM_HOLDBACK_MAX = 512`.
+            if weak_token_anchor is not None and weak_token_anchor.start() < i:
+                i = weak_token_anchor.start()
+
         if i <= 0:
             return ""  # whole buffer is a (possibly partial) credential run — hold
         commit, self._buf = self._buf[:i], self._buf[i:]
@@ -900,6 +1142,11 @@ class StreamRedactor:
 
     def flush(self) -> str:
         """Redact and return the buffered remainder; clears the buffer."""
+        if self._discarding:
+            self._buf = ""
+            self._discarding = False
+            self._discard_kind = None
+            return ""
         out = self._redact(self._buf) if self._buf else ""
         self._buf = ""
         return out
@@ -907,6 +1154,9 @@ class StreamRedactor:
     def reset(self) -> None:
         """Discard the buffer without emitting (segment abandoned/cleared)."""
         self._buf = ""
+        self._discarding = False
+        self._discard_kind = None
+        self._discarded = 0
 
 
 def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]:
@@ -972,8 +1222,8 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
     ── Nested shell payloads ──
     A shell's ``-c`` argument is a COMMAND, and ``shlex`` strips only the OUTER
     quoting level, so ``bash -c 'dd "if=/dev/zero" of=/dev/sda'`` re-joins with
-    its inner quotes intact and the ``dd if=`` rule still does not match (found
-    by the GPT 5.6 review lane on this change).  Each literal payload is
+    its inner quotes intact and the ``dd if=`` rule still does not match.
+    Each literal payload is
     therefore walked and viewed in its own right, reusing
     :func:`_nested_shell_payloads` — the extractor the self-protection floor
     already uses, so the ``-c`` / ``eval`` / ``env -S`` / herestring /
@@ -1070,8 +1320,8 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
             # REQUIRES an intervening token (``rm -rf .* ./data``) matched the
             # double-spaced view and matches neither the elided one nor the
             # command's canonical spelling, so dropping it removed a denial that
-            # existed before: ``r""m -rf "" ./data`` was refused and became
-            # allowed (found by the GPT 5.6 review lane, reproduced against the
+            # existed: ``r""m -rf "" ./data`` was refused and became
+            # allowed (reproduced against the
             # merge-base).  Emitting both means a rule authored against either
             # whitespace shape still fires, which is the only reading that cannot
             # lose a denial.  Rules whose own pattern already tolerated the extra
@@ -1088,14 +1338,12 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
                     seen_views.add(candidate)
                     views.append(candidate)
             joined_here: set[str] = set()
-            payloads = _nested_shell_payloads(
-                tokens, allow_join=allow_join, joined_out=joined_here
-            )
+            payloads = _nested_shell_payloads(tokens, allow_join=allow_join, joined_out=joined_here)
             programs = _argv_programs(tokens) if payloads else []
             # Both values below read ONLY ``tokens``, which is fixed for this
             # whole walk, so they are charged ONCE here instead of once per
-            # payload.  Asking per payload is what made this loop quadratic in
-            # payload count (#8595 -- 18k payloads, ~293s): the exemption's
+            # payload.  Asking per payload is what makes this loop quadratic in
+            # payload count (18k payloads, ~293s): the exemption's
             # command-level guards sweep the whole argv, and recovering a
             # payload's positions with ``enumerate`` sweeps it again, so N
             # payloads cost N x len(tokens).  Neither hoist can change a verdict:
@@ -1113,8 +1361,8 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
                 if len(payload) >= parent_len:
                     continue
                 # ``echo bash -c '<script>'`` PRINTS the script, so descending into
-                # it refuses a command that runs nothing (raised as an advisory by
-                # the GPT 5.6 lane).  The repo's own exemption decides this, rather
+                # it refuses a command that runs nothing.  The repo's own exemption
+                # decides this, rather
                 # than a "launcher must be in command position" rule: the launcher
                 # is NOT in command position in ``sudo bash -c …``,
                 # ``timeout 5 bash -c …``, ``nohup``, ``ssh host``, ``xargs`` or
@@ -1132,8 +1380,7 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
                 # substring or a re-join, not an element of ``tokens``.  Recovering
                 # a position with ``list.index`` therefore raised ``ValueError`` and
                 # propagated out of the permission gate on legitimate input
-                # (``sed 's/x/y/e' notes.txt``): found independently as BLOCKING by
-                # the GPT 5.6 and Opus 4.8 lanes.
+                # (``sed 's/x/y/e' notes.txt``).
                 #
                 # The exemption is decided per OCCURRENCE and fails closed: it is
                 # applied only when the payload appears as a token AND every
@@ -1160,8 +1407,8 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
                 # the top level got: the shell that runs it folds ITS continuations
                 # before lexing, so fold before splitting or the split severs them.
                 # ``bash -c 'r\<newline>m -rf /'`` otherwise yields the pieces ``r``
-                # and ``m -rf /``, and no view holds the command that runs (BLOCKING
-                # from the GPT 5.6 lane).  A view must also not be joined across one
+                # and ``m -rf /``, and no view holds the command that runs.
+                # A view must also not be joined across one
                 # of the payload's own separators.  Only the PIECES are recorded as
                 # walked — recording the payload itself would filter out the single
                 # piece that equals it.
@@ -1340,9 +1587,7 @@ def is_denied(
         agent cannot diagnose at all. The span is the whole subject because a floor
         decides on the argv's SHAPE rather than at an offset.
         """
-        diagnostic = (
-            refusal_diagnostic(rule, component, tool_name) if rule and component else None
-        )
+        diagnostic = refusal_diagnostic(rule, component, tool_name) if rule and component else None
         return _deny_reason(
             matched, reason_notes, note_override=note_override, diagnostic=diagnostic
         )
@@ -1516,11 +1761,20 @@ def is_denied(
         ("credential-exfil-kirocrew-token", _is_credential_mint),
         ("self-protection-kill", _is_self_kill),
         ("self-protection-dev-mode-out-of-root-confirm", _is_dev_mode_out_of_root_confirm),
+        ("sandbox-escape-ssh-self", _is_ssh_to_self),
     ):
         pattern = _SELF_PROTECTION_FLOOR_BY_ID.get(rule_id)
         if pattern is None or pattern not in floor_enabled:
             continue
-        if predicate(lower):
+        # The mint predicate also gets the command AS SUBMITTED: it decodes base64
+        # literals to read the name they hide, and base64 does not survive the
+        # lower-casing every other predicate reads.
+        hit = (
+            _is_credential_mint(lower, raw_text=tool_name)
+            if predicate is _is_credential_mint
+            else predicate(lower)
+        )
+        if hit:
             # Report the rule's own pattern, exactly as the regex tier does, so
             # the denial reason and the SEL event still map back to the rule id —
             # plus a second line saying the match was STRUCTURAL, because a floor
@@ -1543,6 +1797,7 @@ def is_denied(
     for rule_id, predicate in (
         ("self-protection-restart", _is_self_restart),
         ("self-protection-update", _is_self_update),
+        ("self-protection-file-delivery", _is_self_file_delivery),
         ("self-protection-gateway-restart", _is_self_gateway_restart),
         ("self-protection-cloud", _is_self_cloud_destructive),
     ):
@@ -1609,8 +1864,8 @@ def is_denied(
     # suppressed.  ``_split_segments`` is deliberately quote-unaware, so a newline
     # inside a quoted payload severs the command before the payload can be
     # extracted from it -- ``bash -c 'r\<newline>m -rf /'`` arrives as the pieces
-    # ``bash -c 'r\`` and ``m -rf /'`` and the ``-c`` script is never seen (BLOCKING
-    # from the GPT 5.6 lane).  Emitting no view for the command itself is what keeps
+    # ``bash -c 'r\`` and ``m -rf /'`` and the ``-c`` script is never seen.
+    # Emitting no view for the command itself is what keeps
     # this from fabricating one across its separators.
     folded = _fold_line_continuations(tool_name)
     segments = [seg.strip() for seg in _split_segments(folded)]
@@ -1621,8 +1876,7 @@ def is_denied(
     # walking it twice doubles the payload scan -- which is quadratic in token
     # count inside ``_nested_shell_payloads`` -- for no view the segment walk does
     # not already produce.  Measured: skipping the duplicate halves the cost on a
-    # command padded with thousands of interpreter tokens (raised as a stall risk by
-    # the GPT 5.6 lane).
+    # command padded with thousands of interpreter tokens (a stall risk).
     if len(segments) != 1 or segments[0] != folded.strip():
         work.append(("", _deny_segment_views(tool_name, False)))
     for seg_raw in segments:
@@ -1785,9 +2039,8 @@ def _emit_deny_event(
         # credential straddling the 200-char boundary would otherwise be cut in half,
         # and the fragment no longer matches the credential pattern, so SEL's own
         # write-path redaction cannot catch it and the partial secret persists in a
-        # dashboard-readable log.  Both fields take it: ``raw_segment`` is new, and
-        # ``segment`` carried the same hazard from a bare slice (found by the GPT 5.6
-        # review lane on the new field).
+        # dashboard-readable log.  Both fields take it: a bare slice carries the
+        # same hazard in either one.
         metadata = {
             "deny_pattern": deny_pattern,
             "segment": redact_and_truncate(segment, 200) if segment else "",
@@ -1906,8 +2159,465 @@ def scan_history(history_dir: Path, last_n: int = 100) -> list[dict]:
     return findings
 
 
+#: How many episodic rows one store contributes to an injection audit. Newest
+#: first (``get_episodic_list`` orders by ``created_at DESC``), so the bound
+#: drops the oldest rows rather than a random slice, and it is per store: the
+#: work is proportional to the number of declared stores, not shared across them.
+_MEMORY_AUDIT_EPISODIC_LIMIT = 1000
+
+#: How much of a matching row's own text a finding carries. Enough to recognise the
+#: row and decide what to remove; short enough that a report of many findings stays
+#: readable in a terminal. Shared by every tier so one row's excerpt cannot be longer
+#: than another's purely by which pass found it.
+_MEMORY_AUDIT_VALUE_CHARS = 200
+
+
+def _memory_stores_to_scan() -> list[tuple[str, Path | None]]:
+    """``(store name, vector file)`` for every store :func:`scan_memory` opens.
+
+    The DEFAULT store is FIRST and carries ``None``, meaning "construct
+    ``VectorMemoryStore`` with no path". That is not a shortcut: it keeps the
+    default store's construction byte-identical, including the side effect that
+    a bare ``VectorMemoryStore().init()`` CREATES ``config_dir()/memory.db``
+    when it is absent. An install with no named stores must behave exactly as it
+    always has, down to that.
+
+    Named stores come off :func:`memory_stores_declared_names`, the enumeration every tier
+    of the audit shares.
+
+    A declared store whose vector file does not exist yet is SKIPPED. A named
+    store starts empty and its file appears at the first write, while
+    ``VectorMemoryStore.init()`` creates the directory, the file and (under the
+    crew schema lineage) decides its shape — so scanning one would have an audit
+    materialize a silo that holds nothing to scan. Skipping it costs this tier
+    only: that store's JSONL lessons tier is audited regardless, and on a
+    silo-bound crew with no vector store it is the ONLY populated tier there is.
+
+    Never raises: a config that cannot be read degrades to the default store
+    alone, the same floor ``memory_stores._declared_stores`` falls back to.
+    """
+    stores: list[tuple[str, Path | None]] = [(DEFAULT_MEMORY_STORE, None)]
+    for name in memory_stores_declared_names():
+        if name == DEFAULT_MEMORY_STORE:
+            continue
+        try:
+            # Opened DIRECTLY, never through the agent file gate: the whole
+            # ``memory_stores/`` subtree is a keystone leaf, so
+            # ``is_sensitive_path`` is True for every path this resolves. This is
+            # the established keystone-reader pattern — a legitimate reader opens
+            # the path itself, and relaxing the fence for this one caller would
+            # unfence the subtree for every tool caller too.
+            path = resolve_store_path(name)
+            # Confirm attribution independently of config lookup: each audit row
+            # must name the store whose database was actually opened. Strict
+            # binding resolution also rejects unavailable or undeclared stores.
+            if named_store_of_db(path) != name:
+                logger.warning(
+                    "memory store %r resolved to %s, which is not that store's own file; "
+                    "not audited rather than reporting another store's rows under its name",
+                    name,
+                    path,
+                )
+                continue
+            from kiro_crew.memory_stores import memory_store_version
+
+            if not path.exists() and memory_store_version(name) != 2:
+                logger.warning(
+                    "memory store %r has no vector file yet; its vector tier is not audited",
+                    name,
+                )
+                continue
+        except Exception:
+            logger.warning(
+                "memory store %r has no resolvable vector file; not audited", name, exc_info=True
+            )
+            continue
+        stores.append((name, path))
+    return stores
+
+
+#: ``type`` of the synthetic finding that stands in for a store nobody could read.
+#: Not an injection match -- it is the audit reporting that it does not KNOW, which is
+#: the one answer a security verdict must never round down to "clean".
+STORE_UNAUDITABLE = "store_unauditable"
+
+
+def _unauditable_finding(store_name: str) -> dict:
+    """A finding meaning "this store could not be read", shaped like a real one.
+
+    Carries the same four keys both CLI printers read (``type`` / ``key`` / ``warning``
+    / ``value``) plus ``store``, so it renders through each of them unchanged. Without
+    it a per-store failure is fail-soft all the way to the verdict: ``scan_memory()``
+    returns ``[]`` and the CLI prints a green tick, so corrupting one silo would silence
+    the audit for that silo AND earn a clean bill of health for the whole install.
+    """
+    return {
+        "type": STORE_UNAUDITABLE,
+        "key": store_name,
+        "warning": "store could not be read; its contents are UNKNOWN, not clean",
+        "value": "",
+        "store": store_name,
+    }
+
+
+#: ``type`` of a finding from a store's JSONL lessons tier. Distinct from ``"semantic"``
+#: and ``"episodic"`` because the tier decides the remedy — a lesson is removed with
+#: ``kirocrew learn remove``, not a memory delete — and because this tier exists on a
+#: store that has no vector file at all, where it is the only thing feeding the prompt.
+LESSON_FINDING_TYPE = "lesson"
+
+#: ``type`` of the synthetic finding that stands in for a lessons file nobody could read.
+#: The lessons twin of :data:`STORE_UNAUDITABLE`, separate so a report says WHICH tier is
+#: unknown: a store can have a readable vector file and an unreadable lessons file.
+LESSONS_UNAUDITABLE = "lessons_unauditable"
+
+
+def _unauditable_lessons_finding(store_name: str, path: Path) -> dict:
+    """A finding meaning "this store's lessons file could not be read".
+
+    Shaped exactly like :func:`_unauditable_finding` — the four keys both CLI printers
+    read plus ``store`` — for the same reason: a read failure that returns no finding is
+    fail-soft all the way to the verdict, so making one lessons file unreadable would
+    both silence that tier and earn the install a green tick.
+
+    ``key`` names the FILE rather than the store, which is what a reader needs here: the
+    store name is already on the ``store`` key, and the actionable fact is which path
+    would not open.
+    """
+    return {
+        "type": LESSONS_UNAUDITABLE,
+        "key": str(path),
+        "warning": "lessons file could not be read; its contents are UNKNOWN, not clean",
+        "value": "",
+        "store": store_name,
+    }
+
+
+def _lessons_files_to_scan() -> list[tuple[str, Path]]:
+    """``(store name, lessons file)`` for every store's JSONL lessons tier.
+
+    The DEFAULT store is first, then each declared store in name order, off the shared
+    :func:`memory_stores_declared_names`. Every store is listed, including one with no
+    ``memory.db``: a silo-bound crew's lesson WRITES land in this file precisely when
+    that silo has no vector store (``dashboard.handlers.cron._lesson_jsonl_store`` routes
+    by BINDING, and ``ContextBuilder.get_lessons_for`` creates only the markdown
+    directory), and ``LessonStore.get_context`` injects those rows into that crew's
+    prompt as ``[Learned corrections]``. So this is the tier an audit of vector files
+    alone reports "clean" about while it is the only populated, prompt-injected tier the
+    install has.
+
+    Each path comes from :class:`learn.LessonStore` itself rather than from a composed
+    ``<dir>/lessons.jsonl``, so the audit reads the exact file the writer writes.
+
+    A named store's directory is taken from the vector path this audit already trusts:
+    ``resolve_store_path(name).parent`` is the directory ``ensure_memory_store_dir``
+    hands the writer, and ``named_store_of_db`` is the same positive attribution gate the
+    vector pass applies — ``resolve_store_path`` DEGRADES rather than raising, so without
+    it a config save landing mid-scan would resolve the operator's OWN
+    ``lessons.jsonl`` under a crew's name and print the operator's corrections as that
+    crew's. The resolved path is re-checked against that directory afterwards because
+    ``LessonStore.__init__`` has fallbacks of its own; a store whose file lands outside
+    its own directory is not audited rather than misattributed.
+
+    Never raises. A store that cannot be resolved is dropped with a warning, which is
+    fail-soft on the ENUMERATION only — a file that resolves and then will not open is a
+    finding, not a silence (see :func:`_scan_store_lessons`).
+    """
+    from kiro_crew.learn import LessonStore
+
+    files: list[tuple[str, Path]] = []
+    for name in memory_stores_declared_names():
+        try:
+            from kiro_crew.memory_stores import memory_store_version
+
+            if memory_store_version(name) == 2:
+                continue
+            if name == DEFAULT_MEMORY_STORE:
+                # No ``base_dir``: byte-identical with the global ``LessonStore()`` every
+                # write path constructs, so the default store's file is the one the
+                # dashboard route, the CLI and the context builder all share.
+                files.append((name, LessonStore().path))
+                continue
+            db_path = resolve_store_path(name)
+            if named_store_of_db(db_path) != name:
+                logger.warning(
+                    "memory store %r resolved to %s, which is not that store's own file; "
+                    "its lessons tier is not audited rather than reporting another "
+                    "store's corrections under its name",
+                    name,
+                    db_path,
+                )
+                continue
+            path = LessonStore(base_dir=db_path.parent).path
+            if path.parent != db_path.parent:
+                logger.warning(
+                    "memory store %r resolved its lessons file to %s, outside the store's "
+                    "own directory %s; not audited rather than misattributed",
+                    name,
+                    path,
+                    db_path.parent,
+                )
+                continue
+        except Exception:
+            logger.warning(
+                "memory store %r has no resolvable lessons file; not audited",
+                name,
+                exc_info=True,
+            )
+            continue
+        files.append((name, path))
+    return files
+
+
+def _scan_store_lessons(store_name: str, path: Path, findings: list[dict]) -> None:
+    """Injection findings for ONE store's lessons file, each attributed to *store_name*.
+
+    *path* is opened DIRECTLY, never through the agent file gate: a named store's
+    lessons file is inside the keystone ``memory_stores/`` subtree, so
+    ``is_sensitive_path`` is True for it. That is the established keystone-reader pattern
+    (see ``docs/system-specs/modules/security.md`` and
+    ``docs/architecture/security-deep-dive.md``) — a legitimate reader opens the path
+    itself, because relaxing the fence for this one caller would unfence the subtree for
+    every tool caller too.
+
+    An ABSENT file is not a finding: a store's lessons tier appears at the first
+    correction, so absence is the ordinary state of a fresh store rather than a failure.
+    Any OTHER read failure IS one, because the whole file is a directive tier and "I
+    could not look" must not render as a tick.
+
+    Screens ``rule`` and ``negative`` — the two fields ``LessonStore.get_context``
+    renders into the prompt — with the SAME predicate the vector tiers use, so widening
+    the surface does not widen what counts as a finding. Every syntactically valid row is
+    screened, including one carrying a ``repo_scope`` that ``load_all`` drops: an audit
+    has no project to evaluate a scope against, and poisoned text sitting in this file is
+    reportable wherever a context build would have rendered it.
+
+    ONE finding per ROW, on the first matching field. The row is the unit of removal, so
+    a row poisoned in both fields is one thing for a reader to act on rather than two
+    findings sharing a key and inflating the count.
+
+    Reads the file whole. ``LessonStore`` itself loads and rewrites it whole on every
+    save and prunes it to a bounded row count, so the whole file already IS the
+    production working set — and a row-count bound here would be a blind spot an
+    attacker could append past.
+
+    The excerpt is NOT redacted, matching the vector passes exactly: they surface
+    ``value_json`` and ``text`` as stored, and a report that redacted one tier but not
+    another would read as though the tiers held different classes of content.
+    """
+    try:
+        # ``errors="replace"`` so a file carrying a non-UTF-8 byte is still screened
+        # rather than reported unauditable: the rows around the bad byte are exactly the
+        # ones an attacker would hope a decode error hid. It also means the only failure
+        # this can raise is an OSError -- there is no decode path left to fail.
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        logger.debug("memory store %r has no lessons file at %s", store_name, path)
+        return
+    except OSError:
+        logger.warning(
+            "memory store %r has an unreadable lessons file at %s; reporting it as "
+            "unauditable rather than clean",
+            store_name,
+            path,
+            exc_info=True,
+        )
+        findings.append(_unauditable_lessons_finding(store_name, path))
+        return
+    for lineno, line in enumerate(raw.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        matched = next(
+            (
+                value
+                for value in (row.get("rule"), row.get("negative"))
+                if isinstance(value, str) and _contains_injection(value)
+            ),
+            None,
+        )
+        if matched is None:
+            continue
+        findings.append(
+            {
+                "type": LESSON_FINDING_TYPE,
+                # The file and line, so the row can be found and removed. The matching
+                # text is the poisoned content itself, so it is the ``value``.
+                "key": f"{path.name}:{lineno}",
+                "value": matched[:_MEMORY_AUDIT_VALUE_CHARS],
+                "warning": "Injection pattern detected",
+                "store": store_name,
+            }
+        )
+
+
+def _memory_audit_matches(value: object) -> Iterator[str]:
+    """Inspect decoded JSON leaves, including JSON stored inside revision snapshots."""
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif isinstance(current, str):
+            try:
+                decoded = json.loads(current)
+            except (ValueError, TypeError):
+                decoded = None
+            if isinstance(decoded, (dict, list, str)):
+                pending.append(decoded)
+            elif _contains_injection(current):
+                yield current
+
+
+def _scan_memory_record_history(
+    store: VectorMemoryStore,
+    store_name: str,
+    findings: list[dict],
+    reported: set[tuple[str, bytes]],
+) -> None:
+    """Audit all metadata and revisions without loading the history into retrieval.
+
+    The tables are optional for older databases. Read every physical row in bounded
+    batches: a conflict proposal or a corrected old value is still durable content.
+    The same poisoned leaf repeated in an active row and its journal is one finding
+    for that record; a different historical payload remains separately reportable.
+    """
+    for table, kind, identity, prefix in (
+        ("memory_record_meta", "metadata", "record_id", ""),
+        ("memory_revisions", "revision", "record_id", ""),
+        ("memory_history", "history", "day", "history:"),
+        ("memory_consolidations", "consolidation", "source_id", "consolidation:"),
+    ):
+        with store._db_lock:
+            if not store.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",  # wokeignore:rule=master
+                (table,),
+            ).fetchone():
+                continue
+            # These are code-owned identifiers, never user input.
+            cursor = store.db.execute(f'SELECT * FROM "{table}" ORDER BY rowid')
+            columns = [column[0] for column in cursor.description]
+        while True:
+            with store._db_lock:
+                rows = cursor.fetchmany(128)
+            if not rows:
+                break
+            for values in rows:
+                row = dict(zip(columns, values))
+                record_id = prefix + str(row[identity])
+                matches = list(_memory_audit_matches(row))
+                fresh = [
+                    value
+                    for value in matches
+                    if (record_id, _hashlib.sha256(value.encode()).digest()) not in reported
+                ]
+                if not fresh:
+                    continue
+                reported.update(
+                    (record_id, _hashlib.sha256(value.encode()).digest()) for value in matches
+                )
+                key = f"{record_id}@{row['id']}" if "id" in row else record_id
+                findings.append(
+                    {
+                        "type": kind,
+                        "key": key,
+                        "value": fresh[0][:_MEMORY_AUDIT_VALUE_CHARS],
+                        "warning": "Injection pattern detected",
+                        "store": store_name,
+                    }
+                )
+
+
+def _scan_memory_store(store: VectorMemoryStore, store_name: str, findings: list[dict]) -> None:
+    """Injection findings for ONE opened store, each attributed to *store_name*.
+
+    ``store`` is the attribution carrier rather than the caller's own bookkeeping
+    because the findings from every store land in ONE flat list: an unattributed
+    row reads as the global store's, which both hides which crew's silo was
+    poisoned and puts one crew's memory text in another crew's report.
+
+    ``store`` is appended LAST so the four pre-existing keys keep their
+    positions; a consumer reading only those sees the shape it always saw.
+
+    Appends into the CALLER's list rather than building and returning its own: a raise
+    partway through -- a corrupt page reached on the episodic pass -- would otherwise
+    discard every semantic finding already collected for this store along with the
+    exception.
+    """
+    reported: set[tuple[str, bytes]] = set()
+    for entry in store.get_all_semantic():
+        val = entry.get("value_json", "")
+        matches = list(_memory_audit_matches(val))
+        if matches:
+            reported.update(
+                (f"key:{entry['key']}", _hashlib.sha256(value.encode()).digest())
+                for value in matches
+            )
+            findings.append(
+                {
+                    "type": "semantic",
+                    "key": entry["key"],
+                    "value": val[:_MEMORY_AUDIT_VALUE_CHARS],
+                    "warning": "Injection pattern detected",
+                    "store": store_name,
+                }
+            )
+    for entry in store.get_episodic_list(limit=_MEMORY_AUDIT_EPISODIC_LIMIT):
+        text = entry.get("text", "")
+        matches = list(_memory_audit_matches(text))
+        if matches:
+            reported.update(
+                (entry["id"], _hashlib.sha256(value.encode()).digest()) for value in matches
+            )
+            findings.append(
+                {
+                    "type": "episodic",
+                    "key": entry["id"],
+                    "value": text[:_MEMORY_AUDIT_VALUE_CHARS],
+                    "warning": "Injection pattern detected",
+                    "store": store_name,
+                }
+            )
+    _scan_memory_record_history(store, store_name, findings, reported)
+
+
 def scan_memory() -> list[dict]:
-    """Scan vector memory for suspicious content. Returns list of findings."""
+    """Scan every declared memory store's durable rows for suspicious content.
+
+    Returns one flat list of findings, each carrying the ``store`` it came from.
+    The default store comes first, then each declared named store in name order.
+
+    Covers SQLite facts, directives, episodes, metadata, immutable revisions,
+    learned history and consolidation receipts, then V1's JSONL lessons file.
+    Historical values are audit-only and are not added to model retrieval. V2
+    never consults an old learned-file sidecar as another authority.
+
+    Scanning named stores is not completeness for its own sake either: a crew silo's
+    directive tier is loaded into that crew's prompt, so it is the highest-value
+    prompt-injection target on disk, and the audit that reported "clean" while
+    opening only ``config_dir()/memory.db`` was reporting on a file the attacker
+    had no reason to write.
+
+    FAIL SOFT per store and per tier. One unreadable or corrupt silo costs that
+    store's findings for that tier and nothing else — not the default store's, not
+    those of the stores after it, and not the other tier's — because an audit that
+    aborts on the first bad file is an audit an attacker can silence by corrupting one
+    silo. The VERDICT is not fail-soft: a tier that could not be read reports itself,
+    so "unknown" never renders as a tick.
+
+    The vector tier runs first, whole, then the lessons tier. Grouping by tier rather
+    than by store keeps the vector pass's list order untouched, so an install with no
+    lessons file reports exactly what it always reported.
+    """
     findings: list[dict] = []
     # Lazy import to avoid a circular dependency (vector_memory imports
     # redact_credentials/redact_exfiltration_urls from this module at its top
@@ -1918,41 +2628,89 @@ def scan_memory() -> list[dict]:
     except Exception:  # numpy/faiss/snowballstemmer are optional heavy deps; any
         # import-time failure (ImportError, OSError from a C-extension, etc.)
         # must skip the scan cleanly rather than crash the caller.
+        # The lessons tier is stdlib-only and does NOT share that fate: it is the
+        # tier a store has when it has no vector store at all, so returning early
+        # here would make a missing numpy the way to silence it.
+        _scan_lessons_tier(findings)
         return findings
-    try:
-        store = VectorMemoryStore()
-        store.init()
-    except Exception:
-        return findings
 
-    # Scan semantic values
-    for entry in store.get_all_semantic():
-        val = entry.get("value_json", "")
-        if _contains_injection(val):
-            findings.append(
-                {
-                    "type": "semantic",
-                    "key": entry["key"],
-                    "value": val[:200],
-                    "warning": "Injection pattern detected",
-                }
+    for store_name, db_path in _memory_stores_to_scan():
+        try:
+            from kiro_crew.memory_stores import memory_store_version
+
+            member_store = db_path is not None and memory_store_version(store_name) == 2
+            if member_store and db_path is not None:
+                from kiro_crew.config.loader import KiroCrewConfig
+                from kiro_crew.vector_memory import open_member_database
+
+                config = KiroCrewConfig.load()
+                store = open_member_database(
+                    db_path,
+                    member_id=config.memory_stores[store_name].owner_member_id,
+                    store_id=store_name,
+                )
+            else:
+                store = (
+                    VectorMemoryStore() if db_path is None else VectorMemoryStore(db_path=db_path)
+                )
+        except Exception:
+            logger.warning(
+                "could not open memory store %r for an injection audit", store_name, exc_info=True
             )
-
-    # Scan episodic texts
-    for entry in store.get_episodic_list(limit=1000):
-        text = entry.get("text", "")
-        if _contains_injection(text):
-            findings.append(
-                {
-                    "type": "episodic",
-                    "key": entry["id"],
-                    "value": text[:200],
-                    "warning": "Injection pattern detected",
-                }
+            findings.append(_unauditable_finding(store_name))
+            continue
+        try:
+            if not member_store:
+                store.init()
+            _scan_memory_store(store, store_name, findings)
+        except Exception:
+            logger.warning(
+                "memory store %r could not be audited for injection patterns",
+                store_name,
+                exc_info=True,
             )
-
-    store.close()
+            findings.append(_unauditable_finding(store_name))
+        finally:
+            # In a finally so a raise anywhere above cannot leak this store's
+            # sqlite connection, and so a many-store install does not accumulate
+            # one open handle per store for the length of the scan.
+            try:
+                store.close()
+            except Exception:
+                logger.debug("closing memory store %r failed", store_name, exc_info=True)
+    _scan_lessons_tier(findings)
     return findings
+
+
+def _scan_lessons_tier(findings: list[dict]) -> None:
+    """Append every store's lessons-file findings into *findings*.
+
+    Its own function so the two ``scan_memory`` exits — the ordinary one and the early
+    return taken when the optional vector stack will not import — cannot drift on
+    whether this tier ran.
+
+    TOTAL: a failure costs at most one store's lessons tier, never the caller.
+    ``scan_memory`` is reached from two CLI verbs, and an exception here would replace an
+    audit report with a traceback — including the vector findings already collected. The
+    per-store backstop still REPORTS, so a store lost to an unexpected raise is
+    "unknown", not "clean"; :func:`_scan_store_lessons` handles the read failures it can
+    name itself.
+    """
+    try:
+        targets = _lessons_files_to_scan()
+    except Exception:
+        logger.warning("no memory store's lessons tier could be enumerated", exc_info=True)
+        return
+    for store_name, lessons_path in targets:
+        try:
+            _scan_store_lessons(store_name, lessons_path, findings)
+        except Exception:
+            logger.warning(
+                "memory store %r could not have its lessons tier audited",
+                store_name,
+                exc_info=True,
+            )
+            findings.append(_unauditable_lessons_finding(store_name, lessons_path))
 
 
 def audit_injection_dropped(
@@ -2065,6 +2823,7 @@ _SUBMODULES: tuple[ModuleType, ...] = (
     denied_rules,
     redaction,
     exfil,
+    inline_payload,
     argv_floor,
 )
 

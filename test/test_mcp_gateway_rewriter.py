@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from kiro_crew.mcp_gateway import rewriter
-from kiro_crew.mcp_gateway.hashing import is_secret_env_key
+from kiro_crew.mcp_gateway.hashing import expand_stub_flags, is_secret_env_key
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
 from kiro_crew.mcp_gateway.rewriter import (
     _WRAPPER_MARKER,
@@ -41,7 +41,7 @@ class TestSettingsInjection:
     same-named entry kiro-cli merges from the real settings file
     (``session_servers.py``). A server it does NOT return is left entirely to
     that merge — the rewriter never writes a settings overlay and never
-    modifies the real settings file (#8111).
+    modifies the real settings file.
     """
 
     def _spec(self) -> dict:
@@ -90,7 +90,7 @@ class TestSettingsInjection:
 
         The unit tests above pin the producer; this pins the WIRING: the
         stubbed global lands wrapped in the agent overlay, no settings overlay
-        appears anywhere under the overlay tree (#8111), and the real settings
+        appears anywhere under the overlay tree, and the real settings
         file is byte-identical afterwards.
         """
         from kiro_crew.mcp_gateway.rewriter import rewrite_agents
@@ -218,7 +218,7 @@ def test_allowlisted_server_gets_the_poolable_flag(tmp_path: Path) -> None:
     }
     new_spec, _ = _rewrite(spec, tmp_path, stub_servers=frozenset({"shareable"}))
 
-    assert "--poolable" in new_spec["mcpServers"]["shareable"]["args"]
+    assert "--poolable" in expand_stub_flags(new_spec["mcpServers"]["shareable"]["args"])
 
 
 def test_private_server_with_declared_env_is_not_warned_about(tmp_path: Path, caplog) -> None:
@@ -251,7 +251,7 @@ def test_private_server_with_declared_env_is_not_warned_about(tmp_path: Path, ca
         )
 
     assert wrapped == 1  # stubbed
-    assert "--poolable" not in new_spec["mcpServers"]["needs-env"]["args"]
+    assert "--poolable" not in expand_stub_flags(new_spec["mcpServers"]["needs-env"]["args"])
     env_warnings = [r for r in caplog.records if "declares" in r.getMessage()]
     assert env_warnings == [], (
         "a private backend was warned about with pooled-backend advice: "
@@ -278,7 +278,7 @@ def test_shared_server_with_declared_env_is_still_warned_about(tmp_path: Path, c
 
 
 def test_unresolvable_bare_command_is_not_stubbed(tmp_path: Path, caplog) -> None:
-    """Issue #3495 cause A: a bare command that resolves nowhere on the gateway
+    """A bare command that resolves nowhere on the gateway
     search path must NOT get a stub — gatewayd's spawn would ENOENT on every
     session and degrade it through a fallback exec. The entry is left for the
     session to launch directly (its own environment may still resolve it)."""
@@ -306,7 +306,7 @@ def test_unresolvable_bare_command_is_not_stubbed(tmp_path: Path, caplog) -> Non
 
 
 def test_resolvable_bare_command_lands_absolute_in_the_stub(tmp_path: Path) -> None:
-    """Issue #3495 cause A, positive half: a bare command that DOES resolve is
+    """A bare command that DOES resolve is
     baked into the stub as an absolute path, so gatewayd (running under the
     systemd --user PATH) can spawn it."""
     exe_dir, exe_name = str(Path(sys.executable).parent), Path(sys.executable).name
@@ -319,7 +319,7 @@ def test_resolvable_bare_command_lands_absolute_in_the_stub(tmp_path: Path) -> N
     new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"bare"}), forward_env=True)
 
     assert wrapped == 1
-    args = new_spec["mcpServers"]["bare"]["args"]
+    args = expand_stub_flags(new_spec["mcpServers"]["bare"]["args"])
     resolved = args[args.index("--target-command") + 1]
     assert Path(resolved).is_absolute(), resolved
     assert Path(resolved).name == exe_name
@@ -328,7 +328,7 @@ def test_resolvable_bare_command_lands_absolute_in_the_stub(tmp_path: Path) -> N
 def test_env_declaring_server_is_declassified_when_forwarding_is_off(
     tmp_path: Path, caplog
 ) -> None:
-    """Issue #3495 cause B: with declared-env forwarding OFF, pooling a server
+    """With declared-env forwarding OFF, pooling a server
     that declares env spawns it WITHOUT that env — it dies at prime on every
     session, trips the breaker, and falls back anyway. Pre-classify: leave it
     unwrapped so the session applies the declared env itself."""
@@ -504,7 +504,7 @@ def test_pooling_disabled_still_wraps_but_shares_nothing(tmp_path: Path) -> None
     assert wrapped == 1
     listed = new_spec["mcpServers"]["listed"]
     assert listed.get(_WRAPPER_MARKER) is True, "listed lost its stub"
-    assert "--poolable" not in listed["args"], "listed still marked shareable"
+    assert "--poolable" not in expand_stub_flags(listed["args"]), "listed still marked shareable"
 
     declared = new_spec["mcpServers"]["declared"]
     assert (
@@ -562,8 +562,16 @@ def test_rewriter_calls_restrict_to_owner_on_windows(tmp_path: Path, monkeypatch
     # Simulate Windows: IS_POSIX=False, IS_WINDOWS=True.
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_POSIX", False)
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
-    # Forwarding ON or the env-declaring fixture is declassified (issue #3495
-    # cause B) and no sidecar write happens at all.
+    # The spec read and the source fingerprint both go through the hardened
+    # no-reparse open, which under the simulated flag would call the real Win32
+    # API; this test is about the lockdown of what gets WRITTEN, so read the
+    # fixture plainly at both seams.
+    monkeypatch.setattr(
+        "kiro_crew.agent_discovery.safe_read_file_bytes", lambda raw: Path(raw).read_bytes()
+    )
+    monkeypatch.setattr("kiro_crew.hooks.safe_read_file_bytes", lambda raw: Path(raw).read_bytes())
+    # Forwarding ON or the env-declaring fixture is declassified and no sidecar
+    # write happens at all.
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.forward_declared_env_enabled", lambda: True)
     with (
         patch(
@@ -665,9 +673,9 @@ def test_overlay_lockdown_precedes_content(tmp_path: Path, monkeypatch) -> None:
     """The per-agent overlay writer locks the temp file down BEFORE content
     reaches it (the settings overlay shares the same atomic_write call shape).
 
-    Overlays carry passed-through env blocks (tokens / API keys); the previous
-    Windows-only post-rename restrict_to_owner left them readable under the
-    inherited DACL for the whole write window (issue #5285). Asserted by
+    Overlays carry passed-through env blocks (tokens / API keys); a Windows-only
+    post-rename restrict_to_owner leaves them readable under the
+    inherited DACL for the whole write window. Asserted by
     measuring the file's SIZE at lockdown time — zero means no payload byte
     existed yet. A post-write stat passes on the buggy ordering too, so it
     would not be a regression test.
@@ -727,7 +735,7 @@ def _spec_with_env(source_dir: Path) -> None:
 
 def _overlay_stub_args(overlay_dir: Path) -> list[str]:
     spec = json.loads((overlay_dir / "test-agent.json").read_text(encoding="utf-8"))
-    return list(spec["mcpServers"]["myserver"].get("args", []))
+    return expand_stub_flags(spec["mcpServers"]["myserver"].get("args", []))
 
 
 def test_env_sidecar_directory_goes_through_make_owner_only_dir(
@@ -743,8 +751,8 @@ def test_env_sidecar_directory_goes_through_make_owner_only_dir(
     from kiro_crew.mcp_gateway.rewriter import rewrite_agents
 
     # Sidecar machinery is under test, not pooling classification: forwarding
-    # must be ON or the env-declaring fixture is declassified (issue #3495
-    # cause B) and no sidecar is ever written.
+    # must be ON or the env-declaring fixture is declassified and no sidecar
+    # is ever written.
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.forward_declared_env_enabled", lambda: True)
 
     source_dir = tmp_path / "agents"
@@ -790,8 +798,8 @@ def test_failed_sidecar_protection_leaves_no_readable_credentials(
     from kiro_crew.mcp_gateway.rewriter import rewrite_agents
 
     # Sidecar machinery is under test, not pooling classification: forwarding
-    # must be ON or the env-declaring fixture is declassified (issue #3495
-    # cause B) and no sidecar is ever written.
+    # must be ON or the env-declaring fixture is declassified and no sidecar
+    # is ever written.
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.forward_declared_env_enabled", lambda: True)
 
     source_dir = tmp_path / "agents"
@@ -812,6 +820,12 @@ def test_failed_sidecar_protection_leaves_no_readable_credentials(
 
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_POSIX", False)
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    # Same as the lockdown test above: keep the hardened spec read and source
+    # fingerprint off the real Win32 open the simulated flag would select.
+    monkeypatch.setattr(
+        "kiro_crew.agent_discovery.safe_read_file_bytes", lambda raw: Path(raw).read_bytes()
+    )
+    monkeypatch.setattr("kiro_crew.hooks.safe_read_file_bytes", lambda raw: Path(raw).read_bytes())
     with (
         patch(
             "kiro_crew.mcp_gateway.rewriter.platform_compat.restrict_to_owner",
@@ -1005,3 +1019,243 @@ def test_placeholder_source_env_mirrors_the_forwarder_filters(monkeypatch) -> No
             if not (is_secret_env_key(k) or is_credential_env_key(k))
         }
     )
+
+
+# ── cmd.exe-safe launch argv (Windows cmd.exe quote-stripping) ──
+#
+# kiro-cli spawns MCP entries on Windows through ``cmd.exe /C``. A launch line
+# whose command is quoted (a ``Program Files`` interpreter) survives only
+# cmd's exactly-two-quotes special case; one more quoted element strips the
+# outer pair and the interpreter becomes ``C:\Program``. Every stub flag
+# already rides inside the base64url envelope, so the wrapped entry's
+# ``command`` is the one element that must be normalised to a metacharacter-
+# free spelling (the 8.3 short form). These tests construct the hazardous
+# input directly, so they assert the invariant on every platform.
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cmd_safe_state():
+    """Reset the per-element residual-hazard warning latch between tests."""
+    rewriter._reset_cmd_unsafe_warnings()
+    yield
+    rewriter._reset_cmd_unsafe_warnings()
+
+
+def _program_files_interpreter(tmp_path: Path) -> str:
+    """A real executable whose path sits under a directory with a space."""
+    exe_dir = tmp_path / "Program Files" / "Kiro Crew"
+    exe_dir.mkdir(parents=True)
+    exe = exe_dir / "python"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def test_wrapped_argv_is_cmd_safe_under_a_spaced_interpreter_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every element of a wrapped entry's launch argv is free of cmd.exe
+    metacharacters when a short form exists for the interpreter path."""
+    exe = _program_files_interpreter(tmp_path)
+    short = exe.replace("Program Files", "PROGRA~1").replace("Kiro Crew", "KIROCR~1")
+    monkeypatch.setattr(sys, "executable", exe)
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr("kiro_crew.platform_compat.short_path_name", lambda p: short)
+
+    spec = {"name": "agent-a", "mcpServers": {"svc": {"command": exe}}}
+    new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"svc"}))
+    entry = new_spec["mcpServers"]["svc"]
+
+    assert wrapped == 1
+    for element in (entry["command"], *entry["args"]):
+        assert not rewriter._CMD_UNSAFE.intersection(element), element
+    assert entry["command"] == short
+
+
+def test_wrapped_command_kept_and_warned_when_no_short_form_exists(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """8.3 generation can be disabled per volume: the original path is kept
+    (same file, still launchable by non-cmd spawners) and the residual hazard
+    is logged ONCE with the remedy, so the failure is diagnosable instead of
+    silent and a fleet of wrapped servers does not bury the diagnosis."""
+    import logging
+
+    exe = _program_files_interpreter(tmp_path)
+    monkeypatch.setattr(sys, "executable", exe)
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr("kiro_crew.platform_compat.short_path_name", lambda p: "")
+
+    spec = {
+        "name": "agent-a",
+        "mcpServers": {"svc": {"command": exe}, "svc2": {"command": exe}},
+    }
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.rewriter"):
+        new_spec, wrapped = _rewrite(spec, tmp_path, stub_servers=frozenset({"svc", "svc2"}))
+
+    assert wrapped == 2
+    for name in ("svc", "svc2"):
+        # original preserved, never a broken form
+        assert new_spec["mcpServers"][name]["command"] == exe
+    residual = [r.getMessage() for r in caplog.records if "metacharacter" in r.getMessage()]
+    # Once per distinct hazardous element, not once per wrapped server -- and
+    # the line names the remedy, not just the measurement.
+    assert len(residual) == 1, residual
+    assert "8.3" in residual[0]
+
+
+def test_short_form_still_unsafe_falls_back_to_the_original(monkeypatch) -> None:
+    """A short form that itself carries a metacharacter is not an improvement;
+    the original spelling is kept for the guard to report."""
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "kiro_crew.platform_compat.short_path_name", lambda p: r"C:\PROGRA%1\py.exe"
+    )
+    original = r"C:\Program Files\py.exe"
+    assert rewriter._cmd_safe_command(original) == original
+
+
+def test_cmd_safe_command_reresolves_short_form_on_every_call(monkeypatch) -> None:
+    """A removed 8.3 alias cannot remain cached across broker rewrites."""
+    original = r"C:\Program Files\py.exe"
+    short_forms = iter((r"C:\PROGRA~1\py.exe", r"C:\PROGRA~2\py.exe"))
+    calls: list[str] = []
+
+    def _next_short_form(path: str) -> str:
+        calls.append(path)
+        return next(short_forms)
+
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr("kiro_crew.platform_compat.short_path_name", _next_short_form)
+
+    assert rewriter._cmd_safe_command(original) == r"C:\PROGRA~1\py.exe"
+    assert rewriter._cmd_safe_command(original) == r"C:\PROGRA~2\py.exe"
+    assert calls == [original, original]
+
+
+def test_parenthesised_path_is_normalised_too(monkeypatch) -> None:
+    """``(`` and ``)`` are cmd.exe grouping characters and become live the
+    moment quote-stripping unquotes the line -- ``C:\\Program Files (x86)\\``
+    is the everyday spelling of this hazard."""
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr(
+        "kiro_crew.platform_compat.short_path_name", lambda p: r"C:\PROGRA~2\py.exe"
+    )
+    assert rewriter._cmd_safe_command(r"C:\Program Files (x86)\py.exe") == r"C:\PROGRA~2\py.exe"
+    assert rewriter._cmd_safe_command(r"C:\Kiro(dev)\py.exe") == r"C:\PROGRA~2\py.exe"
+
+
+def test_delayed_expansion_path_is_normalised_too(monkeypatch) -> None:
+    """``!NAME!`` spans are expanded when cmd.exe delayed expansion is enabled."""
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+    monkeypatch.setattr("kiro_crew.platform_compat.short_path_name", lambda p: r"C:\TOOLS~1\py.exe")
+    assert rewriter._cmd_safe_command(r"C:\Tools!beta\py.exe") == r"C:\TOOLS~1\py.exe"
+
+
+def test_cmd_safe_command_is_inert_on_posix() -> None:
+    """POSIX spawns never route through cmd.exe: a spaced path is untouched."""
+    if rewriter.platform_compat.IS_WINDOWS:
+        pytest.skip("POSIX-only behaviour")
+    assert rewriter._cmd_safe_command("/opt/has space/python") == "/opt/has space/python"
+
+
+def test_already_safe_command_is_returned_unchanged(monkeypatch) -> None:
+    """A metacharacter-free path is never rewritten -- no API call, no churn in
+    the overlay bytes (the rewrite fingerprint depends on them)."""
+    monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)
+
+    def _boom(path: str) -> str:
+        raise AssertionError("short-path resolution must not run for safe paths")
+
+    monkeypatch.setattr("kiro_crew.platform_compat.short_path_name", _boom)
+    assert rewriter._cmd_safe_command(r"C:\Python312\python.exe") == r"C:\Python312\python.exe"
+
+
+class _FakeKernel32:
+    """``GetShortPathNameW`` with the documented two-call size protocol:
+    call one (NULL buffer) answers the length INCLUDING the NUL, call two
+    fills the buffer and answers the length EXCLUDING it."""
+
+    def __init__(self, short: str | None, *, lie_on_second_call: bool = False):
+        self._short = short
+        self._lie = lie_on_second_call
+
+    def GetShortPathNameW(self, path, buf, buflen):  # noqa: N802 - Win32 name
+        if self._short is None:
+            return 0
+        if buf is None:
+            return len(self._short) + 1
+        if self._lie:
+            return buflen  # "buffer too small": answer >= the size passed in
+        buf.value = self._short
+        return len(self._short)
+
+
+def _fake_windll(kernel32: _FakeKernel32):
+    def factory(name: str, **kwargs):
+        assert name == "kernel32"
+        assert kwargs.get("use_last_error") is True
+        return kernel32
+
+    return factory
+
+
+def test_short_path_name_two_call_protocol(monkeypatch) -> None:
+    """The buffer protocol runs on CI everywhere: a regression here would
+    return '' on every Windows host and silently disable the launch fix."""
+    import ctypes
+
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        _fake_windll(_FakeKernel32(r"C:\PROGRA~1\py.exe")),
+        raising=False,
+    )
+    assert platform_compat.short_path_name(r"C:\Program Files\py.exe") == r"C:\PROGRA~1\py.exe"
+
+
+def test_short_path_name_returns_empty_on_api_failure(monkeypatch) -> None:
+    """A zero-length first answer (path missing, API error) is '' -- never a
+    fabricated path, never an exception."""
+    import ctypes
+
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(ctypes, "WinDLL", _fake_windll(_FakeKernel32(None)), raising=False)
+    assert platform_compat.short_path_name(r"C:\gone\py.exe") == ""
+
+
+def test_short_path_name_returns_empty_when_buffer_reported_too_small(
+    monkeypatch,
+) -> None:
+    """A second answer >= the allocated size means the result cannot be
+    trusted (the path changed between calls): '' rather than a torn value."""
+    import ctypes
+
+    from kiro_crew import platform_compat
+
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        _fake_windll(_FakeKernel32(r"C:\PROGRA~1\py.exe", lie_on_second_call=True)),
+        raising=False,
+    )
+    assert platform_compat.short_path_name(r"C:\Program Files\py.exe") == ""
+
+
+@pytest.mark.skipif(not rewriter.platform_compat.IS_WINDOWS, reason="Windows API")
+def test_cmd_safe_command_contract_on_real_windows(tmp_path: Path) -> None:
+    """On a real Windows kernel the result is either a metacharacter-free
+    spelling of the same file, or the original unchanged (a volume without
+    8.3 aliases may make GetShortPathNameW fail OR succeed with the long
+    spelling; both must degrade to the original, never a broken form)."""
+    spaced = tmp_path / "short name probe"
+    spaced.mkdir()
+    target = spaced / "probe.txt"
+    target.write_text("x")
+    got = rewriter._cmd_safe_command(str(target))
+    if got != str(target):
+        assert os.path.exists(got)
+        assert not rewriter._CMD_UNSAFE.intersection(got)

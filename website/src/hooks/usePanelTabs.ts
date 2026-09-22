@@ -10,7 +10,7 @@ import {
 } from './panelTabRegistry'
 
 /** Singleton "view" tabs (opened from the + menu, one instance each). */
-export type ViewKind = 'changes' | 'issues' | 'links' | 'files' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'context' | 'side' | 'browser' | 'git' | 'summary' | 'pins'
+export type ViewKind = 'changes' | 'issues' | 'links' | 'files' | 'artifacts' | 'subagents' | 'workflows' | 'logs' | 'crewlog' | 'context' | 'side' | 'browser' | 'git' | 'summary' | 'pins'
 /** All tab kinds: singleton views + on-demand document/terminal tabs. */
 /** `app` hosts an MCP App (a sandboxed iframe with a live JSON-RPC bridge).
  *  It is deliberately a TabKind and NOT a ViewKind: SidePanel unmounts
@@ -35,7 +35,9 @@ export type TabKind = ViewKind | 'file' | 'diff' | 'artifact' | 'terminal' | 'fo
  *  the one production caller — `SidePanel`'s `syncPinned(PINNED_VIEWS)`,
  *  unconditional in an effect keyed only on the callback — always passes this
  *  whole list, so no pinned view is ever removed. Pinned at the render level by
- *  `sidePanelPinnedAlwaysPresent.test.tsx`.
+ *  `sidePanelPinnedAlwaysPresent.test.tsx`. A host that cannot feed a pinned
+ *  view (`SidePanel.hiddenViews`, the Members page and `changes`) hides it at
+ *  RENDER time and leaves the bucket alone.
  *
  *  `issues` is deliberately NOT pinned: most sessions never mention an issue,
  *  so a permanent Issues tab would be an always-empty tab for the majority.
@@ -51,6 +53,43 @@ export type TabKind = ViewKind | 'file' | 'diff' | 'artifact' | 'terminal' | 'fo
  *  reaches it through the + menu, the same zero option Issues gives pre-existing
  *  issue links; that is what keeps this free of any reveal-claim mechanism. */
 export const PINNED_VIEWS: ViewKind[] = ['changes', 'artifacts', 'files']
+
+/** Where each singleton view gets its data — the fact a NON-chat host needs to
+ *  decide whether it can offer the view at all.
+ *
+ *  `slot`: the view reads the slot itself (its artifacts, sub-agents, workflow
+ *  runs, git state, project files, a side chat, a browser, a summary of the
+ *  session…) and works for any host that owns a live slot.
+ *  `chat-transcript`: the view is fed by indexes ChatPage builds over the
+ *  transcript it renders — the pull-request / issue / link extraction and the
+ *  pins query — and has NO data on a host that does not run those. Such a
+ *  host must withhold it (`SidePanel.hiddenViews`), or the view renders an
+ *  affirmative "none" that is false.
+ *
+ *  EXHAUSTIVE on purpose (`Record<ViewKind, …>`): adding a `ViewKind` without
+ *  classifying it is a type error, so a new transcript-fed view cannot slip
+ *  onto the Members page unfed — the default is not "offered", it is "decide". */
+export const VIEW_DATA_SOURCE: Record<ViewKind, 'slot' | 'chat-transcript'> = {
+  changes: 'chat-transcript',
+  issues: 'chat-transcript',
+  links: 'chat-transcript',
+  pins: 'chat-transcript',
+  files: 'slot',
+  artifacts: 'slot',
+  subagents: 'slot',
+  workflows: 'slot',
+  logs: 'slot',
+  crewlog: 'slot',
+  context: 'slot',
+  side: 'slot',
+  browser: 'slot',
+  git: 'slot',
+  summary: 'slot',
+}
+
+/** The views a host without ChatPage's transcript indexes cannot feed. */
+export const CHAT_TRANSCRIPT_VIEWS: readonly ViewKind[] = (Object.keys(VIEW_DATA_SOURCE) as ViewKind[])
+  .filter(k => VIEW_DATA_SOURCE[k] === 'chat-transcript')
 
 export interface PanelTab {
   id: string
@@ -71,6 +110,12 @@ export interface PanelTab {
    *  alongside the body it mirrors, so persistence stays metadata-only and a
    *  restored tab is dirty-by-default until hydration re-establishes both. */
   savedContent?: string
+  /** The read said this file is not text (`/api/file-read` answered its
+   *  `binary` envelope), so the body renders a download/reveal card instead of
+   *  a decoded buffer. TRANSIENT — stripped in `serializeBucket` alongside the
+   *  `content` whose absence it explains, and re-established by the same
+   *  hydration read that refills the buffer. */
+  binary?: boolean
   original?: string
   modified?: string
   /** Last selected working-tree diff view for file tabs. Persisted with the
@@ -140,6 +185,7 @@ const VIEW_TITLE_KEY: Record<ViewKind, string> = {
   subagents: 'hooks.usePanelTabs.subagents',
   workflows: 'hooks.usePanelTabs.workflows',
   logs: 'hooks.usePanelTabs.logs',
+  crewlog: 'hooks.usePanelTabs.crewlog',
   context: 'hooks.usePanelTabs.context',
   side: 'hooks.usePanelTabs.side',
   browser: 'hooks.usePanelTabs.browser',
@@ -425,11 +471,18 @@ export function openPanelView(slotKey: string | null, kind: ViewKind): void {
 function serializeBucket(b: Bucket): string {
   const tabs = b.tabs
     .filter(t => t.kind !== 'diff' && t.kind !== 'app')
-    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.revealLine; return copy })
-  // If the focused tab was a dropped diff/app tab, refocus a surviving tab.
-  const activeId = tabs.some(t => t.id === b.activeId)
-    ? b.activeId
-    : (tabs.length ? tabs[tabs.length - 1].id : null)
+    .map(t => { const copy = { ...t }; delete copy.content; delete copy.savedContent; delete copy.binary; delete copy.revealLine; return copy })
+  // If the focused tab was a DROPPED diff/app tab, refocus a surviving tab.
+  // Only then: a focus that names no stored tab at all is a host's leading tab
+  // (`usePanelTabs(…, { leadingId })` — the Members page's Crew summary), which
+  // lives outside the bucket by design and must come back as the focus on
+  // reload rather than be replaced by whatever tab happens to be last.
+  const droppedFocus = b.activeId !== null
+    && b.tabs.some(t => t.id === b.activeId)
+    && !tabs.some(t => t.id === b.activeId)
+  const activeId = droppedFocus
+    ? (tabs.length ? tabs[tabs.length - 1].id : null)
+    : b.activeId
   return JSON.stringify({ activeId, tabs })
 }
 
@@ -534,8 +587,18 @@ export function usePanelTabs(
    *  caller that cannot know the descriptors must never be the reason a user's
    *  persisted tab disappears. `[]` is a known-empty set and does hide app tabs. */
   panelTabDescriptors?: PanelTabDescriptor[],
+  opts?: {
+    /** Id of a HOST-OWNED leading tab (SidePanel's `leadingTab`): a tab that
+     *  sits ahead of the pinned block, is never in the bucket, and whose body the
+     *  host renders. The bucket only ever holds it as `activeId`. Naming it here
+     *  is what lets focus fall back to it — a fresh strip opens on it rather than
+     *  on the first pinned view, and it is never "repaired" away by `syncPinned`
+     *  for not being a stored tab. */
+    leadingId?: string
+  },
 ) {
   const key = bucketKey(slotKey)
+  const leadingId = opts?.leadingId
   const bySlot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
   const { tabs: storedTabs, activeId } = bySlot[key] ?? EMPTY_BUCKET
   // View-tab labels are re-resolved from `kind` on every read so the strip is in
@@ -577,9 +640,12 @@ export function usePanelTabs(
     () => (
       activeId !== null && prunedIds.has(activeId)
         ? (tabs.length ? tabs[tabs.length - 1].id : null)
-        : activeId
+        // A strip with no stored focus opens on the host's leading tab (a fresh
+        // member bucket, before `syncPinned` has written one). Without a leading
+        // tab this stays the stored `null`.
+        : (activeId ?? leadingId ?? null)
     ),
-    [tabs, activeId, prunedIds],
+    [tabs, activeId, prunedIds, leadingId],
   )
 
   /** Apply a bucket transform to the CURRENT slot's strip. */
@@ -631,19 +697,21 @@ export function usePanelTabs(
         k => b.tabs.find(t => t.id === k) ?? { id: k, kind: k, title: viewTitle(k) },
       )
       const nextTabs = [...pinned, ...dynamic]
-      // Refocus if the active tab was a pinned view that just went away.
-      const activeId = b.activeId && nextTabs.some(t => t.id === b.activeId)
+      // Refocus if the active tab was a pinned view that just went away. The
+      // host's leading tab is a valid focus even though it is never a stored
+      // tab; a strip with no usable focus lands on it (else the first pinned).
+      const activeId = b.activeId && (b.activeId === leadingId || nextTabs.some(t => t.id === b.activeId))
         ? b.activeId
-        : (nextTabs.length ? nextTabs[0].id : null)
+        : (leadingId ?? (nextTabs.length ? nextTabs[0].id : null))
       // Bail if nothing actually changed (id sequence + focus) — avoids churn.
       const sameOrder = nextTabs.length === b.tabs.length
         && nextTabs.every((t, i) => t.id === b.tabs[i].id)
       if (sameOrder && activeId === b.activeId) return b
       return { tabs: nextTabs, activeId }
     })
-  }, [update])
+  }, [update, leadingId])
 
-  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean }) => {
+  const openFile = useCallback((path: string, content: string, slot: string | null = null, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; binary?: boolean }) => {
     // `revealLine` is always present in the object, `undefined` when absent:
     // `upsert` merges onto an existing tab with a spread, which only overwrites
     // keys the incoming object HAS. Omitting it would leave a previous chip's
@@ -660,7 +728,13 @@ export function usePanelTabs(
         // not what the user was looking at, and silently replacing the buffer
         // destroyed their work with no prompt and no undo. Everything EXCEPT
         // the buffer and its baseline is refreshed (focus, reveal target,
-        // slot, diff-mode preference).
+        // slot, diff-mode preference). The verdict describes the bytes the TAB
+        // holds; a dirty tab holds the user's text (a binary tab has
+        // content === savedContent === '' and cannot be dirty), so the editor
+        // must stay reachable and the incoming disk verdict is NOT applied
+        // here. That verdict only reaches the tab through a path that replaces
+        // the buffer: a clean reopen (branch below), or Cancel/Refresh in
+        // MarkdownPanel.readFromDisk, which patch both content and verdict.
         return upsertInBucket(b, {
           id: `file:${path}`, kind: 'file', title: basename(path), path, slot,
           revealLine: reveal,
@@ -670,6 +744,10 @@ export function usePanelTabs(
       return upsertInBucket(b, {
         id: `file:${path}`, kind: 'file', title: basename(path), path, content, slot,
         savedContent: content,
+        // Always present, `undefined` when absent: `upsert` spreads onto an
+        // existing tab, so omitting it would leave a previous read's verdict on
+        // a tab whose file has since been replaced by a text one.
+        binary: opts?.binary,
         revealLine: reveal,
         ...(opts?.diffMode != null ? { diffMode: opts.diffMode } : {}),
       }, opts?.replaceId)
@@ -762,13 +840,14 @@ export function usePanelTabs(
       const i = b.tabs.findIndex(t => t.id === id)
       if (i === -1) return b
       const next = b.tabs.filter(t => t.id !== id)
-      // Refocus a neighbor when closing the active tab (prefer the left one).
+      // Refocus a neighbor when closing the active tab (prefer the left one);
+      // an emptied strip falls back to the host's leading tab when there is one.
       const activeId = b.activeId !== id
         ? b.activeId
-        : next.length === 0 ? null : (next[i - 1] ?? next[i] ?? next[next.length - 1]).id
+        : next.length === 0 ? (leadingId ?? null) : (next[i - 1] ?? next[i] ?? next[next.length - 1]).id
       return { tabs: next, activeId }
     })
-  }, [update])
+  }, [update, leadingId])
 
   const closeAll = useCallback(() => { update(() => ({ tabs: [], activeId: null })) }, [update])
 

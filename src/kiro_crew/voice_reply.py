@@ -56,8 +56,10 @@ from kiro_crew.sandbox import (
 from kiro_crew.security import (
     PathResolutionStalled,
     is_sensitive_path,
+    redact,
     redact_credentials,
     redact_exfiltration_urls,
+    redact_with_findings,
 )
 
 if TYPE_CHECKING:
@@ -74,7 +76,7 @@ def resolve_polly_cli() -> str | None:
 
     Routes through the deploy engine's shared well-known-dirs resolver so a
     GUI-launched gateway's minimal PATH still finds the CLI instead of silently
-    skipping TTS / degrading to an empty voice list (#4770). The trailing
+    skipping TTS / degrading to an empty voice list. The trailing
     ``shutil.which`` turns the resolver's bare-name fallback into the ``None``
     these probe sites already treat as "unavailable", and confirms an absolute
     hit is still actually executable.
@@ -379,7 +381,7 @@ def strip_markdown(text: str) -> str:
     t = re.sub(r"```[\s\S]*?```", _code_block, t)
     # Remove HTML/XML tags and their content for block-level elements
     t = re.sub(r"<mcwidget[^>]*>[\s\S]*?</mcwidget>", " (widget) ", t)
-    # Strip RECOGNIZED control-tag comments (keep-visible #7948, deliver
+    # Strip RECOGNIZED control-tag comments (keep-visible, deliver
     # routing, plan_task_id anchors) — never all comments, and never inside
     # inline code, which renders literally and must survive to speech. The
     # generic tag regex below deliberately excludes "<!". Shared
@@ -434,7 +436,7 @@ def strip_markdown(text: str) -> str:
     # halves of a secret contiguous (a control comment, `**` emphasis, or an
     # HTML tag interposed inside a key id), so a credential scan that ran on
     # the raw text has not necessarily seen the string TTS will speak.
-    # Idempotent on clean text; placeholders survive re-scanning. (#7960)
+    # Idempotent on clean text; placeholders survive re-scanning.
     t, _ = redact_exfiltration_urls(t)
     t, _ = redact_credentials(t)
     return t.strip()
@@ -917,7 +919,7 @@ async def _synthesize_piper(
     """
     bin_path = _resolve_piper_binary(piper_binary)
     if not bin_path:
-        logger.error("piper binary not found (configured=%r)", piper_binary)
+        logger.warning("piper binary not found (configured=%r)", piper_binary)
         return None
     model = os.path.expanduser(piper_model) if piper_model else ""
     if not model or not os.path.isfile(model):
@@ -984,8 +986,7 @@ async def synthesize_speech(
     suspicious URLs from being spoken and persisted in Slack.
     """
     # ── Redact LLM output before it crosses an external surface (audio) ──
-    text, cred_warns = redact_credentials(text)
-    text, url_warns = redact_exfiltration_urls(text)
+    text, cred_warns, url_warns = redact_with_findings(text)
     if cred_warns:
         logger.warning("voice_reply: redacted %d credential pattern(s) before TTS", len(cred_warns))
     if url_warns:
@@ -1049,7 +1050,7 @@ async def _synthesize_polly(
     # On a vanilla machine without the CLI installed, degrade gracefully here
     # instead of raising FileNotFoundError from create_subprocess_exec. Resolved
     # absolutely (shared deploy-engine resolver) so a GUI-launched gateway's
-    # minimal PATH does not silently skip TTS (#4770); resolution probes the
+    # minimal PATH does not silently skip TTS; resolution probes the
     # filesystem, so it runs in a thread rather than on the event loop.
     aws_bin = await asyncio.to_thread(resolve_polly_cli)
     if aws_bin is None:
@@ -1364,8 +1365,7 @@ async def _stream_piper_attempts(
     request_id: str,
 ):
     """Try the resident API, then its existing CLI compatibility path if safe."""
-    text, _ = redact_credentials(text)
-    text, _ = redact_exfiltration_urls(text)
+    text = redact(text)
     phrases = _piper_phrases(text)
     if not phrases:
         return
@@ -1626,8 +1626,7 @@ async def streaming_voice_reply(
     to the dashboard bypasses the usual text-path redaction.
     """
     # ── Redact LLM output before it crosses an external surface (audio) ──
-    response_text, cred_warns = redact_credentials(response_text)
-    response_text, url_warns = redact_exfiltration_urls(response_text)
+    response_text, cred_warns, url_warns = redact_with_findings(response_text)
     if cred_warns:
         logger.warning(
             "stream_voice_chunks: redacted %d credential pattern(s) before TTS", len(cred_warns)

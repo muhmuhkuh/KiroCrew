@@ -114,7 +114,7 @@ describe('Issue Radar at narrow widths', () => {
     // hand-excluded. Those navigate from pane CONTENT, by which point the rail is
     // already a 48px strip and reporting would be a no-op.
     const railParts = new Set(
-      [...rail.matchAll(/^import (?:\{[^}]*\}|\w+)(?:, \{[^}]*\})? from '\.\/(\w+)'/gm)]
+      [...rail.matchAll(/^import (?:\{[^}]*\}|\w+)(?:, \{[^}]*\})? from [\"']\.\/(\w+)[\"']/gm)]
         .map((m) => `${m[1]}.tsx`).concat(['LeftRail.tsx']),
     )
     // The navigator NAMES come from the context's own surface, not spelled here: a
@@ -137,8 +137,14 @@ describe('Issue Radar at narrow widths', () => {
         const code = line.trim()
         // Prose mentions the navigators too; only executable lines must report.
         if (code.startsWith('*') || code.startsWith('//') || code.startsWith('/*')) return
-        if (NAV.test(line) && !line.includes('onNavigate?.()')) {
-          unwired.push(`${name}:${i + 1}  ${code.slice(0, 80)}`)
+        if (NAV.test(line)) {
+          // Local formatters may put the callback body on several lines. Inspect
+          // its short forward slice rather than requiring the call and collapse
+          // hook to share one physical line.
+          const callbackSlice = source.split('\n').slice(i, i + 8).join('\n')
+          if (!callbackSlice.includes('onNavigate?.()')) {
+            unwired.push(`${name}:${i + 1}  ${code.slice(0, 80)}`)
+          }
         }
       })
     }
@@ -160,7 +166,7 @@ describe('Issue Radar at narrow widths', () => {
     expect(s).toMatch(/onCollapse=\{railFull \? rail\.collapse : undefined\}/)
     expect(rail).toMatch(/\{onCollapse && \(/)
     // Reuses the app-agnostic catalog key, so no locale gains a string.
-    expect(rail).toContain("i18nT('app.collapse_sidebar')")
+    expect(rail).toMatch(/i18nT\(([\"'])app\.collapse_sidebar\1\)/)
   })
 
   it('names the LIST in the Back control, not one item from it', async () => {

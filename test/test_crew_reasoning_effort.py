@@ -35,6 +35,7 @@ def _owner_caller(monkeypatch):
         "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
+    pass  # Member routing does not depend on OS isolation.
 
 
 class TestCoerceEffort:
@@ -356,7 +357,7 @@ class TestWarmPoolBypassesACrewPin:
 
         from kiro_crew import session_allocation
 
-        src = inspect.getsource(session_allocation.SessionAllocationService.get_or_create)
+        src = inspect.getsource(session_allocation.SessionAllocationService._get_or_create_impl)
         assert "_crew_pins_effort" in src
         assert 'pool_decision = "bypass_effort"' in src
 
@@ -409,6 +410,10 @@ class TestConcurrentRefreshesInstallInOrder:
             patch.object(mgr, "_retire_stale_backend_bg_runtime", AsyncMock()),
             patch("kiro_crew.session.build_provider_factory", return_value=MagicMock()),
             patch("kiro_crew.session.KiroCrewConfig.load", side_effect=_staggered_load),
+            # The refresh also re-adopts the warm pool's cwd, which resolves through
+            # the workspace table and reads config on its own; pinning it keeps the
+            # count at the two refresh reads the inversion is staged on.
+            patch("kiro_crew.session.default_project_dir", return_value="/ws"),
         ):
             await asyncio.gather(mgr.refresh_defaults(), mgr.refresh_defaults())
 

@@ -585,7 +585,7 @@ class TestPublishHomeTabSessions:
     async def test_collector_failure_emits_error_sel_audit(
         self, _mw, _fmt, _yolo, monkeypatch
     ):
-        """Regression for review-bot security-controls finding on rev-after-rebase.
+        """SEL audit records the data-access attempt on the Home Tab path.
 
         SEL audit must record the data-access attempt even when the collector
         raises, so a failure mode can't silently bypass the audit trail. The
@@ -670,7 +670,7 @@ class TestPublishHomeTabSessions:
     async def test_unauthorized_user_blocked_with_denied_audit(
         self, _mw, _fmt, _yolo, tmp_path, monkeypatch
     ):
-        """Regression for review-bot security-controls / authorization rule on Home Tab.
+        """Defense-in-depth authorization gate on the Home Tab path.
 
         Defense-in-depth: even though the dispatcher already gates app_home_opened
         events via is_allowed_user, the Sessions section must also enforce
@@ -839,3 +839,37 @@ class TestHomeTabCollectorConcurrency:
         was current at import, not the gateway's."""
         gate = getattr(events_mod, "_home_tab_collect_sem", None)
         assert gate is None or isinstance(gate, asyncio.Semaphore)
+
+
+@pytest.mark.asyncio
+async def test_home_tab_skill_loader_and_listing_run_off_loop(tmp_path, monkeypatch):
+    import threading
+
+    from kiro_crew.skills import SkillsLoader
+
+    loop_thread = threading.get_ident()
+    threads = []
+    loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+    listing = loader.list_skills
+
+    def list_skills():
+        threads.append(threading.get_ident())
+        return listing()
+
+    def get_loader():
+        threads.append(threading.get_ident())
+        return loader
+
+    monkeypatch.setattr(loader, "list_skills", list_skills)
+    monkeypatch.setattr(events_mod, "_get_skills_loader", get_loader)
+    monkeypatch.setattr(events_mod, "list_servers", lambda: [])
+    monkeypatch.setattr(events_mod, "is_yolo_mode", lambda: False)
+    monkeypatch.setattr("kiro_crew.sso_status.get_sso_status_line", AsyncMock(return_value="ready"))
+    orch = _make_orch(slack=SimpleNamespace(views_publish=AsyncMock()))
+    try:
+        await _publish_home_tab(orch, "U123")
+        orch.slack.views_publish.assert_awaited_once()
+        assert len(threads) == 2
+        assert all(thread != loop_thread for thread in threads)
+    finally:
+        loader.close()

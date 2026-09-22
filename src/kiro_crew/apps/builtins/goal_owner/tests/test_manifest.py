@@ -36,13 +36,11 @@ def test_app_is_opt_in_and_declares_own_surface() -> None:
     assert raw["permissions"]["cron"] is True
 
 
-def test_manifest_declares_appkit_lifecycle_and_routes() -> None:
+def test_manifest_declares_appkit_lifecycle_without_a_frontend_page() -> None:
     hooks = _raw()["backend"]["hooks"]
     assert hooks == {
         "routes": "backend.routes:register_routes",
         "on_startup": "hooks:on_startup",
         "on_shutdown": "hooks:on_shutdown",
     }
-    assert _raw()["ui"]["pages"] == [
-        {"route": "/goal-owner", "label": "Goal Owner", "icon": "Target"}
-    ]
+    assert "ui" not in _raw()

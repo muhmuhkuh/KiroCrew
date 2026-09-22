@@ -24,6 +24,7 @@ from typing import Callable
 from kiro_crew import platform_compat
 from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
+from kiro_crew.execution_context import ExecutionContext
 from kiro_crew.jsonl_util import rotate_jsonl_at
 from kiro_crew.providers.cleanup import _is_safe_path
 
@@ -41,6 +42,13 @@ _SUBAGENTS_DIR: Path | None = None
 SUBAGENT_CONVERSATION_PREFIX = "subagent:"
 _CLEANUP_IDENTITIES_FILE = "cleanup-identities.json"
 _CLEANUP_IDENTITIES_TRUST_DIR = "subagent-cleanup-identities"
+_LIVE_RUN_STATES: dict[tuple[str, str], dict] = {}
+
+
+def _live_run_key(agent_id: str) -> tuple[str, str]:
+    return str(_subagents_dir()), agent_id
+
+
 _CLEANUP_IDENTITY_LOCK = threading.Lock()
 _LIVE_CLEANUP_IDENTITIES: dict[str, list[dict[str, object]]] = {}
 _LIVE_CLEANUP_HINTS: set[str] = set()
@@ -86,6 +94,33 @@ def _protect_cleanup_identities_path(agent_id: str) -> Path:
 def _delete_cleanup_identities_file(agent_id: str) -> None:
     """Remove the protected generation record after its run folder is gone."""
     shutil.rmtree(_cleanup_identities_path(agent_id).parent, ignore_errors=True)
+
+
+def write_run_agent(agent_id: str, agent: str | None, *, kind: str = "template") -> None:
+    from dataclasses import replace
+
+    execution = read_run_execution(agent_id)
+    if (
+        not isinstance(agent, str)
+        or kind not in ("template", "member")
+        or (kind == "member" and not agent)
+    ):
+        raise ValueError("resume_failed: effective agent template is invalid")
+    if kind == "template":
+        update_execution_context(
+            agent_id,
+            replace(execution, template_id=agent or execution.template_id),
+            expected=execution,
+        )
+    elif execution.selection_kind != "member" or agent != execution.selection_name:
+        raise ValueError("resume_failed: selected member is unavailable")
+
+
+def read_run_agent_selection(agent_id: str) -> tuple[str, str]:
+    execution = read_run_execution(agent_id)
+    return execution.selection_kind, (
+        execution.selection_name if execution.selection_kind == "member" else execution.template_id
+    )
 
 
 def _read_cleanup_identities_file(agent_id: str) -> list[dict[str, object]]:
@@ -354,25 +389,35 @@ def agent_dir_for_display(agent_id: str) -> Path:
 def create_agent_folder(
     agent_id: str,
     *,
-    task: str = "",
-    agent: str = "",
-    parent_session: str = "",
-    max_turns: int = 0,
-    context_groups: str = "",
+    task="",
+    agent="",
+    parent_session="",
+    max_turns=0,
+    context_groups="",
+    delegation=None,
+    memory_store="",
+    memory_mode="persistent",
+    app="",
+    execution_context=None,
 ) -> Path:
-    """Create ``~/.kiro/crew/subagents/{id}/`` with ``state.json``.
+    from kiro_crew.execution_context import ExecutionContext, execution_for_store
 
-    ``context_groups`` is the run's injected-context scope, as a comma-joined
-    list of the switchable groups it KEEPS. It is recorded here, at folder
-    creation, because that is the first moment it is known: a continuation
-    resolves an evicted run's scope from this file, and deferring the write to a
-    later read-modify-write would let a failed update silently widen the scope
-    of the follow-up turn. An empty string means every switchable group was
-    withheld — distinct from the key being absent, which marks a run from before
-    the field existed and resolves to all-on.
-    """
-    d = _agent_dir(agent_id)
-    d.mkdir(parents=True, exist_ok=True)
+    execution = execution_context or execution_for_store(
+        memory_store, memory_mode=memory_mode, app=app, template_id=agent or ""
+    )
+    if not isinstance(execution, ExecutionContext):
+        raise ValueError("memory_unavailable: invalid execution context")
+    previous = read_state(agent_id)
+    if previous is not None:
+        from kiro_crew.execution_context import execution_from_record
+
+        original = execution_from_record(previous)
+        if execution_context is not None and execution.store != original.store:
+            raise ValueError("memory_unavailable: run identity is immutable")
+        execution = original.with_mode(memory_mode)
+        if execution.memory_mode != original.memory_mode:
+            update_execution_context(agent_id, execution, expected=original)
+    execution = execution.with_mode(memory_mode)
     state = {
         "id": agent_id,
         "task": task,
@@ -385,10 +430,122 @@ def create_agent_folder(
         "turns": 0,
         "last_tool": "",
         "context_groups": context_groups,
+        "delegation": dict(delegation or {}),
+        "execution_context": execution.to_record(),
+        "memory_store": execution.store.legacy_name,
+        "memory_mode": execution.memory_mode,
+        "app": execution.app,
         "updated_at": time.time(),
     }
-    _atomic_write(d / "state.json", state)
+    d = _agent_dir(agent_id)
+    if execution.memory_mode != "persistent":
+        _LIVE_RUN_STATES[_live_run_key(agent_id)] = state
+    else:
+        d.mkdir(parents=True, exist_ok=True)
+        _atomic_write(d / "state.json", state)
     return d
+
+
+def read_run_execution(agent_id: str, *, state=...) -> "ExecutionContext":
+    from kiro_crew.execution_context import execution_for_store, execution_from_record
+
+    if state is ...:
+        state = read_state(agent_id)
+    if state is None:
+        raise ValueError("memory_unavailable: run record is unavailable")
+    execution = execution_from_record(state, required=False)
+    if execution is not None:
+        return execution
+    # Existing V1 runs retain their ordinary state; V2 never infers identity.
+    from kiro_crew.memory_stores import memory_store_version
+
+    store = state.get("memory_store", "")
+    if memory_store_version(store) == 2:
+        raise ValueError("memory_unavailable: run has no canonical execution")
+    legacy = state
+    if "memory_binding_version" in state:
+        # The old writer used version 2 for V1 runs too. Its ordinary app and
+        # retention fields live only in this existing sidecar; defaults would
+        # turn an app-owned/restricted run into a personal/persistent run.
+        _agent_dir(agent_id)
+        path = (
+            _subagents_dir().parent.resolve() / "member-memory-bindings" / agent_id / "memory.json"
+        )
+        if state["memory_binding_version"] != 2 or path.resolve() != path:
+            raise ValueError("memory_unavailable: legacy V1 execution is invalid")
+        try:
+            legacy = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError) as exc:
+            raise ValueError("memory_unavailable: legacy V1 execution is unreadable") from exc
+        if (
+            not isinstance(legacy, dict)
+            or legacy.get("version") != 2
+            or legacy.get("memory_store") != store
+            or legacy.get("memory_mode") not in ("persistent", "incognito", "temporary")
+            or not isinstance(legacy.get("app"), str)
+        ):
+            raise ValueError("memory_unavailable: legacy V1 execution is invalid")
+    return execution_for_store(
+        store,
+        memory_mode=legacy.get("memory_mode", "persistent"),
+        app=legacy.get("app", ""),
+        template_id=state.get("agent") or "",
+    )
+
+
+def update_execution_context(agent_id: str, execution, *, expected=...) -> None:
+    holder = _lock_for_agent(agent_id)
+    with holder.lock:
+        current = read_run_execution(agent_id)
+        if expected is not ... and current != expected:
+            raise ValueError("memory_unavailable: run changed during admission")
+        execution = execution.with_mode(current.memory_mode)
+        if execution.store != current.store:
+            raise ValueError("memory_unavailable: run memory is immutable")
+        state = read_state(agent_id)
+        if state is None:
+            raise ValueError("memory_unavailable: run record is unavailable")
+        state.update(
+            execution_context=execution.to_record(),
+            memory_mode=execution.memory_mode,
+            memory_store=execution.store.legacy_name,
+        )
+        if execution.memory_mode != "persistent":
+            # Tighten only an already persisted owner's retention metadata.
+            # This preserves restart policy without writing this turn's body.
+            path = _agent_dir(agent_id) / "state.json"
+            if path.exists():
+                durable = json.loads(path.read_text(encoding="utf-8"))
+                durable["execution_context"] = execution.to_record()
+                durable["memory_mode"] = execution.memory_mode
+                _atomic_write(path, durable)
+            _LIVE_RUN_STATES[_live_run_key(agent_id)] = state
+        else:
+            _atomic_write(_agent_dir(agent_id) / "state.json", state)
+
+
+def read_run_memory_mode(agent_id: str) -> str:
+    return read_run_execution(agent_id).memory_mode
+
+
+def tighten_run_memory_mode(agent_id: str, memory_mode: str) -> str:
+    execution = read_run_execution(agent_id)
+    tightened = execution.with_mode(memory_mode)
+    update_execution_context(agent_id, tightened, expected=execution)
+    return tightened.memory_mode
+
+
+def read_run_app(agent_id: str) -> str:
+    return read_run_execution(agent_id).app
+
+
+def read_run_memory_store(agent_id: str, *, validate_memory_files: bool = False) -> str:
+    from kiro_crew.execution_context import validate_execution
+
+    execution = read_run_execution(agent_id)
+    if validate_memory_files:
+        validate_execution(execution)
+    return execution.store.legacy_name
 
 
 # ── read / update ────────────────────────────────────────────────────
@@ -396,6 +553,8 @@ def create_agent_folder(
 
 def read_state(agent_id: str) -> dict | None:
     """Read state.json. Returns None on missing, corrupt, or non-object data."""
+    if _live_run_key(agent_id) in _LIVE_RUN_STATES:
+        return dict(_LIVE_RUN_STATES[_live_run_key(agent_id)])
     try:
         p = _agent_dir(agent_id) / "state.json"
         state = json.loads(p.read_text(encoding="utf-8"))
@@ -429,9 +588,9 @@ def read_tombstone(agent_id: str) -> dict | None:
 #: (model provenance, CC-path model refinement, per-turn diagnostics -- each via
 #: ``asyncio.to_thread``), so two pool writers overlap during a run and a
 #: loop-side write executes while the run's coroutine is suspended inside a
-#: pool-side one (#6298). Cancellation widens it: cancelling a ``to_thread``
+#: pool-side one. Cancellation widens it: cancelling a ``to_thread``
 #: await DETACHES the worker rather than stopping it, so it finishes carrying a
-#: read that is already stale (#6308).
+#: read that is already stale.
 #:
 #: SCOPE -- ordinary ``update_state`` callers take the lock OFF-LOOP only.
 #: Serializing every loop-side write by waiting would block the event loop behind
@@ -439,7 +598,7 @@ def read_tombstone(agent_id: str) -> dict | None:
 #: instead probes the same per-agent lock non-blocking and returns RETRYABLE when
 #: busy; once acquired, its existing on-loop keep write cannot be overwritten by
 #: an older pool writer. Other on-loop callers keep their pre-existing unlocked
-#: behavior -- see :func:`update_state` for the remaining #6308 limitation.
+#: behavior -- see :func:`update_state` for the remaining limitation.
 #:
 #: The ordinary acquire is UNBOUNDED, and can be, because no on-loop caller reaches
 #: it: only pool workers block there, and their own read + fsync + rename already
@@ -547,9 +706,7 @@ def _retention_lock_for_agent(agent_id: str) -> "_AgentLock":
 
 def _try_acquire_retention_lock(agent_id: str) -> "_AgentLock | None":
     """Return held per-agent retention arbitration, or None without blocking."""
-    return _try_acquire_registry_lock(
-        agent_id, _RETENTION_LOCKS, _RETENTION_LOCKS_GUARD
-    )
+    return _try_acquire_registry_lock(agent_id, _RETENTION_LOCKS, _RETENTION_LOCKS_GUARD)
 
 
 def _acquire_retention_locks(*agent_ids: str) -> list["_AgentLock"]:
@@ -572,18 +729,18 @@ def update_state(agent_id: str, **fields: object) -> bool:
     the current state could not be read (missing/corrupt/unreadable). The skip
     is deliberate -- fabricating a fresh state here would resurrect a record
     the reaper deleted -- but callers with a durability contract (the pre-spawn
-    provenance write, #5394) need to see the skip to retry rather than mistake
+    provenance write) need to see the skip to retry rather than mistake
     a silent no-op for success.
 
     The read / merge / rewrite is serialized per agent for OFF-LOOP callers (see
-    :data:`_STATE_LOCKS`), so two pool writers can no longer rewrite a snapshot
+    :data:`_STATE_LOCKS`), so two pool writers cannot rewrite a snapshot
     that predates the other's write.
 
     KNOWN LIMITATION: ordinary ON-LOOP callers do not take the lock, because waiting
     on a pool thread's fsync from the event loop is exactly the blocking call the
-    repo's anchor forbids. Every writer inside a run now goes off-loop through
-    ``_write_state_off_loop`` and is drained on cancellation (#6298 / #6308 /
-    #7302); an abandoned writer holds the conversation until it settles, so the
+    repo's anchor forbids. Every writer inside a run goes off-loop through
+    ``_write_state_off_loop`` and is drained on cancellation; an abandoned writer
+    holds the conversation until it settles, so the
     on-loop retention writes are deferred past it. Retention promotion adds a
     second defense: on the event loop it probes the same per-agent lock
     non-blocking and returns RETRYABLE on contention, while off-loop promotion
@@ -591,8 +748,11 @@ def update_state(agent_id: str, **fields: object) -> bool:
     roll back ``keep=True`` and no loop-side caller waits for a pool writer's
     fsync. The remaining on-loop callers are the synchronous retention writers;
     they still pay their own fsync on the loop, and moving that I/O while keeping
-    their ``SessionMap`` mutation on-loop is the rest of #7302.
+    their ``SessionMap`` mutation on-loop remains outstanding.
     """
+    if _live_run_key(agent_id) in _LIVE_RUN_STATES:
+        _LIVE_RUN_STATES[_live_run_key(agent_id)].update(fields)
+        return True
     p = _agent_dir(agent_id) / "state.json"
     # Off-loop callers serialize; on-loop callers keep pre-existing behaviour.
     # ``holder`` stays referenced for the whole critical section -- that strong
@@ -657,6 +817,8 @@ def promote_retention(
 
 def write_result_chunk(agent_id: str, text: str) -> None:
     """Append *text* to ``result.txt``."""
+    if _live_run_key(agent_id) in _LIVE_RUN_STATES:
+        return
     p = _agent_dir(agent_id) / "result.txt"
     try:
         with p.open("a", encoding="utf-8") as f:
@@ -684,12 +846,20 @@ def write_tombstone(
     **extra: object,
 ) -> None:
     """Write ``tombstone.json`` for an abnormally exited agent."""
+    if _live_run_key(agent_id) in _LIVE_RUN_STATES:
+        return
     d = _agent_dir(agent_id)
-    state = read_state(agent_id) or {}
+    state = read_state(agent_id)
+    # A delayed delivery acknowledgement cannot recreate a released transient
+    # run. Abnormal-exit diagnostics may still record missing state.
+    if state is None and cause == "delivered":
+        return
+    state = state or {}
+    execution = state.get("execution_context")
+    if isinstance(execution, dict) and execution.get("memory_mode") in ("incognito", "temporary"):
+        return
     cleanup_identity = {
-        key: state[key]
-        for key in ("session_id", "provider", "cwd")
-        if state.get(key)
+        key: state[key] for key in ("session_id", "provider", "cwd") if state.get(key)
     }
     live_cleanup_identities = _live_cleanup_identities(agent_id)
     latest_live_identity = live_cleanup_identities[-1] if live_cleanup_identities else {}
@@ -811,9 +981,15 @@ def record_slow_command(agent_id: str, **fields: object) -> None:
 # ── delete ───────────────────────────────────────────────────────────
 
 
+def forget_live_run_state(agent_id: str) -> None:
+    """Release transient run state after its lifecycle writers have settled."""
+    _LIVE_RUN_STATES.pop(_live_run_key(agent_id), None)
+
+
 def delete_agent_folder(agent_id: str) -> None:
     """Remove the entire agent directory and its in-process identity fallback."""
     d = _agent_dir(agent_id)
+    forget_live_run_state(agent_id)
     with _CLEANUP_IDENTITY_LOCK:
         shutil.rmtree(d, ignore_errors=True)
         if not d.exists():
@@ -856,11 +1032,7 @@ _UNRECLAIMABLE_LOOKUP_MAX_AGE_SECS = 90 * 86400
 def _tombstone_died(ts: dict[str, object], path: Path, now: float) -> int | float:
     """Return a finite, positive, non-future death time with bounded fallback."""
     died = ts.get("died")
-    if (
-        isinstance(died, (int, float))
-        and not isinstance(died, bool)
-        and 0 < died <= now
-    ):
+    if isinstance(died, (int, float)) and not isinstance(died, bool) and 0 < died <= now:
         return died
     try:
         fallback = path.stat().st_mtime
@@ -883,9 +1055,7 @@ def _should_defer_tombstone_cleanup(
     """Return whether prune must preserve provider files and identity folder."""
     if retention_unknown:
         if not cleanup_session_id or not (
-            isinstance(died, (int, float))
-            and not isinstance(died, bool)
-            and 0 < died <= now
+            isinstance(died, (int, float)) and not isinstance(died, bool) and 0 < died <= now
         ):
             return False
         return died >= cutoff - _UNREADABLE_STATE_GRACE_SECS
@@ -912,9 +1082,7 @@ def _cleanup_identity_fallback_record(
     return records[-1]
 
 
-def _cleanup_retention_fallback(
-    agent_id: str, session_id: object
-) -> tuple[bool | None, str, str]:
+def _cleanup_retention_fallback(agent_id: str, session_id: object) -> tuple[bool | None, str, str]:
     """Return trusted fallback retention, owner, and SID."""
     record = _cleanup_identity_fallback_record(agent_id, session_id)
     if record is None:
@@ -951,9 +1119,11 @@ def _tombstone_cleanup_identities(agent_id: str) -> list[tuple[str, str, str]]:
         identities.append(
             (
                 sid,
-                record_provider
-                if isinstance(record_provider, str) and record_provider
-                else PROVIDER_LABEL_DEFAULT,
+                (
+                    record_provider
+                    if isinstance(record_provider, str) and record_provider
+                    else PROVIDER_LABEL_DEFAULT
+                ),
                 record_cwd if isinstance(record_cwd, str) else "",
             )
         )
@@ -1087,9 +1257,7 @@ def prune_stale_tombstones(max_age_days: int = 7, delivered_ttl_secs: int = 3600
                                 # to honor because it only preserves material.
                                 if sidecar_keep:
                                     retention_unknown = False
-                            conversation_key = str(
-                                fallback_record.get("conversation_key") or ""
-                            )
+                            conversation_key = str(fallback_record.get("conversation_key") or "")
                         owner_id = subagent_id_from_conversation_key(conversation_key)
                         if owner_id and owner_id != d.name:
                             try:
@@ -1120,19 +1288,13 @@ def prune_stale_tombstones(max_age_days: int = 7, delivered_ttl_secs: int = 3600
                     # arriving after the keep=False decision returns retryable
                     # instead of writing keep=True just before deletion.
                     cleanup_identities = _tombstone_cleanup_identities(d.name)
-                    within_retry_window = (
-                        died >= now - _UNRECLAIMABLE_LOOKUP_MAX_AGE_SECS
-                    )
+                    within_retry_window = died >= now - _UNRECLAIMABLE_LOOKUP_MAX_AGE_SECS
                     # Legacy/pre-upgrade runs can carry a SID only in the
                     # agent-writable state/tombstone. It is not safe deletion
                     # authority, but the folder is useful for a later trusted
                     # migration. Bound that lookup window so an unavailable
                     # migration cannot accumulate private run folders forever.
-                    if (
-                        lookup_session_id
-                        and not cleanup_identities
-                        and within_retry_window
-                    ):
+                    if lookup_session_id and not cleanup_identities and within_retry_window:
                         continue
                     cleanup_succeeded = True
                     for cleanup_sid, cleanup_provider, cleanup_cwd in cleanup_identities:
@@ -1247,3 +1409,35 @@ def _atomic_write(path: Path, data: dict) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def read_session_memory_mode(session_key: str) -> str | None:
+    from kiro_crew.execution_context import read_session_execution
+    from kiro_crew.history import ConversationLog
+
+    execution = read_session_execution(session_key)
+    if execution is not None:
+        return execution.memory_mode
+    metadata, readable = ConversationLog().get_metadata_status(session_key)
+    if not readable:
+        raise ValueError("memory_unavailable: session mode is unavailable")
+    mode = metadata.get("memory_mode")
+    if mode is not None and mode not in ("persistent", "incognito", "temporary"):
+        raise ValueError("memory_unavailable: invalid session mode")
+    return mode
+
+
+def bind_session_memory_mode(session_key: str, memory_mode: str) -> str:
+    from kiro_crew.execution_context import (
+        ExecutionContext,
+        MemoryStoreRef,
+        bind_session_execution,
+        read_session_execution,
+    )
+
+    execution = read_session_execution(session_key)
+    if execution is None:
+        execution = ExecutionContext(None, MemoryStoreRef("default"), "template", "kirocrew")
+    execution = execution.with_mode(memory_mode)
+    bind_session_execution(session_key, execution)
+    return execution.memory_mode

@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING
 
 from kiro_crew.config.loader import (
@@ -47,6 +48,7 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     _coerce_session_folder,
 )
+from kiro_crew.config.schema import requires_restart
 from kiro_crew.sel import sel
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -73,11 +75,31 @@ CHANNEL_CONFIG_SECTIONS: dict[str, str] = {
 }
 
 
-#: Channel config fields the runtime re-reads live, so changing one alone does
-#: NOT require a gateway restart (unlike the boot-read credential and allow-list
-#: fields). ``session_folder`` is re-read on every reconcile pass, so a new value
-#: applies to the next conversation surfaced.
-LIVE_RELOAD_FIELDS = frozenset({"session_folder"})
+def channel_restart_required(
+    section: str,
+    fields: Iterable[str],
+    *,
+    env_updates: Mapping[str, object] | None = None,
+) -> bool:
+    """Whether a channel save needs a gateway restart to take effect.
+
+    Answers from the config SCHEMA -- ``kiro_crew.config.schema.requires_restart``
+    marks the fields that genuinely cannot be applied to a running gateway
+    (``restart=True`` in the field's metadata) -- so one declaration serves the
+    save handler, the dashboard hint and the schema endpoint instead of three
+    hand-maintained lists that drift apart. There is deliberately no per-channel
+    table here to fall back on: a second list is a second place to drift.
+
+    A credential write always requires a restart: credentials are hoisted at
+    connect time from the environment, and the config watcher does not watch
+    ``.env``.
+    """
+    if env_updates:
+        return True
+    staged = {str(f) for f in fields}
+    if not staged:
+        return False
+    return any(requires_restart(f"{section}.{field}") for field in sorted(staged))
 
 
 def clean_session_folder(raw: object) -> str:
@@ -166,6 +188,39 @@ def _find_folder(folders: list[dict], name: str, namespace: str) -> dict | None:
     return fallback
 
 
+async def folder_id_for_name(state: "DashboardState", namespace: str, name: str) -> str:
+    """The id of the folder *name* for channel *namespace*, or ``""`` when absent.
+
+    Split out of :func:`lookup_channel_folder` so a caller that has ALREADY read
+    the configured name can resolve its id without reading config a second time.
+    Two reads are two chances to observe different values: a settings save moving
+    this channel from folder A to folder B, committing between them, hands the
+    caller A's name and B's id -- and a caller that reports the name while writing
+    the id then tells the user one folder and files into another.
+
+    Read under the store lock, for the reason :func:`lookup_channel_folder`
+    documents: an unlocked read can land mid-transaction and return the id of a
+    folder whose write is then rolled back.
+    """
+    name = (name or "").strip()
+    if not name:
+        return ""
+    ns = (namespace or "").lower()
+
+    def _find(folders: list[dict]) -> dict | None:
+        return _find_folder(folders, name, ns)
+
+    existing = await state.read_folders(_find)
+    if existing is None:
+        # Configured but absent — hand-edited config, or the folder was deleted.
+        # Leave the conversation unfiled rather than writing from this path.
+        logger.debug(
+            "channel folder: %r not found for %s; leaving the session unfiled", name, namespace
+        )
+        return ""
+    return str(existing.get("id", ""))
+
+
 async def lookup_channel_folder(state: "DashboardState", namespace: str) -> str:
     """Return the id of the folder channel *namespace* files its sessions into.
 
@@ -196,20 +251,7 @@ async def lookup_channel_folder(state: "DashboardState", namespace: str) -> str:
     name = await asyncio.to_thread(configured_folder_name, namespace)
     if not name:
         return ""
-    ns = (namespace or "").lower()
-
-    def _find(folders: list[dict]) -> dict | None:
-        return _find_folder(folders, name, ns)
-
-    existing = await state.read_folders(_find)
-    if existing is None:
-        # Configured but absent — hand-edited config, or the folder was deleted.
-        # Leave the conversation unfiled rather than writing from this path.
-        logger.debug(
-            "channel folder: %r not found for %s; leaving the session unfiled", name, namespace
-        )
-        return ""
-    return str(existing.get("id", ""))
+    return await folder_id_for_name(state, namespace, name)
 
 
 async def ensure_channel_folder(

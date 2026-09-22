@@ -14,9 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import (
-    pr_recipe as gh_pr,
-)
+from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import pr_recipe as gh_pr
 from kiro_crew.apps.builtins.auto_improvement.profiles.gitlab_repo.pr_recipe import (
     GitLabPRRecipe,
     extract_mr_url,

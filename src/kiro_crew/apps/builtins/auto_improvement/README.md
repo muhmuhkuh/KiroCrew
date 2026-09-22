@@ -69,7 +69,7 @@ not fill the chat surface with agent cards.
 
 ## Requirements
 
-- `git` and an authenticated `gh` or `glab` CLI on the gateway host
+- `git` and an authenticated `gh` CLI on the gateway host
 - A GitHub or GitLab repository you can open pull/merge requests against
 
 ## Layout

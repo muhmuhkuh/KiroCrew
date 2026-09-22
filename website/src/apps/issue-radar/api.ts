@@ -57,10 +57,6 @@ export interface Issue {
   number: number
   title: string
   url: string
-  /** Provider-native status name, when the provider exposes one (for example Jira). */
-  status?: string | null
-  /** Provider-native priority name, when the provider exposes one (for example Jira). */
-  priority?: string | null
   labels: string[]
   comments: number
   /** Total reaction count across all emoji (populated on next refresh). */
@@ -72,6 +68,10 @@ export interface Issue {
   updated_at: string
   created_at?: string
   state?: string
+  /** Provider-native workflow status, present for Jira issues. */
+  status?: string
+  /** Provider-native priority name, present for Jira issues. */
+  priority?: string
   author?: string | null
   assignees?: string[]
   body?: string
@@ -292,8 +292,6 @@ export interface IssueDetailData {
   number: number
   title: string
   body: string
-  status?: string | null
-  priority?: string | null
   state: string
   state_reason: string | null
   url: string
@@ -623,6 +621,11 @@ export interface RepoSettings {
   /** Watch this repo in the background and push a KiroCrew notification when a
    * new issue is opened. Opt-in (default false). */
   notify_on_new_issue: boolean
+  /** Local absolute path to this repo's working copy. Empty string means "use
+   * the default cwd". Local-only, never written back to the source host. The
+   * Investigate action opens its chat session with this as the working
+   * directory so the agent sees the repo's real source. */
+  workspace_path: string
   /** Monotonic counter bumped by every write. A PUT replaces the whole document,
    * so it must echo the revision it read — the server refuses (409) a write built
    * on a snapshot that has since moved, which is what stops one tab from erasing
@@ -637,6 +640,7 @@ export const DEFAULT_REPO_SETTINGS: RepoSettings = {
   unlabeled_is_untriaged: true,
   good_first_issue_labels: [],
   notify_on_new_issue: false,
+  workspace_path: '',
   revision: 0,
 }
 
@@ -932,9 +936,9 @@ export interface RepoRef {
 
 /** Which forge a repo lives on.
  *
- * `azure` is Azure DevOps on `dev.azure.com`, where `owner` carries
- * `{organization}/{project}` — a slash-joined pair, the same way `owner` carries a
- * nested group path on GitLab. */
+ * Azure DevOps uses `dev.azure.com` and carries `{organization}/{project}` in
+ * `owner`; Jira uses an allowlisted host and carries its project key in `owner`.
+ */
 export type SourceProvider = 'github' | 'gitlab' | 'azure' | 'jira'
 
 /** Which provider account an account-scoped endpoint should ask about.
@@ -1263,12 +1267,12 @@ export interface CrewSettingsResponse {
 }
 
 export const issueRadarApi = {
-  connect: async (url: string): Promise<ConnectResponse> => {
+  connect: async (url: string, repo?: string): Promise<ConnectResponse> => {
     const r = await fetch(`${API}/connect`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, ...(repo ? { repo } : {}) }),
     })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()

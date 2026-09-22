@@ -20,15 +20,6 @@
       "on_shutdown": "hooks:on_shutdown"
     }
   },
-  "ui": {
-    "pages": [
-      {
-        "route": "/goal-owner",
-        "label": "Goal Owner",
-        "icon": "Target"
-      }
-    ]
-  },
   "permissions": {
     "api": [
       "/api/apps/goal-owner",
@@ -53,6 +44,6 @@
     "Run a goal through bounded owner cycles while retaining human control over scope, budgets, and completion evidence."
   ],
   "configuration": [
-    "Enable Goal Owner, create a goal with its definition of done, then inspect or pause it from the Goal Owner page."
+    "Enable Goal Owner, create a goal with its definition of done, then inspect or pause it through the app API."
   ]
 }

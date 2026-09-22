@@ -28,9 +28,11 @@ from kiro_crew.apps.manager import (
     get_app_manifest,
     install_app,
     list_apps,
+    list_apps_with_skips,
     register_external_app,
     registry_source_repository,
     uninstall_app,
+    update_app,
 )
 
 # ---------------------------------------------------------------------------
@@ -270,6 +272,72 @@ class TestInstall:
 
 
 class TestUninstall:
+    @pytest.mark.parametrize("existing", [False, True])
+    def test_uninstall_uses_exclusive_dependency_lock_creation(
+        self, tmp_path, app_home, monkeypatch, existing
+    ):
+        install_app(_make_app_source(tmp_path))
+        data = app_home / "apps" / "test-app" / "data"
+        marker = data / "user.txt"
+        marker.write_text("keep me", encoding="utf-8")
+        lock = data / ".kirocrew-deps.lock"
+        if existing:
+            lock.write_text("existing lock", encoding="utf-8")
+        calls = []
+        real_open = os.open
+
+        def record_open(path, flags, mode=0o777, *, dir_fd=None):
+            if str(path).endswith(".kirocrew-deps.lock"):
+                calls.append((flags, dir_fd))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        if real_open in os.supports_dir_fd:
+            monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {record_open})
+        monkeypatch.setattr(os, "open", record_open)
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok, result.error
+        assert len(calls) == (2 if existing else 1)
+        assert calls[0][0] & os.O_EXCL
+        assert calls[0][0] & os.O_CREAT
+        for flags, _fd in calls:
+            assert flags & os.O_RDWR
+            assert not flags & os.O_TRUNC
+            if hasattr(os, "O_NOFOLLOW"):
+                assert flags & os.O_NOFOLLOW
+        if existing:
+            assert not calls[1][0] & (os.O_CREAT | os.O_EXCL)
+            assert calls[1][1] == calls[0][1]
+        assert marker.read_text(encoding="utf-8") == "keep me"
+        assert lock.is_file()
+
+    def test_uninstall_refuses_a_dependency_lock_that_vanishes_before_reopen(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        install_app(_make_app_source(tmp_path))
+        root = app_home / "apps" / "test-app"
+        marker = root / "data" / "user.txt"
+        marker.write_text("keep me", encoding="utf-8")
+        calls = []
+        real_open = os.open
+
+        def race_open(path, flags, mode=0o777, *, dir_fd=None):
+            if str(path).endswith(".kirocrew-deps.lock"):
+                calls.append(flags)
+                if len(calls) == 1:
+                    raise FileExistsError("a contender created the lock")
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        if real_open in os.supports_dir_fd:
+            monkeypatch.setattr(os, "supports_dir_fd", os.supports_dir_fd | {race_open})
+        monkeypatch.setattr(os, "open", race_open)
+        result = uninstall_app("test-app", keep_data=True)
+        assert not result.ok
+        assert len(calls) == 2
+        assert not calls[1] & (os.O_CREAT | os.O_EXCL)
+        assert (root / APP_MANIFEST_FILENAME).is_file()
+        assert marker.read_text(encoding="utf-8") == "keep me"
+        assert not (root / "data" / ".kirocrew-deps.lock").exists()
+
     def test_uninstall_preserves_data_by_default(self, tmp_path, app_home):
         src = _make_app_source(tmp_path)
         install_app(src)
@@ -311,6 +379,181 @@ class TestUninstall:
         assert (app_home / "apps" / "test-app" / "data" / "cache.json").is_file()
         # App files removed
         assert not (app_home / "apps" / "test-app" / APP_MANIFEST_FILENAME).exists()
+
+    def test_uninstall_purges_generated_deps_from_preserved_data(self, tmp_path, app_home):
+        """data/ preservation exists for USER data. The gateway-generated
+        dependency trees must not survive an uninstall: a compromised app
+        could plant code there (sitecustomize.py) and a reinstall under the
+        same name would prepend it to PYTHONPATH - revoked code executing in
+        a fresh install."""
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        data_dir = app_home / "apps" / "test-app" / "data"
+        (data_dir / "cache.json").write_text('{"key": "value"}')
+        for gen in (".kirocrew-deps", ".kirocrew-deps-staging", ".kirocrew-deps-prior"):
+            (data_dir / gen).mkdir(parents=True)
+            (data_dir / gen / "sitecustomize.py").write_text("planted = True\n")
+
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok
+        preserved = app_home / "apps" / "test-app" / "data"
+        assert (preserved / "cache.json").is_file()  # user data kept
+        for gen in (".kirocrew-deps", ".kirocrew-deps-staging", ".kirocrew-deps-prior"):
+            assert not (preserved / gen).exists(), gen
+
+    def test_uninstall_refuses_a_linked_data_directory(self, tmp_path, app_home):
+        """A linked data dir would make the purge (and the whole preserve
+        dance) operate on the link's TARGET - an app pointing data at
+        another app's tree would have this uninstall move and delete a
+        foreign deps tree. The gateway creates data/ as a real directory, so
+        a link is never legitimate: refuse, leaving the app installed and
+        the target untouched."""
+        import os as _os
+
+        if not hasattr(_os, "symlink"):
+            pytest.skip("no symlink support")
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        app_root = app_home / "apps" / "test-app"
+        victim = tmp_path / "victim-data"
+        victim.mkdir()
+        (victim / ".kirocrew-deps").mkdir()
+        (victim / ".kirocrew-deps" / "keepme.py").write_text("x = 1\n")
+        data = app_root / "data"
+        import shutil as _shutil
+
+        _shutil.rmtree(data)
+        try:
+            _os.symlink(victim, data)
+        except OSError:
+            pytest.skip("symlink not permitted")
+
+        result = uninstall_app("test-app", keep_data=True)
+        assert not result.ok
+        # the victim's tree is untouched and the app is still installed
+        assert (victim / ".kirocrew-deps" / "keepme.py").is_file()
+        assert (app_root / APP_MANIFEST_FILENAME).exists()
+
+    def test_suffixed_staging_leftovers_are_purged_at_uninstall(self, tmp_path, app_home):
+        """Staging dirs carry unique per-transaction suffixes; an interrupted
+        install's leftover must not survive uninstall under a name the exact
+        filter never matches."""
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        app_root = app_home / "apps" / "test-app"
+        leftover = app_root / "data" / ".kirocrew-deps-staging-1234-deadbeef"
+        leftover.mkdir()
+        (leftover / "pkg.py").write_text("x = 1\n")
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok, result
+        preserved = app_home / "apps" / "test-app" / "data"
+        assert not list(preserved.glob(".kirocrew-deps-staging*"))
+
+    def test_failed_purge_restores_preserved_data_to_its_home(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """A raise after data/ was moved to its temp name must move it BACK:
+        the app is still installed, and its user data must not be orphaned
+        under a hidden dot-name."""
+        import kiro_crew.apps.manager as mgr
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        app_root = app_home / "apps" / "test-app"
+        marker = app_root / "data" / "user-file.txt"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("keep me")
+
+        real_rmtree = mgr.shutil.rmtree
+
+        def failing_rmtree(path, *args, **kwargs):
+            if str(path) == str(app_root):
+                raise OSError("simulated: app dir resists deletion")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(mgr.shutil, "rmtree", failing_rmtree)
+        result = uninstall_app("test-app", keep_data=True)
+        assert not result.ok
+        assert marker.exists(), "preserved data must be restored to data/"
+        assert not (app_home / "apps" / ".test-app-data-tmp").exists()
+
+    def test_app_owned_names_sharing_the_deps_prefix_survive_uninstall(
+        self, tmp_path, app_home
+    ):
+        """The sweep deletes only the gateway's own generated names: an
+        app-owned entry that merely shares the .kirocrew-deps prefix (a
+        user's backup dir) is preserved data, not a purge target."""
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        app_root = app_home / "apps" / "test-app"
+        backup = app_root / "data" / ".kirocrew-deps-backup"
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "precious.txt").write_text("keep me")
+        # A staging-prefix-sharing app name must equally survive: the
+        # quarantine's strict matcher only claims the generated
+        # -<pid>-<8hex> shape.
+        assets = app_root / "data" / ".kirocrew-deps-staging-assets"
+        assets.mkdir(parents=True, exist_ok=True)
+        (assets / "art.bin").write_text("app asset")
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok, result.error
+        preserved = app_root / "data" / ".kirocrew-deps-backup" / "precious.txt"
+        assert preserved.exists(), "app-owned prefix-sharing data must survive"
+        assert (
+            app_root / "data" / ".kirocrew-deps-staging-assets" / "art.bin"
+        ).exists(), "app-owned staging-prefix data must survive"
+
+    def test_a_file_shaped_deps_artifact_is_purged_and_does_not_poison(
+        self, tmp_path, app_home
+    ):
+        """rmtree refuses non-directories, so a FILE written at a deps-tree
+        name survives every uninstall and poisons the next quarantine
+        rename. Shape-aware removal purges it - and a second
+        install/uninstall round over the same name stays clean."""
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        app_root = app_home / "apps" / "test-app"
+        (app_root / "data" / ".kirocrew-deps").write_text("not a directory\n")
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok, result
+        preserved = app_home / "apps" / "test-app" / "data"
+        assert not (preserved / ".kirocrew-deps").exists()
+        # the poison scenario: same name, directory shape, next round
+        install_app(src)
+        deps = app_home / "apps" / "test-app" / "data" / ".kirocrew-deps"
+        deps.mkdir()
+        (deps / "pkg.py").write_text("x = 1\n")
+        result2 = uninstall_app("test-app", keep_data=True)
+        assert result2.ok, result2
+        assert not (app_home / "apps" / "test-app" / "data" / ".kirocrew-deps").exists()
+
+    def test_uninstall_purge_unlinks_a_planted_deps_symlink(self, tmp_path, app_home):
+        """rmtree refuses a symlink, so a malicious app could plant one at
+        the deps name and its target would ride through the purge; the purge
+        must unlink the LINK (never following it) so the reinstall starts
+        clean while the link's target elsewhere is untouched."""
+        import os as _os
+
+        if not hasattr(_os, "symlink"):
+            pytest.skip("no symlink support")
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        data_dir = app_home / "apps" / "test-app" / "data"
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (target / "sitecustomize.py").write_text("planted = True\n")
+        try:
+            _os.symlink(target, data_dir / ".kirocrew-deps")
+        except OSError:
+            pytest.skip("symlink not permitted")
+
+        result = uninstall_app("test-app", keep_data=True)
+        assert result.ok
+        preserved = app_home / "apps" / "test-app" / "data"
+        assert not (preserved / ".kirocrew-deps").exists()
+        assert not (preserved / ".kirocrew-deps").is_symlink()
+        # the purge removed the LINK, not the linked target's content
+        assert (target / "sitecustomize.py").is_file()
 
     def test_install_preserves_existing_data(self, tmp_path, app_home):
         """Reinstall after default uninstall must preserve user data."""
@@ -546,7 +789,7 @@ class TestAppAdmission:
     def test_register_external_admits_signed_manifest(self, tmp_path, app_home):
         # register_external_app now passes its self-reported manifest to
         # admission, so a correctly-signed app self-registers under
-        # require_signature (previously denied because no manifest was passed).
+        # require_signature (denied when no manifest is passed).
         import hashlib
         import hmac
 
@@ -1209,7 +1452,7 @@ class TestCleanupMigratedBuiltin:
 
 # ---------------------------------------------------------------------------
 # _copy_app_tree — symlink / denylist / off-loop regression tests
-# (app install used to run a raw follow-symlinks copytree on the event loop;
+# (app install must not run a raw follow-symlinks copytree on the event loop;
 # a large `build` symlink target froze the loop until the watchdog killed
 # the gateway)
 # ---------------------------------------------------------------------------
@@ -1276,6 +1519,18 @@ class TestCopyAppTree:
         (src / ".git" / "config").write_text("[core]")
         (src / "__pycache__").mkdir()
         (src / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+        # The gateway's own pip --target provisioning output: machine- and
+        # platform-specific, re-provisioned at the destination on first spawn.
+        # Copying it would put a foreign wheel tree FIRST on the child's
+        # PYTHONPATH, shadowing the correctly provisioned copy. The transient
+        # staging/prior swap directories are denylisted for the same reason.
+        (src / ".kirocrew-deps").mkdir()
+        (src / ".kirocrew-deps" / "requests").mkdir()
+        (src / ".kirocrew-deps" / "requests" / "__init__.py").write_text("x = 1")
+        (src / ".kirocrew-deps-staging").mkdir()
+        (src / ".kirocrew-deps-staging" / "partial.py").write_text("x = 1")
+        (src / ".kirocrew-deps-prior").mkdir()
+        (src / ".kirocrew-deps-prior" / "old.py").write_text("x = 1")
         # A real `build/` dir is NOT denylisted: the manifest may reference
         # runtime paths anywhere under the app root, so it must survive.
         # (A `build` *symlink* is neutralized by symlinks=True instead.)
@@ -1291,6 +1546,9 @@ class TestCopyAppTree:
         assert not (dest / "ui" / "node_modules").exists()
         assert not (dest / ".git").exists()
         assert not (dest / "__pycache__").exists()
+        assert not (dest / ".kirocrew-deps").exists()
+        assert not (dest / ".kirocrew-deps-staging").exists()
+        assert not (dest / ".kirocrew-deps-prior").exists()
         assert (dest / "build" / "artifact.txt").is_file()
         assert (dest / "ui" / "dist" / "index.mjs").is_file()
 
@@ -1661,6 +1919,351 @@ class TestCopyAppTree:
         assert (dest / "data" / "state.json").read_text(encoding="utf-8") == '{"k": 1}'
         assert secret.read_text(encoding="utf-8") == "s3cret"
 
+    @pytest.mark.parametrize("rollback_metadata_fails", [False, True])
+    def test_metadata_failure_restores_data_secret_and_retired_tree(
+        self, tmp_path, app_home, monkeypatch, rollback_metadata_fails
+    ):
+        from kiro_crew.apps import manager as manager_mod
+        from kiro_crew.apps.manager import app_dir, update_app
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        dest = app_dir("test-app")
+        data = dest / "data"
+        data.mkdir(exist_ok=True)
+        (data / "state.json").write_text('{"kept": true}', encoding="utf-8")
+        secret = dest / ".app_secret"
+        secret.write_text("kept-secret", encoding="utf-8")
+        (dest / "old-only.txt").write_text("old tree", encoding="utf-8")
+
+        v2 = _make_app_source(tmp_path / "v2", version="2.0.0")
+        (v2 / "data").write_text("replacement file", encoding="utf-8")
+        (v2 / ".app_secret").mkdir()
+        (v2 / ".app_secret" / "replacement.txt").write_text(
+            "replacement directory", encoding="utf-8"
+        )
+        (v2 / "new-only.txt").write_text("new tree", encoding="utf-8")
+
+        real_write = manager_mod._write_installed
+        writes = 0
+
+        def _fail_metadata_write(name, meta):
+            nonlocal writes
+            writes += 1
+            if writes == 1 or rollback_metadata_fails:
+                raise OSError("metadata write failed")
+            real_write(name, meta)
+
+        monkeypatch.setattr(manager_mod, "_write_installed", _fail_metadata_write)
+        result = update_app(v2)
+
+        assert not result.ok
+        assert data.is_dir()
+        assert (data / "state.json").read_text(encoding="utf-8") == '{"kept": true}'
+        assert secret.is_file()
+        assert secret.read_text(encoding="utf-8") == "kept-secret"
+        assert (dest / "old-only.txt").read_text(encoding="utf-8") == "old tree"
+        assert not (dest / "new-only.txt").exists()
+        assert get_app_manifest("test-app").version == "1.0.0"
+        restored_meta = _read_installed("test-app")
+        assert restored_meta is not None
+        assert restored_meta.version == "1.0.0"
+
+    def test_update_that_adds_session_approval_disables_until_reconsent(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        # Consent is captured at install/enable while the route guard reads the
+        # live manifest, so a version that ADDS the grant must not inherit the
+        # user's earlier "enabled" -- otherwise an update silently widens what
+        # the app may do to their sessions.
+        from kiro_crew.apps import manager as manager_mod
+        from kiro_crew.apps.manager import update_app
+        from kiro_crew.apps.permissions import app_can_manage_session_approvals
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        assert enable_app("test-app").ok
+        assert get_app("test-app")["enabled"] is True
+
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        real_copy = manager_mod._copy_app_tree
+        observed_grants = []
+
+        def _copy_with_permission_probe(source, dest):
+            real_copy(source, dest)
+            observed_grants.append(app_can_manage_session_approvals("test-app"))
+
+        monkeypatch.setattr(manager_mod, "_copy_app_tree", _copy_with_permission_probe)
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert observed_grants == [False]
+        assert "session approval" in result.message
+        # The UI branches on the structured notice, not on the prose.
+        assert result.notice == "session_approval_reconsent"
+        assert result.to_dict()["notice"] == "session_approval_reconsent"
+        assert "code" not in result.to_dict()
+        assert get_app("test-app")["enabled"] is False
+        assert get_app("test-app")["version"] == "2.0.0"
+        assert get_app("test-app")["sessionApprovalConsentPending"] is True
+
+    def test_failed_widening_update_restores_original_tree_and_metadata(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        assert install_app(_make_app_source(tmp_path)).ok
+        assert enable_app("test-app").ok
+        original = _read_installed("test-app")
+        assert original is not None
+
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        real_copytree = shutil.copytree
+
+        def _copy_then_fail(*args, **kwargs):
+            real_copytree(*args, **kwargs)
+            raise OSError("simulated copy failure")
+
+        monkeypatch.setattr(shutil, "copytree", _copy_then_fail)
+        result = update_app(v2)
+
+        assert not result.ok
+        assert "failed to update app files" in (result.error or "")
+        assert _read_installed("test-app") == original
+        assert get_app_manifest("test-app").version == "1.0.0"
+        assert get_app("test-app")["enabled"] is True
+        assert get_app("test-app")["sessionApprovalConsentPending"] is False
+
+    def test_fresh_install_with_session_approval_requires_consent(self, tmp_path, app_home):
+        result = install_app(
+            _make_app_source(tmp_path, permissions={"sessionApproval": True})
+        )
+
+        assert result.ok, result.error
+        assert result.notice == "session_approval_reconsent"
+        assert get_app("test-app")["enabled"] is False
+        assert get_app("test-app")["sessionApprovalConsentPending"] is True
+        blocked = enable_app("test-app")
+        assert not blocked.ok
+        assert blocked.error_code == "session_approval_consent_required"
+        assert enable_app("test-app", session_approval_consent=True).ok
+        assert get_app("test-app")["sessionApprovalConsentPending"] is False
+
+    def test_update_keeping_session_approval_stays_enabled(self, tmp_path, app_home):
+        # The grant was already declared when the user enabled the app, so a
+        # refresh that keeps it is not a new request.
+        from kiro_crew.apps.manager import update_app
+
+        assert install_app(
+            _make_app_source(tmp_path, permissions={"sessionApproval": True})
+        ).ok
+        assert enable_app("test-app", session_approval_consent=True).ok
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert result.notice == ""
+        assert get_app("test-app")["enabled"] is True
+
+    def test_self_registration_that_adds_session_approval_is_disabled(self, app_home):
+        # Self-managed apps re-register on every launch and author their own
+        # manifest, so a manifest that newly asks for session control must not
+        # inherit the always-enabled default -- that would be a self-grant.
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
+        assert get_app("ext-keypad")["enabled"] is True
+
+        result = register_external_app(
+            "ext-keypad",
+            "1.1.0",
+            "Keypad",
+            manifest_data={
+                "name": "ext-keypad",
+                "version": "1.1.0",
+                "permissions": {"sessionApproval": True},
+            },
+        )
+        assert result.ok, result.error
+        assert result.notice == "session_approval_reconsent"
+        assert get_app("ext-keypad")["enabled"] is False
+
+    def test_first_self_registration_with_session_approval_starts_disabled(self, app_home):
+        result = register_external_app(
+            "ext-keypad",
+            "1.0.0",
+            "Keypad",
+            manifest_data={
+                "name": "ext-keypad",
+                "version": "1.0.0",
+                "permissions": {"sessionApproval": True},
+            },
+        )
+        assert result.ok, result.error
+        assert result.notice == "session_approval_reconsent"
+        assert get_app("ext-keypad")["enabled"] is False
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
+        # Only a disclosure surface may clear pending consent.
+        blocked = enable_app("ext-keypad")
+        assert not blocked.ok
+        assert blocked.error_code == "session_approval_consent_required"
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
+        assert enable_app("ext-keypad", session_approval_consent=True).ok
+        assert get_app("ext-keypad")["enabled"] is True
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is False
+
+    def test_self_registration_keeping_session_approval_stays_enabled(self, app_home):
+        manifest = {
+            "name": "ext-keypad",
+            "version": "1.0.0",
+            "permissions": {"sessionApproval": True},
+        }
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad", manifest_data=manifest).ok
+        assert enable_app("ext-keypad", session_approval_consent=True).ok
+        result = register_external_app(
+            "ext-keypad", "1.0.1", "Keypad", manifest_data={**manifest, "version": "1.0.1"}
+        )
+        assert result.ok, result.error
+        assert result.notice == ""
+        assert get_app("ext-keypad")["enabled"] is True
+
+    def test_self_registration_removing_session_approval_clears_pending(self, app_home):
+        manifest = {
+            "name": "ext-keypad",
+            "version": "1.0.0",
+            "permissions": {"sessionApproval": True},
+        }
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad", manifest_data=manifest).ok
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
+
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
+
+        result = register_external_app(
+            "ext-keypad",
+            "1.0.1",
+            "Keypad",
+            manifest_data={"name": "ext-keypad", "version": "1.0.1"},
+        )
+
+        assert result.ok, result.error
+        assert get_app("ext-keypad")["enabled"] is False
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is False
+
+    def test_failed_self_registration_widening_restores_metadata(
+        self, app_home, monkeypatch
+    ):
+        from kiro_crew.apps import manager as manager_mod
+
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
+        original = _read_installed("ext-keypad")
+        assert original is not None
+        real_atomic_write = manager_mod.atomic_write
+        manifest_writes = 0
+
+        def _fail_manifest_once(path, data):
+            nonlocal manifest_writes
+            if Path(path).name == APP_MANIFEST_FILENAME:
+                manifest_writes += 1
+                if manifest_writes == 1:
+                    raise OSError("manifest write failed")
+            real_atomic_write(path, data)
+
+        monkeypatch.setattr(manager_mod, "atomic_write", _fail_manifest_once)
+        result = register_external_app(
+            "ext-keypad",
+            "1.1.0",
+            "Keypad",
+            manifest_data={
+                "name": "ext-keypad",
+                "version": "1.1.0",
+                "permissions": {"sessionApproval": True},
+            },
+        )
+
+        assert not result.ok
+        assert _read_installed("ext-keypad") == original
+        assert get_app_manifest("ext-keypad") is None
+
+    def test_failed_self_registration_removal_preserves_pending_consent(
+        self, app_home, monkeypatch
+    ):
+        from kiro_crew.apps import manager as manager_mod
+
+        manifest = {
+            "name": "ext-keypad",
+            "version": "1.0.0",
+            "permissions": {"sessionApproval": True},
+        }
+        assert register_external_app(
+            "ext-keypad", "1.0.0", "Keypad", manifest_data=manifest
+        ).ok
+        original = _read_installed("ext-keypad")
+        assert original is not None
+        real_write = manager_mod._write_installed
+        metadata_writes = 0
+
+        def _fail_metadata_once(name, meta):
+            nonlocal metadata_writes
+            metadata_writes += 1
+            if metadata_writes == 1:
+                raise OSError("metadata write failed")
+            real_write(name, meta)
+
+        monkeypatch.setattr(manager_mod, "_write_installed", _fail_metadata_once)
+        result = register_external_app(
+            "ext-keypad",
+            "1.1.0",
+            "Keypad",
+            manifest_data={"name": "ext-keypad", "version": "1.1.0"},
+        )
+
+        assert not result.ok
+        assert _read_installed("ext-keypad") == original
+        restored = get_app_manifest("ext-keypad")
+        assert restored is not None
+        assert restored.permissions.sessionApproval is True
+
+    def test_update_of_disabled_app_adding_session_approval_requires_consent(
+        self, tmp_path, app_home
+    ):
+        # A disabled app can be enabled later, so a new grant still needs consent.
+        from kiro_crew.apps.manager import update_app
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        assert get_app("test-app")["enabled"] is False
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert get_app("test-app")["enabled"] is False
+        assert result.notice == "session_approval_reconsent"
+        assert get_app("test-app")["sessionApprovalConsentPending"] is True
+
+    def test_update_removing_session_approval_clears_pending(self, tmp_path, app_home):
+        assert install_app(_make_app_source(tmp_path)).ok
+        widened = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        assert update_app(widened).ok
+        assert get_app("test-app")["sessionApprovalConsentPending"] is True
+
+        narrowed = _make_app_source(tmp_path / "v3", version="3.0.0")
+        result = update_app(narrowed)
+
+        assert result.ok, result.error
+        assert get_app("test-app")["enabled"] is False
+        assert get_app("test-app")["sessionApprovalConsentPending"] is False
+
     def test_local_update_clears_prior_registry_provenance(self, tmp_path, app_home):
         from kiro_crew.apps.manager import (
             _read_installed,
@@ -1943,6 +2546,276 @@ class TestEnabledStateTellsUnreadableFromNotInstalled:
         assert app_enabled_state("shape-probe") is True
 
 
+class TestListingReportsWhatItDropped:
+    """Tests for list_apps_with_skips — the listing says when it dropped an app.
+
+    ``list_apps`` reaches ``if not meta: continue`` for a record that does not read
+    and drops the app silently, so its return value cannot separate "no such app is
+    installed" from "that app's record went unread". The rebuild in ``agent.py``
+    needs them apart: treating an unread claim as a genuinely unclaimed name prunes a
+    mount ref that nothing re-adds.
+
+    These live in the owner's suite on purpose: this module owns the record
+    filename, the occupied-entry test and the skip rules, so a caller that walks
+    the apps directory itself can disagree with all three while every test here
+    still passes. Asking the listing is the only way a caller stays in step.
+    """
+
+    def _install_two(self, tmp_path):
+        install_app(_make_app_source(tmp_path, name="app-one"))
+        install_app(_make_app_source(tmp_path, name="app-two"))
+
+    def test_a_healthy_listing_reports_itself_complete(self, tmp_path, app_home):
+        """The accepting case, so the report is not refusing everything."""
+        self._install_two(tmp_path)
+
+        listing = list_apps_with_skips()
+
+        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
+        assert listing.complete is True
+
+    def test_the_apps_list_is_handed_back_unchanged(self, tmp_path, app_home):
+        """The completeness flag is added BESIDE the listing, never instead of it.
+
+        ``list_apps`` has many callers and its shape is deliberately untouched, so
+        this pins that the new read is the same rows plus one answer.
+        """
+        self._install_two(tmp_path)
+
+        assert list_apps_with_skips().apps == list_apps()
+
+    def test_a_record_the_listing_drops_is_reported_as_a_skip(self, tmp_path, app_home):
+        """The case the whole function exists for: a record that does not parse.
+
+        The app is installed and its directory is on disk. ``list_apps`` reads the
+        record, fails, and drops the row -- so without this report a caller sees a
+        list that does not carry ``app-two`` and an apps root that does, and has to
+        reconstruct which of the two answers to believe.
+        """
+        self._install_two(tmp_path)
+        (app_home / "apps" / "app-two" / "installed.json").write_text(
+            "{ not json", encoding="utf-8"
+        )
+
+        listing = list_apps_with_skips()
+
+        assert {a["name"] for a in listing.apps} == {"app-one"}
+        assert listing.complete is False
+
+    def test_an_unreadable_record_is_reported_as_a_skip(self, tmp_path, app_home):
+        """A permission fault on the record is the same silent drop as a parse fault."""
+        self._install_two(tmp_path)
+        record = app_home / "apps" / "app-two" / "installed.json"
+        os.chmod(record, 0o000)
+        try:
+            if os.access(record, os.R_OK):
+                pytest.skip("this user bypasses file permissions")
+
+            listing = list_apps_with_skips()
+
+            assert {a["name"] for a in listing.apps} == {"app-one"}
+            assert listing.complete is False
+        finally:
+            os.chmod(record, stat.S_IRUSR | stat.S_IWUSR)
+
+    def test_a_dangling_record_link_is_reported_as_a_skip(self, tmp_path, app_home):
+        """Presence is judged WITHOUT resolving the path.
+
+        ``Path.exists`` follows a symlink, so a dangling ``installed.json`` link reads
+        absent while the listing still drops that app for failing to read it. The two
+        answers together would claim there is no such app while the app sits on disk.
+        """
+        self._install_two(tmp_path)
+        record = app_home / "apps" / "app-two" / "installed.json"
+        record.unlink()
+        record.symlink_to(tmp_path / "no-such-target.json")
+        assert not record.exists()
+
+        listing = list_apps_with_skips()
+
+        assert {a["name"] for a in listing.apps} == {"app-one"}
+        assert listing.complete is False
+
+    def test_a_junction_shaped_record_is_reported_as_a_skip(self, tmp_path, app_home, monkeypatch):
+        """``is_symlink`` is False for a Windows directory junction, so it is not enough.
+
+        Fed as a SHAPE rather than a real junction, for the reason the enabled-state
+        tests above give: a junction has no POSIX equivalent, so requiring one would
+        exercise this only on the platform it breaks. A dangling junction presents as
+        ``exists=False, is_symlink=False``, which is what an absent record presents as
+        too, so only the junction probe has to be stood in for.
+        """
+        self._install_two(tmp_path)
+        record = app_home / "apps" / "app-two" / "installed.json"
+        record.unlink()
+        assert not record.exists() and not record.is_symlink()
+
+        monkeypatch.setattr(
+            "kiro_crew.apps.manager.is_link_or_junction",
+            lambda path: Path(path) == record,
+        )
+
+        listing = list_apps_with_skips()
+
+        assert {a["name"] for a in listing.apps} == {"app-one"}
+        assert listing.complete is False
+
+    def test_a_directory_with_no_record_at_all_is_not_a_skip(self, tmp_path, app_home):
+        """A directory that never held a record stood for no app, so it hides nothing.
+
+        This is the boundary against the tests above: there something was AT the
+        record path and could not be read, here the path is plainly empty. Counting
+        this would hold the listing permanently incomplete for any stray directory.
+        """
+        self._install_two(tmp_path)
+        (app_home / "apps" / "not-an-app").mkdir()
+
+        listing = list_apps_with_skips()
+
+        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
+        assert listing.complete is True
+
+    def test_a_plain_file_beside_the_app_directories_is_not_a_skip(self, tmp_path, app_home):
+        """An ordinary file inspects cleanly as a file and is simply not an app.
+
+        It cannot be told apart from an app root overwritten by a file, and counting
+        every one would leave the listing permanently incomplete -- which costs every
+        caller reading completeness as doubt. That residue is deliberate.
+        """
+        self._install_two(tmp_path)
+        (app_home / "apps" / "notes.txt").write_text("not an app", encoding="utf-8")
+
+        listing = list_apps_with_skips()
+
+        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
+        assert listing.complete is True
+
+    def test_a_dangling_app_root_link_is_reported_as_a_skip(self, tmp_path, app_home):
+        """The same blindness one level up, where the listing skips a non-directory.
+
+        An app root replaced by a dangling link is not a dir, is not listed, and its
+        record is unreachable, so every resolving predicate agrees the app is absent
+        while something plainly occupies its name.
+        """
+        self._install_two(tmp_path)
+        (app_home / "apps" / "vanished").symlink_to(tmp_path / "no-such-app-dir")
+
+        listing = list_apps_with_skips()
+
+        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
+        assert listing.complete is False
+
+    def test_no_apps_root_at_all_is_a_complete_listing_of_nothing(self, app_home):
+        """An absent root is the ordinary "nothing installed" shape, not a doubt."""
+        assert not (app_home / "apps").exists()
+
+        listing = list_apps_with_skips()
+
+        assert listing.apps == []
+        assert listing.complete is True
+
+    def test_a_root_replaced_by_a_file_is_reported_as_incomplete(self, app_home):
+        """A file standing where the root belongs hides every record beneath it.
+
+        This is the boundary against the test above: both leave nothing to walk, and
+        only the root's own presence separates them. Absent means no app is installed;
+        occupied means every installed app's record is unreachable and none of them can
+        be vouched for by an entry either, because there are no entries to read.
+
+        A plain file counts HERE and not one level down, where an ordinary non-app file
+        sits legitimately beside the app directories. The position carries the
+        argument: no healthy installation has a file where the apps root belongs.
+        """
+        (app_home / "apps").write_text("not a directory", encoding="utf-8")
+
+        listing = list_apps_with_skips()
+
+        assert listing.apps == []
+        assert listing.complete is False
+
+    def test_a_dangling_root_link_is_reported_as_incomplete(self, tmp_path, app_home):
+        """Presence is judged WITHOUT resolving, one level up from the record tests.
+
+        ``Path.exists`` follows the link, so a dangling apps root reads absent by every
+        resolving predicate while something plainly occupies the name. Reading that as
+        "nothing installed" is the answer that prunes a grant nothing re-adds.
+        """
+        (app_home / "apps").symlink_to(tmp_path / "no-such-apps-root")
+        assert not (app_home / "apps").exists()
+
+        listing = list_apps_with_skips()
+
+        assert listing.apps == []
+        assert listing.complete is False
+
+    def test_a_junction_shaped_root_is_reported_as_incomplete(self, app_home, monkeypatch):
+        """``is_symlink`` is False for a Windows directory junction, so it is not enough.
+
+        Fed as a SHAPE for the reason the record-level junction test gives: a junction
+        has no POSIX equivalent, so requiring a real one would exercise this only on
+        the platform it breaks. A dangling junction and an absent root both present as
+        ``exists=False, is_symlink=False``, so the junction probe is the only thing
+        that separates them and the only thing stood in for.
+        """
+        root = app_home / "apps"
+        assert not root.exists() and not root.is_symlink()
+
+        monkeypatch.setattr(
+            "kiro_crew.apps.manager.is_link_or_junction",
+            lambda path: Path(path) == root,
+        )
+
+        listing = list_apps_with_skips()
+
+        assert listing.apps == []
+        assert listing.complete is False
+
+    def test_a_root_that_cannot_be_walked_is_reported_as_incomplete(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """A root that raises mid-walk vouches for nothing, and keeps the rows it has.
+
+        The rows already read stay in ``apps`` -- they were read before the walk --
+        so the caller keeps every claim it can see and loses only the assurance that
+        it saw them all.
+
+        The completeness walk is picked out by WHEN it runs rather than by counting
+        walks. ``list_apps`` can walk the root more than once on its own: it calls
+        ``detect_orphaned_builtins`` first, which walks the root whenever that
+        module-global cache is cold, so which walk is the Nth depends on whether an
+        earlier test in the same worker happened to warm it. Arming only once
+        ``list_apps`` has returned names the target exactly, however many walks it
+        takes internally, and it keeps the fault out of ``list_apps`` itself --
+        which is called OUTSIDE the completeness ``try``, so an ``OSError`` raised in
+        there would propagate instead of being reported as an incomplete listing.
+        """
+        self._install_two(tmp_path)
+        real_iterdir = Path.iterdir
+        real_list_apps = list_apps
+        root = app_home / "apps"
+        state = {"rows_read": False, "raised": False}
+
+        def _rows_then_arm():
+            rows = real_list_apps()
+            state["rows_read"] = True
+            return rows
+
+        def _explode_once_armed(self):
+            if state["rows_read"] and self == root:
+                state["raised"] = True
+                raise OSError("root unreadable")
+            return real_iterdir(self)
+
+        monkeypatch.setattr("kiro_crew.apps.manager.list_apps", _rows_then_arm)
+        monkeypatch.setattr(Path, "iterdir", _explode_once_armed)
+
+        listing = list_apps_with_skips()
+
+        assert state["raised"], "the completeness walk never ran, so nothing was tested"
+        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
+        assert listing.complete is False
+
+
 class TestBootSkillReconcile:
     """Tests for reconcile_app_skills — startup creates missing skill symlinks."""
 
@@ -2078,7 +2951,7 @@ class TestBootSkillReconcile:
 # backend three ways — the third being a fallback that derives a loopback base
 # URL from a manifest's mcpServers entry (self-managed apps whose backend is a
 # separate loopback process, e.g. the Crew Companion desktop app on :7778).
-# register_builtin_apps() used to write a .app_secret ONLY when
+# register_builtin_apps() must not write a .app_secret ONLY when
 # backend.entryPoint was present, so a builtin declaring only mcpServers
 # resolved a backend fine but was refused a secret — and every proxied request
 # then 502'd with "has no secret". The fix generates the secret whenever a

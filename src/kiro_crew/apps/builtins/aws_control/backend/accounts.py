@@ -48,7 +48,7 @@ _PROBE_TTL_SECS = 300.0
 #: once.
 _PROBE_CONCURRENCY = 4
 
-#: ``aws configure get`` reads used to classify a profile's auth mechanism.
+#: ``aws configure get`` reads that classify a profile's auth mechanism.
 #: Values are setting names passed to the CLI — the CLI parses the config
 #: files itself, so the names-only invariant holds.
 _KIND_SSO_SESSION = "sso_session"
@@ -61,7 +61,7 @@ KIND_CREDENTIAL_PROCESS = "credential-process"
 KIND_OTHER = "other"
 
 #: LoopBoundLock, not asyncio.Lock: a module-global asyncio primitive binds
-#: to the import-time loop and raises when acquired from another (#4800).
+#: to the import-time loop and raises when acquired from another.
 _snapshot_lock = LoopBoundLock()
 _snapshot: dict[str, Any] | None = None
 _snapshot_at: float = 0.0
@@ -411,6 +411,24 @@ def _default_account(snapshot: dict[str, Any]) -> str:
     return ""
 
 
+async def default_account_id() -> str:
+    """The account id the nightly loop will run for, or "" when there is none.
+
+    The loop resolves :func:`resolve_default_account_profile`, which picks the
+    account with :func:`_default_account` and only then chooses a key inside it.
+    This returns that first half on its own, for a per-account surface that has to
+    say whether the account it is showing is the scheduled one. Sharing the
+    account selection is the point: a surface that re-derived it could show a
+    schedule for an account the loop never visits, which is the silence this
+    exists to break.
+
+    Reads the cached snapshot, so it costs no AWS call of its own. A stale answer
+    here can only mislabel a schedule for the seconds after a default is moved,
+    while a fresh sweep would be paid on every poll of a polled route.
+    """
+    return _default_account(await list_accounts())
+
+
 async def resolve_default_account_profile() -> tuple[str, str] | None:
     """The working (profile, region) for the account the registry default names.
 
@@ -470,7 +488,7 @@ def resolve_account_profile_cached(account: str) -> tuple[str, str] | None:
     runners, which are plain ``def`` by the SDK's contract. The async twin cannot
     be reached from there — ``asyncio.run`` in a worker thread builds a second
     event loop, and a module-global asyncio primitive binds to the loop that
-    imported it and raises when acquired from another (#4800, which is why
+    imported it and raises when acquired from another (which is why
     ``_snapshot_lock`` is a :class:`LoopBoundLock` at all). So this reads the
     snapshot the loop already built rather than building one of its own.
 

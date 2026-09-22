@@ -86,6 +86,11 @@ DEFAULT_RULE_PACKS: dict[str, str] = {}
 # ``gh`` must be authenticated for each listed host.
 DEFAULT_GITHUB_HOSTS: list[str] = ["github.com"]
 
+# GitLab-compatible hosts (gitlab.com + optional GitLab self-hosted / Deploy
+# targets). Mirrors ``github_hosts``: opt-in self-hosted instances, ``glab``
+# must be authenticated for each listed host (``glab auth login --hostname <host>``).
+DEFAULT_GITLAB_HOSTS: list[str] = ["gitlab.com"]
+
 DEFAULT_CONFIG: dict[str, object] = {
     "schema": "code-review-sage-config",
     "version": 1,
@@ -118,6 +123,8 @@ DEFAULT_CONFIG: dict[str, object] = {
     "rule_packs": DEFAULT_RULE_PACKS,
     # GitHub-compatible hosts (github.com + optional GitHub Enterprise Server).
     "github_hosts": DEFAULT_GITHUB_HOSTS,
+    # GitLab-compatible hosts (gitlab.com + optional self-hosted instances).
+    "gitlab_hosts": DEFAULT_GITLAB_HOSTS,
     # Settled-change filtering defaults.
     "exclude_settled_by_default": True,
 }
@@ -448,10 +455,10 @@ def data_dir(root: Path | None = None) -> Path:
 
 # --- Per-run scratch ---------------------------------------------------------
 # Every review run owns a private subtree, ``data/runs/<run-id>/``, holding its
-# result records and its report. Runs used to share one ``data/results`` dir and
-# one ``data/reports`` index, which forced the backend to serialize whole runs
-# (an overlapping run would clear the records the other was still writing) and
-# left only the newest report readable. Per-run isolation is what lets several
+# result records and its report. Sharing one ``data/results`` dir and one
+# ``data/reports`` index across runs forces the backend to serialize whole runs
+# (an overlapping run clears the records the other is still writing) and leaves
+# only the newest report readable. Per-run isolation is what lets several
 # reviews run at once AND keeps each finished report retrievable by run id.
 #
 # What stays GLOBAL (deliberately, do not move under a run): ``config.json``,
@@ -526,7 +533,7 @@ def remove_run_dir(run_id: str, root: Path | None = None) -> bool:
 
 
 def list_run_ids(root: Path | None = None) -> list[str]:
-    """Run ids that currently have an on-disk subtree (used to reap orphans)."""
+    """Run ids that currently have an on-disk subtree (the input for orphan reaping)."""
     rr = runs_root(root)
     if not rr.is_dir():
         return []

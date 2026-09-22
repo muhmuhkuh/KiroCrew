@@ -37,6 +37,7 @@ interface, the public edition is complete standalone.
 | `publish` | adapter | `DefaultPublishRegistry` (registers no provider → publish unavailable) | registers enterprise artifact/publish providers |
 | `agent_runtime` | adapter | `DefaultAgentRuntime` (`run_first_run_setup` wired; `managed_mcp_servers` **RESERVED**) | extra one-time first-run provisioning |
 | `agent_executable` | adapter | `DefaultAgentExecutableResolver` (identity) | resolves an edition-managed launcher to its direct executable before core sandboxing |
+| `gateway_lifecycle` | adapter | `DefaultGatewayLifecycleProvider` (`restart_launcher()` → `None`) | stable absolute launcher for package-manager-owned gateway installs |
 | `sandbox` | settings | `DefaultSandboxPolicy` (`_STRICT_DIRS`/`_CC_DIRS`) | additional edition-specific credential dirs |
 | `credentials` | adapter | `DefaultCredentialPolicy` (AKIA/ASIA redaction; `exempt_exact_hosts()` → `frozenset()`) | internal token regexes + trusted-tenant exempt hosts |
 | `security` | **concrete** | `PolicyAuthority()` (baseline only) | `PolicyAuthority(overlay=…)` ADD-only |
@@ -60,10 +61,40 @@ interface, the public edition is complete standalone.
 | `knowledge` | adapter | `DefaultKnowledgeProvider` (no extra connectors) | enterprise doc connector (`extra_connectors`) |
 | `tunnel` | adapter | `DefaultTunnelProvider` (no-op) | internal tunnel supervisor |
 | `telemetry` | adapter | `DefaultTelemetryProvider` (no-op, RUM off; OTLP destination from `telemetry.otlp_endpoint`) | RUM/Cognito config + its own OTLP collector |
-| `dashboard` | adapter | `DefaultDashboardContributor` (no routes/services, no login handler) | secretary/taskkeeper routes + enterprise SSO PTY login |
+| `dashboard` | adapter | `DefaultDashboardContributor` (no routes/services, no login handler, no internal-reachable paths) | secretary/taskkeeper routes + enterprise SSO PTY login |
 | `jail` | adapter | `DefaultJailProvider` (no-op, never jails) | enterprise process isolation |
 | `mobile_connect` | adapter | `DefaultMobileConnectProvider` (personal-install pair: `tailnet_qr` + `login_link` (id == kind by design)) | edition-specific phone-connection methods (descriptor-only `{id, kind}`; minting stays on each method's own endpoint; an empty list hides the dashboard entry; list + mint governed by `capabilities.mobile_connect`) |
+| `remote_provisioners` | adapter | `DefaultRemoteProvisionerProvider` (the built-in `aws_ec2` lane backed by `RealLaunchEngine`, **plus a conditional `aws_fargate` lane** backed by `FargateLaunchEngine` that is offered only when `cloud.json` carries a complete `fargate` block; id == kind by design for both) | edition-specific ways to CREATE a remote instance (a managed dev environment, a container task): descriptor-only `{id, kind, label, posix_only, step_labels, confirm_before_launch}` plus a `LaunchEngine` per id (`confirm_before_launch` carries what the operator must see and confirm before that lane may launch -- `POST /api/cloud/launch` requires `confirm_recipient` to equal it, so the requirement is derived from the row rather than hard-coded to one id, and a lane with nothing to confirm leaves it empty); the core's durable launch job still drives every launch, so cancel, rollback and orphan reaping are inherited rather than reimplemented |
 | `feature_apps` | tuple | **RESERVED** — `()`; apps register via `apps_loader` (provenance record only) | — (slot inert) |
+
+> `remote_provisioners` note — the Set-up tab under Settings → Remote Instances
+> could only ever create an EC2 instance in the user's own AWS account, because
+> `handlers_cloud._engine()` constructed `RealLaunchEngine` directly (the
+> `state.cloud_launch_engine` hook next to it is a test seam, not a contract). A
+> deployment whose users have no AWS account of their own, or whose machines come
+> from a managed dev-environment service, had no way to offer a second lane
+> without shadowing the 1500-line panel. The seam follows `mobile_connect`
+> exactly: the backend contributes descriptors (`GET /api/cloud/provisioners`),
+> the frontend draws each `kind` through `registerRemoteProvisionerRenderer()`
+> (the `aws_ec2` kind is drawn by the core's own form and cannot be claimed), and
+> `POST /api/cloud/launch` resolves the requested `provider_id` against the same
+> seam before a job file exists. What the seam deliberately does NOT hand out is
+> the launch loop itself: an edition supplies the five-method `LaunchEngine` and
+> `cloud/launch_job.py::run_launch` drives it, so one-launch-at-a-time, cancel,
+> the two rollback paths and `reap_orphans` apply to every lane. The four step
+> KEYS are therefore fixed (rollback branches on them); a descriptor may only
+> relabel them. `size_key`, `profile` and `region` are the generic wires: for the
+> built-in they are the EC2 ladder, an AWS profile and an AWS region; another
+> provisioner reads them as its own shape, credential selector and placement,
+> which is why `LaunchJobStore.create()` validates `size_key` against
+> `sizes.py` for the built-in id only. The stop/start/delete lifecycle routes
+> (`/api/cloud/{tag}/...`) remain EC2-specific: a lane that needs them
+> contributes its own through `dashboard.contribute_routes`. No governance scope
+> is added here; the existing EC2 lane carries none today, and a
+> `capabilities.remote_provisioners` row mirroring `capabilities.mobile_connect`
+> is the natural follow-up once a second lane exists to narrow on.
+>
+> Contributor walkthrough: [adding-a-remote-provisioner.md](../../guides/adding-a-remote-provisioner.md).
 
 > `external_access` note — three surfaces the core offers unconditionally, none of
 > which had a composition point. Two are installable-content registries: skill
@@ -175,9 +206,9 @@ once loaded.
 
 ## Level-1 governance ceiling and distribution
 
-`PlatformContext.governance` is the optional Level-1 `GovernanceCeiling` that enforcement chokepoints read through `current_context()`. `governance.load_security_policy` selects the first available source: an explicit local policy, a centrally distributed policy, a companion-bundled policy, then the data-home policy; no source leaves editable standalone defaults. The local source remains first so an operator can roll back a bad fleet-wide publication without waiting for the central control plane.
+`PlatformContext.governance` is the optional Level-1 `GovernanceCeiling` that enforcement chokepoints read through `current_context()`. `governance.load_security_policy` composes a **tier ladder**, highest first: the centrally distributed document, then exactly one of the local sources (an explicit `KIROCREW_SECURITY_POLICY` path, a companion-bundled policy, or the data-home policy). The central document is the authority; every tier below it may only **tighten** it, through the same per-scope AND the profile layer uses. There is no local rollback lever above the fleet: recovery from a bad publication is re-publishing a good document at the source (`governance.md` → "Loading + precedence"). No source leaves editable standalone defaults.
 
-`policy_distribution.resolve_distribution` accepts the central source from fleet environment settings or the `distribution` declaration of an already-selected lower-tier policy, with environment settings taking precedence individually. A declared distribution source cannot carry credentials; request headers remain host-local and `cache_only()` prevents child processes from receiving the means to contact the fleet control plane.
+`policy_distribution.resolve_distribution` takes the central source from the `distribution` declaration of the highest tier that made one, or from fleet environment settings when none did, with environment settings taking precedence individually. A declared distribution source cannot carry credentials; request headers remain host-local and `cache_only()` prevents child processes from receiving the means to contact the fleet control plane.
 
 `governance._parse_controls` rejects every unknown governed key, including an unrecognised `sandbox` child. Only documented non-governed sandbox flags are accepted in the reserved internal scope. This fails closed instead of recording a misspelled sandbox floor as a valid but unenforced policy control.
 
@@ -288,6 +319,17 @@ Policy shape (`admission_policy.json`):
   "capability_ceiling": {"egress": ["*.example.com"], "tools": ["enterprise-mcp"]}
 }
 ```
+
+**Strict gate-flag reading.** `require_signature` and
+`require_policy_signature` are read strictly by `_coerce_flag`: a real JSON
+boolean is honoured, an absent key leaves the gate off (the documented
+default), and any other present value — explicit `null`, the string
+`"false"`, `0`, `1` — is warned about and read as **on**, the fail-closed
+direction (#9641). `bool()` on the raw value used to read any non-empty
+string as ON but `null`/`""` as OFF, so a template rendering
+`"require_policy_signature": null` silently disabled the gate. Same
+strict-read shape as the `boot` gate flags in
+[governance](governance.md) (#9176).
 
 **This policy is also the trust root for the security ceiling.**
 `require_policy_signature` (default `false`) additionally demands a *verified*
@@ -406,6 +448,40 @@ verdict needs no fold (`0.6.0` is not newer than `0.6.0.12`). The wheel's
 dist-info metadata is not touched by the stamp — `pip` and `importlib.metadata`
 still report the base — so a downstream that builds its own wheel and needs
 those to differ must bump its own project version as well.
+
+## Gateway restart launcher
+
+`PlatformContext.gateway_lifecycle` composes a `GatewayLifecycleProvider`.
+`restart_launcher() -> str | None` returns an absolute stable launcher pathname;
+`DefaultGatewayLifecycleProvider` returns `None`. A companion opts in through
+`dataclasses.replace(ctx, gateway_lifecycle=provider)` at its trusted composition
+root, only for installs its launcher owns. This is lifecycle selection, not an
+update authorization setting: no request, config or environment command selects
+it, and update governance is unchanged. `CONTRACT_VERSION` remains 1.
+
+`gateway_restart.resolve_restart_launcher()` is the shared selector for dashboard
+restart (including update apply) and the orchestrator's automatic-update restart.
+Both import it before an update can retire the running package tree and call it
+off-loop before saving or draining sessions. The provider must load its own
+dependencies at composition and return cheaply without deferred imports. A
+provider error or an explicit empty, relative, missing, non-file or non-executable
+target refuses restart; only `None` takes the existing `respawn_executable()` →
+`reexec_python_module()` path, including core-managed virtual environments.
+
+The core executes `[launcher, *sys.argv[1:]]` directly, without a shell or Python
+`-m` prefix, and never resolves the launcher's symlinks: dispatch may depend on
+its basename. `reexec_launcher` preserves the inherited environment, including
+instance home and port, while pinning Python's UTF-8 stream settings. The launcher
+owns choosing the current bundle/interpreter and replacing version-specific
+`PYTHONPATH` and other environment entries before loading that bundle. Windows
+launchers must be native `.exe` files; each argument is quoted for the CRT's
+`execv` command-line reconstruction. POSIX receives the original argv unchanged.
+The existing restart coalescing, callback fence and drain ordering remain with
+their callers. CLI service-manager restarts are independent and unchanged.
+
+Validation establishes availability at selection time, not future execution:
+an updater must keep the stable launcher usable through handoff. The core does
+not retry a failed explicit launcher with the old Python bundle.
 
 ## Consumption-site wiring
 
@@ -675,6 +751,39 @@ Wired sites:
   contract, centralized so the fail-closed policy cannot diverge). `stop_services`
   takes the same `app` handle as `start_services` (symmetric) so a companion need
   not stash services in process-global state.
+- `dashboard/server.py` `_mixed_internal_api_paths()` — unions
+  `dashboard.mixed_internal_api_paths()` into the module-level
+  `_MIXED_INTERNAL_API_PATHS` at BOTH `token_auth_middleware` construction sites
+  (the dashboard chain and the headless `--slack-only` one), so the two cannot
+  gate different route sets. It exists because an edition mounts its routes
+  through `contribute_routes`, so the core cannot name them in a frozenset —
+  without it an edition's own MCP tool authenticating with the loopback
+  `X-Internal-Secret` handshake is not recognized as internal at all and answers
+  `Token required` on every call. ADD-ONLY with two core-enforced limits: a
+  contributed path matching a CORE STRICT entry is DROPPED and SEL-audited
+  (strict hard-denies off-loopback where mixed accepts a validated cookie, so
+  admitting one would soften a deliberately loopback-only route), and the result
+  is a union so a contribution can never remove a core entry. BOTH outcomes are
+  recorded — the admitted set is logged and SEL-audited at composition time
+  alongside the drop audit, because a dropped contribution is invisible to the
+  EDITION while an honoured one is invisible to the OPERATOR, and SEL is what has
+  to distinguish a widened deployment from stock; a public build contributes
+  nothing and stays silent. The degraded-contributor path goes through
+  `safe_context_call`, not a hand-written `try/except`: a
+  `PlatformCompositionError` is RE-RAISED (a host that could not compose its
+  companion must abort, never fall back to open-source defaults) while any other
+  contributor failure degrades to no contribution. The contribution is also
+  MATERIALIZED inside that thunk, so a generator raising part-way through
+  iteration degrades instead of escaping middleware construction and stopping the
+  gateway from binding at all. The overlap is checked in BOTH directions by
+  `_would_soften_a_strict_path`: the request is what
+  gets prefix-matched, so a contributed ANCESTOR of a strict entry reclassifies it
+  exactly as a child does — a request for the strict path then matches both sets,
+  and token_auth's off-loopback arm tests `_matches_mixed` first. Every degraded
+  contributor shape — raising, absent method, non-iterable, non-path entries —
+  contributes nothing rather than widening the set on a value the core could not
+  check; a contributor predating the seam is NOT logged as a fault, while one
+  that raises is.
 - `dashboard/handlers_system.py` — `frontend_rum_config()` added to the status
   payload only when non-None.
 - `config/loader.py` `build_provider_factory(cfg)` (wave 3 wiring) — the
@@ -747,7 +856,13 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   `apps/registry.py::_effective_registries`, which is the single list every
   registry consumer reads (index fetch/refresh, the trusted-host allowlist, row
   lookup, install, the blob-proxy allowlist). Rows are the field shape of
-  `ExternalRegistryConfig` (`{name, repo, branch, trust}`). Unlike
+  `ExternalRegistryConfig` (`{name, repo, branch, label, review, trust}`).
+  `label` (a display name shown instead of the `name` id) and `review` (`""` /
+  `"curated"` / `"community"`, which badge the dashboard renders) are display-only
+  and change no security posture; an unrecognised `review` degrades to `""` (no
+  claim) and is logged, never dropping the row, since a display field must not be
+  able to remove a registry from install and the security gates. `label` never replaces
+  the id: cache paths and installed apps' `_registry` tags are keyed by it. Unlike
   `registry_rows`, the **edition row wins** a `name` collision — and when the two
   rows name DIFFERENT repositories, **neither** is served, because the index cache
   is keyed by name and the displaced row's cache would otherwise be read under the
@@ -958,10 +1073,12 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   > `query` is an optional free-text filter HINT, sent only by MCP discovery
   > search (`mcp_providers/capability.py`); the browse endpoint
   > `GET /api/capability/mcp/registry` omits it and gets the full listing. The
-  > provider consumes at most `_LIST_LIMIT_GUARD` (500) rows, so a manager whose
-  > registry is larger MUST filter server-side or every row past that cap is
-  > unsearchable. Ignoring the hint stays correct — the provider filters again —
-  > it only costs reach. The hint is feature-detected on the signature
+  > provider hands on at most `_LIST_LIMIT_GUARD` (500) entries, and when a query
+  > is present that cap applies to the MATCHES: it bounds the fan-out, never the
+  > searchable window. So a manager whose registry is larger than the cap does NOT
+  > have to filter server-side to stay searchable, and ignoring the hint costs
+  > nothing but the work of returning its own catalog — it is a cost hint, not a
+  > correctness one. The hint is feature-detected on the signature
   > (`mcp_utils.registry_accepts_query`) and forwarded by
   > `BoundedCapabilityManager`, so an edition still on the zero-arg signature
   > keeps working.

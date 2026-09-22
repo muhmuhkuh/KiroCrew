@@ -103,15 +103,13 @@ def _redact_prose(text: str) -> str:
     rewritten, whereas redacting a code diff would corrupt the fix the gate proved
     (that content is DETECTED and refused instead — see ``_scan_pushable_content``).
 
-    FAILS CLOSED by raising :class:`ProseRedactionUnavailable`. This was previously
-    best-effort — it returned the text unscanned — on the reasoning that the diff beside
-    it had passed a fail-closed scan and the PR is only a draft. That reasoning does not
-    hold: the prose is a SEPARATE artifact from the diff, it is the part the agent wrote
-    most freely, and `gh pr create` publishes it to GitHub where a description cannot be
-    un-published (it persists in the API's edit history even after an edit). Every other
-    egress path in this app already fails closed for exactly this reason
-    (`mcp_server._redact_result`, `routes._redact_for_display`); this was the one that
-    did not. Raised by the GPT review of this branch.
+    FAILS CLOSED by raising :class:`ProseRedactionUnavailable`. Best-effort — returning
+    the text unscanned because the diff beside it passed a fail-closed scan and the PR is
+    only a draft — does not hold: the prose is a SEPARATE artifact from the diff, it is
+    the part the agent wrote most freely, and `gh pr create` publishes it to GitHub where
+    a description cannot be un-published (it persists in the API's edit history even
+    after an edit). Every other egress path in this app fails closed for exactly this
+    reason (`mcp_server._redact_result`, `routes._redact_for_display`).
 
     The caller degrades to the durable queue, so a verified fix is never lost — it waits
     on disk for a human instead of being published unscanned.
@@ -285,16 +283,7 @@ class GitHubPRRecipe:
 
     def _build_draft_argv(self, *, summary: str, body_path: Path, branch: str) -> list[str]:
         """The provider CLI argv that opens the DRAFT PR/MR."""
-        cmd = [
-            "gh",
-            *DRAFT_CMD,
-            "--title",
-            summary,
-            "--body-file",
-            str(body_path),
-            "--head",
-            branch,
-        ]
+        cmd = ["gh", *DRAFT_CMD, "--title", summary, "--body-file", str(body_path), "--head", branch]
         if self.base_branch:
             cmd += ["--base", self.base_branch]
         return cmd
@@ -451,7 +440,7 @@ class GitHubPRRecipe:
             isolated = _repository_is_isolated(self.clone_path)
         except IsolationProbeError as exc:
             # Sandbox failure, not an isolation verdict — the note must not
-            # read as if the repository changed under review (#8151).
+            # read as if the repository changed under review.
             return False, str(exc)
         if not isolated:
             return False, "repository isolation changed after review"
@@ -551,12 +540,14 @@ class GitHubPRRecipe:
                 cmd,
                 cwd=str(self.clone_path),
                 capture_output=True,
-                timeout=_GH_TIMEOUT_S,
+                timeout=_CLI_TIMEOUT_S,
                 env=self._cli_env(),
                 **UTF8_TEXT,
             )
         except (FileNotFoundError, subprocess.SubprocessError) as exc:
-            logger.warning("%s create failed to launch for %s: %s", self.cli_name, fingerprint, exc)
+            logger.warning(
+                "%s create failed to launch for %s: %s", self.cli_name, fingerprint, exc
+            )
             return f"QUEUED:{fingerprint}"
         if proc.returncode != 0:
             logger.warning(

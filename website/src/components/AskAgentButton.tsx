@@ -43,12 +43,32 @@ export function askAgentHard(message: string): void {
   sendErrorToChat(askAgentPrompt(resolved), { hard: true })
 }
 
+export function handoffErrorToAgent({
+  report,
+  message,
+  hard = false,
+  onHandoff,
+}: {
+  report?: ErrorReport
+  message?: string
+  hard?: boolean
+  onHandoff?: () => void
+}): boolean {
+  const resolved: ErrorReport | { message: string } | null =
+    report ?? findReport(message) ?? (message ? { message } : null)
+  if (!resolved) return false
+  if (!sendErrorToChat(askAgentPrompt(resolved), { hard })) return false
+  try { onHandoff?.() } catch { /* dismissal is cosmetic; never throw here */ }
+  return true
+}
+
 export default function AskAgentButton({
   report,
   message,
   variant = 'link',
   hard = false,
   onHandoff,
+  label,
   className = '',
 }: {
   report?: ErrorReport
@@ -68,6 +88,16 @@ export default function AskAgentButton({
    * every caller.
    */
   onHandoff?: () => void
+  /**
+   * Overrides the shared "Ask the agent" label.
+   *
+   * For a surface that stacks SEVERAL notices, where the default leaves every
+   * hand-off looking like the same affordance and nothing says which failure
+   * each one carries. The reports genuinely differ -- each has its own
+   * endpoint, status and code -- so the label is the only part that was
+   * indistinguishable. Pass a full localized label, not a fragment to append.
+   */
+  label?: string
   className?: string
 }) {
   // Render only needs to know whether there is anything to offer. The report is
@@ -80,12 +110,7 @@ export default function AskAgentButton({
   if (!report && !message) return null
 
   const onClick = () => {
-    const resolved: ErrorReport | { message: string } | null =
-      report ?? findReport(message) ?? (message ? { message } : null)
-    if (!resolved) return
-    // Dismiss only once the hand-off actually proceeded.
-    if (!sendErrorToChat(askAgentPrompt(resolved), { hard })) return
-    try { onHandoff?.() } catch { /* dismissal is cosmetic; never throw here */ }
+    handoffErrorToAgent({ report, message, hard, onHandoff })
   }
 
   const base = 'inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors'
@@ -103,7 +128,7 @@ export default function AskAgentButton({
       onClick={onClick}
     >
       <Sparkles size={13} aria-hidden="true" />
-      {i18nT('components.askAgent.ask_the_agent')}
+      {label ?? i18nT('components.askAgent.ask_the_agent')}
     </button>
   )
 }

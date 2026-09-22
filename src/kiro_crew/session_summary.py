@@ -12,9 +12,9 @@ directly:
 Why the input is shaped the way it is: a session transcript is dominated by
 assistant records and their tool payloads, while intent lives almost entirely in
 the (small) user messages. Reading ``role``/``content`` only, keeping user text
-whole and excerpting assistant text, reproduces the shape that worked when the
-prompt was prototyped against real sessions -- around 1% of a transcript's bytes
--- and drops tool output entirely, which added nothing.
+whole and excerpting assistant text, holds the input to around 1% of a
+transcript's bytes and drops tool output entirely, which carries nothing about
+intent.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import redact
 
 logger = logging.getLogger(__name__)
 
@@ -380,18 +380,16 @@ def redact_payload(value: Any) -> Any:
     The payload is model output derived from transcript text, so any secret or
     beacon URL that appeared in the conversation can be reproduced inside it.
     The sidecar is read straight back to the dashboard, so redaction has to
-    happen before the write, not at render time -- the same
-    ``redact_credentials`` + ``redact_exfiltration_urls`` chain every other
-    LLM-controlled value in this codebase is put through before it is cached.
+    happen before the write, not at render time. Every string goes through the
+    canonical ``security.redact`` composition, which applies exfiltration-URL
+    redaction before credential redaction.
 
     Recursive because the payload is nested (intents -> next_steps -> strings);
     a single top-level pass would leave every field the panel actually renders
     unredacted.
     """
     if isinstance(value, str):
-        cleaned, _ = redact_credentials(value)
-        cleaned, _ = redact_exfiltration_urls(cleaned)
-        return cleaned
+        return redact(value)
     if isinstance(value, list):
         return [redact_payload(v) for v in value]
     if isinstance(value, dict):

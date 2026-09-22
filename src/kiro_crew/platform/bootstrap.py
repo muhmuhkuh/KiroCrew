@@ -35,6 +35,7 @@ from kiro_crew.platform.defaults import (
     DefaultDeniedRuleProvider,
     DefaultEmbeddingSource,
     DefaultExternalAccessPolicy,
+    DefaultGatewayLifecycleProvider,
     DefaultIdentityProvider,
     DefaultImportSourceProvider,
     DefaultJailProvider,
@@ -45,6 +46,7 @@ from kiro_crew.platform.defaults import (
     DefaultPromptSourceProvider,
     DefaultProviderRegistry,
     DefaultPublishRegistry,
+    DefaultRemoteProvisionerProvider,
     DefaultSandboxPolicy,
     DefaultSkillDiscoveryProvider,
     DefaultSlackEnterpriseGate,
@@ -133,6 +135,7 @@ def build_default_context(
         publish=DefaultPublishRegistry(),
         agent_runtime=DefaultAgentRuntime(),
         agent_executable=DefaultAgentExecutableResolver(),
+        gateway_lifecycle=DefaultGatewayLifecycleProvider(),
         sandbox=DefaultSandboxPolicy(),
         credentials=DefaultCredentialPolicy(),
         security=PolicyAuthority(),  # _NullOverlay → baseline only
@@ -158,6 +161,7 @@ def build_default_context(
         dashboard=DefaultDashboardContributor(),
         jail=DefaultJailProvider(),
         mobile_connect=DefaultMobileConnectProvider(),
+        remote_provisioners=DefaultRemoteProvisionerProvider(),
         feature_apps=(),
         governance=governance,
     )

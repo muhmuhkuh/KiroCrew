@@ -3,25 +3,20 @@
 ## Overview
 
 Issue Radar is an opt-in (`defaultEnabled: false`) built-in app for tracked-item
-and change-request triage across THREE providers — GitHub, GitLab and Azure
-DevOps (see [Providers](#providers)). It connects one or more repos via the
-user's own vendor CLI session (`gh`, `glab` or `az` — no OAuth app, no PAT held
-by Kiro Crew) and provides a 3-column workbench: browse/filter issues (work
-items on Azure DevOps), view AI-summarized detail + timeline, apply triage
-actions (label, close/reopen), and record per-issue investigation findings
-in a local ledger. A parallel PULL REQUESTS section reuses the same shape —
-filter by lifecycle (open / merged / closed-unmerged), person, draft and label;
-read an AI summary of the description plus the whole review conversation; see
-the automated checks ("auto review") on the head commit; and ACT on a PR without
-leaving for the provider's web UI — approve / request changes, comment, close or
-reopen, merge or arm the provider's own auto-merge, and cancel or re-run CI, per-PR
-or in bulk across a selection (see Pull-Request Actions). A background watcher
-optionally notifies on new issues.
+and change-request triage across FOUR providers — GitHub, GitLab, Azure DevOps
+and Jira (see [Providers](#providers)). It connects repos through the user's own
+vendor CLI (`gh`, `glab` or `az`) or Jira REST credentials — no OAuth app and no
+PAT held by Kiro Crew — and provides a 3-column workbench: browse/filter issues
+(work items on Azure DevOps), view AI-summarized detail + timeline, apply triage
+actions (label, close/reopen), and record per-issue investigation findings in a
+local ledger. A parallel PULL REQUESTS section reuses the same shape for the three
+forge providers; Jira is issues-only. A background watcher optionally notifies on
+new issues.
 
 ## Providers
 
-Three providers are supported, and each is a plain MODULE that mirrors the others
-function-for-function (`github_client`, `gitlab_client`, `azure_client`).
+Four providers are supported. GitHub, GitLab and Azure DevOps are plain modules
+that mirror each other; Jira is an issues-only REST client (`jira_client`).
 `provider.py` owns the identity type (`RepoKey`), the dispatch table and the
 display vocabulary; `ProviderClient` is the protocol the routes require, and
 because a module cannot be statically checked against a Protocol, conformance is
@@ -35,7 +30,13 @@ provider cannot be registered while the gate silently keeps comparing three.
 **Each client module is the stable composition façade for its provider.** The
 routes and tests continue to import `github_client`, `gitlab_client` and
 `azure_client`; those modules retain the protocol surface, exception aliases,
-constants and patchable I/O chokepoints. Provider-specific sibling modules keep
+the constants something actually binds, and patchable I/O chokepoints. A mirror
+NOTHING binds is not part of that surface: the sibling that owns the value reads
+its own module global, so a façade copy is never the seam it resembles and
+patching it changes nothing. Binding means the façade's own code, a test that
+asserts on the façade attribute, or a documented cross-surface pointer such as
+`_MEMBER_ASSOC_RANK`, which `website/src/apps/issue-radar/context.tsx` names as
+the anchor the frontend ranking tracks. Provider-specific sibling modules keep
 the implementation boundaries explicit: `*_transport.py` owns URL, environment,
 request and pagination mechanics; `*_normalization.py` converts provider payloads
 into the shared GitHub-shaped records; and `github_queries.py` owns GitHub's
@@ -45,18 +46,22 @@ The reviewed real `glab` and `az` process spawns remain in
 `gitlab_client._glab_run` and `azure_client._az_run`, respectively, which keeps
 the spawn-audit allowlist tied to the same security chokepoints.
 
-| | GitHub | GitLab | Azure DevOps |
-|---|---|---|---|
-| Provider id | `github` | `gitlab` | `azure` |
-| CLI that owns the credential | `gh api` | `glab api` | `az devops invoke` |
-| Host | `github.com` (pinned) | `gitlab.com`, or an allowlisted self-managed `host[:port]` | `dev.azure.com` (pinned) |
-| `RepoKey.owner` carries | owner | group path (`group/subgroup`) | `{organization}/{project}` |
-| Tracked item | issue | issue | work item (**project-scoped**) |
-| Change request | pull request, `#` | merge request, `!` | pull request, `!` |
-| Review verbs | approve / request changes / comment | approve / comment (request changes REFUSED) | comment only (**both verdicts REFUSED** — see below) |
-| Merge methods | `MERGE` / `SQUASH` / `REBASE` | `MERGE` / `SQUASH` (`REBASE` refused) | `MERGE` / `SQUASH` / `REBASE` |
-| Auto-merge | `enablePullRequestAutoMerge` | REFUSED (see below) | `autoCompleteSetBy` |
-| Assignees | a set, capped at 10 | a set (Free keeps only the first) | exactly ONE (`System.AssignedTo`); more than one is REFUSED |
+| | GitHub | GitLab | Azure DevOps | Jira |
+|---|---|---|---|---|
+| Provider id | `github` | `gitlab` | `azure` | `jira` |
+| CLI/API | `gh api` | `glab api` | `az devops invoke` | Jira REST |
+| Host | `github.com` (pinned) | `gitlab.com`, or allowlisted self-managed | `dev.azure.com` (pinned) | `*.atlassian.net`, or allowlisted |
+| `RepoKey.owner` carries | owner | group path | `{organization}/{project}` | project key |
+| Tracked item | issue | issue | work item (**project-scoped**) | issue |
+| Change request | pull request, `#` | merge request, `!` | pull request, `!` | none |
+| Review / merge | supported | provider-limited | provider-limited | refused |
+| Assignees | a set, capped at 10 | a set | exactly one | one or none |
+
+Jira accepts `*.atlassian.net` automatically; self-hosted Jira requires an exact
+entry in `dashboard.jira_hosts`, and the host is rechecked before every API call.
+A Jira connection may carry an optional manual repo mapping for repo-centric UI
+identity, but requests route by project key. Pull requests, reviews, checks and
+workflow runs are refused rather than approximated.
 
 **Every provider is reached by shelling out to its vendor CLI as a raw REST
 passthrough, and Kiro Crew stores NO credential of its own.** `gh api`, `glab api`
@@ -236,6 +241,28 @@ triage prompt. When the agent concludes it writes its verdict back into the
 item's investigation record — that is what puts a verdict + summary on the
 issue's card instead of leaving it in chat scrollback.
 
+The session opens in the repo's configured **`workspace_path`** (a per-repo,
+local-only triage setting stored in `config.json`, alongside `triage_labels` and
+`notify_on_new_issue`, and normalized by `store._normalize_settings`) so the agent
+sees the repo's real source instead of the gateway's default cwd. The frontend forwards it as the new slot's
+`project` on `createSlot`, which sets the working directory via `chatSlotProject`
+after create. An empty setting passes `null`, leaving the slot on the default cwd
+(the pre-workspace behavior). It is applied only when a FRESH session is opened;
+a resumed slot keeps the working directory it was born with, so changing the
+setting never moves the cwd of a conversation already running — which is why the
+Repo Settings readout says "New Investigate sessions will run in …", not that the
+next click will. The path is stored verbatim and never validated against the
+filesystem — the path resolves on the machine running the gateway (which may be a
+different host than the operator's), and a not-yet-checked-out path is a
+legitimate empty state. Because it is unvalidated, `chatSlotProject` can still
+reject it at slot-create time (missing dir on the gateway host, or a sensitive
+path); `createSlot` then deletes the just-made slot and throws, which reaches
+`openSession`'s `catch` and surfaces in the hook's `error` state — the same
+contract the chat sidebar uses ("Not a directory"). A bad path is deliberately
+NOT swallowed into a default-cwd session: doing so would silently pin the whole
+investigation thread in the wrong directory, recreating the wrong-cwd failure
+this feature removes.
+
 That write goes through the **`issue_radar_record_investigation` MCP tool**, not
 a raw HTTP call. An agent session holds no dashboard credential:
 
@@ -336,6 +363,19 @@ the same lock discipline on its own `.lock` sidecar: every mutation is a merge
 would otherwise lose an update. An analysed issue the model declined to label is
 stored as an EMPTY list, not omitted — otherwise "the next un-analysed slice"
 would return the same unlabelable issues forever.
+
+The connected-repo reader treats a non-object `config.json` as an empty config,
+and filters non-object rows from its `repos` list. A malformed row cannot stop
+the app from listing or updating other connected repositories.
+
+Every cache parser applies the same rule to its own file: a JSON root that parses
+but is not an object is unusable. Readers return a MISS so the route refetches and
+the next write heals the file; write-through patchers skip that individual file
+and continue patching the other caches. Without that, a hand-edited or restored
+cache fails its route or aborts the remaining post-write cache repairs. The
+investigation record is deliberately excluded — it is the only copy of a user's
+findings, so reading a malformed root as "absent" would let the next write replace
+it.
 
 ## Permissions
 
@@ -1200,9 +1240,15 @@ the list, the filters, the selected item — is untouched.
   check is answered from POSIX ownership (`st_uid` + the group/other write bits)
   or, on Windows, from the object's ACL — see
   `github_runner.check_provider_path_component_windows` and
-  `kiro_crew.windows_acl`. An **elevated** Windows gateway is refused for the same
-  reason a root POSIX one is: its children would be elevated too, which makes the
-  ownership walk vacuous.
+  `kiro_crew.windows_acl`. A **root** POSIX gateway is refused: the sandbox
+  masks the credential homes from the agent's children but leaves the filesystem
+  writable, and a provider child runs unsandboxed with those credentials, so a
+  root agent could overwrite a root-owned `gh` that the ownership walk cannot
+  tell from the operator's install. An **elevated** Windows gateway (the
+  built-in `Administrator` account is always elevated) is not refused: Windows
+  has no OS sandbox here, so the agent's shell already holds the gateway's full
+  token and the refusal would remove the feature without removing any exposure.
+  The ACL walk runs unchanged for it, keyed on the gateway user's SID.
 - **Azure DevOps is POSIX only (macOS/Linux).** `azure_client._az_bin` refuses
   `win32` before it resolves anything, and raises `ProviderCliError` rather than
   `ProviderSetupError` so the connect dialog does not offer an install that would

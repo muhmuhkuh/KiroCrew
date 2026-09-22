@@ -11,17 +11,15 @@ downstream through the descriptor you already hold. A descriptor cannot be
 re-pointed, so a component that is open is fixed; a component reached by name is
 not.
 
-Why this module exists rather than a check at each call site: two closed pull
-requests (#2446, #2447) tried to add snapshot components while hardening staging in
-the same change. Each review round named one more validated-by-name path use --
-source root, each ancestor, each file, the destination tree, the pre-restore backup
-pass -- and neither converged. The mechanism belongs in one place with one set of
-invariants, and callers become thin consumers of it.
+Why this module exists rather than a check at each call site: the
+validated-by-name path uses are many and easy to miss one at a time -- source root,
+each ancestor, each file, the destination tree, the pre-restore backup pass. The
+mechanism belongs in one place with one set of invariants, and callers become thin
+consumers of it.
 
-The mechanical half of this was first written for the benchmark harness in
-``kiro_crew.eval.bench.safepath``, which now imports it from here. Its invariants
-survived several rounds of review there and are preserved verbatim; the docstrings
-explaining WHY each flag is load-bearing came with them.
+``kiro_crew.eval.bench.safepath`` imports the mechanical half from here, so the
+benchmark harness and the product share one set of invariants. The docstrings
+explaining WHY each flag is load-bearing live with them.
 
 Two things this module deliberately does NOT do:
 
@@ -60,6 +58,7 @@ __all__ = [
     "REMOVAL_UNVERIFIABLE",
     "SKIP_NOT_REGULAR",
     "SKIP_SYMLINK",
+    "SKIP_UNREADABLE_ENTRY",
     "SKIP_VANISHED",
     "SkipReporter",
     "StagedRemoval",
@@ -73,6 +72,7 @@ __all__ = [
     "fd_real_path",
     "is_reparse_point",
     "is_regular_at",
+    "omits_wanted_data",
     "stat_at",
     "open_dir_pinned",
     "open_in_pinned_parent",
@@ -107,6 +107,73 @@ SKIP_VANISHED = "vanished"
 SKIP_NOT_REGULAR = "not_regular"
 SKIP_TOO_LARGE = "too_large"
 SKIP_IDENTITY_CHANGED = "identity_changed"
+#: The entry is still there and this process may not read its metadata or its bytes
+#: -- a platform-protected path, or one an ACL denies. Distinct from SKIP_VANISHED,
+#: which says the name is gone: a caller that must not omit anything silently has to
+#: tell those apart. Spelled for the ENTRY rather than reusing the neighbouring
+#: module's SKIP_UNREADABLE, whose value is a different string for a different
+#: subject (an unreadable trash BATCH).
+SKIP_UNREADABLE_ENTRY = "unreadable_entry"
+
+#: The reason codes that mean "carrying this was never the intent". A symlink and a
+#: non-regular entry are screened on EVERY run, by design, and an archive that screened
+#: one is complete -- there is nothing the operator asked for that it lacks. These two
+#: codes are therefore reserved for a FIRST look: an entry that was regular when the
+#: walk judged it and is a link or a FIFO by the time it is opened has been swapped,
+#: and every site that can observe that reports ``SKIP_IDENTITY_CHANGED`` instead.
+#: Private: the one question a caller may ask is :func:`omits_wanted_data`, so no
+#: caller can build its own partial enumeration from these.
+_NEVER_ARCHIVED = frozenset({SKIP_SYMLINK, SKIP_NOT_REGULAR})
+
+#: The reason codes that mean the archive lacks something it WAS asked to carry: the
+#: bytes were refused, truncated, swapped for another inode mid-copy, or the name went
+#: away between the listing and the copy. Listed so a test can assert the two sets
+#: together cover every ``SKIP_*`` code in this module.
+_OMITS_WANTED_DATA = frozenset(
+    {SKIP_UNREADABLE_ENTRY, SKIP_TOO_LARGE, SKIP_VANISHED, SKIP_IDENTITY_CHANGED}
+)
+
+#: Times :func:`create_and_open_dir_pinned` re-runs its ``mkdir``-then-``open`` pair
+#: when the directory is removed between the two. There is no atomic "create this
+#: directory and open it", so a removal lands INSIDE the sequence and no ordering of
+#: the two calls closes that window -- the answer is to run the sequence again. A
+#: small count is the right bound because an attempt is two syscalls with NO sleep
+#: between them: this is a lost race to redo at once, not a resource to wait on.
+#: Three, so a single interleaving costs one retry, a second one is still absorbed,
+#: and a caller that keeps losing reports rather than spinning: past that point the
+#: removals are not a race being lost but something removing the directory
+#: repeatedly, which no number of attempts fixes and an operator has to see.
+#:
+#: :mod:`kiro_crew.platform_log_append` holds a private bound of the same name and
+#: the same value for its own create-then-open pair, and the two stay separate
+#: deliberately. They govern different sequences with different costs: that one
+#: re-runs a directory create plus a FILE open for best-effort observation, where
+#: losing the race costs one log row, and this one re-runs a directory create plus
+#: the open OF that directory for a caller whose data must land. Sharing one
+#: constant would mean tuning either operation silently retunes the other, and the
+#: equal value today is two similar judgements rather than one decision.
+_CREATE_ATTEMPTS = 3
+
+
+def omits_wanted_data(reason: str) -> bool:
+    """Whether *reason* means the archive lacks something it was asked to carry.
+
+    The single question a retention or completeness decision needs to ask, answered
+    HERE rather than at each consumer. A consumer that names one code has to be found
+    and edited every time a code is added, and until someone does it silently keeps
+    the old answer: a guard that names ``SKIP_UNREADABLE_ENTRY`` lets
+    ``SKIP_TOO_LARGE``, ``SKIP_VANISHED`` and ``SKIP_IDENTITY_CHANGED`` past it into a
+    prune that deletes the last complete backup.
+
+    An UNKNOWN reason answers True, and that direction is the point. This is asked by
+    code deciding whether to DELETE an older archive, so the two wrong answers are not
+    symmetric: keeping a surplus bundle costs disk, and pruning on a reason nobody
+    classified costs the operator's last complete backup. A new code is therefore
+    incomplete-by-default the moment it is reported, before anyone has thought about
+    it, and the completeness test is what tells the author to choose a side.
+    """
+    return reason not in _NEVER_ARCHIVED
+
 
 #: ``(reason_code, by_name_path)``. The path is for the message only -- it is never
 #: re-opened, because re-opening it is the bug this module exists to prevent.
@@ -126,12 +193,12 @@ def fatal_skip_reporter(what: str, *, refusal: type[Exception] = PinnedPathRefus
     the live copy is gone AND the replacement was never written, so the operation
     "succeeds" having destroyed data.
 
-    That distinction cost three separate review findings on this change (a backup pass
-    whose skips preceded an ``rmtree``, a restore source skipped after the live file was
-    moved aside, and a destination subtree that could not be opened). They were three
-    instances of one rule, so the rule is now a parameter a caller passes rather than a
-    condition each site re-implements: archive paths keep the recording reporter, mutating
-    paths pass this one, and which kind a call site is becomes visible at the call site.
+    The distinction is easy to lose one site at a time -- a backup pass whose skips
+    precede an ``rmtree``, a restore source skipped after the live file was moved aside,
+    a destination subtree that cannot be opened -- so the rule is a parameter a caller
+    passes rather than a condition each site re-implements: archive paths keep the
+    recording reporter, mutating paths pass this one, and which kind a call site is
+    becomes visible at the call site.
     """
 
     def _refuse(reason: str, path: str) -> None:
@@ -210,8 +277,7 @@ def pin_parent(
 
     *resolved_parent* must be resolved by the CALLER, once, before this runs.
     Resolving it here would re-follow whatever an ancestor points at by now, which
-    is the exact mistake that made an earlier version of this defensible-looking and
-    useless.
+    is the exact mistake that makes this check defensible-looking and useless.
 
     The descriptor is returned OPEN and the caller must close it. Handing it back
     rather than doing one open inside is what lets a durable write create its
@@ -284,8 +350,8 @@ def open_dir_pinned(
 ) -> int:
     """Open a DIRECTORY with its whole ancestor chain pinned, final component included.
 
-    This is the one the preserved staging branches did not have, and its absence is
-    the finding that closed #2446: ``os.open(str(src), O_DIRECTORY | O_NOFOLLOW)``
+    Its absence is what makes a root-only check unsound:
+    ``os.open(str(src), O_DIRECTORY | O_NOFOLLOW)``
     refuses a link at the root's own name but reaches that name by walking every
     ancestor BY NAME, so swapping a validated ancestor for a link to a credential
     directory redirects the whole traversal and the ``O_NOFOLLOW`` on the final
@@ -450,6 +516,7 @@ def copy_file_pinned(
     dst_dir_fd: int | None = None,
     dst_name: str | None = None,
     skip_existing: bool = False,
+    skip_unreadable: bool = False,
     force_mode: int | None = None,
     max_bytes: int | None = None,
     expected_src_ident: "tuple[int, int] | None" = None,
@@ -459,6 +526,15 @@ def copy_file_pinned(
     """Copy one file's bytes from a descriptor pinned to a validated inode.
 
     Returns True when bytes were copied, False when the source was skipped.
+
+    ``skip_unreadable`` tolerates ONE failure: the SOURCE open being refused for
+    permission, which is reported as ``SKIP_UNREADABLE_ENTRY`` and returns False.
+    It is deliberately not a tolerance for the copy as a whole. A caller that
+    wrapped this call instead could not tell the two ends apart, so a DESTINATION
+    refusal was recorded as an unreadable source -- an omission attributed to the
+    operator's data rather than to the failure to write it, in a bundle that then
+    reported success and let retention prune a complete one. Only the end that was
+    actually refused is knowable here, so the decision belongs here.
 
     ``expected_src_ident`` (when given) is the ``(st_dev, st_ino)`` a caller's
     own validation observed: the copy proceeds only when the pinned source
@@ -505,8 +581,8 @@ def copy_file_pinned(
     never re-opened by name; on Windows, which has no ``dir_fd`` support, that is
     the only pinned source form available. A
     destination reached by name is an ancestor swap away from landing the bytes
-    somewhere else entirely -- that was a real gap in the first version of this
-    module, caught in review, and it is why the by-name destination is now the
+    somewhere else entirely -- a real gap in a by-name-only design, and it is why
+    the by-name destination is now the
     exception rather than the only form.
 
     The destination is created with ``O_EXCL``, so anything already at that name is a
@@ -548,21 +624,41 @@ def copy_file_pinned(
                 fd = os.open(by_name, src_flags)
         except OSError as exc:
             if exc.errno == errno.ELOOP:
-                # A symlink final component that appeared after the listing-time link
-                # screen -- refuse it the same way the screen would have.
-                on_skip(SKIP_SYMLINK, by_name)
+                # A symlink at the final component. Which reason code depends on whether
+                # the caller already LOOKED: with `expected_src_ident` the caller stat-ed
+                # a regular file at this name and a link now sits there, which is the
+                # same-UID swap this module is built to refuse, and a bundle missing that
+                # file lacks something it was asked to carry. Without it this open is the
+                # first look, and a link on first look is the ordinary screen. The two
+                # reasons sit on opposite sides of the retention split, so reporting the
+                # swap as a screen let it prune the last complete backup.
+                on_skip(
+                    SKIP_IDENTITY_CHANGED if expected_src_ident is not None else SKIP_SYMLINK,
+                    by_name,
+                )
+                return False
+            if skip_unreadable and isinstance(exc, PermissionError):
+                # The SOURCE, and only here: this is the one open in this function
+                # that reads the operator's file. Everything below writes.
+                on_skip(SKIP_UNREADABLE_ENTRY, by_name)
                 return False
             raise
     try:
         st = os.fstat(fd)
-        if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            on_skip(SKIP_NOT_REGULAR, by_name)
-            return False
         if expected_src_ident is not None and (st.st_dev, st.st_ino) != expected_src_ident:
             # The descriptor is pinned, but it is not the inode the caller's
-            # validation judged — something was swapped in at the name between
-            # the two. Refuse rather than copy bytes nobody vetted.
+            # validation judged -- something was swapped in at the name between
+            # the two. Refuse rather than copy bytes nobody vetted. Asked BEFORE the
+            # type check: a swap to a FIFO or a directory is still a swap, and asking
+            # the type first reported it as `not_regular`, a screen code, so the bundle
+            # that omitted a wanted file read as complete and retention pruned on it.
             on_skip(SKIP_IDENTITY_CHANGED, by_name)
+            return False
+        if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            # Reached with a matching identity, or with none supplied: this is the same
+            # inode the caller saw, or the first look at it, so a non-regular type or a
+            # hardlink alias here is the design screen and not a swap.
+            on_skip(SKIP_NOT_REGULAR, by_name)
             return False
         if max_bytes is not None and st.st_size > max_bytes:
             # BEFORE the destination is created: ``fstat`` reports a sparse
@@ -985,19 +1081,18 @@ def create_and_open_dir_pinned(
     consistent. Merge callers leave it false, because meeting an existing directory is
     what merging IS.
 
-    This used to also report whether our own `mkdir` was what created the directory, so
-    that the archive's mode and timestamps could be stamped on in that case only. That
-    flag is gone, and the reasoning that justified it was wrong in an instructive way.
+    It does NOT report whether our own `mkdir` created the directory, which would be
+    the natural way to stamp the archive's mode and timestamps on only in that case.
+    Such a flag cannot be trusted.
 
-    It was correct that sampling `dst.exists()` beforehand is a name-based check with a
-    window after it. What it missed is that `mkdir` succeeding does not close the window
-    either: the descriptor comes from a SEPARATE `open`, so a directory replaced between
-    the two leaves the flag true while describing an object the caller no longer holds --
-    and the archive's metadata then lands on somebody else's directory. Review found
-    that. Nothing repairs it: a stat taken after the `mkdir` observes the replacement
-    just as happily, POSIX has no atomic create-and-open for a directory, and under a
-    same-user threat model no mode trick helps. So the metadata is simply not applied to
-    directories, and the flag has no remaining purpose.
+    Sampling `dst.exists()` beforehand is a name-based check with a window after it, and
+    `mkdir` succeeding does not close that window either: the descriptor comes from a
+    SEPARATE `open`, so a directory replaced between the two leaves the flag true while
+    describing an object the caller does not hold -- and the archive's metadata then
+    lands on somebody else's directory. Nothing repairs it: a stat taken after the
+    `mkdir` observes the replacement just as happily, POSIX has no atomic
+    create-and-open for a directory, and under a same-user threat model no mode trick
+    helps. So the metadata is simply not applied to directories.
 
     ``Path(p).mkdir(parents=True)`` creates every missing component by name, so a link
     already sitting at an ancestor is followed and the directories are created inside
@@ -1012,38 +1107,124 @@ def create_and_open_dir_pinned(
     link when the parent was resolved is followed by that resolution, because refusing
     every symlinked ancestor would break a destination under ``/tmp`` on macOS. The
     parent must therefore already exist -- callers create their own tree roots.
+
+    Creating the directory and opening it are two syscalls, and a removal landing
+    between them is an interleaving no ordering closes. The pair is therefore
+    re-attempted, :data:`_CREATE_ATTEMPTS` times, against the SAME pinned parent
+    descriptor -- a retry resolves no name, so it cannot be steered anywhere the first
+    attempt could not go, and ``must_create`` plus the ``O_NOFOLLOW`` refusal are both
+    re-asked on every attempt. Tolerating only the ``FileExistsError`` half handled a
+    concurrent writer and not a concurrent remover (GH-12043), and this is a caller
+    that needs the directory: a snapshot's staging root, a restore destination, a pod
+    home. Exhaustion, and a removal of the pinned PARENT (which no attempt can
+    survive), raise ``FileNotFoundError`` carrying the whole path rather than the bare
+    relative name ``openat`` was given.
+
+    The re-attempt covers a directory THIS call created and no other. When the
+    ``mkdir`` instead MET one that was already there -- the merge case, where
+    ``must_create`` is false and the destination legitimately holds the caller's files
+    -- a removal in the window is reported, not re-attempted: the contents are already
+    unrecoverable, and re-creating the name would hand back an empty directory that an
+    additive restore would stage into and report success over. Review caught that as
+    the retry's one unsafe case, and it is why the loop tracks which of the two
+    happened rather than retrying on the errno alone.
     """
     as_given = Path(path)
     parent_fd = pin_parent(
         os.path.realpath(as_given.parent or Path(".")), what=what, refusal=refusal
     )
     try:
-        try:
-            os.mkdir(as_given.name, 0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            if must_create:
-                raise refusal(
-                    f"refusing to use the {what}: {as_given.name!r} already exists, and "
-                    "this operation replaces its destination rather than merging into "
-                    "it. Something recreated that directory after it was removed, so "
-                    "staging into it would leave files the archive does not contain "
-                    "while reporting a replacement. Remove it and re-run with the "
-                    "gateway stopped."
-                ) from None
-        try:
-            return os.open(as_given.name, dir_flags(), dir_fd=parent_fd)
-        except OSError as exc:
-            # A link (or a plain file) at the destination's own name. O_NOFOLLOW already
-            # refuses it -- the gap review found was that it escaped as a raw OSError, so
-            # a restore ended in a traceback instead of the refusal every other path on
-            # this surface produces. Translated here so callers have one type to contain.
-            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                raise refusal(
-                    f"refusing to use the {what}: {as_given.name!r} is a symbolic link "
-                    "or not a directory, so creating the tree there would write through "
-                    "whatever it points at. Remove it and re-run."
+        lost: FileNotFoundError | None = None
+        for _ in range(_CREATE_ATTEMPTS):
+            ours = True
+            try:
+                os.mkdir(as_given.name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                if must_create:
+                    raise refusal(
+                        f"refusing to use the {what}: {as_given.name!r} already exists, and "
+                        "this operation replaces its destination rather than merging into "
+                        "it. Something recreated that directory after it was removed, so "
+                        "staging into it would leave files the archive does not contain "
+                        "while reporting a replacement. Remove it and re-run with the "
+                        "gateway stopped."
+                    ) from None
+                ours = False
+            except FileNotFoundError as exc:
+                # The PINNED PARENT is gone, not the directory being created. Nothing
+                # can be made inside an unlinked directory, so every further attempt
+                # would land here too -- reported at once, and with the whole path,
+                # because the errno carries only the relative name the syscall was
+                # given.
+                raise FileNotFoundError(
+                    errno.ENOENT,
+                    f"the directory holding the {what} was removed, so "
+                    f"{as_given.name!r} cannot be created in it",
+                    str(as_given),
                 ) from exc
-            raise
+            try:
+                return os.open(as_given.name, dir_flags(), dir_fd=parent_fd)
+            except FileNotFoundError as exc:
+                if not ours:
+                    # This call did NOT create the directory: the `mkdir` above met one
+                    # that was already there, holding whatever the caller was about to
+                    # merge into, and it is gone. Re-creating it would hand back an
+                    # EMPTY directory, and a merge (`must_create=False`) would then
+                    # stage the archive into it and report success while the files it
+                    # was merging with are unrecoverably gone. Review caught this as
+                    # the retry's one unsafe case. So it is reported instead -- the
+                    # same outcome the caller got before the retry existed, with the
+                    # path the errno omits and a sentence saying what was lost.
+                    raise FileNotFoundError(
+                        errno.ENOENT,
+                        f"the {what} already existed when this call met it and was "
+                        "removed before it could be opened, so whatever it held is "
+                        "gone; refusing to re-create it empty, because an additive "
+                        "restore would then report success over the loss",
+                        str(as_given),
+                    ) from exc
+                # The directory this attempt CREATED is gone. Nothing of the caller's
+                # was in it -- it was empty and unopened -- so re-running the pair
+                # costs nothing and loses nothing. That is the mirror of the
+                # ``FileExistsError`` tolerated above: a concurrent writer is handled
+                # and, without this, a concurrent REMOVER was not (GH-12043). Both are
+                # the same interleaving seen from opposite sides, and everything here
+                # runs as the same user as the agent, which is the premise the pinning
+                # exists for.
+                #
+                # The pair is run again rather than repaired in place, because no
+                # ordering of two syscalls closes a window between them. Every attempt
+                # goes through the ONE descriptor pinned above this loop, so a retry
+                # cannot be steered: nothing is re-resolved by name, ``must_create``
+                # and this created-it-ourselves test are re-asked on each attempt, and
+                # a link that appears at the name between two attempts is refused by
+                # the ``O_NOFOLLOW`` below exactly as it is on the first.
+                lost = exc
+                continue
+            except OSError as exc:
+                # A link (or a plain file) at the destination's own name. O_NOFOLLOW already
+                # refuses it -- the gap review found was that it escaped as a raw OSError, so
+                # a restore ended in a traceback instead of the refusal every other path on
+                # this surface produces. Translated here so callers have one type to contain.
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise refusal(
+                        f"refusing to use the {what}: {as_given.name!r} is a symbolic link "
+                        "or not a directory, so creating the tree there would write through "
+                        "whatever it points at. Remove it and re-run."
+                    ) from exc
+                raise
+        # Exhaustion is a ``FileNotFoundError``, not a *refusal*: a refusal on this
+        # surface means the destination is a link or an occupied name a caller must
+        # remove, and callers word it that way -- the prompt handler maps one to
+        # "your prompt root is a link". A directory that keeps being removed is an
+        # operational failure, so it stays in the class the kernel reported and gains
+        # the FULL path the kernel could not name.
+        raise FileNotFoundError(
+            errno.ENOENT,
+            f"the {what} {as_given} was removed between its creation and its open, "
+            f"{_CREATE_ATTEMPTS} attempts in a row",
+            str(as_given),
+        ) from lost
     finally:
         os.close(parent_fd)
 
@@ -1057,6 +1238,7 @@ def stage_tree_pinned(
     on_skip: SkipReporter = _noop_skip,
     skip_existing: bool = False,
     must_create: bool = False,
+    skip_unreadable: bool = False,
     refusal: type[Exception] = PinnedPathRefusal,
 ) -> None:
     """Copy a tree with BOTH traversals pinned end to end.
@@ -1087,6 +1269,17 @@ def stage_tree_pinned(
     other error propagates, so a staging pass never silently ships without files it
     failed to read.
 
+    *skip_unreadable* is the one exception, and it is off by default. With it, an
+    entry whose metadata or bytes this process may not read is reported as
+    ``SKIP_UNREADABLE_ENTRY`` and skipped -- a file, a directory whose open is
+    refused, and the tree's own root alike, since a tolerance that covered only
+    files still ended the operation on a directory. It belongs ONLY to a caller that records
+    every skip somewhere the operator will read it: a data home can hold a
+    platform-protected path that no retry will make readable, and ending the walk
+    there leaves them with no backup at all instead of one that declares the gap. A
+    RESTORE must never set it -- there the unreadable name is the archive's own
+    content, so skipping it drops data the operator asked to have put back.
+
     Refuses outright on a platform that cannot pin a tree. Callers that must still
     function there are expected to say so explicitly rather than have this module
     quietly hand them a by-name walk -- see :func:`supports_pinned_tree_walk`.
@@ -1101,7 +1294,21 @@ def stage_tree_pinned(
         )
 
     def _walk(src_fd: int, dst_fd: int, by_name: str) -> None:
-        names = os.listdir(src_fd)
+        try:
+            names = os.listdir(src_fd)
+        except PermissionError:
+            # The directory opened and its LISTING is refused. Local static modes
+            # cannot produce this -- an O_RDONLY open already required read -- but a
+            # filesystem that re-validates on each call can, when the grant changes
+            # between the open and the read. It is the same omission as a directory
+            # whose open was refused, and a caller that records that gap records this
+            # one: nothing under the directory is copied, and the reporter says so.
+            # The PERMISSION class only, as at every other tolerated site: any other
+            # errno here says the storage is failing and still ends the walk.
+            if not skip_unreadable:
+                raise
+            on_skip(SKIP_UNREADABLE_ENTRY, by_name)
+            return
         skipped = set(ignore(by_name, names)) if ignore else set()
         for entry in sorted(names):
             if entry in skipped:
@@ -1112,10 +1319,30 @@ def stage_tree_pinned(
             except FileNotFoundError:
                 on_skip(SKIP_VANISHED, path)
                 continue
+            except PermissionError:
+                # Unclassifiable, so there is nothing to copy and nothing to descend
+                # into. Reported under its own reason rather than as a vanished entry:
+                # the name is still there, and a caller recording the omission has to
+                # be able to say which of the two it was.
+                #
+                # The PERMISSION class only. An EIO or an ENOTCONN says the storage
+                # is failing, and a backup that quietly omits files because the disk
+                # is dying is the worst possible artefact -- those still end the walk.
+                if not skip_unreadable:
+                    raise
+                on_skip(SKIP_UNREADABLE_ENTRY, path)
+                continue
             if _stat.S_ISLNK(st.st_mode):
                 on_skip(SKIP_SYMLINK, path)
             elif _stat.S_ISDIR(st.st_mode):
-                child_src = _open_child_dir(src_fd, entry, path, on_skip)
+                child_src = _open_child_dir(
+                    src_fd,
+                    entry,
+                    path,
+                    on_skip,
+                    skip_unreadable=skip_unreadable,
+                    after_stat=True,
+                )
                 if child_src is None:
                     continue
                 try:
@@ -1174,12 +1401,12 @@ def stage_tree_pinned(
                         # mode. That rule was applied to files and not carried to
                         # directories.
                         #
-                        # The archive's directory mode and mtime are NOT applied. They used
-                        # to be, gated on `created` from the `mkdir`, and review showed the
-                        # gate cannot be trusted: the descriptor comes from a separate
-                        # `open`, so a directory replaced between the two leaves
-                        # `created=True` describing an object we no longer hold, and the
-                        # archive's metadata then lands on somebody else's directory.
+                        # The archive's directory mode and mtime are NOT applied.
+                        # Gating them on `created` from the `mkdir` cannot be trusted:
+                        # the descriptor comes from a separate `open`, so a directory
+                        # replaced between the two leaves `created=True` describing an
+                        # object we do not hold, and the archive's metadata then
+                        # lands on somebody else's directory.
                         #
                         # There is no sound repair. An identity check cannot help -- a
                         # stat taken after the mkdir observes the REPLACEMENT just as
@@ -1206,6 +1433,11 @@ def stage_tree_pinned(
                         dst_dir_fd=dst_fd,
                         dst_name=entry,
                         skip_existing=skip_existing,
+                        skip_unreadable=skip_unreadable,
+                        # The inode this walk just judged regular. Handing it over is
+                        # what lets the copy tell a swap from a first-look screen and
+                        # report it under the reason retention treats as an omission.
+                        expected_src_ident=(st.st_dev, st.st_ino),
                         on_skip=on_skip,
                     )
                 except FileNotFoundError:
@@ -1242,6 +1474,14 @@ def stage_tree_pinned(
             errno.ENOTDIR,
             errno.ENOENT,
         ):
+            # A ROOT refused for permission is the same omission as a refused entry
+            # inside it, and it reaches the recorder the same way, so a caller that
+            # declares the gap declares this one too. Every other errno still ends
+            # the walk. Without this the tolerance was file-shaped only: a tree whose
+            # own directory cannot be opened still ended the operation.
+            if skip_unreadable and isinstance(exc, PermissionError):
+                on_skip(SKIP_UNREADABLE_ENTRY, str(src))
+                return
             raise
         on_skip(SKIP_SYMLINK, str(src))
         return
@@ -1280,18 +1520,35 @@ def stage_tree_pinned(
         os.close(root_src)
 
 
-def _open_child_dir(parent_fd: int, entry: str, by_name: str, on_skip: SkipReporter) -> int | None:
+def _open_child_dir(
+    parent_fd: int,
+    entry: str,
+    by_name: str,
+    on_skip: SkipReporter,
+    *,
+    skip_unreadable: bool = False,
+    after_stat: bool = False,
+) -> int | None:
     """Open a child directory through *parent_fd*, or report why it was skipped.
 
     Returns ``None`` for the two races worth tolerating -- the entry vanished, or it
     stopped being a plain directory between the stat and this open. ``ELOOP`` and
     ``ENOTDIR`` are exactly the swap the pinned open exists to refuse, so they are
-    reported as a skipped symlink rather than raised: the listing-time screen would
-    have said the same thing a moment earlier. Every other error propagates.
+    reported rather than raised. WHICH reason depends on *after_stat*: a SOURCE walk
+    that stat-ed a directory and now meets a link has watched a swap, and everything
+    under that directory is data the bundle was asked to carry, so it reports
+    ``SKIP_IDENTITY_CHANGED`` -- the side of the retention split that holds the prune.
+    A destination, or a caller that has not looked yet, reports ``SKIP_SYMLINK``, the
+    screen. Every other error propagates.
 
     Extracted because the source and destination sides need identical handling, and
     the version of this code that had it on one side only let the swap the source
     skipped escape the destination as a raw ``OSError``.
+
+    *skip_unreadable* adds one more tolerated case, for a SOURCE side that records
+    what it omitted: a directory whose open is REFUSED for permission is reported as
+    ``SKIP_UNREADABLE_ENTRY`` rather than ending the walk. It stays off for the
+    destination, where the same failure means the copy has nowhere to go.
     """
     try:
         return os.open(entry, dir_flags(), dir_fd=parent_fd)
@@ -1300,7 +1557,10 @@ def _open_child_dir(parent_fd: int, entry: str, by_name: str, on_skip: SkipRepor
         return None
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            on_skip(SKIP_SYMLINK, by_name)
+            on_skip(SKIP_IDENTITY_CHANGED if after_stat else SKIP_SYMLINK, by_name)
+            return None
+        if skip_unreadable and isinstance(exc, PermissionError):
+            on_skip(SKIP_UNREADABLE_ENTRY, by_name)
             return None
         raise
 
@@ -1310,11 +1570,10 @@ def _open_child_dir(parent_fd: int, entry: str, by_name: str, on_skip: SkipRepor
 #
 # Everything below owns ONE mechanism: removing something reached through a pinned
 # descriptor, where the removal itself must not address a name that could have been
-# swapped since it was checked. It lives here rather than at its call sites because it
-# was previously spelled once per site -- the interior directories of a trash batch, the
-# batch directory, and the coarse fallback -- and a fourth consumer is what finally shows
-# which parts are consumer-agnostic. That per-site respelling is the failure this module's
-# own docstring names, from #2446 and #2447.
+# swapped since it was checked. It lives here rather than at its call sites because
+# spelling it once per site -- the interior directories of a trash batch, the batch
+# directory, the coarse fallback -- is exactly the per-site respelling this module's own
+# docstring names as the failure to avoid.
 #
 # The policy stays with the caller. Nothing here logs, and nothing here decides whether a
 # refusal aborts or is reported and skipped: each function returns what happened and the

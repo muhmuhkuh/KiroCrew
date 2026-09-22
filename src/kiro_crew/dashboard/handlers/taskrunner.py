@@ -7,15 +7,57 @@ import logging
 import re
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from aiohttp import web
 
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.execution_context import ExecutionContext, bind_session_execution
+from kiro_crew.hooks import FileTooLargeError
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.task_planner import plan_to_yaml
+from kiro_crew.taskrunner import WorkflowInitializing
+from kiro_crew.workflow_memory import capture_admission_execution
+
+if TYPE_CHECKING:
+    from kiro_crew.taskrunner import TaskRunner
 
 logger = logging.getLogger(__name__)
+
+
+async def _taskrunner_request_origin(request: web.Request) -> tuple[str, web.Response | None]:
+    """Use the session named by an ordinarily authenticated internal request."""
+    if request.get("internal_auth") is not True:
+        return "", None
+    return request.headers.get("X-Session-Key", ""), None
+
+
+def _canonical_task_reference(runner: TaskRunner, reference: str, *, first: bool = False) -> str:
+    runs = runner._runs
+    if reference in runs:
+        return reference
+    matches = [run for run in runs.values() if run.name == reference]
+    return matches[0 if first else -1].task_id if matches else reference
+
+
+async def _task_result_slot(request: web.Request, state: DashboardState, task_id: str):
+    """Continue the owning project's exact execution in a fresh chat session."""
+    run = state.task_runner._runs.get(task_id) if state.task_runner else None
+    execution = run.execution_context if run else None
+    if execution is None:
+        return state.get_or_create_slot()
+    token = uuid.uuid4().hex
+    session_key = f"taskrunner:{task_id}:chat:{token}"
+    await asyncio.to_thread(bind_session_execution, session_key, execution)
+    slot = state.get_or_create_slot(
+        f"task-review-{token}", linked_session_key=session_key, memory_mode=execution.memory_mode
+    )
+    slot.memory_store = execution.store.legacy_name
+    slot.memory_mode = execution.memory_mode
+    slot.agent = execution.selection_name or execution.template_id
+    slot._app = execution.app
+    return slot
 
 
 def _sel():
@@ -100,6 +142,9 @@ async def api_taskrunner_status(request: web.Request) -> web.Response:
     if not state.task_runner:
         return web.json_response({"running": False, "available": False})
     data = state.task_runner.status()
+    origin, refusal = await _taskrunner_request_origin(request)
+    if refusal is not None:
+        return refusal
     visible_sources = {"text", "spec", "file", "chat", "dashboard", "mcp", "yaml"}
     data["runs"] = [r for r in data["runs"] if r.get("source") in visible_sources]
     for run in data["runs"]:
@@ -136,6 +181,12 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
+    origin, refusal = await _taskrunner_request_origin(request)
+    if refusal is not None:
+        return refusal
+    execution = await capture_admission_execution(
+        state.task_runner._ctx, origin, capture_fn=state.task_runner._capture_execution
+    )
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -151,13 +202,18 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
     if not spec_path.startswith("__inline__:"):
         resolved = Path(spec_path).resolve()
         if ".." in Path(spec_path).parts or not resolved.is_file():
-            return web.json_response({"error": "invalid spec path"}, status=400)
+            return web.json_response(
+                {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
+            )
         if is_sensitive_path(str(resolved)):
-            return web.json_response({"error": "access denied"}, status=403)
+            return web.json_response(
+                {"error": "access denied", "code": "access_denied"}, status=403
+            )
         spec_path = str(resolved)
 
     # Handle inline spec content
     created_spec: Path | None = None
+    inline_content: str | None = None
     if spec_path.startswith("__inline__:"):
         content = spec_path[len("__inline__:") :]
         if not content.strip():
@@ -165,9 +221,12 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         work_dir = state.task_runner._work_dir
         fname = f"TASK_{uuid.uuid4().hex[:8]}.md"
         fpath = Path(work_dir) / fname
-        fpath.parent.mkdir(parents=True, exist_ok=True)
-        fpath.write_text(content, encoding="utf-8")
-        created_spec = fpath
+        if execution.memory_mode == "persistent":
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text(content, encoding="utf-8")
+            created_spec = fpath
+        else:
+            inline_content = content
         spec_path = str(fpath)
 
     try:
@@ -188,6 +247,9 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
             source=source,
             workspace_dir=workspace_dir,
             auto_approve=auto_approve,
+            session_key=origin,
+            execution_context=execution,
+            **({"input_content": inline_content} if inline_content is not None else {}),
         )
     except Exception as exc:
         # The handler owns the temp file ONLY when it created it: a rejected
@@ -204,6 +266,8 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
                     created_spec,
                     exc_info=True,
                 )
+        if isinstance(exc, WorkflowInitializing):
+            return web.json_response({"error": str(exc), "code": exc.code}, status=503)
         return web.json_response({"error": str(exc)}, status=400)
     return web.json_response({"ok": True, "spec": spec_path, "task_id": task_id})
 
@@ -217,7 +281,27 @@ async def api_taskrunner_cancel(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    state.task_runner.cancel(body.get("task_id"))
+    task_id = body.get("task_id")
+    if task_id is not None and not isinstance(task_id, str):
+        return web.json_response(
+            {"error": "task_id must be a string", "code": "invalid_task_id"}, status=400
+        )
+    exact = request.get("internal_auth") is True
+    if exact and task_id and task_id not in state.task_runner._runs:
+        return web.json_response(
+            {"error": "Use the task's canonical ID.", "code": "task_scope_denied"}, status=404
+        )
+    if not task_id and request.get("internal_auth") is True:
+        _, refusal = await _taskrunner_request_origin(request)
+        if refusal is not None:
+            return refusal
+        return web.json_response(
+            {"error": "task_id required", "code": "task_scope_denied"}, status=403
+        )
+    if exact:
+        state.task_runner.cancel(task_id, exact=True)
+    else:
+        state.task_runner.cancel(task_id)
     return web.json_response({"ok": True})
 
 
@@ -226,7 +310,9 @@ async def api_taskrunner_pause(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
-    task_id = request.match_info["task_id"]
+    task_id = _canonical_task_reference(
+        state.task_runner, request.match_info["task_id"], first=True
+    )
     runner = state.task_runner
     run = runner._runs.get(task_id)
     if not run:
@@ -274,7 +360,10 @@ async def api_taskrunner_delete(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
     if run.status in ("running", "cancelling"):
         return web.json_response({"error": "cancel first"}, status=409)
-    await state.task_runner.delete_run(task_id)
+    try:
+        await state.task_runner.delete_run(task_id)
+    except WorkflowInitializing as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=503)
     return web.json_response({"ok": True})
 
 
@@ -304,7 +393,7 @@ async def api_taskrunner_update_task(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
-    task_id = request.match_info["task_id"]
+    task_id = _canonical_task_reference(state.task_runner, request.match_info["task_id"])
     try:
         index = int(request.match_info["index"])
     except ValueError:
@@ -326,6 +415,8 @@ async def api_taskrunner_update_task(request: web.Request) -> web.Response:
             metadata={"task_id": task_id, "index": index, "fields": list(data.keys())},
         )
         return web.json_response({"ok": True, **result})
+    except WorkflowInitializing as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=503)
     except ValueError as exc:
         _sel().log_tool_invocation(
             session_key="dashboard",
@@ -344,7 +435,7 @@ async def api_taskrunner_retry(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
-    task_id = request.match_info["task_id"]
+    task_id = _canonical_task_reference(state.task_runner, request.match_info["task_id"])
     body, body_err = await read_bounded_json(request, allow_absent=True)
     if body_err is not None:
         return body_err
@@ -355,6 +446,8 @@ async def api_taskrunner_retry(request: web.Request) -> web.Response:
             task_id, from_step, agent=state.task_runner._agent or ""
         )
         return web.json_response({"ok": True, "task_id": task_id})
+    except WorkflowInitializing as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=503)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
@@ -430,12 +523,16 @@ async def api_taskrunner_to_chat(request: web.Request) -> web.Response:
     # Handle planned runs — send to chat for optimization
     if run.status == "planned":
         summary = state.task_runner.plan_to_chat_context(task_id)
-        slot = state.get_or_create_slot()
+        slot = await _task_result_slot(request, state, task_id)
         slot.title = f"Plan: {run.task_id}"
         slot.append("user", summary, "msg msg-u")
         from kiro_crew.dashboard.chat import _run_chat  # noqa: F811
 
-        task = asyncio.create_task(_run_chat(state, slot, summary, _directive_user_origin=False))
+        # The summary is composed by the task runner, not typed by anyone, so the
+        # session ledger records the gateway as the actor rather than the user.
+        task = asyncio.create_task(
+            _run_chat(state, slot, summary, _directive_user_origin=False, _turn_actor="gateway")
+        )
         slot.task = task
         state._background_tasks.add(task)
         task.add_done_callback(state._background_tasks.discard)
@@ -499,14 +596,17 @@ async def api_taskrunner_to_chat(request: web.Request) -> web.Response:
         )
     summary = "\n".join(lines)
 
-    slot = state.get_or_create_slot()
+    slot = await _task_result_slot(request, state, task_id)
     slot.title = f"Review: {spec_name}"
     slot.append("user", summary, "msg msg-u")
 
     # Auto-trigger LLM response so user doesn't have to send a message
     from kiro_crew.dashboard.chat import _run_chat  # noqa: F811
 
-    task = asyncio.create_task(_run_chat(state, slot, summary, _directive_user_origin=False))
+    # Runner-composed text, so the ledger records the gateway rather than a user.
+    task = asyncio.create_task(
+        _run_chat(state, slot, summary, _directive_user_origin=False, _turn_actor="gateway")
+    )
     slot.task = task
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
@@ -520,6 +620,12 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
+    origin, refusal = await _taskrunner_request_origin(request)
+    if refusal is not None:
+        return refusal
+    execution = await capture_admission_execution(
+        state.task_runner._ctx, origin, capture_fn=state.task_runner._capture_execution
+    )
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -529,6 +635,17 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
     spec_path = body.get("spec", "")
     agent = body.get("agent", "")
     workspace_dir = body.get("workspace_dir", "")
+    if source == "file":
+        resolved = Path(spec_path).resolve()
+        if ".." in Path(spec_path).parts or not resolved.is_file():
+            return web.json_response(
+                {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
+            )
+        if is_sensitive_path(str(resolved)):
+            return web.json_response(
+                {"error": "access denied", "code": "access_denied"}, status=403
+            )
+        spec_path = str(resolved)
     try:
         plan_coro = state.task_runner.plan(
             input_text=input_text,
@@ -536,12 +653,18 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
             spec_path=spec_path,
             agent=agent,
             workspace_dir=workspace_dir,
+            session_key=origin,
+            execution_context=execution,
         )
         state.task_runner._plan_task = asyncio.current_task()
         run = await plan_coro
+    except WorkflowInitializing as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=503)
     except asyncio.CancelledError:
         return web.json_response({"error": "Planning was cancelled."}, status=400)
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, PermissionError, FileTooLargeError, ValueError) as exc:
+        # A descriptor-gate refusal or an oversize spec is the caller's problem to
+        # see, not a bare 500: the message names what was withheld.
         return web.json_response({"error": str(exc)}, status=400)
     finally:
         state.task_runner._plan_task = None
@@ -573,6 +696,17 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
 async def api_taskrunner_plan_cancel(request: web.Request) -> web.Response:
     """POST /api/taskrunner/plan/cancel — cancel running plan decomposition."""
     state: DashboardState = request.app["state"]
+    if request.get("internal_auth") is True:
+        _, refusal = await _taskrunner_request_origin(request)
+        if refusal is not None:
+            return refusal
+        return web.json_response(
+            {
+                "error": "Shared planning cancellation requires the owner dashboard.",
+                "code": "task_scope_denied",
+            },
+            status=403,
+        )
     if state.task_runner:
         state.task_runner.cancel_plan()
     return web.json_response({"ok": True})
@@ -591,6 +725,8 @@ async def api_taskrunner_update_plan(request: web.Request) -> web.Response:
     steps = body.get("steps", [])
     try:
         run = await state.task_runner.update_plan(task_id, steps)
+    except WorkflowInitializing as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=503)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     return web.json_response(
@@ -647,6 +783,8 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
             workspace_dir=workspace_dir,
             auto_approve=auto_approve,
         )
+    except WorkflowInitializing as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=503)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     return web.json_response({"ok": True, "task_id": task_id})
@@ -659,6 +797,12 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
+    origin, refusal = await _taskrunner_request_origin(request)
+    if refusal is not None:
+        return refusal
+    execution = await capture_admission_execution(
+        state.task_runner._ctx, origin, capture_fn=state.task_runner._capture_execution
+    )
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -668,6 +812,8 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
     if not steps or not isinstance(steps, list):
         return web.json_response({"error": "steps array required"}, status=400)
     try:
+        # This path allocates its own placeholder before calling update_plan.
+        state.task_runner._require_workflow_ready()
         if task_id:
             run = await state.task_runner.update_plan(task_id, steps)
         else:
@@ -689,9 +835,13 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
                 task_id=new_id,
                 work_dir=str(task_dir),
                 name=state.task_runner._auto_name(original_input),
+                execution_context=execution,
             )
             state.task_runner._runs[new_id] = run
             try:
+                await state.task_runner._bind_run_execution(run, f"taskrunner:{new_id}:runtime")
+                if origin:
+                    state.task_runner._run_session_keys[new_id] = origin
                 await state.task_runner._workflow_begin(run)
                 run = await state.task_runner.update_plan(new_id, steps)
             except BaseException:
@@ -706,6 +856,8 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
                     except OSError:
                         logger.warning("Failed to remove rejected chat plan directory %s", task_dir)
                 raise
+    except WorkflowInitializing as exc:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=503)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     return web.json_response(
@@ -748,7 +900,9 @@ _REFINE_PROMPT = (
 )
 
 
-async def _run_refine(state: DashboardState, user_input: str) -> None:
+async def _run_refine(
+    state: DashboardState, user_input: str, execution: ExecutionContext | None = None
+) -> None:
     """Background task: multi-turn LLM refine with tool access and Q&A."""
     import time as _time  # noqa: F811
 
@@ -772,6 +926,8 @@ async def _run_refine(state: DashboardState, user_input: str) -> None:
         state.broadcast_ws("refine", d)
 
     try:
+        if execution is not None:
+            await asyncio.to_thread(bind_session_execution, session_key, execution)
         prompt = _REFINE_PROMPT.format(input=user_input)
         state._refine_text = ""
         _push()
@@ -825,6 +981,14 @@ async def _run_refine(state: DashboardState, user_input: str) -> None:
 async def api_taskrunner_refine(request: web.Request) -> web.Response:
     """POST /api/taskrunner/refine — start background spec generation from user input."""
     state: DashboardState = request.app["state"]
+    origin, _ = await _taskrunner_request_origin(request)
+    execution = (
+        await capture_admission_execution(
+            state.task_runner._ctx, origin, capture_fn=state.task_runner._capture_execution
+        )
+        if state.task_runner
+        else None
+    )
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -841,7 +1005,7 @@ async def api_taskrunner_refine(request: web.Request) -> web.Response:
     state._refine_error = ""
     state._refine_status = "running"
     state._refine_input = user_input
-    task = asyncio.create_task(_run_refine(state, user_input))
+    task = asyncio.create_task(_run_refine(state, user_input, execution))
     state._refine_task = task
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)

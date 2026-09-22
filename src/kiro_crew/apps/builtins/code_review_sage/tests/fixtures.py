@@ -70,7 +70,7 @@ SENSITIVE_TINY_FILES = [{
 
 # A GitHub PR payload as the worker assembles it from `gh api`: the pulls/{n}
 # object merged with a `files` array (each carrying its per-file `patch`) and
-# a `comments` list. Mirrors the private kiro-team/kiro-cli PR #3361 shape.
+# a `comments` list. Mirrors the shape of a private kiro-team/kiro-cli pull request.
 GITHUB_PAYLOAD = {
     "number": 3361,
     "title": "Fix set_mode deadlock in SwapAgent handler",
@@ -89,4 +89,24 @@ GITHUB_PAYLOAD = {
          "patch": _FORMAT_DIFF, "status": "modified"},
     ],
     "comments": [{"user": {"login": "reviewer"}, "body": "add a regression test"}],
+}
+
+# A GitLab merge-request payload as the worker assembles it from `glab api`:
+# the MR object merged with a `changes` array (each carrying new_path + diff)
+# and a `notes` list. Nested group path exercises group/subgroup addressing.
+GITLAB_PAYLOAD = {
+    "iid": 42,
+    "title": "Fix flaky retry in pipeline runner",
+    "description": "Retries raced on the shared lock. Closes #17.",
+    "web_url": "https://gitlab.com/kiro-team/platform/-/merge_requests/42",
+    "state": "opened",
+    "draft": False,
+    "author": {"username": "mlerner"},
+    "target_branch": "main",
+    "sha": "c0ffee0000000000000000000000000000000001",
+    "changes": [
+        {"new_path": "src/worker/runner.py", "diff": _SERVER_DIFF,
+         "old_path": "src/worker/runner.py"},
+    ],
+    "notes": [{"author": {"username": "reviewer"}, "body": "add a regression test"}],
 }

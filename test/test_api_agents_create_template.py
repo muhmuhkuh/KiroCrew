@@ -1,10 +1,10 @@
 """Tests for the ``kiro_agent`` template contract on POST /api/agents.
 
-``kiro_agent`` used to default to ``"kirocrew"`` when a create request omitted
-it. Because dispatch flattens a crew alias to its ``kiro_agent`` pointer
-(``config.loader.resolve_agent_bindings``), such a crew was offered in the chat
-picker and then the DEFAULT agent answered — the "picker reverts to default"
-report behind #1684, with only a log line marking the substitution.
+Dispatch flattens a crew alias to its ``kiro_agent`` pointer
+(``config.loader.resolve_agent_bindings``), so a crew whose ``kiro_agent`` is
+allowed to default to ``"kirocrew"`` is offered in the chat picker and then
+answered by the DEFAULT agent — the picker appears to revert to default, with
+only a log line marking the substitution.
 
 The contract these tests pin:
 
@@ -32,6 +32,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.config.sections import MemoryConfig
+
 
 @pytest.fixture(autouse=True)
 def _owner_caller(monkeypatch):
@@ -43,20 +45,24 @@ def _owner_caller(monkeypatch):
         "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
+    pass  # Member routing does not depend on OS isolation.
 
 
 def _fake_config():
     """A stand-in KiroCrewConfig snapshot.
 
-    The handler persists via a delta mutate through ``update_config_locked``
-    (#4767) -- ``_post`` patches that and records the mutated document into
+    The handler persists via a delta mutate through ``update_config_locked`` --
+    ``_post`` patches that and records the mutated document into
     ``written`` -- so ``saved``/``written`` observe whether and what the
     endpoint persisted.
     """
     saved: list[bool] = []
     return SimpleNamespace(
         agent=SimpleNamespace(provider="acp"),
+        memory=MemoryConfig(),
+        degraded_sections=frozenset(),
         agents={},
+        memory_stores={},
         default_agent="kirocrew",
         save=lambda: saved.append(True),
         saved=saved,
@@ -100,7 +106,7 @@ async def _post(body, cfg, installed=(), spy=None):
             return_value=cfg,
         ),
         patch(
-            "kiro_crew.dashboard.handlers.agents.update_config_locked",
+            "kiro_crew.config.loader.update_config_locked",
             new=_fake_update_config_locked,
         ),
         patch(

@@ -19,7 +19,7 @@ import { render } from '@testing-library/react'
 import ErrorBoundary from '../components/ErrorBoundary'
 import {
   registerBuiltinComponents,
-  getBuiltinComponent,
+  getBuiltinApp,
   hasBuiltinComponent,
 } from '../apps/builtinRegistry'
 import { registerBuiltinIcons, getBuiltinIcon } from '../apps/builtinIcons'
@@ -57,6 +57,11 @@ import {
   getMobileConnectRenderers,
   canRenderMobileConnectKind,
 } from '../components/mobileConnectRenderers'
+import {
+  registerRemoteProvisionerRenderer,
+  getRemoteProvisionerRenderer,
+  canRenderRemoteProvisionerKind,
+} from '../components/remoteProvisionerRenderers'
 import { apiTransport } from '../api/apiTransport'
 // Importing the client installs the blessed transport (installApiTransport runs
 // at client module load), so `apiTransport` is populated for the test below.
@@ -67,17 +72,19 @@ const Dummy = () => null
 describe('builtinRegistry — page seam', () => {
   it('registers a new route and resolves it', () => {
     const Comp = lazy(async () => ({ default: Dummy }))
-    registerBuiltinComponents({ '/seam-test-page': Comp })
+    registerBuiltinComponents({ '/seam-test-page': { component: Comp, appId: 'seam-test-page' } })
     expect(hasBuiltinComponent('/seam-test-page')).toBe(true)
-    expect(getBuiltinComponent('/seam-test-page')).toBe(Comp)
+    expect(getBuiltinApp('/seam-test-page')?.component).toBe(Comp)
   })
 
   it('throws on a duplicate route in dev/test; core wins', () => {
     const first = lazy(async () => ({ default: Dummy }))
     const second = lazy(async () => ({ default: Dummy }))
-    registerBuiltinComponents({ '/seam-dup': first })
-    expect(() => registerBuiltinComponents({ '/seam-dup': second })).toThrow(/already registered/)
-    expect(getBuiltinComponent('/seam-dup')).toBe(first)
+    registerBuiltinComponents({ '/seam-dup': { component: first, appId: 'seam-dup' } })
+    expect(() =>
+      registerBuiltinComponents({ '/seam-dup': { component: second, appId: 'seam-dup' } }),
+    ).toThrow(/already registered/)
+    expect(getBuiltinApp('/seam-dup')?.component).toBe(first)
   })
 })
 
@@ -451,6 +458,70 @@ describe('mobileConnectRenderers — phone-connection method renderer seam', () 
   })
 })
 
+describe('remoteProvisionerRenderers — remote-instance provisioner form seam', () => {
+  // Same shape as the mobile-connect block above: the registry is a module
+  // singleton, so every test here is self-contained on its OWN kind and none
+  // asserts an absolute registry size — an assertion like that passes or fails on
+  // test ORDER once a sibling has registered (it fails under --sequence.shuffle).
+  // The "core registers nothing" claim is the one that genuinely needs an
+  // untouched registry, so it takes a fresh module.
+  it('registers nothing of its own — a fresh registry is empty', async () => {
+    vi.resetModules()
+    const fresh = await import('../components/remoteProvisionerRenderers')
+    expect(fresh.getRemoteProvisionerRenderer('seam_test_unlisted')).toBeUndefined()
+    for (const kind of fresh.BUILTIN_REMOTE_PROVISIONER_KINDS) {
+      // Drawable because the PANEL draws it, so there is no renderer to hand back.
+      expect(fresh.canRenderRemoteProvisionerKind(kind)).toBe(true)
+      expect(fresh.getRemoteProvisionerRenderer(kind)).toBeUndefined()
+    }
+    expect(fresh.canRenderRemoteProvisionerKind('seam_test_unlisted')).toBe(false)
+  })
+
+  it('registering a kind is what makes it drawable', () => {
+    const Comp = () => null
+    expect(canRenderRemoteProvisionerKind('seam_test_devspace')).toBe(false)
+    registerRemoteProvisionerRenderer({ kind: 'seam_test_devspace', component: Comp })
+    // The single definition of the renderable set: this predicate is what the
+    // setup tab filters the server's provisioner list on, so registering is what
+    // makes the row selectable at all.
+    expect(canRenderRemoteProvisionerKind('seam_test_devspace')).toBe(true)
+    expect(getRemoteProvisionerRenderer('seam_test_devspace')?.component).toBe(Comp)
+  })
+
+  it('refuses the built-in kind — that would be an override, not a contribution', () => {
+    // `aws_ec2` is drawn by RemoteCrewPanel's own prerequisites card and launch
+    // form. Silently replacing it would let a composition step redirect a launch
+    // into a different AWS account while the core still believes it owns the form.
+    expect(() =>
+      registerRemoteProvisionerRenderer({ kind: 'aws_ec2', component: () => null }),
+    ).toThrow(/drawn by a built-in form/)
+    expect(getRemoteProvisionerRenderer('aws_ec2')).toBeUndefined()
+  })
+
+  it('refuses a kind that could never match a server row verbatim', () => {
+    // Blank, whitespace-padded, and non-string all route to one rejection: the
+    // readers compare the server's `kind` verbatim, so normalizing here would
+    // register a key nothing can ever match, and reaching for `.trim()` on a
+    // non-string would throw a raw TypeError in production instead of degrading.
+    for (const kind of ['', '   ', ' padded_devspace ', 123 as unknown as string]) {
+      expect(() => registerRemoteProvisionerRenderer({ kind, component: () => null })).toThrow(
+        /non-empty provisioner kind with no surrounding whitespace/,
+      )
+    }
+    expect(getRemoteProvisionerRenderer(' padded_devspace ')).toBeUndefined()
+  })
+
+  it('throws on a duplicate kind in dev/test; the first renderer keeps it', () => {
+    const first = () => null
+    const second = () => null
+    registerRemoteProvisionerRenderer({ kind: 'seam_test_prov_dup', component: first })
+    expect(() =>
+      registerRemoteProvisionerRenderer({ kind: 'seam_test_prov_dup', component: second }),
+    ).toThrow(/already has a renderer/)
+    expect(getRemoteProvisionerRenderer('seam_test_prov_dup')?.component).toBe(first)
+  })
+})
+
 describe('autolinkRules — bare-token autolink seam', () => {
   afterEach(() => resetAutolinkRulesForTest())
 
@@ -497,15 +568,22 @@ describe('builtinRegistry — route-shape guard', () => {
     ['/', 'root only'],
   ])('throws on unresolvable route %s (%s)', route => {
     expect(() =>
-      registerBuiltinComponents({ [route]: lazy(async () => ({ default: Dummy })) }),
+      registerBuiltinComponents({
+        [route]: { component: lazy(async () => ({ default: Dummy })), appId: 'seam-shape' },
+      }),
     ).toThrow(/plain path segment/)
     expect(hasBuiltinComponent(route)).toBe(false)
   })
 
+  // The route charset and the appId charset are independent: a route may carry
+  // uppercase, `_` and `.` because it is a URL path segment, while the appId is a
+  // storage key held to `[a-z0-9-]`.
   it.each(['/seam-single', '/Reports', '/my_app', '/a.b', '/x~y-z'])(
     'accepts a single plain path segment route %s',
     route => {
-      registerBuiltinComponents({ [route]: lazy(async () => ({ default: Dummy })) })
+      registerBuiltinComponents({
+        [route]: { component: lazy(async () => ({ default: Dummy })), appId: 'seam-shape-ok' },
+      })
       expect(hasBuiltinComponent(route)).toBe(true)
     },
   )

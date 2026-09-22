@@ -5,11 +5,9 @@ from __future__ import annotations
 import json
 import re
 from types import SimpleNamespace
-from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from aiohttp import web
 
 from kiro_crew.acp.client import PROTOCOL_VERSION_CLAUDE, AcpClient, AcpError
 from kiro_crew.acp.types import ACP_BACKEND_PI, JsonRpcMessage
@@ -657,9 +655,8 @@ async def test_pi_catalog_uses_selected_backend():
         patch.object(KiroCrewConfig, "load", return_value=cfg),
         patch.object(agents, "_pi_models_from_cli", new_callable=AsyncMock, return_value=rows),
     ):
-        response = await agents.api_models(cast(web.Request, SimpleNamespace(app={})))
+        response = await agents.api_models(SimpleNamespace(app={}))
     assert response.status == 200
-    assert response.text is not None
     assert json.loads(response.text) == rows
 
 

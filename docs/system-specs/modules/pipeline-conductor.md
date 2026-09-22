@@ -26,8 +26,10 @@ is the contract for the machinery underneath it.
 | `src/kiro_crew/subagent.py` | `UNADVERTISED_AGENTS` — the conductor is never offered in a rendered agent roster |
 | `src/kiro_crew/builtin_skills/pipeline-conductor/SKILL.md` | The operating procedure: pipeline spec, claim preflight, work-order brief, probe cycle and action table, intervention ladder, adjudication and override protocol, admission table, credit rules, `conductor-status/v1`, cleanup |
 | `.../pipeline-conductor/scripts/claim_preflight.py` | One claim verdict per candidate item |
+| `.../pipeline-conductor/scripts/coverage_filter.py` | The batch open-PR exclusion for the queue build |
 | `.../pipeline-conductor/scripts/fleet_probe.py` | The batch patrol probe |
 | `.../pipeline-conductor/scripts/credit_spend.py` | Per-item credit rollup and budget verdict |
+| `.../pipeline-conductor/scripts/spec_check.py` | The spec's closed-value fields, checked once before the run arms |
 | `src/kiro_crew/dashboard/session_control.py` | Worker-session stand-up and control: `create_session`, `send_to_target`, `read_messages`, `stop_target`, `authorize_target` |
 | `src/kiro_crew/session_ledger.py` | The conductor's durable item table and the `[work ledger]` snapshot it must not mistake for the record |
 
@@ -91,7 +93,9 @@ with the defaults that apply when the spec omits them:
   "work_source": {"kind": "gh_issues", "select_labels": ["auto-fixable"],
                   "skip_signals": ["claimed", "in-progress"]},
   "worker_contract": {"branch_pattern": "fix/{slug}-{n}",
-                      "worktree_pattern": "../{repo_name}-fix-{n}"},
+                      "worktree_pattern": "../{repo_name}-fix-{n}",
+                      "max_commits": 2},
+  "verifier": {"repro_gate": "best_effort"},
   "governance": {"max_in_flight": 32, "max_per_cycle": 3,
                  "idle_alert_secs": 900, "session_ceiling": 30,
                  "credit_budget_per_item": 100, "topup_ceiling": 2},
@@ -104,7 +108,11 @@ per-cycle dispatch limit, the silence a worker may accumulate before the probe
 fires `IDLE`, a session budget for the run, a per-item credit allowance, and how
 many budget top-ups an item may receive. The interface block names the chat
 folder the pipeline's sessions live in and the language its digests are written
-in.
+in. `verifier.repro_gate` selects the campaign's admission policy — `best_effort`
+(the generic contract) or `pod_required` (a live pod repro is a precondition for
+implementation, not a score attached afterwards) — and it is the one field with a
+closed value set, so `spec_check.py` refuses the run on any third value rather
+than defaulting.
 
 The spec file's directory is the run's state home: the probe config is
 `<spec-dir>/probe-config.json` and the probe owns
@@ -113,7 +121,7 @@ is optional in that config and is what makes `cwd=fleet` reachable, so omitting
 it classifies every banned-process line as `foreign` or `unknown` and the one
 enforcing row of the banned-ops table never fires.
 
-## The three scripts
+## The bundled scripts
 
 Anything the procedure states as prose rots silently; anything a script computes
 can be tested. So every decision the skill delegates is the script's answer to
@@ -124,6 +132,17 @@ the exit code: `CLAIM` 0, `UNKNOWN` 3, `SKIP` 10, `CLOSE` 11, `REVIEW` 13. Two
 rules are load-bearing. `UNKNOWN` is never permission. And `REVIEW` is a closure
 request read out of the item's prose, which the conductor confirms itself,
 because prose never closes an item.
+
+**`coverage_filter.py`** answers the same coverage question as
+`claim_preflight.py` check 2, for MANY candidates in one forge call, so the queue
+build can drop covered items instead of rediscovering them one dispatch at a
+time. Its evidence is the repository's open pull requests (title and body, fork
+and draft PRs included) rather than the item's timeline, and the rule that makes
+two evidence sources safe is that this one only ever SUBTRACTS: `COVERED` is a
+positive finding and removes an item, `UNCOVERED` certifies nothing, and an
+unreadable forge exits 3 printing no `uncovered` list at all, so an unanswered
+batch cannot render as a finding about the items. `claim_preflight.py` remains the
+authority before every claim.
 
 **`fleet_probe.py`** answers, in one call per cycle, whether anything in the
 fleet needs judgment: per-session tail classification, tail index, idle age,
@@ -154,6 +173,36 @@ gateway's usage shards and answers `within`, `exhausted`, `truncated` or
 `unmetered`. `exhausted` is monotone (more shards can only add spend, so it
 stands on a partial view), and `unmetered` means at least one watched slot had no
 shard row, which the caller must treat as unknown spend rather than zero.
+
+**`spec_check.py`** runs once, at startup, over the spec fields whose value set is
+CLOSED, and exit 2 refuses the run. It exists because a closed field is the one
+shape where a typo is silent: a misspelled repo or threshold fails at first use,
+while a misspelled enum matches no branch, so the mode the operator asked for is
+off while the spec says it is on. `verifier.repro_gate` is the field that made
+this concrete — `pod_required` is the gate that makes unit-only evidence
+inadmissible, and `"pod-required"` would leave the generic contract in force
+under a spec that reads as gated, with the campaign metric still counting the run
+as pod-verified. The check therefore fails closed rather than defaulting to
+`best_effort`; the accepted set is declared once, in the script's `_ENUMS` table,
+which is also the seam a future closed field registers in. An ABSENT field is not
+an error (omission is how a pipeline asks for its documented default), while an
+explicit `null` is a value and is refused.
+
+The spec path itself is operator-supplied, so the read is a GATED read: the file
+goes through `hooks.safe_read_file`, which re-checks the RESOLVED target against
+`is_sensitive_path` and opens it `O_NOFOLLOW`. A `--spec` symlinked at a
+credential store is therefore refused through the link (`refused spec: Blocked:
+access to sensitive path: …`, exit 2) rather than parsed. A skill's scripts are
+copied out of the package tree and run under whichever `python3` the operator
+has, which under a managed install is not the interpreter Kiro Crew runs on — so
+the gate import frequently fails where the script is invoked. There is no safe
+degradation for a read gate, so the script does not read plainly and does not
+refuse either: it re-execs itself once under the interpreter beside the
+`kirocrew` launcher, which is the one carrying the package, and the child's
+verdict is the invocation's verdict. Refusal is what remains when the gate is
+reachable from no interpreter — no launcher on `PATH`, or a second import failure
+inside the re-exec — because a startup predicate that refuses every spec on a
+healthy install is the same outage as one that admits a bad one.
 
 ## The patrol cycle
 
@@ -200,6 +249,16 @@ Per-item state, session keys and PRs are the **ledger's**, cached here for one
 cycle's fleet view; when the two disagree the ledger wins and this file is what
 gets fixed. Two independent spellings of item state would drift, and the drift
 would be silent.
+
+Two more conductor-owned artifacts live beside the spec, opened empty at
+startup: `decisions.md`, one line per decision
+(`<ts> | <subject> | <decision> | <reason>`) appended at the moment the decision
+is made, and the run's retrospective, appended in the cycle a lesson happens.
+They are the durable record, and they exist because every alternative is a
+tail: `events_tail` is a bounded, newest-first mirror of the most recent
+`decisions.md` lines, and the session ledger keeps `_MAX_EVENTS` = 100 events on
+disk while `session_ledger_read` returns only the newest `_MAX_EVENT_TAIL` = 20
+(`session_ledger.py`), so neither can hold a whole run's rulings.
 
 `open_rulings` is reviewed every cycle independently of what the probe fired.
 That is structural: the probe is right not to re-fire a signal already marked
@@ -250,24 +309,26 @@ is not granted them; its durable state is the session work ledger
 `conductor-status/v1`. The work-ledger tool family generalized from the Issue
 Radar one, proposed in
 [`../../request-for-change/rfc-conductor-work-ledger.md`](../../request-for-change/rfc-conductor-work-ledger.md),
-is now built through Phase 2 — but this conductor does **not** mount it. It was
-mounted here briefly and the mount was retracted: the ledger flow inverts the
-dispatch order and replaces the patrol cycle, so it is a different procedure
-rather than two extra tools, and it lives on its own agent. See that RFC's
-rollout note for the criteria under which the two fold back together.
+is now built and is what `kirocrew-conductor` runs — but this conductor does
+**not** mount it. It was mounted here briefly and the mount was retracted: the
+ledger flow binds before it seeds and reads a record instead of a transcript, so
+it is a different procedure rather than two extra tools, and this conductor's
+children report through the `pipeline-conductor` skill's own scripts.
 
-Two sibling agents share this one's installer mechanics and nothing else:
-`kirocrew-conductor` (the `goal-conductor` skill) decomposes a free-form goal,
-and `kirocrew-ledger-conductor` (the `goal-ledger-conductor` skill) does the same
-while tracking items in the work ledger. All three narrow `mcpServers`, withhold
-every file-writing tool, grant verb by verb and derive `permissions` from the
-filtered list; only the third mounts `kirocrew-work`.
+One sibling agent shares this one's installer mechanics and nothing else:
+`kirocrew-conductor` (the `goal-conductor` skill) decomposes a free-form goal and
+tracks its items in the work ledger. `kirocrew-ledger-conductor` is a deprecated
+alias emitting that same spec under the flow's old name for one release. Both
+narrow `mcpServers`, withhold every file-writing tool, grant verb by verb and
+derive `permissions` from the filtered list; only the conductor mounts
+`kirocrew-work`.
 
 ## Tests that pin this
 
 | Test | What it holds |
 |---|---|
-| `test/test_pipeline_conductor_agent.py` | Identity and charter, the owned filename, the verbosity placeholder, patrol via `monitor_start` rather than `wait`, that the prompt names the tools and scripts it runs on, that no file-writing tool is mounted, that dashboard grants are create-and-read only, that core grants are named verbs rather than a whole server, that `mcpServers` is narrowed, and that a governed host withholds and audits |
-| `test/test_pipeline_conductor_skill_contract.py` | That the skill cites the script rather than a prose predicate, that every exit code has a documented action, that all five verdicts are named, that `UNKNOWN` is never permission, that a prose closure request needs author authorization, and that an absent script has defined behaviour |
+| `test/test_pipeline_conductor_agent.py` | Identity and charter, the owned filename, that the retired verbosity token is absent, patrol via `monitor_start` rather than `wait`, that the prompt names the tools and scripts it runs on, that no file-writing tool is mounted, that dashboard grants are create-and-read only, that core grants are named verbs rather than a whole server, that `mcpServers` is narrowed, and that a governed host withholds and audits |
+| `test/test_pipeline_conductor_skill_contract.py` | That the skill cites the script rather than a prose predicate, that every exit code has a documented action, that all five verdicts are named, that `UNKNOWN` is never permission, that a prose closure request needs author authorization, that an absent script has defined behaviour, and that a `verifier.repro_gate` outside its two declared values refuses the run instead of degrading to the generic contract |
 | `test/test_pipeline_conductor_probe_roundtrip.py` | That the probe classifies what the conversation log actually wrote, that the watchdog patterns match the constants the gateway emits, that the index needle matches the real writer, that a raw slot key finds the transcript the dashboard writes, and that `credit_spend.py` sums what the recorder wrote |
 | `test/test_pipeline_conductor_claim_preflight.py` | The claim verdict lattice: merged-PR coverage and its near misses, fork PRs, prose self-claims, closure requests outranking claims, and absent-symbol risk handling |
+| `test/test_pipeline_conductor_coverage_filter.py` | The batch coverage exclusion: that a title or body reference to an item is coverage whether or not it carries a closing keyword, that fork and draft PRs count while a neighbouring number does not, that an unreadable forge exits 3 with no `uncovered` list, that the filter writes nothing, and that its reference vocabulary agrees with `claim_preflight.py`'s |

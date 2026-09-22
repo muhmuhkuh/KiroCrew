@@ -29,7 +29,7 @@ a pack may ship. Validation is tier-scaled to payload trust.
 | Tier | `level` | Surface unlocked |
 |---|---|---|
 | **L0 Color** | 0 | the 56 theme CSS variables (dark + light) only |
-| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark), `styles/fonts/`, scoped `overrides.css` |
+| **L1 Branded** | 1 | + `branding/` (logo, favicon, wordmark), `styles/fonts/`, scoped `overrides.css`, `loader/*.png\|webp\|gif\|svg` |
 | **L2 Experience** | 2 | + `overlays/` + `topbar/` sandboxed HTML, `audio/`, `persona.md` |
 
 Level-1 and Level-2 manifests may also declare `loaderIcons`: 4–8 distinct
@@ -40,6 +40,19 @@ Lucide components and reuses the existing carousel. No component code, SVG, or
 asset path crosses the manifest boundary. Missing declarations preserve the
 Kiro ghost poses, and trusted compiled themes retain the broader
 `registerThemeBranding()` component seam.
+
+Installed packs may also supply the loader **art**, not just select symbols:
+`loader/*.png` `.webp` `.gif` `.svg` (1–8 images, Level 1) are the pack's own
+loader art: one image renders on its own, 2–8 are cycled by the stock carousel.
+Animated WebP/APNG/GIF and animated SVG self-animate inside the `<img>`, so a
+pack can ship a single fully-authored loop. Each is served through the ordinary
+asset route with a strict Content-Type + `nosniff` under `_THEME_ASSET_CSP`
+(`default-src 'none'; sandbox`) and referenced only as an `<img>` — SVG is safe
+the same way `logo.svg` is (an `<img>`-loaded SVG runs in the browser's secure
+static/animated mode: no scripts, no external loads, animation still plays), so
+it needs no HTML-serving route of its own. The frontend
+`resolveLoader` precedence is: compiled `loader` → pack images (one on its own,
+2–8 cycled) → `loaderIcons` (manifest, then compiled) → the default poses.
 
 Constants (`dashboard/theme_validate.py`): `_THEME_MAX_LEVEL=2`,
 `_THEME_MAX_FONTS=6`, `_THEME_MAX_OVERLAYS=5`, `_THEME_PERSONA_MAX_CHARS=2000`,
@@ -133,7 +146,12 @@ predate this subsystem and remain the color-theme surface.)
   `fcntl.F_GETPATH` on macOS, and `GetFinalPathNameByHandleW` on Windows. The
   resolved path must remain inside the pack root; an unavailable or failed
   resolution rejects the read rather than falling back to a pathname-only
-  check.
+  check. On macOS, a case-only spelling mismatch is accepted by the shared
+  reader only after a no-follow walk proves identity with the held descriptor;
+  containment compares kernel spellings of the file and pinned root, never a
+  globally case-folded prefix. This lets legitimate APFS aliases reach the
+  install destination guard, which still refuses a source inside its own
+  destination before promotion and preserves source and sibling contents.
 - **postMessage allowlist** — the parent (`ThemeExperienceLayer.tsx`) accepts
   only `theme:resize`, `theme:sound`, `theme:visibility`, and `theme:state`
   messages from a pack iframe; all others are dropped.
@@ -215,6 +233,7 @@ predate this subsystem and remain the color-theme surface.)
 | Loader | `website/src/hooks/useTheme.tsx` | Applies CSS vars; `applyThemeOverrides` → `_scopeOverridesCss` + `_rewriteOverridesUrls`; `injectThemeFonts`; pre-apply self-repair; `themeSwitching` state |
 | Experience layer | `website/src/components/ThemeExperienceLayer.tsx` | Mounts sandboxed overlay/topbar iframes + audio; enforces the postMessage allowlist |
 | Settings UI | `website/src/pages/settings/DisplayPanel.tsx` | Single Theme dropdown + install-from-local/GitHub + remove + "Applying…" status indicator |
+| Utility bridge | `website/src/tailwind-theme.css` | Tailwind v4 `@theme` mapping each utility (`bg-accent`, `text-muted/40`, `rounded-md`, `shadow-sm`, `font-mono`) onto the runtime CSS variable of the same stem, plus the `dark:` variant keyed on `[data-theme="dark"]`. A pack changes what a utility renders by writing the variable; it never touches this file. |
 
 ### One theme, one picker row (registered vs installed)
 

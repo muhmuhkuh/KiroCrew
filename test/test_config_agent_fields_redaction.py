@@ -1,4 +1,4 @@
-"""Agent-record free text must leave GET /api/config/kirocrew masked (#8717).
+"""Agent-record free text must leave GET /api/config/kirocrew masked.
 
 ``description`` and ``triggers`` on an agent record are agent- and
 package-writable: an agent can edit ``config.json`` directly, and agent sync
@@ -7,7 +7,7 @@ schema-``sensitive`` (they are not owner secrets), so ``_masked_config_dict``'s
 schema-driven walk never touched them and a credential- or
 exfiltration-URL-shaped value shipped to the browser verbatim — from BOTH
 response sites of the endpoint (the GET body and the PATCH echo). The roster
-endpoint masks the same class of strings (#8472); these tests pin the config
+endpoint masks the same class of strings; these tests pin the config
 endpoint's side of that rule.
 
 The rule under test (``_mask_agent_free_text``): a value ``_redact_external``
@@ -151,15 +151,18 @@ class TestMaskedConfigDict:
             assert val != _SENSITIVE_MASK, f"unexpected mask on agents.*.{key}"
 
     def test_extended_fields_mask_when_suspicious(self):
-        # The wider field set (#8717 review): every unguarded record string is
+        # The wider field set: every unguarded record string is
         # covered, not just the two the issue named. A credential-shaped
         # workspace/kiro_agent must mask; the benign defaults must not.
         cfg = KiroCrewConfig()
         cfg.agents["odd"] = KiroCrewAgentConfig(
-            kiro_agent=_CRED_DESCRIPTION, workspace=_EXFIL_TRIGGERS
+            member_id=_CRED_DESCRIPTION,
+            kiro_agent=_CRED_DESCRIPTION,
+            workspace=_EXFIL_TRIGGERS,
         )
         masked = _masked_config_dict(cfg)
         record = masked["agents"]["odd"]
+        assert record["member_id"] == _SENSITIVE_MASK
         assert record["kiro_agent"] == _SENSITIVE_MASK
         assert record["workspace"] == _SENSITIVE_MASK
         # Untouched benign defaults keep rendering in the Settings UI.

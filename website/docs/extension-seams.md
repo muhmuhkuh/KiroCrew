@@ -9,10 +9,10 @@ The backend has the sibling mechanism, Composed Platform Providers: see
 [`docs/system-specs/modules/platform-context.md`](../../docs/system-specs/modules/platform-context.md).
 The two are independent. Nothing here reads `CONTRACT_VERSION`.
 
-## The fourteen registry seams
+## The fifteen registry seams
 
 Each entry is one registrar the edition may call, paired with the reader the core
-already calls. `src/extensions.ts` names exactly these fourteen in its header.
+already calls. `src/extensions.ts` names exactly these fifteen in its header.
 `src/test/extensionSeams.test.tsx` exercises each one except the source-provider
 seam, which has its own suite in `src/test/sourceProviderSeam.test.ts`.
 
@@ -35,6 +35,7 @@ POSTs the file context to the app's endpoint — see the App Kit publishing guid
 | Non-app route prefixes | `components/MigrationCheck.tsx` | `registerNonAppPrefix()`, read by `MigrationCheck` |
 | Source providers (Changes panel + sidebar chips) | `utils/pullRequestLinks.ts` | `registerSourceProvider()` to `sourceProviderDescriptor()` |
 | Phone-connection method renderers | `components/mobileConnectRenderers.tsx` | `registerMobileConnectRenderer()` to `getMobileConnectRenderers()` / `canRenderMobileConnectKind()` |
+| Remote-instance provisioner forms | `components/remoteProvisionerRenderers.tsx` | `registerRemoteProvisionerRenderer()` to `getRemoteProvisionerRenderer()` / `canRenderRemoteProvisionerKind()` |
 | Bare-token autolink rules | `utils/autolinkRules.ts` | `registerAutolinkRules()` to `getAutolinkRules()` |
 
 Plus one **exported-transport** seam for edition-owned API methods. It is not a
@@ -42,10 +43,10 @@ registry; see "API methods" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
 providers, tool pills, terminal sockets, highlight.js languages) are core-internal
-wiring, not edition seams. Only the fourteen above are called from the composition
+wiring, not edition seams. Only the fifteen above are called from the composition
 root.
 
-Thirteen of the fourteen are **additive** — the edition contributes a surface. The
+Fourteen of the fifteen are **additive** — the edition contributes a surface. The
 remaining one is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
 Overview surface for a distribution whose environment makes it permanently
 inapplicable, which no additive seam can express. It is named `suppress*` rather
@@ -228,11 +229,11 @@ must stay deduplicated or hooks bind to a second React.
 
 ### Typecheck the edition, or ship ReferenceErrors
 
-The core's `tsc -b` covers `website/src` only (`tsconfig.app.json` has
+The core's `tsc -p tsconfig.app.json` covers `website/src` only (`tsconfig.app.json` has
 `"include": ["src"]`), so the edition's sources are outside every typecheck the
 core runs. The bundler does not fill the gap: TypeScript is erased, and a free
 identifier — a typo like `registerThemee` — compiles into the bundle as an
-assumed **global**. The build succeeds, `tsc -b` stays green, and the app
+assumed **global**. The build succeeds, the type check stays green, and the app
 throws `ReferenceError` at module load. Because the composition root runs
 before `App` mounts, that is a blank page, not a broken widget.
 
@@ -247,7 +248,13 @@ will never run it for you:
     "noEmit": true,
     // Without vite/client, every `import.meta.env` the edition touches
     // (directly or via a core module it imports) is a TS2339 false positive.
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    // The core's tsconfig sets an incremental cache, and an inherited
+    // `tsBuildInfoFile` resolves against the file that DECLARED it -- so
+    // without this override the edition writes its cache into
+    // `../KiroCrew/website/tsconfig.app.tsbuildinfo`, the core's own file,
+    // and the two programs invalidate each other on every run.
+    "tsBuildInfoFile": "./tsconfig.tsbuildinfo"
   },
   "include": ["."]
 }
@@ -501,6 +508,37 @@ disables only itself. It **cannot widen governance**: the endpoint filters every
 through `capabilities.mobile_connect` before the dialog sees a kind, and each mint
 endpoint re-runs that decision (`mint_denied_reason`), so a renderer for a denied or
 unoffered method draws nothing.
+
+**Remote-instance provisioner forms.**
+`registerRemoteProvisionerRenderer({ kind, component })` supplies the launch form
+that Settings → Remote Instances → "Set up a new one" draws for one provisioner
+the backend offers. It keys on `kind`, not `id`, for the same reason as the seam
+above: `id` is what `POST /api/cloud/launch` names in `provider_id` (an id the
+server does not offer is refused with `unknown_provisioner`), while `kind` exists
+to name the renderer — so two rows may share one kind, and a form that needs its
+own row reads the `provisioner` prop it is handed. A blank kind, a duplicate, or
+the **built-in** kind (`aws_ec2`) routes through `reportSeamCollision`: that one
+is drawn by the panel's own prerequisites card and launch form, so registering
+over it would silently redirect a launch into a different AWS account while the
+core still believes it owns the form.
+
+**The server's list decides what exists, not this registry.**
+`GET /api/cloud/provisioners` returns the rows a deployment offers, and the setup
+tab filters them through `canRenderRemoteProvisionerKind()` — so a registered
+kind the gateway does not list draws nothing, and a listed kind nothing can draw
+is never offered. When more than one renderable row survives, the tab shows a
+selector above the form (the choice persists in `mc-cloud-provisioner`); with a
+single row, or while the query is loading, failed, or empty, the tab renders the
+built-in EC2 form exactly as it did before this seam existed. The registered form
+is mounted in its own `ErrorBoundary`, and the launch-progress card and status
+notice stay core-owned below whichever form shows, so a launch already in flight
+survives a throwing renderer.
+
+It **cannot skip a check**: the backend `LaunchEngine` runs its own preflight on
+every launch whatever the form collected, and a `posix_only` provisioner on a
+Windows gateway is refused server-side (400 `posix_host_required`) rather than
+hidden client-side. An edition's own provisioner enforces its own authorization
+in its backend, not here.
 
 **Bare-token autolink rules.**
 `registerAutolinkRules([{ id, pattern, href }])` teaches the markdown renderer that

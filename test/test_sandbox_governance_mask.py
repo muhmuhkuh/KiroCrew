@@ -76,6 +76,75 @@ def _expected_exceptions() -> set[str]:
     }
 
 
+@pytest.mark.parametrize(
+    ("leaf", "read_refused"),
+    (
+        # The canonical run records. Write-protected so an agent cannot rewrite the app
+        # owner a cold continuation restores, and READABLE because a run's results are
+        # the product working.
+        ("subagents", False),
+        # Its retained V1 companion, on the read+write floor instead: a legacy binding
+        # record carries a raw session key, so the agent may not open one. The edit
+        # refusal below is identical either way, which is why both leaves stay in one
+        # test and only the read expectation is per-leaf.
+        ("member-memory-bindings", True),
+    ),
+)
+def test_run_authority_file_edits_are_refused_on_both_run_roots(
+    tmp_path, monkeypatch, leaf, read_refused
+):
+    from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    target = tmp_path / leaf / "run-one" / "state.json"
+    target.parent.mkdir(parents=True)
+    target.write_text('{"app":"original-app"}', encoding="utf-8")
+    assert security.is_sensitive_path(str(target)) is read_refused
+    assert security.is_sensitive_write_path(str(target))
+    gate = HookManager(HooksConfig.from_dict({}))
+    decision = gate.on_tool_call(
+        "Edit run ownership",
+        session_key="cli_chat",
+        tool_kind="edit",
+        raw_params={"path": str(target)},
+    )
+    assert decision.action == TOOL_DENY
+    assert target.read_text(encoding="utf-8") == '{"app":"original-app"}'
+    # The gateway's direct writer remains usable; this is not a host chmod.
+    target.write_text('{"app":"gateway-app"}', encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == '{"app":"gateway-app"}'
+    assert not security.is_sensitive_write_path(str(tmp_path / (leaf + "-notes") / "x"))
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_member_memory_is_readable_but_not_writable_in_the_sandbox(mode: str) -> None:
+    """Named-store integrity leaves reads, credentials and governance unchanged."""
+    profile = sandbox._build_seatbelt_profile(mode)
+    for prefix in _CREW_PREFIXES:
+        memory = _crew_path(prefix, "memory_stores")
+        token = _crew_path(prefix, "token_signing.key")
+        policy = _crew_path(prefix, "security_policy.json")
+        assert f'(deny file-read* (subpath "{memory}"))' not in profile
+        assert f'(deny file-write* (literal "{memory}"))' in profile
+        assert f'(deny file-write* (subpath "{memory}"))' in profile
+        assert f'(deny file-link (subpath "{memory}"))' in profile
+        assert security.is_sensitive_path(memory + "/member-one/memory.db")
+        assert f'(deny file-read* (subpath "{token}"))' in profile
+        assert f'(deny file-write* (subpath "{policy}"))' in profile
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("mode", _MODES)
+def test_linux_member_memory_is_sealed_without_a_hidden_view(mode: str) -> None:
+    hidden, readonly, _files = _launcher_sets(mode)
+    for prefix in _CREW_PREFIXES:
+        memory = _crew_path(prefix, "memory_stores")
+        assert memory not in hidden
+        assert memory in readonly
+        assert _crew_path(prefix, "token_signing.key") in hidden
+        assert _crew_path(prefix, "security_policy.json") in readonly
+
+
 class TestKeystonesAreSealedInEveryMode:
     """The ceiling files the issue named, on every backend the launcher feeds."""
 
@@ -83,6 +152,8 @@ class TestKeystonesAreSealedInEveryMode:
     #: THESE paths are covered, so a test derived from the same tuple the production
     #: code reads would pass just as happily after someone emptied it.
     KEYSTONES = (
+        "subagents",
+        "member-memory-bindings",
         "security_policy.json",
         "admission_policy.json",
         "app_admission.json",
@@ -91,17 +162,32 @@ class TestKeystonesAreSealedInEveryMode:
         "computer_use.json",
         "oauth_endpoints.json",
         "aws_service_consent.json",
-        # Recorded consent to deliver a scanner-flagged file (#7770). Sealing it
+        # Recorded consent to send conversation state to the external decision
+        # provider. Same class: the seal is what makes "the owner consents to
+        # the egress, never the agent" true.
+        "decisions_consent.json",
+        # Recorded consent to deliver a scanner-flagged file. Sealing it
         # is the load-bearing half of the whole design: the deny-list tiers can
         # be evaded by runtime path construction, so only a kernel write denial
         # makes "the owner consents, never the agent" true rather than merely
         # intended.
         "file_delivery_consent.json",
-        # The app dev-mode authorization record (#6907): sealing it is what
+        # Gateway-executed browser launcher. Agent shells must read and run it,
+        # but a write would choose the binary the unsandboxed gateway executes.
+        "playwright-cli",
+        # The app dev-mode authorization record: sealing it is what
         # makes the operator-attestation flag unforgeable from an agent shell
         # — a sandboxed process cannot mint a grant however the toggle was
         # spelled.
         "apps/.dev-grants.json",
+        # The cloud launcher's config. Its `fargate.image` names the container a launch
+        # runs and the task's execution role delivers the model credential into that
+        # container, so a write here selects WHO RECEIVES the credential -- which is as
+        # powerful as holding it. The file-tool gate alone is not enough: a sandboxed
+        # shell's `open(..., "w")` never passes through it, so only the kernel denial
+        # this list asserts makes "the owner chooses the image, never the agent" true
+        # rather than intended.
+        "cloud.json",
     )
 
     @_POSIX_ONLY
@@ -277,6 +363,65 @@ class TestTheReconciliationIsComplete:
         assert not hidden & visible
         assert not readonly & visible
 
+    def test_every_non_hidden_leaf_is_classified_for_a_foreign_child(self) -> None:
+        """A new VISIBLE/READONLY leaf must be classified before it can ship.
+
+        ``adapter_hidden_credential_dirs`` masks the whole read-gate floor for an
+        ENFORCED harness and then subtracts ``crew_host_runtime_leaves()``. So every
+        leaf this module lets a sandboxed process read is one of two things to a
+        FOREIGN harness's child: safe to hand over, or a credential to keep back.
+
+        The two lists are written out rather than one being the complement of the
+        other, and this is the pin that makes that pay. Under a complement an
+        unclassified leaf would default to READABLE and reach a self-approving
+        third-party binary with nothing reading as wrong. Here it appears in neither
+        list, this fails, and the author has to choose a side.
+
+        Both directions are asserted. Completeness catches the leaf nobody
+        classified; disjointness catches the leaf classified twice, where the mask's
+        contents would otherwise depend on which list won.
+        """
+        source = set(sandbox._CREW_SANDBOX_VISIBLE_LEAVES) | set(sandbox._CREW_READONLY_LEAVES)
+        readable = set(sandbox._CREW_CHILD_READABLE_LEAVES)
+        withheld = set(sandbox._CREW_CHILD_WITHHELD_LEAVES)
+
+        assert not readable & withheld, (
+            "a crew leaf is both child-readable and withheld: " f"{sorted(readable & withheld)}"
+        )
+        assert source - (readable | withheld) == set(), (
+            "unclassified crew leaf(es) -- a sandboxed process may read them, so each "
+            "must be declared either safe for a foreign harness's child or withheld "
+            f"as credential-bearing: {sorted(source - (readable | withheld))}"
+        )
+        assert (readable | withheld) - source == set(), (
+            "classified leaf(es) that no disposition list declares, so the "
+            f"classification covers nothing: {sorted((readable | withheld) - source)}"
+        )
+
+    def test_the_child_readable_set_is_exactly_what_the_accessor_publishes(self) -> None:
+        """The pin above governs the accessor, not just the constant beside it.
+
+        ``crew_host_runtime_leaves()`` is what ``tool_gate`` actually subtracts from
+        the mask. If it ever stopped returning the pinned list -- recomputing a
+        complement, filtering, or reordering into a different set -- the pin would go
+        on passing while the mask changed underneath it.
+        """
+        assert set(sandbox.crew_host_runtime_leaves()) == set(sandbox._CREW_CHILD_READABLE_LEAVES)
+        assert not set(sandbox.crew_host_runtime_leaves()) & set(
+            sandbox._CREW_CHILD_WITHHELD_LEAVES
+        )
+
+    def test_the_gateway_launcher_is_a_top_level_readonly_leaf(self) -> None:
+        """A nested leaf can be bypassed by renaming its writable parent.
+
+        The Linux bind mount follows the moved parent, leaving the original path
+        free for an agent-planted replacement. A top-level leaf has no extra
+        agent-writable ancestor inside the data home.
+        """
+        assert "playwright-cli" in sandbox._CREW_READONLY_LEAVES
+        assert "playwright-cli" in sandbox._CREW_NOFOLLOW_READONLY_DIR_LEAVES
+        assert "tools/playwright-cli" not in sandbox._CREW_READONLY_LEAVES
+
     @pytest.mark.parametrize("mode", _MODES)
     def test_every_mode_carries_the_derived_set(self, mode: str) -> None:
         """The governance tree is masked at every level, the way ``.vault`` already is.
@@ -327,22 +472,32 @@ class TestARelocatedDataHomeIsCoveredToo:
 
     @_POSIX_ONLY
     @pytest.mark.parametrize("mode", _MODES)
-    def test_the_launcher_seals_the_resolved_ceiling(self, mode, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        "leaf", ("security_policy.json", "subagents", "member-memory-bindings")
+    )
+    def test_the_launcher_seals_the_resolved_ceiling(self, mode, tmp_path, monkeypatch, leaf):
         root = self._relocate(monkeypatch, tmp_path)
         hidden, readonly, _files = _launcher_sets(mode)
 
-        target = os.path.join(root, "security_policy.json")
+        target = os.path.join(root, leaf)
         assert target in readonly, f"a relocated ceiling is writable in {mode}"
         assert target not in hidden, "it must stay readable — masking a ceiling removes it"
 
     @pytest.mark.parametrize("mode", _MODES)
-    def test_the_seatbelt_profile_covers_the_resolved_paths(self, mode, tmp_path, monkeypatch):
+    @pytest.mark.parametrize(
+        "leaf", ("security_policy.json", "subagents", "member-memory-bindings")
+    )
+    def test_the_seatbelt_profile_covers_the_resolved_paths(
+        self, mode, tmp_path, monkeypatch, leaf
+    ):
         root = self._relocate(monkeypatch, tmp_path)
         profile = sandbox._build_seatbelt_profile(mode)
 
-        ceiling = os.path.join(root, "security_policy.json")
+        ceiling = os.path.join(root, leaf)
         secret = os.path.join(root, "token_signing.key")
         assert f'(deny file-write* (literal "{ceiling}"))' in profile
+        assert f'(deny file-write* (subpath "{ceiling}"))' in profile
+        assert f'(deny file-read* (subpath "{ceiling}"))' not in profile
         assert f'(deny file-read* (subpath "{secret}"))' in profile
 
     def test_the_default_layout_adds_no_duplicate_rule(self, monkeypatch, tmp_path):
@@ -410,7 +565,7 @@ class TestThirdPartyCredentialsKeepTheirExistingTiering:
 
 
 class TestAppBackendOwnedLeaves:
-    """An app's OWN backend gets its state leaves back; nothing else changes (#8762).
+    """An app's OWN backend gets its state leaves back; nothing else changes.
 
     The md-notebook leaves are masked to fence agent subprocesses, but the Notes
     backend is itself a sandboxed spawn and is those files' only legitimate
@@ -494,7 +649,7 @@ class TestAppBackendOwnedLeaves:
 
 
 class TestForeignMaskShadowGuard:
-    """A carve-out spelling beneath a FOREIGN mask is refused, not carved (#8795).
+    """A carve-out spelling beneath a FOREIGN mask is refused, not carved.
 
     ``_hidden_path_contains_visible_path`` cancels any hidden mask entry that
     CONTAINS a visible path, so an ``extra_visible_dirs`` spelling planted beneath
@@ -621,7 +776,7 @@ class TestForeignMaskShadowGuard:
 
 
 class TestAPodChildsRemappedHomeIsMasked:
-    """Round 10 security fix. ``acp.client._apply_pod_home_remap`` gives a pod's
+    """``acp.client._apply_pod_home_remap`` gives a pod's
     kiro-cli child a pod-owned ``HOME`` (``KIROCREW_OS_HOME``) and
     ``pod.runtime._seed_pod_os_home`` stages the host's SSO tokens into it -- but
     every entry in the tier lists is ``$HOME``-relative joined against the GATEWAY's
@@ -665,8 +820,7 @@ class TestAPodChildsRemappedHomeIsMasked:
         `<os-home>/.aws/sso/cache/kiro-auth-token*.json`, and the pod's kiro-cli
         child WRITES its own MCP OAuth grants into that same directory.
 
-        This assertion is the inverse of the one round 10 shipped, and that
-        reversal is the fix. Bind-masking `<os-home>/.aws` empty breaks both
+        Bind-masking `<os-home>/.aws` empty breaks both
         directions -- the child cannot read the token it was seeded, and its grant
         writes land in the overlay rather than the pod tree, so `mcp_grant`'s stat
         answers "no grant" forever. On Linux `is_kiro_cli` does not skip Crew's

@@ -215,7 +215,7 @@ class TestGithubParse(unittest.TestCase):
     def test_metadata(self):
         self.assertEqual(self.t.author, "zejiangg")
         self.assertEqual(self.t.target_branch, "main")
-        # head SHA is the commit_id used to anchor draft comments.
+        # head SHA is the commit_id that anchors draft comments.
         self.assertEqual(self.t.revision, "fb58081a1c0ffee0000000000000000000000000")
         self.assertTrue(self.t.is_fix)
         self.assertEqual(self.t.linked_issue, "#3250")
@@ -268,6 +268,107 @@ class TestGithubParse(unittest.TestCase):
     def test_fail_fast_no_identity(self):
         with self.assertRaises(A.AdapterParseError):
             A.parse_github_payload({"body": "x", "files": [{"path": "a", "diff": "d"}]})
+
+
+class TestGitlabDetection(unittest.TestCase):
+    def test_gitlab_com(self):
+        self.assertEqual(
+            A.detect_platform("https://gitlab.com/org/proj/-/merge_requests/5"),
+            "gitlab")
+
+    def test_gitlab_nested_group(self):
+        self.assertEqual(
+            A.detect_platform("https://gitlab.com/org/team/proj/-/merge_requests/7"),
+            "gitlab")
+
+    def test_github_still_detected(self):
+        self.assertEqual(A.detect_platform("https://github.com/o/r/pull/1"), "github")
+
+    def test_github_pr_on_gitlab_host_rejected(self):
+        with self.assertRaises(A.UnsupportedPlatform):
+            A.detect_platform("https://gitlab.com/org/proj/pull/5")
+
+    def test_configured_self_hosted_gitlab(self):
+        cfg = {"gitlab_hosts": ["gitlab.corp.example"]}
+        self.assertEqual(
+            A.detect_platform("https://gitlab.corp.example/org/proj/-/merge_requests/3",
+                              config=cfg), "gitlab")
+
+    def test_unconfigured_gitlab_host_rejected(self):
+        with self.assertRaises(A.UnsupportedPlatform):
+            A.detect_platform("https://gitlab.corp.example/org/proj/-/merge_requests/3",
+                              config={})
+
+    def test_gitlab_pr_ref_nested(self):
+        self.assertEqual(A.gitlab_pr_ref(
+            "https://gitlab.com/org/team/proj/-/merge_requests/9"),
+            ("gitlab.com", "org/team/proj", "9"))
+
+    def test_canonicalizes_www_gitlab(self):
+        self.assertEqual(A.gitlab_pr_ref(
+            "https://www.gitlab.com/o/r/-/merge_requests/1")[0], "gitlab.com")
+
+    def test_bad_gitlab_link_rejected(self):
+        with self.assertRaises(A.AdapterParseError):
+            A.gitlab_pr_ref("https://gitlab.com/org/proj")
+
+
+class TestGitlabIds(unittest.TestCase):
+    def test_change_id(self):
+        self.assertEqual(A.gitlab_change_id("org/team/proj", 7), "GL-org_team_proj-7")
+
+    def test_change_id_self_hosted_is_host_qualified(self):
+        self.assertEqual(
+            A.gitlab_change_id("org/proj", 7, host="gitlab.corp.example"),
+            "GL-gitlab.corp.example-org_proj-7")
+
+    def test_review_key(self):
+        self.assertEqual(A.gitlab_review_key("Org/Proj", 7), "gitlab.com/org/proj#7")
+
+    def test_change_id_hosts_do_not_collide(self):
+        self.assertNotEqual(
+            A.gitlab_change_id("o/p", 1),
+            A.gitlab_change_id("o/p", 1, host="gitlab.corp.example"))
+
+    def test_ids_differ_from_github(self):
+        self.assertNotEqual(A.gitlab_change_id("o/p", 1), A.github_change_id("o", "p", 1))
+
+
+class TestGitlabParse(unittest.TestCase):
+    def setUp(self):
+        from tests.fixtures import GITLAB_PAYLOAD  # noqa: PLC0415
+        self.t = A.parse_gitlab_payload(GITLAB_PAYLOAD)
+
+    def test_identity_nested_group(self):
+        self.assertEqual(self.t.platform, "gitlab")
+        self.assertEqual(self.t.change_id, "GL-kiro_team_platform-42")
+        self.assertEqual(self.t.repo_identity, "gitlab.com/kiro-team/platform")
+
+    def test_files(self):
+        self.assertEqual(self.t.files[0]["path"], "src/worker/runner.py")
+        self.assertTrue(self.t.files[0]["diff"])
+
+    def test_metadata(self):
+        self.assertEqual(self.t.title, "Fix flaky retry in pipeline runner")
+        self.assertEqual(self.t.author, "mlerner")
+        self.assertEqual(self.t.target_branch, "main")
+        self.assertEqual(self.t.revision, "c0ffee0000000000000000000000000000000001")
+        self.assertEqual(self.t.linked_issue, "#17")
+
+    def test_fail_fast_no_identity(self):
+        with self.assertRaises(A.AdapterParseError):
+            A.parse_gitlab_payload({"body": "x", "changes": [{"new_path": "a", "diff": "d"}]})
+
+    def test_fail_fast_no_files_no_desc(self):
+        with self.assertRaises(A.AdapterParseError):
+            A.parse_gitlab_payload({}, link="https://gitlab.com/o/r/-/merge_requests/1")
+
+    def test_normalize_routes(self):
+        t = A.normalize("https://gitlab.com/o/r/-/merge_requests/5",
+                        {"iid": 5, "description": "hi",
+                         "web_url": "https://gitlab.com/o/r/-/merge_requests/5"})
+        self.assertEqual(t.platform, "gitlab")
+        self.assertEqual(t.change_id, "GL-o_r-5")
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ Two kinds of SSM interaction:
    ``AWS-StartPortForwardingSession`` document. This is a streaming child
    process, so it is spawned directly with ``subprocess.Popen`` (not through the
    capture-only chokepoint). The argv builders are testable (the CLI head is
-   resolved via the deploy engine's shared resolver, #4770).
+   resolved via the deploy engine's shared resolver).
 
 Requires the ``session-manager-plugin`` on the client for #2 (bundled by the
 launcher prerequisites); #1 needs only the ``aws`` CLI.
@@ -48,8 +48,17 @@ _SESSION_MANAGER_PLUGIN_DOC_URL = (
     "session-manager-working-with-install-plugin.html"
 )
 
-# Valid Unix username shape for the `sudo -u <run_as>` target.
-_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+# Valid Unix username shape for the `sudo -u <run_as>` target. Anchored with
+# ``\Z``, not ``$``: ``$`` also matches just before a trailing newline, so the
+# ``$`` form accepted ``"ec2-user\n"`` — and ``run_as`` IS interpolated into the
+# command string :func:`_wrap_remote_command` builds, where a newline begins a
+# second shell line. No caller threads user input into ``run_as`` today (each
+# passes the default, or a registry value already bounded with ``\Z`` by
+# ``validation.validate_ssm_run_as``), so this was latent, not exploitable. It is
+# fixed here because :func:`run_command`'s docstring promises the injection
+# surface stays closed "if a caller ever threads user input through", and under
+# ``$`` that promise did not hold.
+_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}\Z")
 
 
 @dataclass
@@ -162,7 +171,7 @@ def run_command(
 
 
 def build_port_forward_argv(
-    instance_id: str,
+    target: str,
     remote_port: int,
     local_port: int,
     profile: str = "",
@@ -170,15 +179,26 @@ def build_port_forward_argv(
 ) -> list[str]:
     """Build the ``aws ssm start-session`` port-forward argv (testable).
 
+    *target* is an EC2/SSM-managed instance id (``i-…``/``mi-…``) or an ECS task
+    target (``ecs:<cluster>_<taskId>_<runtimeId>``) for the Fargate lane — hence
+    "target" rather than "instance id". Both lanes use the SAME argv and the SAME
+    ``AWS-StartPortForwardingSession`` document, which forwards to a port on the
+    target itself; only the ``--target`` value differs. There is deliberately no
+    branch here, so the EC2 argv cannot drift while the Fargate one is changed.
+
+    Note this document takes no ``host`` parameter: the destination is the target,
+    never a host the caller names, so the tunnel cannot be pointed at a third
+    machine the target happens to be able to reach.
+
     The CLI head is resolved absolutely through the deploy engine's shared
-    resolver so a GUI-launched gateway's minimal PATH still finds it (#4770).
+    resolver so a GUI-launched gateway's minimal PATH still finds it.
     """
     argv = [
         resolve_aws_bin(),
         "ssm",
         "start-session",
         "--target",
-        instance_id,
+        target,
         "--document-name",
         _PORT_FORWARD_DOC,
         "--parameters",
@@ -197,11 +217,11 @@ def session_manager_plugin_installed() -> bool:
     Resolved through the deploy engine's shared resolver, not a bare
     ``shutil.which``: the plugin's own installers target ``/usr/local/bin`` (and
     the Homebrew cask the brew prefix), neither of which is on the minimal
-    launchd ``PATH`` a Finder/Dock-launched gateway inherits — so the bare probe
-    reported "not installed" for a plugin that was installed, and
-    :func:`require_session_manager_plugin` refused every SSM tunnel before one
-    was attempted (#5392). Same resolution the ``start-session`` argv head
-    already uses, so probe and spawn can no longer disagree (#4770, #5360).
+    launchd ``PATH`` a Finder/Dock-launched gateway inherits — so a bare probe
+    reports "not installed" for a plugin that IS installed, and
+    :func:`require_session_manager_plugin` would refuse every SSM tunnel before
+    one is attempted. Same resolution the ``start-session`` argv head already
+    uses, so probe and spawn agree.
     """
     return shutil.which(resolve_aws_tool_bin(_SESSION_MANAGER_PLUGIN)) is not None
 
@@ -317,13 +337,17 @@ def require_session_manager_plugin() -> None:
 
 
 def open_port_forward(
-    instance_id: str,
+    target: str,
     remote_port: int,
     local_port: int,
     profile: str = "",
     region: str = "",
 ) -> subprocess.Popen:
     """Spawn a background SSM port-forward. Returns the live child process.
+
+    *target* is an EC2/SSM-managed instance id or an ECS task target; both lanes
+    route through THIS function rather than a per-lane opener, so the human-action
+    guard below and every process guard here apply to both without being restated.
 
     The caller owns the process (terminate it to close the tunnel). Not routed
     through :func:`cloud.aws.run_aws` because the session streams for its whole
@@ -337,7 +361,7 @@ def open_port_forward(
     The child gets :func:`~kiro_crew.deploy.engine.aws_spawn_env` rather than a
     bare inherited env: the ``aws`` head is resolved absolutely, but the CLI then
     looks ``session-manager-plugin`` up by name on its OWN ``PATH``, which under a
-    GUI-launched gateway is the minimal launchd one (#5392). The resolved head is
+    GUI-launched gateway is the minimal launchd one. The resolved head is
     handed over so the widening is withheld when it is a bare name — a bare name
     means provenance REFUSED the candidate in those dirs, and widening would put
     it back within ``execvp``'s reach.
@@ -347,9 +371,9 @@ def open_port_forward(
     # human-only action, not something an agent session may do).
     aws.assert_human_action("ssm:StartSession")
     require_session_manager_plugin()
-    argv = build_port_forward_argv(instance_id, remote_port, local_port, profile, region)
+    argv = build_port_forward_argv(target, remote_port, local_port, profile, region)
     logger.info(
-        "opening SSM port-forward %s: local %d -> remote %d", instance_id, local_port, remote_port
+        "opening SSM port-forward %s: local %d -> remote %d", target, local_port, remote_port
     )
     return subprocess.Popen(  # noqa: S603 — fixed argv, no shell
         argv,
@@ -516,6 +540,109 @@ def instance_is_managed(instance_id: str, profile: str = "", region: str = "") -
         region,
     )
     return rc == 0 and out.strip() == "Online"
+
+
+@dataclass
+class TaskExecReadiness:
+    """Whether an ECS task can accept an SSM session, and why not when it cannot."""
+
+    ready: bool
+    reason: str = ""
+
+
+#: Cap on how much AWS stderr is quoted into a readiness reason. The tail is
+#: operator-facing diagnostics rather than anything parsed, and an unbounded one
+#: pastes a page of CLI output into a single error line.
+_MAX_AWS_ERROR_CHARS = 200
+
+
+def task_exec_readiness(
+    cluster: str, task_id: str, profile: str = "", region: str = ""
+) -> TaskExecReadiness:
+    """Whether *task_id* in *cluster* is ready for an SSM port-forward.
+
+    The Fargate sibling of :func:`instance_is_managed`, and it exists for the same
+    reason: without it the tunnel simply fails to open and the message says
+    nothing about which prerequisite is missing. AWS exposes exactly the two
+    observables that distinguish the causes, so this reads both.
+
+    ``enableExecuteCommand`` false is TERMINAL for that task's life. ECS cannot
+    turn the channel on for a running task, so the remedy is teardown and relaunch,
+    and the message says exactly that instead of inviting a retry that would repeat
+    forever. The distinction lives in the MESSAGE because that is the only place
+    anything acts on it: this module's Fargate consumer surfaces a reason string,
+    and a structured ``recoverable`` flag was removed rather than kept unread,
+    because a field whose presence implies a caller branches on it asserts a
+    guarantee no code delivers.
+
+    The execute-command managed agent not ``RUNNING`` invites a retry instead,
+    because it is usually still starting -- but it is also what a
+    PrivateLink-only VPC looks like, where the subnets can reach the container
+    registry (so the task pulls its image and reaches RUNNING) and cannot reach
+    ``ssmmessages`` (so the agent never comes up). The message names that
+    possibility, because it is otherwise invisible: nothing else in a healthy
+    task's state points at it.
+    """
+    rc, out, err = aws.run_aws(
+        [
+            "ecs",
+            "describe-tasks",
+            "--cluster",
+            cluster,
+            "--tasks",
+            task_id,
+            "--query",
+            "tasks[0].[enableExecuteCommand,containers[0].managedAgents[?name=="
+            "`ExecuteCommandAgent`].lastStatus|[0]]",
+            "--output",
+            "text",
+        ],
+        profile,
+        region,
+    )
+    if rc != 0:
+        # !r-quoted and capped, matching connect_fargate's sibling error and unlike
+        # instance_is_managed, which discards stderr entirely. AWS names the full
+        # caller ARN on an AccessDenied, and the repr turns an ESC or a newline in
+        # the tail into a literal rather than something a terminal acts on.
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"could not describe task {task_id} in cluster {cluster}: "
+                f"{err.strip()[:_MAX_AWS_ERROR_CHARS]!r}"
+            ),
+        )
+    fields = out.split()
+    if len(fields) < 2:
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"task {task_id} was not found in cluster {cluster}, or it has stopped. "
+                f"Check `kirocrew cloud status`."
+            ),
+        )
+    exec_enabled, agent_status = fields[0], fields[1]
+    if exec_enabled.lower() != "true":
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"task {task_id} was launched without the execute-command channel, so no "
+                f"SSM session can reach it. ECS cannot enable it on a running task: tear "
+                f"this crew down and launch it again."
+            ),
+        )
+    if agent_status != "RUNNING":
+        return TaskExecReadiness(
+            ready=False,
+            reason=(
+                f"the execute-command agent in task {task_id} is {agent_status or 'absent'}, "
+                f"not RUNNING. It may still be starting -- retry shortly. If it stays this "
+                f"way, the task's subnets probably cannot reach the `ssmmessages` endpoint: "
+                f"a VPC with registry endpoints but no `ssmmessages` endpoint (and no NAT "
+                f"route) pulls the image and runs the task, but never brings this agent up."
+            ),
+        )
+    return TaskExecReadiness(ready=True)
 
 
 # --- small helpers ---------------------------------------------------------

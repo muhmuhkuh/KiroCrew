@@ -33,6 +33,7 @@ const {
   isKirocrewCommand,
 } = require("./gateway-stop");
 const {
+  canonicalWindowsPath,
   windowsGatewayExecutablePaths,
   windowsListenPids,
   windowsProcessCommand,
@@ -86,6 +87,16 @@ const INSTALLING_STATUS = "Finishing installation…";
 const RESTARTING_STATUS = "Restarting Kiro Crew to finish the update…";
 const POLL_INTERVAL_MS = 500;
 const ADOPTED_RECOVERY_WAIT_MS = 30_000;
+// loadFile query that tells loading.html it is being painted by a reconnect
+// path rather than a cold boot, so it can offer its exit control at once
+// (loading.html reads `reconnect=1`). A query, not an IPC send: the splash
+// loads asynchronously and a message sent right after loadFile can be missed.
+const SPLASH_RECONNECT_QUERY = Object.freeze({ reconnect: "1" });
+// loadFile query that tells loading.html it is painted into the main window:
+// the one window whose close hides to tray and keeps the connect loop alive.
+// A connection window is destroyed by close, so the page words its close hint
+// from this flag (loading.html reads `primary=1`; absent means not primary).
+const SPLASH_PRIMARY_QUERY = Object.freeze({ primary: "1" });
 // How long this instance stays alive waiting for a successor copy of the app
 // to prove itself by serving on the gateway port (relaunchViaConfirmedSuccessor):
 // Electron boot plus the successor's own gateway budget, with margin.
@@ -119,6 +130,8 @@ function createGatewaySupervisor({
   cancelPendingTrayHide,
   exitImmersiveModes,
   log,
+  warn,
+  error,
   logPath,
   fsMod = defaultFs,
   osMod = defaultOs,
@@ -148,6 +161,8 @@ function createGatewaySupervisor({
   const IS_WIN = processObj.platform === "win32";
 
   const glog = typeof log === "function" ? log : (() => {});
+  const userWarn = typeof warn === "function" ? warn : glog;
+  const userError = typeof error === "function" ? error : userWarn;
   const gatewayLogPath = typeof logPath === "function" ? logPath : (() => "");
   const mainWindow = () => (typeof getMainWindow === "function" ? getMainWindow() : null);
   const quitting = () => (typeof isQuitting === "function" ? isQuitting() : false);
@@ -184,6 +199,12 @@ function createGatewaySupervisor({
   // whenever one reaches handoff, and whenever a monitored backend answers
   // again, so each incident gets its own budget.
   let reresolveAttempts = 0;
+  // Executables the CURRENT child was actually spawned from. findKirocrewBin
+  // re-probes on every call, so after a Toolbox `current` junction is repointed
+  // at a newer version it names a backend this shell never started; the child
+  // still running is the one spawned before the repoint, and it must keep
+  // classifying as ours (stop, liveness, port-owner) until it exits.
+  let spawnedExecutablePaths = [];
 
   /**
    * Can app.relaunch() still find something to re-exec? Electron relaunches
@@ -252,7 +273,7 @@ function createGatewaySupervisor({
       if (window && !window.isDestroyed()) {
         try {
           window.webContents.loadFile(path.join(dirname, "loading.html"), {
-            query: { accent: currentThemeAccent() },
+            query: splashQuery(window, { accent: currentThemeAccent() }),
           });
         } catch { /* window may be tearing down */ }
       }
@@ -337,6 +358,19 @@ function createGatewaySupervisor({
     return THEME_ACCENT_RE.test(configured) ? configured : DEFAULT_THEME_ACCENT;
   }
 
+  /**
+   * The loadFile query every loading.html painter uses. `primary` is decided
+   * here, from the window being painted, so no painter can mark a connection
+   * window as the main one (see SPLASH_PRIMARY_QUERY).
+   */
+  function splashQuery(window, { reconnect = false, accent = "" } = {}) {
+    const query = {};
+    if (accent) query.accent = accent;
+    if (reconnect) Object.assign(query, SPLASH_RECONNECT_QUERY);
+    if (window === mainWindow()) Object.assign(query, SPLASH_PRIMARY_QUERY);
+    return query;
+  }
+
   // NOTE: /api/health carries app identity; /api/status does not.
   function fetchHealthInfo(healthUrl = `${BACKEND_URL}${HEALTH_IDENTITY_PATH}`) {
     return new Promise((resolve) => {
@@ -384,6 +418,8 @@ function createGatewaySupervisor({
     });
   }
 
+  const windowsRealpath = (candidate) => fs.realpathSync.native(candidate);
+
   function isTrustedWindowsGatewayCommand(command) {
     const gatewayBin = findKirocrewBin(
       fs,
@@ -393,7 +429,11 @@ function createGatewaySupervisor({
       dirname,
     );
     return isKirocrewCommand(command, {
-      trustedExecutablePaths: windowsGatewayExecutablePaths(gatewayBin),
+      trustedExecutablePaths: [
+        ...windowsGatewayExecutablePaths(gatewayBin, { realpathSync: windowsRealpath }),
+        ...spawnedExecutablePaths,
+      ],
+      canonicalizePath: (candidate) => canonicalWindowsPath(candidate, windowsRealpath),
     });
   }
 
@@ -654,7 +694,7 @@ function createGatewaySupervisor({
     try {
       fs.mkdirSync(kirocrewDir, { recursive: true, mode: 0o700 });
     } catch (error) {
-      glog(`WARN failed to create kirocrew dir ${kirocrewDir}: ${error.message}`);
+      userWarn(`WARN failed to create kirocrew dir ${kirocrewDir}: ${error.message}`);
     }
 
     const bin = findKirocrewBin(
@@ -681,7 +721,7 @@ function createGatewaySupervisor({
       const missingParts = findMissingBundleParts(fs, path, backendRoot);
       if (missingParts.length) {
         const errorMessage = describeIncompleteBundle(missingParts);
-        glog(`spawn REFUSED: incomplete bundle at ${backendRoot} — missing: ${missingParts.join(", ")}`);
+        userError(`spawn REFUSED: incomplete bundle at ${backendRoot} — missing: ${missingParts.join(", ")}`);
         gatewayStartFailure = {
           error: errorMessage,
           incompleteBundle: true,
@@ -706,11 +746,11 @@ function createGatewaySupervisor({
         cliBin: bin,
       });
       if (need) {
-        glog(`WARN agent sandbox will fail closed: ${need.reason}`);
-        glog(`HINT run this in a terminal (needs sudo), then restart the app: ${need.command}`);
+        userWarn(`WARN agent sandbox will fail closed: ${need.reason}`);
+        userWarn(`HINT run this in a terminal (needs sudo), then restart the app: ${need.command}`);
       }
     } catch (error) {
-      glog(`WARN sandbox profile check failed: ${error.message}`);
+      userWarn(`WARN sandbox profile check failed: ${error.message}`);
     }
 
     // The explicit --port is the single source of truth. Inheriting
@@ -735,7 +775,7 @@ function createGatewaySupervisor({
     // tracebacks which otherwise disappear on clean recipient machines.
     let childOut = "ignore";
     try { childOut = fs.openSync(gatewayLogPath(), "a"); }
-    catch (error) { glog(`WARN could not open child log fd: ${error.message}`); }
+    catch (error) { userWarn(`WARN could not open child log fd: ${error.message}`); }
     glog(SPAWN_MARKER);
     gatewayStartFailure = null;
 
@@ -750,7 +790,7 @@ function createGatewaySupervisor({
         spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
       } else {
         const errorMessage = describeIncompleteBundle([]);
-        glog(`spawn REFUSED: bundled interpreter absent at ${pythonExe} — install likely still extracting`);
+        userError(`spawn REFUSED: bundled interpreter absent at ${pythonExe} — install likely still extracting`);
         gatewayStartFailure = {
           error: errorMessage,
           incompleteBundle: true,
@@ -781,6 +821,11 @@ function createGatewaySupervisor({
     });
     gatewayProcess = child;
     gatewayOwnership = "spawned";
+    if (IS_WIN) {
+      spawnedExecutablePaths = windowsGatewayExecutablePaths(spawnBin, {
+        realpathSync: windowsRealpath,
+      });
+    }
     if (typeof childOut === "number") {
       try { fs.closeSync(childOut); } catch { /* ignore */ }
     }
@@ -827,6 +872,7 @@ function createGatewaySupervisor({
         reresolveAttempts += 1;
         glog(`stale bundle (${cause} on bin=${bin}) — re-resolving the backend and respawning (attempt ${reresolveAttempts})`);
         gatewayProcess = null;
+        spawnedExecutablePaths = [];
         gatewayStartFailure = null;
         spawnGateway(resolve);
         return true;
@@ -837,8 +883,9 @@ function createGatewaySupervisor({
     };
 
     child.on("error", (error) => {
-      glog(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
+      userError(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
       if (gatewayProcess !== child) return;
+      spawnedExecutablePaths = [];
       const giveUp = () => {
         gatewayStartFailure = { error: error.message, bundled };
         sendStatus(`Gateway failed: ${error.message}`);
@@ -848,13 +895,18 @@ function createGatewaySupervisor({
       giveUp();
     });
     child.on("exit", (code, signal) => {
-      glog(`gateway child exited code=${code} signal=${signal}`);
+      const exitMessage = `gateway child exited code=${code} signal=${signal}`;
+      const currentChild = gatewayProcess === child;
+      const expectedExit = !currentChild || quitting() || installingUpdate;
+      if (expectedExit) glog(exitMessage);
+      else userError(exitMessage);
       // Node's Windows kill maps both signal names to TerminateProcess. The
       // Gatekeeper hint is meaningful only on macOS, never on normal teardown.
-      if (signal === "SIGKILL" && IS_MAC) {
-        glog("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
+      if (signal === "SIGKILL" && IS_MAC && !expectedExit) {
+        userWarn("HINT: SIGKILL on a freshly-spawned bundled binary almost always means macOS Gatekeeper blocked an unsigned/quarantined nested executable. On the recipient's Mac run: xattr -cr <path to KiroCrew.app>");
       }
-      if (gatewayProcess !== child) return;
+      if (!currentChild) return;
+      spawnedExecutablePaths = [];
       const giveUp = () => {
         if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
         gatewayProcess = null;
@@ -874,8 +926,12 @@ function createGatewaySupervisor({
    */
   async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
     const gateway = gatewayProcess;
-    if (!gateway || gateway.exitCode !== null) { gatewayProcess = null; return; }
-    console.log("Stopping gateway gracefully...");
+    if (!gateway || gateway.exitCode !== null) {
+      gatewayProcess = null;
+      spawnedExecutablePaths = [];
+      return;
+    }
+    glog("Stopping gateway gracefully...");
     // Resolve secrets at call time. The gateway accepts only the secret for its
     // current boot; trying every readable candidate prevents a stale copy from
     // forcing the hard-signal path and skipping session/memory/cron flushes.
@@ -899,6 +955,7 @@ function createGatewaySupervisor({
       killTreeFn: killGatewayTreeOnWindowsBounded,
     });
     gatewayProcess = null;
+    spawnedExecutablePaths = [];
   }
 
   function killGatewayTreeOnWindowsBounded(pid) {
@@ -961,7 +1018,7 @@ function createGatewaySupervisor({
 
     return new Promise((resolve) => {
       sendStatus("Fetching token from remote dev desktop…");
-      console.log(`SSH token fetch: ssh ${remoteHost} for port ${effectivePort}`);
+      glog(`SSH token fetch: ssh ${remoteHost} for port ${effectivePort}`);
       execFile(
         "/usr/bin/ssh",
         sshArgs,
@@ -1316,6 +1373,7 @@ function createGatewaySupervisor({
     // sweep before probing the port or descendants escape and retain locks.
     await killGatewayProcessTree(gatewayProcess, "SIGKILL");
     gatewayProcess = null;
+    spawnedExecutablePaths = [];
     let freed = true;
     let foreignHolder = false;
     let probeFailed = false;
@@ -1346,7 +1404,7 @@ function createGatewaySupervisor({
 
   async function reconnectExternalGateway(window) {
     const webContents = window.webContents;
-    try { webContents.loadFile(path.join(dirname, "loading.html")); }
+    try { webContents.loadFile(path.join(dirname, "loading.html"), { query: splashQuery(window, { reconnect: true }) }); }
     catch { /* window may be tearing down */ }
     if (!window || window.isDestroyed() || quitting()) return;
     // No reveal here: network/tunnel healing must not re-surface a window the
@@ -1368,7 +1426,7 @@ function createGatewaySupervisor({
 
   async function reconnectOrRespawnAdoptedGateway(window) {
     const webContents = window.webContents;
-    try { webContents.loadFile(path.join(dirname, "loading.html")); }
+    try { webContents.loadFile(path.join(dirname, "loading.html"), { query: splashQuery(window, { reconnect: true }) }); }
     catch { /* window may be tearing down */ }
     if (!window || window.isDestroyed() || quitting()) return;
     sendStatus("Gateway stopped responding — waiting for it to recover…");
@@ -1493,7 +1551,7 @@ function createGatewaySupervisor({
     const healthUrl = `${targetBackendUrl}/api/status`;
     const webContents = window.webContents;
     webContents.loadFile(path.join(dirname, "loading.html"), {
-      query: { accent: currentThemeAccent() },
+      query: splashQuery(window, { reconnect, accent: currentThemeAccent() }),
     });
     // Cold boot and user-clicked retries raise. Autonomous liveness recovery
     // loads into the existing hidden/minimized window without touching focus.

@@ -66,12 +66,27 @@ class TestWidgetBlockPlaceholder:
         # Hard budget per density. The pre-pointer block was ~800 chars of
         # inlined instructions; the pointer deliberately grew to two short
         # sections (Inline Widgets + Artifacts, ~640 chars for "more") when the
-        # Artifacts pointer was added. Budgets sit just above today's sizes to
-        # keep catching accidental regrowth toward inlining full skill docs.
-        budgets = {"more": 700, "less": 400}
+        # Artifacts pointer was added, and again by one theme-contract sentence
+        # (~1000 / ~560) once answer-only widgets shipped unreadable in dark
+        # mode because the model never loaded the skill. Budgets sit just above
+        # today's sizes to keep catching accidental regrowth toward inlining
+        # full skill docs.
+        budgets = {"more": 1050, "less": 600}
         for density, budget in budgets.items():
             result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
             assert len(result) < budget, f"{density} pointer too long: {len(result)} chars"
+
+    def test_pointer_carries_the_theme_contract_without_the_var_table(self):
+        # The one rule that cannot wait for a skill load: the frame's body is
+        # already themed, so a fixed light palette with the theme's text color
+        # inherited (the answer-only failure) renders white-on-white in dark
+        # mode. Both densities state the rule in prose -- no var names, so the
+        # no-restating guard above still holds.
+        for density in ("more", "less"):
+            result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
+            assert "The frame is themed" in result, density
+            assert "never a fixed palette" in result, density
+            assert "background together with its text color" in result, density
 
     def test_dashboard_underscore_key_also_matches(self):
         # Some dashboard sessions use `dashboard_<slot>` instead of `dashboard:<slot>`.
@@ -93,10 +108,10 @@ class TestWidgetBlockPlaceholder:
 
 
 class TestMaxSubagentsPlaceholder:
-    """`{{MAX_SUBAGENTS}}` expands to the live resolved concurrent cap on every transport."""
+    """`{{MAX_SUBAGENTS}}` expands to the concurrent cap IN FORCE on every transport."""
 
     @staticmethod
-    def _resolve_cap(prompt, session_key, *, cap=None, raises=False):
+    def _resolve_cap(prompt, session_key, *, cap=None, raises=False, live=0):
         from kiro_crew.context import ContextBuilder
 
         fake_cfg = SimpleNamespace(dashboard=SimpleNamespace(widget_density="more"))
@@ -107,16 +122,31 @@ class TestMaxSubagentsPlaceholder:
             )
         else:
             sub = patch("kiro_crew.subagent.resolve_max_subagents", return_value=cap)
-        with patch("kiro_crew.context.KiroCrewConfig.load", return_value=fake_cfg), sub:
+        with (
+            patch("kiro_crew.context.KiroCrewConfig.load", return_value=fake_cfg),
+            patch("kiro_crew.resource_status.adaptive_exec_cap", return_value=live),
+            sub,
+        ):
             return ContextBuilder._resolve_prompt_templates(prompt, session_key)
 
-    def test_token_replaced_with_live_cap_on_every_transport(self):
-        # The cap must reach dashboard, Slack, CLI, and empty-key sessions alike —
-        # delegation guidance is transport-agnostic.
+    def test_the_cap_in_force_wins_over_the_configured_ceiling(self):
+        # ``max_subagents`` is a ceiling; the adaptive controller can be
+        # dispatching far fewer under it, and a model sized to the ceiling
+        # queues work it believes is running. The live figure is what is used,
+        # with no ceiling label, and the configured number does not appear.
+        result = self._resolve_cap("up to {{MAX_SUBAGENTS}} run", "dashboard:abc", cap=64, live=8)
+        assert "up to 8 run" in result
+        assert "64" not in result and "ceiling" not in result
+
+    def test_token_replaced_with_labelled_ceiling_on_every_transport(self):
+        # No controller in this process: the configured number is still given,
+        # but LABELLED as a ceiling so the model does not read it as the cap in
+        # force. It must reach dashboard, Slack, CLI, and empty-key sessions
+        # alike — delegation guidance is transport-agnostic.
         for key in ("dashboard:abc", "slack:C1:1.2", "cli:local", ""):
             result = self._resolve_cap("up to {{MAX_SUBAGENTS}} agents", key, cap=12)
             assert "{{MAX_SUBAGENTS}}" not in result
-            assert "up to 12 agents" in result
+            assert "up to 12 (configured ceiling) agents" in result
 
     def test_zero_cap_falls_back_to_several(self):
         # cap==0 (auto-size failed / unreadable host) keeps the sentence grammatical.

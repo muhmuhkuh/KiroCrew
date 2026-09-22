@@ -307,7 +307,16 @@ def test_known_membership_is_unchanged_by_the_move() -> None:
     Membership is the gate on the ``acp_backend`` kwarg, so a widened set means
     provider construction accepts a value it must reject.
     """
-    assert sorted(sdk_backends.ACP_BACKENDS_KNOWN) == ["", "claude", "codex", "kas"]
+    assert sorted(sdk_backends.ACP_BACKENDS_KNOWN) == [
+        "",
+        "claude",
+        "codex",
+        "deepseek",
+        "goose",
+        "kas",
+        "opencode",
+        "pi",
+    ]
 
 
 #: Every capability field for every known id, plus an unknown one.
@@ -320,7 +329,7 @@ EXPECTED_CAPABILITIES = {
     "": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
     "kas": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
     "claude": (PROVIDER_CLAUDE_CODE, "claude_code", True, True, True),
-    "codex": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, True, False),
+    "codex": (PROVIDER_ACP, "codex", True, True, True),
     "nope": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
 }
 
@@ -393,6 +402,35 @@ def test_every_capability_set_has_a_disposition_row() -> None:
     assert not stale, (
         f"the disposition table names sets that no longer exist: {stale}; "
         f"remove the rows with the sets"
+    )
+
+
+def test_a_markdown_dispatching_host_must_reach_the_overlay_format_rule() -> None:
+    """``overlay_project_scope`` computes its format half from ``has_mirror`` ALONE.
+
+    A host that reads the markdown spec form from a checkout ITSELF is a second
+    way for a project ``foo.md`` to be the agent a session runs, and that set is
+    deliberately not OR-ed into the decider because its only member also reads the
+    user level alone and leaves the decider before the question arises -- an OR
+    term no caller could reach is dead surface.
+
+    This assertion is what keeps that omission honest. A host in the markdown set
+    which DOES receive a project scope would dispatch a project markdown agent
+    while the decider answered ``markdown_specs=False``, so the user-level
+    overlay's stub for that name would survive, outrank the project's own
+    declaration, and run its command and credentials under the checkout's agent.
+    """
+    markdown = sdk_backends.ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+    user_level_only = sdk_backends.ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY
+    assert markdown, "the markdown-spec set is empty; this pin no longer measures anything"
+    escaped = sorted(markdown - user_level_only)
+    assert not escaped, (
+        f"these backends read markdown agent specs from a checkout themselves but DO "
+        f"receive a project scope: {escaped}. agent_sdk/backends.overlay_project_scope "
+        f"computes markdown_specs from has_mirror alone, so such a host is told "
+        f"markdown_specs=False and keeps the user-level overlay's stub for a spec it "
+        f"actually dispatches -- the stub's command and credentials then run under the "
+        f"checkout's agent. OR this set into that decider before adding the host."
     )
 
 
@@ -475,9 +513,12 @@ class TestTheKiroConstructionPathIsUnconditional:
     reached through a TABLE, so an edit to
     ``_MODEL_REGISTRY_NAMESPACE_BY_BACKEND`` can move it.
 
-    So the pin is the branch, not the value: every non-claude backend must reach
-    ``to_acp_id`` and must never reach ``to_provider_id``. That is what makes
-    "the Kiro path is unconditional" a test result rather than a claim.
+    So the pin is the branch, not the value: every kiro-family backend (and any
+    stranger, which defaults to that family) must reach ``to_acp_id`` and must
+    never reach ``to_provider_id``. That is what makes "the Kiro path is
+    unconditional" a test result rather than a claim. codex is on its own
+    provider namespace like claude and takes the other arm -- pinned below so a
+    move in either direction is a deliberate edit.
     """
 
     @staticmethod
@@ -503,20 +544,27 @@ class TestTheKiroConstructionPathIsUnconditional:
         cfg.acp_effective_model(None, "opus-4.8-1m")
         return calls
 
-    @pytest.mark.parametrize("backend", ["", "kas", "codex", "some-future-harness"])
-    def test_a_non_claude_backend_never_reaches_the_provider_namespace(
+    @pytest.mark.parametrize("backend", ["", "kas", "some-future-harness"])
+    def test_a_kiro_family_backend_never_reaches_the_provider_namespace(
         self, monkeypatch, backend: str
     ) -> None:
         calls = self._translations(monkeypatch, backend)
         assert [c[0] for c in calls] == ["to_acp_id"], (
             f"backend {backend!r} left the acp translation path; the capability "
-            f"lookup must not move a non-claude backend off to_acp_id"
+            f"lookup must not move a kiro-family backend off to_acp_id"
         )
 
     def test_the_claude_backend_still_reaches_its_own_namespace(self, monkeypatch) -> None:
         """The other half: the one backend that DID take the other arm still does."""
         calls = self._translations(monkeypatch, "claude")
         assert calls == [("to_provider_id", "opus-4.8-1m", "claude_code")]
+
+    def test_the_codex_backend_reaches_its_own_namespace(self, monkeypatch) -> None:
+        """codex ids are the adapter's own vocabulary: translated into the ``codex``
+        namespace (a passthrough, the registry has no such provider), never folded
+        onto a kiro id codex would refuse."""
+        calls = self._translations(monkeypatch, "codex")
+        assert calls == [("to_provider_id", "opus-4.8-1m", "codex")]
 
     def test_the_namespace_table_cannot_move_kiro_off_the_acp_arm(self) -> None:
         """The drift the reviewer named, pinned at the table rather than the branch.
@@ -525,7 +573,7 @@ class TestTheKiroConstructionPathIsUnconditional:
         translator call; this names the table entry, so the failure message points
         at the line an editor would have changed.
         """
-        for backend in ("", "kas", "codex"):
+        for backend in ("", "kas"):
             assert sdk_backends.model_registry_namespace(backend) == MODEL_NAMESPACE_ACP
 
 

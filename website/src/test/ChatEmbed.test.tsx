@@ -17,12 +17,15 @@ interface MockChatMessageListProps {
   running: boolean
   onApprove?: (approvalId: string, decision: string) => void
   canTrust?: boolean
+  /** The virtualized mount's slots: the embed's empty state renders above the rows. */
+  transcript?: { aboveRows?: React.ReactNode }
 }
 
 vi.mock('./ChatMessageList', () => ({
-  default: ({ messages, running, onApprove, canTrust }: MockChatMessageListProps) => (
+  default: ({ messages, running, onApprove, canTrust, transcript }: MockChatMessageListProps) => (
     <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}
       data-can-approve={String(!!onApprove)} data-can-trust={String(!!canTrust)}>
+      {transcript?.aboveRows}
       {onApprove && (
         <>
           <button data-testid="mock-approve" onClick={() => onApprove('appr-1', 'approved')}>approve</button>
@@ -35,9 +38,10 @@ vi.mock('./ChatMessageList', () => ({
 
 // Mock ChatMessageList from the correct path (ChatEmbed imports from ./ChatMessageList)
 vi.mock('../app-sdk/ChatMessageList', () => ({
-  default: ({ messages, running, onApprove, canTrust }: MockChatMessageListProps) => (
+  default: ({ messages, running, onApprove, canTrust, transcript }: MockChatMessageListProps) => (
     <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}
       data-can-approve={String(!!onApprove)} data-can-trust={String(!!canTrust)}>
+      {transcript?.aboveRows}
       {onApprove && (
         <>
           <button data-testid="mock-approve" onClick={() => onApprove('appr-1', 'approved')}>approve</button>
@@ -265,7 +269,7 @@ describe('ChatEmbed', () => {
       }))
     })
 
-    it('does not send on Shift+Enter', async () => {
+    it('keeps a Shift+Enter newline in the draft instead of sending', async () => {
       await act(async () => {
         renderWithProviders(<ChatEmbed slotKey="slot-1" />)
       })
@@ -275,11 +279,54 @@ describe('ChatEmbed', () => {
         fireEvent.change(input, { target: { value: 'hello' } })
       })
 
+      const shiftEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      })
       await act(async () => {
-        fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+        input.dispatchEvent(shiftEnter)
+        if (!shiftEnter.defaultPrevented) {
+          fireEvent.input(input, { target: { value: 'hello\n' } })
+        }
       })
 
+      expect(shiftEnter.defaultPrevented).toBe(false)
+      expect(input).toHaveValue('hello\n')
       expect(mockPost).not.toHaveBeenCalled()
+    })
+
+    it('does not send the Enter that commits an IME candidate', async () => {
+      await act(async () => {
+        renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+      })
+      const input = screen.getByLabelText('Chat message')
+
+      await act(async () => {
+        fireEvent.change(input, { target: { value: '你好' } })
+        fireEvent.compositionStart(input)
+        fireEvent.keyDown(input, { key: 'Enter' })
+      })
+
+      expect(input).toHaveValue('你好')
+      expect(mockPost).not.toHaveBeenCalled()
+    })
+
+    it('grows to the shared height cap, then keeps vertical scrolling', async () => {
+      await act(async () => {
+        renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+      })
+      const input = screen.getByLabelText('Chat message') as HTMLTextAreaElement
+      Object.defineProperty(input, 'scrollHeight', { value: 9999, configurable: true })
+
+      await act(async () => {
+        fireEvent.change(input, { target: { value: 'a long multi-line draft' } })
+      })
+
+      expect(input).toBeInstanceOf(HTMLTextAreaElement)
+      expect(input.style.height).toBe('240px')
+      expect(input).toHaveClass('overflow-y-auto')
     })
   })
 
@@ -334,7 +381,8 @@ describe('ChatEmbed', () => {
         renderWithProviders(<ChatEmbed slotKey="test-slot" />)
       })
 
-      expect(mockGet).toHaveBeenCalledWith('/api/chat/slots/' + encodeURIComponent('test-slot'))
+      // Bounded to one page (P5-e): the newest EMBED_PAGE_LIMIT rows, never the whole slot.
+      expect(mockGet).toHaveBeenCalledWith('/api/chat/slots/' + encodeURIComponent('test-slot') + '?limit=200')
     })
 
     it('polls at 5000ms interval when idle', async () => {
@@ -541,7 +589,7 @@ describe('ChatEmbed follow-up options', () => {
     // Chip clicks are debounced 220ms (so a double-click can still fire the
     // distinct "send now" gesture) whenever onSend is supplied, as it is here.
     await act(async () => {
-      fireEvent.click(screen.getByText('Run tests'))
+      fireEvent.click(screen.getByRole('button', { name: 'Run tests' }))
       vi.advanceTimersByTime(250)
     })
 
@@ -566,13 +614,13 @@ describe('ChatEmbed follow-up options', () => {
     // Chip clicks are debounced 220ms (so a double-click can still fire the
     // distinct "send now" gesture) whenever onSend is supplied, as it is here.
     await act(async () => {
-      fireEvent.click(screen.getByText('Run tests'))
+      fireEvent.click(screen.getByRole('button', { name: 'Run tests' }))
       vi.advanceTimersByTime(250)
     })
     expect(input.value).toBe('Run tests')
 
     await act(async () => {
-      fireEvent.click(screen.getByText('Run tests'))
+      fireEvent.click(screen.getByRole('button', { name: 'Run tests' }))
       vi.advanceTimersByTime(250)
     })
     expect(input.value).toBe('')

@@ -25,10 +25,9 @@ import errno
 import os
 import shlex
 import shutil
-import sys
 from pathlib import Path
 
-from kiro_crew import pinned_fs
+from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod.config import TERMINAL_BOOT_EXIT_CODES, PodConfig, environment_vars
 from kiro_crew.service.common import systemd_quote
@@ -85,7 +84,8 @@ def _kirocrew_argv() -> tuple[str, ...]:
       1. ``KIROCREW_POD_BIN`` — explicit override (used when installing a unit that
          must boot a specific build, e.g. a worktree's own ``.venv``).
       2. the console-script on PATH.
-      3. ``<this python> -m kiro_crew`` so it works from a bare checkout.
+      3. ``<this python> [-s] -m kiro_crew`` so it works from a bare checkout
+         under the parent interpreter's effective user-site policy.
     """
     override = os.environ.get("KIROCREW_POD_BIN")
     if override:
@@ -93,7 +93,7 @@ def _kirocrew_argv() -> tuple[str, ...]:
     found = shutil.which("kirocrew")
     if found:
         return (found,)
-    return (sys.executable, "-m", "kiro_crew")
+    return tuple(platform_compat.isolated_python_argv("-m", "kiro_crew"))
 
 
 def _environment_block(cfg: PodConfig) -> str:
@@ -178,12 +178,11 @@ def render_dropin(checkout: Path) -> str:
 def _write_unit_file_atomic_nofollow(dst: Path, content: str, *, what: str) -> None:
     """Publish one managed systemd file without following planted links.
 
-    Thin wrapper kept for its call sites' readability: the mechanism now lives in
+    Thin wrapper kept for its call sites' readability: the mechanism lives in
     ``pinned_fs.write_file_pinned``, which is the SINGLE no-follow publish path in
-    the tree. This function used to hand-roll it (pin the parent, ``lstat`` through
-    the descriptor, refuse a link or a non-regular file, then ``atomic_write_at``),
-    and the pod boot path grew a second hand-rolled copy independently -- so the
-    two were collapsed onto one implementation rather than gaining a third.
+    the tree (pin the parent, ``lstat`` through the descriptor, refuse a link or a
+    non-regular file, then ``atomic_write_at``). Both this site and the pod boot
+    path delegate to it rather than hand-rolling a copy.
     """
     pinned_fs.write_file_pinned(dst, content, what=what, mode=0o600, refusal=OSError)
 
@@ -193,7 +192,7 @@ def install_dropin(cfg: PodConfig, name: str, checkout: Path) -> Path:
 
     Rewritten on every start rather than created once, so a pod re-``up``ped from
     a different checkout — or one whose venv was rebuilt elsewhere — cannot keep
-    booting a path that no longer exists (the failure mode ``unit_exec_ok``
+    booting a path that does not exist (the failure mode ``unit_exec_ok``
     exists to self-heal for the template).
     """
     dst = dropin_path(cfg, name)
@@ -327,7 +326,7 @@ def unit_is_current(cfg: PodConfig) -> bool:
     """True when the installed unit is one this build is willing to boot.
 
     Three ways it can be stale, and a start self-heals all of them by
-    re-rendering: the baked ExecStart binary no longer exists
+    re-rendering: the baked ExecStart binary does not exist
     (:func:`unit_exec_ok`), the unit still carries a directive this build has
     REMOVED, or it is missing one this build now REQUIRES. All three matter on
     UPGRADE — the unit is written once by ``pod install``, so without these checks

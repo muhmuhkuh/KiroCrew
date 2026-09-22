@@ -30,7 +30,10 @@ class TestMcpCoreUserActions:
             mock_post.return_value = {"id": "abc12345"}
             result = self._simulate_tool_call(
                 "spawn_run",
-                {"task": "search the codebase for uses of SessionManager"},
+                {
+                    "task": "search the codebase for uses of SessionManager",
+                    "solo_reason": "bulk_data",
+                },
             )
         assert "abc12345" in result
         assert "Spawned" in result
@@ -50,7 +53,7 @@ class TestMcpCoreUserActions:
         """spawn_run always returns immediately — fire-and-forget."""
         with patch("kiro_crew.mcp_core._post") as mock_post:
             mock_post.return_value = {"id": "ghi789"}
-            result = self._simulate_tool_call("spawn_run", {"task": "quick check"})
+            result = self._simulate_tool_call("spawn_run", {"task": "quick check", "solo_reason": "bulk_data"})
         assert "Spawned" in result
         assert "completion event" in result.lower()
 
@@ -79,7 +82,7 @@ class TestMcpCoreUserActions:
     def test_learn_with_negative(self):
         """The NOT-clause must reach the payload, not just the tool schema.
 
-        Regression guard: this test used to supply ``negative`` and assert only
+        Regression guard: a weaker version supplies ``negative`` and asserts only
         that the call succeeded, so it passed while ``_call_tool`` built the body
         as ``{rule, category, scope}`` and dropped the clause client-side -- the
         very field whose ``rule`` description tells the model to prefer it over
@@ -250,7 +253,7 @@ class TestMcpCronUserActions:
 
         The ownership gate reads the stored row now, so a mock that leaves
         ``get_job`` unset returns a bare ``MagicMock`` whose ``session_key``
-        compares unequal to the caller's and the tool refuses. It used to be
+        compares unequal to the caller's and the tool refuses -- an unidentified
         waved through, because an unidentified caller was.
         """
         job = MagicMock()
@@ -260,7 +263,7 @@ class TestMcpCronUserActions:
         return job
 
     def _simulate_tool_call(self, tool_name: str, arguments: dict) -> str:
-        from kiro_crew.mcp_cron import _call_tool
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
 
         return _call_tool(tool_name, arguments)
 
@@ -487,9 +490,9 @@ class TestMcpCronUserActions:
     # -- cron_remove_all --
 
     def test_remove_all(self):
-        # Identity, not an ambient flag: this tool used to be reachable with no
+        # Identity, not an ambient flag: this tool is not reachable with no
         # session at all by setting KIROCREW_CLI=1, which is the forgeable claim
-        # #6624 removed. The tool path being exercised here is unchanged; what
+        # gone. The tool path being exercised here is unchanged; what
         # changed is that reaching it requires a caller the gateway can name.
         with patch("kiro_crew.mcp_cron.CronService") as mock_svc:
             svc = mock_svc.return_value
@@ -572,7 +575,7 @@ class TestBadInputsCaught:
         return _call_tool(name, args)
 
     def _cron_call(self, name: str, args: dict) -> str:
-        from kiro_crew.mcp_cron import _call_tool
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
 
         return _call_tool(name, args)
 
@@ -586,7 +589,7 @@ class TestBadInputsCaught:
             mock_post.return_value = {"id": "clean1"}
             result = self._core_call(
                 "spawn_run",
-                {"task": "search\u200b for\u200d files"},
+                {"task": "search\u200b for\u200d files", "solo_reason": "bulk_data"},
             )
         assert "clean1" in result
         # Verify the API received cleaned text

@@ -137,11 +137,23 @@ subprocess-free scripts:
   are derived, never configurable: transcripts only from this gateway's own session store (keys are
   validated stems; a candidate resolving outside the store — a symlink — reads as missing), state
   only beside the config file.
+- `scripts/coverage_filter.py` — the batch half of the same coverage question, for the QUEUE rather
+  than for one candidate. The work source selects and excludes by label, and a PR carrying
+  `Fixes #N` applies no label, so a label-shaped selector cannot tell a covered item from a free
+  one: measured on this repo, 25 of 29 label-clean candidates were already referenced by an open PR.
+  `claim_preflight.py` refuses each of them, but only at claim time and at one timeline read plus one
+  detail read per referencing PR, per item — a cost that scales with the backlog and is paid again
+  every cycle. So this script reads the repository's open pull requests once, fork and draft PRs
+  included, and reports which candidates their titles or bodies reference. It only ever SUBTRACTS:
+  `COVERED` is a positive finding, `UNCOVERED` certifies nothing, and an unreadable forge exits 3
+  printing no `uncovered` list, so the cheaper evidence can never widen what gets dispatched and
+  cannot be mistaken for permission. That asymmetry is what makes two evidence sources safe rather
+  than a drift risk; the reference vocabulary the two scripts share is pinned by a test.
 - `scripts/credit_spend.py` — per-item credit rollup with budget verdicts `within` / `exhausted` /
   `truncated` (a bounded scan never claims `within`) / `unmetered` (absent metering is unknown,
   not zero).
 
-The design rule the three share: **a decision expressed as prose in the skill rots silently, and a
+The design rule these scripts share: **a decision expressed as prose in the skill rots silently, and a
 decision computed by a script can be tested.** Each script exists because a predicate the skill
 used to state in prose was found to be answering one question and treating an empty answer as
 permission.
@@ -238,7 +250,8 @@ default_branch: main
 work_source: {kind: gh_issues, select_labels: [...], skip_signals: [...]}   # SEAM: adapter
 claim: {lock_label, marker_phrase, operator_tag}                            # lock protocol as data
 worker_contract: {branch_pattern, worktree_pattern, brief_template, heartbeat_sla}
-verifier: {gate_profile, reviewer_lanes: [...], readiness_context, acceptance}  # SEAM: adapter
+verifier: {gate_profile, reviewer_lanes: [...], readiness_context, acceptance,
+           repro_gate: best_effort|pod_required}  # SEAM: adapter
 adjudication: {auto_action_categories, blast_radius_max, security_denylist}     # SEAM: policy as data
 governance: {max_in_flight, per_cycle, credit_budget_per_item, session_ceiling, posture}
 interface: {folder_name, worker_model, digest_language, notify_channel}
@@ -250,6 +263,18 @@ adapter (reviewer lanes as a data list), protocol vocabulary as data (labels, ma
 the highest-leverage seam), adjudication policy as data, and per-repo identity (#6221). One
 invariant stays out of the template: the forge is the cross-operator lock (claim label + assignee
 + operator-tagged comments); local state is only a cache.
+
+`verifier.repro_gate` is campaign admission policy, not a score attached after implementation.
+`best_effort` preserves the generic worker contract. `pod_required` admits an issue only after the
+unmodified worktree produces the reported failure through a live pod's real product surface; unit
+or structural repro does not substitute. A missing route, caller identity, scenario, host
+capability, or externally drivable trigger produces an evidence-bearing stand-down with no edits,
+commit, or PR, and the conductor advances the queue. The same pod trace must turn green before the
+item can report green. This distinction prevents a pipeline advertised as pod verification from
+silently measuring ordinary unit-fix throughput instead. The two values are the whole set, checked
+at startup by `scripts/spec_check.py` rather than by prose: a spec whose gate is neither value
+engages neither branch, so it would run generically while reading as gated, and the check refuses
+the run instead of defaulting.
 
 ## Phases
 

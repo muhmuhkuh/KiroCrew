@@ -7,7 +7,7 @@ MUTATION-VERIFIED assertion recorded in the PR write-up (break the code, watch t
 test go red, restore):
 
   * **The live phase is the record's, authoritative — never the max timeline
-    index.** A review round-trip ends LEFT of where it has been, so keying the head
+    index.** A review can send an item LEFT of where it has been, so keying the head
     off the furthest column reached puts the item in a phase it already left.
   * **Off-spine phases are an ``exit``, not a timeline entry**, and the exit stands
     only when the item's live phase is itself off-spine (a reopen clears it).
@@ -320,7 +320,7 @@ class FoldTest(unittest.TestCase):
         item = _fold_item(self.root, 5120)
 
         self.assertEqual(item["phase"], "awaiting-ci")  # on-spine now
-        self.assertIsNone(item["exit"])  # the yield no longer holds
+        self.assertIsNone(item["exit"])  # the yield does not hold
         self.assertEqual(item["reopens"], 1)  # implementing re-entered after the exit
         # yielded is off-spine, so it never appears in the timeline spine.
         self.assertNotIn("yielded", [t["phase"] for t in item["timeline"]])
@@ -428,11 +428,20 @@ class FoldTest(unittest.TestCase):
     # ── ordering across items ────────────────────────────────────────────────
 
     def test_items_are_newest_progress_first(self):
-        _step(self.root, self.cid, 100, "claimed", "claim", "older")
-        _step(self.root, self.cid, 200, "claimed", "claim", "newer")
+        # Distinct progress timestamps establish recency independently of clock resolution.
+        with mock.patch.object(store, "_now_iso", return_value="2026-01-01T00:00:00.000000Z"):
+            _step(self.root, self.cid, 100, "claimed", "claim", "older")
+        with mock.patch.object(store, "_now_iso", return_value="2026-01-01T00:00:01.000000Z"):
+            _step(self.root, self.cid, 200, "claimed", "claim", "newer")
         numbers = [it["number"] for it in crew_store.fold_fabric(OWNER, REPO, self.root)]
         self.assertEqual(numbers[0], 200)
         self.assertIn(100, numbers)
+
+        # Progress on the older item must outrank creation time on the newer item.
+        with mock.patch.object(store, "_now_iso", return_value="2026-01-01T00:00:02.000000Z"):
+            _step(self.root, self.cid, 100, "implementing", "implement", "resumed work")
+        numbers = [it["number"] for it in crew_store.fold_fabric(OWNER, REPO, self.root)]
+        self.assertEqual(numbers, [100, 200])
 
 
 # ── route ────────────────────────────────────────────────────────────────────

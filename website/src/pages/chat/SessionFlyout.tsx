@@ -6,6 +6,7 @@ import type { ChatSlot } from '../../types'
 import { compareBySort, comparePinnedThenSort } from './sessionOrder'
 import { i18nT } from '../../i18n/t'
 import { PINNED_SESSION_ORDER_CHANGED_EVENT, PINNED_SESSION_ORDER_KEY, readPinnedSessionOrder, reconcilePinnedSessionOrder } from '../../utils/pinnedSessionOrder'
+import { LIST_TITLE_CLS } from '../../components/listShell'
 
 /** Rows shown before the list defers to "show all". Sized so the flyout stays
  *  a glance rather than a panel: past ~8 rows the eye has to scan, at which
@@ -252,7 +253,7 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
               than a flyout-local copy means the two can never disagree, in any
               locale. A distinct "Recent" caption would put a text swap in the
               middle of a morph whose whole point is that nothing moves. */}
-          <span className="sessions-panel-title truncate text-sm font-semibold tracking-[.04em] text-text-strong">
+          <span className={LIST_TITLE_CLS}>
             {i18nT('pages.chatSidebar.sessions')}
           </span>
         </div>
@@ -294,7 +295,7 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
               aria-disabled={!connected}
               title={label}
               onClick={() => { if (connected) onSwitch(slot.key) }}
-              className={`flex w-full items-center gap-2 rounded-md border-none bg-transparent px-2 py-1.5 text-left text-[13px] outline-none transition-colors ${
+              className={`flex w-full items-center gap-2 rounded-md border-none bg-transparent px-2 py-1.5 text-left text-[13px] outline-hidden transition-colors ${
                 isActive
                   ? '!bg-accent-subtle text-text-strong'
                   : connected
@@ -310,7 +311,7 @@ const SessionFlyout = forwardRef<HTMLDivElement, Props>(function SessionFlyout({
                   status === 'approval' ? 'bg-warn'
                     : status === 'question' ? 'bg-info'
                       : status === 'running' ? 'bg-accent animate-pulse'
-                        : isUnread ? 'bg-accent'
+                        : isUnread ? 'bg-ok'
                           : 'bg-transparent'
                 }`}
               />

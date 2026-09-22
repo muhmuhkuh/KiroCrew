@@ -206,12 +206,20 @@ def _resolve_concurrency(explicit: int | None = None) -> int:
 
 
 def _cid(link: str) -> str:
-    """Derive the change id from a GitHub PR link — filesystem-safe. A PR URL ->
-    ``GH-<owner>-<repo>-<n>`` (matching the id ``adapters.parse_github_payload``
-    records, so the worker's written record and the driver's read hit the same
-    file); otherwise a sanitized fallback (never a raw URL, which is not a valid
-    filename)."""
+    """Derive the change id from a GitHub PR or GitLab MR link — filesystem-safe.
+    A PR URL -> ``GH-<owner>-<repo>-<n>`` (matching the id
+    ``adapters.parse_github_payload`` records) or ``GL-<ns>-<iid>`` (matching
+    ``adapters.parse_gitlab_payload`` records), so the worker's written record and
+    the driver's read hit the same file; otherwise a sanitized fallback (never a
+    raw URL, which is not a valid filename)."""
     try:
+        platform = pipeline.adapters.detect_platform(link)
+    except pipeline.adapters.AdapterError:
+        return results.safe_change_id(link)
+    try:
+        if platform == "gitlab":
+            host, namespace, iid = pipeline.adapters.gitlab_pr_ref(link)
+            return pipeline.adapters.gitlab_change_id(namespace, iid, host=host)
         host, owner, repo, number = pipeline.adapters.github_pr_ref(link)
         return pipeline.adapters.github_change_id(owner, repo, number, host=host)
     except pipeline.adapters.AdapterParseError:
@@ -235,10 +243,18 @@ def reviewed_key_for(link: str) -> str:
     is therefore lossily sanitized (``-`` -> ``_``), which let two different repos
     (``acme/service-api`` vs ``acme/service_api``) with the same PR number collide
     on one dedup key and skip a requested review. The reviewed-index key never
-    names a file, so it uses the lossless canonical identity instead. Falls back to
-    the sanitized change-id for a non-PR link (defensive; repo-review only ever
-    feeds real PR URLs from ``list_open_prs``)."""
+    names a file, so it uses the lossless canonical identity instead (GitHub:
+    ``github_review_key``, GitLab: ``gitlab_review_key``). Falls back to the
+    sanitized change-id for a non-PR link (defensive; repo-review only ever feeds
+    real PR/MR URLs from ``list_open_prs``)."""
     try:
+        platform = pipeline.adapters.detect_platform(link)
+    except pipeline.adapters.AdapterError:
+        return results.safe_change_id(link)
+    try:
+        if platform == "gitlab":
+            host, namespace, iid = pipeline.adapters.gitlab_pr_ref(link)
+            return pipeline.adapters.gitlab_review_key(namespace, iid, host=host)
         host, owner, repo, number = pipeline.adapters.github_pr_ref(link)
         return pipeline.adapters.github_review_key(owner, repo, number, host=host)
     except pipeline.adapters.AdapterParseError:
@@ -246,25 +262,28 @@ def reviewed_key_for(link: str) -> str:
 
 
 def _confirmed_host(link: str) -> str:
-    """The link's validated GitHub host, or ``""`` for a bare legacy change
-    token that names no host at all.
+    """The link's validated GitHub or GitLab host, or ``""`` for a bare legacy
+    change token that names no host at all.
 
     FAILS CLOSED: raises ``AdapterError`` when the link NAMES a host that does
-    not (re)validate against ``allowed_hosts()`` — e.g. a GitHub Enterprise
-    host removed from ``github_hosts`` between run start and prompt build, or
+    not (re)validate against ``allowed_hosts()`` / ``gitlab_allowed_hosts()`` —
+    e.g. a host removed from the allowlist between run start and prompt build, or
     an unreadable config. Producing a prompt for such a link would let its
-    ``gh api`` calls default to PUBLIC github.com and cross GitHub instances
-    (fetching from — or posting an internal enterprise draft onto — a public
-    same-slug PR). A token that names no host (``CR-1``) has no instance to
-    cross to, so it keeps the legacy default-instructions path: ``""`` here
-    means "no host named", never "failed to resolve" — those two cases are
-    deliberately NOT allowed to look identical."""
+    ``gh``/``glab`` api calls default to the PUBLIC instance and cross hosts
+    (fetching from — or posting an internal enterprise PR/MR draft onto — a
+    public same-slug change). A token that names no host (``CR-1``) has no
+    instance to cross to, so it keeps the legacy default-instructions path:
+    ``""`` here means "no host named", never "failed to resolve" — those two
+    cases are deliberately NOT allowed to look identical."""
     try:
-        return pipeline.adapters.github_pr_ref(link)[0]
+        platform = pipeline.adapters.detect_platform(link)
     except pipeline.adapters.AdapterError:
         if pipeline.adapters.link_names_a_host(link):
             raise
         return ""
+    if platform == "gitlab":
+        return pipeline.adapters.gitlab_pr_ref(link)[0]
+    return pipeline.adapters.github_pr_ref(link)[0]
 
 
 def python_command() -> str:
@@ -523,7 +542,7 @@ def build_post_task(change_link: str) -> str:
     )
     # FAIL CLOSED on host resolution — the host decides which GitHub instance
     # every `gh api` call in this prompt targets. `_confirmed_host` raises when
-    # the link names a host that no longer revalidates (a GHE host removed from
+    # the link names a host that does not revalidate (a GHE host removed from
     # `github_hosts` mid-run, an unreadable config); producing a prompt then
     # would let every call default to PUBLIC github.com and post an internal
     # enterprise draft onto a public same-slug PR. The raise is converted to a
@@ -825,7 +844,7 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
         return {"post_ok": False, "post_error": staged, "posted_comments": 0,
                 "design_comment_posted": False, "pending": len(pending),
                 "expected_units": 0, "posted_keys": list(already)}
-    # The prompt builder FAILS CLOSED when the link's host no longer revalidates
+    # The prompt builder FAILS CLOSED when the link's host does not revalidate
     # (see build_post_task): a prompt built with an unconfirmed host would let
     # its `gh api` calls default to public github.com and land this draft on a
     # public same-slug PR. Surface that as a per-change post failure — the
@@ -915,8 +934,8 @@ def post_recorded(change_id: str, link: str, *, dispatch, root: Path | None = No
             spawn.get("error", "")
             or ("" if confirmed else
                 "the posted draft could not be confirmed on the pull request")),
-        # Authoritative once confirmed: `after["posted_comments"]` was replaced with
-        # the payload's own unit count above, so this no longer echoes the poster.
+        # Authoritative once confirmed: `after["posted_comments"]` holds the payload's
+        # own unit count from above, so this does not echo the poster.
         "posted_comments": int(after.get("posted_comments", 0) or 0),
         "design_comment_posted": bool(after.get("design_comment_posted")),
         "pending": len(pending),
@@ -1042,7 +1061,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
     Phase-2 deep-review task for every usable verdict (PASS / CONCERNS / BLOCK).
     Each task is dispatched to the reusable worker pool (``dispatch``) and the
     call returns when that task's session finishes its turn. The driver reads
-    the gate verdict; a BLOCK no longer skips Phase 2 (it only informs the ship
+    the gate verdict; a BLOCK does not skip Phase 2 (it only informs the ship
     decision), then builds the Focus Report. Returns a deterministic summary.
 
     ``dispatch`` is an injected ``(task, timeout) -> {ok, output, error}`` callable
@@ -1205,7 +1224,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         # someone else's findings on this pull request. If the slot cannot be cleared, skip
         # adoption rather than trust it.
         # Build the prompt BEFORE staking the shared slot: the builder FAILS
-        # CLOSED (raises) when the link's host no longer revalidates against
+        # CLOSED (raises) when the link's host does not revalidate against
         # `allowed_hosts()`, and a fetch instruction with an unconfirmed host
         # would route the worker at public github.com — reviewing (and later
         # posting about) a same-slug public PR instead of the intended one.
@@ -1406,7 +1425,7 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
         #
         # The report is written to the run's own dir FIRST and kept there
         # regardless of whether the artifact archive succeeds — the in-app report
-        # view reads that file, so a failed archive no longer means "no report".
+        # view reads that file, so a failed archive does not mean "no report".
         try:
             rep = report.generate(root, run_id=run_id)
             summary["report"] = rep["index"]

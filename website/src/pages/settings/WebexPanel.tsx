@@ -10,6 +10,7 @@ import { TagListEditor } from './SlackPanel'
 import { api, type WebexConfigData, type WebexConfigSave } from '../../api/client'
 
 import { i18nT } from '../../i18n/t'
+import { ChannelFolderBackfill } from './ChannelFolderBackfill'
 /** Brand name — do-not-translate, so it lives here rather than in the catalog. */
 const CHANNEL_NAME = "Webex"
 const CREATE_BOT_URL = 'https://developer.webex.com/my-apps/new/bot'
@@ -375,6 +376,14 @@ export function WebexPanel() {
                 />
               </div>
             )}
+            {!!data.session_folder && (
+              <ChannelFolderBackfill
+                namespace="webex"
+                folderName={data.session_folder}
+                disabled={ro}
+                testId="session-folder-backfill"
+              />
+            )}
           </div>
         </SettingsCard>
       </SettingsSection>
@@ -415,7 +424,7 @@ export function WebexPanel() {
         </Btn>
         {saved && (
           <span className="inline-flex items-center gap-1.5 text-[12px] text-ok">
-            <Check size={14} /> {tokenVerified ? i18nT('pages.settings.webexPanel.verified_with_webex_and_saved_restart_the_gatewa') : restartHint ? i18nT('pages.settings.webexPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.webexPanel.saved')}
+            <Check size={14} /> {tokenVerified ? (restartHint ? i18nT('pages.settings.webexPanel.verified_with_webex_and_saved_restart_the_gatewa') : i18nT('pages.settings.webexPanel.verified_and_saved')) : restartHint ? i18nT('pages.settings.webexPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.webexPanel.saved')}
           </span>
         )}
         {saved && verifyWarning && (

@@ -15,7 +15,7 @@ import asyncio
 import contextlib
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -322,34 +322,46 @@ class TestDigestHoldSecs:
 
 
 class TestCheckMemoryAvailable:
-    def test_parses_mem_available(self) -> None:
-        text = "MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_parses_mem_available(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal:       1000 kB\nMemAvailable:    8388608 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert ok is True
         assert gb == 8.0
 
-    def test_below_threshold_reports_not_ok(self) -> None:
-        text = "MemAvailable:    1048576 kB\n"
-        with patch.object(sa, "safe_read_file", return_value=text):
-            ok, gb = sa.check_memory_available(min_gb=4.0)
+    def test_below_threshold_reports_not_ok(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    1048576 kB\n")
+        ok, gb = sa.check_memory_available(min_gb=4.0, path=str(f))
         assert (ok, gb) == (False, 1.0)
 
-    def test_sensitive_path_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=PermissionError):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_path_gate_not_consulted(self, tmp_path: Path) -> None:
+        """The fixed kernel path is read with plain open, never the gate."""
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:    8388608 kB\n")
+        with (
+            patch("kiro_crew.hooks.safe_read_file", side_effect=AssertionError),
+            patch("kiro_crew.hooks.is_sensitive_path", side_effect=AssertionError),
+        ):
+            assert sa.check_memory_available(min_gb=4.0, path=str(f)) == (True, 8.0)
+
+    def test_permission_error_fails_open(self) -> None:
+        with patch("builtins.open", side_effect=PermissionError):
+            assert sa.check_memory_available(path="/test/meminfo") == (True, -1.0)
 
     def test_read_error_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", side_effect=OSError):
-            assert sa.check_memory_available() == (True, -1.0)
+        with patch("builtins.open", side_effect=OSError):
+            assert sa.check_memory_available(path="/test/meminfo") == (True, -1.0)
 
-    def test_malformed_line_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemAvailable:  notanumber kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_malformed_line_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemAvailable:  notanumber kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
-    def test_missing_key_fails_open(self) -> None:
-        with patch.object(sa, "safe_read_file", return_value="MemTotal: 12 kB\n"):
-            assert sa.check_memory_available() == (True, -1.0)
+    def test_missing_key_fails_open(self, tmp_path: Path) -> None:
+        f = tmp_path / "meminfo"
+        f.write_text("MemTotal: 12 kB\n")
+        assert sa.check_memory_available(path=str(f)) == (True, -1.0)
 
 
 class TestReadIntFile:
@@ -373,6 +385,13 @@ class TestReadIntFile:
 
 
 class TestCgroupAvailable:
+    @pytest.fixture(autouse=True)
+    def _fixed_cgroup_roots(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Calculation cases use fixed mounts, independent of the host's /proc."""
+        v2 = PurePosixPath("/sys/fs/cgroup")
+        v1 = PurePosixPath("/sys/fs/cgroup/memory")
+        monkeypatch.setattr(sa, "_cgroup_memory_roots", lambda: [(v2, v2, True), (v1, v1, False)])
+
     def _reader(self, values: dict[str, int | None]):
         return lambda path: values.get(path)
 
@@ -424,12 +443,22 @@ class TestCgroupAvailable:
         monkeypatch.setattr(sa, "_read_int_file", self._reader({}))
         assert sa._cgroup_available_gb() == -1.0
 
-    def test_usage_absent_treated_as_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("usage, expected", [(None, 0.0), (0, 2.0)])
+    def test_usage_unknown_is_distinct_from_zero(
+        self, monkeypatch: pytest.MonkeyPatch, usage: int | None, expected: float
+    ) -> None:
         gib = 1024**3
         monkeypatch.setattr(
-            sa, "_read_int_file", self._reader({"/sys/fs/cgroup/memory.max": 2 * gib})
+            sa,
+            "_read_int_file",
+            self._reader(
+                {
+                    "/sys/fs/cgroup/memory.max": 2 * gib,
+                    "/sys/fs/cgroup/memory.current": usage,
+                }
+            ),
         )
-        assert sa._cgroup_available_gb() == pytest.approx(2.0)
+        assert sa._cgroup_available_gb() == expected
 
 
 class TestAvailableMemoryGb:
@@ -837,7 +866,7 @@ class TestSampleLiveCounts:
         assert (info.last_procs, info.last_stubs) == (7, 6)
 
     def test_one_walk_per_agent_not_one_per_metric(self) -> None:
-        """The whole point of #3970: RSS, CPU and both counts come off ONE walk.
+        """The whole point: RSS, CPU and both counts come off ONE walk.
 
         Patching the shared sample is not enough to prove that — a sweep that
         still called three readers would also pass the assertions above. Count
@@ -1105,10 +1134,10 @@ class TestReadSurfaces:
         assert mgr.task_memory_rows() == []
 
     def test_task_memory_rows_redact_before_truncate(self) -> None:
-        """#5582: a credential straddling the 80-char cut must not leak a fragment.
+        """A credential straddling the 80-char cut must not leak a fragment.
 
         The old spelling ``_redact(a.task[:80])`` sliced first, so a key cut at
-        the boundary lost its tail and no longer matched the credential regex —
+        the boundary loses its tail and does not match the credential regex —
         the raw prefix escaped into the session-memory surface.
         The fabricated AKIA-shaped literal is inlined rather than bound to a
         ``secret``-named variable, which would trip CodeQL's name-based
@@ -1143,6 +1172,30 @@ class TestReadSurfaces:
         mgr = _manager(max_concurrent=7)
         mgr._running_count = 4
         assert (mgr.max_concurrent, mgr.running_count) == (7, 4)
+
+    @pytest.mark.asyncio
+    async def test_pending_work_count_covers_post_slot_lifecycle_tasks(self) -> None:
+        mgr = _manager()
+        release = asyncio.Event()
+        recovery = asyncio.create_task(release.wait())
+        report = asyncio.create_task(release.wait())
+        followup = asyncio.create_task(release.wait())
+        reconcile = asyncio.create_task(release.wait())
+        completed = asyncio.create_task(asyncio.sleep(0))
+        await completed
+        mgr._running_count = 0
+        mgr._queue = [{"parent_session_key": "dash:1"}]
+        mgr._tasks = {"run:recovery": recovery, "done": completed}
+        mgr._report_tasks = {report}
+        mgr._followup_watchers = {"run": followup}
+        mgr._reconcile_task = reconcile
+        mgr._abandoned_state_writers = {"state-writer"}
+        try:
+            # queue + recovery + report + follow-up + reconciliation + writer
+            assert mgr.pending_work_count == 6
+        finally:
+            release.set()
+            await asyncio.gather(recovery, report, followup, reconcile)
 
 
 class TestQueueDepth:
@@ -1257,6 +1310,246 @@ class TestNotifyInjectionFailed:
             side_effect=RuntimeError("no dashboard"),
         ):
             mgr.notify_injection_failed(_info(parent_session_key="dash:1"))
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_cancelled_run_announces_nothing(self, tmp_path: Path) -> None:
+        """A run whose parent ended must not queue a failure into that parent.
+
+        The notice is drained into the LLM's context on the parent key's next
+        turn, so a queued one outlives the conversation it describes.
+        """
+        seen: list[dict] = []
+
+        async def _on_event(_etype: str, _info: SubagentInfo, extra: dict) -> None:
+            seen.append(extra)
+
+        mgr = _manager(on_event=_on_event)
+        info = _info(parent_session_key="dash:1")
+        mgr._teardown_cancelled_ids.add(info.id)
+        with patch("kiro_crew.dashboard.chat_utils.dashboard_slot_key", return_value="slot-1"):
+            mgr.notify_injection_failed(info)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen == []
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_cancelled_member_arms_no_digest_flush(self) -> None:
+        """The hold-expiry sweep must not arm a flush for a wave whose parent ended.
+
+        A wave member parks its siblings' announces on its own digest. When the hold
+        ages out the reaper forces a partial flush -- and that flush is a SYNTHETIC
+        record with a fresh id, so the delivery gate keyed on run ids can never
+        recognise it. It would reach ``_on_done`` on its own and rebuild the retired
+        parent's conversation minutes after the teardown. The member is therefore
+        skipped at the source, in the expiry scan.
+        """
+        import kiro_crew.subagent as _facade
+
+        mgr = _manager(on_done=AsyncMock())
+        held = _info(parent_session_key="dash:1")
+        held.batch_id = "wave-1"
+        held.batch_total = 2
+        held._digest_held_at = 1.0
+        mgr._agents[held.id] = held
+
+        scan = mgr._waves._expired_digest_holds
+        with patch.object(_facade, "DIGEST_HOLD_SECS", 5.0):
+            assert scan(1000.0), (
+                "the scan found no expiry for an aged hold, so this test is not "
+                "exercising the gate it claims to"
+            )
+            mgr._teardown_cancelled_ids.add(held.id)
+            assert scan(1000.0) == []
+
+    @pytest.mark.asyncio
+    async def test_a_suppressed_report_drops_its_own_digest_hold(self) -> None:
+        """Skipping the delivery also releases what the run was holding.
+
+        Leaving ``_digest_held_at`` set would let the next expiry sweep arm the flush
+        this run's own suppression exists to prevent, and leaving ``_digest_settle_ids``
+        on the record would leave its held siblings with an ungated delivery. The
+        siblings are marked, not tombstoned: their results never reached a parent, so
+        orphan reconciliation must still be able to find them.
+        """
+        mgr = _manager(on_done=AsyncMock())
+        info = _info(parent_session_key="dash:1")
+        info.done = False
+        info._digest_held_at = 1.0
+        info._digest_settle_ids = ["sib-1", "sib-2"]
+        mgr._agents[info.id] = info
+        mgr._teardown_cancelled_ids.add(info.id)
+
+        await mgr._report_terminal(
+            info,
+            source="test",
+            injection_timeout_reason="delivery timed out",
+            mark_delivered_on_success=False,
+        )
+
+        assert info._digest_held_at == 0.0
+        assert info._digest_settle_ids == []
+        assert "sib-1" in mgr._teardown_cancelled_ids
+        assert "sib-2" in mgr._teardown_cancelled_ids
+        mgr._on_done.assert_not_awaited()
+
+    def test_the_teardown_gate_forgets_by_age_and_never_by_count(self) -> None:
+        """Eviction is AGE, because a capacity rule can drop a live gate.
+
+        One parent with more queued children than any capacity would evict its own
+        earliest ids while their reports were still being spawned, and those reports then
+        walk through the gate and rebuild the conversation the teardown took down. An age
+        rule cannot: the TTL exceeds every window in which a marked run has an announce
+        left. A read must not extend an entry's life either, or the TTL stops describing
+        what is retained.
+        """
+        from kiro_crew.subagent import _AgingIdSet
+
+        ids = _AgingIdSet(3600.0)
+        ids.update(str(n) for n in range(10_000))
+        assert len(ids) == 10_000, "a count rule evicted ids whose runs can still announce"
+        assert "0" in ids
+
+        aged = _AgingIdSet(1.0)
+        with patch("kiro_crew.subagent.time.monotonic", return_value=1_000.0):
+            aged.update(["old-1", "old-2"])
+        with patch("kiro_crew.subagent.time.monotonic", return_value=1_000.5):
+            assert "old-1" in aged  # a read does not refresh it
+        with patch("kiro_crew.subagent.time.monotonic", return_value=1_100.0):
+            aged.add("new-1")
+        assert list(aged) == ["new-1"]
+
+    @pytest.mark.asyncio
+    async def test_a_suppressed_report_discards_its_own_gate_entry(self) -> None:
+        """The gate keeps an id until that run's delivery is suppressed, not for a span.
+
+        Age is only the backstop. Once the report has been dropped, ``_on_done`` was never
+        called, so none of the gateway's injection paths can fire for this run either --
+        the entry has done its job. Leaving it to expire instead made the gate depend on a
+        TTL in the ordinary case, and an approval-parked run (deliberately not cancelled,
+        because the approval is a person's to answer) can outlive any short one.
+        """
+        mgr = _manager(on_done=AsyncMock())
+        info = _info(parent_session_key="dash:1")
+        info.done = False
+        mgr._agents[info.id] = info
+        mgr._teardown_cancelled_ids.add(info.id)
+
+        await mgr._report_terminal(
+            info,
+            source="test",
+            injection_timeout_reason="delivery timed out",
+            mark_delivered_on_success=False,
+        )
+
+        mgr._on_done.assert_not_awaited()
+        assert info.id not in mgr._teardown_cancelled_ids, (
+            "the gate entry outlived the suppression it existed for, so the set depends on "
+            "its age backstop even on the ordinary path"
+        )
+
+    @pytest.mark.usefixtures("healthy_host_memory")
+    @pytest.mark.asyncio
+    async def test_a_rejected_spawn_approval_after_teardown_does_not_recreate_the_conversation(
+        self,
+    ) -> None:
+        """The REJECTION path announces too, and it never reached ``_report_terminal``.
+
+        A spawn parked on its approval is marked by the teardown and deliberately not
+        cancelled, because the approval is a person's to answer. When that person then
+        DECLINES, the spawn gate takes its own terminal exit: it claims the finalize and
+        calls ``_safe_announce`` directly, without passing through the terminal report
+        where the delivery gate lives. So the one representation the teardown is certain
+        to have marked walked straight into ``_on_done``, which resolves the parent key
+        through the session registry and CREATES a session when none is live -- rebuilding
+        the conversation the teardown had just taken down and seeding it with the refusal
+        of a spawn that key never asked for.
+
+        Driven through the real gate rather than a hand-built record: ``spawn`` registers,
+        the approval callback parks, ``snapshot_teardown_children`` arms the mark exactly
+        as ``session_lifecycle`` does, and only then is the prompt answered ``False``.
+        """
+        approval_gate = asyncio.Event()
+
+        async def _park_then_decline(
+            _request_id: str, _description: str, _parent: str = ""
+        ) -> bool:
+            await approval_gate.wait()
+            return False
+
+        sessions = _sessions()
+        # "ask" is what makes the spawn consult the interactive callback at all;
+        # the agent seams below are what let vetting pass on a bare double.
+        sessions.get_approval_policy = MagicMock(return_value="ask")
+        sessions.get_agent = MagicMock(return_value="")
+        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("built", None))
+        ctx.hooks.on_tool_call = MagicMock()
+        ctx.hooks.auto_approve_subagent_spawn = False
+
+        mgr = _manager(
+            sessions=sessions,
+            ctx_builder=ctx,
+            on_spawn_approval=_park_then_decline,
+            on_done=AsyncMock(),
+            is_yolo=lambda: False,
+        )
+        info = mgr.spawn("t", parent_session_key="dash:1")
+        assert info is not None
+        for _ in range(20):
+            await asyncio.sleep(0)
+        registered = mgr._agents.get(info.id)
+        assert registered is not None, f"spawn did not register: {info.error!r}"
+        assert registered._awaiting_approval is True, "precondition: parked on its prompt"
+
+        # The teardown's synchronous half. It returns nothing to cancel for a parked
+        # run and marks it for delivery suppression instead -- that split is the point.
+        assert mgr.snapshot_teardown_children("dash:1") == ()
+        assert info.id in mgr._teardown_cancelled_ids
+
+        approval_gate.set()
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if registered.done:
+                break
+
+        assert registered.done is True, "the decline did not reach its terminal exit"
+        mgr._on_done.assert_not_awaited()
+
+        for task in list(mgr._tasks.values()):
+            task.cancel()
+        await asyncio.sleep(0)
+
+    def test_the_gate_backstop_outlasts_a_human_approval_window(self) -> None:
+        """The age backstop must not prune a run that is waiting on a person.
+
+        An approval-parked run is deliberately not cancelled, so it can sit for as long as
+        the person takes. An hour let a later teardown prune its mark while it waited, and
+        the completion then injected into whatever the key served by then.
+        """
+        from kiro_crew.subagent import _TEARDOWN_GATE_TTL_SECS
+
+        assert _TEARDOWN_GATE_TTL_SECS >= 86400.0, (
+            "the backstop is shorter than a person plausibly takes to answer an approval, "
+            f"so a waiting run's mark can be pruned before it completes: {_TEARDOWN_GATE_TTL_SECS}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_sibling_of_a_teardown_cancelled_run_still_announces(self) -> None:
+        """The gate is per-id: a run the teardown did not touch is unaffected."""
+        seen: list[dict] = []
+
+        async def _on_event(_etype: str, _info: SubagentInfo, extra: dict) -> None:
+            seen.append(extra)
+
+        mgr = _manager(on_event=_on_event)
+        mgr._teardown_cancelled_ids.add("some-other-agent")
+        info = _info(parent_session_key="dash:1")
+        with patch("kiro_crew.dashboard.chat_utils.dashboard_slot_key", return_value="slot-1"):
+            mgr.notify_injection_failed(info)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert seen and seen[0]["slot"] == "slot-1"
 
 
 # ── Injection-failure notice: outcome-aware copy ──────────────────────────

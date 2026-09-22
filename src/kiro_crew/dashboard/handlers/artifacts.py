@@ -136,11 +136,15 @@ def _notify_artifact_update(state: Any, slug: str, version: int, *, deleted: boo
     Called from the mutation funnel (create / content update / revert /
     relocate / delete) — the same choke points as the SEL audit, so panel
     chat, other dashboard sessions, Slack, and CLI mutations all emit.
-    Fire-and-forget:
-    react-query's 30s staleness window remains the safety net if the broadcast
-    fails or a client misses it. Known limitation (accepted): external edits to
-    a file-backed artifact's source_path never pass through a handler, so those
-    stay on pull-based refresh.
+    Fire-and-forget: a dropped or missed broadcast is picked up the next time a
+    client fetches the artifact.
+
+    External edits to a file-backed artifact's source_path never pass through a
+    handler, so this never fires for them. The dashboard covers that case from
+    the other side: ``useArtifactLiveReload`` watches ``source_path`` over
+    ``GET /api/file-watch`` and refetches the artifact on a change (see
+    docs/system-specs/modules/artifacts.md, "Live refresh — file-backed
+    artifacts").
     """
     try:
         if state is not None:
@@ -4537,6 +4541,13 @@ async def api_artifact_publish_providers(request: web.Request) -> web.Response:
                 # send the user somewhere generic, and a provider's own hint is the only
                 # thing that knows WHICH action makes it available.
                 "install_hint": str(getattr(p, "install_hint", "") or ""),
+                # Whether the published link is served with no authentication. The
+                # FE gates the public-exposure warning and the acknowledgment modal
+                # on it; a destination that stores content privately declares False
+                # so the flow stops telling the user their content is on the open
+                # internet. Coerced to a real bool so a stub attribute cannot leak a
+                # non-JSON value into the response.
+                "public_reachable": bool(p.public_reachable),
                 "sharing_model": _sharing_model_dict(sm),
                 "sync_model": {
                     "authority": sy.authority,

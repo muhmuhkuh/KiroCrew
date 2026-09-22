@@ -22,7 +22,9 @@ organized for someone browsing the repository.
 | Doc | Covers |
 |---|---|
 | [agents.md](agents.md) | Switching between specialized agents per conversation, thread, or cron job. |
+| [agent-spec-fields.md](agent-spec-fields.md) | Every agent-spec field, what it does, and how that differs per ACP backend. |
 | [skills.md](skills.md) | Drop-in markdown knowledge packs for domain-specific workflows. |
+| [monitoring.md](monitoring.md) | Token-efficient pull-request monitoring and finite legacy fallbacks. |
 | [cron-and-scheduling.md](cron-and-scheduling.md) | Scheduling recurring tasks. |
 | [subagents.md](subagents.md) | Spawning parallel background workers for fan-out work. |
 | [dynamic-subagent-sizing.md](dynamic-subagent-sizing.md) | How the concurrent sub-agent cap is sized from host memory and CPU. |
@@ -31,6 +33,7 @@ organized for someone browsing the repository.
 | [memory-and-learning.md](memory-and-learning.md) | Persistent preferences, project context, and learned corrections. |
 | [knowledge-library-how-it-works.md](knowledge-library-how-it-works.md) | How the knowledge graph is built from your documents. |
 | [dashboard.md](dashboard.md) | The web dashboard: multi-session chat, memory management, live metrics. |
+| [issue-radar-pipeline.md](issue-radar-pipeline.md) | Which step of automated triage every issue is sitting in, how long it has been there, and what each agent session cost. |
 | [agent-questions.md](agent-questions.md) | Letting an agent pause mid-turn to ask a clickable question. |
 | [followup-suggestions.md](followup-suggestions.md) | Agent-proposed next steps above the composer. |
 | [feature-tips.md](feature-tips.md) | Personalized tips pointing at features you have not used. |
@@ -44,6 +47,7 @@ organized for someone browsing the repository.
 | [session-ledger.md](session-ledger.md) | The durable per-session work record that survives context compaction. |
 | [artifacts.md](artifacts.md) | Saving, versioning, and reverting generated UI and documents. |
 | [computer-use.md](computer-use.md) | Reading and driving native desktop applications; opt-in and off by default. |
+| [decisions.md](decisions.md) | Jev decisions: letting a small fast model pick the automatic skill for a sampled conversation and pick whether a mid-turn message steers or queues, with the shipped behaviour as the fallback; flagging a risky tool call on its own card in a session that approves its own calls, which changes no permission; and a basic diagnostic log for all of them. |
 | [browser-control.md](browser-control.md) | Driving a real web page from the dashboard's Browser panel. |
 
 ## Channels
@@ -67,10 +71,11 @@ organized for someone browsing the repository.
 | Doc | Covers |
 |---|---|
 | [mcp-apps.md](mcp-apps.md) | Rendering interactive MCP tool output in chat: the two gates, what a server declares, and the plain-text fallback. |
+| [settings-deeplink.md](settings-deeplink.md) | Answering "where is that setting?" with a link that opens and flashes the control, and the generated registry it comes from. |
 
 ## Maintaining this directory
 
-Two constraints make this tree different from `docs/`:
+Three constraints make this tree different from `docs/`:
 
 - **Filenames are an API.** `tips.py` globs `*.md` here and filters through
   `tips_allowlist.py`, extracting each doc's H1 and first paragraph into the in-app
@@ -81,8 +86,15 @@ Two constraints make this tree different from `docs/`:
 - **The tree is flat, deliberately.** `setup.cfg`'s `package_data` glob for this
   directory does not recurse, so a file in a subdirectory would ship in the sdist
   but be missing from the wheel.
+- **Not every file here is prose.** `settings-registry.generated.json` is a build
+  artifact of the dashboard (`npm run gen:settings`), shipped beside
+  [settings-deeplink.md](settings-deeplink.md) so the agent can enumerate the
+  Settings controls at runtime. Do not hand-edit it; a frontend test byte-matches
+  it against the live panels.
 
 Because every doc here reaches every user, keep the content task-oriented and free
 of internal design narration. An engineering note belongs in
-[`../../../docs/`](../../../docs/README.md) instead. Each doc's first paragraph is
+[`../../../docs/`](../../../docs/README.md) instead — for example
+[how the model's context is assembled](../../../docs/architecture/context-management.md),
+which cites private symbols and so lives there rather than here. Each doc's first paragraph is
 read verbatim as a feature description, so write it to stand alone.

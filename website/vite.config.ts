@@ -9,6 +9,7 @@ import { fileURLToPath, URL } from 'node:url'
 import { defineConfig, type Plugin } from 'vite'
 /// <reference types="vitest" />
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs'
 import { execSync } from 'child_process'
 import http from 'http'
@@ -94,6 +95,7 @@ function appImportMapPlugin(): Plugin {
             'react/jsx-runtime': '/vendor/react-jsx-runtime.mjs',
             '@kirocrew/app-sdk': '/vendor/kirocrew-app-sdk.mjs',
             '@kirocrew/app-sdk/ui': '/vendor/kirocrew-ui.mjs',
+            '@tanstack/react-query': '/vendor/tanstack-react-query.mjs',
             'lucide-react': '/vendor/lucide-react.mjs',
           },
         }
@@ -322,6 +324,11 @@ function swVersionPlugin(): Plugin {
  * the core never importing an edition — the edition is injected by config at
  * build time, never by shadowing `main.tsx`/`extensions.ts`.
  */
+/** The comment in src/index.css that the edition seam swaps for an `@source`. */
+const EDITION_SOURCE_MARKER = '/* @kirocrew-edition-source */'
+/** The stylesheet carrying that marker (module id may carry a `?query`). */
+const EDITION_CSS_ENTRY = /[\\/]src[\\/]index\.css(?:\?|$)/
+
 function editionExtensionPlugin(): Plugin {
   const VIRTUAL_ID = 'virtual:kirocrew-edition'
   const RESOLVED_ID = '\0' + VIRTUAL_ID
@@ -484,6 +491,32 @@ function editionExtensionPlugin(): Plugin {
       if (id === VIRTUAL_ID) return RESOLVED_ID
       return null
     },
+    // Tailwind content scan for the edition's own sources. Tailwind v4 is
+    // configured in CSS (`@source` lines in src/index.css), and CSS cannot read
+    // an environment variable — so when an edition is composed, its directory is
+    // spliced in here, replacing the marker comment index.css carries for this
+    // purpose. Without it any utility class used only by an edition component
+    // (e.g. `z-[95]`) is silently absent from the generated stylesheet and the
+    // edition UI renders unstyled with no build error. This runs before
+    // `@tailwindcss/vite` compiles the file: both plugins are `enforce: 'pre'`
+    // and this one is registered first. Gated on `editionEntry`, which is only
+    // set once the KIROCREW_ALLOW_EDITION opt-in above has passed, so a stray
+    // env var can never widen the scan of a stock build.
+    transform(code, id) {
+      if (!editionEntry || !EDITION_CSS_ENTRY.test(id)) return null
+      if (!code.includes(EDITION_SOURCE_MARKER)) {
+        throw new Error(
+          `[kirocrew-edition] ${id} no longer carries the '${EDITION_SOURCE_MARKER}' marker, ` +
+            'so the edition sources cannot be added to the Tailwind content scan.'
+        )
+      }
+      // Forward slashes: `@source` is a CSS string and Tailwind resolves it as a
+      // path; Windows backslashes would be read as escapes. JSON.stringify quotes
+      // and escapes the path the way a CSS string reads it, and the function
+      // replacement keeps a `$` in the path from being read as a replace pattern.
+      const glob = path.resolve(editionDir as string).split(path.sep).join('/') + '/**/*.{ts,tsx}'
+      return { code: code.replace(EDITION_SOURCE_MARKER, () => `@source ${JSON.stringify(glob)};`), map: null }
+    },
     load(id) {
       if (id !== RESOLVED_ID) return null
       if (editionEntry) {
@@ -606,7 +639,10 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
+  // `editionExtensionPlugin()` precedes `tailwindcss()` on purpose: both run
+  // `enforce: 'pre'` transforms, and the edition `@source` must be spliced into
+  // index.css before Tailwind compiles it (see the plugin's `transform`).
+  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -750,6 +786,34 @@ export default defineConfig({
         'src/**/*.stories.{ts,tsx}',
         'src/**/*.d.ts',
         'src/vite-env.d.ts',
+        // Everything in website/ that is NOT src/, spelled out. Vitest matches
+        // `include` against the ABSOLUTE file path with picomatch
+        // `{ contains: true }`, so `src/**` is satisfied by any `src/` segment
+        // anywhere in the path -- and the CodeBuild-hosted CI runner checks out
+        // under `/codebuild/output/src<random>/src/actions-runner/...`. There,
+        // every loaded file under website/ (integration mocks, scripts/) matched
+        // `src/**` and landed in the merged report with its own coverage number,
+        // which the per-file gate then failed. GitHub-hosted runners have no
+        // such segment, which is why this never showed before. Anchoring on
+        // `website/` keeps these correct on every checkout path; they are
+        // no-ops where the include already did not match.
+        //
+        // Why a blocklist and not an anchored include (`**/website/src/**`):
+        // vitest reuses `include` as a filesystem glob RELATIVE to root to add
+        // never-imported source files at 0% (getUntestedFilesByRoot), and from
+        // website/ that anchored form matches nothing, so untested files would
+        // silently drop out of the report and the per-file gate. A new
+        // top-level website/ directory whose files tests import needs an entry
+        // here -- the symptom is a non-src path in the merged report on the
+        // CodeBuild runner only.
+        '**/website/integration/**',
+        '**/website/scripts/**',
+        '**/website/capture/**',
+        '**/website/playwright/**',
+        '**/website/electron/**',
+        '**/website/eslint-rules/**',
+        '**/website/docs/**',
+        '**/website/*.ts',
       ],
     },
   },

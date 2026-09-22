@@ -1,4 +1,4 @@
-"""Drain-time re-validation of queued prompts (issue #5911).
+"""Drain-time re-validation of queued prompts.
 
 Authorization is decided at ADMISSION — ``authorize_target`` for
 ``session_send``, the authenticated composer for a human typing into a busy
@@ -8,7 +8,7 @@ while unlinked can gain a channel or mirror link before its queue drains.
 
 These tests pin the three-part fix end to end: producers stamp the
 admission-time containment on the queue entry (``containment_meta``), the drain
-re-asserts the same constraints and drops what no longer qualifies, and a drop
+re-asserts the same constraints and drops what stops qualifying, and a drop
 is loud (queue card retracted, visible transcript notice, SEL record) — never a
 silent vanish. They also pin the two designed non-drops: a constraint already
 held at admission is not a change (channel-born sessions keep draining), and
@@ -90,7 +90,6 @@ def test_human_typed_enqueue_stamps_admission_snapshot(tmp_path):
         "linked": False,
         "mirrored": False,
         "mirror_identity": "",
-        "crew": False,
         "ephemeral": False,
         "app": False,
         "unattended": False,
@@ -132,18 +131,25 @@ def test_channel_born_enqueue_records_linked_true(tmp_path):
 
 
 def test_requeued_steer_is_stamped(tmp_path):
-    """A steer degraded to a queue card is plain user speech re-entering the
-    queue; the requeue stamps it like any other plain producer."""
+    """A steer degraded to a queue card is plain user speech re-entering the queue,
+    and it is stamped with the containment its SEND was admitted under.
+
+    The stamp comes from the caller, not from reading the slot here: this requeue
+    runs in the turn's teardown, past the steer RPC's suspension, so a slot read
+    would fold a mirror linked during that suspension into the entry's own baseline
+    and the drain would then read the widened audience as one the authorization saw.
+    """
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("chat-1")
     slot._pending_steers = ["steer me"]
+    slot._steer_admissions["steer me"] = sc.containment_meta(state, slot)
 
     cr._requeue_unconsumed_steers(state, slot)
 
     assert _snapshot_of(slot._queue[0]) is not None
 
 
-# ── The drain drops what no longer qualifies, loudly ─────────────────────────
+# ── The drain drops what stops qualifying, loudly ─────────────────────────
 
 
 def test_linked_after_enqueue_drops_with_visible_notice(tmp_path, _inline_audit):
@@ -373,7 +379,7 @@ def test_malformed_snapshot_fails_closed():
 
 
 def test_workspace_change_invalidates_admission(tmp_path):
-    """`authorize_target`'s seventh refusal is `workspace_mismatch`, and
+    """`authorize_target`'s sixth refusal is `workspace_mismatch`, and
     `slot.workspace` is mutable while a queue waits (the agent-switch endpoint
     re-derives it): a prompt admitted under workspace A must not run with
     workspace B's memory, lessons and project context."""
@@ -527,17 +533,125 @@ async def test_consumed_entry_emits_an_allowed_audit(tmp_path, monkeypatch, _inl
     assert allowed and qid in allowed[-1].kwargs["metadata"]["queue_ids"]
 
 
+@pytest.mark.asyncio
+async def test_channel_provenance_reaches_the_drained_turn(tmp_path, monkeypatch, _inline_audit):
+    state = _make_state(tmp_path)
+    state.subagents = None
+    slot = _busy(state.get_or_create_slot("chat-1"))
+    slot.queue_append(
+        "watch the pull request",
+        meta=sc.containment_meta(state, slot),
+        directive_user_origin=True,
+        directive_channel_origin=True,
+    )
+    slot.task = None
+    captured: dict[str, object] = {}
+
+    def _stub_run_chat(_state, _slot, _prompt, **kwargs):
+        captured.update(kwargs)
+
+        async def _done():
+            return None
+
+        return _done()
+
+    def _fake_spawn(_state, _slot, coro):
+        coro.close()
+        task = MagicMock()
+        task.done.return_value = True
+        return task
+
+    monkeypatch.setattr(cr, "_run_chat", _stub_run_chat)
+    monkeypatch.setattr(cr, "spawn_guarded_turn", _fake_spawn)
+
+    assert await cr._start_next_queued_turn(state, slot) is True
+    assert captured["_directive_user_origin"] is True
+    assert captured["_directive_channel_origin"] is True
+
+
+@pytest.mark.asyncio
+async def test_mixed_origin_merge_keeps_channel_provenance(tmp_path, monkeypatch, _inline_audit):
+    """Any channel entry makes the merged turn channel-authorized.
+
+    Changing the origin reduction back to ``all`` would let an adjacent dashboard
+    entry erase the channel boundary for the whole model turn.
+    """
+    state = _make_state(tmp_path)
+    state.subagents = None
+    slot = _busy(state.get_or_create_slot("chat-1"))
+    admission = sc.containment_meta(state, slot)
+    slot.queue_append(
+        "from the linked channel",
+        meta=admission,
+        directive_user_origin=True,
+        directive_channel_origin=True,
+    )
+    slot.queue_append(
+        "from the dashboard",
+        meta=admission,
+        directive_user_origin=True,
+    )
+    slot.task = None
+    config = MagicMock()
+    config.dashboard.merge_queued_messages = True
+    captured: dict[str, object] = {}
+
+    def _stub_run_chat(_state, _slot, _prompt, **kwargs):
+        captured.update(kwargs)
+
+        async def _done():
+            return None
+
+        return _done()
+
+    def _fake_spawn(_state, _slot, coro):
+        coro.close()
+        task = MagicMock()
+        task.done.return_value = True
+        return task
+
+    monkeypatch.setattr(cr.KiroCrewConfig, "load", lambda: config)
+    monkeypatch.setattr(cr, "_run_chat", _stub_run_chat)
+    monkeypatch.setattr(cr, "spawn_guarded_turn", _fake_spawn)
+
+    assert await cr._start_next_queued_turn(state, slot) is True
+    assert captured["_directive_channel_origin"] is True
+
+
 def test_requeued_steer_in_a_plain_slot_carries_human_provenance(tmp_path):
-    """The only steer producer is the api_chat composer branch, and app
-    isolation confines app requests to app slots — so a non-app slot's
-    requeued steer is human speech and keeps the audience exemption."""
+    """A COMPOSER steer keeps the audience exemption: its author typed into this
+    session's own surface, so linking the session is that owner's deliberate act.
+
+    Provenance is now reported by the steer's caller rather than derived from the
+    slot. It was derivable while ``steer_into_running_turn`` had exactly one caller
+    (the api_chat composer branch); ``session_send``'s steer is a second caller with
+    no such author, so the flag has to say which one produced the text. The composer
+    records ``True`` -- ``user_origin`` defaults to it -- which is what this asserts.
+    """
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("chat-1")
     slot._pending_steers = ["steer me"]
+    slot._steer_user_origin["steer me"] = True
 
     cr._requeue_unconsumed_steers(state, slot)
 
     assert slot._queue[0].get("_directive_user_origin") is True
+
+
+def test_a_requeued_steer_with_no_recorded_provenance_fails_closed(tmp_path):
+    """An unrecorded steer is not treated as the session owner's.
+
+    The exemption is the one thing a peer must not inherit, so the absent case has
+    to fall on the unexempted side: the entry faces the LINKED drop like any other
+    queued prompt rather than riding past it on an assumption nobody made.
+    """
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("chat-1")
+    slot._pending_steers = ["no provenance recorded"]
+
+    cr._requeue_unconsumed_steers(state, slot)
+
+    assert slot._queue[0].get("_directive_user_origin") is not True
 
 
 # ── The full drain path ──────────────────────────────────────────────────────
@@ -601,7 +715,7 @@ async def test_drain_strips_snapshot_from_the_persisted_row(tmp_path, monkeypatc
     assert sc.QUEUED_CONTAINMENT_META_KEY not in row_meta
 
 
-# ── Constraint-set parity with authorize_target (#5994) ──────────────────────
+# ── Constraint-set parity with authorize_target ──────────────────────
 #
 # The constraint set now has two hand-maintained spellings: `authorize_target`
 # refuses admission inline, and `containment_snapshot` re-derives the same
@@ -616,13 +730,12 @@ async def test_drain_strips_snapshot_from_the_persisted_row(tmp_path, monkeypatc
 # and it belongs in `_NON_CONTAINMENT_REFUSALS` with a reason.
 
 # Target-side containment refusals, mapped to the snapshot key that re-asserts
-# each one at drain time. `workspace_mismatch` is the seventh (see
+# each one at drain time. `workspace_mismatch` is the sixth (see
 # `test_workspace_change_invalidates_admission`); it is an identity rather than
 # a boolean, but it is still a constraint the drain compares.
 _TARGET_CONTAINMENT_REFUSALS = {
     "linked_session_target": "linked",
     "mirrored_target": "mirrored",
-    "crew_mode_target": "crew",
     "ephemeral_target": "ephemeral",
     "app_scoped_target": "app",
     "unattended_target": "unattended",
@@ -699,7 +812,7 @@ def test_the_parse_finds_the_refusals_it_is_asked_to_pin():
     """
     codes = _authorize_target_refusal_codes()
     assert len(codes) >= len(_TARGET_CONTAINMENT_REFUSALS) + len(_NON_CONTAINMENT_REFUSALS)
-    assert "workspace_mismatch" in codes, "the seventh refusal must be visible to the parse"
+    assert "workspace_mismatch" in codes, "the sixth refusal must be visible to the parse"
 
 
 def test_every_refusal_is_classified():

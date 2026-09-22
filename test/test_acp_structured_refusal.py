@@ -62,11 +62,30 @@ class TestCapabilitySet:
         assert ACP_BACKEND_CLAUDE not in ACP_BACKENDS_STRUCTURED_REFUSAL
         assert ACP_BACKEND_CODEX not in ACP_BACKENDS_STRUCTURED_REFUSAL
 
-    def test_every_shared_runtime_harness_is_a_member(self):
-        # AcpSessionHandle reads the envelope unconditionally on the strength of
-        # this subset relation; a runtime harness outside the set would have its
-        # metadata guessed at.
-        assert ACP_BACKENDS_ACP_RUNTIME <= ACP_BACKENDS_STRUCTURED_REFUSAL
+    def test_the_shared_runtime_carries_hosts_outside_the_set(self):
+        """The subset relation does not hold, which is why the read is gated.
+
+        A parser written for one host's vocabulary must not judge another's
+        notification: its answer would be attached to the turn as a refusal
+        category the host never sent.
+        """
+        assert not (ACP_BACKENDS_ACP_RUNTIME <= ACP_BACKENDS_STRUCTURED_REFUSAL)
+
+    def test_both_cores_gate_the_read_on_membership(self):
+        """Neither core may read the envelope for a host outside the set.
+
+        Asserted on both, because the two paths answering differently is how one of
+        them ends up reading a notification the set says it cannot parse.
+        """
+        import inspect
+
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.session_handle import AcpSessionHandle
+
+        for fn in (AcpClient._track_metadata, AcpSessionHandle._track_metadata):
+            source = inspect.getsource(fn)
+            assert "parse_refusal" in source, fn.__qualname__
+            assert "ACP_BACKENDS_STRUCTURED_REFUSAL" in source, fn.__qualname__
 
 
 class TestParseRefusal:
@@ -310,7 +329,7 @@ class TestCardDoesNotRepeatStreamedText:
 
 class TestRedactionSeesTheWholeValue:
     """Round-3 GPT finding: a pre-redaction slice can cut a secret so its prefix
-    no longer matches and reaches the surface raw. The redactors run on the
+    does not match and reaches the surface raw. The redactors run on the
     full value; only the result is capped."""
 
     def test_credential_beyond_the_cap_is_still_redacted(self):
@@ -413,7 +432,7 @@ class TestSendMessageStreamFoldsRefusal:
 
 
 class TestRefusalTerminalIsScoped:
-    """Design Review round: only the bare -32603 after a recorded refusal is
+    """Only the bare -32603 after a recorded refusal is
     the refusal's terminal. Any other error keeps its own classification and
     the swallow is logged at WARNING."""
 
@@ -480,7 +499,7 @@ class TestRefusalTerminalIsScoped:
 
 
 class TestRefusalTerminalFlushesToolResults:
-    """GPT round on 6a58089f9: the refusal terminal in ``_dispatch_events``
+    """The refusal terminal in ``_dispatch_events``
     must drain pending tool results before EVENT_COMPLETE, like ``complete``
     does, or a result from the tool that ran just before the filtered
     inference is dropped or leaks into the next turn."""

@@ -20,10 +20,11 @@ import { i18nT } from '../../i18n/t'
 import { compareText } from '../../i18n/format'
 import type { EditorialArtwork } from '../../components/appstore/useEditorialArt'
 import type { SourceRow } from '../../components/appstore/CategoryRail'
+import { orderByReview } from '../../components/appstore/registryOrder'
 import { categoryCounts, mergeCategoryOrder, type Category } from '../../components/appstore/categories'
 import { hasHeroArt } from '../../components/appstore/useHeroArt'
 import {
-  isVerified, normalizeInstalledApp, normalizeRegistryApp,
+  isVerified, normalizeInstalledApp, normalizeRegistryApp, sourceKey,
   type InstalledApp, type RegistryApp,
 } from '../../components/appstore/types'
 import { isBuiltinServerRow } from '../../components/appstore/mergeBuiltinRow'
@@ -184,6 +185,14 @@ export type AppsData = {
   sources: SourceRow[]
   /** The Library list: installed apps with update state attached. */
   installedApps: LibraryApp[]
+  /**
+   * How many admissible Library rows the "enabled only" view is hiding — the
+   * count the "Show N disabled" affordance names. Zero when `showAll` is on
+   * (nothing is hidden) or when no admissible row is outside the enabled group.
+   * Computed from the same `libraryView` latch as `installedApps`, so the
+   * number and the rows it describes can never disagree.
+   */
+  disabledCount: number
   /** Library apps Update All would touch (gateway-lifecycle with a pending update). */
   updatables: LibraryApp[]
   /** Dispatch mc:apps-changed (module-level function, re-exported for convenience). */
@@ -242,10 +251,22 @@ export type LibrarySlot = { listed: boolean; wasEnabled: boolean }
  * place instead of moving it off-screen or deleting it. A previously concealed
  * row is promoted if an out-of-band action enables it, so the per-visit cache
  * cannot keep an enabled app unreachable. Uninstalled rows are forgotten.
+ *
+ * `showAll` is the reader's view control. When it is on, every admissible row is
+ * listed — the reachability the store depends on, since Library is the only
+ * surface that can enable a locally-shipped builtin. When it is off (the
+ * default), a row is listed only if it earned a place in the enabled group:
+ * either it is enabled now, or its slot remembers it was enabled when first
+ * placed this visit. That second clause is why the control clicked does not
+ * vanish — disabling a row flips `enabled` to false but the slot's `wasEnabled`
+ * still holds, so the row stays put; a builtin that was never enabled this visit
+ * is the clutter the off view drops. The decision runs through the SAME
+ * per-slot `wasEnabled` the ordering already reads, so the filter cannot
+ * contradict the latch it sits beside.
  */
 export function libraryView<
   T extends Pick<InstalledApp, 'origin' | 'enabled' | 'manifest'> & { name: string },
->(apps: T[], view: Map<string, LibrarySlot>): T[] {
+>(apps: T[], view: Map<string, LibrarySlot>, showAll = true): T[] {
   const live = new Set(apps.map(app => app.name))
   for (const name of view.keys()) {
     if (!live.has(name)) view.delete(name)
@@ -254,17 +275,40 @@ export function libraryView<
     const slot = view.get(app.name)
     if (!slot) {
       view.set(app.name, { listed: keepInLibrary(app), wasEnabled: !!app.enabled })
-    } else if (!slot.listed && keepInLibrary(app)) {
-      slot.listed = true
-      // The row was not previously visible, so this is its first placement in
-      // the visit. It appears enabled and belongs with the enabled group.
-      slot.wasEnabled = !!app.enabled
+    } else {
+      if (!slot.listed && keepInLibrary(app)) {
+        slot.listed = true
+        // The row was not previously visible, so this is its first placement in
+        // the visit. It appears enabled and belongs with the enabled group.
+        slot.wasEnabled = !!app.enabled
+      }
+      // Enablement latches for the visit: once a row has been enabled, it stays
+      // in the enabled group so a later disable keeps it listed under the off
+      // view instead of dropping under the cursor. A row enabled out-of-band
+      // AFTER it was first placed disabled reaches this branch (already
+      // `listed`, so the promotion above does not fire) — without this its
+      // `wasEnabled` would stay false and the off view would drop it the moment
+      // the reader disabled it. Monotonic: it never clears, so a never-enabled
+      // builtin stays out of the group and remains the clutter the off view hides.
+      if (app.enabled) slot.wasEnabled = true
     }
   }
-  const rows = apps.filter(app => view.get(app.name)?.listed)
+  // A slot is in the enabled group when it is enabled right now OR its latch
+  // remembers it was enabled at first placement — the same predicate the
+  // ordering below groups on. The off view keeps exactly that group, so a row
+  // disabled mid-visit (enabled false, wasEnabled still true) stays listed.
+  const inEnabledGroup = (app: T) => {
+    const slot = view.get(app.name)
+    return !!app.enabled || !!slot?.wasEnabled
+  }
+  const rows = apps.filter(app => {
+    const slot = view.get(app.name)
+    if (!slot?.listed) return false
+    return showAll || inEnabledGroup(app)
+  })
   return [
-    ...rows.filter(app => view.get(app.name)?.wasEnabled),
-    ...rows.filter(app => !view.get(app.name)?.wasEnabled),
+    ...rows.filter(inEnabledGroup),
+    ...rows.filter(app => !inEnabledGroup(app)),
   ]
 }
 
@@ -392,7 +436,7 @@ export async function registryQueryFn(): Promise<{
     }
 }
 
-export default function useAppsData(): AppsData {
+export default function useAppsData({ showAll = true }: { showAll?: boolean } = {}): AppsData {
   const libraryViewRef = useRef(new Map<string, LibrarySlot>())
   const { data: apps = [], isLoading: appsLoading, error: appsError } = useQuery<InstalledApp[]>({
     queryKey: ['apps'],
@@ -560,22 +604,62 @@ export default function useAppsData(): AppsData {
     // Count built-ins from browseApps so the SOURCES totals describe the same
     // population as the "All apps" count (built-ins are always browsable,
     // enabled or not).
-    const builtinCount = browseApps.filter(a => a.origin === 'builtin').length
+    const builtinCount = browseApps.filter(a => sourceKey(a) === '__builtin__').length
     const counts = new Map<string, number>()
     let coreCount = 0
     for (const a of browseApps) {
-      if (a.origin === 'builtin') continue
-      if (a._registry) counts.set(a._registry, (counts.get(a._registry) || 0) + 1)
-      else coreCount++
+      const key = sourceKey(a)
+      if (key === '__builtin__') continue
+      if (key === '__core__') coreCount++
+      else counts.set(key, (counts.get(key) || 0) + 1)
     }
     const rows: SourceRow[] = []
     if (builtinCount > 0) rows.push({ name: '__builtin__', label: i18nT('pages.appsPage.built_in_kirocrew'), count: builtinCount, builtin: true })
-    for (const reg of registriesData?.registries || []) {
-      rows.push({ name: reg.repo, label: reg.name || reg.repo, count: counts.get(reg.name || reg.repo) || 0, builtin: false })
-      counts.delete(reg.name || reg.repo)
+    // Build-pinned and operator registries in ONE pass, ordered by review tier.
+    // Pinned rows were previously absent from this list entirely, so their apps
+    // fell through to the stale-cache loop below and the rail showed the bare
+    // registry id with a neutral Database icon — no name, no review claim. They
+    // are read here so a pinned source gets its label and its tier like any
+    // other. `name` stays the identity every count and refresh call is keyed by;
+    // `label` is only what is displayed.
+    //
+    // ORDER OF THE TWO STEPS IS LOAD-BEARING. Dedupe FIRST, on the pinned-first
+    // concatenation, and only then sort. That is the merge rule the backend's
+    // `_effective_registries` applies ("an edition default wins on a name
+    // collision"), and it is necessary because GET reports `config.registries`
+    // raw beside `pinned`: a config.json naming a pinned registry would
+    // otherwise render twice — duplicate React keys, and a second row whose apps
+    // never load, since the backend merge dropped it.
+    //
+    // Sorting first would INVERT that rule for exactly the row it matters most
+    // for: a pinned `community` row ranks after an unreviewed row, so a
+    // hand-edited operator row sharing its id would be seen first and win, and
+    // the card would show the operator's row in place of the build's community
+    // registry — with none of its warning copy.
+    //
+    // Keyed case-insensitively for the same reason the backend keys on the cache
+    // FILE: `Official` and `official` are one file on Windows and default macOS,
+    // so a case variant is contested there and must not read as its own source.
+    const seen = new Set<string>()
+    const merged: typeof rows = []
+    for (const reg of [...(registriesData?.pinned || []), ...(registriesData?.registries || [])]) {
+      const id = reg.name || reg.repo
+      const key = id.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      const sourceId = sourceKey({ _registry: id })
+      merged.push({ name: id, label: reg.label || reg.name || reg.repo, count: counts.get(sourceId) || 0, builtin: false, review: reg.review })
+      counts.delete(sourceId)
     }
+    // Display order last, through the same helper the External Registries card
+    // uses, so the two lists put a community source in the same place. Stable, so
+    // unreviewed and operator rows keep the order the backend sent.
+    rows.push(...orderByReview(merged))
     // Registries present in entries but no longer configured (stale cache)
-    for (const [name, count] of counts) rows.push({ name, label: name, count, builtin: false })
+    for (const [key, count] of counts) {
+      const name = key.slice('registry:'.length)
+      rows.push({ name, label: name, count, builtin: false })
+    }
     if (coreCount > 0) rows.push({ name: '__core__', label: i18nT('pages.appsPage.kirocrew_registry'), count: coreCount, builtin: true })
     return rows
   }, [browseApps, registriesData])
@@ -585,13 +669,28 @@ export default function useAppsData(): AppsData {
   const updateMap = useMemo(() => buildUpdateMap(registry), [registry])
   const installedApps: LibraryApp[] = useMemo(
     () =>
-      libraryView(apps, libraryViewRef.current)
+      libraryView(apps, libraryViewRef.current, showAll)
         .map(a => ({
           ...a,
           updateAvailable: updateMap.has(a.name),
           _newVersion: updateMap.get(a.name),
         })),
-    [apps, updateMap],
+    [apps, updateMap, showAll],
+  )
+  // Rows the "enabled only" view is hiding, from the SAME latch that produced
+  // `installedApps`: the full admissible list minus the enabled-group list. Off
+  // the toggle this is the count the "Show N disabled" label names; on the
+  // toggle nothing is hidden, so it is zero. Read against the same visit map, so
+  // a row held in place by the latch is counted as shown, never as hidden.
+  // Depends on `apps` alone: both `libraryView` calls read `apps` and mutate the
+  // ref (non-reactive), and neither reads `showAll` — the count is view-
+  // independent by construction (it always compares the full list to the
+  // enabled group).
+  const disabledCount = useMemo(
+    () =>
+      libraryView(apps, libraryViewRef.current, true).length
+      - libraryView(apps, libraryViewRef.current, false).length,
+    [apps],
   )
   const updatables = useMemo(
     // Keep this live-filtered rather than visit-held: `countUpdatables` powers
@@ -615,6 +714,7 @@ export default function useAppsData(): AppsData {
     categories,
     sources,
     installedApps,
+    disabledCount,
     updatables,
     announceAppsChanged,
   }

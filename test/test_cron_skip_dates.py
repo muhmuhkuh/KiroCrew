@@ -90,7 +90,7 @@ class TestIsDueSkipDates:
 
     def test_skip_dates_uses_now_parameter_not_wall_clock(self) -> None:
         """skip_dates check should use the now parameter, not datetime.now()."""
-        # Synthetic now: 2026-04-06 12:00 UTC
+        # Synthetic now, fixed by the timegm tuple below.
         synthetic_now = timegm((2026, 4, 6, 12, 0, 0, 0, 0, 0))
         job = self._make_cron_job(
             skip_dates=["2026-04-06"], timezone="UTC",
@@ -148,7 +148,7 @@ class TestMcpCronSkipDates:
     """Integration tests for skip_dates via MCP tool layer."""
 
     def test_cron_add_with_skip_dates(self, monkeypatch, tmp_path) -> None:
-        from kiro_crew.mcp_cron import _call_tool
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
 
         # Isolate the cron store to tmp_path so parallel (xdist) cron tests don't
         # race on the shared default jobs file. _call_tool builds its service from
@@ -175,7 +175,7 @@ class TestMcpCronSkipDates:
         assert jobs[0].timezone == "Europe/Luxembourg"
 
     def test_cron_update_skip_dates(self, monkeypatch, tmp_path) -> None:
-        from kiro_crew.mcp_cron import _call_tool
+        from kiro_crew.mcp_cron import _call_tool_locally as _call_tool
 
         monkeypatch.setattr("kiro_crew.mcp_cron.config_dir", lambda: tmp_path)
         monkeypatch.delenv("KIROCREW_CHANNEL_ID", raising=False)
@@ -228,7 +228,7 @@ class TestComputeNextRunTsSkipDates:
 
     def test_skip_dates_advances_past_skipped_friday(self) -> None:
 
-        # Fix "now" to Thursday 2026-05-28 12:00 UTC so next Friday = 2026-05-29
+        # Fix "now" to a Thursday so the immediate next Friday is the skipped one.
         synthetic_now = timegm((2026, 5, 28, 12, 0, 0, 0, 0, 0))
         job = self._make_cron_job(
             skip_dates=["2026-05-29"],  # skip the immediate next Friday

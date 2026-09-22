@@ -27,7 +27,6 @@ from aiohttp import web
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.security import redact
 
-from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
 from ..spine.push_policy import normalize_branch
 from . import (
     clone_setup,
@@ -69,6 +68,10 @@ _CONFIG_WRITABLE = frozenset(
         "bandCapMs",
         "forceBugSeeds",
         "autoDraftPr",
+        #: Display-only label for the GitLab namespace — neither this nor
+        #: ``githubUser`` decides where a push lands (``provider``/``host`` only
+        #: move through setup-clone).
+        "gitlabUser",
         # Opt-in: mark a fully-green DRAFT pull request ready-for-review. Safe to
         # expose because it can only ever flip a draft to ready — it never merges,
         # never enables auto-merge, and the gate (pr_watchers.auto_publish_gate) is
@@ -337,12 +340,12 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
-    """Validate a GitHub URL, clone it push-disabled, and record it as the target.
+    """Validate a GitHub or GitLab URL, clone it push-disabled, record the target.
 
-    This is the ONLY path that may set ``clone``/``target_url`` in config —
-    ``PUT /config`` deliberately cannot, because these decide which repository
-    the agent is turned loose on. The clone itself is a blocking git subprocess,
-    so it runs off the event loop.
+    This is the ONLY path that may set ``clone``/``target_url`` (and, with them,
+    ``provider``/``host``) in config — ``PUT /config`` deliberately cannot,
+    because these decide which repository the agent is turned loose on. The
+    clone itself is a blocking git subprocess, so it runs off the event loop.
     """
     body = await _json_body(request)
     url = str(body.get("url") or "").strip()
@@ -358,12 +361,12 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
     def _clone() -> tuple[dict, str]:
         return clone_setup.setup_safe_clone(url, store.scratch_path())
 
-    # `result` is a PARAMETER, not a closure read. It used to be a free variable of this
-    # handler, which broke the moment clone+persist moved inside `_clone_and_persist` to take
-    # the lock: that inner function binds its own local `result`, so the outer cell stayed
-    # empty and every successful setup raised `NameError` (a 500, with the clone on disk and
-    # config.json never written — the app could not be set up at all). Passing it explicitly
-    # makes the dependency visible instead of scope-dependent. Raised by the Opus 5 review.
+    # `result` is a PARAMETER, not a closure read. clone+persist live inside
+    # `_clone_and_persist` so they hold the lock, and that inner function binds its own local
+    # `result` — read as a free variable of this handler, the outer cell stays empty and every
+    # successful setup raises `NameError` (a 500, with the clone on disk and config.json never
+    # written, so the app cannot be set up at all). Passing it explicitly makes the dependency
+    # visible instead of scope-dependent.
     def _persist(result: dict) -> dict[str, Any]:
         current = store.read_json(store.config_path(), {}) or {}
         retargeted = str(current.get("target_url") or "") != url
@@ -376,6 +379,13 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
         # this setup path.
         current["origin_url"] = str(result.get("origin_url") or "")
         current["target_display"] = result["display"]
+        # The code host (github/gitlab) and instance host are derived from the
+        # validated URL at setup time and persisted here — NOT in
+        # ``_CONFIG_WRITABLE`` — because they decide which forge a push/PR targets.
+        # Every downstream consumer (profile dispatch, recipe factory, frontend
+        # link builder) reads these rather than re-guessing.
+        current["provider"] = str(result.get("provider") or "github")
+        current["host"] = str(result.get("host") or "")
         if retargeted:
             # A branch belongs to the repo it came from. Carrying it across a retarget
             # leaves config naming a branch that does not exist in the NEW clone — the
@@ -633,7 +643,7 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
             "status": latest.get("status") or "",
             "note": latest.get("note") or "",
             "ts": latest.get("ts"),
-            # The ledger's field is historically named ``cr``; expose it as ``pr``
+            # The ledger's field is named ``cr``; expose it as ``pr``
             # so the UI speaks one vocabulary, and keep the raw key readable.
             "pr": latest.get("pr") or latest.get("cr") or "",
             "history": history,
@@ -752,6 +762,33 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
     return web.json_response({"finding": _redact_tree(detail)})
 
 
+def _recipe_for(config: dict, *, clone: str, pr_queue_dir: Path):
+    """Build the PR/MR recipe the draft path should use.
+
+    Picks the recipe by the persisted ``provider`` (github default) so the same
+    publish path drafts a GitHub PR or a GitLab MR without knowing which forge
+    the operator configured. The provider/host came from the validated setup
+    URL (Stage 2), never from free text here.
+    """
+    from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
+    from ..profiles.gitlab_repo.pr_recipe import GitLabPRRecipe
+
+    provider = str((config or {}).get("provider") or "github").lower()
+    cls = GitLabPRRecipe if provider == "gitlab" else GitHubPRRecipe
+    user = str(
+        config.get("gitlabUser") if provider == "gitlab" else config.get("githubUser")
+    )
+    return cls(
+        user=user,
+        clone_path=Path(clone),
+        pr_queue_dir=pr_queue_dir,
+        base_ref=str(config.get("branch") or "origin/main"),
+        # From config, not the clone — see clone_setup._disable_push.
+        fetch_url=clone_setup.resolve_origin_url(config) or None,
+        host=str(config.get("host") or "") or None,
+    )
+
+
 async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     """Draft (or re-draft) a pull request for a finding already in the queue.
 
@@ -800,7 +837,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         try:
             isolated = clone_setup._repository_is_isolated(Path(clone))
         except clone_setup.IsolationProbeError as exc:
-            # Sandbox failure, not an isolation verdict — name it (#8151).
+            # Sandbox failure, not an isolation verdict — name it as such.
             return {"ok": False, "error": str(exc)}
         if not isolated:
             return {"ok": False, "error": "repository isolation check failed — re-run setup"}
@@ -862,14 +899,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
                 ),
             }
 
-        recipe = GitHubPRRecipe(
-            user=str(config.get("githubUser") or ""),
-            clone_path=Path(clone),
-            pr_queue_dir=queue,
-            base_ref=str(config.get("branch") or "origin/main"),
-            # From config, not the clone — see clone_setup._disable_push.
-            fetch_url=clone_setup.resolve_origin_url(config) or None,
-        )
+        recipe = _recipe_for(config, clone=clone, pr_queue_dir=queue)
         try:
             ref = recipe.draft(
                 summary=summary,
@@ -1389,7 +1419,7 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
         # Before the generic clause: this subclasses RuntimeError, but it is a
         # sandbox-launcher failure, not a config/state conflict — a distinct
         # `code` so a UI branching on it does not render the misleading
-        # push-isolation guidance (#8151). The message is the actionable part.
+        # push-isolation guidance. The message is the actionable part.
         return web.json_response(
             {"code": "sandbox_launcher_failed", "error": str(exc)}, status=409
         )

@@ -50,6 +50,9 @@ import {
 import { detectFileType } from '../../components/FileRenderers'
 import { ContentRenderer, MD_EXTS, extOf, langFor, wrapCode } from '../../components/ContentRenderer'
 import { usePersistedString } from '../../hooks/usePersistedString'
+// Imported by path, not from the app-sdk barrel: that barrel is the surface published to
+// third-party apps, and this store is builtin-only.
+import { useAppViewState, isViewString, type ViewStateDecl } from '../../app-sdk/viewState'
 import { api } from '../../api/client'
 import type { Artifact } from '../../types'
 import { useDialogFocusTrap } from '../../hooks/useDialogFocusTrap'
@@ -61,6 +64,7 @@ import { awsControlApi, AwsControlError } from './api'
 import type {
   DriveSection, DriveStatus, ArtifactKind, LibraryArtifact,
   BackupKind, BackupRun, BackupJobState, Share, DriveUsage,
+  BackupArchive, RemoteBackup,
 } from './types'
 import { CopyBtn, PaneHeader, AwsErrorNotice, StorageBar, QuickTile } from './shared'
 
@@ -85,6 +89,63 @@ const START_ERROR_KEYS: Record<string, string> = {
   drive_missing: 'apps.awsControl.console.backup_start_no_drive',
   jobs_unavailable: 'apps.awsControl.console.backup_start_unavailable',
 }
+
+/**
+ * Why the nightly transcript archive is not running, in the reader's language.
+ *
+ * The backend sends a stable code, not a sentence: it cannot know the reader's
+ * locale, so a sentence chosen there is English on every install. An unrecognised
+ * code falls through to the general line rather than rendering nothing, because a
+ * newer gateway can name a condition this build has never heard of -- and "on
+ * hold" is true of all of them, which is far better than letting the page imply
+ * the backup is fine.
+ *
+ * A switch over static map access rather than an indexed lookup, so every key
+ * here stays findable by the i18n gate instead of counting as a dynamic site.
+ */
+const BACKUP_BLOCKED_KEYS = {
+  host: 'apps.awsControl.console.backup_nightly_sessions_blocked_host',
+  redaction: 'apps.awsControl.console.backup_nightly_sessions_blocked_redaction',
+  otherAccount: 'apps.awsControl.console.backup_nightly_sessions_blocked_other_account',
+  other: 'apps.awsControl.console.backup_nightly_sessions_blocked_other',
+} as const
+
+/* The two "you can still start it yourself" lines, literal for the same reason as
+   the map above: named property access keeps each key findable by the i18n gate. */
+const BACKUP_NEXT_KEYS = {
+  generic: 'apps.awsControl.console.backup_nightly_sessions_blocked_next',
+  redaction: 'apps.awsControl.console.backup_nightly_sessions_blocked_next_redaction',
+} as const
+
+function nightlySessionsBlockedText(code: string): string {
+  switch (code) {
+    case 'host_unsupported': return i18nT(BACKUP_BLOCKED_KEYS.host)
+    case 'redaction_on': return i18nT(BACKUP_BLOCKED_KEYS.redaction)
+    case 'other_account': return i18nT(BACKUP_BLOCKED_KEYS.otherAccount)
+    default: return i18nT(BACKUP_BLOCKED_KEYS.other)
+  }
+}
+
+/* Which "you can still start it yourself" line to offer under the notice, or
+   null for none. The manual run is per-account and per-kind, so it is a real next
+   step for a grant withheld by a setting or recorded on an account the schedule
+   does not visit -- and NOT one on a host that cannot produce the archive at all,
+   where that same run refuses with the same capability answer. Naming a click
+   that fails is worse than naming none.
+
+   `redaction_on` gets its OWN line because there the manual run's outcome is the
+   very thing the notice above it withheld: the nightly stands down precisely
+   because the sessions archive has no redaction seam (it has two bundle roots, so
+   `prepare_redacted_copy` refuses it), and the button uploads those same bytes
+   unredacted. The backend calls that owner "present and choosing knowingly", which
+   is only true if the page says what the choice is -- and the operator reading this
+   notice is by definition one who asked for redaction. */
+function nightlySessionsBlockedNextText(code: string): string | null {
+  if (code === 'host_unsupported') return null
+  if (code === 'redaction_on') return i18nT(BACKUP_NEXT_KEYS.redaction)
+  return i18nT(BACKUP_NEXT_KEYS.generic)
+}
+
 const KIND_LABEL_KEY: Record<ArtifactKind, string> = {
   widget: 'apps.awsControl.console.kind_widget',
   markdown: 'apps.awsControl.console.kind_markdown',
@@ -981,7 +1042,7 @@ function LibraryCloudCard({ slug, local, localAnswered, confirm, failed, failedW
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <IconButton
-              className="bg-card/85 backdrop-blur-sm"
+              className="bg-card/85 backdrop-blur-xs"
               aria-label={i18nT('apps.awsControl.console.library_actions')}
               data-testid="library-more"
             >
@@ -1205,7 +1266,7 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
                  the CLI drawer) before reaching this dialog. It also gives mouse
                  users type-to-filter immediately. */
               autoFocus
-              className="min-w-0 flex-1 border-none bg-transparent text-[13px] text-text outline-none"
+              className="min-w-0 flex-1 border-none bg-transparent text-[13px] text-text outline-hidden"
               data-testid="library-add-search"
             />
           </div>
@@ -1799,10 +1860,48 @@ function PreviewDialog({
   )
 }
 
+/**
+ * What the drive restores when you come back to it.
+ *
+ * One field. The rest of "where I was" is already durable elsewhere and deliberately
+ * stays there: the pane is in the URL (`usePaneFromPath`), the grid/list choice is in
+ * `useViewMode`, and the selected account is in `awsControl.selectedAccount` — which is
+ * this record's SCOPE rather than one of its fields, so a prefix can never be restored
+ * into a bucket it was not taken in.
+ *
+ * The listing itself is not here and cannot be: `contents` is not a declared field, so
+ * `pickDeclared` drops it on write even if a caller passes it in. Server-owned data is
+ * refetched, per the design's three-tier ownership split.
+ *
+ * Module-level, so the hook sees one stable declaration rather than a new object per
+ * render.
+ */
+const DRIVE_VIEW: ViewStateDecl<{ path: string }> = {
+  // Names this SURFACE, not the app: the library and backup panes are separate consumers
+  // and get their own records, so neither can erase this one's folder.
+  name: 'drive',
+  revision: 1,
+  fields: { path: isViewString },
+  defaults: { path: '' },
+}
+
 export function DriveSectionView({ account, bucket }: { account: string; bucket: string }) {
   const qc = useQueryClient()
   const [mode, setMode] = useViewMode('drive', 'list')
-  const [path, setPath] = useState('')
+  // The current folder is the app's view state, restored on mount from the host's
+  // namespace. `path` is read from the store rather than held in local state so there is
+  // one source of truth for it, and it is available on the FIRST render — the infinite
+  // query below is keyed on it, so a restored folder is what gets fetched, with no
+  // wasted listing of the root and no skeleton flash on the way to the right place.
+  //
+  // Scoped to `account`, because a prefix only means anything inside the bucket it was
+  // taken in. The prop is always a resolved, non-empty account id by the time this
+  // renders: `AwsControlPage` returns the accounts pane while `!selected`, and
+  // `DrivePaneGate` yields children only once `drive?.exists`. Were it briefly `''`, the
+  // scope would never match and a restore would silently never happen.
+  const [view, setView] = useAppViewState(DRIVE_VIEW, { scope: account })
+  const path = view.path
+  const setPath = useCallback((next: string) => setView({ path: next }), [setView])
   const [share, setShare] = useState<{ key: string } | null>(null)
   const [uploadError, setUploadError] = useState<Failure | null>(null)
   /** Keyed by the object whose download failed, so the preview dialog shows
@@ -3728,12 +3827,18 @@ function BackupRow({
   kind,
   run,
   job,
+  unsupported,
   onStarted,
 }: {
   account: string
   kind: BackupKind
   run: BackupRun | undefined
   job: BackupJobState | undefined
+  /* This host cannot produce this kind's payload at all. The manual run answers
+     the same capability question and refuses with 501, so a pressable button here
+     offers work that cannot happen -- and the notice under the switch already
+     says why, which is the sentence a disabled button sends the reader to. */
+  unsupported: boolean
   onStarted: () => void
 }) {
   const runMut = useMutation({
@@ -3820,7 +3925,11 @@ function BackupRow({
             ? i18nT('apps.awsControl.console.backup_state_current')
             : i18nT('apps.awsControl.console.backup_state_never')}
         </Badge>
-        <Btn onClick={() => runMut.mutate()} disabled={busy} data-testid={`backup-run-${kind}`}>
+        <Btn
+          onClick={() => runMut.mutate()}
+          disabled={busy || unsupported}
+          data-testid={`backup-run-${kind}`}
+        >
           <RefreshCw size={13} className={busy ? 'animate-spin' : ''} />
           {busy ? i18nT('apps.awsControl.console.backup_running') : i18nT('apps.awsControl.console.backup_run_now')}
         </Btn>
@@ -3829,15 +3938,65 @@ function BackupRow({
   )
 }
 
+/**
+ * The attribution string shown beside an archive row.
+ *
+ * The label is resolved by looking the row's owning `install` id up in the
+ * remote roster; a missing entry or an empty label falls back to the no-label
+ * form. The id decides everything a restore is allowed to do -- this string is
+ * only what a human reads.
+ *
+ *   self          <label> . this install
+ *   other +label  "<label>" (another install . <first 8 hex>)
+ *   other -label  another install . <first 8 hex>
+ *   legacy        unknown origin
+ *
+ * The double quotes around a foreign label are required: they carry the meaning
+ * "this string was written by whoever wrote the archive", not by us.
+ */
+function archiveAttribution(f: BackupArchive, remote: RemoteBackup | null): string {
+  if (f.origin === 'legacy') return i18nT('apps.awsControl.console.backup_origin_unknown')
+  // Under this install's own prefix, but this install has no record of uploading
+  // it -- and a prefix is a folder name any bucket writer can create. Said plainly
+  // rather than rendered as ownership.
+  if (f.origin === 'unverified') return i18nT('apps.awsControl.console.backup_attribution_unverified')
+  const label = remote?.installs.find((i) => i.id === f.install)?.label ?? ''
+  // Each shape is ONE catalog key rather than pieces joined here. The separator,
+  // the parentheses and the quotation marks are punctuation choices that differ by
+  // locale -- assembling them in code would pin every language to English
+  // typography, and the quote glyphs are exactly what carries "somebody else wrote
+  // this string" to the reader.
+  if (f.origin === 'self') {
+    return label
+      ? i18nT('apps.awsControl.console.backup_attribution_self', { label })
+      : i18nT('apps.awsControl.console.backup_attribution_self_unnamed')
+  }
+  const id = f.install.slice(0, 8)
+  return label
+    ? i18nT('apps.awsControl.console.backup_attribution_other', { label, id })
+    : i18nT('apps.awsControl.console.backup_attribution_other_unnamed', { id })
+}
+
 export function BackupSection({ account }: { account: string }) {
   const qc = useQueryClient()
   const [showRemote, setShowRemote] = useState(false)
+  // Opt-in: each other install listed costs extra paid AWS calls, so the drive
+  // is asked about co-tenants only when the reader turns this on. Part of the
+  // query key the same way `showRemote` is, so flipping it is a deliberate
+  // refetch rather than a hidden cost on every poll.
+  const [showOthers, setShowOthers] = useState(false)
   const backupQ = useQuery({
-    // `showRemote` is part of the key on purpose: the remote listing costs paid
-    // AWS calls, so it is fetched only while the stored-archive list is open, and
-    // opening it is a deliberate refetch rather than a hidden cost on every poll.
-    queryKey: ['aws-control', 'backup', account, showRemote],
-    queryFn: () => awsControlApi.backup(account, { remote: showRemote }),
+    // `showRemote` and `showOthers` are part of the key on purpose: the remote
+    // listing and the co-tenant roster each cost paid AWS calls, so they are
+    // fetched only while the stored-archive list is open and only when asked.
+    queryKey: ['aws-control', 'backup', account, showRemote, showOthers],
+    queryFn: () => awsControlApi.backup(account, { remote: showRemote, others: showOthers }),
+    // The co-tenant toggle is part of the key, so without this the panel that
+    // HOSTS the toggle unmounts to a skeleton for the round trip -- the control
+    // the reader just clicked disappears under the cursor. Keyed on the account so
+    // switching accounts still clears rather than showing the previous one's rows.
+    placeholderData: (prev, prevQuery) =>
+      (prevQuery?.queryKey as unknown[] | undefined)?.[2] === account ? prev : undefined,
     // Poll only while a run is actually in flight: an idle section needs no
     // timer, and a start goes through `invalidate`, which is deterministic
     // rather than a wait for the next tick. A remount must ADOPT the server's
@@ -3853,11 +4012,80 @@ export function BackupSection({ account }: { account: string }) {
     mutationFn: (enabled: boolean) => awsControlApi.backupNightly(account, enabled),
     onSuccess: invalidate,
   })
+  // A separate mutation, not a parameter on the one above: the two grants are
+  // separate requests to separate endpoints, and a failure to record one must
+  // leave the other's switch exactly where it was.
+  const nightlySessionsMut = useMutation({
+    mutationFn: (enabled: boolean) => awsControlApi.backupNightlySessions(account, enabled),
+    onSuccess: invalidate,
+  })
+  // The label decides only what a human reads; the restore gate never consults
+  // it. On failure the label is left unchanged and the row says so.
+  const [editingLabel, setEditingLabel] = useState(false)
+  const [labelDraft, setLabelDraft] = useState('')
+  const labelMut = useMutation({
+    mutationFn: (label: string) => awsControlApi.installLabel(label),
+    onSuccess: () => { setEditingLabel(false); invalidate() },
+  })
+  // The archive row awaiting an in-page confirm, by key. Never the label: two
+  // installs can publish the same label, and the confirm is about a specific
+  // object.
+  const [confirmKey, setConfirmKey] = useState<string | null>(null)
+  // Restore carries the confirmed override. A row whose origin is not 'self' asks
+  // first, and confirming ANY of them sends foreignOk true -- foreign, unverified
+  // and legacy alike -- because the backend refuses every origin it cannot prove is
+  // this install's own.
   const restoreMut = useMutation({
-    mutationFn: (key: string) => awsControlApi.backupRestore(account, key),
+    mutationFn: (v: { key: string; foreignOk?: boolean }) =>
+      awsControlApi.backupRestore(account, v.key, v.foreignOk),
+    onError: (error, v) => {
+      // The refusal is the backend's own origin judgment, made against the
+      // drive's current bytes; the row's rendered origin is a cached read of the
+      // upload ledger. When the two disagree -- a 'self' row whose stored bytes a
+      // co-writer has since replaced -- the unconfirmed restore lands here, and
+      // without opening the confirm strip the refusal is a dead end: no path on
+      // the page can ever send the override. Only an UNCONFIRMED attempt opens
+      // the strip; a refusal of an attempt that already carried foreignOk stays
+      // an error, because re-asking the question it answered would loop.
+      if (!v.foreignOk && (error as Error | null)?.message === 'foreign_install_archive') {
+        setConfirmKey(v.key)
+      }
+    },
   })
 
   const data = backupQ.data
+  // The rows the archive list below actually renders -- each kind's listing
+  // under its display cap, flattened in render order. Computed ONCE so the
+  // empty state, the strip-visibility invariant, and the list itself share a
+  // single definition of "on screen" and cannot drift when the cap changes.
+  const renderedRows = BACKUP_KINDS.flatMap((kind) => (data?.remote?.[kind] ?? []).slice(0, 5))
+  // The refusal sentence below and the confirm strip answer the same question,
+  // so exactly one of them may be on screen -- and the strip only exists while
+  // the disclosure is open AND its row is among the rendered rows. Visibility
+  // is therefore DERIVED from the same rows the list renders: a state flag
+  // would go stale when the disclosure collapses or a refetch drops the
+  // refused key out of the listing, and the failure would render nowhere.
+  // The strip must also be answering THIS refusal -- a strip opened for some
+  // other row does not speak for the refused one.
+  const refusedKey = restoreMut.variables?.key
+  const refusalAnswered =
+    confirmKey !== null &&
+    confirmKey === refusedKey &&
+    showRemote &&
+    renderedRows.some((f) => f.key === confirmKey)
+  // Which sentence a refusal gets follows the refused row's own drawn origin:
+  // a 'self' row was refused because the drive's bytes moved under it, and the
+  // foreign-install sentence would contradict the attribution the row itself
+  // renders. Looked up across the whole listing (not the render slice) --
+  // wording truth does not depend on the display cap. A row a refetch removed
+  // entirely falls back to the foreign sentence, the pre-diff behavior.
+  const refusedSelf = BACKUP_KINDS.some((kind) =>
+    (data?.remote?.[kind] ?? []).some((f) => f.key === refusedKey && f.origin === 'self'))
+
+  // Counted from the SAME rows the list below renders, so the empty state cannot
+  // disagree with what is on screen: a kind holding only the label sidecar, or rows
+  // trimmed by the per-kind cap, must not read as rows that exist.
+  const rowCount = renderedRows.length
 
   return (
     <section data-testid="backup-section">
@@ -3889,6 +4117,10 @@ export function BackupSection({ account }: { account: string }) {
               // Account-scoped: this payload answers "is a backup running for THIS
               // account", which the app-scoped `_jobs/active` surface cannot.
               job={data.jobs?.[kind]}
+              /* Only the sessions kind has a reported capability answer, and it is
+                 host-wide rather than per-account, so it is the same answer the
+                 manual run would give. */
+              unsupported={kind === 'sessions' && data.nightlySessionsBlocked === 'host_unsupported'}
               // Re-read immediately after a start, rather than waiting out the
               // poll gap and looking like the click did nothing.
               onStarted={invalidate}
@@ -3910,8 +4142,150 @@ export function BackupSection({ account }: { account: string }) {
               <AwsErrorNotice
                 askAgent
                 error={nightlyMut.error}
-                message={i18nT('apps.awsControl.console.backup_nightly_failed')}
+                message={i18nT('apps.awsControl.console.backup_nightly_failed', {
+                  setting: i18nT('apps.awsControl.console.backup_nightly'),
+                })}
                 testId="backup-nightly-error"
+              />
+            </div>
+          )}
+          {/* The transcript grant, and deliberately a SECOND switch rather than a
+              wider meaning for the one above. The switch above was answered about
+              memory; conversations are the most sensitive payload here, so the
+              operator is asked separately and the answer defaults to off. The hint
+              states what the archive carries, because an unattended upload the
+              operator misunderstood is the failure that matters. */}
+          <div className="flex items-center justify-between gap-3 px-3 py-2.5" data-testid="backup-nightly-sessions">
+            <div className="min-w-0">
+              <div className="text-[13px] font-medium text-text">{i18nT('apps.awsControl.console.backup_nightly_sessions')}</div>
+              <div className="text-[12px] text-muted">
+                {i18nT('apps.awsControl.console.backup_nightly_sessions_hint')}{' '}
+                {/* The SAME string the archive row above carries, not a paraphrase
+                    of it. This is the sentence the owner consents on, and the row
+                    it schedules says the payload reaches past chats started here
+                    into every session under this Kiro home. A hint that says less
+                    than the row asks for a yes to more than it states, and two
+                    wordings of one scope would drift; one string cannot. */}
+                {i18nT('apps.awsControl.console.backup_sessions_scope')}{' '}
+                {/* Where the bytes GO, which the two sentences above do not say. A
+                    reader can understand the payload exactly and still decline for
+                    want of a destination, so this names the storage and ties it to
+                    the manual button they can already see. The button's own label is
+                    interpolated rather than quoted, so renaming it carries through
+                    here instead of leaving this sentence pointing at nothing. */}
+                {i18nT('apps.awsControl.console.backup_nightly_sessions_destination', {
+                  button: i18nT('apps.awsControl.console.backup_run_now'),
+                })}
+              </div>
+            </div>
+            <Toggle checked={data.nightlySessions === true} onChange={(v) => nightlySessionsMut.mutate(v)} label={i18nT('apps.awsControl.console.backup_nightly_sessions')} />
+          </div>
+          {/* Granted, and not running. Shown only in that combination: with the
+              grant off there is nothing being withheld, and the hint above
+              already says what the switch would do. The switch itself stays
+              interactive and keeps reading back as the owner set it -- their
+              answer is theirs -- while this says the schedule is not producing
+              anything, which is the part they cannot otherwise see until the
+              host is gone. */}
+          {data.nightlySessions === true && data.nightlySessionsBlocked ? (
+            <div className="px-3 pb-2 text-[12px] text-warn" data-testid="backup-nightly-sessions-blocked">
+              {[
+                nightlySessionsBlockedText(data.nightlySessionsBlocked),
+                nightlySessionsBlockedNextText(data.nightlySessionsBlocked),
+              ]
+                .filter(Boolean)
+                .join(' ')}
+            </div>
+          ) : null}
+          {nightlySessionsMut.isError && (
+            <div className="px-3 py-2">
+              <AwsErrorNotice
+                askAgent
+                error={nightlySessionsMut.error}
+                message={i18nT('apps.awsControl.console.backup_nightly_failed', {
+                  setting: i18nT('apps.awsControl.console.backup_nightly_sessions'),
+                })}
+                testId="backup-nightly-sessions-error"
+              />
+            </div>
+          )}
+          {/* This install's own identity. The id decides what a restore is
+              allowed to do; this LABEL is only what a human reads, so it is
+              editable in place and its failure is stated without touching the
+              stored name. */}
+          <div className="flex flex-wrap items-center gap-3 px-3 py-2.5" data-testid="backup-install">
+            <div className="min-w-0 flex-1">
+              <div className="text-[13px] font-medium text-text">{i18nT('apps.awsControl.console.backup_install')}</div>
+              {editingLabel ? (
+                <div className="mt-1 flex flex-wrap items-center gap-2">
+                  <Input
+                    aria-label={i18nT('apps.awsControl.console.backup_install_name_label')}
+                    value={labelDraft}
+                    onChange={(e) => setLabelDraft(e.target.value)}
+                    // Same keys as the three rename editors on this page. A reader
+                    // habituated by those presses Enter here, and losing the name to
+                    // a key that works everywhere else is the worst version of it.
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') labelMut.mutate(labelDraft)
+                      if (e.key === 'Escape') { setEditingLabel(false); labelMut.reset() }
+                    }}
+                    autoFocus
+                    disabled={labelMut.isPending}
+                    data-testid="backup-install-name"
+                    className="min-w-0 flex-1"
+                  />
+                  <Btn
+                    primary
+                    onClick={() => labelMut.mutate(labelDraft)}
+                    disabled={labelMut.isPending}
+                    data-testid="backup-install-save"
+                  >
+                    {i18nT('apps.awsControl.console.backup_install_save')}
+                  </Btn>
+                  <Btn
+                    onClick={() => { setEditingLabel(false); labelMut.reset() }}
+                    disabled={labelMut.isPending}
+                    data-testid="backup-install-cancel"
+                  >
+                    {i18nT('apps.awsControl.console.backup_restore_confirm_no')}
+                  </Btn>
+                </div>
+              ) : (
+                <>
+                  <div className="text-[12px]">
+                    <span className="font-medium text-text" data-testid="backup-install-label">{data.install.label}</span>
+                  </div>
+                  {/* Its own line, like the nightly row directly above. Glued after
+                      the label it wrapped badly at narrow widths, because a
+                      renameable value of any length sat in front of a 20-word
+                      sentence. */}
+                  <div className="text-[12px] text-muted">
+                    {i18nT('apps.awsControl.console.backup_install_hint')}
+                  </div>
+                </>
+              )}
+            </div>
+            {!editingLabel && (
+              <Btn
+                className="ml-auto shrink-0"
+                onClick={() => { setLabelDraft(data.install.label); setEditingLabel(true) }}
+                data-testid="backup-install-rename"
+              >
+                <Pencil size={13} />{i18nT('apps.awsControl.console.backup_install_rename')}
+              </Btn>
+            )}
+          </div>
+          {labelMut.isError && (
+            <div className="px-3 py-2">
+              {/* No hand-off: this notice sits inside the open rename editor, whose
+                  `labelDraft` is not saved anywhere durable -- the failed write is
+                  the reason it is still only a draft. Handing off navigates to the
+                  chat and unmounts this tree, so the name the reader just typed
+                  would be gone when they came back. */}
+              <AwsErrorNotice
+                error={labelMut.error}
+                message={i18nT('apps.awsControl.console.backup_install_rename_failed')}
+                testId="backup-install-error"
               />
             </div>
           )}
@@ -3950,14 +4324,146 @@ export function BackupSection({ account }: { account: string }) {
             <ChevronDown size={12} className={`transition-transform ${showRemote ? 'rotate-180' : ''}`} />
           </button>
           {showRemote && (
-            <div className="mt-1.5 rounded-md border border-border bg-card divide-y divide-border" data-testid="backup-archive">
-              {BACKUP_KINDS.flatMap((kind) => (data.remote?.[kind] ?? []).slice(0, 5).map((f) => (
-                <div key={f.key} className="flex items-center gap-2 px-3 py-2 text-[12px]" data-testid="backup-archive-row">
-                  <span className="min-w-0 flex-1 truncate font-mono text-text">{f.key}</span>
-                  <span className="hidden shrink-0 text-muted sm:inline">{fmtBytes(f.size)}</span>
-                  <Btn onClick={() => restoreMut.mutate(f.key)} disabled={restoreMut.isPending} data-testid="backup-restore"><Download size={13} />{i18nT('apps.awsControl.console.backup_restore')}</Btn>
+            // One card: what FILTERS the list, what EXPLAINS the list, then the
+            // list. The co-tenant count and the shared-drive note are the reason
+            // foreign rows are in this list at all, so they belong with it rather
+            // than stacked above it as loose paragraphs.
+            <div className="mt-1.5 rounded-md border border-border bg-card" data-testid="backup-archive">
+              {/* Opt-in: listing co-tenant installs costs extra paid AWS calls,
+                  so it is off until asked. Part of the query key, so flipping it
+                  refetches. */}
+              <div
+                className="flex items-center justify-between gap-3 border-b border-border px-3 py-2.5"
+                data-testid="backup-others-toggle"
+              >
+                <div className="min-w-0">
+                  <div className="text-[13px] font-medium text-text">
+                    {i18nT('apps.awsControl.console.backup_show_others')}
+                  </div>
+                  {data.remote && data.remote.others > 0 && (
+                    <div className="text-[12px] text-muted" data-testid="backup-others-on-drive">
+                      {i18nT('apps.awsControl.console.backup_others_on_drive', { count: data.remote.others })}
+                    </div>
+                  )}
                 </div>
-              )))}
+                <Toggle
+                  checked={showOthers}
+                  onChange={(v) => setShowOthers(v)}
+                  label={i18nT('apps.awsControl.console.backup_show_others')}
+                />
+              </div>
+              {data.remote && data.remote.others > 0 && (
+                <p
+                  className="border-b border-border px-3 py-2 text-[12px] text-muted"
+                  data-testid="backup-shared-note"
+                >
+                  {i18nT('apps.awsControl.console.backup_shared_note')}
+                </p>
+              )}
+              {data.remote?.truncated && (
+                <p
+                  className="border-b border-border px-3 py-2 text-[12px] text-muted"
+                  data-testid="backup-others-truncated"
+                >
+                  {i18nT('apps.awsControl.console.backup_others_truncated', { max: data.remote.max })}
+                </p>
+              )}
+              <div className="divide-y divide-border">
+                {/* A fresh install is the case this whole feature exists for -- its
+                    predecessor's archives are the only copy left -- and it is
+                    exactly the case with no rows of its own. Without this line the
+                    card renders a co-tenant count above an empty list, and nothing
+                    tells the reader that the toggle is what reveals the archives the
+                    count is counting. Only while the toggle is OFF: once it is on,
+                    an instruction to turn it on is not an instruction. */}
+                {rowCount === 0 && !showOthers && (data.remote?.others ?? 0) > 0 && (
+                  <p className="px-3 py-2 text-[12px] text-muted" data-testid="backup-no-own-archives">
+                    {i18nT('apps.awsControl.console.backup_none_from_this_install')}
+                  </p>
+                )}
+                {renderedRows.map((f) => {
+                  const asking = confirmKey === f.key
+                  return (
+                    <div key={f.key} data-testid="backup-archive-row">
+                      <div className="flex flex-wrap items-center gap-2 px-3 py-2 text-[12px]">
+                        <span className="min-w-0 flex-1 truncate font-mono text-text" data-testid="backup-archive-key">{f.key}</span>
+                        <span className="basis-full shrink-0 text-muted sm:basis-auto" data-testid="backup-archive-origin">
+                          {archiveAttribution(f, data.remote)}
+                        </span>
+                        <span className="hidden shrink-0 text-muted sm:inline">{fmtBytes(f.size)}</span>
+                        <Btn
+                          onClick={() => {
+                            // 'self' restores at once; anything else asks first.
+                            if (f.origin === 'self') restoreMut.mutate({ key: f.key })
+                            else setConfirmKey(f.key)
+                          }}
+                          disabled={restoreMut.isPending}
+                          data-testid="backup-restore"
+                        >
+                          <Download size={13} />{i18nT('apps.awsControl.console.backup_restore')}
+                        </Btn>
+                      </div>
+                      {asking && (
+                        <div className="flex flex-wrap items-center gap-2 px-3 pb-2.5" data-testid="backup-restore-confirm">
+                          <p className="basis-full text-[12px] text-muted">
+                            {f.origin === 'legacy'
+                              ? i18nT('apps.awsControl.console.backup_restore_unknown_confirm')
+                              : f.origin === 'unverified'
+                                ? i18nT('apps.awsControl.console.backup_restore_unverified_confirm')
+                                : f.origin === 'self'
+                                  // A self row reaches this strip only after the
+                                  // backend refused its unconfirmed restore: the
+                                  // ledger says this install uploaded it, the
+                                  // drive's bytes no longer match that record.
+                                  // Neither the foreign nor the unverified
+                                  // sentence is true of that state, so it gets
+                                  // its own.
+                                  ? i18nT('apps.awsControl.console.backup_restore_overwritten_confirm')
+                                  : i18nT('apps.awsControl.console.backup_restore_foreign_confirm', { install: f.install.slice(0, 8) })}
+                          </p>
+                          <Btn
+                            onClick={() => {
+                              // The backend refuses ANY origin it cannot prove is
+                              // this install's own, so confirming any of the three
+                              // cases sends the override. It is not a "foreign
+                              // only" flag: it means the reader accepts that this
+                              // archive may not be this machine's.
+                              restoreMut.mutate({ key: f.key, foreignOk: true })
+                              setConfirmKey(null)
+                            }}
+                            disabled={restoreMut.isPending}
+                            data-testid="backup-restore-confirm-yes"
+                          >
+                            {i18nT('apps.awsControl.console.backup_restore_confirm_yes')}
+                          </Btn>
+                          <Btn
+                            onClick={() => {
+                              // Cancel CONCLUDES a refused attempt: the reader
+                              // answered the question with "no", so the refusal
+                              // sentence must not come back and tell them to
+                              // answer it again. Only this strip's own refusal
+                              // is cleared -- a pre-flight confirm fired no
+                              // attempt, and an unrelated earlier failure keeps
+                              // its sentence.
+                              if (
+                                f.key === restoreMut.variables?.key &&
+                                restoreMut.isError &&
+                                (restoreMut.error as Error | null)?.message === 'foreign_install_archive'
+                              ) {
+                                restoreMut.reset()
+                              }
+                              setConfirmKey(null)
+                            }}
+                            data-testid="backup-restore-confirm-no"
+                          >
+                            {i18nT('apps.awsControl.console.backup_restore_confirm_no')}
+                          </Btn>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
             </div>
           )}
           {showRemote && (
@@ -3974,11 +4480,28 @@ export function BackupSection({ account }: { account: string }) {
 
       {/* Restore is the call the recommended write-only policy denies (the
           caveat above says so) — and its failure used to be invisible, the one
-          outcome that caveat exists to explain. */}
+          outcome that caveat exists to explain. A `foreign_install_archive`
+          refusal is its own sentence, keyed to the refused row's drawn origin —
+          but only while the strip answering THIS refusal is actually on screen.
+          The strip IS the confirmation the sentence asks for, so rendering both
+          would tell the reader to do the thing the page is already asking them
+          to do; the moment the strip is not rendered (disclosure collapsed, row
+          out of the render slice, or the strip belongs to another row), the
+          sentence carries the failure instead. */}
       <AwsErrorNotice
         askAgent
         error={restoreMut.error}
-        message={restoreMut.isError ? i18nT('apps.awsControl.console.backup_restore_failed') : null}
+        message={
+          restoreMut.isError
+            ? (restoreMut.error as Error | null)?.message === 'foreign_install_archive'
+              ? refusalAnswered
+                ? null
+                : i18nT(refusedSelf
+                  ? 'apps.awsControl.console.backup_restore_overwritten_refused'
+                  : 'apps.awsControl.console.backup_restore_foreign_refused')
+              : i18nT('apps.awsControl.console.backup_restore_failed')
+            : null
+        }
         className="mt-2"
         testId="backup-restore-error"
       />

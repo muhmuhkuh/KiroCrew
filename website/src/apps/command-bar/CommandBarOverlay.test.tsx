@@ -40,6 +40,7 @@ vi.mock('../../store/chatSlice', () => ({
   // `keepTargetOnMissing` decides whether a 404 unwinds to the previous slot.
   switchSlot: (arg: string | { key: string; keepTargetOnMissing?: boolean }) =>
     typeof arg === 'string' ? { type: 'switchSlot', key: arg } : { type: 'switchSlot', ...arg },
+  requestFolderReveal: (folderId: string) => ({ type: 'requestFolderReveal', folderId }),
 }))
 vi.mock('../../components/commandPalette/paletteActions', () => ({
   usePaletteActions: () => ({ navigate, enterInsertOrNewSession, newSessionWithToken }),
@@ -61,6 +62,14 @@ vi.mock('../../hooks/useVisualViewport', () => ({ useVisualViewport: () => ({ he
 vi.mock('../../hooks/useDialogFocusTrap', () => ({ useDialogFocusTrap: () => {} }))
 const cycleTheme = vi.fn()
 vi.mock('../../hooks/useTheme', () => ({ useTheme: () => ({ cycle: cycleTheme }) }))
+// Only the filing call is stubbed — it talks to the folder API. `commandFolderName`
+// stays REAL: it decides what the folder is called, which is exactly what these tests
+// assert, and a stub would let them agree with themselves.
+const fileSessionInCommandFolder = vi.fn(async () => 'folder-1')
+vi.mock('./sessionFolder', async importOriginal => ({
+  ...(await importOriginal<typeof import('./sessionFolder')>()),
+  fileSessionInCommandFolder: (...args: unknown[]) => fileSessionInCommandFolder(...(args as [])),
+}))
 
 /** Resolve the promise `createSlot` dispatch is expected to produce. */
 const resolvingDispatch = () => dispatch.mockReturnValue({ unwrap: () => Promise.resolve('slot-1') })
@@ -312,7 +321,7 @@ describe('CommandBarOverlay rows', () => {
     // the App Store, find the app and disable it by hand.
     const onClose = mount()
     fireEvent.change(screen.getByRole('combobox'), { target: { value: 'zzzznomatch' } })
-    const hint = await screen.findByText(/disable Command Bar in the App Store/)
+    const hint = await screen.findByText(/turn full search back on/)
     fireEvent.mouseDown(hint.closest('[role="option"]') as HTMLElement)
     expect(navigate).toHaveBeenCalledWith('/apps/detail/command-bar')
     expect(onClose).toHaveBeenCalled()
@@ -329,10 +338,10 @@ describe('CommandBarOverlay rows', () => {
         screen.getAllByRole('option').some(o => o.textContent?.includes('Toggle Theme')),
       ).toBe(true),
     )
-    expect(screen.queryByText(/disable Command Bar in the App Store/)).toBeNull()
+    expect(screen.queryByText(/turn full search back on/)).toBeNull()
     // With nothing matched, the dead end is real and the row appears.
     fireEvent.change(input, { target: { value: 'zzzznomatch' } })
-    expect(await screen.findByText(/disable Command Bar in the App Store/)).toBeTruthy()
+    expect(await screen.findByText(/turn full search back on/)).toBeTruthy()
   })
 
   it('Escape dismisses from a focusable sibling, not only from the input', async () => {
@@ -458,6 +467,21 @@ describe('CommandBarOverlay rows', () => {
     await waitFor(() => expect(sessionSearch.mock.calls.length).toBeGreaterThan(before))
   })
 
+  it('leaves the sessions failure a row, with none of the artifacts scope notice', async () => {
+    // Guard on a deliberate boundary. The artifacts scope renders its failure through
+    // ErrorNotice above the list, and it would have been easy to reach that surface for
+    // both scopes on the grounds that they should match. They should not: the sessions
+    // row's text was never a backend string, so nothing about it misled anyone, and
+    // changing it would mean a feature PR reshaping a surface it does not own. Without
+    // this, the gate can be removed and every other test here still passes.
+    sessionSearch.mockRejectedValue(new Error('gateway down'))
+    mount()
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'quarterly' } })
+    await screen.findByText('Search failed')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('opens the sessions view on its recents listing, not on an empty screen', async () => {
     // Entering a view used to land on a centred "keep typing" sentence: no rows, so no
     // selection, so nothing Enter could do -- and that rowless state is the only
@@ -580,7 +604,7 @@ describe('CommandBarOverlay rows', () => {
     expect(rows[0].textContent).not.toContain('Command')
     // Activating one switches to it, the same way every other surface opens a session.
     fireEvent.mouseDown(rows[0])
-    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a' })
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a', announceOnMissing: true })
   })
 
   it('shows no attention section when nothing is waiting on the user', () => {
@@ -613,7 +637,7 @@ describe('CommandBarOverlay rows', () => {
     // `pendingInput` by REPLACING the slot's draft and persisting it, so inserting
     // here would silently destroy a half-written message the user had not sent.
     // Created WITHOUT activating, so nothing has focus until the claim is checked.
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     await waitFor(() =>
       expect(dispatch).toHaveBeenCalledWith({
         type: 'switchSlot',
@@ -623,6 +647,9 @@ describe('CommandBarOverlay rows', () => {
     )
     await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'setPendingInput', text: 'why did the deploy stall' }))
     expect(enterInsertOrNewSession).not.toHaveBeenCalled()
+    // NOT filed into a command folder: this is a sentence the reader wrote, so it
+    // belongs wherever they are working rather than under a command's name.
+    expect(fileSessionInCommandFolder).not.toHaveBeenCalled()
   })
 
   it('keeps the question recoverable when the session cannot be created', async () => {
@@ -704,7 +731,7 @@ describe('CommandBarOverlay rows', () => {
     // The user walks away before the gateway answers.
     rerender(false)
     release({ key: 'slot-9' })
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     // No activation, no seed, no navigation -- the abandoned create is allowed to leak
     // a slot, but it must not touch shared state.
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-9' })
@@ -727,7 +754,7 @@ describe('CommandBarOverlay rows', () => {
     await waitFor(() => expect(screen.getByLabelText('Working…')).toBeTruthy())
     unmount()
     release({ key: 'slot-9' })
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-9' })
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: 'why did the deploy stall' })
     expect(navigate).not.toHaveBeenCalled()
@@ -802,6 +829,7 @@ describe('CommandBarOverlay contributed commands', () => {
     enterInsertOrNewSession.mockReset()
     newSessionWithToken.mockReset()
     cycleTheme.mockReset()
+    fileSessionInCommandFolder.mockClear()
     storeState.dashboard = { slots: [], unreadSlots: [] }
     storeState.chat = { slotStatusDetail: {}, activeSlot: null }
     window.localStorage.clear()
@@ -928,7 +956,7 @@ describe('CommandBarOverlay contributed commands', () => {
     mountWithApps([appWith([APPROVE_ALL])])
     enterCommand(/Approve all PRs/)
     expect(screen.queryAllByRole('option')).toHaveLength(0)
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
     expect(navigate).not.toHaveBeenCalled()
   })
 
@@ -936,7 +964,63 @@ describe('CommandBarOverlay contributed commands', () => {
     dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
     mountWithApps([appWith([STANDUP])])
     enterCommand(/Write my standup/)
-    expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'createSlot',
+      arg: { activate: false, memory_mode: 'persistent' },
+    })
+  })
+
+  it("files the session it opened under the command's own folder", async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
+    mountWithApps([appWith([STANDUP])])
+    enterCommand(/Write my standup/)
+    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
+    const [slotKey, folderName] = fileSessionInCommandFolder.mock.calls[0] as unknown as [
+      string,
+      string,
+    ]
+    expect(slotKey).toBe('slot-new')
+    // The row's own title, so a second command lands in a folder of its own rather
+    // than sharing one with every other row this app contributed.
+    expect(folderName).toBe('Write my standup')
+  })
+
+  it('files an argument-taking command under its title too', async () => {
+    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-approve' }) })
+    mountWithApps([appWith([APPROVE_ALL])])
+    const input = enterCommand(/Approve all PRs/)
+    fireEvent.change(input, { target: { value: LINK } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
+    expect(fileSessionInCommandFolder.mock.calls[0]?.[1]).toBe('Approve all PRs')
+  })
+
+  it('files nothing when the seed was abandoned mid-flight', async () => {
+    // The prompt never became a message, so there is no session worth filing -- and a
+    // folder named after a command that did not run is worse than an unfiled session.
+    let resolveSlot: (v: unknown) => void = () => {}
+    dispatch.mockReturnValue({ unwrap: () => new Promise(res => (resolveSlot = res)) })
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], [appWith([STANDUP])])
+    const onClose = vi.fn()
+    const view = render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    enterCommand(/Write my standup/)
+    // Dismissed while the create is still in flight, which revokes the run's claim.
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open={false} onClose={onClose} />
+      </QueryClientProvider>,
+    )
+    await act(async () => {
+      resolveSlot({ key: 'slot-abandoned' })
+      await Promise.resolve()
+    })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: STANDUP.prompt })
+    expect(fileSessionInCommandFolder).not.toHaveBeenCalled()
   })
 
   it("refuses a value the app's own pattern rejects, creating nothing", async () => {
@@ -947,7 +1031,7 @@ describe('CommandBarOverlay contributed commands', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
     // The app supplies the message, because only the app knows what shape it wanted.
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Not a GitHub link.'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
     expect(onClose).not.toHaveBeenCalled()
     expect(input.value).toBe('https://gitlab.com/g/p/-/merge_requests/1')
   })
@@ -982,7 +1066,7 @@ describe('CommandBarOverlay contributed commands', () => {
     await waitFor(() =>
       expect(screen.getByRole('alert').textContent).toContain('no longer available'),
     )
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
   })
 
   it('refuses to send a prompt that differs from the one it previewed', async () => {
@@ -1015,7 +1099,7 @@ describe('CommandBarOverlay contributed commands', () => {
 
     fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('changed'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
     // The refreshed preview shows the new text, so the next Enter is informed.
     expect(screen.getByText(/Delete every branch behind https/)).toBeTruthy()
   })
@@ -1156,7 +1240,7 @@ describe('CommandBarOverlay contributed commands', () => {
 
     fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
     await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('changed'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
   })
 
   it('a stale activation does not clear a live one\'s duplicate-run guard', async () => {
@@ -1227,7 +1311,7 @@ describe('CommandBarOverlay contributed commands', () => {
 
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy())
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } })
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
   })
 
   it('shows the resolved prompt before an auto-sending command fires', async () => {
@@ -1441,7 +1525,7 @@ describe('CommandBarOverlay contributed commands', () => {
     const input = enterCommand(/Approve all PRs/)
     fireEvent.change(input, { target: { value: LINK } })
     fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: { activate: false } }))
+    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
     await waitFor(() =>
       expect(dispatch).toHaveBeenCalledWith({
         type: 'switchSlot',

@@ -8,16 +8,16 @@
 // 'sessions')` in the Usage tab — the tab renders `queryErr.message` verbatim,
 // so whatever this method rejects with is what the user is told.
 
-vi.mock("../api/client", () => ({
+vi.mock('../api/client', () => ({
   api: {
     kiroUsage: vi.fn(),
   },
-}));
+}))
 
-import { api } from "../api/client";
-import { AcpAdapter } from "../providers/adapters/acp";
+import { api } from '../api/client'
+import { AcpAdapter } from '../providers/adapters/acp'
 
-const kiroUsage = api.kiroUsage as unknown as ReturnType<typeof vi.fn>;
+const kiroUsage = api.kiroUsage as unknown as ReturnType<typeof vi.fn>
 
 /** The route's payload when the directory read failed: complete zero statistics
  *  plus the reason. Mirrors `_parse_sessions`, whose shape
@@ -25,12 +25,12 @@ const kiroUsage = api.kiroUsage as unknown as ReturnType<typeof vi.fn>;
  *  pins on the backend side. */
 function unreadableSessionsPayload() {
   return {
-    username: "someone",
-    error: "cannot read sessions directory",
-    billing: { plan: "Pro", credits_used: 10, credits_plan: 100 },
+    username: 'someone',
+    error: 'cannot read sessions directory',
+    billing: { plan: 'Pro', credits_used: 10, credits_plan: 100 },
     sessions: {
-      error: "cannot read sessions directory",
-      code: "sessions_dir_unreadable",
+      error: 'cannot read sessions directory',
+      code: 'sessions_dir_unreadable',
       total_sessions: 0,
       total_messages: 0,
       total_tool_calls: 0,
@@ -43,7 +43,7 @@ function unreadableSessionsPayload() {
       avg_tools_per_session: 0,
       refused_transcripts: 0,
     },
-  };
+  }
 }
 
 /** The shape the route answered BEFORE the statistics contract was restored:
@@ -52,78 +52,74 @@ function unreadableSessionsPayload() {
  *  updated yet, and the wire is where the two meet. */
 function errorOnlySessionsPayload() {
   return {
-    username: "someone",
-    error: "cannot read sessions directory",
-    billing: { plan: "Pro", credits_used: 10, credits_plan: 100 },
+    username: 'someone',
+    error: 'cannot read sessions directory',
+    billing: { plan: 'Pro', credits_used: 10, credits_plan: 100 },
     sessions: {
-      error: "cannot read sessions directory",
-      code: "sessions_dir_unreadable",
+      error: 'cannot read sessions directory',
+      code: 'sessions_dir_unreadable',
     },
-  };
+  }
 }
 
 function healthySessionsPayload() {
-  const p = unreadableSessionsPayload();
-  delete (p.sessions as Record<string, unknown>).error;
-  delete (p.sessions as Record<string, unknown>).code;
-  delete (p as Record<string, unknown>).error;
-  p.sessions.today = { sessions: 3, messages: 9, tool_calls: 4 };
-  return p;
+  const p = unreadableSessionsPayload()
+  delete (p.sessions as Record<string, unknown>).error
+  delete (p.sessions as Record<string, unknown>).code
+  delete (p as Record<string, unknown>).error
+  p.sessions.today = { sessions: 3, messages: 9, tool_calls: 4 }
+  return p
 }
 
-describe("AcpAdapter.fetchUsage — an unreadable sessions directory", () => {
-  beforeEach(() => vi.clearAllMocks());
+describe('AcpAdapter.fetchUsage — an unreadable sessions directory', () => {
+  beforeEach(() => vi.clearAllMocks())
 
-  it("rejects with the message the server sent", async () => {
-    kiroUsage.mockResolvedValue(unreadableSessionsPayload());
+  it('rejects with the message the server sent', async () => {
+    kiroUsage.mockResolvedValue(unreadableSessionsPayload())
     await expect(new AcpAdapter().fetchUsage()).rejects.toThrow(
-      "cannot read sessions directory",
-    );
-  });
+      'cannot read sessions directory',
+    )
+  })
 
-  it("does not reject with a property-access TypeError", async () => {
+  it('does not reject with a property-access TypeError', async () => {
     // The distinguishing assertion: reading `s.today.sessions` off this payload
     // also rejects, but with the client's own "Cannot read properties of
     // undefined (reading 'sessions')" instead of the server's diagnostic. The
     // message is what the Usage tab prints, so equality is the property that
     // matters, not merely that something was thrown.
-    kiroUsage.mockResolvedValue(unreadableSessionsPayload());
+    kiroUsage.mockResolvedValue(unreadableSessionsPayload())
     const err = await new AcpAdapter().fetchUsage().then(
       () => null,
       (e: unknown) => e,
-    );
-    expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toBe("cannot read sessions directory");
-    expect((err as Error).message).not.toMatch(/undefined/);
-  });
+    )
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toBe('cannot read sessions directory')
+    expect((err as Error).message).not.toMatch(/undefined/)
+  })
 
-  it("reports the reason for an error-only payload too, not a TypeError", async () => {
+  it('reports the reason for an error-only payload too, not a TypeError', async () => {
     // A gateway that has not shipped the statistics contract yet answers the
     // reason INSTEAD of the numbers. Reaching for `s.today.sessions` there is
     // what produced "Cannot read properties of undefined (reading 'sessions')"
     // in the Usage tab, in place of the message the server had already written.
-    kiroUsage.mockResolvedValue(errorOnlySessionsPayload());
+    kiroUsage.mockResolvedValue(errorOnlySessionsPayload())
     const err = await new AcpAdapter().fetchUsage().then(
       () => null,
       (e: unknown) => e,
-    );
-    expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toBe("cannot read sessions directory");
-  });
+    )
+    expect(err).toBeInstanceOf(Error)
+    expect((err as Error).message).toBe('cannot read sessions directory')
+  })
 
-  it("still normalizes a healthy response", async () => {
+  it('still normalizes a healthy response', async () => {
     // Guard the guard: a method that rejected unconditionally would pass both
     // assertions above.
-    kiroUsage.mockResolvedValue(healthySessionsPayload());
-    const usage = await new AcpAdapter().fetchUsage();
-    expect(usage.sessions.today).toEqual({
-      sessions: 3,
-      messages: 9,
-      toolCalls: 4,
-    });
-    expect(usage.billing?.plan).toBe("Pro");
-  });
-});
+    kiroUsage.mockResolvedValue(healthySessionsPayload())
+    const usage = await new AcpAdapter().fetchUsage()
+    expect(usage.sessions.today).toEqual({ sessions: 3, messages: 9, toolCalls: 4 })
+    expect(usage.billing?.plan).toBe('Pro')
+  })
+})
 
 // `GET /api/usage/kiro` can also answer 200 with a body that is not the route's
 // contract at all -- no `sessions` half. A reverse proxy or a fixture stub that
@@ -133,28 +129,25 @@ describe("AcpAdapter.fetchUsage — an unreadable sessions directory", () => {
 // (reading 'total_sessions')" -- the engine's English, in every locale, which
 // the en-XA pseudolocale sweep counts as a latin leak as soon as the gate waits
 // for the surface to settle before scanning it (#9709).
-describe("AcpAdapter.fetchUsage — a payload with no sessions half", () => {
-  beforeEach(() => vi.clearAllMocks());
+describe('AcpAdapter.fetchUsage — a payload with no sessions half', () => {
+  beforeEach(() => vi.clearAllMocks())
 
   it.each([
-    ["an array", []],
-    ["an empty object", {}],
-    [
-      "a sessions half that is an array",
-      { username: "someone", billing: {}, sessions: [] },
-    ],
-  ])("rejects with the catalog message for %s, not a TypeError", async (_label, payload) => {
-    kiroUsage.mockResolvedValue(payload);
+    ['an array', []],
+    ['an empty object', {}],
+    ['a sessions half that is an array', { username: 'someone', billing: {}, sessions: [] }],
+  ])('rejects with the catalog message for %s, not a TypeError', async (_label, payload) => {
+    kiroUsage.mockResolvedValue(payload)
     const err = await new AcpAdapter().fetchUsage().then(
       () => null,
       (e: unknown) => e,
-    );
-    expect(err).toBeInstanceOf(Error);
+    )
+    expect(err).toBeInstanceOf(Error)
     // The message is what the Overview card and the Usage tab print, so it has
     // to be a catalog string: setup pins i18next to English, and the key is the
     // one `api/client.ts` already uses for a body that is not what the route
     // promised.
-    expect((err as Error).message).toBe("Unexpected server response");
-    expect((err as Error).message).not.toMatch(/undefined|total_sessions/);
-  });
-});
+    expect((err as Error).message).toBe('Unexpected server response')
+    expect((err as Error).message).not.toMatch(/undefined|total_sessions/)
+  })
+})

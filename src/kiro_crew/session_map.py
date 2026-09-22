@@ -31,6 +31,7 @@ from kiro_crew.messaging.link import (
     canonical_key,
     is_channel_session_key,
     legacy_dashboard_mirror_key,
+    split_dm_session_key,
 )
 from kiro_crew.sel import _infer_source, sel
 
@@ -46,8 +47,8 @@ SESSION_MAP_FILENAME = "session_map.json"
 # Resolved per call, never captured at import: an import-time binding freezes
 # the data home and defeats pod isolation, the lazy legacy-home migration and
 # test isolation. The name below is an opt-in override (None = live home) so
-# existing monkeypatch call sites keep working. See config.md "Data Home" and
-# issue #874; dashboard/handlers/usage.py is the reference implementation.
+# existing monkeypatch call sites keep working. See config.md "Data Home";
+# dashboard/handlers/usage.py is the reference implementation.
 _KIRO_SESSIONS_DIR: Path | None = None
 
 
@@ -61,6 +62,11 @@ def _kiro_sessions_dir() -> Path:
 # persists it, so renaming the literal would silently re-enable mirroring for
 # every conversation that had already turned it off.
 MIRROR_OPT_OUT_FLAG = "mirror_opt_out"
+
+# Highest explicit DM generation acknowledged before its first provider turn.
+# Stored on the stable bucket entry so repeated /new commands cost one integer,
+# not one immortal map row per empty generation.
+GENERATION_FLOOR_FIELD = "generation_floor"
 
 # Flags that are durable SETTINGS rather than session-scoped state, and so keep
 # their entry alive through :meth:`SessionMap.prune`. Membership is opt-in
@@ -90,14 +96,18 @@ def _has_durable_flag(entry: dict) -> bool:
 def _survives_prune(entry: dict) -> bool:
     """True iff *entry* holds state that must outlive its native session.
 
-    The ONE predicate behind every stale branch of :meth:`SessionMap.prune`, so
-    they cannot disagree about what a missing session file is allowed to take
-    with it. Two kinds of state qualify: a durable flag (a per-conversation
-    setting) and a channel binding — a Slack thread or a ``mirror`` — which is
-    the identity that routes a conversation back to its channel. Prune may clear
-    a stale ``sid`` on such an entry, but never discards the entry itself.
+    Durable settings, an explicit generation floor, and channel bindings all
+    outlive a provider session. The generation floor prevents a restart from
+    reusing a history key after ``/new`` was acknowledged before the first turn.
     """
-    return bool(_has_durable_flag(entry) or entry.get("slack_thread_ts") or entry.get("mirror"))
+    floor = entry.get(GENERATION_FLOOR_FIELD)
+    has_generation_floor = isinstance(floor, int) and not isinstance(floor, bool) and floor > 0
+    return bool(
+        _has_durable_flag(entry)
+        or has_generation_floor
+        or entry.get("slack_thread_ts")
+        or entry.get("mirror")
+    )
 
 
 # The callable shape a lost-binding announcement is delivered through:
@@ -110,6 +120,26 @@ UnbindListener = Callable[[str, ChannelLink, str], None]
 # :data:`_MAP_LOCK`: a clearing call site may hold a throwaway ``SessionMap()``, and
 # a per-instance listener would leave those removals unannounced.
 _UNBIND_LISTENER: UnbindListener | None = None
+
+# The callable shape a COMMITTED channel binding is announced through: ``(session_key,)``.
+# Deliberately carries only the key: the sink resolves the session itself, because what
+# it records is a property of that session rather than of the link.
+BindListener = Callable[[str], None]
+
+# Announces that a session's conversation is now published to a channel. Registered by
+# the gateway, which is the only layer that can see a session's memory mode and owning
+# app -- this store sees the binding and nothing else about the session. MODULE-level
+# for the same reason as :data:`_UNBIND_LISTENER`: a binding call site may hold a
+# throwaway ``SessionMap()``, and a per-instance listener would leave those
+# announcements unmade.
+#
+# It exists because the crew log records a session's CLASS, and a reader deciding
+# whether another session may read that log asks about the whole life of the log rather
+# than about now. Sampling the class at each turn's start misses a link that commits
+# and is removed inside ONE turn, and content authored through it is in the log with no
+# record that it was published. Announcing the commit is what closes that: the record
+# is written when the fact becomes true, not when someone next looks.
+_BIND_LISTENER: BindListener | None = None
 
 
 def _normalize_unbind_reason(reason: str) -> str:
@@ -142,6 +172,33 @@ def set_unbind_listener(callback: UnbindListener | None) -> None:
     """
     global _UNBIND_LISTENER
     _UNBIND_LISTENER = callback
+
+
+def set_bind_listener(callback: BindListener | None) -> None:
+    """Register (or clear, with None) the sink for COMMITTED channel bindings.
+
+    Invoked as ``callback(session_key)`` once the IN-MEMORY binding is committed and
+    while the map lock is still held, which is what makes it precede any traffic: routing
+    an inbound message reads this map, so no message can be attributed to the session
+    before the announcement has been made. The guarantee rests on that in-memory commit
+    ALONE, and deliberately so: the ordering that matters is against readers of the map,
+    and they read the dict, not the file. Where the file write has reached by then varies
+    by context and is not part of the guarantee -- on a thread running an event loop it is
+    only queued, while a caller with no running loop (CLI, tests, worker threads) has
+    already written it inline. A sink that waited for the disk would hold the lock across
+    a write on the one path that must not pay for it, without buying any ordering the
+    in-memory commit does not already give.
+
+    Best-effort at the call site, on the same contract as its unbind sibling -- it runs
+    on a synchronous path, so it must not block, and an exception it raises is
+    swallowed rather than failing the bind. That is safe here only because the thing it
+    records is fail-closed at the far end: the record is handed to the crew log's
+    writer without waiting, and a write the writer permanently loses is itself recorded,
+    which the class fold reads as a hole and a cross-session read refuses on. So a lost
+    announcement costs a refusal, never a silent grant.
+    """
+    global _BIND_LISTENER
+    _BIND_LISTENER = callback
 
 
 # Serializes every structural access to the map. MODULE-level, not per-instance,
@@ -488,7 +545,7 @@ class SessionMap:
         - on a thread running an event loop: mark dirty and schedule ONE
           debounced flush task. The task serializes under the lock and does the
           disk write in a worker thread, so the loop never pays the write
-          inline (issue #2405). A mutation landing while a flush is in flight
+          inline. A mutation landing while a flush is in flight
           re-marks dirty, and the task loops until it observes a clean map, so
           a trailing mutation is never dropped.
         - no running loop (CLI, tests, worker threads): write inline on the
@@ -836,6 +893,22 @@ class SessionMap:
         except (TypeError, ValueError):
             return None
 
+    def _note_bind(self, key: str) -> None:
+        """Announce one COMMITTED channel binding. The choke point both bind paths use.
+
+        Called after the binding is persisted and inside the map lock, so it describes
+        something that has happened and precedes anything that could route through it.
+        Best-effort, matching :meth:`_note_inbound_unbind`: a broken sink must not turn
+        a bind into a raise.
+        """
+        listener = _BIND_LISTENER
+        if listener is None:
+            return
+        try:
+            listener(key)
+        except Exception:
+            logger.warning("channel-bind listener failed for %s", key, exc_info=True)
+
     def _note_inbound_unbind(self, key: str, link: ChannelLink, reason: str) -> None:
         """Audit and announce the removal of one inbound resume binding.
 
@@ -1061,7 +1134,7 @@ class SessionMap:
             # One more dirty-mark after the rebuild. ``_save`` is loop-aware:
             # on prune's only production path (``start_pool`` on the startup
             # loop) the saves coalesce into one deferred flush whose disk
-            # write runs on a worker thread (#2405) — the loop still pays the
+            # write runs on a worker thread — the loop still pays the
             # serialize, never the write. A ``batched_save`` here would write
             # inline at batch exit on that same loop.
             self._save()
@@ -1195,6 +1268,12 @@ class SessionMap:
             else:
                 self._thread_to_session[thread_ts] = key
         self._save()
+        if thread_ts:
+            # A real binding, not the clear sentinel. The identical-coordinates branch
+            # above returns before reaching here, so the inbound path re-writing the
+            # same thread every turn does not announce: this fires on a binding that
+            # CHANGED, which is what the sink records.
+            self._note_bind(key)
 
     @_guarded
     def get_slack_link(self, key: str) -> tuple[str | None, str | None]:
@@ -1338,6 +1417,7 @@ class SessionMap:
         # as the Slack path: a marker outliving its binding re-mutes the next one.
         entry.pop("mirror_paused", None)
         self._save()
+        self._note_bind(key)
         if displaced is not None and (displaced != link or not accepts_inbound):
             self._note_inbound_unbind(key, displaced, reason)
 
@@ -1614,7 +1694,7 @@ class SessionMap:
           from the CANONICAL row -- the session's own -- never through
           ``_mirror_key``. That conversation is permanent, so the flag cannot be
           orphaned by its target disappearing; it CAN be orphaned by the lookup
-          moving, which is what keying it to the mirror binding used to do.
+          moving, which is what keying it to the mirror binding would do.
         * ``origin=False`` requires an explicit ``mirror`` dict, and follows the
           binding through ``_mirror_key``.
         """
@@ -1631,19 +1711,43 @@ class SessionMap:
         return entry.get("mirror_paused") is True
 
     @_guarded
+    def reserve_generation(self, session_key: str) -> None:
+        """Persist the generation in *session_key* before its first provider turn.
+
+        The watermark lives on the stable bucket entry instead of materializing
+        one map row per empty generation. It is monotonic: a delayed or repeated
+        command can never lower the restart seed and make an older history key
+        reusable.
+        """
+        parsed = split_dm_session_key(canonical_key(session_key))
+        if parsed is None:
+            raise ValueError(f"not a canonical DM session key: {session_key!r}")
+        bucket, generation = parsed
+        if generation <= 0:
+            return
+        entry = self._ensure_entry(bucket)
+        current = entry.get(GENERATION_FLOOR_FIELD)
+        if isinstance(current, int) and not isinstance(current, bool) and current >= generation:
+            return
+        entry[GENERATION_FLOOR_FIELD] = generation
+        self._save()
+
+    @_guarded
     def max_generation(self, bucket: str) -> int:
         """Return the highest persisted DM generation for a session *bucket*.
 
         The bucket is the generation-0 key (e.g.
         ``telegram:<agent>:direct:<user>``); generations persist as ``{bucket}``
-        (gen 0) and ``{bucket}:gen{N}``. Returns the max ``N`` with a persisted
-        entry, or -1 when the bucket has none. Channels seed their in-memory
-        generation counter from this so ``/new`` and idle/daily reset advance
-        past any generation left on disk (restart-safe) instead of colliding
-        with a stale session and resuming it.
+        (gen 0) and ``{bucket}:gen{N}``. An explicit ``/new`` also records a
+        monotonic generation floor on the bucket before the first provider turn.
+        Returns the highest of those sources, or -1 when the bucket has none.
         """
         bucket = canonical_key(bucket)
         best = 0 if bucket in self._data else -1
+        entry = self._data.get(bucket)
+        floor = entry.get(GENERATION_FLOOR_FIELD) if entry else None
+        if isinstance(floor, int) and not isinstance(floor, bool):
+            best = max(best, floor)
         prefix = f"{bucket}:gen"
         for key in self._data:
             if key.startswith(prefix):
@@ -1653,9 +1757,16 @@ class SessionMap:
         return best
 
     @_guarded
-    def find_key_by_sid(self, session_id: str) -> str | None:
-        """Find the session map key for a given kiro-cli session ID."""
+    def find_key_by_sid(self, session_id: str, *, exclude: str = "") -> str | None:
+        """Find the session map key for a given kiro-cli session ID.
+
+        *exclude* skips one key, for a caller asking whether ANOTHER key maps the same
+        session -- the question "is this session still somebody's" cannot be answered by
+        a lookup that can return the very key the caller is retiring.
+        """
         for k, entry in self._data.items():
+            if exclude and k == exclude:
+                continue
             sid = entry.get("sid") if isinstance(entry, dict) else entry
             if sid == session_id:
                 return k

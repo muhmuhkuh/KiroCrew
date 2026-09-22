@@ -4,6 +4,7 @@
 vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-ui/react-select'))
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import '@testing-library/jest-dom/vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import React from 'react'
@@ -31,14 +32,29 @@ vi.mock('../api/client', () => ({
     updateDashboardConfig: () => Promise.resolve({}),
     tipsStatus: () => Promise.resolve({ enabled_config: true, opted_out: false }),
     tipsFeedback: () => Promise.resolve({ ok: true }),
+    // The panel reads the feature-video cache on mount. Downloads OFF here, so
+    // the readout renders its policy line and no button -- these files measure
+    // other settings, and a live control would put a stray button in their reach.
+    featureVideoStatus: () => Promise.resolve({
+      enabled: true, download_enabled: false, release: 'r1',
+      cached: 0, total: 0, downloading: null,
+    }),
+    featureVideoFetchAll: () => Promise.resolve({ ok: true }),
   },
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
 
+import { Provider } from 'react-redux'
+
+// ChatPanel reads the active slot from redux to name the session on its
+// feature-video calls, so these renders need a store. A FRESH one per file,
+// not the app singleton: a shared store would carry `activeSlot` across suites.
+import { createTestStore } from './helpers'
+
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(<Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
 }
 
 const seed = (agent: Record<string, unknown>) =>
@@ -48,15 +64,27 @@ const seed = (agent: Record<string, unknown>) =>
  *  Waits for the control to leave its loading-disabled state first — the
  *  trigger exists (inert) while the config query is still in flight. */
 async function openSelect(label: string) {
-  const trigger = await screen.findByRole('combobox', { name: label })
+  // SearchableSelect (used for the model pickers) renders a plain <button>
+  // trigger, while the still-plain SimpleSelect/Raix rendition renders a
+  // role="combobox" — so the trigger must be located by whichever role the
+  // current control actually emits, not a hard-coded one.
+  const trigger = await findTrigger(label)
   await waitFor(() => expect(trigger).not.toHaveAttribute('data-disabled'))
   fireEvent.click(trigger)
   return screen.getAllByRole('option')
 }
 
+/** Locate a SettingsSelect trigger by its accessible name, whether it is a
+ * Radix combobox (plain select) or a SearchableSelect button. */
+async function findTrigger(label: string): Promise<HTMLElement> {
+  const combobox = screen.queryByRole('combobox', { name: label })
+  if (combobox) return combobox
+  return screen.findByRole('button', { name: label })
+}
+
 /** Assert a SettingsSelect is inert: it stays closed when clicked. */
 async function expectSelectInert(label: string) {
-  const trigger = await screen.findByRole('combobox', { name: label })
+  const trigger = await findTrigger(label)
   await waitFor(() => expect(trigger).toHaveAttribute('data-disabled'))
   fireEvent.click(trigger)
   expect(screen.queryAllByRole('option')).toHaveLength(0)
@@ -72,7 +100,7 @@ describe('ChatPanel — default model', () => {
   it('renders the Model section with both controls', async () => {
     wrap(<ChatPanel />)
     expect(await screen.findByText('Model')).toBeInTheDocument()
-    expect(await screen.findByRole('combobox', { name: 'Default Model' })).toBeInTheDocument()
+    expect(await findTrigger('Default Model')).toBeInTheDocument()
     expect(
       await screen.findByRole('combobox', { name: 'Default Reasoning Effort' })
     ).toBeInTheDocument()
@@ -100,8 +128,8 @@ describe('ChatPanel — default model', () => {
   it('shows the stored model in the trigger', async () => {
     seed({ model: 'claude-opus-4.8', reasoning_effort: '' })
     wrap(<ChatPanel />)
-    await waitFor(() =>
-      expect(screen.getByRole('combobox', { name: 'Default Model' })).toHaveTextContent(
+    await waitFor(async () =>
+      expect(await findTrigger('Default Model')).toHaveTextContent(
         'claude-opus-4.8'
       )
     )
@@ -122,8 +150,8 @@ describe('ChatPanel — default model', () => {
   it('treats an empty stored model as the auto default', async () => {
     seed({ model: '', reasoning_effort: '' })
     wrap(<ChatPanel />)
-    await waitFor(() =>
-      expect(screen.getByRole('combobox', { name: 'Default Model' })).toHaveTextContent(
+    await waitFor(async () =>
+      expect(await findTrigger('Default Model')).toHaveTextContent(
         'Default (auto)'
       )
     )

@@ -3,25 +3,37 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import fields
-from typing import Protocol
 
 from kiro_crew.monitoring.decision import (
     decide_monitor,
     monitor_budget_reason,
+    monitor_stall_reason,
+    stamp_monitor_alerted,
     terminal_decision_for_outcome,
 )
-from kiro_crew.monitoring.github_pull_request import GitHubPullRequestProbeResult
+
+# The engine names no host anywhere else, and this import is the exception the
+# observation type forces: a tick that sent no request is a third outcome
+# ``MonitorObservation`` has no field for, so the only marker is the reason code
+# the probe set -- and a reason code belongs to the kind that emits it.
+from kiro_crew.monitoring.github_provider_errors import is_unattempted_probe
 from kiro_crew.monitoring.models import (
     MonitorDecision,
     MonitorObservationStatus,
     MonitorOutcome,
+    MonitorProbe,
     MonitorState,
     MonitorVerdict,
     ProviderErrorKind,
     is_finite_non_negative_number,
+    resolve_probe_result,
+)
+from kiro_crew.monitoring.registry import (
+    kind_supports_objective,
+    kind_supports_shadow,
 )
 
 ShadowStatePersistence = Callable[[MonitorState], Awaitable[None]]
@@ -31,20 +43,9 @@ class ShadowWakeDeliveryRefused(RuntimeError):
     """Raised when a caller asks the persistence-only path to wake a session."""
 
 
-class GitHubShadowProvider(Protocol):
-    """External probe boundary required by the shadow controller."""
-
-    def probe(
-        self,
-        raw_target: str,
-        *,
-        previous_observation: Mapping[str, object] | None = None,
-    ) -> GitHubPullRequestProbeResult: ...
-
-
 async def run_shadow_probe(
     state: MonitorState,
-    provider: GitHubShadowProvider,
+    provider: MonitorProbe,
     persist: ShadowStatePersistence,
     *,
     now: float,
@@ -57,8 +58,16 @@ async def run_shadow_probe(
     """
     if wake_delivery:
         raise ShadowWakeDeliveryRefused("wake delivery is unavailable in shadow mode")
-    if state.kind != "github_pull_request" or state.objective != "review_ready":
-        raise ValueError("shadow mode supports only github_pull_request review_ready")
+    # A CAPABILITY the kind declares, not an allowlist of what a caller may request:
+    # this asks whether the persistence-only path is implemented for the kind, which
+    # is a fact about what code exists. A kind registered without it is refused here
+    # rather than silently inheriting a claim about a path it has never run.
+    if not kind_supports_shadow(state.kind):
+        raise ValueError(f"shadow mode is not implemented for monitored kind {state.kind!r}")
+    if not kind_supports_objective(state.kind, state.objective):
+        raise ValueError(
+            f"monitored kind {state.kind!r} does not declare objective {state.objective!r}"
+        )
     if not is_finite_non_negative_number(now):
         raise ValueError("now must be a finite non-negative number")
     if not callable(persist):
@@ -78,11 +87,12 @@ async def run_shadow_probe(
         await _persist_and_publish(state, staged, persist)
         return MonitorVerdict(decision=MonitorDecision.STOP_BUDGET)
 
-    result = await asyncio.to_thread(
+    results = await asyncio.to_thread(
         provider.probe,
-        state.target,
-        previous_observation=deepcopy(state.last_observation),
+        (state.target,),
+        previous_observations={state.target: deepcopy(state.last_observation)},
     )
+    result = resolve_probe_result(results, state.target)
     staged = deepcopy(state)
     verdict = decide_monitor(staged, result.observation, now=now)
     decision = verdict.decision
@@ -90,8 +100,19 @@ async def run_shadow_probe(
     staged.last_probe_at = now
     staged.last_decision = decision
     observation = result.observation
+    staged.last_observation_status = observation.status
+    staged.last_observation_reason_code = observation.reason_code
     provider_error = observation.provider_error or observation.supplemental_provider_error
-    if provider_error is not None:
+    if is_unattempted_probe(observation):
+        # THE THIRD OUTCOME, and it moves neither counter. The provider-error
+        # budget is finite and never refunded, so it has to measure refusals the
+        # HOST gave this watch: charged for a request the probe declined to send,
+        # a cooldown that unrelated work opened retires a healthy watch on its own
+        # cadence. Clearing the streak instead is the opposite error -- an outage
+        # interleaved with skips would never retire the watch it is blinding -- so
+        # a tick that observed nothing leaves the accounting exactly as it was.
+        pass
+    elif provider_error is not None:
         staged.provider_error_count += 1
         staged.consecutive_provider_errors += 1
         staged.last_provider_error = provider_error
@@ -102,13 +123,21 @@ async def run_shadow_probe(
         staged.last_observation = deepcopy(result.canonical)
         staged.last_fingerprint = observation.fingerprint
         staged.last_observed_at = now
+    if decision is MonitorDecision.WAKE_ACTIONABLE:
+        # Record that a wake was DECIDED for the conditions it delivers, next to
+        # the persist. The shadow path deliberately does not deliver, but the
+        # field records the decision, not the delivery, so the re-alert interval
+        # is measured from here exactly as on the delivering path.
+        stamp_monitor_alerted(staged, now=now)
     if decision in {
         MonitorDecision.STOP_SUCCESS,
         MonitorDecision.STOP_BLOCKED,
         MonitorDecision.STOP_BUDGET,
     }:
         staged.outcome = _terminal_outcome(decision, observation.provider_error)
-        staged.stopped_reason = observation.reason_code or decision.value
+        staged.stopped_reason = (
+            monitor_stall_reason(staged, now=now) or observation.reason_code or decision.value
+        )
         staged.stopped_at = now
         staged.next_probe_at = 0.0
     else:

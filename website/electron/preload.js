@@ -23,7 +23,11 @@ contextBridge.exposeInMainWorld("kirocrew", {
   // Caption controls for the frameless Linux window. macOS keeps its traffic
   // lights and Windows its titleBarOverlay when frameless; Linux gets neither,
   // so main.js injects header buttons that round-trip through this channel.
-  // The action vocabulary is validated in main.js (applyWindowControl).
+  // The splash (loading.html) also sends `close` through it on every
+  // platform, since it can be painted into a window whose native close
+  // control is hidden. The action vocabulary and the per-platform admission
+  // are validated in the main process (handleWindowControl /
+  // applyWindowControl).
   windowControl: (action) => ipcRenderer.send("window-control", String(action || "")),
 });
 
@@ -234,6 +238,11 @@ contextBridge.exposeInMainWorld("browserAPI", {
     ipcRenderer.invoke("browser:set-control-owner", panelId, owner),
   getControl: (panelId) => ipcRenderer.invoke("browser:get-control", panelId),
   control: (panelId, op, args) => ipcRenderer.invoke("browser:control", panelId, op, args),
+  // Human-initiated element annotation on the page in the native view:
+  // start/stop pick mode, poll the notes the user typed in the in-page
+  // overlay, remove/edit/clear, capture a screenshot with the markers. Read
+  // through executeJavaScript + capturePage, not the agent control plane.
+  annotate: (panelId, op, args) => ipcRenderer.invoke("browser:annotate", panelId, op, args),
   // Declares that a chat session may host a browser panel, so the agent command
   // channel polls for it even before the Browser tab is ever opened. Grants no
   // authorization — authorization to drive the built-in browser is Browser Mode

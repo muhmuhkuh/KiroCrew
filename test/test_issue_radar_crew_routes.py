@@ -77,7 +77,7 @@ CREW_ROUTES: tuple[tuple[str, str], ...] = (
     ("POST", "/issue/comment"),
 )
 
-#: Endpoints this app used to expose to hold an issue for a human, and must not
+#: Endpoints that would hold an issue for a human, which this app must not
 #: expose again. Kept as an explicit table rather than deleted with their tests: the
 #: registrar is checked against ``CREW_ROUTES`` by name, so a re-added handler under
 #: a path nobody enumerates would pass every other test in this file silently.
@@ -341,6 +341,14 @@ class TestRegistrationAndGates(_CrewRouteCase):
 
 
 class TestCrewsList(_CrewRouteCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Only the store's timestamp source moves; filesystem writes and locks stay real.
+        self.clock = mock.Mock(return_value="2026-01-01T00:00:00.000001+00:00")
+        patcher = mock.patch.object(store, "_now_iso", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     async def test_returns_crews_settings_and_counts(self):
         self.crew("Andromeda")
         res = await self.call("GET", "/crews", query={"owner": OWNER, "repo": REPO})
@@ -360,19 +368,38 @@ class TestCrewsList(_CrewRouteCase):
         # implement came second — which is the whole point of the rule.
         crew = self.crew("Andromeda")
         self.work(crew["id"], 1, "awaiting-ci")
+        self.clock.return_value = "2026-01-01T00:00:00.000002+00:00"
         self.work(crew["id"], 2, "implementing")
         counts = _payload(
             await self.call("GET", "/crews", query={"owner": OWNER, "repo": REPO})
         )["counts"]
         self.assertEqual(counts["working"], 1)
 
+        # Progress on the older parked item makes it newest without creating an item.
+        self.clock.return_value = "2026-01-01T00:00:00.000003+00:00"
+        crew_store.upsert_work_item(
+            OWNER, REPO, crew["id"], 1, {"next": "waiting for checks"}, self.root
+        )
+        page = _payload(await self.call("GET", "/crews", query={"owner": OWNER, "repo": REPO}))
+        self.assertEqual(page["counts"]["working"], 0)
+        self.assertEqual(page["crews"][0]["status"], "idle")
+
     async def test_a_crew_parked_on_its_newest_item_is_not_working(self):
         crew = self.crew("Andromeda")
         self.work(crew["id"], 1, "implementing")
+        self.clock.return_value = "2026-01-01T00:00:00.000002+00:00"
         self.work(crew["id"], 2, "awaiting-ci")
         page = _payload(await self.call("GET", "/crews", query={"owner": OWNER, "repo": REPO}))
         self.assertEqual(page["counts"]["working"], 0)
         self.assertEqual(page["crews"][0]["status"], "idle")
+
+        self.clock.return_value = "2026-01-01T00:00:00.000003+00:00"
+        crew_store.upsert_work_item(
+            OWNER, REPO, crew["id"], 1, {"next": "implementing the next step"}, self.root
+        )
+        page = _payload(await self.call("GET", "/crews", query={"owner": OWNER, "repo": REPO}))
+        self.assertEqual(page["counts"]["working"], 1)
+        self.assertEqual(page["crews"][0]["status"], "working")
 
     async def test_a_retired_crew_is_neither_listed_nor_on_duty(self):
         crew = self.crew("Andromeda")
@@ -2019,11 +2046,11 @@ class TestSettings(_CrewRouteCase):
                 self.assertEqual(_payload(res)["code"], "invalid_settings")
 
 
-# ── the endpoints that used to hold work for a human ──────────────────────
+# ── the endpoints that would hold work for a human ──────────────────────
 
 
 class TestNothingWaitsForAHuman(_CrewRouteCase):
-    """A crew never parks an issue on a person, so neither endpoint that used to
+    """A crew never parks an issue on a person, so neither endpoint that would
     express that exists: no queue of held items, and no channel for a human to
     answer a crew mid-turn.
 

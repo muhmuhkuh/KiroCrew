@@ -18,6 +18,7 @@ def _write_cfg(tmp_path: Path) -> Path:
                 "memory_store": "default",
             },
             "oncall": {
+                "member_id": "member-oncall",
                 "kiro_agent": "oncall-agent",
                 "workspace": "oncall-ws",
                 "memory_store": "oncall-mem",
@@ -27,7 +28,14 @@ def _write_cfg(tmp_path: Path) -> Path:
         },
         "default_agent": "default",
         "workspaces": {"default": {"dir": "workspace"}, "oncall-ws": {"dir": "oncall"}},
-        "memory_stores": {"default": {}, "oncall-mem": {}},
+        "memory_stores": {
+            "default": {},
+            "oncall-mem": {
+                "owner_member": "oncall",
+                "owner_member_id": "member-oncall",
+                "memory_version": 2,
+            },
+        },
     }
     p = tmp_path / "config.json"
     p.write_text(json.dumps(data), encoding="utf-8")

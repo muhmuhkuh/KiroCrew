@@ -31,7 +31,7 @@ Both commands refuse to run on a platform that cannot open a directory relative 
 
 | Component | Files |
 |-----------|-------|
-| memory | `memory.db`, `memory_index.db`, `workspace/memory/`, `workspace/knowledge/` |
+| memory | `memory.db`, `memory_index.db`, `workspace/memory/`, `workspace/knowledge/`, `memory_stores/` |
 | crons | `crons.json` |
 | config | `config.json`, `session_map.json`, `hooks.json`, `project_dir`, `workspace_dir` |
 | skills | `skills/` directory |
@@ -47,6 +47,18 @@ stages the shared paths once.
 
 `workspace/hygiene_data/` and `workspace/insert_facts*.py` are excluded: they are
 large and regenerable.
+
+`memory_stores/` holds named V1 stores and member-scoped V2 stores. V2 learning
+has one SQLite authority, including history, full-text search and vectors;
+manual rules and project guidance remain separate files. Snapshot memory capture
+uses SQLite backup for consistent committed state, including WAL data.
+Local rolling backups and pending restore journals stay on their host. Historical
+host credential and runtime-log filenames are excluded from portable bundles.
+
+Archives contain member memory in cleartext. Keep them in storage appropriate
+for the data. Owner-only staging and extraction permissions protect against other
+OS users, not arbitrary code run as the same user. Member-scoped tools do not
+promise confidentiality for exported copies.
 
 The security event log's HMAC key (`sel_hmac.key`) is deliberately **excluded**
 from every snapshot, and is regenerated on the restoring host. That keeps each
@@ -164,9 +176,11 @@ The mode is auto-detected from whether `~/.kiro/crew/memory.db` exists, so a
 restore onto a fresh machine replaces and a restore onto a machine you are
 already using merges. Override with `--mode replace` or `--mode merge`.
 
-In `replace` mode the state being overwritten is moved into a
-`pre-restore-<timestamp>/` folder inside the data home first, and the path is
-printed, so a wrong-snapshot restore is recoverable.
+In `replace` mode the state being overwritten is saved first. Named stores go
+into `memory_stores/.member-backups/pre-restore-<timestamp>/` inside the data home,
+where agents cannot read them. Other components go into `pre-restore-<timestamp>/`
+at the data-home root. The saved paths are printed, so a wrong-snapshot restore
+is recoverable. If rollback cannot finish, the failure report names both locations.
 
 ### What merge does per component
 
@@ -202,6 +216,59 @@ knowledge library are:
 - `--mode replace`, which takes the snapshot's knowledge database whole; or
 - restore onto a machine that has no knowledge database yet, where nothing is
   being merged and the snapshot's copy lands directly.
+
+Named stores merge as whole directories, in both snapshot restore and dashboard
+import. An existing `memory_stores/<name>/` is kept whole: no missing files are
+added to it, so a V1 database cannot gain a V2 manifest or index. Each kept store
+is named in the result. Only stores the receiving machine lacks are installed,
+with their manifest, databases and memory files together. Empty directories and
+Markdown-only stores are kept too; missing databases do not mean local notes can
+be combined with another store's identity. Use replace to take the archive's store.
+
+#### Replace refuses while a named store is open
+
+A named V1 or V2 store that some process still has open would survive the replacement as
+an unlinked file, and that process would keep writing memory nothing will ever
+read again. `--mode replace` therefore takes each store's lifetime lock for the
+whole replace and refuses, before changing anything, when one is already held:
+stop the gateway (`kirocrew stop`) and any other process using the store, then
+re-run. A store that something tries to open during the replace waits for it to
+finish. The dashboard import answers the same refusal with its reason instead of
+applying. On POSIX, named V1 Markdown-only dashboard caches hold admission until
+their last user releases the object. Snapshot and ZIP-export readers hold admission
+while copying named stores, so replacement cannot mix their files across generations.
+Creating and publishing new named stores waits behind the same namespace lock as
+replace, merge and backup reads. Replace holds that lock before listing stores and
+keeps it through rollback, so a successful concurrent create is not silently erased.
+Opening a named vector store also takes namespace admission before its lifetime lock
+and SQLite initialization. A cold open with no directory waits until replace finishes;
+it cannot create an open database that replace then deletes. Directory creation helpers
+and pending member-restore activation follow the same order. Global V1 is unchanged.
+Keep the gateway stopped for replace because external writers may bypass these locks.
+On every platform, named Markdown and lesson-file reads and writes hold the namespace
+lock for the full operation, including index updates. A write that starts during replace
+waits until replacement or rollback finishes; it does not disappear between backup and
+clear. This also protects Windows stores that have no SQLite database. Global V1 is
+unchanged. Windows SQLite handles separately prevent deleting an open database.
+Async lesson and memory requests perform locked reads and store construction in
+worker threads, so waiting for replace does not freeze the gateway event loop.
+
+Because those locks live under `memory_stores/.member-backups/`, replace clears
+`memory_stores/` store by store and leaves its host-local entries
+(`.member-backups/`, `.execution-logs/`, `.member-api-key`) in place, the way the
+default store's `<home>/backups/` is left in place. If replacement fails, rollback
+restores the store directories into that same root without removing the locks or
+the saved copy. The default, unnamed store does not take this named-store lock.
+
+#### Replace and snapshots taken before named stores were backed up
+
+Replace makes each memory tree match the archive, so a store directory the
+archive does not carry is removed (saved under
+`memory_stores/.member-backups/pre-restore-<timestamp>/`).
+The one exception is a snapshot whose `MANIFEST.json` predates version 4:
+those were written before the tree was part of `memory`, so their silence says
+nothing about the source. Replacing from one leaves the live named stores exactly
+as they are and prints a line saying so, while the rest of `memory` is replaced.
 ### Options
 
 | Flag | Description |
@@ -218,8 +285,9 @@ After a restore, run `kirocrew restart` so the gateway picks up the new state.
 ### Integrity check
 
 In `replace` mode every database the snapshot carries is checked **before any live
-state is touched** — `memory.db`, `memory_index.db`, and
-`workspace/knowledge/knowledge.db`. A snapshot whose database is unreadable or
+state is touched** — `memory.db`, `memory_index.db`,
+`workspace/knowledge/knowledge.db`, and every named store's
+`memory_stores/<name>/memory.db` and `memory_index.db`. A snapshot whose database is unreadable or
 fails its integrity check is refused with a non-zero exit and nothing is
 replaced, so a corrupt archive cannot leave the data home sitting on it. This
 matters most for a bundle fetched from S3, which is untrusted input regardless of

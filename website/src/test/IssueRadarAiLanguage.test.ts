@@ -41,7 +41,13 @@ vi.mock('../apps/issue-radar/context', async () => {
   const actual = await vi.importActual<typeof import('../apps/issue-radar/context')>(
     '../apps/issue-radar/context',
   )
-  return { ...actual, useIssueRadar: () => ({ aiLanguage: livePref }) }
+  return {
+    ...actual,
+    // `repoSettings` is part of the context contract (useInvestigate reads
+    // `workspace_path` off it); this suite only varies `aiLanguage`, so the rest
+    // stays at defaults.
+    useIssueRadar: () => ({ aiLanguage: livePref, repoSettings: { workspace_path: '' } }),
+  }
 })
 
 const {
@@ -263,14 +269,20 @@ describe('a second tab cannot erase the choice', () => {
   it('writes the language from its own setter and never from the whole-state save', async () => {
     const src = await readFile(join(__dirname, '..', 'apps/issue-radar/context.tsx'), 'utf8')
     expect(src).toMatch(/patchUiState\(\{ aiLanguage: next \}\)/)
+    // Scope this assertion to the persistence payload. The context value also
+    // exposes `aiLanguage`, which is a read surface, not a storage write.
+    const savePayload = src.match(
+      /const current: Partial<PersistedUiState> = \{[\s\S]*?if \(saveUiState\(changed\)\) lastWritten\.current = current;/,
+    )?.[0]
+    expect(savePayload).toBeTruthy()
     // The save effect must not write this field AT ALL any more. It used to send
     // `aiLanguage: storedAiLanguage()` -- a read-back carve-out that kept a stale tab
     // from reverting the choice while the effect still rewrote the whole document.
     // The effect now sends only the fields that tab changed, so the carve-out is gone
     // and the setter is the single writer. A payload line for this field, whether the
     // bare variable or the read-back, is the defect returning.
-    expect(src).not.toMatch(/\n      aiLanguage,\n/)
-    expect(src).not.toMatch(/aiLanguage: storedAiLanguage\(\)/)
+    expect(savePayload).not.toMatch(/\baiLanguage\b/)
+    expect(savePayload).not.toMatch(/aiLanguage: storedAiLanguage\(\)/)
     // And the helper that carve-out needed is gone from format.ts. Re-exporting it
     // is how the read-back would come back, so pin its absence rather than only the
     // call site: with the function deleted, the assertion above cannot fail on its own.

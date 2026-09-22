@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
+from tmpdir_helpers import SHORT_TMP_PREFIX
 
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import transport
@@ -218,7 +219,7 @@ def sock_dir(tmp_path: Path) -> Iterator[Path]:
     that actually bind a socket need this; the ones asserting path arithmetic
     (``lock_path_for``, ``resolve_address``) are unaffected and keep ``tmp_path``.
     """
-    base = Path(tempfile.mkdtemp(prefix="kcs-", dir="/tmp"))
+    base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "gwsock-", dir="/tmp"))
     try:
         yield base
     finally:
@@ -883,8 +884,9 @@ def test_installing_the_pipe_factory_twice_is_a_noop(
 
 # --- prepare_dir must not run on the event loop -------------------------------
 
-# ``prepare_dir`` -> ``platform_compat.make_owner_only_dir`` shells out to
-# ``icacls`` on Windows with a multi-second timeout. Both call sites are
+# ``prepare_dir`` -> ``platform_compat.make_owner_only_dir`` is blocking file
+# IO whose Windows DACL write can block on a network volume round-trip. Both
+# call sites are
 # coroutines, so an inline call stalls the loop it runs on -- for the manager
 # that is the live gateway's loop (a dashboard toggle freezes chat turns and the
 # liveness heartbeat), and for the daemon it is the loop already serving its

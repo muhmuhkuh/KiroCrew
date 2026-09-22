@@ -5,7 +5,7 @@ the browser and the ``chat_folder_*`` MCP tools. An audit line that labels
 every write ``dashboard`` cannot answer "did I file that session, or did the
 agent?", which is the whole point of auditing a mutation.
 
-Since #3503 the audit splits interface from identity: ``source`` stays in
+The audit splits interface from identity: ``source`` stays in
 SEL's closed interface vocabulary (``dashboard`` / ``mcp``) so operator
 queries like ``source == "mcp"`` keep matching every MCP-driven event
 uniformly, while ``caller`` carries the internal caller's own declared
@@ -158,8 +158,8 @@ class TestFolderAuditOrigin:
     ) -> None:
         """Secret present, no caller header: audit loudly, never guess.
 
-        This is the exact latent bug of #3503 made visible — an internal
-        caller that never declared itself used to inherit the ``mcp`` label
+        This is the latent bug this guards, made visible — an internal
+        caller that never declared itself would inherit the ``mcp`` label
         silently; now it shows up as ``unknown-internal`` plus a warning that
         names the fix (add the caller to the known set, with a test).
         """
@@ -212,12 +212,26 @@ class TestKnownCallerRatchet:
     def test_known_internal_callers_exact_list(self) -> None:
         """RATCHET: adding an internal caller is a conscious, reviewed edit.
 
-        The known set is the entire defense #3503 asks for — a second internal
+        The known set is the entire defense this asks for — a second internal
         caller must fail loudly (``unknown-internal`` + warning) until someone
         adds it HERE, alongside its own audit test. Widening this assertion is
         that conscious edit.
+
+        ``kirocrew-crew-log`` joined it with the read-only crew-log server: its
+        routes validate the header through the same ``request_origin`` and refuse a
+        request naming anything else, and its own audit assertions live in
+        ``test_crew_log_routes.py``.
         """
-        assert _KNOWN_INTERNAL_CALLERS == frozenset({"kirocrew-dashboard"})
+        assert _KNOWN_INTERNAL_CALLERS == frozenset({"kirocrew-dashboard", "kirocrew-crew-log"})
+
+    def test_crew_log_server_name_is_a_known_caller(self) -> None:
+        """The same cross-module pin as the dashboard one below, for the crew-log
+        server: its routes accept the internal transport ONLY for the caller name
+        it declares, so renaming either side without the other turns every agent
+        read into a refusal rather than into a silent widen."""
+        from kiro_crew.mcp_crew_log import SERVER_NAME
+
+        assert SERVER_NAME in _KNOWN_INTERNAL_CALLERS
 
     def test_dashboard_server_name_is_a_known_caller(self) -> None:
         """The cross-module contract pin: the name the dashboard MCP server

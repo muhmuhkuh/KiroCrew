@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import shutil
+import site
 import socket
 import struct
 import sys
@@ -136,27 +137,64 @@ def posix_test_shell() -> str:
     return shell
 
 
-# ── Windows CI ──────────────────────────────────────────────────────────
+# ── Windows and macOS CI ────────────────────────────────────────────────
 # The backend runs natively on Windows (kiro_crew.platform_compat), but a
 # handful of suites exercise POSIX-only-by-design features (OS-level
 # sandbox, process groups / PGID semantics, PTY, AF_UNIX sockets -- see
 # docs/guides/windows-install.md's per-feature table). Skip collecting them on
 # Windows rather than marking test-by-test: several fail at import or
 # fixture time on win32.
+#
+# macOS reuses the same file-driven mechanism (macos-collect-ignore.txt). macOS is
+# POSIX, so the reasons that fill the Windows list do not apply there; that list is
+# expected to stay short or empty, and a file exists so a whole-file exclusion has
+# one documented home instead of an inline literal.
 from kiro_crew import platform_compat  # noqa: E402
+
+
+@pytest.fixture
+def nonbundled_python_without_user_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model a non-bundled venv whose user site is already unavailable."""
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
+
+
+@pytest.fixture
+def nonbundled_python_with_user_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model a hosted interpreter whose user site is enabled."""
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", True)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
+
+
+@pytest.fixture
+def bundled_python_with_user_site(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model the bundled interpreter with an otherwise enabled user site."""
+    monkeypatch.setattr(site, "ENABLE_USER_SITE", True)
+    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: True)
+
+
+def _collect_ignore_from(listname: str) -> list:
+    """Bare test filenames listed in ``test/<listname>``, comments stripped."""
+    path = os.path.join(os.path.dirname(__file__), listname)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [
+                name
+                for name in (ln.split("#", 1)[0].strip() for ln in fh)
+                if name
+            ]
+    except OSError:  # pragma: no cover - list file absent in a partial checkout
+        return []
+
 
 if platform_compat.IS_WINDOWS:
     # Read from windows-collect-ignore.txt rather than an inline list: the CI
     # reduced-scope selector (scripts/ci-surface-tests.py) has to apply the same
     # exclusion, because naming a file explicitly on the pytest command line
     # bypasses collect_ignore. One file, two readers, no drift.
-    _ignore_listfile = os.path.join(os.path.dirname(__file__), "windows-collect-ignore.txt")
-    with open(_ignore_listfile, encoding="utf-8") as _fh:
-        collect_ignore = [
-            name
-            for name in (ln.split("#", 1)[0].strip() for ln in _fh)
-            if name
-        ]
+    collect_ignore = _collect_ignore_from("windows-collect-ignore.txt")
+elif platform_compat.IS_MACOS:
+    collect_ignore = _collect_ignore_from("macos-collect-ignore.txt")
 
 
 def make_escaping_link(inside: pathlib.Path, outside: pathlib.Path) -> str:
@@ -241,6 +279,88 @@ def forget_env_at_teardown(monkeypatch, *names: str) -> None:
             monkeypatch.delenv(name)
 
 
+#: Thread-CPU budget for ONE rejection of a pump in the SMALL ramp. The shipped
+#: grammars spend under one clock tick here; the exponential class a shared character
+#: between two adjacent quantified classes produces measured 4.3 s at 24 characters
+#: and doubles per character, so it is more than a decade over.
+REDOS_SMALL_BUDGET_SECONDS = 0.5
+#: Pump lengths for the small ramp, ONE unit at a time. Ramping (not one fixed size)
+#: is what bounds the cost of catching a regression: the mutant with the steepest
+#: growth measured (~8x per pumped block) spends at most ~growth x budget on the
+#: first size that overruns, and the ramp stops there. A single 24-unit probe
+#: against that mutant would not return inside pytest's ``--timeout``.
+REDOS_SMALL_PUMPS = tuple(range(1, 25))
+#: Thread-CPU budget for one rejection of a pump in the LARGE ramp. The shipped
+#: grammars measured 0.03 s at 20 000; a quadratic regression is 4e8 steps there.
+REDOS_LARGE_BUDGET_SECONDS = 2.0
+#: Pump lengths for the polynomial class, ascending so a cubic overruns at 2 000
+#: (8e9 steps) before 20 000 is ever attempted.
+REDOS_LARGE_PUMPS = (200, 2_000, 20_000)
+
+
+def assert_rejected_without_backtracking(reject, build_pump) -> None:
+    """Assert a marker grammar handles an adversarial pump in linear CPU time.
+
+    ``build_pump(n)`` returns an input with an ``n``-unit pump (a run of tabs, ``n``
+    repeated heads or blocks); ``reject(text)`` runs the grammar and asserts its own
+    outcome (a refusal, or the one legitimate match the shape has). Replaces the
+    ``elapsed < 1.0`` wall-clock shape, which flaked in one of five full runs:
+    ``perf_counter`` charges the time this worker spent DESCHEDULED behind nine
+    siblings to a regex that took 0.15 s of CPU (class 5 in testing-conventions),
+    and a ``monotonic()`` ratio read 16x from a 15.6 ms clock tick. Four properties:
+
+    * **Thread CPU, not wall clock.** ``time.thread_time`` counts this thread's
+      own execution, so another worker's slice cannot inflate it; the regex runs
+      in C, so coverage instrumentation does not either.
+    * **A one-unit ramp FIRST, and it is what catches the real regression.** A
+      shared character between two adjacent quantified classes in these grammars
+      is not polynomial but EXPONENTIAL (measured: 0.27 s at 20 characters, 4.3 s
+      at 24, doubling per character; an interior that admits every bracket grows
+      ~8x per block), so the 200 000-character input the old tests used would never
+      return under a regression and the worker would be killed at ``--timeout`` --
+      a lost run (class 6), not a red test. Ramping one unit at a time means the
+      first over-budget size costs at most ~growth x budget, and the assertion
+      fires there; only when the whole ramp passes is a long pump tried at all.
+    * **Ascending long pumps** for the polynomial class, so a cubic overruns at
+      2 000 before 20 000 is attempted.
+    * **Minimum of two readings, and the second is taken only if the first
+      overran.** A gen-2 garbage collection charged to this thread mid-search is
+      the one thing that can still spend CPU here; it cannot hit two consecutive
+      readings, so a first reading under budget is a verdict on its own and two
+      over-budget readings are a verdict the other way -- the measurement never
+      pays a regression's cost more than twice per size.
+
+    The budgets are generous on purpose (a decade or more over the shipped cost):
+    a real complexity regression is orders of magnitude, and a tight bound only
+    turns runner variance into red.
+    """
+    import time
+
+    def cheapest(text: str, budget: float) -> float:
+        start = time.thread_time()
+        reject(text)
+        first = time.thread_time() - start
+        if first < budget:
+            return first
+        start = time.thread_time()
+        reject(text)
+        return min(first, time.thread_time() - start)
+
+    for n in REDOS_SMALL_PUMPS:
+        cost = cheapest(build_pump(n), REDOS_SMALL_BUDGET_SECONDS)
+        assert cost < REDOS_SMALL_BUDGET_SECONDS, (
+            f"handling a {n}-unit pump cost {cost:.2f}s of CPU -- the grammar "
+            "backtracks catastrophically (a body class now shares a character with "
+            "an adjacent quantified run, or two alternatives can consume one span?)"
+        )
+    for n in REDOS_LARGE_PUMPS:
+        cost = cheapest(build_pump(n), REDOS_LARGE_BUDGET_SECONDS)
+        assert cost < REDOS_LARGE_BUDGET_SECONDS, (
+            f"handling a {n}-unit pump cost {cost:.2f}s of CPU -- superlinear in the "
+            "pump length"
+        )
+
+
 def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
     """Make ``kiro_crew.artifact_source`` see NO project root above ``ceiling``.
 
@@ -286,7 +406,7 @@ def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _windows_restrict_to_owner_stub(request, monkeypatch):
+def _windows_restrict_to_owner_stub(request, _floor_monkeypatch):
     """On Windows, no-op the secret lockdown for hermetic tests.
 
     Many tests stub ``subprocess.run`` (or strip PATH) for hermeticity, or
@@ -304,7 +424,7 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     through, so stubbing only the file helper would leave every test that
     creates an owner-only directory writing a real DACL.
 
-    Note the lockdown no longer spawns anything -- it applies the DACL through
+    Note the lockdown does not spawn anything -- it applies the DACL through
     ``advapi32`` in-process -- so the subprocess-stub collision this fixture was
     built for is mostly gone. The stub is kept because a hermetic test that
     patches the SID resolver or the writer seam can still trip the fail-loud
@@ -323,8 +443,8 @@ def _windows_restrict_to_owner_stub(request, monkeypatch):
     ):
         yield
         return
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: None)
-    monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", lambda p: None)
+    _floor_monkeypatch.setattr(platform_compat, "restrict_to_owner", lambda p: None)
+    _floor_monkeypatch.setattr(platform_compat, "restrict_dir_to_owner", lambda p: None)
     yield
 
 
@@ -349,7 +469,49 @@ def _release_source_corpus_after_module():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_aim_skills_dir(monkeypatch):
+def _drop_live_config_snapshot():
+    """Give every test an unstarted process watcher, and leave none behind.
+
+    ``kiro_crew.config.live`` keeps ONE process-global watcher, and every
+    point-of-use reader (``SkillsLoader._max_triggered_now``, the channel
+    dispatchers' ``_live_cfg``) prefers its snapshot over the config it was
+    constructed with. A test that primes it and does not reset therefore sets the
+    live config for every later test on the same xdist worker -- measured as a
+    ``max_triggered`` of 0 leaking into ``test_explain_for_skill`` from an
+    unrelated module. The reset is a lock and a ``None`` store, so it costs the
+    ~57k tests that never prime nothing measurable.
+
+    Reset on BOTH sides, so a test asserting on the subscription registry starts
+    from an empty one whatever ran before it on this worker -- the registry is
+    process-global too, and an entry another test left in it is indistinguishable
+    from one the test under way registered.
+    """
+    from kiro_crew.config import live
+
+    live.reset_for_tests()
+    yield
+    live.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _inline_taskq_pump(_floor_monkeypatch):
+    """Run the subagent pump and the store open inline for the suite.
+
+    In production the pump is a coroutine whose store reads run on the task
+    store's writer thread, and a manager built on a running loop opens its
+    store on a worker; the suite's harnesses settle with ``sleep(0)`` loops
+    and virtual clocks, and construct a manager and spawn on the next line,
+    which cannot wait for a thread hop. Both off-loop paths are pinned by their
+    own tests, which turn the switches back on.
+    """
+    from kiro_crew.subagent_manager.admission import SpawnAdmissionCoordinator
+
+    _floor_monkeypatch.setattr(SpawnAdmissionCoordinator, "pump_off_loop", False)
+    _floor_monkeypatch.setattr(SpawnAdmissionCoordinator, "open_store_off_loop", False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_aim_skills_dir(_floor_monkeypatch):
     """Prevent SkillsLoader from discovering edition-contributed skill roots.
 
     SkillsLoader now sources extra skill roots from the CPP seam
@@ -365,7 +527,7 @@ def _isolate_aim_skills_dir(monkeypatch):
     """
     from kiro_crew.platform.defaults import DefaultMcpToolingProvider
 
-    monkeypatch.setattr(DefaultMcpToolingProvider, "extra_skills", lambda self: [])
+    _floor_monkeypatch.setattr(DefaultMcpToolingProvider, "extra_skills", lambda self: [])
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -400,7 +562,7 @@ def pytest_configure(config: pytest.Config) -> None:
     # never-probe-on-the-loop guard and read it as "this host has no sandbox".
 
 
-# ── xdist INTERNALERROR terminal report (issue #2803) ───────────────────
+# ── xdist INTERNALERROR terminal report ───────────────────
 # When TWO pytest-timeout worker kills land in the same ``--dist loadgroup``
 # shard, xdist's loadscope scheduler can die with ``KeyError:
 # <WorkerController gwN>`` (a replaced node present in ``assigned_work`` but
@@ -672,18 +834,18 @@ def _reset_reasoning_effort_globals():
 
 
 @pytest.fixture(autouse=True)
-def _disable_dev_fleet_background_tasks(monkeypatch):
+def _disable_dev_fleet_background_tasks(_floor_monkeypatch):
     """Stop dev-fleet's app-startup hook from starting its background loops.
 
     A test that boots the real app via ``dev_fleet.server.create_app()`` (to
     exercise middleware, for instance) otherwise starts ``_status_refresher``,
     a genuine network ``git fetch``, as a fire-and-forget task. That task can
     still be running when the test's client tears down, and cancelling it then
-    is what leaked into unrelated tests and flaked ``Gateway Tests (macOS)``
-    (issue #1832). A test that wants the real refresher overrides this itself
+    is what leaked into unrelated tests and flaked the macOS backend job. A
+    test that wants the real refresher overrides this itself
     via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
-    monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
+    _floor_monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
 
 
 @pytest.fixture(autouse=True)
@@ -719,6 +881,14 @@ def _isolate_kiro_window_cache():
     finally:
         _mr._KIRO_WINDOWS.clear()
         _mr._KIRO_WINDOWS.update(saved)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_advertised_model_cache(_floor_monkeypatch):
+    """Keep one session's advertised model spellings inside its own test."""
+    from kiro_crew import model_registry
+
+    _floor_monkeypatch.setattr(model_registry, "_ADVERTISED_MODELS", {})
 
 
 @pytest.fixture(autouse=True)
@@ -791,6 +961,36 @@ def _disarm_agent_slice_memory_high():
         _sb._SLICE_MEMHIGH_APPLIED = saved_applied
         _sb._SLICE_MEMHIGH_EVENTS_SEEN = saved_events_seen
         _sb._SLICE_MEMHIGH_CLIMB_WARNED = saved_climb_warned
+
+
+@pytest.fixture(autouse=True)
+def _reset_live_execution_records():
+    """A reused temporary home must not inherit another test's live records."""
+
+    def clear():
+        for name, attribute in (
+            ("kiro_crew.execution_context", "_LIVE_EXECUTIONS"),
+            ("kiro_crew.subagent_persistence", "_LIVE_RUN_STATES"),
+        ):
+            module = sys.modules.get(name)
+            if module is not None:
+                getattr(module, attribute).clear()
+
+    clear()
+    try:
+        yield
+    finally:
+        clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_switch_locks(monkeypatch):
+    """Tests reuse session keys across loops; the gateway has one serving loop."""
+    import weakref
+
+    from kiro_crew import llm_helpers
+
+    monkeypatch.setattr(llm_helpers, "_slot_switch_session_locks", weakref.WeakValueDictionary())
 
 
 @pytest.fixture(autouse=True)
@@ -921,7 +1121,7 @@ def _restore_default_child_watcher():
 
 
 @pytest.fixture(autouse=True)
-def _git_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+def _git_identity(_floor_monkeypatch) -> None:
     """Make git tests hermetic: pin identity AND neutralize host global/system config.
 
     Two independent host-environment bleeds must be closed for git-backed tests
@@ -937,22 +1137,22 @@ def _git_identity(monkeypatch: pytest.MonkeyPatch) -> None:
        ``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM`` at ``/dev/null`` so no
        host-level config (excludes, aliases, hooks, signing) leaks into tests.
     """
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
-    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
-    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
+    _floor_monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
+    _floor_monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+    _floor_monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
+    _floor_monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
     # Isolate from the host's global/system git config (Git >= 2.32). An empty
     # file (/dev/null) means git reads no global or system settings.
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    _floor_monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    _floor_monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
 
 
 @pytest.fixture(autouse=True)
-def _enterprise_bypass(monkeypatch: pytest.MonkeyPatch) -> None:
+def _enterprise_bypass(_floor_monkeypatch) -> None:
     """Set a default validated team_id so _route_message doesn't reject messages."""
-    monkeypatch.setattr("kiro_crew.slack.enterprise._validated_team_id", "TTEST")
-    monkeypatch.setattr("kiro_crew.slack.enterprise._validated_enterprise_id", "ETEST")
-    monkeypatch.setattr("kiro_crew.slack.enterprise._allowed_team_ids", {"TTEST"})
+    _floor_monkeypatch.setattr("kiro_crew.slack.enterprise._validated_team_id", "TTEST")
+    _floor_monkeypatch.setattr("kiro_crew.slack.enterprise._validated_enterprise_id", "ETEST")
+    _floor_monkeypatch.setattr("kiro_crew.slack.enterprise._allowed_team_ids", {"TTEST"})
 
 
 @pytest.fixture(autouse=True)
@@ -1181,31 +1381,11 @@ def _fake_computer_use_backend():
     reset_shared_backend()
 
 
-@pytest.fixture(autouse=True)
-def _reset_platform_context(monkeypatch):
-    """Clear the process-global PlatformContext between tests.
-
-    A test that composes a non-default context (e.g. an Amazon-overlay probe)
-    must not leak it into the next test.  ``current_context()`` lazily rebuilds
-    the standalone default on next access.
-
-    Also pins ``KIROCREW_PROFILE=standalone`` by default so a dev box that has a
-    real SSO-marker directory does not make ``boot_platform`` resolve the
-    ``amazon`` profile and fail closed (no companion installed) for the many
-    pre-existing tests that drive ``run_gateway`` / boot.  A test that wants the
-    amazon profile overrides this env via its own ``monkeypatch.setenv`` (it
-    runs after this autouse fixture), or composes the context directly via
-    ``set_context`` without booting.
-    """
-    from kiro_crew.platform.bootstrap import _reset_boot_state
-    from kiro_crew.platform.context import reset_context
-
-    monkeypatch.setenv("KIROCREW_PROFILE", "standalone")
-    reset_context()
-    _reset_boot_state()
-    yield
-    reset_context()
-    _reset_boot_state()
+# ``_reset_platform_context`` (the per-test PlatformContext reset and the
+# ``KIROCREW_PROFILE=standalone`` pin) lives in the ROOTDIR conftest, not here:
+# the ~108 test modules under ``src/kiro_crew/apps/builtins/*/tests/`` never see
+# this file, and an inherited enterprise ``KIROCREW_PROFILE`` failed 150+ of them
+# closed on an operator's box while ``test/`` stayed green.
 
 
 @pytest.fixture
@@ -1225,11 +1405,13 @@ def short_sock_dir(tmp_path):
     """
     import tempfile
 
+    from tmpdir_helpers import SHORT_TMP_PREFIX
+
     short_root = "/tmp" if os.path.isdir("/tmp") else None
     if short_root is None:
         yield tmp_path
         return
-    path = tempfile.mkdtemp(dir=short_root, prefix="kcsock-")
+    path = tempfile.mkdtemp(dir=short_root, prefix=SHORT_TMP_PREFIX + "unixsock-")
     try:
         yield pathlib.Path(path)
     finally:
@@ -1237,7 +1419,7 @@ def short_sock_dir(tmp_path):
 
 
 @pytest.fixture(autouse=True)
-def _no_release_feed_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_release_feed_network(_floor_monkeypatch) -> None:
     """Make the update check's network seam unreachable for the whole suite.
 
     ``handlers.updates._do_update_check`` now has a second branch: any install
@@ -1266,20 +1448,20 @@ def _no_release_feed_network(monkeypatch: pytest.MonkeyPatch) -> None:
             "kiro_crew.dashboard.handlers.updates._fetch_feed_bytes instead"
         )
 
-    monkeypatch.setattr(
+    _floor_monkeypatch.setattr(
         "kiro_crew.dashboard.handlers.updates._fetch_feed_bytes", _refuse, raising=True
     )
 
 
 @pytest.fixture(autouse=True)
-def _no_live_catalog_network(monkeypatch: pytest.MonkeyPatch):
+def _no_live_catalog_network(_floor_monkeypatch):
     """Make the official app catalog's network seam unreachable for the suite.
 
     ``official_catalog._open_catalog`` is THE seam every catalog fetch goes
     through (its own docstring says tests must intercept there). Two paths
     reach it without a test asking to: the install path's
     ``inventory_for_install`` performs a fresh, deliberately UNCACHED HTTPS
-    fetch of ``official-registry.json`` on every call (#4236), and store
+    fetch of ``official-registry.json`` on every call, and store
     listings can trigger ``load_official_catalog``. Without this fixture,
     any test that walks either path makes a real HTTPS request to the live
     CDN — slow, offline-hostile, and nondeterministic: the test's verdict
@@ -1314,7 +1496,7 @@ def _no_live_catalog_network(monkeypatch: pytest.MonkeyPatch):
             "seam such as inventory_for_install) instead"
         )
 
-    monkeypatch.setattr(official_catalog, "_open_catalog", _refuse, raising=True)
+    _floor_monkeypatch.setattr(official_catalog, "_open_catalog", _refuse, raising=True)
     yield original
 
 
@@ -1329,7 +1511,7 @@ def named_cron_caller(monkeypatch):
 
     Tests about cron's FIELD handling -- schedules, channels, models, validation
     -- have always assumed a caller the gateway vouches for; they simply never
-    said so, because the unidentified state used to be allowed to write. This
+    said so. This
     states the precondition. A test that is actually ABOUT the unidentified
     caller must not use this fixture.
 
@@ -1399,6 +1581,40 @@ def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subagent, "cached_admission_check", _admit)
 
 
+@pytest.fixture
+def ample_host_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``resource_status.probe`` to AMPLE so no turn gains a ``[RESOURCES]`` line.
+
+    ``ContextBuilder.build_message`` prepends a ``[RESOURCES]`` advisory whenever
+    the host's own memory reading is tight or critical. Every test that asserts on
+    the SHAPE of a built turn -- that it opens with the user's text, with a hook
+    prefix, or with nothing at all -- therefore has the runner's free memory as a
+    hidden input, and fails with the advisory glued to the front of the string it
+    compared.
+
+    Not a platform gap: a macos-15 runner under a 3-way xdist split is simply the
+    first host observed under the threshold, and a loaded Linux runner reaches the
+    same state. The probe is imported INSIDE ``build_message``, so patching it on
+    its own module is what that call resolves.
+
+    A test that is actually ABOUT the advisory patches the probe in its own body,
+    which lands on top of this and reverts to it.
+    """
+    import kiro_crew.resource_status as resource_status
+
+    def _ample(cfg: object | None = None) -> "resource_status.ResourceStatus":
+        return resource_status.ResourceStatus(
+            available_gb=_HEALTHY_AVAILABLE_GB,
+            cpu_count=4,
+            load_per_cpu=0.1,
+            posture=resource_status.POSTURE_AMPLE,
+            pressure_gb=4.0,
+            critical_gb=2.0,
+        )
+
+    monkeypatch.setattr(resource_status, "probe", _ample)
+
+
 @pytest.fixture(autouse=True)
 def _reset_create_rate_limit_buckets():
     """Clear the session/folder creation rate limiter between tests.
@@ -1410,9 +1626,7 @@ def _reset_create_rate_limit_buckets():
     composition performs more than the per-window budget of creates within one
     wall-clock window then refuses a legitimate test create with
     ``create_rate_limited`` — a pass/fail outcome decided by shard composition
-    and runner speed, not the code under test (#7836; observed twice on the
-    Windows shard in one day, on PRs touching neither the limiter nor
-    session_control). The limiter's own direct tests build their scenarios on
+    and runner speed, not the code under test. The limiter's own direct tests build their scenarios on
     top of a clean slate, so clearing between tests changes nothing for them.
     """
     from kiro_crew.dashboard import create_rate_limit
@@ -1439,6 +1653,7 @@ _REAL_MCP_POST_MODULES = frozenset(
         "test_mcp_core",
         "test_mcp_core_coverage",
         "test_mcp_internal_caller",
+        "test_session_token_header_parity",
     }
 )
 
@@ -1462,7 +1677,7 @@ class _InertGatewayPosts(list):
 
 
 @pytest.fixture(autouse=True)
-def gateway_posts(request, monkeypatch):
+def gateway_posts(request, _floor_monkeypatch):
     """Record ``mcp_core._post`` calls instead of letting them reach a gateway.
 
     ``mcp_tools.control._emit_directive`` publishes every directive out of band
@@ -1503,7 +1718,7 @@ def gateway_posts(request, monkeypatch):
                 " loopback_urlopen/_api_urlopen (or _post) in the test itself"
             )
 
-        monkeypatch.setattr(mcp_core, "loopback_urlopen", _refuse_network)
+        _floor_monkeypatch.setattr(mcp_core, "loopback_urlopen", _refuse_network)
         yield _InertGatewayPosts()
         return
 
@@ -1513,7 +1728,7 @@ def gateway_posts(request, monkeypatch):
         posted.append((path, json.loads(json.dumps(body)) if body is not None else None))
         return {}
 
-    monkeypatch.setattr(mcp_core, "_post", _capture)
+    _floor_monkeypatch.setattr(mcp_core, "_post", _capture)
     yield posted
 
 

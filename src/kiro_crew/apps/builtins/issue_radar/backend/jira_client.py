@@ -185,6 +185,14 @@ def _audit(op: str, target: str, outcome: str, *, error: str = "") -> None:
 # ── single HTTP chokepoint ───────────────────────────────────────────────────
 
 
+def _require_https_url(url: str) -> str:
+    """Reject non-HTTPS URLs before urllib can interpret them."""
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ProviderCliError("Jira API URL must use HTTPS")
+    return url
+
+
 def _jira_request(
     host: str,
     method: str,
@@ -223,14 +231,17 @@ def _jira_request(
             "Accept": "application/json",
             "Content-Type": "application/json" if payload is not None else "text/plain",
         }
-    req = urllib.request.Request(
+    url = _require_https_url(url)
+    req = urllib.request.Request(  # noqa: S310
         url,
         method=method,
         data=json.dumps(payload).encode("utf-8") if payload is not None else None,
         headers=headers,
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # URL scheme is pinned by _require_https_url above.
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             body = resp.read().decode("utf-8", "replace")
     # pi-lens-ignore: no-boolean-in-except
     except urllib.error.HTTPError as exc:

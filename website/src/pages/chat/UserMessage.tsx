@@ -3,10 +3,10 @@ import { motion } from 'framer-motion'
 import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, X } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
-import { HOVER_NONE_ACTIONS_ROW_CLS } from '../../utils/touchActions'
+import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
 import { useSearchHighlight, useCurrentOcc } from '../../hooks/SearchHighlightContext'
 import { useImeGuard } from '../../hooks/useImeGuard'
-import { applySearchHighlights } from '../../utils/domHighlight'
+import { applySearchHighlights, clearSearchHighlights } from '../../utils/domHighlight'
 import { scrollCurrentMatchIntoView } from '../../utils/searchScroll'
 import { containedSelectionRange } from '../../utils/selectionContainment'
 import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pasteTokens'
@@ -14,6 +14,8 @@ import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pas
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import InfoTip from '../../components/InfoTip'
+import SteerDecisionLine from './SteerDecisionLine'
+import { readSteerRecord } from './decisionRecord'
 // Steer bubbles play a one-shot entrance (slide-in + ring pulse) when they land.
 // The chat transcript is virtualized, so a row can remount when scrolled away and
 // back; without this guard the entrance would replay every time. Module-level set
@@ -25,7 +27,11 @@ interface UserMessageProps {
   meta?: Record<string, unknown>
   timestamp?: string
   timestampTitle?: string
-  renderContent: (content: string, meta: Record<string, unknown> | undefined) => React.ReactNode
+  /** `messageTs` is handed over because the session chip's short-name form needs
+   *  to know WHEN the text was written: a bare `chat-1380` resolves against the
+   *  live roster, and slot numbers are reused, so without a write time it cannot
+   *  tell the session that name meant from the one that later took its number. */
+  renderContent: (content: string, meta: Record<string, unknown> | undefined, messageTs?: string) => React.ReactNode
   canEdit?: boolean
   messageIndex?: number
   messageTs?: string
@@ -42,9 +48,16 @@ interface UserMessageProps {
    *  work that ended (#9037 UX review). Fail-closed: no claim without a
    *  running turn. */
   slotRunning?: boolean
+  /** Draw a steer as an ORDINARY user message in every lifecycle state: no
+   *  "Steered into the running turn" badge, no accent tint, no entrance ring,
+   *  no "Steering…" pulse, no requeued note. For a surface that
+   *  has no queue/steer concept to explain (a member DM thread, where every
+   *  send while the member works is a steer), the badge would label every
+   *  such send with the mechanics the surface exists to hide. */
+  hideSteerBadge?: boolean
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, slotRunning }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, slotRunning, hideSteerBadge }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -90,9 +103,16 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // answered at all. That is the least confirmed a steer can be, so letting it
   // fall through to the legacy case would show the success badge at exactly the
   // moment nothing is known, which is the claim this change exists to stop.
+  // The receipt for a send whose mid-turn handling Jev chose (`steer: "auto"`,
+  // `decisions/points/message_steer.py`). Read off this row's own meta, which is
+  // what both doors carry -- the live `steer_push` / `queue_push` reconcile and a
+  // row reloaded from history -- so the line survives a reload without a fetch.
+  // Absent on every ordinary send, and that absence is what draws nothing.
+  const steerDecision = readSteerRecord((meta as { decisions_strip?: unknown } | undefined)?.decisions_strip)
   const steerState = (meta as { steerState?: string } | undefined)?.steerState
   const steerOptimistic = !!(meta as { optimistic?: boolean } | undefined)?.optimistic
-  const isSteer = !!(meta && (meta as { steer?: boolean }).steer)
+  const isSteer = !hideSteerBadge
+    && !!(meta && (meta as { steer?: boolean }).steer)
     && steerState !== 'written'
     && steerState !== 'requeued'
     && !(steerOptimistic && !steerState)
@@ -106,8 +126,11 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // excluded from `isSteer` above, so the accent badge's confirmed-only gating
   // (#7997) is untouched.
   const steerMeta = !!(meta && (meta as { steer?: boolean }).steer)
-  const pendingSteer = steerMeta && !!slotRunning && (steerState === 'written' || (steerOptimistic && !steerState))
-  const requeuedSteer = steerMeta && steerState === 'requeued'
+  // `hideSteerBadge` silences all three lifecycle indicators, not just the
+  // confirmed badge: "Steering…" and "runs as its own message" are the same
+  // steer/queue vocabulary the steer-only surface exists to hide.
+  const pendingSteer = !hideSteerBadge && steerMeta && !!slotRunning && (steerState === 'written' || (steerOptimistic && !steerState))
+  const requeuedSteer = !hideSteerBadge && steerMeta && steerState === 'requeued'
   // Fired from an EFFECT rather than a `useState` initializer, because the state
   // this depends on arrives AFTER mount. The optimistic bubble mounts with
   // `{ steer: true, optimistic: true }` and no `steerState`, so `isSteer` is
@@ -168,7 +191,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     // Converge-center the exact occurrence (see scrollCurrentMatchIntoView).
     // Cancel on re-run/unmount so rapid navigation doesn't accumulate loops.
     const cancelScroll = currentOcc >= 0 ? scrollCurrentMatchIntoView(el) : undefined
-    return () => cancelScroll?.()
+    // The ranges live on a page-wide CSS.highlights entry (see domHighlight):
+    // withdraw this bubble's on unmount so a virtualized row that scrolls away
+    // is not kept alive through them.
+    return () => { cancelScroll?.(); clearSearchHighlights(el) }
   }, [term, caseSensitive, currentOcc, content])
 
   /** Native select+copy from a sent bubble gives the literal chip label
@@ -213,7 +239,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             bubble it replaces, capped at 550px or the column, whichever is
             smaller. No JS measurement. */}
         <div
-          className="edit-grow user-bubble px-4 py-2 text-sm leading-6 rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow user-bubble px-4 py-2 text-sm leading-6 rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
         >
@@ -221,7 +247,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             ref={taRef}
             rows={1}
             aria-label={i18nT('pages.chat.userMessage.edit_message')}
-            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-none text-sm leading-6"
+            // focus-cue-ok: the cue is the wrapping .edit-grow frame above, which
+            // paints a 2px accent outline for the whole edit session; a second
+            // ring on the textarea would double-paint the one control.
+            className="bg-transparent text-card-fg resize-none overflow-hidden focus:outline-hidden text-sm leading-6"
             value={draft}
             onChange={e => setDraft(e.target.value)}
             {...ime.bindComposition()}
@@ -250,7 +279,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
     <div ref={userRef} onCopy={handleCopy} className={`message-bubble msg-content px-4 py-2 text-sm leading-6 rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-      {renderContent(content, meta)}
+      {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
+          correct for the audio key above, which wants the optimistic bubble's own
+          identity, but this value is COMPARED against server-clock slot mint
+          epochs: `clientTs` is the client's clock, retained through reconcile, so
+          an ahead-skewed one would let a reused slot pass the mint check and open
+          the wrong conversation, silently. The fallback still covers a bubble that
+          has no server ts yet. */}
+      {renderContent(content, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
     </div>
   )
 
@@ -274,6 +310,10 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           <div className="inline-flex items-center gap-1 text-[12px] leading-5 font-semibold text-accent mb-1 pr-1">
             <Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.steered_into_the_running_turn')}
           </div>
+          {/* WHO chose this, when the sender did not. Below the badge that says
+              what happened, because the badge is the outcome and this is the
+              decision behind it. */}
+          {steerDecision && <SteerDecisionLine record={steerDecision} />}
           <motion.div
             /* Same width cap as the bubble, not just max-w-full: this wrapper
                sits between the content column and the bubble, and a percentage
@@ -336,6 +376,12 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               <Target size={12} className="shrink-0" /> {i18nT('pages.chat.userMessage.turn_ended_before_this_applied_runs_as_its_own_message')}
             </div>
           )}
+          {/* A queued send has no badge of its own here, so on this arm the line
+              is the only thing that says the handling was decided rather than
+              chosen. Drawn in both arms rather than above them: the confirmed-steer
+              arm wraps its bubble in an animated box, and a line inside that box
+              would slide in with it as though it were part of the message. */}
+          {steerDecision && <SteerDecisionLine record={steerDecision} />}
           {bubble}
         </>
       )}
@@ -343,7 +389,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           descendant overrides grow every action to a 40px touch target (20px
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover
           behavior and the compact 14px icons untouched. */}
-      <div className={`flex items-center gap-2 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+      <div className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
         <button
           onClick={() => {
             const pastes = (meta?.pastes as PasteBlock[] | undefined) || []

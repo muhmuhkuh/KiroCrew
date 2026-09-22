@@ -84,11 +84,10 @@ describe('ConnectPanel provider rows', () => {
     // disabled row with a "Soon" badge would occupy a full row of the card while
     // offering the user nothing. Only connectable sources are listed, and their
     // absence is pinned here — adding a dead row would need a decision, not a
-    // silent revert.
-    for (const name of ['Jira', 'Linear']) {
-      expect(screen.queryByRole('button', { name: new RegExp(name) })).toBeNull()
-    }
-    for (const name of ['GitHub', 'GitLab', 'Azure DevOps']) {
+    // silent revert. Jira is wired through REST and gateway credentials, so it is
+    // listed alongside the forge providers.
+    expect(screen.queryByRole('button', { name: /Linear/ })).toBeNull()
+    for (const name of ['GitHub', 'GitLab', 'Azure DevOps', 'Jira']) {
       expect(screen.getByRole('button', { name: new RegExp(name) })).toBeEnabled()
     }
     // Nothing is fetched until a provider is actually opened.

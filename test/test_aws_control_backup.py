@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import datetime as dt
 import errno
+import hashlib
 import json
 import logging
 import tarfile
@@ -31,6 +32,11 @@ import pytest
 from kiro_crew.apps.builtins.aws_control.backend import backup, costs
 
 ACCOUNT = "111122223333"
+
+#: What the fake downloads write, and the fingerprint a matching upload record
+#: must carry -- the restore verdict is decided on the bytes that arrive.
+ARCHIVE_BYTES = b"archive"
+ARCHIVE_FINGERPRINT = hashlib.md5(ARCHIVE_BYTES).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -50,13 +56,19 @@ class TestAuthorizeUpload:
     def test_upload_refused_when_profile_now_points_at_another_account(self):
         # The live STS check is FIRST and is what makes a profile repointed
         # mid-build refuse: the recorded account and the account the profile
-        # resolves to today no longer agree, so the bytes must not leave.
+        # resolves to today do not agree, so the bytes must not leave.
         with mock.patch(
             "kiro_crew.deploy.engine._checked",
             return_value=json.dumps({"Account": "999988887777"}),
         ):
             with pytest.raises(RuntimeError, match="no longer points at"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_unparseable_sts_output_reads_as_no_account_and_refuses(self):
         # A garbled STS response must not be trusted as a match: it decodes to
@@ -64,7 +76,13 @@ class TestAuthorizeUpload:
         # upload is refused rather than proceeding on unknown identity.
         with mock.patch("kiro_crew.deploy.engine._checked", return_value="not json"):
             with pytest.raises(RuntimeError, match="no longer points at"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_upload_refused_when_app_disabled_during_build(self):
         # STS agrees, but the app was disabled while the archive built: the
@@ -77,7 +95,13 @@ class TestAuthorizeUpload:
             mock.patch("kiro_crew.apps.manager.is_app_enabled", return_value=False),
         ):
             with pytest.raises(RuntimeError, match="was disabled"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
     def test_upload_refused_when_s3_consent_no_longer_holds(self):
         # STS agrees and the app is on, but S3 consent was withdrawn: the
@@ -91,7 +115,13 @@ class TestAuthorizeUpload:
             mock.patch("kiro_crew.aws_consent.is_granted", return_value=(False, "expired")),
         ):
             with pytest.raises(RuntimeError, match="consent no longer holds.*expired"):
-                backup._authorize_upload(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
+                backup._authorize_upload(
+                    ACCOUNT,
+                    "p",
+                    "us-west-2",
+                    caller=backup.CALLER_OWNER,
+                    payload_kind=backup.KIND_SNAPSHOT,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +133,12 @@ class TestRunSnapshotBackup:
     @pytest.fixture(autouse=True)
     def _isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        # A successful push ends with the retention sweep, which LISTS the drive.
+        # Stubbed here rather than per test: the sweep swallows its own failures by
+        # design, so an unstubbed test would attempt a real CLI call and still
+        # pass. Retention's own behaviour is covered in
+        # test_aws_control_backup_retention.py.
+        monkeypatch.setattr(backup.storage, "list_object_versions", lambda *a, **k: [])
         yield
 
     def test_failed_snapshot_build_raises_before_any_upload(self):
@@ -147,29 +183,108 @@ class TestRunSnapshotBackup:
         with (
             mock.patch.object(backup, "snapshot_main", side_effect=fake_snapshot),
             mock.patch.object(backup, "_authorize_upload") as authz,
-            mock.patch.object(backup.storage, "put_file") as put_file,
+            mock.patch.object(backup.storage, "put_file", return_value="v-test") as put_file,
         ):
             record = backup.run_snapshot_backup(
                 ACCOUNT, "p", "us-west-2", "bkt", caller=backup.CALLER_OWNER
             )
 
-        authz.assert_called_once_with(ACCOUNT, "p", "us-west-2", caller=backup.CALLER_OWNER)
-        put_file.assert_called_once()
+        # ONE authorization per S3 operation, and that is the contract: the
+        # archive PUT and each of the two label PUTs sit immediately after their
+        # own gate, so none of them runs on a decision that went stale during
+        # another's round trip.
+        #
+        # THREE, not four: this fixture configures no retention count, so retention
+        # is off and the sweep declines before asking for anything. That is the
+        # shipped default, and it is worth pinning as an absence rather than as a
+        # smaller number -- an off sweep costs no authorization round trip and no
+        # listing call, so a fourth gate appearing here would mean the sweep had
+        # started doing cloud work on an install that never asked for it.
+        #
+        # Each write also NAMES what it carries, which is what lets the gate
+        # re-read the unattended grant for the right payload. The archive is the
+        # snapshot's payload; the two label writes are one caption published under
+        # both prefixes and are nobody's payload, so they name none.
+        #
+        # The write gates are checked field by field rather than against a whole
+        # expected call: they now carry `payload_kind` as well, so an equality
+        # against a fixed call would assert the ABSENCE of that argument, which is
+        # the opposite of what the line above pins.
+        assert authz.call_count == 3
+        write_gates = [c for c in authz.call_args_list if "operation" not in c.kwargs]
+        assert len(write_gates) == 3
+        sweep_gates = [c for c in authz.call_args_list if "operation" in c.kwargs]
+        assert sweep_gates == []
+        assert [c.kwargs["payload_kind"] for c in authz.call_args_list] == [
+            backup.KIND_SNAPSHOT,
+            None,
+            None,
+        ]
+        for call in authz.call_args_list:
+            assert call.args == (ACCOUNT, "p", "us-west-2")
+            assert call.kwargs["caller"] == backup.CALLER_OWNER
+        # Two pushes now: the archive, then this install's label sidecar beside it.
+        # The label is what stops another install's rows reading as 32 hex
+        # characters, and it is published from here because this is the one place
+        # that already holds a bucket and a live authorization decision.
+        pushed = {call.args[4]: call for call in put_file.call_args_list}
+        install_id = backup.install_identity()["id"]
+        # The label is written under BOTH kind prefixes, not only the kind that
+        # triggered this run. The reader takes the first sidecar it finds across
+        # kinds, so a rename followed by a backup of one kind would otherwise leave
+        # the other prefix serving the old name.
+        for sub in ("snapshots", "sessions"):
+            assert f"{sub}/{install_id}/{backup.LABEL_OBJECT_NAME}" in pushed
+        archive_keys = [k for k in pushed if not k.endswith(backup.LABEL_OBJECT_NAME)]
+        assert len(archive_keys) == 1
+        pushed_key = archive_keys[0]
         # Same long-timeout contract as the sessions push: the declared
         # `_PUSH_TIMEOUT_SECS` has to REACH the uploader, not sit unread.
-        assert put_file.call_args.kwargs["timeout"] == backup._PUSH_TIMEOUT_SECS
-        pushed_key = put_file.call_args.args[4]
-        assert pushed_key.startswith("snapshots/kirocrew-snapshot-")
+        assert pushed[pushed_key].kwargs["timeout"] == backup._PUSH_TIMEOUT_SECS
+        # The install id is its own key SEGMENT, which is what lets one delimited
+        # listing name every install writing here instead of walking the prefix.
+        install_id = backup.install_identity()["id"]
+        assert pushed_key.startswith(f"snapshots/{install_id}/kirocrew-snapshot-")
         # Entropy suffix means the pushed key is NOT the engine's file name.
         assert "20260101T000000Z" not in pushed_key
         assert record["key"] == pushed_key
         assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT]["key"] == pushed_key
+
+    def test_a_failed_label_push_still_reports_the_backup_as_done(self):
+        # The label is a caption. A backup whose archive reached the bucket must
+        # not be reported as failed because a hundred-byte display string did not
+        # -- the reader degrades to the id on its own.
+        def fake_snapshot(argv):
+            archive = Path(argv[0]) / "kirocrew-snapshot-20260101T000000Z.tar.gz"
+            with tarfile.open(archive, "w:gz"):
+                pass
+            return 0
+
+        def fake_put(profile, region, bucket, section, key, local_path, **kwargs):
+            if key.endswith(backup.LABEL_OBJECT_NAME):
+                raise RuntimeError("label push failed")
+
+        with (
+            mock.patch.object(backup, "snapshot_main", side_effect=fake_snapshot),
+            mock.patch.object(backup, "_authorize_upload"),
+            mock.patch.object(backup.storage, "put_file", side_effect=fake_put),
+        ):
+            record = backup.run_snapshot_backup(
+                ACCOUNT, "p", "us-west-2", "bkt", caller=backup.CALLER_OWNER
+            )
+
+        assert record["key"].startswith("snapshots/")
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT]["key"] == record["key"]
 
 
 class TestRunSessionsBackup:
     @pytest.fixture(autouse=True)
     def _isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        # See TestRunSnapshotBackup: the push ends with a drive listing, and the
+        # sweep swallows its own failures, so leaving it unstubbed would attempt a
+        # real CLI call from a passing test.
+        monkeypatch.setattr(backup.storage, "list_object_versions", lambda *a, **k: [])
         yield
 
     def test_empty_session_dirs_raise_before_upload(self, tmp_path, monkeypatch):
@@ -217,6 +332,11 @@ class TestRunSessionsBackup:
         def fake_put(
             profile, region, bucket, section, key, local_path, *, account=None, timeout=None
         ):
+            if key.endswith(backup.LABEL_OBJECT_NAME):
+                # The label sidecar rides along on the same push path; it is not
+                # the archive and must not be mistaken for it here.
+                pushed["label_key"] = key
+                return
             pushed["key"] = key
             pushed["local"] = local_path
             pushed["timeout"] = timeout
@@ -232,7 +352,9 @@ class TestRunSessionsBackup:
                 ACCOUNT, "p", "us-west-2", "bkt", caller=backup.CALLER_OWNER
             )
 
-        assert pushed["key"].startswith("sessions/sessions-")
+        install_id = backup.install_identity()["id"]
+        assert pushed["key"].startswith(f"sessions/{install_id}/sessions-")
+        assert pushed["label_key"] == f"sessions/{install_id}/{backup.LABEL_OBJECT_NAME}"
         # A multi-GB sessions archive on a slow uplink needs the long timeout, not
         # `put_file`'s own 600s default -- passing it is the whole point of
         # `_PUSH_TIMEOUT_SECS` existing.
@@ -385,22 +507,635 @@ class TestRefusalWithoutPinnedTraversal:
 
 
 class TestListRemoteBackups:
-    def test_lists_both_kinds_newest_first_and_caps_the_page(self):
-        # Each kind is sorted by key descending (newest stamps first) and the
-        # page is capped at 20 so a bucket with thousands of archives cannot
-        # flood the console.
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        # The listing reads install ids through `_install_folders` -- one
+        # implementation, and the complete unredacted one -- so a test that
+        # only stubs `list_section` would reach AWS. Each test below sets
+        # `self.folders` to the ids the bucket holds.
+        self.folders: set[str] = set()
+        monkeypatch.setattr(
+            backup,
+            "_install_folders",
+            lambda profile, region, bucket, kind, *, account: set(self.folders),
+        )
+        yield
+
+    def test_lists_own_and_legacy_archives_newest_first_and_caps_the_page(self):
+        mine = backup.install_identity()["id"]
+        self.folders = {mine}
+
         def fake_list(profile, region, bucket, section, sub, *, account):
-            return {"files": [{"key": f"{sub}/{i:03d}.tar.gz"} for i in range(25)]}
+            if "/" in sub:
+                # This install's own prefix.
+                return {
+                    "files": [
+                        {
+                            "key": f"{sub}/kirocrew-snapshot-2026010{i % 10}T000000Z-aaa.tar.gz",
+                            "modified": f"2026-02-{i + 1:02d}T00:00:00+00:00",
+                        }
+                        for i in range(25)
+                    ],
+                    "folders": [],
+                }
+            # The un-nested level: pre-namespace archives as FILES, every install
+            # writing here as a FOLDER -- both answers from one call.
+            return {
+                "files": [
+                    {
+                        "key": f"{sub}/kirocrew-snapshot-20250101T00000{i}Z-bbb.tar.gz",
+                        "modified": f"2025-01-0{i + 1}T00:00:00+00:00",
+                    }
+                    for i in range(2)
+                ],
+                "folders": [f"{sub}/{mine}"],
+            }
 
         with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
-            result = backup.list_remote_backups("p", "us-west-2", "bkt", account="111122223333")
+            result = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
 
-        assert set(result) == {backup.KIND_SNAPSHOT, backup.KIND_SESSIONS}
         snaps = result[backup.KIND_SNAPSHOT]
         assert len(snaps) == 20
-        # Descending: the highest-numbered (newest) key comes first.
-        assert snaps[0]["key"] == "snapshots/024.tar.gz"
-        assert snaps[-1]["key"] == "snapshots/005.tar.gz"
+        # Ordered by S3's own timestamp, so rows from two prefixes interleave by
+        # time instead of clustering by install id -- clustering is how the newest
+        # overall stops being at the top and the wrong archive gets picked. The
+        # 2025 legacy archives are older than every 2026 one, so the cap drops
+        # them and the newest 2026 row leads.
+        assert snaps[0]["modified"] == "2026-02-25T00:00:00+00:00"
+        assert snaps[0]["key"].startswith(f"snapshots/{mine}/")
+        # Under our own prefix but with no local record of the upload, so the row
+        # is reported as unverified rather than claimed -- a prefix is a folder
+        # name any bucket writer can create.
+        assert snaps[0]["origin"] == backup.ORIGIN_UNVERIFIED
+        assert snaps[0]["install"] == mine
+        # Recorded as uploaded by this install, the same row reads as ours.
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, snaps[0]["key"], 1)
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            again = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+        assert again[backup.KIND_SNAPSHOT][0]["origin"] == backup.ORIGIN_SELF
+        assert result["others"] == 0
+        assert result["installs"][0]["id"] == mine
+
+    def test_a_legacy_archive_is_never_claimed_as_this_installs(self):
+        # Backward compatibility with a bite: pre-namespace archives keep being
+        # listed, but as unknown origin. Claiming them would re-create the exact
+        # mistake the namespace prevents.
+        def fake_list(profile, region, bucket, section, sub, *, account):
+            if "/" in sub:
+                return {"files": [], "folders": []}
+            return {"files": [{"key": f"{sub}/kirocrew-snapshot-old.tar.gz"}], "folders": []}
+
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            result = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+
+        rows = result[backup.KIND_SNAPSHOT]
+        assert [r["origin"] for r in rows] == [backup.ORIGIN_LEGACY]
+        assert rows[0]["install"] == ""
+
+    def test_another_installs_folder_is_reported_without_listing_its_archives(self):
+        # The default view names the other install (so "another install writes
+        # here" is visible) but does NOT enumerate its prefix: that costs paid
+        # calls and is opt-in.
+        mine = backup.install_identity()["id"]
+        other = "a" * 32
+        self.folders = {mine, other}
+        listed: list[str] = []
+
+        def fake_list(profile, region, bucket, section, sub, *, account):
+            listed.append(sub)
+            if "/" in sub:
+                return {"files": [{"key": f"{sub}/one.tar.gz"}], "folders": []}
+            return {"files": [], "folders": [f"{sub}/{mine}", f"{sub}/{other}"]}
+
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            result = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+
+        assert result["others"] == 1
+        assert {i["id"] for i in result["installs"]} == {mine, other}
+        assert not any(sub.endswith(other) for sub in listed)
+        # No label is fetched for an install whose rows are not being shown.
+        assert [i for i in result["installs"] if i["id"] == other][0]["label"] == ""
+
+    def test_include_others_enumerates_foreign_prefixes_and_reads_their_labels(self):
+        # This is what makes a REPLACEMENT machine usable: it owns no archives, so
+        # a view that only ever read its own prefix would show it nothing on the
+        # one occasion the bucket holds the only surviving copy.
+        mine = backup.install_identity()["id"]
+        other = "b" * 32
+        self.folders = {other}
+
+        def fake_list(profile, region, bucket, section, sub, *, account):
+            if sub.endswith(other):
+                return {
+                    "files": [
+                        {"key": f"{sub}/theirs.tar.gz"},
+                        {"key": f"{sub}/{backup.LABEL_OBJECT_NAME}"},
+                    ],
+                    "folders": [],
+                }
+            if "/" in sub:
+                return {"files": [], "folders": []}
+            return {"files": [], "folders": [f"{sub}/{other}"]}
+
+        with (
+            mock.patch.object(backup.storage, "list_section", side_effect=fake_list),
+            mock.patch.object(backup, "read_remote_label", return_value="their laptop"),
+        ):
+            result = backup.list_remote_backups(
+                "p", "us-west-2", "bkt", account=ACCOUNT, include_others=True
+            )
+
+        rows = result[backup.KIND_SNAPSHOT]
+        assert [r["key"] for r in rows] == [f"snapshots/{other}/theirs.tar.gz"]
+        assert rows[0]["origin"] == backup.ORIGIN_OTHER
+        assert rows[0]["install"] == other
+        # The label sidecar shares the prefix with the archives it labels. It is
+        # not an archive and must never be offered for restore.
+        assert all(backup.LABEL_OBJECT_NAME not in r["key"] for r in rows)
+        assert [i for i in result["installs"] if i["id"] == other][0]["label"] == "their laptop"
+        assert mine not in [r["install"] for r in rows]
+
+    def test_more_other_installs_than_the_cap_are_reported_as_truncated(self):
+        # A bounded expansion that says it is bounded, rather than silently
+        # showing a subset of the machines writing here.
+        ids = [f"{n:032x}" for n in range(backup.MAX_OTHER_INSTALLS + 3)]
+        self.folders = set(ids)
+
+        def fake_list(profile, region, bucket, section, sub, *, account):
+            if "/" in sub:
+                return {"files": [], "folders": []}
+            return {"files": [], "folders": [f"{sub}/{i}" for i in ids]}
+
+        with mock.patch.object(backup.storage, "list_section", side_effect=fake_list):
+            result = backup.list_remote_backups("p", "us-west-2", "bkt", account=ACCOUNT)
+
+        assert result["others"] == len(ids)
+        assert result["truncated"] is True
+        assert len(result["installs"]) == backup.MAX_OTHER_INSTALLS + 1  # + this install
+
+    def test_a_hex_install_id_survives_the_display_listings_sanitisation(self):
+        # `list_remote_backups` reads install ids out of `list_section`'s FOLDER
+        # names, and that listing runs every name through the egress redactors --
+        # which exist to change strings that look like secrets, and a 32-hex blob
+        # is exactly that shape. If a redactor ever rewrote one, the id would stop
+        # matching and another install's archives would read as absent: the drive
+        # would look unshared. Pin the property the parse depends on.
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+        for candidate in (backup.install_identity()["id"], "a" * 32, f"{7:032x}"):
+            name, _ = redact_credentials(candidate)
+            name, _ = redact_exfiltration_urls(name)
+            assert name == candidate
+
+
+# ---------------------------------------------------------------------------
+# install identity — the id that decides, and the label that only displays
+# ---------------------------------------------------------------------------
+
+
+class TestInstallIdentity:
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        backup._fallback_identity.clear()
+        yield
+        backup._fallback_identity.clear()
+
+    def test_the_id_is_minted_once_and_then_stable(self):
+        first = backup.install_identity()
+        assert backup._INSTALL_ID_RE.match(first["id"])
+        assert backup.install_identity()["id"] == first["id"]
+        # Stored at the TOP level, not per account: one machine must not become
+        # two installs the first time a second account is connected.
+        assert backup.read_state()[backup.INSTALL_KEY]["id"] == first["id"]
+
+    def test_the_id_is_not_the_telemetry_install_id(self):
+        # Reusing `beacon.install_id()` would materialise a TELEMETRY identity on
+        # a host that opted out of telemetry, because that function creates the
+        # file it reads. The technique is worth copying; the value is not.
+        with mock.patch("kiro_crew.beacon.install_id") as beacon_id:
+            backup.install_identity()
+        beacon_id.assert_not_called()
+
+    def test_the_default_label_names_no_machine_fact(self):
+        identity = backup.install_identity()
+        # Published to a shared bucket, so a default must not leak a hostname or
+        # a user name. Four hex characters make two installs distinguishable,
+        # which is all a default has to do.
+        assert identity["label"] == f"install-{identity['id'][:4]}"
+
+    def test_renaming_changes_the_label_and_never_the_id(self):
+        before = backup.install_identity()
+        after = backup.set_install_label("Raymond's laptop")
+        assert after["label"] == "Raymond's laptop"
+        assert after["id"] == before["id"]
+        assert backup.install_identity()["label"] == "Raymond's laptop"
+
+    def test_an_empty_or_unusable_label_falls_back_rather_than_storing_nothing(self):
+        identity = backup.install_identity()
+        assert backup.set_install_label("   ")["label"] == f"install-{identity['id'][:4]}"
+        assert backup.set_install_label(None)["label"] == f"install-{identity['id'][:4]}"
+
+    def test_an_unstorable_id_degrades_to_a_process_local_one_instead_of_failing(self):
+        # An unwritable state file already lets a backup upload and hold its run
+        # in memory (see `_record_run`). Refusing here would turn that into a
+        # backup that stops running, which is a regression -- and a per-process id
+        # still keeps one process's archives together and apart from another
+        # install's.
+        with mock.patch.object(
+            backup, "_locked_state_update", side_effect=OSError(errno.EROFS, "ro")
+        ):
+            first = backup.install_identity()
+            second = backup.install_identity()
+        assert backup._INSTALL_ID_RE.match(first["id"])
+        assert first == second
+
+
+class TestLabelIsDisplayOnly:
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        yield
+
+    def test_a_foreign_label_is_redacted_and_bounded_before_it_is_rendered(self):
+        # A label read from the bucket is written by ANOTHER install, so it is
+        # foreign-authored text arriving through the same door object names arrive
+        # through -- and `storage.list_section` already runs those through these
+        # redactors for exactly this reason.
+        assert len(backup.sanitize_label("x" * 500)) == backup.LABEL_MAX_CHARS
+        # Control characters are what turn one caption line into something that
+        # overwrites the row above it, and they survive both redactors untouched.
+        # The escape BYTE is what carries that power, so it is the byte that goes;
+        # the printable remainder of a sequence is inert text.
+        cleaned = backup.sanitize_label("lap\x1b[2Jtop\r\n")
+        assert not any(not ch.isprintable() for ch in cleaned)
+        assert "\x1b" not in cleaned and "\n" not in cleaned and "\r" not in cleaned
+        assert cleaned.startswith("lap") and cleaned.endswith("top")
+        assert backup.sanitize_label("") == ""
+        assert backup.sanitize_label(12345) == ""
+        leaked = backup.sanitize_label("key AKIAIOSFODNN7EXAMPLE here")
+        assert "AKIAIOSFODNN7EXAMPLE" not in leaked
+
+    def test_a_published_label_cannot_make_a_foreign_archive_restorable(self):
+        # The whole point of the id/label split. A label is a string an install
+        # writes about ITSELF into a bucket another install reads, so if it could
+        # reach the gate an install could name itself into being restorable.
+        mine = backup.install_identity()
+        other = "c" * 32
+        key = f"snapshots/{other}/theirs.tar.gz"
+        with (
+            mock.patch.object(
+                backup, "read_remote_label", return_value=mine["label"]
+            ) as read_label,
+            mock.patch.object(backup.storage, "get_file") as get_file,
+        ):
+            with pytest.raises(backup.UnprovenArchive) as caught:
+                backup.restore_download("p", "us-west-2", "bkt", key, account=ACCOUNT)
+        assert caught.value.install_id == other
+        # Not merely unpersuaded by the label -- it never asks for one.
+        read_label.assert_not_called()
+        get_file.assert_not_called()
+
+    def test_an_unreadable_label_sidecar_degrades_to_the_empty_string(self):
+        # A caption that could not be read must not break the listing that would
+        # have told the operator whose archives these are.
+        with mock.patch.object(
+            backup.storage, "get_object_head_bytes", side_effect=RuntimeError("denied")
+        ):
+            assert (
+                backup.read_remote_label(
+                    "p", "r", "b", backup.KIND_SNAPSHOT, "d" * 32, account=ACCOUNT
+                )
+                == ""
+            )
+        with mock.patch.object(
+            backup.storage, "get_object_head_bytes", return_value=(b"not json", 8)
+        ):
+            assert (
+                backup.read_remote_label(
+                    "p", "r", "b", backup.KIND_SNAPSHOT, "d" * 32, account=ACCOUNT
+                )
+                == ""
+            )
+
+    def test_the_label_read_is_range_bounded_not_a_full_download(self):
+        # The object is written by another install, so its SIZE is that install's
+        # choice: a plain get-object of a file named `_label.json` would let a
+        # multi-gigabyte object be pulled onto this disk, on the owner's transfer
+        # bill, to render one caption.
+        with mock.patch.object(
+            backup.storage,
+            "get_object_head_bytes",
+            return_value=(json.dumps({"label": "their box"}).encode(), 40),
+        ) as head:
+            label = backup.read_remote_label(
+                "p", "r", "b", backup.KIND_SNAPSHOT, "e" * 32, account=ACCOUNT
+            )
+        assert label == "their box"
+        assert head.call_args.kwargs["max_bytes"] <= 4096
+        assert head.call_args.args[4] == f"snapshots/{'e' * 32}/{backup.LABEL_OBJECT_NAME}"
+
+    def test_the_label_sidecar_cannot_be_named_by_a_restore_request(self):
+        # `_label.json` starts with an underscore, and `validate_key` requires a
+        # segment to START alphanumeric -- so the object is unreachable through
+        # every route that validates a caller-supplied key. That is a rule, not a
+        # name comparison somebody has to remember to write.
+        from kiro_crew.apps.builtins.aws_control.backend import storage as storage_mod
+
+        assert storage_mod.validate_key(f"snapshots/{'f' * 32}/{backup.LABEL_OBJECT_NAME}")
+
+
+class TestObjectAuthentication:
+    """A recorded key names a PATH; the fingerprint names the BYTES.
+
+    On a drive other installs can write to, a key can be overwritten after this
+    install recorded uploading it. Matching keys alone would then hand that
+    overwrite back as ours with no confirmation, so the verdict is decided on the
+    bytes that actually arrive -- which also leaves no window for an overwrite to
+    land between a check and the transfer.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        monkeypatch.setattr(
+            "kiro_crew.apps.builtins.aws_control.backend.backup.app_data_dir",
+            lambda name: tmp_path / "appdata",
+        )
+        backup._unpersisted_runs.clear()
+        yield
+        backup._unpersisted_runs.clear()
+
+    def test_the_fingerprint_is_the_s3_etag_of_a_single_part_upload(self, tmp_path):
+        # `put_file` issues one `put-object`, and for a single-part upload under
+        # AES256 the ETag is the hex MD5 of the body -- which is why this can be
+        # computed locally with no extra call to AWS.
+        body = tmp_path / "archive.tar.gz"
+        body.write_bytes(b"some archive bytes")
+        assert backup._body_fingerprint(body) == hashlib.md5(b"some archive bytes").hexdigest()
+
+    def _download(self, key, content, **kwargs):
+        def fake_get(profile, region, bucket, section, k, dest, *, account, timeout=600):
+            Path(dest).write_bytes(content)
+
+        with mock.patch.object(backup.storage, "get_file", side_effect=fake_get):
+            return backup.restore_download("p", "us-west-2", "bkt", key, account=ACCOUNT, **kwargs)
+
+    def _recorded(self, fingerprint):
+        mine = backup.install_identity()["id"]
+        key = f"snapshots/{mine}/a.tar.gz"
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, key, 10, fingerprint)
+        return key
+
+    def test_bytes_matching_the_record_confirm_the_archive_is_ours(self):
+        key = self._recorded(ARCHIVE_FINGERPRINT)
+        assert self._download(key, ARCHIVE_BYTES)["origin"] == backup.ORIGIN_SELF
+
+    def test_an_overwritten_archive_is_no_longer_ours_and_needs_the_override(self):
+        key = self._recorded(ARCHIVE_FINGERPRINT)
+        with pytest.raises(backup.UnprovenArchive) as caught:
+            self._download(key, b"somebody elses archive")
+        assert caught.value.origin == backup.ORIGIN_UNVERIFIED
+        result = self._download(key, b"somebody elses archive", foreign_ok=True)
+        assert result["origin"] == backup.ORIGIN_UNVERIFIED
+
+    def test_a_refused_restore_leaves_nothing_at_the_destination(self, tmp_path):
+        # The refusal happens after the transfer, so the staged bytes must be
+        # discarded and the destination left untouched -- otherwise a refusal would
+        # still hand somebody an archive to apply.
+        key = self._recorded(ARCHIVE_FINGERPRINT)
+        with pytest.raises(backup.UnprovenArchive):
+            self._download(key, b"not ours")
+        staging = tmp_path / "appdata" / "restore"
+        assert not (staging / "a.tar.gz").exists()
+        assert list(staging.glob("*")) == []
+
+    def test_a_planted_key_under_our_prefix_is_refused_without_downloading_it(self):
+        """A co-writer must not be able to make an un-overridden restore pay for a GET.
+
+        The install prefix is a listable folder name, so anyone who can write to the
+        drive can put an object of any size under it. That key is absent from the
+        upload ledger, which local state settles on its own -- so it is refused
+        before the transfer, not after.
+        """
+        mine = backup.install_identity()["id"]
+        planted = f"snapshots/{mine}/planted.tar.gz"
+        with mock.patch.object(backup.storage, "get_file") as get_file:
+            with pytest.raises(backup.UnprovenArchive) as caught:
+                backup.restore_download("p", "us-west-2", "bkt", planted, account=ACCOUNT)
+        assert caught.value.origin == backup.ORIGIN_UNVERIFIED
+        get_file.assert_not_called()
+
+    def test_a_record_with_no_fingerprint_fails_closed(self):
+        # Unknown is not a pass. A key recorded before a fingerprint existed cannot
+        # authenticate anything, so it takes the needs-an-override path.
+        key = self._recorded("")
+        with pytest.raises(backup.UnprovenArchive) as caught:
+            self._download(key, ARCHIVE_BYTES)
+        assert caught.value.origin == backup.ORIGIN_UNVERIFIED
+
+    def test_verification_costs_no_extra_aws_call(self):
+        # The fingerprint comes from a file already on disk, both when it is written
+        # and when it is read back, so proving ownership adds no request.
+        key = self._recorded(ARCHIVE_FINGERPRINT)
+        with mock.patch.object(backup, "_checked") as checked:
+            assert self._download(key, ARCHIVE_BYTES)["origin"] == backup.ORIGIN_SELF
+        checked.assert_not_called()
+
+
+class TestClassifyKey:
+    def test_origin_comes_from_the_key_and_nothing_else(self):
+        mine = "1" * 32
+        other = "2" * 32
+        own_key = f"snapshots/{mine}/a.tar.gz"
+        # `self` requires a local record of having uploaded it -- see the class
+        # below for why the prefix alone is not enough.
+        assert backup.classify_key(own_key, mine, {own_key}) == (backup.ORIGIN_SELF, mine)
+        assert backup.classify_key(f"sessions/{other}/a.tar.gz", mine) == (
+            backup.ORIGIN_OTHER,
+            other,
+        )
+        # No id segment: written before the namespace existed, so the origin is
+        # genuinely unknown. Claiming it as this install's would re-create the
+        # mistake the namespace prevents; calling it foreign would refuse an
+        # operator their own pre-upgrade archive.
+        assert backup.classify_key("snapshots/kirocrew-snapshot-x.tar.gz", mine) == (
+            backup.ORIGIN_LEGACY,
+            "",
+        )
+        # A folder someone made in the console is not an install id.
+        assert backup.classify_key("snapshots/holiday-photos/a.tar.gz", mine) == (
+            backup.ORIGIN_LEGACY,
+            "",
+        )
+
+
+class TestSelfOwnershipIsProvenNotInferred:
+    """An install id is a folder name, so a bucket writer can create one.
+
+    The drive is shared by design, which puts a co-writer inside the operating
+    envelope rather than outside it. If the prefix alone decided ownership, that
+    co-writer could upload beneath this install's own prefix and the archive would
+    come back classified as ours and restore with no confirmation -- the exact
+    unwarned wrong-machine restore this whole change exists to stop, reintroduced
+    through the mechanism meant to stop it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        monkeypatch.setattr(
+            "kiro_crew.apps.builtins.aws_control.backend.backup.app_data_dir",
+            lambda name: tmp_path / "appdata",
+        )
+        backup._unpersisted_runs.clear()
+        yield
+        backup._unpersisted_runs.clear()
+
+    def _download(self, key, **kwargs):
+        def fake_get(profile, region, bucket, section, k, dest, *, account, timeout=600):
+            Path(dest).write_bytes(b"archive")
+
+        with mock.patch.object(backup.storage, "get_file", side_effect=fake_get):
+            return backup.restore_download("p", "us-west-2", "bkt", key, account=ACCOUNT, **kwargs)
+
+    def test_a_key_planted_under_our_own_prefix_is_not_treated_as_ours(self):
+        mine = backup.install_identity()["id"]
+        planted = f"snapshots/{mine}/kirocrew-snapshot-planted.tar.gz"
+        # Nothing was ever recorded as uploaded, so the prefix is the ONLY thing
+        # claiming this archive is ours -- and a prefix is forgeable.
+        assert backup.uploaded_keys(ACCOUNT) == set()
+        # The BACKEND refuses it, not just the dashboard. A confirmation dialog
+        # binds only the client that shows it, so a caller reaching the endpoint
+        # directly would otherwise restore a planted archive with no override.
+        with pytest.raises(backup.UnprovenArchive) as caught:
+            self._download(planted)
+        assert caught.value.origin == backup.ORIGIN_UNVERIFIED
+        assert caught.value.install_id == mine
+        # With the override stated, it downloads and still reports what it is.
+        assert self._download(planted, foreign_ok=True)["origin"] == backup.ORIGIN_UNVERIFIED
+
+    def test_an_archive_this_install_recorded_uploading_is_ours(self):
+        mine = backup.install_identity()["id"]
+        key = f"snapshots/{mine}/kirocrew-snapshot-real.tar.gz"
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, key, 10, ARCHIVE_FINGERPRINT)
+        assert backup.uploaded_objects(ACCOUNT)[key] == ARCHIVE_FINGERPRINT
+        assert self._download(key)["origin"] == backup.ORIGIN_SELF
+
+    def test_an_upload_whose_state_write_failed_still_counts_as_ours(self):
+        # The archive really did reach the bucket; making the operator confirm an
+        # archive this process uploaded minutes ago would be a false alarm.
+        mine = backup.install_identity()["id"]
+        key = f"snapshots/{mine}/kirocrew-snapshot-held.tar.gz"
+        with mock.patch.object(
+            backup, "_locked_state_update", side_effect=OSError(errno.ENOSPC, "full")
+        ):
+            backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, key, 10)
+        assert key in backup.uploaded_keys(ACCOUNT)
+
+    def test_the_remembered_set_is_bounded_and_drops_the_oldest(self):
+        mine = backup.install_identity()["id"]
+        keys = [
+            f"snapshots/{mine}/a{i:04d}.tar.gz" for i in range(backup.MAX_REMEMBERED_UPLOADS + 5)
+        ]
+        for key in keys:
+            backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, key, 1)
+        remembered = backup.uploaded_keys(ACCOUNT)
+        assert len(remembered) == backup.MAX_REMEMBERED_UPLOADS
+        assert keys[-1] in remembered
+        assert keys[0] not in remembered
+
+    def test_re_recording_one_key_does_not_grow_the_set(self):
+        mine = backup.install_identity()["id"]
+        key = f"snapshots/{mine}/a.tar.gz"
+        for _ in range(4):
+            backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, key, 1, "abc123")
+        assert backup.read_state()["accounts"][ACCOUNT]["uploads"] == {key: "abc123"}
+
+    def test_the_upload_record_is_local_and_never_read_from_the_bucket(self):
+        # What makes the record trustworthy is that no bucket writer can reach it.
+        # If the gate ever consulted S3 for this answer, the forgery would be back.
+        mine = backup.install_identity()["id"]
+        key = f"snapshots/{mine}/a.tar.gz"
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, key, 1)
+        with (
+            mock.patch.object(backup.storage, "list_section") as listed,
+            mock.patch.object(backup.storage, "get_object_head_bytes") as head,
+        ):
+            assert backup.uploaded_keys(ACCOUNT) == {key}
+        listed.assert_not_called()
+        head.assert_not_called()
+
+
+class TestRestoreOwnershipGate:
+    @pytest.fixture(autouse=True)
+    def _isolated_state(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(backup, "_state_path", lambda: tmp_path / "backup.json")
+        monkeypatch.setattr(
+            "kiro_crew.apps.builtins.aws_control.backend.backup.app_data_dir",
+            lambda name: tmp_path / "appdata",
+        )
+        yield
+
+    def _download(self, key, **kwargs):
+        def fake_get(profile, region, bucket, section, k, dest, *, account, timeout=600):
+            Path(dest).write_bytes(b"archive")
+
+        with mock.patch.object(backup.storage, "get_file", side_effect=fake_get):
+            return backup.restore_download("p", "us-west-2", "bkt", key, account=ACCOUNT, **kwargs)
+
+    def test_this_installs_own_archive_downloads_with_no_override(self):
+        mine = backup.install_identity()["id"]
+        key = f"snapshots/{mine}/a.tar.gz"
+        # Recorded as uploaded by THIS install, which is what makes it provably
+        # ours rather than merely sitting under our prefix.
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, key, 10, ARCHIVE_FINGERPRINT)
+        result = self._download(key)
+        assert result["origin"] == backup.ORIGIN_SELF
+        assert result["install"] == mine
+
+    def test_a_foreign_archive_is_refused_until_the_caller_says_it_means_it(self):
+        other = "9" * 32
+        key = f"snapshots/{other}/a.tar.gz"
+        with pytest.raises(backup.UnprovenArchive):
+            self._download(key)
+        # Overridable on purpose: on a replacement machine EVERY archive is
+        # foreign, which is what disaster recovery IS, so a hard wall would block
+        # the one case the backup exists for.
+        result = self._download(key, foreign_ok=True)
+        assert result["origin"] == backup.ORIGIN_OTHER
+        assert result["install"] == other
+
+    def test_a_legacy_archive_is_refused_too_until_the_caller_accepts_it(self):
+        # Legacy is not a free pass. An archive with no id segment has an unknown
+        # author, and "unknown" includes "somebody else" -- so the same override
+        # applies. It stays overridable rather than forbidden because a
+        # pre-upgrade archive really may be the operator's own.
+        with pytest.raises(backup.UnprovenArchive) as caught:
+            self._download("snapshots/kirocrew-snapshot-old.tar.gz")
+        assert caught.value.origin == backup.ORIGIN_LEGACY
+        result = self._download("snapshots/kirocrew-snapshot-old.tar.gz", foreign_ok=True)
+        assert result["origin"] == backup.ORIGIN_LEGACY
+        assert result["install"] == ""
+
+    def test_only_a_proven_self_archive_needs_no_override(self):
+        # One rule, stated once: prove it is ours, or say you accept it might not
+        # be. The earlier draft refused only the foreign case and left the other
+        # two to the dashboard, which put a safety property in one client.
+        mine = backup.install_identity()["id"]
+        proven = f"snapshots/{mine}/proven.tar.gz"
+        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, proven, 1, ARCHIVE_FINGERPRINT)
+        unproven = [
+            f"snapshots/{'9' * 32}/theirs.tar.gz",
+            f"snapshots/{mine}/not-recorded.tar.gz",
+            "snapshots/kirocrew-snapshot-flat.tar.gz",
+        ]
+        assert self._download(proven)["origin"] == backup.ORIGIN_SELF
+        for key in unproven:
+            with pytest.raises(backup.UnprovenArchive):
+                self._download(key)
+            assert self._download(key, foreign_ok=True)["path"]
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +1169,16 @@ class TestRestoreDownloadResolveGuard:
         ):
             with pytest.raises(ValueError, match="resolves outside app storage"):
                 backup.restore_download(
-                    "p", "us-west-2", "b", "snapshots/a.tar.gz", account="111122223333"
+                    "p",
+                    "us-west-2",
+                    "b",
+                    "snapshots/a.tar.gz",
+                    account="111122223333",
+                    # A flat key is unproven, so the ownership gate would refuse it
+                    # first and this test would pass for the wrong reason. The
+                    # override gets past that gate so the STAGING guard is what is
+                    # actually being exercised.
+                    foreign_ok=True,
                 )
         get_file.assert_not_called()
 
@@ -703,14 +1447,10 @@ class TestALostRunWriteDoesNotReUploadForever:
         monkeypatch.setattr(backup, "_state_path", lambda: elsewhere)
         assert backup.last_runs(ACCOUNT) == {}
 
-    def test_a_persisting_run_does_not_evict_a_newer_held_run(self):
-        # The pop happens after the sidecar lock is released, so a run that
-        # failed its write can cache a NEWER record in the window between another
-        # run's write and that pop. An unconditional pop would evict it and the
-        # panel would report the older archive while the newer upload has no
-        # record anywhere. Two gateway processes hold separate caches, so no file
-        # lock can close this -- only monotonic eviction can.
+    def test_an_older_acknowledgement_does_not_evict_a_newer_held_run(self):
+        # A stale acknowledgement cannot clear a subsequently held record.
         backup.set_nightly(ACCOUNT, True)
+        persisted = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/older.tar.gz", 7)
         newer = {
             "key": "snapshots/newer.tar.gz",
             "bytes": 11,
@@ -719,9 +1459,7 @@ class TestALostRunWriteDoesNotReUploadForever:
             ),
         }
         backup._remember_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, newer)
-
-        # This one persists, and its stamp is older than the held record's.
-        backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/older.tar.gz", 7)
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, persisted)
 
         assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT]["key"] == "snapshots/newer.tar.gz"
 
@@ -815,39 +1553,37 @@ class TestALostRunWriteDoesNotReUploadForever:
             runs = backup.last_runs(ACCOUNT)
             assert runs[backup.KIND_SNAPSHOT]["key"] == "snapshots/x.tar.gz"
 
-    def test_a_held_run_with_an_equal_stamp_is_evicted(self):
-        # Windows clock granularity is far above a microsecond, so two
-        # back-to-back runs can stamp IDENTICALLY -- this is what reddened
-        # `test_a_later_successful_write_takes_over_from_memory` on the Windows
-        # shard while it passed on Linux. On a tie the entry must go: the two
-        # records are simultaneous and the persisted one is on disk, and keeping
-        # the held copy would make it immortal for the life of the process
-        # because no later write can ever compare greater. Only a STRICTLY newer
-        # held record is protected. Asserted directly rather than through the
-        # clock, so it pins the rule on every platform.
+    def test_only_the_exact_same_time_run_is_acknowledged(self):
+        # Only the exact acknowledged run is removed, not another same-time run.
         stamp = dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc).isoformat(timespec="microseconds")
-        backup._remember_unpersisted(
-            ACCOUNT,
-            backup.KIND_SNAPSHOT,
-            {"key": "snapshots/tie.tar.gz", "bytes": 5, "at": stamp},
+        held = {"key": "snapshots/tie.tar.gz", "bytes": 5, "at": stamp}
+        backup._remember_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, held)
+        backup._forget_unpersisted(
+            ACCOUNT, backup.KIND_SNAPSHOT, {**held, "key": "snapshots/other.tar.gz"}
         )
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == held
 
-        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, stamp)
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, dict(held))
 
         assert (backup._state_key(), ACCOUNT, backup.KIND_SNAPSHOT) not in backup._unpersisted_runs
 
-    def test_two_runs_in_the_same_second_are_distinguishable(self):
-        # `_stamp` already carries entropy because a manual run can race the
-        # nightly loop into the same second. The run record has to be orderable
-        # at that resolution too, or the overlay cannot tell which of two uploads
-        # is the later one: at `timespec="seconds"` these compare EQUAL.
+    @pytest.mark.parametrize("backwards", [False, True], ids=["equal", "backwards"])
+    def test_two_runs_in_the_same_second_are_distinguishable(self, monkeypatch, backwards):
+        first_time = dt.datetime(2026, 9, 19, 11, 23, 39, 817045, tzinfo=dt.timezone.utc)
+        second_time = first_time - dt.timedelta(microseconds=int(backwards))
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = first_time
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
         backup.set_nightly(ACCOUNT, True)
         first = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/a.tar.gz", 1)
+        clock.now.return_value = second_time
         second = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/b.tar.gz", 2)
 
-        assert first["at"] != second["at"]
-        assert first["at"] < second["at"]
-        # And it still parses as a timestamp, which `due_for_nightly` relies on.
+        assert first["at"] == first_time.isoformat(timespec="microseconds")
+        assert second["at"] == second_time.isoformat(timespec="microseconds")
+        assert first["process"] == second["process"]
+        assert first["sequence"] < second["sequence"]
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
         assert dt.datetime.fromisoformat(second["at"]).tzinfo is not None
 
     def test_the_later_of_two_same_second_runs_wins_the_overlay(self):
@@ -867,6 +1603,205 @@ class TestALostRunWriteDoesNotReUploadForever:
         backup._remember_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, held)
 
         assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT]["key"] == "snapshots/second.tar.gz"
+
+    @pytest.mark.parametrize("backwards", [False, True], ids=["equal", "backwards"])
+    @pytest.mark.parametrize("failure", ["read", "write"])
+    @pytest.mark.parametrize("recover", ["same-kind", "sibling-kind", "toggle"])
+    def test_run_identity_recovery(self, monkeypatch, backwards, failure, recover):
+        now = dt.datetime(2026, 9, 19, 11, 23, 39, 817045, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        backup.set_nightly(ACCOUNT, True)
+        first = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/a.tar.gz", 1, "a")
+        clock.now.return_value = now - dt.timedelta(hours=int(backwards))
+        target = "_read_state_for_update" if failure == "read" else "write_state"
+        with mock.patch.object(backup, target, side_effect=OSError(errno.EIO, "injected")):
+            second = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "snapshots/b.tar.gz", 2, "b")
+        assert second["at"] == clock.now.return_value.isoformat(timespec="microseconds")
+        assert self._on_disk()["accounts"][ACCOUNT]["runs"][backup.KIND_SNAPSHOT] == first
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+        assert backup.uploaded_objects(ACCOUNT)[second["key"]] == "b"
+        assert backup.due_for_nightly(ACCOUNT, now=now) is False
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, first)
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+
+        # A second failed recovery must not acknowledge or discard either upload.
+        with mock.patch.object(backup, "write_state", side_effect=OSError(errno.EIO, "injected")):
+            with pytest.raises(OSError):
+                backup.set_nightly(ACCOUNT, True)
+        assert backup.uploaded_objects(ACCOUNT)[second["key"]] == "b"
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+
+        expected = second
+        if recover == "toggle":
+            backup.set_nightly(ACCOUNT, True)
+        else:
+            kind = backup.KIND_SNAPSHOT if recover == "same-kind" else backup.KIND_SESSIONS
+            third = backup._record_run(ACCOUNT, kind, "recovery/c.tar.gz", 3, "c")
+            if recover == "same-kind":
+                expected = third
+        disk = self._on_disk()["accounts"][ACCOUNT]
+        assert disk["runs"][backup.KIND_SNAPSHOT] == expected
+        assert disk["uploads"][first["key"]] == "a"
+        assert disk["uploads"][second["key"]] == "b"
+        assert (backup._state_key(), ACCOUNT, backup.KIND_SNAPSHOT) not in backup._unpersisted_runs
+        assert (backup._state_key(), ACCOUNT) not in backup._unpersisted_uploads
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == expected
+        assert backup.due_for_nightly(ACCOUNT, now=now) is False
+
+    @pytest.mark.parametrize("legacy", [False, True], ids=["prior-process", "legacy"])
+    @pytest.mark.parametrize("backwards", [False, True], ids=["equal", "backwards"])
+    @pytest.mark.parametrize(
+        "pending_kind,record_new",
+        [(None, True), ("snapshot", True), ("sessions", True), ("snapshot", False)],
+    )
+    def test_locked_run_and_recovery_ordering(
+        self, monkeypatch, legacy, backwards, pending_kind, record_new
+    ):
+        now = dt.datetime(2026, 9, 19, 11, 23, 39, 817045, tzinfo=dt.timezone.utc)
+        old = {
+            "key": "old.tar.gz",
+            "at": (now + dt.timedelta(seconds=int(backwards))).isoformat(timespec="microseconds"),
+        }
+        if not legacy:
+            old.update(process="prior-process", sequence=7)
+        backup.write_state(
+            {
+                "accounts": {
+                    ACCOUNT: {
+                        "nightly": True,
+                        "runs": {backup.KIND_SNAPSHOT: old},
+                        "uploads": {old["key"]: "old-fingerprint"},
+                    }
+                }
+            }
+        )
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        if pending_kind is not None:
+            with self._full_disk():
+                pending = backup._record_run(ACCOUNT, pending_kind, "pending.tar.gz", 1, "pending")
+            pending_before = dict(pending)
+        expected_uploads = {"old.tar.gz": "old-fingerprint"}
+        expected_run = old
+        if record_new:
+            expected_run = backup._record_run(
+                ACCOUNT, backup.KIND_SNAPSHOT, "new.tar.gz", 2, "new-fingerprint"
+            )
+            assert expected_run["at"] == now.isoformat(timespec="microseconds")
+            expected_uploads["new.tar.gz"] = "new-fingerprint"
+        else:
+            # Recovery alone is not a new run: preserve the foreign/legacy
+            # wall-time fallback, but migrate the pending fingerprint.
+            backup.set_nightly(ACCOUNT, True)
+        disk = self._on_disk()["accounts"][ACCOUNT]
+        assert disk["runs"][backup.KIND_SNAPSHOT] == expected_run
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == expected_run
+        if pending_kind is not None:
+            assert pending == pending_before
+            expected_uploads["pending.tar.gz"] = "pending"
+            assert (backup._state_key(), ACCOUNT, pending_kind) not in backup._unpersisted_runs
+            if pending_kind == backup.KIND_SESSIONS:
+                assert disk["runs"][pending_kind] == pending
+        assert disk["uploads"] == expected_uploads
+        assert backup.uploaded_objects(ACCOUNT) == expected_uploads
+        assert (backup._state_key(), ACCOUNT) not in backup._unpersisted_uploads
+        assert backup.due_for_nightly(ACCOUNT, now=now) is False
+
+    def test_run_identity_exact_acknowledgement(self, monkeypatch):
+        now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        with self._full_disk():
+            first = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "same.tar.gz", 1, "a")
+            second = backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "same.tar.gz", 1, "a")
+        assert first["at"] == second["at"]
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, first)
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+        backup._forget_unpersisted(ACCOUNT, backup.KIND_SNAPSHOT, dict(second))
+        assert backup.last_runs(ACCOUNT) == {}
+        # Run acknowledgement cannot silently acknowledge a fingerprint too.
+        assert backup.uploaded_objects(ACCOUNT)[second["key"]] == "a"
+
+    def test_run_identity_pending_metadata_is_bounded_and_recovered(self, monkeypatch):
+        monkeypatch.setattr(backup, "MAX_REMEMBERED_UPLOADS", 3)
+        with self._full_disk():
+            for index in range(5):
+                last = backup._record_run(
+                    ACCOUNT, backup.KIND_SNAPSHOT, f"snapshots/{index}.tar.gz", index, str(index)
+                )
+        expected = {f"snapshots/{i}.tar.gz": str(i) for i in range(2, 5)}
+        assert backup.uploaded_objects(ACCOUNT) == expected
+        assert backup.last_runs(ACCOUNT) == {backup.KIND_SNAPSHOT: last}
+        backup.set_nightly(ACCOUNT, True)
+        assert self._on_disk()["accounts"][ACCOUNT]["uploads"] == expected
+        assert backup.uploaded_objects(ACCOUNT) == expected
+
+    def test_run_identity_different_process_sequences_are_not_comparable(self):
+        earlier = {"process": "other", "sequence": 999, "at": "2026-09-18"}
+        later = {"process": "this", "sequence": 1, "at": "2026-09-19"}
+        assert backup._run_is_newer(later, earlier)
+        assert not backup._run_is_newer(earlier, later)
+        # Tied foreign/legacy wall times retain the disk selection, not a
+        # fabricated total ordering by random process identity or sequence.
+        assert not backup._run_is_newer({**earlier, "at": later["at"]}, later)
+
+    def test_run_identity_concurrent_failure_then_recovery(self, monkeypatch):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        entered, release, contender = Event(), Event(), Event()
+        now = dt.datetime(2026, 9, 19, tzinfo=dt.timezone.utc)
+        clock = mock.Mock(wraps=dt.datetime)
+        clock.now.return_value = now
+        monkeypatch.setattr(backup, "dt", mock.Mock(datetime=clock, timezone=dt.timezone))
+        real_write = backup.write_state
+
+        def writer(state):
+            if not entered.is_set():
+                entered.set()
+                assert release.wait(10), "test did not release the failed writer"
+                raise OSError(errno.EIO, "injected")
+            real_write(state)
+
+        def second_run():
+            contender.set()
+            return backup._record_run(ACCOUNT, backup.KIND_SNAPSHOT, "second.tar.gz", 2, "b")
+
+        monkeypatch.setattr(backup, "write_state", writer)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                backup._record_run, ACCOUNT, backup.KIND_SNAPSHOT, "first.tar.gz", 1, "a"
+            )
+            try:
+                assert entered.wait(10)
+                second_future = pool.submit(second_run)
+                assert contender.wait(10)
+            finally:
+                release.set()
+            first = first_future.result(timeout=10)
+            second = second_future.result(timeout=10)
+        assert first["at"] == second["at"]
+        assert first["sequence"] < second["sequence"]
+        assert backup.last_runs(ACCOUNT)[backup.KIND_SNAPSHOT] == second
+        assert self._on_disk()["accounts"][ACCOUNT]["uploads"] == {
+            "first.tar.gz": "a",
+            "second.tar.gz": "b",
+        }
+
+
+@pytest.mark.parametrize("basename", ["backup.tar.gz", "备份.tar.gz", "x" * 255])
+def test_staging_name_preserves_digest_and_byte_budget(basename):
+    key = "snapshots/install/" + basename
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    prefix = digest + "-"
+    budget = backup.STAGING_NAME_MAX_BYTES - len(prefix)
+    expected = prefix + basename.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    assert backup._staging_name(key) == expected
+    assert len(expected.encode("utf-8")) <= backup.STAGING_NAME_MAX_BYTES
 
 
 class TestCostsCacheBranches:

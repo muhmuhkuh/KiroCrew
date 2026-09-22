@@ -51,7 +51,6 @@ function topbarTracks(): { sides: string[]; search: string } {
 // Mock all page components to isolate routing
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => <div data-testid="system-page">SystemPage</div> }))
-vi.mock('../pages/AgentsPage', () => ({ default: () => <div data-testid="agents-page">AgentsPage</div> }))
 vi.mock('../pages/ProjectsPage', () => ({ default: () => <div data-testid="projects-page">ProjectsPage</div> }))
 vi.mock('../pages/LogsPage', () => ({ default: () => <div data-testid="logs-page">LogsPage</div> }))
 vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => <div data-testid="mc-agents-page">MCAgentsPage</div> }))
@@ -1332,10 +1331,14 @@ describe('App routing', () => {
         // cannot leave it queued for a later, unrelated message.
         { source: 'feature-request', maxAge: 60 },
       )
+      // sendTurn's dashboard wire passes (message, slot, agent, signal, memoryMode, steer).
       expect(api.sendChat).toHaveBeenCalledWith(
         'I’d like to request a feature!',
         'feature-slot',
         expect.any(String),
+        expect.any(AbortSignal),
+        undefined,
+        undefined,
       )
     })
     expect(api.sendChat).not.toHaveBeenCalledWith(
@@ -1349,7 +1352,9 @@ describe('App routing', () => {
     renderWithProviders(<App />, { route: '/chat' })
     // Connection is a colored dot in the unified readout capsule ("Offline"
     // text was removed -- the capsule's red tint is the disconnected signal).
-    expect(screen.getByLabelText('Gateway offline')).toBeInTheDocument()
+    // The dot's accessible name carries the cause; with no auth banner up it
+    // is the reconnecting variant (see #9692).
+    expect(screen.getByLabelText(/Gateway offline/i)).toBeInTheDocument()
   })
 
   it('keeps theme controls available from Settings', () => {
@@ -1902,6 +1907,23 @@ describe('Alt+Shift+S/X model cycling via React Query cache', () => {
 })
 
 describe('Kiro credits pill', () => {
+  beforeEach(async () => {
+    // First-run tests earlier in the file mock themeBoot with mockResolvedValueOnce
+    // (onboarded:false). If one ends before its App consumes that once, the value
+    // leaks into the queue and THIS test's App consumes it — mounting the first-run
+    // tour (with its dialogs) instead of the topbar credits pill. Reset the mock to
+    // the default onboarded contract so a leaked once can't shift the boot state.
+    const { api } = await import('../api/client')
+    vi.mocked(api.themeBoot).mockReset().mockResolvedValue({
+      mode: '',
+      color: '',
+      onboarded: true,
+      import_onboarded: true,
+    } as never)
+    localStorage.setItem('mc-onboarded', '1')
+    localStorage.setItem('mc-import-onboarded', '1')
+  })
+
   it('shows a checking/loading state until usage resolves with plan data', async () => {
     const { api } = await import('../api/client')
     vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: {} } as never)

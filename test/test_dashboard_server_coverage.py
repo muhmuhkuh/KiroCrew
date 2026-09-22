@@ -514,6 +514,57 @@ class TestConnectionsWarmLifecycle:
             assert source.index("_start_site(site, port)") < source.index(kick)
 
 
+# ── _register_browser_view_cleanup ──────────────────────────────────────
+
+
+class TestBrowserSessionsLifecycle:
+    @pytest.mark.asyncio
+    async def test_startup_reclaim_parks_in_the_state_background_tasks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reclaim runs off the boot path as a background task, and that task
+        lives in ``state._background_tasks`` with every other one ``server.py``
+        holds -- there is no second, module-global task set for it."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[str] = []
+
+        def _reclaim() -> int:
+            calls.append("reclaim")
+            return 0
+
+        async def _to_thread(func: Any, *args: Any) -> Any:
+            started.set()
+            await release.wait()
+            return func(*args)
+
+        monkeypatch.setattr(srv.browser_cli_launcher, "reclaim_stranded", _reclaim)
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        app = web.Application()
+        state = _state()
+        srv._register_browser_view_cleanup(app, state)
+        startup = next(
+            hook for hook in app.on_startup if hook.__name__ == "_browser_sessions_startup"
+        )
+
+        await startup(app)
+        await started.wait()
+
+        assert calls == []  # still in flight: the hook did not wait on the CLI
+        assert len(state._background_tasks) == 1
+        assert not hasattr(srv, "_startup_tasks")
+
+        release.set()
+        await asyncio.gather(*state._background_tasks)
+        assert calls == ["reclaim"]
+        assert state._background_tasks == set()  # the done callback discards it
+
+    def test_the_gateway_passes_its_state_to_the_registration(self) -> None:
+        source = inspect.getsource(srv.start_dashboard)
+        assert "_register_browser_view_cleanup(app, state)" in source
+
+
 # ── _register_prevent_sleep_shutdown ────────────────────────────────────
 
 
@@ -733,6 +784,22 @@ class TestStartApiServerResidualPaths:
         monkeypatch.setattr(srv, "sel", MagicMock(return_value=audit))
         subagents = MagicMock()
         subagents.spawn.side_effect = RuntimeError("spawn exploded")
+        from kiro_crew.execution_context import bind_session_execution, execution_for_store
+
+        # Admit a real captured caller so the identity and privacy gates reach
+        # the crashing spawn; the body must claim that same authenticated caller.
+        session_key = "dashboard:audit-crash"
+        bind_session_execution(session_key, execution_for_store(""))
+        # The caller also has to PROVE the key it declares, the way its production
+        # counterpart does, or the identity gate answers ahead of the spawn and the
+        # crash under test never happens.
+        from kiro_crew import member_memory_auth
+
+        monkeypatch.setattr(
+            member_memory_auth,
+            "verify_session_token",
+            lambda token: token.removeprefix("signed:"),
+        )
 
         runner, _state_obj = await _start_api(
             tmp_path, monkeypatch, subagents=subagents
@@ -746,13 +813,18 @@ class TestStartApiServerResidualPaths:
             async with TestClient(TestServer(runner.app)) as client:
                 resp = await client.post(
                     "/api/spawn",
-                    json={"task": "noop"},
-                    headers={"X-Internal-Secret": secret},
+                    json={"task": "noop", "parent_session": session_key},
+                    headers={
+                        "X-Internal-Secret": secret,
+                        "X-Session-Key": session_key,
+                        "X-Session-Token": f"signed:{session_key}",
+                    },
                 )
                 assert resp.status == 500
         finally:
             await runner.cleanup()
 
+        subagents.spawn.assert_called_once()
         errors = [
             call.kwargs
             for call in audit.log_api_access.call_args_list
@@ -807,7 +879,7 @@ class TestSttHooks:
         """169 ms of numpy and native binding must not run inline on the loop.
 
         The boot delay was not enough on its own: it moved the import out of
-        ``runner.setup()`` (so it no longer delays the first socket bind) and left it
+        ``runner.setup()`` (so it does not delay the first socket bind) but leaves it
         running on the loop, where it stalls every socket and heartbeat the gateway is
         serving at that moment.
 

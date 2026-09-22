@@ -58,7 +58,7 @@ def _seal_loop_source() -> str:
     """The launcher's ``READONLY_DIRS`` loop body, ready to run.
 
     Pulled out of the generated script rather than restated, so this test cannot pass
-    against a loop the launcher no longer contains.
+    against a loop the launcher does not contain.
     """
     script = sandbox._build_launcher_script("strict")
     loop = (
@@ -93,6 +93,30 @@ def _run_seal_loop(targets: list[str]) -> list[tuple[str, int]]:
         },
     )
     return calls
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("leaf", ("subagents", "member-memory-bindings"))
+def test_run_authority_root_is_sealed_before_its_first_record(crew_home, leaf):
+    target = crew_home / leaf
+    assert not target.exists()
+    sandbox._materialize_sealable_ceilings()
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+    assert _run_seal_loop([str(target)]) == [
+        (str(target), _MS_BIND),
+        (str(target), _MS_REMOUNT | _MS_BIND | _MS_RDONLY),
+    ]
+
+
+@_POSIX_ONLY
+def test_member_memory_is_not_an_os_hidden_root(crew_home):
+    target = crew_home / "memory_stores"
+    assert not target.exists()
+    sandbox.namespace_argv(["/bin/true"])
+    script = sandbox._build_launcher_script("standard")
+    match = re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S)
+    assert match and str(target) not in json.loads(match.group(1))
 
 
 @_POSIX_ONLY
@@ -291,7 +315,7 @@ class TestAnUnsealedCeilingIsNeverSilent:
                 sandbox._materialize_sealable_ceilings()
 
         assert "REFUSING to launch" in caplog.text
-        assert "profiles" in caplog.text
+        assert sandbox._CREW_PRECREATE_READONLY_DIR_LEAVES[0] in caplog.text
 
     def test_failed_publish_warns(self, crew_home, monkeypatch, caplog):
         monkeypatch.setattr(
@@ -471,6 +495,40 @@ class TestADanglingSymlinkRefusesTheSpawn:
 
 
 @_POSIX_ONLY
+class TestGatewayLauncherDirectoryNeedsARealLeaf:
+    @pytest.mark.parametrize("leaf", ("playwright-cli", "subagents", "member-memory-bindings"))
+    def test_a_resolving_symlink_refuses_the_spawn(self, crew_home, tmp_path, leaf):
+        real = tmp_path / "attacker-controlled"
+        real.mkdir()
+        target = crew_home / leaf
+        target.symlink_to(real, target_is_directory=True)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert target.is_symlink(), "the operator must remove the refused link"
+
+    def test_a_symlink_winning_the_create_race_refuses(self, crew_home, tmp_path, monkeypatch):
+        target = crew_home / "playwright-cli"
+        real = tmp_path / "race-winner"
+        real.mkdir()
+        real_mkdir = os.mkdir
+
+        def _mkdir(path, mode=0o777, *, dir_fd=None):
+            if os.fspath(path) == os.fspath(target):
+                target.symlink_to(real, target_is_directory=True)
+                raise FileExistsError("symlink won the race")
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "mkdir", _mkdir)
+
+        with pytest.raises(sandbox.SandboxCeilingUnsealable):
+            sandbox._materialize_sealable_ceilings()
+
+        assert target.is_symlink()
+
+
+@_POSIX_ONLY
 class TestAnAliasBackedCeilingIsReported:
     """``MS_RDONLY`` binds a MOUNT, not an inode, so a second name survives the seal.
 
@@ -611,13 +669,45 @@ class TestMaskableDirsAreMaterializedBeforeTheSpawn:
             assert (crew_home / leaf).is_dir()
 
     def test_an_existing_directory_is_left_alone_and_not_reported(self, crew_home):
+        """Every leaf, not one of them: with a leaf hardcoded here, adding a second one to
+        ``_CREW_PRECREATE_HIDDEN_DIR_LEAVES`` makes materialisation report the new leaf and
+        this assertion fail for a reason that has nothing to do with what it checks."""
+        markers = []
         for leaf in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES:
-            (crew_home / leaf).mkdir(parents=True)
-        marker = crew_home / "aws-control-staging" / "drive-preview-live"
-        marker.mkdir()
+            target = crew_home / leaf
+            target.mkdir(parents=True)
+            marker = target / "pre-existing-content"
+            marker.mkdir()
+            markers.append(marker)
 
         assert sandbox._materialize_maskable_dirs() == []
-        assert marker.is_dir()
+        assert markers, "no maskable leaves are declared, so this proves nothing"
+        for marker in markers:
+            assert marker.is_dir()
+
+    @_POSIX_ONLY
+    @pytest.mark.parametrize("mode", ["standard", "cc", "strict"])
+    def test_an_absent_ledgers_root_is_materialized_before_the_mask_binds(self, crew_home, mode):
+        """The sharpest case of this whole class, named on its own.
+
+        A crew log is the authority a reader trusts instead of re-deriving, and the
+        store creates this root on its first write. Absent, the ``isdir`` guard
+        skips it and the mask is vacuous for the life of every sandbox spawned
+        first -- one of which can then create the directory itself and fill it with
+        entries attributed to the gateway.
+        """
+        root = crew_home / "crew-log"
+        assert not root.exists(), "the point of the test is that it starts absent"
+
+        created = sandbox._materialize_maskable_dirs()
+
+        assert str(root) in created
+        assert root.is_dir()
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        script = sandbox._build_launcher_script(mode)
+        match = re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S)
+        assert match
+        assert str(root) in set(json.loads(match.group(1)))
 
     @_POSIX_ONLY
     @pytest.mark.parametrize("mode", ["standard", "cc", "strict"])

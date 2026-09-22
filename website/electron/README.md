@@ -101,14 +101,21 @@ Notes:
   and copies only the small root remainder; per-machine installs keep the
   upstream copy path so files inherit the Program Files ACL. Cross-volume or
   occupied destinations also retain the upstream copy-and-retry fallback. The
-  Windows backend ships checked-hash
+  Windows backend ships hash-based (unchecked)
   bytecode for the measured gateway import closure, so first launch consumes
   build-time caches rather than generating thousands of files under Defender.
+  Unchecked rather than checked so the loader does not also re-read and re-hash
+  every `.py` it imports, which cost a median 12.5 s per cold boot; macOS's
+  whole-tree caches stay checked-hash.
 - The native welcome/finish sidebar and the header used on intermediate pages
   carry the Kiro Crew logo and ghost artwork. The standard NSIS controls and
   localized instructions remain native. Page boundaries use a short Win32
   alpha-blended cross-fade that follows the system client-area animation setting;
   extraction itself stays on the native progress page without timer-driven art.
+- A fresh install's native Finish page discloses that the default Kiro agent
+  needs a separately installed and authenticated Kiro CLI, names `kiro-cli
+  login`, and links to <https://kiro.dev/cli/>. It never runs either step.
+  Auto-updates skip the Finish page and keep their existing automatic relaunch.
 
 See `../../docs/guides/windows-install.md` for the CI-built installer and the
 current Windows support status.
@@ -248,6 +255,16 @@ Open via **Tab menu → Open Config File** or tray menu.
   gateway and authentication origin, but does not copy the current session,
   project, draft, or context.
 - Closing the window hides to tray — right-click the tray icon or Cmd+Q to quit
+- **GPU rendering.** Hardware acceleration is on by default.
+  `KIROCREW_DISABLE_GPU=1` or `--disable-gpu` turns it off for a launch
+  (`disable-gpu.js`). On Windows, if the GPU process dies before the dashboard
+  has loaded, the app relaunches itself once with software rendering
+  (`--in-process-gpu --use-angle=swiftshader`, never `--no-sandbox`) and keeps
+  that setting for the current app version under `gpuSoftwareFallback` in
+  `config.json`; a new version tries hardware rendering again once
+  (`gpu-crash-fallback.js`). The software-mode boot drops the opt-in's
+  `--disable-software-rasterizer` so `KIROCREW_DISABLE_GPU=1` cannot veto
+  SwiftShader. Remove the key to retry hardware rendering sooner.
 - External links open in your default browser
 - Desktop leaves the child `PATH` unchanged; the gateway-side prerequisite
   service independently probes Kiro CLI's supported user-local, Homebrew,

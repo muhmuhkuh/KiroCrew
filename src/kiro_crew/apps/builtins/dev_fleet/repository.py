@@ -8,6 +8,7 @@ import json
 import locale
 import os
 import re
+import stat
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -285,6 +286,69 @@ def _default_main_repo_state() -> tuple[str, bool]:
 # Startup replaces this stat-only hint after the complete discovery chain runs.
 MAIN_REPO, MAIN_REPO_INFERRED = _default_main_repo_state()
 BASE_BRANCH = "main"
+
+# --- full discovery, once per process ---
+_DISCOVERY_DONE = False
+_DISCOVERY_LOCK: asyncio.Lock | None = None
+
+
+async def ensure_main_repo_discovered() -> None:
+    """Run the complete main-checkout discovery chain exactly once in this process.
+
+    The backend runs it from ``server.dev_fleet_startup``; the GATEWAY runs it lazily
+    from its in-gateway cutover route (``gateway_routes._ensure_repo``), because
+    ``_make_live`` validates its target against the discovered worktree set and the
+    gateway never ran the backend's startup hook. Idempotent and single-flight, so
+    two first requests do not race the globals below.
+
+    Discovery runs on a local so the global is written exactly once — this keeps the
+    function out of the ``MAIN_REPO`` AST ratchet's allowlist: nothing here reads the
+    bare global, so a git call added to discovery (where it is most often still
+    unresolved) cannot consume it unnoticed.
+    """
+    global _DISCOVERY_DONE, _DISCOVERY_LOCK, MAIN_REPO, MAIN_REPO_INFERRED, _REPO_INVALID_MSG
+    if _DISCOVERY_DONE:
+        return
+    if _DISCOVERY_LOCK is None:
+        _DISCOVERY_LOCK = asyncio.Lock()
+    async with _DISCOVERY_LOCK:
+        if _DISCOVERY_DONE:
+            return
+        loop = asyncio.get_running_loop()
+        configured = await loop.run_in_executor(subprocess_executor(), _configured_main_repo)
+        discovered = await loop.run_in_executor(subprocess_executor(), _discover_main_repo)
+        if discovered:
+            discovered = await loop.run_in_executor(
+                subprocess_executor(), _resolve_primary_checkout, discovered
+            )
+            # Tiers 1-2 are taken verbatim so a typo surfaces against the path the
+            # user named — but "not replaced by a discovered checkout" and "not
+            # validated" are separable, and only the first is wanted. An unvalidated
+            # configured path that happens to be SOME readable git repository would
+            # have its worktrees listed and `worktree remove`, `update-ref -d`,
+            # `pull --ff-only` and `pip install -e` run inside it. Validated once here
+            # rather than per call, so no request or refresher cycle pays the stats;
+            # the message is composed here too because it embeds the config-derived
+            # source hint, which reads files.
+            valid, hint = await loop.run_in_executor(
+                subprocess_executor(),
+                lambda: (_is_kirocrew_checkout(discovered), _repo_source_hint()),
+            )
+            _REPO_INVALID_MSG = (
+                None
+                if valid
+                else (
+                    f"not a Kiro Crew checkout: {discovered} exists but does not carry the "
+                    f"markers (.git, src/kiro_crew/, pyproject.toml). {hint}"
+                )
+            )
+        MAIN_REPO = discovered
+        MAIN_REPO_INFERRED = bool(discovered and not configured)
+        await _load_trusted_credential_helpers()
+        await _load_fallback_repos()
+        await _upstream_remote()
+        _DISCOVERY_DONE = True
+
 
 # --- upstream remote resolution (replaces hardcoded 'origin') ---
 _UPSTREAM_REMOTE: str | None = None
@@ -597,12 +661,12 @@ async def _discover_worktrees() -> list[dict]:
             # git never ran: the HOST has no git the resolver is willing to
             # execute. Checked before the .git probe because the probe's
             # outcome is irrelevant here — wrapping this in "worktree
-            # discovery failed in <repo>" (the old behavior) sent users to
-            # debug a healthy checkout (#2530). The trusted-PATH detail is
+            # discovery failed in <repo>" would send users to debug a healthy
+            # checkout. The trusted-PATH detail is
             # operator-diagnostic, so it goes to the log, not the banner.
             runtime.logger.warning("dev-fleet: %s", raw)
             raise RepoUnreadable(runtime._unresolved_tool_message("git"))
-        # Every other git failure was previously swallowed into a silent [] —
+        # Every other git failure must NOT be swallowed into a silent [] —
         # which the UI renders as the "No worktrees found / Nothing under the
         # worktrees root yet" empty state. When MAIN_REPO is wrong that empty
         # state is a lie: the fleet is not empty, it is unreadable. Reaching here
@@ -702,6 +766,20 @@ async def _own_commits_count(path: str) -> int | None:
     return int(out) if out and out.isdigit() else None
 
 
+def _is_directory_at(name: str, dir_fd: int) -> bool:
+    """Whether *name*, resolved relative to the pinned *dir_fd*, is a directory.
+
+    ``lstat`` through the descriptor and without following links, so the answer is
+    about the entry the failed ``unlink`` addressed and not about whatever a link
+    at that name points to. Any error reads as "not a directory": the caller then
+    reports the original failure instead of a guess.
+    """
+    try:
+        return stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
 def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
     """Delete exactly the approved untracked files. None on success, else a reason.
 
@@ -774,10 +852,10 @@ def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
         ):
             return f"refusing to discard a path that is not worktree-relative: {rel!r}"
         dir_fds: list[int] = []
+        walked = 0
         try:
             try:
                 dir_fds.append(os.open("/", os.O_RDONLY | os.O_DIRECTORY))
-                walked = 0
                 for comp in (*root_parts[1:], *parts[:-1]):
                     dir_fds.append(
                         os.open(
@@ -802,7 +880,30 @@ def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
                     f"refusing to discard {rel!r}: it is now a directory, not the "
                     "file that was confirmed"
                 )
+            except PermissionError as exc:
+                # Same type change, different errno. Linux answers EISDIR from
+                # unlink(2) on a directory; darwin answers EPERM, so the branch
+                # above never sees it and the user reads a bare "operation not
+                # permitted" that names nothing. Confirmed with a stat before it is
+                # reported, so a genuine permission refusal keeps its own message,
+                # and only the LEAF can be this case -- an EPERM from the ancestor
+                # walk never reached the unlink.
+                reached_unlink = walked == len(root_parts) - 1 + len(parts) - 1
+                if reached_unlink and _is_dir_at(parts[-1], dir_fds[-1]):
+                    return (
+                        f"refusing to discard {rel!r}: it is now a directory, not the "
+                        "file that was confirmed"
+                    )
+                return f"could not discard {rel!r}: {exc.strerror or exc}"
             except OSError as exc:
+                if exc.errno == errno.EPERM and _is_directory_at(parts[-1], dir_fds[-1]):
+                    # macOS and the BSDs answer unlink() on a directory with EPERM,
+                    # not Linux's EISDIR, so the type change arrives here instead of
+                    # in the clause above. Same refusal: nothing recurses into it.
+                    return (
+                        f"refusing to discard {rel!r}: it is now a directory, not the "
+                        "file that was confirmed"
+                    )
                 if walked < len(root_parts) - 1 and exc.errno in (errno.ELOOP, errno.ENOTDIR):
                     # A component of the worktree path is a symlink. Could be a
                     # host whose home directory is linked, could be an ancestor
@@ -822,6 +923,32 @@ def _discard_untracked_files(worktree: str, rel_paths: list[str]) -> str | None:
                 except OSError:  # pragma: no cover - defensive
                     pass
     return None
+
+
+def _count_missing(worktree: str, rel_paths: list[str]) -> int:
+    """How many of the approved paths are absent -- i.e. how many the discard
+    deleted before it was refused. Read-only (``lstat``, never follows the
+    leaf) and consulted only so an incomplete-discard refusal says what is gone;
+    it takes no decision, so it needs none of the helper's fd pinning."""
+    gone = 0
+    for rel in rel_paths:
+        try:
+            os.lstat(os.path.join(worktree, rel))
+        except OSError:
+            gone += 1
+    return gone
+
+
+def _is_dir_at(name: str, dir_fd: int) -> bool:
+    """Whether *name* under *dir_fd* is a real directory right now.
+
+    Never raises: the caller is already handling a refusal and only needs to know
+    which refusal to report.
+    """
+    try:
+        return stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
 
 
 async def _real_dirty(path: str) -> bool | None:
@@ -961,21 +1088,31 @@ async def _find_worktree_by_path(path: str) -> tuple[dict | None, str | None]:
     server's authoritative set — an arbitrary path can never be made live."""
     if not path:
         return None, "'path' must be a non-empty string"
-    try:
-        # Explicit on every platform: POSIX ``realpath`` raises ValueError on an
-        # embedded NUL, but Windows' swallows it and resolves the string anyway,
-        # which would send garbage on to the enumeration instead of refusing it.
-        if "\x00" in path:
-            raise ValueError("embedded null byte")
-        want = Path(path).resolve()
-    except (OSError, ValueError, RuntimeError):
+    # Explicit on every platform: POSIX ``realpath`` raises ValueError on an
+    # embedded NUL, but Windows' swallows it and resolves the string anyway,
+    # which would send garbage on to the enumeration instead of refusing it.
+    if "\x00" in path:
         return None, f"invalid path: {path!r}"
-    for w in await _discover_worktrees():
+    worktrees = await _discover_worktrees()
+
+    def _select() -> tuple[dict | None, str | None]:
+        # ``resolve()`` walks the filesystem for the selector and for every
+        # discovered worktree; this runs on the gateway's loop, so it hops out.
         try:
-            if Path(w["path"]).resolve() == want:
-                return w, None
-        except OSError:
-            continue
+            want = Path(path).resolve()
+        except (OSError, ValueError, RuntimeError):
+            return None, f"invalid path: {path!r}"
+        for w in worktrees:
+            try:
+                if Path(w["path"]).resolve() == want:
+                    return w, None
+            except OSError:
+                continue
+        return None, None
+
+    found, err = await asyncio.get_running_loop().run_in_executor(subprocess_executor(), _select)
+    if found is not None or err is not None:
+        return found, err
     return None, f"path is not a known worktree: {path!r}"
 
 
@@ -1003,6 +1140,7 @@ __all__ = (
     "_dirty_split",
     "_discard_untracked_files",
     "_discover_main_repo",
+    "ensure_main_repo_discovered",
     "_discover_worktrees",
     "_find_worktree",
     "_find_worktree_by_path",

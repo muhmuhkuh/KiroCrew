@@ -158,7 +158,7 @@ def _await_status(
 
 
 def _await_gone(path: Path, timeout: float = WAIT_S) -> None:
-    """Poll until ``path`` no longer exists. Fails the test on timeout."""
+    """Poll until ``path`` is gone. Fails the test on timeout."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not path.exists():
@@ -403,7 +403,14 @@ class TestNudgeLoop:
             max_nudges=5,
             interval_s=0.0,
         )
-        snap = _await_status(reg, "fp-breach", {pr_watchers.STATUS_ERROR})
+        # `WAIT_S * 3`, the same allowance the exhausted-after-one-pass test below
+        # carries and for the same reason: reaching a verdict here is a real `git
+        # clone` plus a full loop pass plus the breach detection, and the default
+        # 10s is sized for one cheap poll. MEASURED as
+        # "watcher never reached {'error'}" on a Windows CI shard that had just run
+        # 12,366 tests. The ceiling is not a race to tune -- it only matters when
+        # the property is broken, so it is generous and still far under `--timeout`.
+        snap = _await_status(reg, "fp-breach", {pr_watchers.STATUS_ERROR}, timeout=WAIT_S * 3)
         assert "re-pointed" in snap["lastNote"]
         assert len(breaches) == 1  # stopped after the breaching pass, not 5 passes
         log = reg.get_log("fp-breach")
@@ -592,9 +599,9 @@ class TestGitOutputDecoding:
     `git diff` prints the CONTENT of changed files, and repositories legitimately contain
     binary (a PNG fixture) or non-UTF-8 text (a latin-1 source). Under a strict decode the
     UnicodeDecodeError is raised inside ``subprocess.communicate``, so it is NOT something
-    callers can read off ``returncode`` as data: it propagated out of `_export_is_durable`,
-    past `_run_agent_pass`, and killed the whole watcher with STATUS_ERROR — every PR in a
-    repo containing one binary file. Regression for the strict-decode default.
+    callers can read off ``returncode`` as data: it propagates out of `_export_is_durable`,
+    past `_run_agent_pass`, and kills the whole watcher with STATUS_ERROR — every PR in a
+    repo containing one binary file. These pin the lenient decode that avoids it.
     """
 
     def _repo_with_binary(self, tmp_path: Path) -> Path:
@@ -855,3 +862,31 @@ class TestWorkItems:
 
     def test_clean_status_has_no_work_items(self) -> None:
         assert pr_watchers._work_items(_status(failing=[])) == []
+
+
+class TestNudgePromptGitLab:
+    """A watched GitLab MR must be taught glab verbs and glab's own limits."""
+
+    @staticmethod
+    def _prompt(pr: str) -> str:
+        st = pr_watchers.WatcherState(fp="fp", pr=pr)
+        return pr_watchers.build_nudge_prompt(st, "/tmp/clone", _status())
+
+    def test_gitlab_mr_uses_glab_verbs(self) -> None:
+        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
+        assert "glab mr view" in prompt
+        assert "glab ci status" in prompt
+        assert "gh pr view" not in prompt
+
+    def test_gitlab_limits_forbid_merging_and_ready(self) -> None:
+        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
+        low = prompt.lower()
+        assert "glab mr merge" in low
+        assert "glab mr update --ready" in low
+        assert "never push" in low
+        assert "gh pr ready" not in low
+
+    def test_github_prompt_still_uses_gh(self) -> None:
+        prompt = self._prompt("https://github.com/owner/repo/pull/7")
+        assert "gh pr view" in prompt
+        assert "glab mr view" not in prompt

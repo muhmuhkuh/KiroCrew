@@ -25,6 +25,7 @@ import errno
 import io
 import logging
 import os
+import struct
 import subprocess
 import sys
 import types
@@ -458,7 +459,9 @@ def _bsdinfo(ppid: int = 0, sec: int = 0, usec: int = 0) -> bytes:
     """A synthetic ``struct proc_bsdinfo`` with the three fields we read."""
 
     buf = bytearray(pc._DARWIN_BSDINFO_SIZE)
-    buf[16:20] = ppid.to_bytes(4, "little")
+    buf[
+        pc._DARWIN_PBI_PPID_OFFSET : pc._DARWIN_PBI_PPID_OFFSET + 4
+    ] = ppid.to_bytes(4, "little")
     buf[pc._DARWIN_OFF_START_TVSEC : pc._DARWIN_OFF_START_TVSEC + 8] = sec.to_bytes(8, "little")
     buf[pc._DARWIN_OFF_START_TVUSEC : pc._DARWIN_OFF_START_TVUSEC + 8] = usec.to_bytes(
         8, "little"
@@ -484,6 +487,8 @@ def _fake_libproc(
         return ret
 
     lib = types.SimpleNamespace(proc_pidinfo=_Fn(_proc_pidinfo))
+    monkeypatch.setattr(pc, "_darwin_libproc", None)
+    monkeypatch.setattr(pc, "_darwin_libproc_loaded", False)
     monkeypatch.setattr(pc.ctypes, "CDLL", lambda _p: lib)
 
 
@@ -564,6 +569,17 @@ class TestGetPpid:
 
 
 class TestGetProcessStartId:
+    def test_macos_reads_start_id_and_ppid_atomically(self, monkeypatch):
+        _fake_libproc(
+            monkeypatch,
+            payload=_bsdinfo(ppid=4321, sec=1700000000, usec=42),
+            ret=136,
+        )
+
+        assert pc.get_process_start_identity(5) == pc.ProcessStartIdentity(
+            "1700000000.000042", 4321
+        )
+
     def test_macos_formats_seconds_and_microseconds(self, monkeypatch):
         _fake_libproc(monkeypatch, payload=_bsdinfo(sec=1700000000, usec=42), ret=136)
         # Microsecond resolution is the point: two processes started in the same
@@ -582,8 +598,17 @@ class TestGetProcessStartId:
         _fake_libproc(monkeypatch, payload=None, ret=-1)
         assert pc.get_process_start_id(5) is None
 
-    def test_windows_is_unknown_rather_than_a_mismatch(self, monkeypatch):
+    def test_windows_uses_query_only_creation_identity(self, monkeypatch):
         monkeypatch.setattr(pc.sys, "platform", "win32")
+        monkeypatch.setattr(
+            pc, "process_start_time", lambda pid: "133000123456789" if pid == 5 else None
+        )
+        assert pc.get_process_start_id(5) == "133000123456789"
+        assert pc.get_process_start_id(6) is None
+
+    def test_windows_unreadable_identity_is_unknown(self, monkeypatch):
+        monkeypatch.setattr(pc.sys, "platform", "win32")
+        monkeypatch.setattr(pc, "process_start_time", lambda pid: None)
         assert pc.get_process_start_id(5) is None
 
     def test_identity_never_contains_a_colon(self, monkeypatch):
@@ -591,6 +616,43 @@ class TestGetProcessStartId:
         _fake_libproc(monkeypatch, payload=_bsdinfo(sec=17, usec=1), ret=136)
         value = pc.get_process_start_id(5)
         assert value is not None and ":" not in value
+
+
+@pytest.mark.parametrize(
+    "scenario", ["unique", "duplicate", "closed", "truncated", "denied", "oversize"]
+)
+def test_windows_tcp_peer_table_refuses_uncertain_identity(monkeypatch, scenario):
+    monkeypatch.setattr(pc, "IS_WINDOWS", True)
+    row = struct.pack(
+        "<I4sI4sII",
+        1 if scenario == "closed" else 5,
+        b"\x7f\x00\x00\x01",
+        0xD007,
+        b"\x7f\x00\x00\x01",
+        0xE803,
+        2468,
+    )
+    count = 2 if scenario in {"duplicate", "truncated"} else 1
+    raw = struct.pack("<I", count) + row * (2 if scenario == "duplicate" else 1)
+
+    def query(buffer, size_pointer, *_args):
+        size = ctypes.cast(size_pointer, ctypes.POINTER(pc.wintypes.DWORD))
+        if scenario == "denied":
+            return 5
+        size.contents.value = 16 * 1024 * 1024 if scenario == "oversize" else len(raw)
+        if buffer is None:
+            return 122
+        ctypes.memmove(buffer, raw, len(raw))
+        return 0
+
+    monkeypatch.setattr(
+        pc.ctypes,
+        "WinDLL",
+        lambda *a, **kw: types.SimpleNamespace(GetExtendedTcpTable=_Fn(query)),
+        raising=False,
+    )
+    result = pc.get_tcp_peer_pid(("127.0.0.1", 1000), ("127.0.0.1", 2000))
+    assert result == (2468 if scenario == "unique" else None)
 
 
 # ---------------------------------------------------------------------------
@@ -763,16 +825,24 @@ def _identity_kernel32(
     exit_code: int = 259,
     times_ok: list[bool] | None = None,
     exit_code_ok: bool = True,
+    wait: int | None = None,
 ) -> Any:
     """kernel32 fake for ``_windows_process_handle_identity``.
 
     ``exit_times`` is replayed one entry per ``GetProcessTimes`` call, so a test
     can script the exited-but-exit-FILETIME-unpublished window; ``times_ok``
     scripts per-call success of the same function.
+
+    ``wait`` is what ``WaitForSingleObject`` answers, which is what decides
+    liveness: a signalled process object has terminated. It defaults to agreeing
+    with ``exit_code`` -- WAIT_TIMEOUT for a live process, WAIT_OBJECT_0 for an
+    exited one -- so a test scripts liveness in one place. Pass it explicitly to
+    script a handle that cannot be waited on (WAIT_FAILED).
     """
 
     times = list(exit_times or [0])
     oks = list(times_ok or [])
+    waited = (0x00000102 if exit_code == 259 else 0x00000000) if wait is None else wait
 
     def _get_times(_handle: Any, creation_out: Any, exit_out: Any, _k: Any, _u: Any) -> int:
         if oks and not oks.pop(0):
@@ -792,6 +862,7 @@ def _identity_kernel32(
         GetProcessId=_const(pid),
         GetProcessTimes=_Fn(_get_times),
         GetExitCodeProcess=_Fn(_get_exit_code),
+        WaitForSingleObject=_Fn(lambda _handle, _millis: waited),
     )
 
 
@@ -807,6 +878,29 @@ class TestWindowsHandleIdentity:
 
     def test_a_live_process_has_no_exit_bound(self, monkeypatch):
         _fake_windows(monkeypatch, kernel32=_identity_kernel32())
+        assert pc._windows_process_handle_identity(5) == (4242, 100, None)
+
+    def test_an_exit_status_of_259_is_read_as_exited_when_the_wait_says_so(self, monkeypatch):
+        # 259 is both STILL_ACTIVE and an ordinary exit code, so the exit code
+        # alone cannot decide liveness: a child that picks it would read back as
+        # running for as long as a handle is held, and a drain waiting for its
+        # exit would never finish. The signalled process object is authoritative.
+        _fake_windows(
+            monkeypatch,
+            kernel32=_identity_kernel32(
+                exit_code=259, wait=0x00000000, exit_times=[777, 777]
+            ),
+        )
+        assert pc._windows_process_handle_identity(5) == (4242, 100, 777)
+
+    def test_a_handle_that_cannot_be_waited_on_falls_back_to_the_exit_code(self, monkeypatch):
+        # A query-only handle carries no SYNCHRONIZE right, so the wait fails.
+        # Those callers read identity without draining anything, so they keep the
+        # exit-code answer rather than losing the identity altogether.
+        _fake_windows(
+            monkeypatch,
+            kernel32=_identity_kernel32(exit_code=259, wait=0xFFFFFFFF),
+        )
         assert pc._windows_process_handle_identity(5) == (4242, 100, None)
 
     def test_an_exited_process_reports_its_exit_filetime(self, monkeypatch):
@@ -2059,7 +2153,7 @@ class TestCountOpenFds:
     Both the ``kirocrew.process.open_fds`` gauge and gatewayd's
     zombie-diagnostic ``fd_count`` delegate here, so these tests pin the probe
     once: the POSIX steady-state correction, the None contract, and the
-    Windows handle-count route the gauge previously lacked.
+    Windows handle-count route.
     """
 
     def test_posix_count_is_positive_and_excludes_the_probe_fd(self):
@@ -2803,7 +2897,7 @@ class TestDescendantHandleScanCleanup:
 
         closed: list[int] = []
         monkeypatch.setattr(pc, "_windows_process_parent_map", _parent_map)
-        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid: 9001)
+        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid, **_k: 9001)
         monkeypatch.setattr(
             pc,
             "_windows_process_handle_identity",
@@ -2814,16 +2908,54 @@ class TestDescendantHandleScanCleanup:
             pc.descendant_termination_handles(100, {}, 8001)
         assert closed == [9001]
 
-    def test_skips_children_whose_handle_cannot_be_opened(self, monkeypatch):
-        # A child that exits between the snapshot and the open is not an error;
-        # it just is not ours to terminate.
+    @pytest.mark.parametrize("outcome", ["live", "unknown", "gone"])
+    def test_unopenable_child_requires_proven_absence(self, monkeypatch, outcome):
+        # OpenProcess denial is not death, even if a query-only probe says False.
+        # Only a fresh complete snapshot can prove that the child disappeared.
+        scans = 0
+
+        def snapshot():
+            nonlocal scans
+            scans += 1
+            if scans > 1:
+                if outcome == "unknown":
+                    raise OSError("snapshot unavailable")
+                if outcome == "gone":
+                    return {}
+            return {101: 100}
+
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(pc, "_windows_process_parent_map", snapshot)
+        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid, **_k: None)
+        monkeypatch.setattr(pc, "pid_exists", lambda _pid: False)
+        monkeypatch.setattr(pc, "_windows_process_handle_identity", lambda _h: (100, 10, None))
+        if outcome == "gone":
+            assert pc.descendant_termination_handles(100, {}, 8001) == {}
+        else:
+            with pytest.raises(OSError, match="unavailable"):
+                pc.descendant_termination_handles(100, {}, 8001)
+        assert scans == 2
+
+    @pytest.mark.parametrize("unreadable", [True, False])
+    def test_unknown_identity_refuses_but_proven_foreign_child_is_excluded(
+        self, monkeypatch, unreadable
+    ):
+        closed: list[int] = []
         monkeypatch.setattr(pc, "IS_WINDOWS", True)
         monkeypatch.setattr(pc, "_windows_process_parent_map", lambda: {101: 100})
-        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid: None)
+        monkeypatch.setattr(pc, "_open_process_termination_handle", lambda _pid, **_k: 9001)
         monkeypatch.setattr(
-            pc, "_windows_process_handle_identity", lambda _h: (100, 10, None)
+            pc,
+            "_windows_process_handle_identity",
+            {8001: (100, 10, 20), 9001: None if unreadable else (101, 21, None)}.get,
         )
-        assert pc.descendant_termination_handles(100, {}, 8001) == {}
+        monkeypatch.setattr(pc, "close_process_handle", closed.append)
+        if unreadable:
+            with pytest.raises(OSError, match="identity unreadable"):
+                pc.descendant_termination_handles(100, {}, 8001)
+        else:
+            assert pc.descendant_termination_handles(100, {}, 8001) == {}
+        assert closed == [9001]
 
 
 class TestCloseProcessHandleWindows:

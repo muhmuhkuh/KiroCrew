@@ -46,13 +46,12 @@ HOST_ARCH="$(uname -m)"
 
 # Beacon provenance for the artifact this run produces, derived from the
 # electron-builder target rather than the host: mac.target is dmg, linux.target
-# is AppImage + deb + rpm (website/electron/package.json). Reading the host OS instead
-# would be wrong on Linux, where the same machine also builds wheels.
-# Windows ships an NSIS installer, which has no KNOWN_DISTRIBUTIONS value yet;
-# "source" is the honest answer until "nsis" is added on both sides.
+# is AppImage + deb + rpm, win.target is nsis (website/electron/package.json).
+# Reading the host OS instead would be wrong on Linux, where the same machine
+# also builds wheels.
 case "$OS" in
   darwin)  KC_DISTRIBUTION="dmg" ;;
-  windows) KC_DISTRIBUTION="source" ;;
+  windows) KC_DISTRIBUTION="nsis" ;;
   *)       KC_DISTRIBUTION="appimage" ;;
 esac
 
@@ -505,8 +504,13 @@ LAUNCH
   fi
 
   # Self-containment gate: the full import chain must resolve with no user-site.
+  # Bare `--version` is a pre-dispatch fast-path that skips `kiro_crew.cli`'s
+  # heavy imports, so it cannot prove the chain alone: the import probe below
+  # restores the gate's meaning.
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/bin/python3.12" -m kiro_crew --version >/dev/null \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/bin/python3.12" -c 'import kiro_crew.cli' \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   # Prune to shrink the bundle.
@@ -664,6 +668,8 @@ build_backend_windows() {
   log "Verifying self-containment ($(basename "$out"))…"
   PYTHONNOUSERSITE=1 "$out/python.exe" -s -m kiro_crew --version >/dev/null \
     || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
+  PYTHONNOUSERSITE=1 "$out/python.exe" -s -c 'import kiro_crew.cli' \
+    || { echo "ERROR: bundled backend is NOT self-contained (missing dep under PYTHONNOUSERSITE=1)" >&2; exit 1; }
 
   log "Pruning bundle ($(basename "$out"))…"
   ( cd "$out"
@@ -683,10 +689,17 @@ build_backend_windows() {
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
 
-  # Trace the real gateway import after the final prune and ship checked-hash
-  # pycs for exactly that closure. Windows can consume these beside the source
-  # without invalidating an Authenticode signature, avoiding the first launch's
-  # thousand-file cache write while keeping unrelated modules out of the bundle.
+  # Trace the real gateway import after the final prune and ship hash-based
+  # (UNCHECKED) pycs for exactly that closure. Windows can consume these beside
+  # the source without invalidating an Authenticode signature, avoiding the first
+  # launch's thousand-file cache write while keeping unrelated modules out of the
+  # bundle. Unchecked, not checked, and the difference is load-bearing: a
+  # checked-hash pyc makes the loader read and hash each .py in ADDITION to the
+  # .pyc, which measured 43.55 MB and 1639 extra cold file opens per boot -- a
+  # median 12.5 s on a cold file cache. Both hash modes ignore mtime, which is
+  # the property this needs; only the re-read is dropped. The posix tree above
+  # stays checked-hash: it is a different mechanism (whole tree, codesigned) and
+  # does not show the symptom.
   log "Precompiling Windows gateway startup modules ($(basename "$out"))…"
   env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
     "$out/python.exe" -s "$ROOT/packaging/precompile_windows.py" \

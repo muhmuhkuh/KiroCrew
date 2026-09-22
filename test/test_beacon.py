@@ -9,6 +9,7 @@ from __future__ import annotations
 import http.client
 import importlib
 import json
+import re
 import socket
 import ssl
 import subprocess
@@ -352,6 +353,58 @@ class TestDistributionStamp:
         assert "src/kiro_crew/_build_info.py" in (root / ".gitignore").read_text()
 
 
+class TestDesktopStampPerOS:
+    """``packaging/build-desktop.sh`` must stamp a desktop value on every OS.
+
+    Source-level, so it runs on Windows CI too, where bash is unavailable.
+
+    The stamp is not only a beacon field: ``platform/update_capability.py`` keys
+    the externally-managed classes on it, so a desktop artifact stamped with a
+    feed-checkable value is offered the CLI release feed and the POSIX
+    ``curl … | sh`` installer command instead of the app's own updater.
+    """
+
+    _SCRIPT = Path(__file__).resolve().parents[1] / "packaging" / "build-desktop.sh"
+
+    def _os_stamps(self) -> dict[str, str]:
+        """``{OS branch: stamped value}`` read out of the shipped script."""
+        text = self._SCRIPT.read_text(encoding="utf-8")
+        block = re.search(
+            r'case "\$OS" in\n((?:\s*\S+\)\s*KC_DISTRIBUTION="[^"]+"\s*;;\n)+)\s*esac',
+            text,
+        )
+        assert block, "no KC_DISTRIBUTION case found in packaging/build-desktop.sh"
+        found = dict(
+            re.findall(r'(\S+)\)\s*KC_DISTRIBUTION="([^"]+)"', block.group(1))
+        )
+        assert found, "KC_DISTRIBUTION case matched no branches"
+        return found
+
+    def test_every_branch_stamps_a_known_distribution(self):
+        for branch, dist in self._os_stamps().items():
+            assert dist in beacon.KNOWN_DISTRIBUTIONS, (
+                f"{branch}) stamps {dist!r}, which the clamp rejects — "
+                "the artifact would silently report 'source'"
+            )
+
+    def test_every_branch_stamps_an_externally_managed_value(self):
+        """The script only ever packages the desktop app, on every OS.
+
+        A branch stamping a feed-checkable value is the defect, not a variant:
+        the artifact then advertises an update path that cannot replace its
+        bytes.
+        """
+        from kiro_crew.platform.update_capability import EXTERNALLY_MANAGED_STAMPS
+
+        for branch, dist in self._os_stamps().items():
+            assert dist in EXTERNALLY_MANAGED_STAMPS, (
+                f"{branch}) stamps {dist!r}, which is not externally managed"
+            )
+
+    def test_the_windows_branch_stamps_nsis(self):
+        assert self._os_stamps().get("windows") == "nsis"
+
+
 class TestVersionClamp:
     """`v` must stay low-cardinality however the build stamped __version__.
 
@@ -687,9 +740,9 @@ class TestUrlAndTransport:
         """An unwritable data home must not propagate out of send()/status().
 
         Regression test: should_send() and payload() probe the filesystem, and
-        they used to run OUTSIDE send()'s try, so a PermissionError from
-        config_dir() escaped into the gateway's daemon thread (traceback on every
-        boot) and made `kirocrew telemetry status` crash — while the module
+        they must run INSIDE send()'s try, or a PermissionError from
+        config_dir() escapes into the gateway's daemon thread (traceback on every
+        boot) and makes `kirocrew telemetry status` crash — while the module
         documents an in-memory fallback for exactly this case.
         """
 
@@ -726,9 +779,9 @@ class TestUrlAndTransport:
         """A host with a space passes the https:// check but breaks urlopen.
 
         Regression test: http.client.InvalidURL is not an OSError or ValueError,
-        so it used to escape send() into the gateway's detached daemon thread,
-        where threading.excepthook printed a traceback on every boot — violating
-        this function's documented silent-on-failure contract. Drives the REAL
+        so without a broad enough except it escapes send() into the gateway's
+        detached daemon thread, where threading.excepthook prints a traceback on
+        every boot — violating this function's silent-on-failure contract. Drives the REAL
         urlopen (no stub), because the bug was in the except tuple itself.
         """
         assert beacon.send("https://exa mple.invalid", "1.2.3", enabled=True, acked=True) is False
@@ -899,8 +952,8 @@ class TestTelemetryCliWrite:
     def test_non_object_config_is_never_overwritten(self, _isolated_home, monkeypatch, raw):
         """A config.json that is valid JSON but not an object must not be replaced.
 
-        Regression test: the toggle used to coerce non-dict data to ``{}``, then
-        write — silently destroying the file's contents AND printing success. A
+        Regression test: the toggle must not coerce non-dict data to ``{}`` and
+        write — that silently destroys the file's contents AND prints success. A
         privacy toggle must never be a data-loss path.
         """
         from kiro_crew.cli_commands import _telemetry
@@ -994,7 +1047,7 @@ class TestTelemetryCliWrite:
     def test_uses_atomic_write_not_write_text(self, _isolated_home, monkeypatch):
         """The toggle must route through update_config_locked (atomic + locked).
 
-        Regression test: the toggle used to call ``path.write_text``, which
+        Regression test: ``path.write_text`` (which the toggle must not call)
         truncates in place — a disk-full or interrupted write mid-rewrite of the
         user's WHOLE config.json would leave a partial file and every later load
         would silently discard their configuration. The current path goes through

@@ -1,4 +1,4 @@
-"""No spawn may hand CPython a ``preexec_fn`` (issue #935).
+"""No spawn may hand CPython a ``preexec_fn``.
 
 ``preexec_fn`` forces a plain ``fork()`` of the multi-GB, ~118-thread gateway and
 runs Python bytecode in the child before ``exec``. A lock another thread held at
@@ -43,13 +43,6 @@ _ALLOWED = frozenset(
         # a truncated install), where dropping the resource caps would be worse
         # than the fork risk.
         "sandbox.py::create_subprocess_limited",
-        # The user's interactive terminal. It carries NO resource policy (no
-        # rlimits, no OOM bias), so the shim had nothing to deliver for it and
-        # cost an interpreter startup on every terminal open. Its preexec_fn is a
-        # single pre-resolved ioctl with no allocation and no lock acquisition --
-        # the only shape where a fork-child callable is defensible. Residual risk
-        # is accepted and documented at the call site.
-        "dashboard/handlers/terminal.py::api_terminal_ws",
     }
 )
 

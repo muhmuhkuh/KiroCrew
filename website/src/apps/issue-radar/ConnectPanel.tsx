@@ -18,11 +18,11 @@
 //      additive — the Connect action submits every selected target, so a user
 //      can add a repo that isn't in the recent list without losing their ticks.
 //
-// Every listed source is wired to a backend (Issue Radar reads each one through
-// the user's own `gh` / `glab` / `az` CLI). Unwired sources are NOT listed: a row
-// that only carries a "Soon" badge costs the same vertical space as a usable one
-// and gives the user nothing to do, so unwired sources like Jira/Linear are left
-// out of the list rather than rendered disabled.
+// Every listed source is wired to a backend: GitHub, GitLab and Azure through
+// their own CLIs, and Jira through REST with ambient JIRA_EMAIL + JIRA_API_TOKEN
+// credentials. Unwired sources are NOT listed: a row that only carries a "Soon"
+// badge costs the same vertical space as a usable one and gives the user nothing
+// to do, so sources like Linear are left out rather than rendered disabled.
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertCircle, Check, RefreshCw } from 'lucide-react'
@@ -36,6 +36,7 @@ import ErrorNotice from '../../components/ErrorNotice'
 import AzureDevopsLogo from '../../components/icons/AzureDevopsLogo'
 import GithubLogo from '../../components/icons/GithubLogo'
 import GitlabLogo from '../../components/icons/GitlabLogo'
+import JiraLogo from '../../components/icons/JiraLogo'
 
 import { i18nT } from '../../i18n/t'
 import { fmtDateTimeNumeric } from '../../i18n/format'
@@ -243,7 +244,7 @@ function publicRepoUrl(provider: ProviderId, fullName: string): string {
  * (repo picker BELOW the provider list, body scrolling). One predicate makes
  * that drift impossible. */
 export function expandsCard(provider: ProviderId | null): boolean {
-  return provider === 'github' || provider === 'gitlab' || provider === 'azure'
+  return provider === 'github' || provider === 'gitlab' || provider === 'azure' || provider === 'jira'
 }
 
 interface Provider {
@@ -258,6 +259,7 @@ const PROVIDERS: Provider[] = [
   { id: 'github', label: 'GitHub', icon: <GithubLogo size={18} /> },
   { id: 'gitlab', label: 'GitLab', icon: <GitlabLogo size={18} /> },
   { id: 'azure', label: 'Azure DevOps', icon: <AzureDevopsLogo size={18} /> },
+  { id: 'jira', label: 'Jira', icon: <JiraLogo size={18} /> },
 ]
 
 /** One connect target: either a ticked recent repo or the manually typed URL. */
@@ -266,6 +268,8 @@ export interface ConnectTarget {
   /** What `POST /connect` receives — it parses owner/repo out of the URL. */
   url: string
   label: string
+  /** Manual Git-slug mapping for a Jira project. */
+  repo?: string
 }
 
 export interface ConnectFlow {
@@ -275,6 +279,9 @@ export interface ConnectFlow {
   clearProvider: () => void
   url: string
   setUrl: (u: string) => void
+  /** Manual Git-slug mapping for a Jira project. */
+  repo: string
+  setRepo: (r: string) => void
   /** `owner/repo` keys ticked in the recent-repos column. */
   picked: Set<string>
   togglePicked: (fullName: string) => void
@@ -298,6 +305,7 @@ export function useConnectFlow(onConnected: (repo: ActiveRepo) => void): Connect
   const queryClient = useQueryClient()
   const [provider, setProvider] = useState<ProviderId | null>(null)
   const [url, setUrl] = useState('')
+  const [repo, setRepo] = useState('')
   const [picked, setPicked] = useState<Set<string>>(() => new Set())
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
   const [errors, setErrors] = useState<string[]>([])
@@ -327,9 +335,18 @@ export function useConnectFlow(onConnected: (repo: ActiveRepo) => void): Connect
       label: fullName,
     }))
     const typed = url.trim()
-    // A typed URL that duplicates a tick is submitted once, not twice — matched
-    // on normalised owner/repo identity, not raw text (see repoIdentity).
-    if (typed) {
+    // Jira has no repo picker or shorthand URL; its project URL is submitted
+    // verbatim with the optional manual Git-slug mapping.
+    if (typed && scope === 'jira') {
+      out.push({
+        key: `${URL_TARGET_PREFIX}${typed}`,
+        url: typed,
+        label: typed,
+        repo: repo.trim() || undefined,
+      })
+    } else if (typed) {
+      // A typed URL that duplicates a tick is submitted once, not twice — matched
+      // on normalised owner/owner identity, not raw text (see repoIdentity).
       const typedId = repoIdentity(typed, scope)
       const already = typedId !== null && out.some((t) => repoIdentity(t.url, scope) === typedId)
       if (!already) {
@@ -346,7 +363,7 @@ export function useConnectFlow(onConnected: (repo: ActiveRepo) => void): Connect
       }
     }
     return out
-  }, [picked, url, provider])
+  }, [picked, url, repo, provider])
 
   const connectMutation = useMutation({
     mutationFn: async (list: ConnectTarget[]) => {
@@ -366,7 +383,9 @@ export function useConnectFlow(onConnected: (repo: ActiveRepo) => void): Connect
         if (cancelledRef.current) break
         setProgress({ done: i, total: list.length })
         try {
-          const res = await issueRadarApi.connect(list[i].url)
+          const res = list[i].repo
+            ? await issueRadarApi.connect(list[i].url, list[i].repo)
+            : await issueRadarApi.connect(list[i].url)
           succeeded.push(list[i].key)
           if (!first) {
             first = {
@@ -431,6 +450,8 @@ export function useConnectFlow(onConnected: (repo: ActiveRepo) => void): Connect
     clearProvider: () => setProvider(null),
     url,
     setUrl,
+    repo,
+    setRepo,
     picked,
     togglePicked: (fullName) => setPicked((prev) => {
       const next = new Set(prev)
@@ -451,6 +472,7 @@ export function useConnectFlow(onConnected: (repo: ActiveRepo) => void): Connect
     reset: () => {
       setPicked((prev) => (prev.size ? new Set() : prev))
       setUrl((prev) => (prev ? '' : prev))
+      setRepo((prev) => (prev ? '' : prev))
     },
   }
 }
@@ -464,6 +486,7 @@ export function useConnectFlow(onConnected: (repo: ActiveRepo) => void): Connect
 function urlPlaceholderFor(provider: SourceProvider): string {
   if (provider === 'gitlab') return i18nT('apps.issueRadar.connectPanel.https_gitlab_com_group_project')
   if (provider === 'azure') return i18nT('apps.issueRadar.connectPanel.https_dev_azure_com_org_project_git_repo')
+  if (provider === 'jira') return i18nT('apps.issueRadar.connectPanel.jira_url_example')
   return i18nT('apps.issueRadar.connectPanel.https_github_com_owner_repo')
 }
 
@@ -477,9 +500,9 @@ function urlPlaceholderFor(provider: SourceProvider): string {
  * notice. */
 export default function ConnectPanel({ flow }: { flow: ConnectFlow }) {
   const ime = useImeGuard()
-  // Every wired provider expands into the two-column body. Jira/Linear stay
-  // collapsed because they are still placeholders.
+  // Every wired provider expands into the two-column body.
   const expanded = expandsCard(flow.provider)
+  const isJira = flow.provider === 'jira'
   const scopeProvider: SourceProvider = flow.provider ?? 'github'
 
   // One example for the SELECTED provider, never all of them in one string. A
@@ -500,11 +523,12 @@ export default function ConnectPanel({ flow }: { flow: ConnectFlow }) {
     queryKey: ['issue-radar', 'recent-repos', RECENT_WINDOW_DAYS, scopeProvider],
     queryFn: () => issueRadarApi.recentRepos(RECENT_WINDOW_DAYS, { provider: scopeProvider }),
     // Only fetch once a wired provider's panel is actually open, and don't
-    // re-shell out to the CLI on every window focus.
-    enabled: expanded,
+    // re-shell out to the CLI on every window focus. Jira has no contributed-
+    // repo feed, so its panel never runs this query.
+    enabled: expanded && !isJira,
     refetchOnWindowFocus: false,
   })
-  const setupRequired = query.data?.setup_required ?? null
+  const setupRequired = isJira ? null : (query.data?.setup_required ?? null)
 
   // Nothing here is connectable without a working `gh`, so any target the user
   // picked before the query resolved is now a guaranteed failure — and the URL
@@ -581,15 +605,53 @@ export default function ConnectPanel({ flow }: { flow: ConnectFlow }) {
           ))}
         </div>
 
-        {/* Right column — everything GitHub-specific: the repo multi-select (or
-         * the setup notice) and, when usable, the manual URL entry. */}
+        {/* Right column — the repo picker for forge providers, or the URL and
+         * optional mapping fields for Jira. */}
         {expanded && (
           <div
             className={`flex-1 min-w-0 flex flex-col gap-3 ${
               stacked ? 'border-t border-border pt-4 min-h-[220px]' : 'min-h-0 border-l border-border pl-5'
             }`}
           >
-            <RecentRepoPicker
+            {isJira ? (
+              <div className="flex flex-col gap-3 pt-3 flex-shrink-0">
+                <span className="text-[11px] font-semibold text-muted uppercase tracking-[.08em] opacity-70">
+                  {i18nT('apps.issueRadar.connectPanel.paste_a_url')}
+                </span>
+                <input
+                  id="ir-repo-url"
+                  aria-label={i18nT('apps.issueRadar.connectPanel.repository_url')}
+                  value={flow.url}
+                  onChange={(e) => flow.setUrl(e.target.value)}
+                  {...ime.bindEnter({ onEnter: () => flow.submit() })}
+                  disabled={flow.pending}
+                  placeholder={urlPlaceholder}
+                  className="w-full box-border text-[12.5px] px-3 py-2 rounded-md bg-bg text-text border border-border font-mono disabled:opacity-50"
+                />
+                <span className="text-[11px] font-semibold text-muted uppercase tracking-[.08em] opacity-70">
+                  {i18nT('apps.issueRadar.connectPanel.optional_repo_mapping')}
+                </span>
+                <input
+                  id="ir-repo-mapping"
+                  aria-label={i18nT('apps.issueRadar.connectPanel.optional_repo_mapping')}
+                  value={flow.repo}
+                  onChange={(e) => flow.setRepo(e.target.value)}
+                  {...ime.bindEnter({ onEnter: () => flow.submit() })}
+                  disabled={flow.pending}
+                  placeholder={i18nT('apps.issueRadar.connectPanel.repo_mapping_placeholder')}
+                  className="w-full box-border text-[12.5px] px-3 py-2 rounded-md bg-bg text-text border border-border font-mono disabled:opacity-50"
+                />
+                <p className="text-[11px] text-muted leading-[1.6]">
+                  {i18nT('apps.issueRadar.connectPanel.repo_mapping_hint')}
+                </p>
+                <div className="flex items-start gap-1.5 px-3 py-2 rounded-md border border-warn/30 bg-warn/5 text-[11px] text-muted leading-[1.6]">
+                  <AlertCircle size={13} className="flex-shrink-0 mt-0.5 text-warn" />
+                  <span>{i18nT('apps.issueRadar.connectPanel.jira_env_hint')}</span>
+                </div>
+              </div>
+            ) : (
+              <>
+                <RecentRepoPicker
               picked={flow.picked}
               onToggle={flow.togglePicked}
               // submit() snapshots the target list, so a tick added mid-flight
@@ -639,6 +701,8 @@ export default function ConnectPanel({ flow }: { flow: ConnectFlow }) {
                   className="w-full box-border text-[12.5px] px-3 py-2 rounded-md bg-bg text-text border border-border font-mono disabled:opacity-50"
                 />
               </div>
+            )}
+              </>
             )}
           </div>
         )}

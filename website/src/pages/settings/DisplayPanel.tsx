@@ -6,7 +6,7 @@ import type { FontFamily } from '../../hooks/useZoom'
 import { useTheme } from '../../hooks/useTheme'
 import type { ColorTheme } from '../../hooks/useTheme'
 import { useUIMode } from '../../hooks/useUIMode'
-import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput, SettingsCombobox } from '../../components/settings'
+import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput, SettingsCombobox, SettingsToggle } from '../../components/settings'
 import SimpleSelect from '../../components/SimpleSelect'
 import { Input } from '../../components/ui'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
@@ -67,6 +67,27 @@ function StatusIndicator({ label }: { label: string }) {
       <StatusSpinner />
       {label}
     </span>
+  )
+}
+
+/**
+ * True when a failed credit-meter save was the owner gate refusing, not a
+ * transient failure.
+ *
+ * Enabling this field is owner-only (handlers/core.py refuses with 403 and the
+ * standard `owner_only` code). The generic line ends "you can try again", which
+ * for a non-owner is a loop: the retry can never succeed. Duck-typed on
+ * `status` and the body rather than `instanceof ApiError`, the same way
+ * `isNotFoundError` is, so a suite that mocks `api/client` still reaches this
+ * branch.
+ */
+function isOwnerOnlyRefusal(err: unknown): boolean {
+  const e = err as { status?: unknown; body?: unknown } | null
+  return (
+    typeof e === 'object' &&
+    e !== null &&
+    e.status === 403 &&
+    String(e.body ?? '').includes('owner_only')
   )
 }
 
@@ -143,7 +164,13 @@ export function DisplayPanel() {
   // Recency-tint count is persisted server-side (dashboard.recent_tint_count) via the shared
   // kirocrewConfig query, so the choice follows the user across browsers/restarts.
   const qc = useQueryClient()
-  type KirocrewCfg = { dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }
+  type KirocrewCfg = {
+    dashboard?: {
+      recent_tint_count?: number
+      usage_text_scrape_enabled?: boolean
+      terminal?: { shell?: string; completion?: { enabled?: boolean } }
+    }
+  }
   const mcQ = useQuery<KirocrewCfg>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
@@ -229,6 +256,76 @@ export function DisplayPanel() {
     shellMut.mutate(value)
   }
 
+  // The Terminal tab's completion popup (dashboard.terminal.completion.enabled).
+  // Server-side like the shell, because the gate lives in the completion
+  // route: with it off the gateway answers every listing request with nothing,
+  // so the popup never opens and no menu can steal a key. Default on; only a
+  // literal `false` reads as off — the same rule the backend applies, so a
+  // hand-edited `"false"` string cannot show as off here while the popup keeps
+  // appearing. Same per-path overlay as the shell field, so a slow save
+  // cannot roll back an in-flight sibling.
+  const serverCompletion = mcQ.data?.dashboard?.terminal?.completion?.enabled !== false
+  const shownCompletion = overlay.shown('dashboard.terminal.completion.enabled', serverCompletion)
+  const [completionError, setCompletionError] = useState<string | null>(null)
+  const completionMut = useMutation(overlay.mutationOpts<boolean>({
+    queryKey: ['kirocrewConfig'],
+    mutationFn: (value: boolean) => api.patchConfig('dashboard.terminal.completion.enabled', value),
+    path: () => 'dashboard.terminal.completion.enabled',
+    displayValue: v => v,
+    applyToCache: (cached, value) =>
+      setConfigPathValue(cached as KirocrewCfg, 'dashboard.terminal.completion.enabled', value),
+    onFailure: () => setCompletionError(i18nT('pages.settings.displayPanel.terminal_completion_save_failed')),
+    onSupersede: () => setCompletionError(null),
+  }))
+
+  // ── Billed credit-meter fallback (server-side; dashboard.usage_text_scrape_enabled) ──
+  // Copies the terminal-completion toggle directly above: same ['kirocrewConfig']
+  // query, same `api.patchConfig` write, same per-path overlay, same
+  // onFailure/onSupersede error line. Before this the key was declared in the
+  // schema but missing from the PATCH allowlist, so no control could have saved
+  // it at all (see handlers/core.py `_EDITABLE_CONFIG`).
+  //
+  // `=== true` is not a UI default, it MIRRORS the backend's own coercion:
+  // config/loader.py stores this field as `_safe_bool(..., False)` and
+  // config/sections.py:357 defines `_safe_bool` as "return value only when it
+  // is a real bool, else default". So a hand-edited `"true"` string is read as
+  // OFF by the gate, and must render OFF here too — the same reasoning the
+  // completion toggle above applies with its `!== false` (its default is on,
+  // ours is off). A config that has never carried the key renders OFF, so
+  // installing this control changes nothing until the user flips it.
+  //
+  // No restart prompt, which the issue asked about: the reader calls
+  // `KiroCrewConfig.load()` per check and the config cache is keyed on
+  // `_config_fingerprint()` (st_mtime_ns + st_size + st_mode), whose docstring
+  // says any edit busts it — so the next refresh interval already sees the new
+  // value. A banner promising a restart would be a false instruction.
+  //
+  // Locked for the round-trip (`scrapeMut.isPending`), like the shell field
+  // below and unlike the completion toggle above. The overlay's token guard
+  // already keeps the DISPLAYED value and the cache write coherent, but it
+  // cannot order two PATCHes in flight: rapid on-off clicks are ordinary, and
+  // if they land out of order the server keeps `true` after the user's final
+  // `false`. For this key that is not a cosmetic revert, it is billed refreshes
+  // the user switched off, so the second click is made unrepresentable instead.
+  const serverScrape = mcQ.data?.dashboard?.usage_text_scrape_enabled === true
+  const shownScrape = overlay.shown('dashboard.usage_text_scrape_enabled', serverScrape)
+  const [scrapeError, setScrapeError] = useState<string | null>(null)
+  const scrapeMut = useMutation(overlay.mutationOpts<boolean>({
+    queryKey: ['kirocrewConfig'],
+    mutationFn: (value: boolean) => api.patchConfig('dashboard.usage_text_scrape_enabled', value),
+    path: () => 'dashboard.usage_text_scrape_enabled',
+    displayValue: v => v,
+    applyToCache: (cached, value) =>
+      setConfigPathValue(cached as KirocrewCfg, 'dashboard.usage_text_scrape_enabled', value),
+    onFailure: err =>
+      setScrapeError(
+        isOwnerOnlyRefusal(err)
+          ? i18nT('pages.settings.displayPanel.credit_usage_scrape_owner_only')
+          : i18nT('pages.settings.displayPanel.credit_usage_scrape_save_failed'),
+      ),
+    onSupersede: () => setScrapeError(null),
+  }))
+
   // ── Install theme (Level 0) from a local folder or a GitHub repo ──
   const [installType, setInstallType] = useState<'github' | 'local'>('github')
   const [installValue, setInstallValue] = useState('')
@@ -307,6 +404,32 @@ export function DisplayPanel() {
               { value: 'cli', label: 'CLI' },
             ]}
             onChange={v => setUIMode(v as 'chat' | 'cli')} />
+          {/* The credit pill's data source. It sits on Display because the pill
+              is dashboard chrome and the issue asked for it here; the closest
+              boolean of the same family (link_previews, also opt-in and also
+              off for a non-display reason) lives on the Chat tab, so this is
+              the reporter's placement rather than that sibling's.
+
+              `description` is a bare i18nT() call, not an element: the settings
+              extractor reads it only as a string literal or a t() call
+              (scripts/settingsExtract.ts `extractStringProp`), so wrapping it
+              would drop this row's description from the command-palette
+              registry with no type error. The sentence reuses the cost
+              disclosure the account modal already ships in every locale
+              (components.kiroAccountModal.credit_usage_scrape_disabled). */}
+          <SettingsToggle
+            label={i18nT('pages.settings.displayPanel.credit_usage_scrape')}
+            description={i18nT('pages.settings.displayPanel.credit_usage_scrape_desc')}
+            checked={shownScrape}
+            onChange={v => scrapeMut.mutate(v)}
+            disabled={scrapeMut.isPending || !mcQ.isSuccess}
+            configKey="dashboard.usage_text_scrape_enabled"
+          />
+          {/* A rejected write rolls the switch back, which is honest but silent
+              about why. No hand-off: `shellDraft` and `installValue` elsewhere
+              on this panel are unsaved local state the navigation would
+              discard — same rule as the language notice above. */}
+          <ErrorNotice message={scrapeError} variant="inline" />
         </SettingsCard>
       </SettingsSection>
 
@@ -407,6 +530,19 @@ export function DisplayPanel() {
               a rejected path stays in the field for the user to fix, and the
               hand-off would navigate away from it. */}
           <ErrorNotice message={shellError} variant="inline" />
+          <SettingsToggle
+            label={i18nT('pages.settings.displayPanel.terminal_completion')}
+            description={i18nT('pages.settings.displayPanel.terminal_completion_desc')}
+            checked={shownCompletion}
+            onChange={v => completionMut.mutate(v)}
+            disabled={!mcQ.isSuccess}
+            configKey="dashboard.terminal.completion.enabled"
+          />
+          {/* No hand-off: the toggle itself has no draft (it saves on click),
+              but `shellDraft` above and `installValue` further down this panel
+              are unsaved local state, and the hand-off's navigation unmounts
+              the whole panel with them. Same rule as the language notice. */}
+          <ErrorNotice message={completionError} variant="inline" />
           {/* The shell field and the recency-tint stepper are both disabled
               while this query is not successful. A failed read used to leave
               them greyed out with no reason on screen. No hand-off: the theme
@@ -571,9 +707,9 @@ export function DisplayPanel() {
             <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
             <div className="text-[12px] text-muted">{i18nT('pages.settings.displayPanel.none_auto_cycle_or_pick_a_fixed_color')}</div>
             <div className="flex flex-wrap items-center gap-1.5">
-              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:scale-110 ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
+              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
               {colors.map((c, i) => (
-                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} aria-pressed={defaultColor === i} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:scale-110 ${defaultColor === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
+                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} aria-pressed={defaultColor === i} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
               ))}
               <button type="button" className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium cursor-pointer border transition-all ${defaultColor === 'auto' ? 'bg-accent-subtle text-accent border-accent' : 'bg-transparent text-muted border-border hover:border-border-strong hover:text-text'}`} onClick={() => dispatch(setSessionDefaultColor('auto'))}>{i18nT('pages.settings.displayPanel.auto')}</button>
             </div>

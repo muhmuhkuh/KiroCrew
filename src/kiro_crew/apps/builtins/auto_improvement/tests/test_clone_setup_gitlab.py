@@ -14,10 +14,7 @@ flow into CloneSpec / remote validation.
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
-
-import pytest
 
 from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
 from kiro_crew.apps.builtins.issue_radar.backend import gitlab_client
@@ -30,11 +27,6 @@ def _valid(url: str) -> clone_setup.CloneSpec:
 
 
 class TestValidateTargetUrlGitLab:
-    @pytest.fixture(autouse=True)
-    def _use_https_for_url_shape_tests(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Keep URL-shape assertions independent of the developer's glab transport config."""
-        monkeypatch.setattr(clone_setup, "_gitlab_prefers_ssh", lambda _host: False)
-
     def test_public_gitlab_project_url(self) -> None:
         spec = _valid("https://gitlab.com/zedmor/kiro-crew")
         assert spec.provider == "gitlab"
@@ -105,40 +97,6 @@ class TestValidateTargetUrlGitLab:
         spec = _valid("https://gitlab.example.test:8443/group/project")
         assert spec.host == "gitlab.example.test:8443"
         assert spec.clone_url == "https://gitlab.example.test:8443/group/project.git"
-
-
-class TestGitLabSshTransport:
-    def test_reuses_push_disabled_clone_after_transport_change(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        clone = tmp_path / "group--project"
-        clone.mkdir()
-        subprocess.run(["git", "-C", str(clone), "init", "-q"], check=True)
-        subprocess.run(
-            ["git", "-C", str(clone), "remote", "add", "origin", clone_setup.DISABLED_NO_PUSH],
-            check=True,
-        )
-        monkeypatch.setattr(clone_setup, "_host_is_blocked", lambda _host: False)
-        monkeypatch.setattr(clone_setup, "_gitlab_prefers_ssh", lambda _host: True)
-        result, error = clone_setup.setup_safe_clone(
-            "https://gitlab.com/group/project", tmp_path
-        )
-        assert error == ""
-        assert result["reused"] is True
-        assert result["push_disabled"] is True
-
-    def test_uses_the_validated_namespace_in_the_configured_ssh_remote(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(clone_setup, "_host_is_blocked", lambda _host: False)
-        monkeypatch.setattr(clone_setup, "_gitlab_prefers_ssh", lambda _host: True)
-        monkeypatch.setattr(
-            gitlab_client,
-            "allowed_hosts",
-            lambda: frozenset({"gitlab.bildungsinnovator.com"}),
-        )
-        spec = _valid("https://gitlab.bildungsinnovator.com/bildungsinnovator/lxt/vox")
-        assert spec.clone_url == "git@gitlab.bildungsinnovator.com:bildungsinnovator/lxt/vox.git"
 
 
 class TestRemoteSlugGeneralized:

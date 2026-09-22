@@ -324,6 +324,13 @@ async def _handle_connect(request: web.Request) -> web.Response:
     gitlab.com or in the operator's ``dashboard.gitlab_hosts`` allowlist. The
     client cannot nominate a provider here -- that is what keeps a connected-repo
     record, and therefore every later request authorized against it, honest.
+
+    A Jira connection additionally accepts an OPTIONAL ``repo`` field: the
+    manually-mapped Git repo slug the operator wants the Jira project to be
+    associated with (Jira itself has no repo). It is only ever a label — the
+    Jira client ignores it, using ``owner`` (the project key) for all API calls
+    — but it keeps the repo-centric routes/UI consistent and is round-tripped by
+    ``_identity`` so the frontend can address the project.
     """
     try:
         body = await request.json()
@@ -338,19 +345,21 @@ async def _handle_connect(request: web.Request) -> web.Response:
 
     try:
         # Off-loop: on a non-github.com URL this reads the operator's
-        # ``dashboard.gitlab_hosts`` allowlist, and ``KiroCrewConfig.load()`` is
-        # synchronous file I/O + validation. Cheap per call, but it is the
-        # gateway's single event loop, and every other blocking call in this
-        # module is already threaded for the same reason.
+        # ``dashboard.gitlab_hosts`` / ``dashboard.jira_hosts`` allowlists, and
+        # ``KiroCrewConfig.load()`` is synchronous file I/O + validation. Cheap
+        # per call, but it is the gateway's single event loop, and every other
+        # blocking call in this module is already threaded for the same reason.
         key = await asyncio.to_thread(provider.parse_repo_url, url)
     except github_client.RepoUrlError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
     owner, repo = key.owner, key.repo
     if key.provider == provider.JIRA:
+        # The operator's manual Git-slug mapping; absent/empty falls back to the
+        # project key so repo-shaped routes retain a stable non-empty identity.
         repo = _str_field(body, "repo")
         key = provider.key_from_parts(owner, repo, provider=key.provider, host=key.host)
-        owner, repo = key.owner, key.repo
+
     client = provider.client_for(key)
     pkw = provider.call_kwargs(key)
 
@@ -417,14 +426,14 @@ _PROBE_COALESCE_SEC = 15.0
 # self-managed instance.
 _ProbeKey = tuple[str, str, str, str, str]
 _probe_memo: dict[_ProbeKey, tuple[float, dict]] = {}
-_probe_inflight: dict[_ProbeKey, asyncio.Future[dict]] = {}
+_probe_inflight: dict[_ProbeKey, "asyncio.Future[dict]"] = {}
 # Guards the two maps ONLY. It is deliberately never held across the probe call
 # itself: a global lock around a 20s-timeout `gh` invocation would make one slow
 # repo's probe stall every other repo's and kind's poll response.
 _probe_lock = LoopBoundLock()
 
 
-def _remember_probe(key: _ProbeKey, task: asyncio.Future[dict]) -> None:
+def _remember_probe(key: _ProbeKey, task: "asyncio.Future[dict]") -> None:
     """Done-callback: publish a finished probe and retire its in-flight entry.
 
     Runs on the event loop with no awaits, so it cannot interleave with the
@@ -1567,14 +1576,11 @@ _DEPS_REFRESH_TASKS_APP_KEY: web.AppKey[_DepsRefreshTasks] = web.AppKey(
 )
 
 # Per-repo rebuild mutex. Coalescing (above) only stops a SECOND BACKGROUND
-# refresh; it cannot order a background rebuild against a synchronous one, and
-# ``write_deps_cache`` stamps ``fetched_at`` at WRITE time. Without this lock:
-# a stale GET starts background rebuild A, an edge changes, ``refresh=1`` starts
-# synchronous rebuild B, B writes the fresh graph -- and then the slower A lands
-# on top with its older edges and stamps them fresh for a full TTL. Serializing
-# every rebuild for a repo makes the last write the last FETCH, which is the
-# property the cache's freshness stamp claims. Two concurrent ``refresh=1``
-# calls are ordered by the same lock.
+# refresh; this lock keeps a background rebuild and a synchronous ``refresh=1``
+# rebuild (or two concurrent ``refresh=1`` calls) from fetching the same graph
+# concurrently. Ordering their WRITES is not its job: the store's compare-and-set on
+# ``fetched_at`` decides which graph is newer, and it also covers the sweep's
+# thread-side write, which never takes this mutex.
 _DepsRebuildLocks = dict[str, "asyncio.Lock"]
 _DEPS_REBUILD_LOCKS_APP_KEY: web.AppKey[_DepsRebuildLocks] = web.AppKey(
     "issue_radar_deps_rebuild_locks", dict
@@ -1595,7 +1601,7 @@ def _deps_refresh_registry(app: web.Application) -> _DepsRefreshTasks:
     return reg
 
 
-def _deps_rebuild_lock(app: web.Application, key: provider.RepoKey) -> asyncio.Lock:
+def _deps_rebuild_lock(app: web.Application, key: provider.RepoKey) -> "asyncio.Lock":
     """The per-repo rebuild mutex, created on first use.
 
     Bound to the app (hence to one event loop), so this is a plain
@@ -1619,11 +1625,11 @@ class _DepsScopeUnavailable(GhCliError):
 
     A dedicated type rather than a message pattern: the route maps this to the
     ``deps_issue_scope_unavailable`` code and a plain :class:`GhCliError` to
-    ``deps_fetch_failed``. Both failures used to be told apart by which of two
-    ``try`` blocks caught them; now that one helper owns the whole build, the
-    distinction has to travel with the exception, and sniffing the message text
-    would silently reclassify every scope failure whose wording does not happen
-    to mention issues (``gh api ... failed`` mentions neither).
+    ``deps_fetch_failed``. One helper owns the whole build, so the distinction
+    has to travel with the exception rather than with which ``try`` block caught
+    it, and sniffing the message text would silently reclassify every scope
+    failure whose wording does not happen to mention issues
+    (``gh api ... failed`` mentions neither).
     """
 
 
@@ -1649,6 +1655,15 @@ async def _rebuild_deps(app: web.Application, key: provider.RepoKey) -> dict:
     """
     owner, repo = key.owner, key.repo
     async with _deps_rebuild_lock(app, key):
+        # Captured BEFORE the issue snapshot is loaded — the snapshot is the
+        # graph's SCOPE, so the rebuilt graph is as old as its oldest input,
+        # not as old as the edge fetch alone. A later stamp would let a rebuild
+        # scoped by a stale snapshot outrank a concurrent producer (the sweep's
+        # thread-side write, which never takes the mutex above) that used a
+        # fresher one, and suppress its scope changes for the TTL.
+        # Under-claiming age is the safe direction: this rebuild can only lose
+        # a CAS race it might have won, never persist stale data as fresh.
+        fetch_started = time.time()
         try:
             issues = await _load_open_issues_for_reco(key)
         except GhCliError as exc:
@@ -1658,7 +1673,7 @@ async def _rebuild_deps(app: web.Application, key: provider.RepoKey) -> dict:
         edges, nodes = await asyncio.to_thread(
             partial(github_client.fetch_dependency_edges, owner, repo, issues, hints)
         )
-        await _st(key, store.write_deps_cache, owner, repo, edges, nodes)
+        await _st(key, store.write_deps_cache, owner, repo, edges, nodes, fetched_at=fetch_started)
         stored = await _st(key, store.read_deps_cache, owner, repo)
     if stored is not None:
         return stored
@@ -2858,7 +2873,7 @@ async def _handle_labels_apply(request: web.Request) -> web.Response:
     # The cache was patched inside the locked step above. Pruning the Tagging queue
     # is a SEPARATE try: sharing one with the patch meant a failed patch skipped the
     # prune, leaving a successfully labelled issue sitting in the queue.
-    # The issue is no longer untagged, so its Tagging-queue proposal is spent —
+    # The issue is tagged, so its Tagging-queue proposal is spent —
     # drop it here too (not just on the bulk path) so accepting a suggestion from
     # the detail pane also clears it from the dashboard.
     if final_labels:
@@ -3517,11 +3532,7 @@ async def _compute_label_recommendations(
     prose surfaces already do) because it also has to stamp the cache with the
     same tag, and two independent reads could disagree if the language moved
     between them."""
-    from kiro_crew.llm_helpers import (
-        ToolApprovalPolicy,
-        parse_llm_json,
-        stream_and_collect,
-    )
+    from kiro_crew.llm_helpers import ToolApprovalPolicy, parse_llm_json, stream_and_collect
     from kiro_crew.security import redact
 
     state = request.app.get("state")
@@ -3897,9 +3908,9 @@ async def _handle_get_tagging(request: web.Request) -> web.Response:
     which the queue's reload needs: labels get added on GitHub itself, and a
     cache-first read would keep reporting those issues as untagged.
 
-    Returns the issues as ROWS, not just numbers. The frontend used to resolve
-    numbers against the shared issue list, which follows the user's open/closed
-    filter — so entering Tagging from a Closed filter showed an empty queue."""
+    Returns the issues as ROWS, not just numbers. Resolving numbers in the
+    frontend against the shared issue list would follow the user's open/closed
+    filter, so entering Tagging from a Closed filter would show an empty queue."""
     key = _key_from_request(request)
     owner, repo = key.owner, key.repo
     if not owner or not repo:
@@ -3972,7 +3983,7 @@ async def _handle_get_tagging(request: web.Request) -> web.Response:
 
     # Only report suggestions for issues that are STILL untagged: a label applied
     # elsewhere (GitHub, the detail pane) makes a cached proposal moot, and
-    # showing it would offer to re-label an issue that no longer needs it.
+    # showing it would offer to re-label an issue that does not need it.
     live = {str(n) for n in untagged}
     return web.json_response(
         {
@@ -4911,7 +4922,7 @@ async def _refuse_if_head_moved(
 
     The check neither provider will do for us on a review. GitLab's ``/approve`` takes a
     real ``sha`` precondition, but GitHub's ``commit_id`` only ATTRIBUTES the review to a
-    commit — it accepts one that is no longer the head, and whether the resulting stale
+    commit — it accepts one that is not the head, and whether the resulting stale
     approval still counts toward branch protection is a per-repo setting ("dismiss stale
     pull request approvals"). Where that is off, an unchecked approval satisfies
     protection on code nobody read. So the app reads the head itself, exactly as
@@ -5121,9 +5132,9 @@ async def _handle_pull_auto_merge(request: web.Request) -> web.Response:
 #                blocking discussions and required pipelines all satisfied
 #
 # `unstable` is deliberately EXCLUDED. It is usually described as "only non-required
-# checks are failing", and that reading is what an earlier revision allowed — but the
-# state does not actually distinguish a failing REQUIRED check from a failing optional
-# one, so it cannot be used to conclude the protections are satisfied. For an ordinary
+# checks are failing", but the state does not actually distinguish a failing REQUIRED
+# check from a failing optional one, so it cannot prove the protections are satisfied.
+# For an ordinary
 # user the provider would refuse anyway; for the admin this gate exists to protect
 # against, allowing it would land code over a red required check. A gate that cannot
 # tell must refuse: the PR is still one click from `auto_merge`, which lets the provider

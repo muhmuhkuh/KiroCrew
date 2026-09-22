@@ -185,6 +185,80 @@ class TestRecentHistoryDecay:
         assert "qqzz-body" in store.read_history()
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_history_retention_is_version_scoped(tmp_path, monkeypatch, version, request):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 7, 12, tzinfo=tz)
+
+    monkeypatch.setattr("kiro_crew.memory.datetime", Clock)
+    from kiro_crew.vector_memory import create_member_database, open_member_database
+
+    tier = None
+    if version == 2:
+        path = tmp_path / "memory_stores" / "member-alice" / "memory.db"
+        create_member_database(path, member_id="alice", store_id="member-alice")
+        tier = open_member_database(path, member_id="alice", store_id="member-alice")
+        request.addfinalizer(tier.close)
+    store = MemoryStore(workspace=tmp_path, memory_version=version, vector_store=tier)
+    store.init()
+    history = tmp_path / "memory" / "history"
+    original = {}
+    for age in (0, 20, 100, 400, 2000):
+        day = (Clock.now() - timedelta(days=age)).date().isoformat()
+        content = f"# {day}\n#### first\nfirst-{age}\n#### second\nretained-evidence-{age}\n"
+        if tier is not None:
+            with tier.db:
+                tier._write_history(day, content)
+            original[day] = content
+        else:
+            path = history / f"{day}.md"
+            path.write_text(content, encoding="utf-8")
+            original[path] = content
+    store.rebuild_index()
+    rendered = store.read_recent_history(days=14)
+    assert "retained-evidence-0" in rendered
+    if version == 2:
+        assert all(f"retained-evidence-{age}" in rendered for age in (20, 100, 400, 2000))
+        assert store.prune_history(keep_days=1) == 0
+        assert {row["date"]: row["content"] for row in tier.read_history_entries()} == original
+        assert not history.exists()
+        assert store.search("retained-evidence-2000")
+        reopened = MemoryStore(workspace=tmp_path, memory_version=2, vector_store=tier)
+        assert reopened.read_recent_history() == rendered
+        assert "decaying" not in reopened.get_context()
+    else:
+        assert "first-20" in rendered and "retained-evidence-20" not in rendered
+        assert "retained-evidence-100" not in rendered
+        assert "first-400" not in rendered and "first-2000" not in rendered
+        assert store.prune_history(keep_days=365) == 2
+
+
+def test_prepared_v2_tier_invalidates_old_decayed_history_cache(tmp_path, request):
+    store = MemoryStore(workspace=tmp_path)
+    store.init()
+    path = tmp_path / "memory" / "history" / "2000-01-01.md"
+    path.write_text("# 2000-01-01\n#### note\nOriginal durable evidence.", encoding="utf-8")
+    assert store.read_recent_history() == ""
+    from kiro_crew.vector_memory import create_member_database, open_member_database
+
+    database = tmp_path / "memory_stores" / "member-alice" / "memory.db"
+    create_member_database(database, member_id="alice", store_id="member-alice")
+    tier = open_member_database(database, member_id="alice", store_id="member-alice")
+    request.addfinalizer(tier.close)
+    with tier.db:
+        tier._write_history("2000-01-01", "SQLite durable evidence.")
+    store.vector_store = tier
+    assert store.read_recent_history() == "SQLite durable evidence."
+    assert "Original durable evidence." not in store.read_recent_history()
+    store.vector_store = None
+    with pytest.raises(RuntimeError, match="Member memory database is unavailable"):
+        store.read_recent_history()
+    assert store.prune_history(keep_days=1) == 0
+    assert path.read_text(encoding="utf-8") == "# 2000-01-01\n#### note\nOriginal durable evidence."
+
+
 class TestFtsErrorPaths:
     """Every FTS entry point swallows a sqlite failure instead of propagating."""
 

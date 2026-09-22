@@ -32,7 +32,7 @@ import {
   type GraphNode, type NodeState, type FrontierItem,
 } from '../lib/deps'
 import { i18nT } from '../../../i18n/t'
-import { splitOnPlaceholder } from '../../crew-companion/splitOnPlaceholder'
+import { splitOnPlaceholder } from '../../../lib/splitOnPlaceholder'
 
 /** The theme token a node state paints with. `open`/`done` are drawn muted. */
 function stateColor(state: NodeState): string {
@@ -239,7 +239,7 @@ export default function GraphView() {
               onKeyDown={(e) => { if (e.key === 'Enter') onJump((e.target as HTMLInputElement).value) }}
               placeholder={i18nT('apps.issueRadar.views.graphView.jump_placeholder')}
               aria-label={i18nT('apps.issueRadar.views.graphView.jump_label')}
-              className="w-40 md:w-52 bg-card border border-border-strong text-text px-2.5 py-1 rounded-sm text-[11px] focus:outline-none focus:border-accent"
+              className="w-40 md:w-52 bg-card border border-border-strong text-text px-2.5 py-1 rounded-sm text-[11px] focus:outline-hidden focus:border-accent"
             />
           </label>
           <datalist id="ir-graph-open-items">

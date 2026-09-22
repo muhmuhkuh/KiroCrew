@@ -4,7 +4,7 @@ import { renderWithProviders } from '../../test/helpers'
 import { i18nT } from '../../i18n/t'
 import { fmtBytes } from '../../i18n/format'
 import type {
-  DriveStatus, DriveUsage, DriveSearchHit, DriveListing, LibraryResponse, BackupStatus, SharesResponse, Share,
+  DriveStatus, DriveUsage, DriveSearchHit, DriveListing, LibraryResponse, BackupStatus, RemoteBackup, SharesResponse, Share,
 } from './types'
 
 /* The sections read only through the api client; mocking it keeps every case
@@ -39,7 +39,9 @@ vi.mock('./api', async () => {
       backup: vi.fn(),
       backupRun: vi.fn(),
       backupNightly: vi.fn(),
+      backupNightlySessions: vi.fn(),
       backupRestore: vi.fn(),
+      installLabel: vi.fn(),
     },
   }
 })
@@ -92,7 +94,15 @@ const driveExists: Extract<DriveStatus, { exists: true }> = {
 }
 
 const emptyLibrary: LibraryResponse = { artifacts: [] }
-const emptyBackup: BackupStatus = { nightly: false, runs: {}, remote: { snapshot: [], sessions: [] } }
+const INSTALL_ID = 'a'.repeat(32)
+/** An empty remote half in the new shape: no archives, no co-tenants. */
+const emptyRemote = { snapshot: [], sessions: [], installs: [], others: 0, truncated: false, max: 8 }
+const emptyBackup: BackupStatus = {
+  nightly: false,
+  runs: {},
+  install: { id: INSTALL_ID, label: 'This Mac' },
+  remote: emptyRemote,
+}
 const noShares: SharesResponse = { shares: [] }
 
 function stubDrivePresent() {
@@ -176,6 +186,8 @@ async function chooseFromMenu(trigger: HTMLElement, itemTestId: string) {
   fireEvent.keyDown(trigger, { key: 'Enter' })
   fireEvent.click(await screen.findByTestId(itemTestId))
 }
+
+const BLOCKED_HOST_KEY = 'apps.awsControl.console.backup_nightly_sessions_blocked_host'
 
 describe('DrivePage sections', () => {
   it('mints a share link and shows the URL exactly once in the dialog', async () => {
@@ -2277,7 +2289,8 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     vi.mocked(awsControlApi.backup).mockResolvedValue({
       nightly: false,
       runs: { snapshot: { key: 'snap-1', bytes: 1024, at: '2026-08-24T00:00:00Z' } },
-      remote: { snapshot: [], sessions: [] },
+      install: { id: INSTALL_ID, label: 'This Mac' },
+      remote: emptyRemote,
     })
     vi.mocked(awsControlApi.backupRun).mockResolvedValue({
       started: true, kind: 'snapshot', runId: 'a'.repeat(32),
@@ -2300,18 +2313,23 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     await waitFor(() => expect(awsControlApi.backupNightly).toHaveBeenCalledWith(ACCOUNT_ID, true))
   })
 
-  it('discloses the stored-backups archive and restores a file, showing the staged path', async () => {
+  it('discloses the stored-backups archive and restores a self-owned file, showing the staged path', async () => {
     stubDrivePresent()
     vi.mocked(awsControlApi.backup).mockResolvedValue({
       nightly: true,
       runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
       remote: {
-        snapshot: [{ key: 'backup/snapshot/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z' }],
+        snapshot: [{ key: 'snapshots/' + INSTALL_ID + '/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z', install: INSTALL_ID, origin: 'self' }],
         sessions: [],
+        installs: [{ id: INSTALL_ID, label: 'This Mac', origin: 'self' }],
+        others: 0,
+        truncated: false,
+        max: 8,
       },
     })
     vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
-      downloaded: true, path: '/home/u/.kiro/restore/2026-08-24', bytes: 4096,
+      downloaded: true, path: '/home/u/.kiro/restore/2026-08-24', bytes: 4096, origin: 'self', install: INSTALL_ID,
     })
 
     await renderDrive('backup')
@@ -2323,16 +2341,17 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     // The write-only-tier restore caveat renders alongside.
     expect(screen.getByTestId('backup-restore-caveat')).toBeTruthy()
 
-    // Restore stages the archive locally and echoes the landed path.
+    // A self-owned row restores at once, with no confirm and no foreignOk.
     fireEvent.click(within(archive).getByTestId('backup-restore'))
-    await waitFor(() => expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, 'backup/snapshot/2026-08-24.tar'))
+    expect(screen.queryByTestId('backup-restore-confirm')).toBeNull()
+    await waitFor(() => expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, 'snapshots/' + INSTALL_ID + '/2026-08-24.tar', undefined))
     expect(await screen.findByTestId('backup-restored')).toHaveTextContent('/home/u/.kiro/restore/2026-08-24')
   })
 
   it('shows the backup remote-error note when the archive could not be read', async () => {
     stubDrivePresent()
     vi.mocked(awsControlApi.backup).mockResolvedValue({
-      nightly: false, runs: {}, remote: null, remoteError: 'AccessDenied',
+      nightly: false, runs: {}, install: { id: INSTALL_ID, label: 'This Mac' }, remote: null, remoteError: 'AccessDenied',
     })
 
     await renderDrive('backup')
@@ -2378,6 +2397,403 @@ describe('DrivePage sections: backup, access, CLI drawer', () => {
     fireEvent.click(await screen.findByTestId('cli-drawer-toggle'))
     const body = await screen.findByTestId('cli-drawer-body')
     expect(body).toHaveTextContent('aws s3 ls s3://kirocrew-drive-abc123/artifacts/')
+  })
+})
+
+describe('DrivePage sections: per-install backup attribution', () => {
+  const OTHER_ID = 'b'.repeat(32)
+
+  /**
+   * A remote half carrying one archive per origin, and an install roster that
+   * gives the foreign install a label. `label` on the other row is chosen by the
+   * caller so the label vs id split can be exercised.
+   */
+  function remoteWith(opts?: { otherLabel?: string; others?: number; truncated?: boolean }): RemoteBackup {
+    return {
+      snapshot: [
+        { key: `snapshots/${INSTALL_ID}/self.tar`, size: 10, modified: '2026-09-01T00:00:00Z', install: INSTALL_ID, origin: 'self' },
+        { key: `snapshots/${OTHER_ID}/other.tar`, size: 10, modified: '2026-09-01T00:00:00Z', install: OTHER_ID, origin: 'other' },
+        { key: 'snapshots/legacy.tar', size: 10, modified: '2026-09-01T00:00:00Z', install: '', origin: 'legacy' },
+      ],
+      sessions: [],
+      installs: [
+        { id: INSTALL_ID, label: 'This Mac', origin: 'self' },
+        ...(opts?.otherLabel !== undefined ? [{ id: OTHER_ID, label: opts.otherLabel, origin: 'other' as const }] : []),
+      ],
+      others: opts?.others ?? 1,
+      truncated: opts?.truncated ?? false,
+      // Served by the backend rather than derived from `installs.length`, which
+      // counts THIS install too and would be off by one.
+      max: 8,
+    }
+  }
+
+  function stubBackup(remote: RemoteBackup, install = { id: INSTALL_ID, label: 'This Mac' }) {
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      nightly: false, runs: {}, install, remote,
+    } as BackupStatus)
+  }
+
+  async function openArchive() {
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-remote-toggle'))
+    return within(await screen.findByTestId('backup-archive'))
+  }
+
+  it('renders the self row as the install label and the self origin', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    // self row: the catalog's own self shape, with this install's label in it.
+    expect(rows[0].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self', { label: 'This Mac' }),
+    )
+  })
+
+  it('keeps the attribution caption on every row, not hidden below a viewport width', async () => {
+    // The caption is the one thing this whole change adds, so a narrow window
+    // must still show it -- it wraps to its own line, it does not disappear.
+    // jsdom has no layout, so this pins the CLASS rather than a measured width:
+    // a future `hidden`/`sm:inline` pair would silently remove it on a phone.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const captions = archive.getAllByTestId('backup-archive-origin')
+    expect(captions).toHaveLength(3)
+    for (const caption of captions) {
+      // The text is really there (not an empty node the layout would show).
+      expect(caption.textContent?.trim()).not.toBe('')
+      // And nothing hides it at a breakpoint.
+      expect(caption.className).not.toMatch(/\bhidden\b/)
+      expect(caption.className).not.toMatch(/\bsm:inline\b/)
+    }
+    // The self row's caption reads as this install, proving it is the real
+    // attribution and not a placeholder kept only to satisfy the class check.
+    expect(captions[0].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self', { label: 'This Mac' }),
+    )
+  })
+
+  it('renders a labelled foreign row with the quoted label, the other origin, and 8 hex', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    // other + label: the catalog quotes the label, because the string was written
+    // by whoever wrote the archive, and names the id beside it.
+    expect(rows[1].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_other', {
+        label: 'Alice laptop',
+        id: OTHER_ID.slice(0, 8),
+      }),
+    )
+    expect(rows[1].textContent).toContain('"Alice laptop"')
+  })
+
+  it('renders an unlabelled foreign row as the other origin and 8 hex, no quotes', async () => {
+    stubDrivePresent()
+    // No roster entry for the other install -> label falls back to the no-label form.
+    stubBackup(remoteWith())
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    expect(rows[1].textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_other_unnamed', {
+        id: OTHER_ID.slice(0, 8),
+      }),
+    )
+    expect(rows[1].textContent).not.toContain('"')
+  })
+
+  it('renders a legacy row as unknown origin', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-origin')
+    expect(rows[2].textContent).toBe(i18nT('apps.awsControl.console.backup_origin_unknown'))
+  })
+
+  it('refuses a foreign restore until confirmed, then sends foreignOk true', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'other', install: OTHER_ID,
+    })
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+
+    // The foreign row is the second one. Its Restore asks first -- nothing sent.
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore'))
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    const confirm = within(rows[1]).getByTestId('backup-restore-confirm')
+    // The confirm names the archive's owning id (first 8 hex), not its label.
+    expect(confirm.textContent).toContain(OTHER_ID.slice(0, 8))
+
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, `snapshots/${OTHER_ID}/other.tar`, true),
+    )
+  })
+
+  it('confirms a legacy restore, then sends the override like every unproven row', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'legacy', install: '',
+    })
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+
+    // The legacy row is the third. It asks first...
+    fireEvent.click(within(rows[2]).getByTestId('backup-restore'))
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    expect(within(rows[2]).getByTestId('backup-restore-confirm').textContent).toContain(
+      i18nT('apps.awsControl.console.backup_restore_unknown_confirm'),
+    )
+
+    // ...and confirming sends the override. The backend refuses every origin it
+    // cannot PROVE is this install's own, and an archive with no id has an unknown
+    // author -- "unknown" includes "somebody else's".
+    fireEvent.click(within(rows[2]).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, 'snapshots/legacy.tar', true),
+    )
+  })
+
+  /**
+   * An archive under THIS install's own prefix but with no local upload record.
+   *
+   * The prefix is a folder name any bucket writer can create, so a match on it
+   * proves nothing. Such a row is `unverified`, not `self`: it renders the
+   * unverified attribution and confirms before it downloads, exactly like a
+   * legacy archive -- and, like legacy, it then sends the override, because the
+   * backend refuses every origin it cannot prove is this install's own.
+   */
+  const unverifiedRemote: RemoteBackup = {
+    snapshot: [
+      { key: `snapshots/${INSTALL_ID}/planted.tar`, size: 10, modified: '2026-09-01T00:00:00Z', install: INSTALL_ID, origin: 'unverified' },
+    ],
+    sessions: [],
+    installs: [{ id: INSTALL_ID, label: 'This Mac', origin: 'self' }],
+    others: 0,
+    truncated: false,
+    max: 8,
+  }
+
+  it('renders an unverified row as the unverified attribution, not the self one', async () => {
+    stubDrivePresent()
+    stubBackup(unverifiedRemote)
+    const archive = await openArchive()
+    const origin = archive.getByTestId('backup-archive-origin')
+    expect(origin.textContent).toBe(
+      i18nT('apps.awsControl.console.backup_attribution_unverified'),
+    )
+    // It must NOT be dressed as this install's own archive, named or unnamed.
+    expect(origin.textContent).not.toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self', { label: 'This Mac' }),
+    )
+    expect(origin.textContent).not.toBe(
+      i18nT('apps.awsControl.console.backup_attribution_self_unnamed'),
+    )
+  })
+
+  it('asks before restoring an unverified row, then sends the override', async () => {
+    stubDrivePresent()
+    stubBackup(unverifiedRemote)
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'unverified', install: INSTALL_ID,
+    })
+    const archive = await openArchive()
+    const row = archive.getByTestId('backup-archive-row')
+
+    // Unlike a self row, it does not restore at once: it asks first.
+    fireEvent.click(within(row).getByTestId('backup-restore'))
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    expect(within(row).getByTestId('backup-restore-confirm').textContent).toContain(
+      i18nT('apps.awsControl.console.backup_restore_unverified_confirm'),
+    )
+
+    // Confirming sends the override. Sitting under this install's own prefix is
+    // not proof of anything -- a prefix is a folder name any bucket writer can
+    // create, which is exactly what this origin exists to say.
+    fireEvent.click(within(row).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, `snapshots/${INSTALL_ID}/planted.tar`, true),
+    )
+  })
+
+  it('does not consult the label when gating a restore: a labelled foreign row still confirms', async () => {
+    // The label is written by another install into a shared bucket, so it must
+    // never decide what a restore may do. A foreign row with a friendly label is
+    // still gated on its origin: it asks first and sends foreignOk true.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Totally Trusted' }))
+    vi.mocked(awsControlApi.backupRestore).mockResolvedValue({
+      downloaded: true, path: '/tmp/x', bytes: 10, origin: 'other', install: OTHER_ID,
+    })
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore'))
+    // A label, however friendly, does not skip the confirm.
+    expect(within(rows[1]).getByTestId('backup-restore-confirm')).toBeTruthy()
+    expect(awsControlApi.backupRestore).not.toHaveBeenCalled()
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore-confirm-yes'))
+    await waitFor(() =>
+      expect(awsControlApi.backupRestore).toHaveBeenCalledWith(ACCOUNT_ID, `snapshots/${OTHER_ID}/other.tar`, true),
+    )
+  })
+
+  it('surfaces the foreign-refused sentence when the mutation still returns the refusal code', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.backupRestore).mockRejectedValue(
+      new AwsControlError('foreign_install_archive', 409),
+    )
+    const archive = await openArchive()
+    const rows = archive.getAllByTestId('backup-archive-row')
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore'))
+    fireEvent.click(within(rows[1]).getByTestId('backup-restore-confirm-yes'))
+
+    expect(await screen.findByTestId('backup-restore-error')).toHaveTextContent(
+      i18nT('apps.awsControl.console.backup_restore_foreign_refused'),
+    )
+  })
+
+  it('shows the shared-drive notes and the truncation note when other installs exist', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop', others: 3, truncated: true }))
+    await openArchive()
+    expect(screen.getByTestId('backup-shared-note')).toBeTruthy()
+    expect(screen.getByTestId('backup-others-on-drive')).toBeTruthy()
+    expect(screen.getByTestId('backup-others-truncated')).toBeTruthy()
+  })
+
+  it('the others-toggle drives `others` on the backup request and re-queries', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    await renderDrive('backup')
+    fireEvent.click(await screen.findByTestId('backup-remote-toggle'))
+    await screen.findByTestId('backup-archive')
+
+    // Before the toggle, others is off in the request.
+    expect(awsControlApi.backup).toHaveBeenCalledWith(ACCOUNT_ID, { remote: true, others: false })
+    vi.mocked(awsControlApi.backup).mockClear()
+
+    const toggle = within(screen.getByTestId('backup-others-toggle')).getByRole('switch')
+    fireEvent.click(toggle)
+    await waitFor(() =>
+      expect(awsControlApi.backup).toHaveBeenCalledWith(ACCOUNT_ID, { remote: true, others: true }),
+    )
+  })
+
+  it('renames this install through the api and does not touch the label until it succeeds', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.installLabel).mockResolvedValue({
+      install: { id: INSTALL_ID, label: 'Renamed Mac' },
+    })
+    await renderDrive('backup')
+
+    const row = await screen.findByTestId('backup-install')
+    expect(within(row).getByTestId('backup-install-label')).toHaveTextContent('This Mac')
+    fireEvent.click(within(row).getByTestId('backup-install-rename'))
+    const input = await screen.findByTestId('backup-install-name')
+    fireEvent.change(input, { target: { value: 'Renamed Mac' } })
+    fireEvent.click(screen.getByTestId('backup-install-save'))
+    await waitFor(() => expect(awsControlApi.installLabel).toHaveBeenCalledWith('Renamed Mac'))
+  })
+
+  it('Enter saves the install name and Escape abandons it, like the drive rename editors', async () => {
+    // Three rename editors on this page commit on Enter and close on Escape. A
+    // reader habituated by those presses Enter here, so a name lost to a key that
+    // works everywhere else on the page is the worst version of the divergence.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.installLabel).mockResolvedValue({
+      install: { id: INSTALL_ID, label: 'Typed name' },
+    })
+    await renderDrive('backup')
+
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    const input = await screen.findByTestId('backup-install-name')
+    fireEvent.change(input, { target: { value: 'Typed name' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(awsControlApi.installLabel).toHaveBeenCalledWith('Typed name'))
+
+    vi.mocked(awsControlApi.installLabel).mockClear()
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    const reopened = await screen.findByTestId('backup-install-name')
+    fireEvent.change(reopened, { target: { value: 'abandoned' } })
+    fireEvent.keyDown(reopened, { key: 'Escape' })
+    await waitFor(() =>
+      expect(screen.queryByTestId('backup-install-name')).not.toBeInTheDocument(),
+    )
+    expect(awsControlApi.installLabel).not.toHaveBeenCalled()
+  })
+
+  it('connects the co-tenant count to the toggle when this install has no rows of its own', async () => {
+    // The replacement-machine case this feature exists for: a fresh install owns
+    // nothing, so every archive on the drive is behind the off-by-default toggle. A
+    // count above an empty list is the failure -- the reader is told others are here
+    // and given nothing that reveals them.
+    stubBackup({ ...remoteWith(), snapshot: [], sessions: [], others: 1 })
+    const card = await openArchive()
+
+    expect(card.getByTestId('backup-others-on-drive')).toBeInTheDocument()
+    expect(card.getByTestId('backup-no-own-archives')).toHaveTextContent(
+      i18nT('apps.awsControl.console.backup_none_from_this_install'),
+    )
+  })
+
+  it('drops the no-rows line once this install has archives of its own', async () => {
+    stubBackup(remoteWith())
+    const card = await openArchive()
+
+    expect(card.getAllByTestId('backup-archive-row').length).toBeGreaterThan(0)
+    expect(card.queryByTestId('backup-no-own-archives')).not.toBeInTheDocument()
+  })
+
+  it('drops the no-rows line when the toggle is already on, since it would name a done action', async () => {
+    // The line's sentence is an instruction to use the toggle. With the toggle on
+    // there is nothing left to instruct, so repeating it would read as the control
+    // having failed.
+    stubBackup({ ...remoteWith(), snapshot: [], sessions: [], others: 1 })
+    const card = await openArchive()
+    expect(card.getByTestId('backup-no-own-archives')).toBeInTheDocument()
+
+    fireEvent.click(within(card.getByTestId('backup-others-toggle')).getByRole('switch'))
+    await waitFor(() =>
+      expect(card.queryByTestId('backup-no-own-archives')).not.toBeInTheDocument(),
+    )
+  })
+
+  it('the rename commit button reads Save name, not Rename', async () => {
+    // Rename OPENS the editor; the commit button SAVES it. One word for both was
+    // the UX defect this fixes, so the commit control must not reuse the rename
+    // label.
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    await renderDrive('backup')
+
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    const save = await screen.findByTestId('backup-install-save')
+    expect(save).toHaveTextContent(i18nT('apps.awsControl.console.backup_install_save'))
+    expect(save).not.toHaveTextContent(i18nT('apps.awsControl.console.backup_install_rename'))
+  })
+
+  it('reports a failed rename and leaves the stored name in place', async () => {
+    stubDrivePresent()
+    stubBackup(remoteWith({ otherLabel: 'Alice laptop' }))
+    vi.mocked(awsControlApi.installLabel).mockRejectedValue(new AwsControlError('invalid_label', 400))
+    await renderDrive('backup')
+
+    fireEvent.click(await screen.findByTestId('backup-install-rename'))
+    fireEvent.change(await screen.findByTestId('backup-install-name'), { target: { value: '' } })
+    fireEvent.click(screen.getByTestId('backup-install-save'))
+    expect(await screen.findByTestId('backup-install-error')).toHaveTextContent(
+      i18nT('apps.awsControl.console.backup_install_rename_failed'),
+    )
   })
 })
 
@@ -2781,9 +3197,215 @@ describe('DrivePage sections: error surfaces reach the agent', () => {
     const toggle = within(await screen.findByTestId('backup-nightly')).getByRole('switch')
     fireEvent.click(toggle)
     const notice = await screen.findByTestId('backup-nightly-error')
-    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.backup_nightly_failed'))
+    expect(notice.textContent).toContain(i18nT('apps.awsControl.console.backup_nightly'))
     // Adjacent to the row it explains: the notice is the nightly row's next sibling.
     expect(screen.getByTestId('backup-nightly').nextElementSibling).toContainElement(notice)
+  })
+
+  it('the transcript switch is its own grant: off while the snapshot nightly is on', async () => {
+    // The state most installs are in, and the one a single field could not
+    // render: memory is backed up nightly and conversations are not.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup, nightly: true, nightlySessions: false,
+    })
+    vi.mocked(awsControlApi.backupNightlySessions).mockResolvedValue({ nightlySessions: true } as never)
+    await renderDrive('backup')
+
+    const snapshotToggle = within(await screen.findByTestId('backup-nightly')).getByRole('switch')
+    const sessionsToggle = within(screen.getByTestId('backup-nightly-sessions')).getByRole('switch')
+    expect(snapshotToggle.getAttribute('aria-checked')).toBe('true')
+    expect(sessionsToggle.getAttribute('aria-checked')).toBe('false')
+
+    // Flipping it reaches its OWN endpoint, and never the snapshot one.
+    fireEvent.click(sessionsToggle)
+    await waitFor(() =>
+      expect(awsControlApi.backupNightlySessions).toHaveBeenCalledWith(ACCOUNT_ID, true),
+    )
+    expect(awsControlApi.backupNightly).not.toHaveBeenCalled()
+  })
+
+  it('a backend that does not report the transcript grant renders it off', async () => {
+    // The field is absent from an older backend. Read as undefined it must show
+    // OFF, not an indeterminate switch that a click could flip in the dark: a
+    // page that cannot say whether transcripts are being uploaded must not
+    // imply they are not by accident.
+    const { nightlySessions: _omitted, ...withoutField } = { ...emptyBackup, nightlySessions: false }
+    vi.mocked(awsControlApi.backup).mockResolvedValue(withoutField)
+    await renderDrive('backup')
+
+    const sessionsToggle = within(await screen.findByTestId('backup-nightly-sessions')).getByRole('switch')
+    expect(sessionsToggle.getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('a refused transcript toggle says so under its own row', async () => {
+    // Its own notice under its own row. Sharing the snapshot row's notice would
+    // put the explanation under a switch that did not move.
+    vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
+    vi.mocked(awsControlApi.backupNightlySessions).mockRejectedValue(new AwsControlError('restricted_session', 403))
+    await renderDrive('backup')
+
+    const toggle = within(await screen.findByTestId('backup-nightly-sessions')).getByRole('switch')
+    fireEvent.click(toggle)
+    const notice = await screen.findByTestId('backup-nightly-sessions-error')
+    expect(screen.getByTestId('backup-nightly-sessions').nextElementSibling).toContainElement(notice)
+    // Names the transcript setting rather than reusing the snapshot row's copy.
+    // With two nightly switches on the page, "the nightly backup setting" cannot
+    // say which one it failed to change.
+    expect(notice.textContent).toContain(i18nT('apps.awsControl.console.backup_nightly_sessions'))
+  })
+
+  it('a grant that cannot run here says so next to the switch', async () => {
+    // The state a surface reading only the grant would show as healthy: the owner
+    // asked for nightly transcripts, the host cannot produce them, and without
+    // this the console claims the backup is on while nothing is ever uploaded.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightlySessions: true,
+      nightlySessionsBlocked: 'host_unsupported',
+    } as never)
+    await renderDrive('backup')
+
+    const row = await screen.findByTestId('backup-nightly-sessions')
+    const blocked = await screen.findByTestId('backup-nightly-sessions-blocked')
+    expect(blocked.textContent).toContain(i18nT(BLOCKED_HOST_KEY))
+    // The switch still reads back as the owner set it. Flipping it to reflect
+    // the host would answer a question they did not ask.
+    expect(within(row).getByRole('switch').getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('no blocked notice while the grant is off', async () => {
+    // Nothing is being withheld until the owner asks for it, and the hint above
+    // the switch already says what it would do.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightlySessions: false,
+      nightlySessionsBlocked: 'host_unsupported',
+    } as never)
+    await renderDrive('backup')
+    await screen.findByTestId('backup-nightly-sessions')
+    expect(screen.queryByTestId('backup-nightly-sessions-blocked')).toBeNull()
+  })
+
+  it('no blocked notice when the grant is on and nothing is in the way', async () => {
+    // The other half. Without this pair the assertion above is satisfied by a
+    // notice that renders unconditionally, which would tell every healthy install
+    // its transcripts are not being backed up.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup, nightlySessions: true, nightlySessionsBlocked: null,
+    } as never)
+    await renderDrive('backup')
+    await screen.findByTestId('backup-nightly-sessions')
+    expect(screen.queryByTestId('backup-nightly-sessions-blocked')).toBeNull()
+  })
+
+  it('the consent hint states the same scope the archive row does', async () => {
+    // The switch authorizes the row above it, so the hint has to say what that row
+    // says the payload is: every session under this Kiro home, CLI replay logs
+    // included, not only chats started here. A hint that says less asks for a yes
+    // to more than it states, which is the one decision this feature exists for.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup, nightlySessions: false,
+    } as never)
+    await renderDrive('backup')
+
+    const row = await screen.findByTestId('backup-nightly-sessions')
+    expect(row.textContent).toContain(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_hint'),
+    )
+    expect(row.textContent).toContain(i18nT('apps.awsControl.console.backup_sessions_scope'))
+    // And where it goes, naming the manual button rather than quoting it, so the
+    // sentence cannot point at a label that has since been renamed.
+    expect(row.textContent).toContain(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_destination', {
+        button: i18nT('apps.awsControl.console.backup_run_now'),
+      }),
+    )
+  })
+
+  it('a host that cannot make the archive gets no pressable manual run either', async () => {
+    // The notice says the schedule produces nothing here; the manual run answers
+    // the same capability question and refuses with 501, so leaving the button
+    // pressable offers a click that fails.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightlySessions: true,
+      nightlySessionsBlocked: 'host_unsupported',
+    } as never)
+    await renderDrive('backup')
+    expect((await screen.findByTestId('backup-run-sessions')).hasAttribute('disabled')).toBe(true)
+    // The snapshot row is untouched: its payload is producible on every platform.
+    expect(screen.getByTestId('backup-run-snapshot').hasAttribute('disabled')).toBe(false)
+  })
+
+  it('a host that CAN make the archive keeps the manual run pressable', async () => {
+    // The other direction, so the disable cannot be one that fires always.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup, nightlySessions: true, nightlySessionsBlocked: null,
+    } as never)
+    await renderDrive('backup')
+    expect((await screen.findByTestId('backup-run-sessions')).hasAttribute('disabled')).toBe(false)
+  })
+
+  it('a grant on an account the schedule does not visit says so, and offers the manual run', async () => {
+    // The grant is settable on any account while the nightly runs for one, so
+    // this is the state where the switch is genuinely on and genuinely idle. The
+    // manual run IS per-account, so the next step is a real one here.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightlySessions: true,
+      nightlySessionsBlocked: 'other_account',
+    } as never)
+    await renderDrive('backup')
+
+    const blocked = await screen.findByTestId('backup-nightly-sessions-blocked')
+    expect(blocked.textContent).toContain(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_blocked_other_account'),
+    )
+    expect(blocked.textContent).toContain(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_blocked_next'),
+    )
+  })
+
+  it('the redaction hold names what the manual run does to the archive', async () => {
+    // The nightly stands down here because the sessions archive has no redaction
+    // seam, and the manual run uploads those same bytes unredacted. An operator who
+    // asked for redaction is the LAST one who should learn that by pressing it, so
+    // this state gets its own next step and must not fall back to the generic line.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightlySessions: true,
+      nightlySessionsBlocked: 'redaction_on',
+    } as never)
+    await renderDrive('backup')
+
+    const blocked = await screen.findByTestId('backup-nightly-sessions-blocked')
+    expect(blocked.textContent).toContain(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_blocked_redaction'),
+    )
+    expect(blocked.textContent).toContain(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_blocked_next_redaction'),
+    )
+    expect(blocked.textContent).not.toBe(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_blocked_redaction'),
+    )
+  })
+
+  it('a host that cannot produce the archive is NOT offered the manual run', async () => {
+    // The manual run answers the capability question the same way and refuses, so
+    // offering it here names a click that fails. Paired with the test above, which
+    // is what stops this being satisfied by dropping the next step everywhere.
+    vi.mocked(awsControlApi.backup).mockResolvedValue({
+      ...emptyBackup,
+      nightlySessions: true,
+      nightlySessionsBlocked: 'host_unsupported',
+    } as never)
+    await renderDrive('backup')
+
+    const blocked = await screen.findByTestId('backup-nightly-sessions-blocked')
+    expect(blocked.textContent).toContain(i18nT(BLOCKED_HOST_KEY))
+    expect(blocked.textContent).not.toContain(
+      i18nT('apps.awsControl.console.backup_nightly_sessions_blocked_next'),
+    )
   })
 
   it('a rejected folder name is a notice WITHOUT the hand-off — nothing reached AWS', async () => {
@@ -2804,9 +3426,14 @@ describe('DrivePage sections: error surfaces reach the agent', () => {
     vi.mocked(awsControlApi.backup).mockResolvedValue({
       nightly: true,
       runs: {},
+      install: { id: INSTALL_ID, label: 'This Mac' },
       remote: {
-        snapshot: [{ key: 'backup/snapshot/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z' }],
+        snapshot: [{ key: 'snapshots/' + INSTALL_ID + '/2026-08-24.tar', size: 4096, modified: '2026-08-24T00:00:00Z', install: INSTALL_ID, origin: 'self' }],
         sessions: [],
+        installs: [{ id: INSTALL_ID, label: 'This Mac', origin: 'self' }],
+        others: 0,
+        truncated: false,
+        max: 8,
       },
     })
     vi.mocked(awsControlApi.backupRestore).mockRejectedValue(new AwsControlError('aws_call_failed', 502))
@@ -3577,7 +4204,7 @@ describe('DrivePage sections: preview, rename, search', () => {
     // The menu trigger unmounted with the search view; the row takes focus so
     // keyboard and assistive-technology users land on the hit, not on <body>.
     expect(marked[0]).toHaveAttribute('tabindex', '-1')
-    expect(document.activeElement).toBe(marked[0])
+    await waitFor(() => expect(document.activeElement).toBe(marked[0]))
   })
 
   it('a hit past the first listing page is paged in until its row mounts', async () => {
@@ -4177,11 +4804,15 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
     // Pointer open: the button is NOT focused first, exactly as Safari leaves it.
     fireEvent.pointerDown(trigger, { pointerType: 'mouse', button: 0, ctrlKey: false })
     fireEvent.click(await screen.findByTestId('drive-share'))
-    await screen.findByTestId('share-dialog')
+    const dialog = await screen.findByTestId('share-dialog')
+    // Mounting the dialog precedes useDialogFocusTrap's passive effects:
+    // wait for focus entry before sending Escape to its keydown listener.
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true))
 
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
-    expect(document.activeElement).toBe(trigger)
+    // The opener owns focus restoration, not the previously focused button.
+    await waitFor(() => expect(document.activeElement).toBe(trigger))
   })
 
   it('the share dialog closes on Escape and returns focus to the row menu, but not mid-mint', async () => {
@@ -4225,7 +4856,9 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
     // Focus went back to where the reader was, not to <body>.
-    expect(document.activeElement).toBe(trigger)
+    // Focus returns in a passive effect one tick after the dialog unmounts, so
+    // a synchronous read races it under shard load; wait for it to settle.
+    await waitFor(() => expect(document.activeElement).toBe(trigger))
   })
 
   it('the deleted-count line is a real plural, not a parenthetical', async () => {
@@ -4265,7 +4898,7 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
     toggle.focus()
     fireEvent.click(toggle)
     const input = await screen.findByTestId('drive-folder-name')
-    expect(document.activeElement).toBe(input)
+    await waitFor(() => expect(document.activeElement).toBe(input))
 
     fireEvent.keyDown(input, { key: 'Escape' })
     // The disclosure unmounted the input and both buttons; focus must not fall
@@ -4343,6 +4976,8 @@ describe('DrivePage sections: keyboard paths and honest copy', () => {
 
     fireEvent.keyDown(document, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByTestId('share-dialog')).toBeNull())
-    expect(document.activeElement).toBe(trigger)
+    // Focus returns in a passive effect one tick after the dialog unmounts, so
+    // a synchronous read races it under shard load; wait for it to settle.
+    await waitFor(() => expect(document.activeElement).toBe(trigger))
   })
 })

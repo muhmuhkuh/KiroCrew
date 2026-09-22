@@ -66,6 +66,63 @@ class _FakeSessions:
         return self._session
 
 
+class _ResettingSessions(_FakeSessions):
+    """A registry whose owning slot is RESET while the background call runs.
+
+    ``get_provider`` answers the pre-reset unit the first time and the successor
+    every time after, which is what a slot reset, agent switch or compaction does:
+    the successor cold-starts a new ACP session id.
+    """
+
+    def __init__(self, session, key: str, before: str, after: str) -> None:
+        super().__init__(session)
+        self._key = key
+        self._answers = [before]
+        self._after = after
+
+    def get_provider(self, key: str):
+        if key != self._key:
+            return None
+        served = self._answers.pop(0) if self._answers else self._after
+        return SimpleNamespace(session_id=served)
+
+
+@pytest.mark.asyncio
+async def test_the_background_owner_is_pinned_before_the_call_not_after_it(monkeypatch):
+    """The spend must stay with the session that ordered the work.
+
+    ``run_bg_oneliner`` writes its ledger entry in the teardown, and the resolver
+    answers which unit a slot's work is landing in NOW -- so resolving there would
+    file this call's cost against a successor session that never incurred it,
+    silently, in an append-only file. The registry double flips its answer between
+    the two moments, so only a pre-call resolution can pass.
+    """
+    from kiro_crew.crew_log import emit
+
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+    recorded: list[str] = []
+    monkeypatch.setattr(
+        emit,
+        "on_background_completed",
+        lambda session_id, **_kw: recorded.append(session_id),
+    )
+    session = _FakeSession(
+        [
+            SimpleNamespace(kind=EVENT_TEXT_CHUNK, text="hi"),
+            SimpleNamespace(kind=EVENT_COMPLETE, text=""),
+        ],
+        turn_credits=1.0,
+    )
+    sessions = _ResettingSessions(session, "dashboard:chat-7", "owner-sid", "successor-sid")
+    await run_bg_oneliner(
+        sessions,
+        "prompt",
+        crew_log_kind="title",
+        crew_log_session_key="dashboard:chat-7",
+    )
+    assert recorded == ["owner-sid"], "the entry must name the unit that ordered the work"
+
+
 @pytest.mark.asyncio
 async def test_accumulates_text_and_sets_model_and_destroys():
     sess = _FakeSession(
@@ -469,7 +526,7 @@ async def test_the_turn_duration_reaches_the_row():
 
 class _ClaudeSeamStats:
     """Mirrors AcpPromptStats on the claude seam: ``credits`` stays 0 and the
-    billing dimensions travel through ``to_turn_usage()`` (the post-#6757
+    billing dimensions travel through ``to_turn_usage()`` (the
     stats -> event contract that ``_attempt_usage`` duck-types on)."""
 
     def __init__(self, usage: TurnUsage) -> None:
@@ -496,7 +553,7 @@ class _ClaudeSeamSession(_FakeSession):
 @pytest.mark.asyncio
 async def test_a_cost_only_claude_seam_turn_writes_a_row_with_cost_and_cache_intact():
     """On the claude seam a background turn can bill ``cost_usd`` with credits
-    AND both token counts at zero -- the #6758 shape. The row must be written
+    AND both token counts at zero -- the cost-with-zero-tokens shape. The row must be written
     (mutation guard on the gate's ``cost_usd`` conjunct) and must carry the
     cost and cache fields through ``_attempt_usage``'s ``to_turn_usage`` path
     (mutation guard on the duck-typed converter: the credits-only fallback

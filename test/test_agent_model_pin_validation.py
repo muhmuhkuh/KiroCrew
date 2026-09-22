@@ -25,6 +25,7 @@ def _owner_caller(monkeypatch):
         "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
+    pass  # Member routing does not depend on OS isolation.
 
 
 class TestAcpIdCorrection:

@@ -34,6 +34,22 @@ import copy
 import logging
 import threading
 
+# Top-level config.json sections a BUILTIN APP owns and reads from the file
+# directly, with no modelled field in this core. Not in _KNOWN_CONFIG_SECTIONS
+# (no dataclass parses them) and not in CONFIG_RESERVED_TOP_KEYS (they must
+# survive save(), not be dropped by it): the loader already captures them into
+# _extra_sections and re-emits them like any other unmodelled section. The one
+# thing that sets them apart is that they are NOT unrecognized -- the product
+# itself tells the operator to write them -- so the unrecognized-top-level-key
+# warning below skips them, or every launch scolds the user for following Kiro
+# Crew's own instructions. Private to this module because that warning is the
+# only consumer; a second member is the point at which this wants to become an
+# app-declared registration rather than a longer literal.
+#   * dev_fleet -- ``dev_fleet.repo_path`` names the Kiro Crew checkout Dev Fleet
+#     manages; read by apps/builtins/dev_fleet/repository.py::_load_dev_fleet_cfg
+#     and prescribed by the dashboard's "no checkout found" banner.
+_APP_OWNED_TOP_KEYS: frozenset = frozenset({"dev_fleet"})
+
 try:
     import jsonschema
 
@@ -96,6 +112,16 @@ def _is_deprecated_path(schema: dict, dot_path: str) -> bool:
     return node.get("x-meta", {}).get("deprecated", False)
 
 
+def _holds_nothing(value: object) -> bool:
+    """True for a stored value with nothing in it: null, or an empty map/list/string.
+
+    Deliberately NOT plain falsiness: ``False`` and ``0`` are real settings an
+    operator chose, and a deprecated flag set to ``False`` still deserves the
+    deprecation notice.
+    """
+    return value is None or (isinstance(value, (dict, list, str)) and not value)
+
+
 def _get_help_text(schema: dict, dot_path: str) -> str:
     """Return the help text for the field at *dot_path*."""
     node = _lookup_schema_node(schema, dot_path)
@@ -143,8 +169,8 @@ def _actual_type_name(value: object) -> str:
 #:
 #: * ``publish`` (the section) and ``publish.allowed_destinations``: the
 #:   default is **open** (no restriction), so repairing a malformed narrowing
-#:   silently widens it to allow-all with no denial and no audit record
-#:   (#4057). The loader's recording coercion (``_coerced_section``) and the
+#:   silently widens it to allow-all with no denial and no audit record.
+#:   The loader's recording coercion (``_coerced_section``) and the
 #:   gate's fail-closed checks are the honest handlers — but they can only run
 #:   if validation leaves the evidence in place. Keeping the value also keeps
 #:   security behaviour identical whether or not ``jsonschema`` is installed
@@ -170,6 +196,10 @@ def _actual_type_name(value: object) -> str:
 #:   segments it is already past ``_apply_field_default``'s depth cap, so a
 #:   malformed list value is kept today.
 #:
+#: * ``memory``: new private provisioning defaults to enabled. Preserve an
+#:   unreadable section so the loader records its degradation and the creation
+#:   guard refuses instead of treating the operator's setting as absent.
+#:
 #: Exact-match only: this is a per-path judgment, not a subtree rule. The
 #: registry is only half of a fix — a preserved value changes nothing unless
 #: the loader RECORDS the degradation and a gate reads
@@ -181,6 +211,7 @@ _FAIL_CLOSED_PATHS = frozenset(
         "publish.allowed_destinations",
         "dashboard",
         "dashboard.tailscale",
+        "memory",
     }
 )
 
@@ -200,7 +231,7 @@ def _apply_field_default(data: dict, dot_path: str) -> bool:
     Values at a fail-closed path (see :data:`_FAIL_CLOSED_PATHS`) are never
     removed: repairing them to their open defaults silently widens a security
     narrowing, and the loader/gate pair downstream turns the preserved
-    malformed value into a recorded degradation and a denial instead (#4057).
+    malformed value into a recorded degradation and a denial instead.
     """
     if dot_path in _FAIL_CLOSED_PATHS:
         return False
@@ -285,6 +316,15 @@ class ConfigCache:
         self._lock = threading.Lock()
         # (fingerprint, deep-copyable validated data dict, opaque sidecar)
         self._entry: tuple[tuple, dict, dict] | None = None
+        # Monotonic invalidation token. A loader captures this before disk I/O;
+        # clear() advances it so that reader cannot publish a pre-write snapshot
+        # afterward even when a coarse filesystem reports the same fingerprint.
+        self._generation = 0
+
+    def generation(self) -> int:
+        """Return the current invalidation token for a prospective disk read."""
+        with self._lock:
+            return self._generation
 
     def get(self, fingerprint: tuple) -> dict | None:
         """Return a deep copy of the cached dict if *fingerprint* matches, else None.
@@ -317,33 +357,46 @@ class ConfigCache:
                 return copy.deepcopy(self._entry[1]), copy.deepcopy(self._entry[2])
         return None
 
-    def store(self, data: dict, fingerprint: tuple, sidecar: dict | None = None) -> None:
-        """Cache a deep copy of *data* (and *sidecar*) under *fingerprint*.
+    def store(
+        self,
+        data: dict,
+        fingerprint: tuple,
+        sidecar: dict | None = None,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """Cache *data* when no invalidation occurred since its disk read began.
 
         *fingerprint* MUST be the one captured BEFORE the files were read (by
-        ``load()``), not a fresh stat. If a write lands between the read and this
-        store, *fingerprint* describes the pre-write file, so it won't match the
-        post-write on-disk stat — the next ``load()`` misses and re-reads rather
-        than serving the stale content we just read. Re-statting here instead
-        would cache old content under the new file's fingerprint (a read->store
-        TOCTOU) and serve it as a false hit until the file changed again.
+        ``load()``), not a fresh stat. Normally a write changes that fingerprint,
+        so the next ``load()`` misses. A same-size replacement on a coarse-time
+        filesystem can remain indistinguishable, however; *expected_generation*
+        closes that gap. ``clear()`` advances the token, and a reader holding an
+        older token is refused rather than restoring stale data after the clear.
+
+        Returns whether the value was stored. Callers that do not perform disk
+        I/O may omit *expected_generation* and retain the original unconditional
+        cache-insertion behavior.
         """
         with self._lock:
+            if expected_generation is not None and expected_generation != self._generation:
+                return False
             self._entry = (fingerprint, copy.deepcopy(data), copy.deepcopy(sidecar or {}))
+            return True
 
     def clear(self) -> None:
-        """Drop the cached validated config (called after save()/write-back)."""
+        """Drop the cached config and invalidate every in-flight disk read."""
         with self._lock:
             self._entry = None
+            self._generation += 1
 
 
 # Process-global cache instance.
 _CONFIG_CACHE = ConfigCache()
-# Back-compat alias only: the cache lock used to be a module-level global of this
-# name. Exposed so any lingering `kiro_crew.config.loader._CONFIG_CACHE_LOCK`
-# reference keeps resolving. Do NOT acquire this externally — all locking is
-# internal to ConfigCache; this alias can be dropped once nothing references the
-# old module-level name.
+# Back-compat alias for callers still referencing the module-level global
+# `kiro_crew.config.loader._CONFIG_CACHE_LOCK`. Do NOT acquire this externally —
+# all locking is internal to ConfigCache; the alias can be dropped once nothing
+# references that name.
 _CONFIG_CACHE_LOCK = _CONFIG_CACHE._lock
 
 
@@ -369,14 +422,28 @@ def validate_config_data(data: dict) -> dict:
 
     # 1. Detect unrecognized top-level keys. The schema registry models only the
     # config's *sections*, so the keys save() stamps itself are not in it and
-    # must be excluded — otherwise every load of a config KiroCrew has ever
-    # saved warns about KiroCrew's own bookkeeping.
+    # must be excluded — otherwise every load of a config Kiro Crew has ever
+    # saved warns about Kiro Crew's own bookkeeping. A section a builtin app owns
+    # and reads from the file directly (_APP_OWNED_TOP_KEYS) is not in the
+    # registry either, and is excluded for the same reason: the product told the
+    # operator to write it. Excluded only in the shape the app reads -- a JSON
+    # object. The app's reader keeps only a dict (repository.py
+    # ``isinstance(raw.get("dev_fleet"), dict)``) and silently falls back to
+    # discovery on anything else, so a scalar ``dev_fleet: "/opt/kc"`` would
+    # otherwise lose the one warning that tells the operator it is being ignored.
     known_top_keys = {e.path for e in SCHEMA_REGISTRY if "." not in e.path and e.path != "*"}
-    unknown = sorted(set(data.keys()) - known_top_keys - CONFIG_RESERVED_TOP_KEYS)
+    app_owned_sections = {k for k in _APP_OWNED_TOP_KEYS if isinstance(data.get(k), dict)}
+    unknown = sorted(
+        set(data.keys()) - known_top_keys - CONFIG_RESERVED_TOP_KEYS - app_owned_sections
+    )
     if unknown:
         logger.warning("Config: unrecognized top-level keys: %s", ", ".join(unknown))
 
-    # 2. Detect deprecated fields and log warnings
+    # 2. Detect deprecated fields and log warnings. A deprecated key that holds
+    # nothing (an empty map/list/string, or null) carries nothing for the
+    # operator to migrate, so it is not announced: warning on bare presence would
+    # scold an install whose earlier build materialized the key's empty default
+    # into every save, which the operator never wrote and cannot act on.
     for entry in SCHEMA_REGISTRY:
         if not entry.deprecated:
             continue
@@ -390,7 +457,7 @@ def validate_config_data(data: dict) -> dict:
             else:
                 found = False
                 break
-        if found:
+        if found and not _holds_nothing(node):
             logger.warning(
                 "Config: deprecated field '%s': %s",
                 entry.path,

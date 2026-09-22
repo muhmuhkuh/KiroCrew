@@ -19,6 +19,17 @@ A typical flow:
 The dashboard provides a `/artifacts` library page for browse/search and a
 `/artifacts/<slug>` standalone view with a version dropdown.
 
+### Library scrolling
+
+Small galleries and single-column virtualized lists scroll with the page.
+A multi-column gallery with at least 30 entries fills the remaining page height
+when no discovery-capable provider is available. With an available discovery
+provider, the page keeps its scroll axis and the saved masonry uses a bounded
+60vh viewport. Chat documents and remote lists stay in normal page flow, so
+expanding a section cannot compress the toolbar or hide later provider rows.
+Provider capability selects the layout, not the result of a remote fetch.
+Loading, empty results, filtering, and read errors therefore keep the same mode.
+
 ## Storage Layout
 
 ```
@@ -70,6 +81,14 @@ store.merge_remote_comments(art.slug, "artifactory", remote_comments)
 The store is thread-safe. A module-level singleton is available via
 `get_default_store()`; pass an explicit `root` to `ArtifactStore(root=...)`
 for isolated test instances.
+
+`list()` returns newest first on a TOTAL order, `(updated_at, slug)` descending.
+The tie-break is load-bearing, not cosmetic: `updated_at` is microsecond ISO, so
+two artifacts written inside one microsecond carry the identical stamp, and
+sorting on it alone is a stable sort over equal keys that preserves directory
+scan order — which differs per platform and per filesystem, making the library
+UI, the MCP list tool and the auto-widget pruning sweep disagree about which
+artifact is newest on otherwise identical data.
 
 ### Kind inference
 
@@ -175,9 +194,14 @@ slash-free in practice). Clone/fork keep the id in the JSON body instead.
 POST/PATCH/DELETE require an unrestricted session. The HTTP body envelope is
 capped at 2 MiB; the store enforces a per-content cap of 25 MiB
 (`artifacts.MAX_CONTENT_BYTES`), large enough for cloned/pulled rich artifacts
-(HTML reports, CSVs). The MCP save/update field cap
-(`validation.ARTIFACT_CONTENT_MAX`) imports that same constant so the tool and
-store paths never disagree.
+(HTML reports, CSVs). The number is owned by `constants.ARTIFACT_MAX_CONTENT_BYTES`;
+`artifacts.MAX_CONTENT_BYTES` and the MCP save/update field cap
+(`validation.ARTIFACT_CONTENT_MAX`) are both that name, so the tool and store
+paths never disagree. It lives in the `constants` leaf rather than in `artifacts`
+because `validation` importing `artifacts` closed the cycle `artifacts -> hooks
+-> webhooks -> validation -> artifacts`, which raised ImportError in any process
+whose first `kiro_crew` import reached `artifacts` before `validation`;
+`test_agent_import_hoist.py` pins that `validation` never imports `artifacts`.
 
 **Folders:** `Artifact.folder_id` (`""` = unfiled) is an opaque,
 rename-safe membership id, tolerant-loaded for legacy meta.json.
@@ -440,9 +464,25 @@ wrong bytes at a URL the user already knows about; a stale withdrawal leaves con
 served that the user believes they took down, which is the worse failure and the one
 worth surfacing as an error the user can act on.
 
-The public-exposure warning and the blocking `PublicPublishAckModal` are
-unchanged and unconditional — every destination gets both, on the clean path and
-on a scan override.
+The public-exposure warning and the blocking `PublicPublishAckModal` are gated
+on the selected destination's `public_reachable` descriptor field
+(`PublishProvider.public_reachable`, class attribute, default `True`, carried
+on each `GET /api/artifacts/publish-providers` row). A destination whose
+published link is served with no authentication gets both, on the clean path
+and on a scan override, exactly as before. A destination that declares `False`
+-- one that stores content privately behind a login -- gets neither: the
+confirm click publishes directly, because both surfaces say the content is
+going onto the open internet, and a gate that lies where the destination is
+private teaches the user to click past it where it is public. The publish flow
+always requests `visibility: PUBLIC`, so `False` asserts that even a
+publication the provider files as PUBLIC is served only to an authenticated
+reader; a provider whose PUBLIC publications are readable by anyone must leave
+it `True`. The default is
+`True` and the frontend treats an omitted field as `True`, so a provider must
+declare that it needs authentication; the failure mode of the wrong default is
+a public link with no warning. App-registered rows from
+`GET /api/publish-providers` are the public-web deploy surface and are always
+treated as reachable.
 
 ## Widget auto-registration
 
@@ -462,19 +502,23 @@ Artifacts tab list widgets at all (a widget's HTML is inline in the message and
 never written to disk, so the file-backed session-docs scan cannot see it).
 
 **Identity — a two-language contract.** The slug is derived from
-`(message_ts, widget_index)`:
+`(message_ts, body)` — the parent message's timestamp plus a fingerprint of the
+widget's body:
 
-- `src/kiro_crew/widget_slug.py` → `derive_widget_slug`
-- `website/src/lib/widgetSlug.ts` → `deriveWidgetSlug`
+- `src/kiro_crew/widget_slug.py` → `derive_widget_body_slug`
+- `website/src/lib/widgetSlug.ts` → `deriveWidgetBodySlug`
 
-Both MUST produce identical output (two FNV-1a passes, 32-bit prime, 16 hex
-chars); the frontend uses it to find the artifact the backend wrote, with no id
-exchanged. Likewise `widget_parse.parse_widgets` mirrors the frontend's
-`parseBlocks` widget detection, because a disagreement about *which* spans are
-widgets shifts `widget_index` and mis-keys every subsequent artifact. Parity is
-pinned by shared vectors/fixtures in `test/test_widget_slug.py`,
-`test/test_widget_parse.py`, and `website/src/test/widgetSlug.test.ts` — a change
-to one side fails all three.
+Both MUST produce identical output (seed `<ts>#w:<body>`, two FNV-1a passes,
+32-bit prime, 16 hex chars); the frontend uses it to find the artifact the
+backend wrote, with no id exchanged. Because the body is part of the key, a slug
+hit implies the same body: a disagreement about *which* spans are widgets can
+only cause a probe miss (the star shows unsaved), never a binding to the wrong
+artifact. `widget_parse.parse_widgets` mirrors the frontend's `parseBlocks`
+widget detection so both sides agree which spans are widgets and what their exact
+bodies are. Parity is pinned by shared body-slug vectors in
+`test/test_widget_slug.py` and `website/src/test/widgetSlug.test.ts`, and by
+shared parser fixtures in `test/test_widget_parse.py` and
+`website/src/test/widgetSlug.test.ts` — a change to one side fails the other.
 
 Registration is **idempotent and non-destructive**: an existing slug is left
 untouched (a replayed or rehydrated message never duplicates or clobbers content
@@ -852,6 +896,24 @@ adding a parallel watcher (see `kiro_crew.knowledge.artifact_ingest`):
   content-affecting mutation (create, content-changing update, delete). A
   metadata-only rename fires a separate `rename` signal that refreshes the
   stored group label without re-ingesting (no chunk churn).
+- **Every store take runs in a worker thread.** `on_change` schedules the
+  handler on the gateway loop, so `_handle` and `ingest_artifact` run on the
+  loop thread — where a contended knowledge connection would busy-wait every
+  task (the watchdog heartbeat included) for the connection's whole busy timeout
+  and, past 25s, get the gateway killed (see the on-loop guard in
+  [knowledge](knowledge.md)). Each store call on these paths is offloaded with
+  `asyncio.to_thread`: the `get_source_by_uri` lookups (delete/rename/upsert),
+  `ensure_artifact_source`, `refresh_artifact_name`, `ingest_artifact`'s
+  `_get_state` read and `release_stale_claim` write, the per-job
+  `get_job_status` read in `reconcile_artifacts`, and `remove_artifact` (a
+  `delete_items_batch` → graph rebuild). The one take still on the loop is
+  `ingest_artifact`'s post-ingest `get_job_status` read: it sits between the
+  commit and the fallback ownership write, so offloading it belongs with the
+  ownership-write change that keeps those two from being separated by a
+  cancellation point. The ordering the handler describes is preserved across
+  the hops — name refresh before ingest, the kind-change reconcile before the
+  ingest — and the deduped/ownership finalizers still run on the pipeline's own
+  worker hop, not the loop.
 - **Reconcile on every start, not a creation-gated backfill.** The feature is
   opt-in, and while it is off the change-listener is not registered, so writes in
   that window never reach the Library. Tying the catch-up pass to *creation of
@@ -972,8 +1034,40 @@ not enforce uniqueness.
 source_path dedup-bump paths), content-carrying PATCH (Save / Snapshot /
 MCP update / revert — metadata-only PATCHes do NOT emit), delete
 (`deleted: true`), relocate, and pull-latest (when the pull actually landed a
-new snapshot). Fire-and-forget; react-query's 30s staleness window remains
-the safety net.
+new snapshot). Fire-and-forget.
+
+**Live refresh — file-backed artifacts** — the funnel above only covers
+mutations that pass through a handler, so an agent (or any other tool) writing
+a file-backed artifact's `source_path` directly emitted nothing, and the open
+surface kept rendering pre-edit content. The frontend closes that gap with
+`useArtifactLiveReload(slug, source_path)`, mounted on `ArtifactDetailPage`
+(hence also `/popout/artifact/:slug`) and on the side-panel `ArtifactPanel`:
+
+- It subscribes to the existing `GET /api/file-watch` SSE for `source_path` as
+  a **change signal only** — the frame's `content` is discarded and the
+  artifact is refetched through `GET /api/artifacts/{slug}` instead, so
+  redaction, the live/snapshot fallback and the `live_dirty` recompute all keep
+  running on the one serving path. This also sidesteps the 512KB cap on what
+  the watch stream can *deliver* — the separate cap on what it can *detect*
+  still applies, see the known limits below.
+- 400ms debounce, then `invalidateQueries(['artifact', slug])` — an active
+  refetch, not a staleness mark, because the shared QueryClient runs
+  `staleTime: Infinity` and freshness is push-driven.
+- **Never refetches while an edit buffer is open** (`isArtifactEditing(slug)`),
+  matching the `artifact_update` WS handler: moving the editor's baseline under
+  a stale buffer makes the next Save silently overwrite the incoming update.
+  Nothing else is refreshed on that branch — an external write produces no
+  artifact event and no comment — and the detail page already refetches when
+  editing ends.
+- Inert for artifacts with no `source_path`, and inert after an SSE failure
+  (`useFileWatch` closes the stream rather than reconnecting), which degrades to
+  the previous manual-reload behavior.
+
+Known limits, both inherited from the endpoint: `api_file_watch` only emits when
+the redacted **first 512,000 bytes** change, so a rewrite touching only bytes
+past that cap produces no signal and no reload; and each mounted surface (every
+popout is its own window) opens its own EventSource against an HTTP/1.1 gateway,
+so nothing is watched unless the artifact is actually file-backed.
 
 **Panel (frontend)** — the comments sidebar and the chat panel are mutually
 exclusive flex siblings of the artifact body, icon-toggled from the toolbar
@@ -1219,10 +1313,15 @@ and each one is registered, copying the bytes immediately so temp-file cleanup
 cannot strip them.
 
 - **Identity.** Slugs are derived deterministically from `(message_ts, index)`
-  via the widget-slug contract, where `index` counts **every** image match in the
-  message including skipped ones — so an image's ordinal is stable regardless of
-  which siblings were skipped. A replayed message is therefore idempotent and
-  never clobbers an artifact the user has since edited.
+  via `widget_slug.derive_widget_slug` on the Python side —
+  `image_artifacts._derive_image_slug` seeds it with `<ts>#image` so an image and
+  a widget in the same message never collide. This ordinal form is backend-only:
+  the frontend has no counterpart, because widget identity is keyed on the body
+  (see the widget Identity contract above), not on an ordinal. `index` counts
+  **every** image match in the message including skipped ones — so an image's
+  ordinal is stable regardless of which siblings were skipped. A replayed message
+  is therefore idempotent and never clobbers an artifact the user has since
+  edited.
 - **Destination parsing.** Balanced-paren walk, so `screenshot(1).png` survives;
   `<...>` destinations are unwrapped so a path containing spaces survives;
   backslashes are treated as escapes **only** before markdown-significant

@@ -162,10 +162,8 @@ def _write_runs(payload: str) -> None:
     """
     f = _runs_file()
     f.parent.mkdir(parents=True, exist_ok=True)
-    # The shared helper already does everything this write needs, and does one
-    # thing the hand-rolled version did not: it replaces through
-    # ``replace_with_retry``, so a transient Windows sharing violation does not
-    # silently lose the save (the defect class tracked in #4701 / #4898). It also
+    # The shared helper replaces through ``replace_with_retry``, so a transient
+    # Windows sharing violation does not silently lose the save. It also
     # picks a random mkstemp name, applies the owner-only lockdown to the temp
     # BEFORE the payload lands, and refuses to follow a planted parent link --
     # the three properties the review worker's writable tree requires, since it
@@ -522,14 +520,14 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                 run["status"] = "error"
             elif attempted > 0 and (recorded == 0 or deep == 0):
                 # run_review returns ok=True for any run with >=1 change, so a run
-                # whose every change failed used to report "done" with an empty
-                # report. Nothing was reviewed; say so rather than letting the UI
-                # claim success and then show an empty report.
+                # whose every change failed would otherwise report "done" with an
+                # empty report. Nothing was reviewed; say so rather than letting the
+                # UI claim success and then show an empty report.
                 #
                 # `deep == 0` is checked as well as `recorded == 0`: a change can
-                # persist a record and still never be deep-reviewed, which cleared the
-                # record count while leaving the report with no findings in it. Both
-                # are the same "claimed success, delivered nothing" failure.
+                # persist a record and still never be deep-reviewed, which leaves a
+                # non-zero record count with no findings in the report. Both are the
+                # same "claimed success, delivered nothing" failure.
                 run["status"] = "error"
                 run["error"] = _first_change_error(summary) or (
                     "the reviewer produced no result record"
@@ -625,14 +623,25 @@ def _run_headline(run: dict) -> str:
     if n == 1 and changes:
         link = str(changes[0])
         try:
+            platform = adapters.detect_platform(link)
+        except adapters.AdapterError:
+            platform = ""
+        if platform == "gitlab":
+            try:
+                host, ns, iid = adapters.gitlab_pr_ref(link)
+            except adapters.AdapterError:
+                return link
+            prefix = "" if host == "gitlab.com" else f"{host}/"
+            return f"{prefix}{ns}!{iid}"
+        try:
             host, owner, name, number = adapters.github_pr_ref(link)
         except adapters.AdapterError:
-            return link.rsplit("github.com/", 1)[-1]
+            return link
         # github.com stays host-less (the unambiguous common case); a GitHub
         # Enterprise PR carries its host so two instances' PRs read apart.
         prefix = "" if host == "github.com" else f"{host}/"
         return f"{prefix}{owner}/{name}/pull/{number}"
-    return f"{n} PR{'s' if n != 1 else ''}"
+    return f"{n} change{'s' if n != 1 else ''}"
 
 
 async def _notify_finished(run: dict) -> None:
@@ -1573,20 +1582,37 @@ async def _handle_my_repos(request: web.Request) -> web.Response:
 
 
 def _pull_request_ref(link: str) -> dict | None:
-    """Parse a pasted GitHub PR URL into the repo plus the PR's identity.
+    """Parse a pasted GitHub PR or GitLab MR URL into the repo + its identity.
 
-    Returns None for anything that is not a PR link, so the caller can fall back
+    Returns None for anything that is not a PR/MR link, so the caller can fall back
     to repo-URL parsing. Deliberately tolerant about what it accepts and strict
     about what it returns: every field here is produced by the same validated
     parser the review path uses, never by string slicing.
     """
-    if "/pull/" not in (link or ""):
+    text = link or ""
+    platform = None
+    if "/pull/" in text:
+        platform = "github"
+    elif "/-/merge_requests/" in text:
+        platform = "gitlab"
+    if platform is None:
         return None
     try:
-        host, owner, repo, number = adapters.github_pr_ref(link)
+        if platform == "gitlab":
+            host, ns, iid = adapters.gitlab_pr_ref(text)
+            return {
+                "provider": "gitlab",
+                "host": host,
+                "namespace": ns,
+                "iid": int(iid),
+                "url": f"https://{host}/{ns}/-/merge_requests/{iid}",
+                "change_id": adapters.gitlab_change_id(ns, iid, host=host),
+            }
+        host, owner, repo, number = adapters.github_pr_ref(text)
     except (adapters.AdapterParseError, adapters.UnsupportedPlatform, ValueError):
         return None
     return {
+        "provider": "github",
         "host": host,
         "owner": owner,
         "repo": repo,
@@ -1612,6 +1638,8 @@ async def _handle_repos(request: web.Request) -> web.Response:
         body = {}
     owner = str(body.get("owner") or "").strip()
     name = str(body.get("repo") or "").strip()
+    repo_provider = "github"
+    repo_host = "github.com"
     pr: dict | None = None
     if owner and name:
         # An owner/repo pair supplied directly still has to satisfy the same
@@ -1644,15 +1672,31 @@ async def _handle_repos(request: web.Request) -> web.Response:
                     },
                     status=400,
                 )
-            owner, name = pr["owner"], pr["repo"]
+            if pr.get("provider") == "gitlab":
+                namespace = str(pr.get("namespace") or "")
+                owner, name = namespace.rsplit("/", 1) if "/" in namespace else ("", namespace)
+                repo_provider = "gitlab"
+                repo_host = str(pr.get("host") or "")
+            else:
+                owner, name = pr["owner"], pr["repo"]
+                repo_host = str(pr.get("host") or "github.com")
+            if repo_provider == "github" and repo_host != "github.com":
+                return web.json_response(
+                    {
+                        "code": "unsupported_repo_host",
+                        "error": "GitHub Enterprise repos can't be pinned; paste the "
+                        "PR link in the review box instead",
+                    },
+                    status=400,
+                )
         else:
             try:
-                repo_host, owner, name = adapters.parse_repo_ref(name)
+                repo_provider, repo_host, owner, name = adapters.parse_any_repo_ref(name)
             except (adapters.AdapterParseError, adapters.UnsupportedPlatform, ValueError) as e:
                 return web.json_response(
                     {"code": "invalid_repo_url", "error": f"invalid repo url: {e}"}, status=400
                 )
-            if repo_host != "github.com":
+            if repo_provider == "github" and repo_host != "github.com":
                 return web.json_response(
                     {
                         "code": "unsupported_repo_host",
@@ -1668,14 +1712,31 @@ async def _handle_repos(request: web.Request) -> web.Response:
         )
 
     if request.method == "POST":
-        repos = await asyncio.to_thread(discovery.add_repo, owner, name)
+        repos = await asyncio.to_thread(
+            discovery.add_repo,
+            owner,
+            name,
+            provider=repo_provider,
+            host=repo_host,
+        )
     else:
-        repos = await asyncio.to_thread(discovery.remove_repo, owner, name)
+        repos = await asyncio.to_thread(
+            discovery.remove_repo,
+            owner,
+            name,
+            provider=repo_provider,
+            host=repo_host,
+        )
     out: dict[str, Any] = {"ok": True, "repos": repos}
     if request.method == "POST":
-        # Which repo was just added. The caller previously guessed at repos[0],
-        # which is only right if the store happens to prepend.
-        out["added"] = {"owner": owner, "repo": name}
+        # Name the added repo explicitly: repos[0] is only it if the store
+        # happens to prepend.
+        out["added"] = {
+            "owner": owner,
+            "repo": name,
+            "provider": repo_provider,
+            "host": repo_host,
+        }
     if request.method == "POST" and pr is not None:
         # The caller uses this to open the pasted pull request instead of leaving
         # the user to find it in the list.

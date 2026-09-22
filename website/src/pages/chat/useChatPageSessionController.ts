@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 
 import { useMutation } from '@tanstack/react-query'
 import type { NavigateFunction, NavigationType } from 'react-router-dom'
 
+import type { ChatLaunchOptions } from '../../app-sdk'
 import { i18nT } from '../../i18n/t'
 import { useSessionTabs } from '../../hooks/useSessionTabs'
 import { useAppSelector, type AppDispatch } from '../../store'
@@ -11,10 +12,12 @@ import {
   fetchHistory,
   resumeFromHistory,
   setActiveSlot,
+  setPendingInput,
   switchSlot,
 } from '../../store/chatSlice'
 import type { ChatSlot, SessionInfo } from '../../types'
 import { isChatPageSurface } from '../../utils/channelOrigin'
+import { writePrefill } from '../../utils/navIntent'
 import type { PasteBlock } from '../../utils/pasteTokens'
 import { safeSetItem } from '../../utils/safeStorage'
 import { shouldReplaceSessionUrl, popMaySwitchSession } from '../../utils/sessionUrlHistory'
@@ -166,7 +169,9 @@ export function useChatPageSessionController({
     // The row menu is a deliberate "take me there", so it opens in foreground.
     if (opts?.background) return
     if (!connectedRef.current) return
-    if (key !== activeSlotRef.current) dispatch(switchSlot(key))
+    // Foreground open-in-tab is a user gesture on a session reference: the
+    // announced class.
+    if (key !== activeSlotRef.current) dispatch(switchSlot({ key, announceOnMissing: true }))
     // Depends on the ONE member it calls, not on `sessionTabs` — that hook
     // returns a fresh object literal every render, so the whole object as a dep
     // makes this callback (and thus ChatSidebar's `onOpenSlotInNewTab`, and thus
@@ -176,7 +181,9 @@ export function useChatPageSessionController({
   }, [sessionTabs.openInNewTab, dispatch, activeSlotRef])
   const selectSessionTab = useCallback((key: string) => {
     if (key === activeSlotRef.current || !connectedRef.current) return
-    dispatch(switchSlot(key))
+    // Tab-strip select is a user gesture on a session reference: the announced
+    // class.
+    dispatch(switchSlot({ key, announceOnMissing: true }))
   }, [dispatch, activeSlotRef])
   const closeSessionTab = useCallback((key: string) => {
     const next = sessionTabs.closeTab(key)
@@ -213,6 +220,28 @@ export function useChatPageSessionController({
   const initialMsgRef = useRef(searchParams.get('msg'))
   const initialMidRef = useRef(searchParams.get('mid'))
   const initialNewRef = useRef(searchParams.get('new') === '1')
+  const newRequestConsumedRef = useRef(false)
+  const appDraftAgentRef = useRef<string | undefined>(undefined)
+  /**
+   * A prompt to seed the new session's composer with, carried by the SAME cold
+   * URL that asks for the session: `/chat?new=1&prefill=<text>`. This is the deep
+   * link an external launcher (a Slack card, a bookmarklet, a CLI `--open`) can
+   * build, since the only other cold-URL prompt channel is the signed `?token=`
+   * one it cannot mint. It SEEDS ONLY — auto-send stays behind that token path,
+   * so a link can never spend a model turn without a human pressing Enter.
+   *
+   * Read only when `?new=1` is also present, which is the whole guard. A bare
+   * `?prefill=<v>` is an in-app SENTINEL in this dashboard — the file explorer's
+   * "Chat about this file" navigates to `/chat?prefill=1` and a project idea's
+   * "Edit in chat" to `/chat?prefill=plan`, both with the real text riding Redux
+   * `pendingInput` — so honouring one here would spawn a spurious empty session
+   * and drop the literal `1` / `plan` into its composer.
+   *
+   * Captured at MOUNT because ChatPage's own `?prefill=` reader strips the param
+   * from the URL, and consumed in `newSlotMutation.onSuccess` below, the only
+   * place that knows the created session's key.
+   */
+  const initialPrefillRef = useRef(initialNewRef.current ? (searchParams.get('prefill') ?? '') : '')
   // Deep-link mount activation in progress — stops the sync effect from stripping
   // ?sid before activation lands. Cleared once activeSlot is truthy.
   const pendingSidRef = useRef(!!initialSidRef.current)
@@ -254,15 +283,75 @@ export function useChatPageSessionController({
   const [sidError, setSidError] = useState('')
   const [newSlotFailed, setNewSlotFailed] = useState(false)
   const [highlightTs, setHighlightTs] = useState<string | null>(null)
+  const [appSlotLaunch, setAppSlotLaunch] = useState<ChatLaunchOptions | null>(null)
+  const appSlotLaunchRef = useRef<ChatLaunchOptions | null>(null)
+
+  // An app's explicit target is a session-entry action, not an ordinary PUSH
+  // URL to ignore. Claim it before URL sync can restore the outgoing slot.
+  useEffect(() => {
+    if (embedded || !connected) return
+    const launchWindow = window as Window & {
+      __mc_chat_launch?: ChatLaunchOptions & { ts: number }
+    }
+    const intent = launchWindow.__mc_chat_launch
+    if (!intent || Date.now() - intent.ts > 10_000) return
+    // A newer launch, including a new-session request, supersedes a pending
+    // target activation so its later completion cannot release an old message.
+    appSlotLaunchRef.current = intent
+    setAppSlotLaunch(null)
+    if (!intent.slotKey || intent.slotKey !== searchParams.get('sid')) return
+    delete launchWindow.__mc_chat_launch
+    initialSidRef.current = null
+    pendingSidRef.current = false
+    // The app activation owns the mount fetch just like a normal deep link.
+    deepLinkPendingRef.current = true
+    popInFlightRef.current = true
+    setSidError('')
+    // Keep the claimed message across slow activation. Only a fulfilled switch
+    // releases it to the composer; an HTTP failure must never become a send.
+    void dispatch(switchSlot(intent.slotKey)).then(result => {
+      if (appSlotLaunchRef.current !== intent) return
+      popInFlightRef.current = false
+      if (switchSlot.fulfilled.match(result)) {
+        setAppSlotLaunch(intent)
+      } else {
+        const title = filteredSlots.find(slot => slot.key === intent.slotKey)?.title
+        const failure = title
+          ? i18nT('pages.chatPage.could_not_open_this_session', { title })
+          : i18nT('appChatLaunch.targetUnavailable')
+        setSidError(intent.message ? i18nT('appChatLaunch.unsent', { error: failure, message: intent.message }) : failure)
+      }
+    })
+  }, [connected, dispatch, embedded, filteredSlots, locationKey, searchParams])
 
   // ?new=1: create a blank slot for an embed or a fresh desktop window.
   const newSlotMutation = useMutation({
-    mutationFn: () => dispatch(createSlot({ mode })).unwrap(),
+    mutationFn: () => dispatch(createSlot({ mode, agent: appDraftAgentRef.current })).unwrap(),
     onSuccess: (slot) => {
       newSessionRef.current = false
       setNewSlotFailed(false)
       setSidError('')
       if (!slot?.key) return
+      // Stage the launcher's prompt BEFORE the navigate below: that navigate
+      // drops the query string, and the reader on the other side (ChatPage's
+      // slot-restore effect, via `kirocrew_prefill` with its 30s TTL) consumes
+      // the staged value when the new slot becomes active — so a seed written
+      // afterwards has nothing left to seed from. Spent once: a retry of a failed
+      // create still carries the same intent, but must not re-seed a session the
+      // user has since typed into.
+      if (initialPrefillRef.current) {
+        // Storage can refuse the write (disabled, or full past the store's own
+        // reclaim). Fall back to the in-memory `pendingInput` channel the command
+        // bar and file explorer already seed composers through, so a refused write
+        // degrades to "the prompt still arrives" rather than "the prompt is gone" —
+        // the launcher's URL is consumed by the navigate below either way.
+        if (!writePrefill(slot.key, initialPrefillRef.current)) {
+          dispatch(setPendingInput(initialPrefillRef.current))
+        }
+        // Cleared only after the prompt is staged SOMEWHERE, so neither branch can
+        // drop it: this is what makes the seed spent-once rather than lost-once.
+        initialPrefillRef.current = ''
+      }
       navigate(
         embedMode ? `/embed/chat/${slot.key}` : `/chat?sid=${encodeURIComponent(slot.key)}`,
         { replace: true },
@@ -278,14 +367,32 @@ export function useChatPageSessionController({
     },
   })
   useEffect(() => {
-    if (!initialNewRef.current || (embedded && !embedMode) || popout) return
+    if (searchParams.get('new') !== '1') { newRequestConsumedRef.current = false; return }
+    if (newRequestConsumedRef.current || (embedded && !embedMode) || popout) return
+    // URL synchronization can replace the history entry while creation is in
+    // flight. The new=1 intent is spent once, not once per history key.
+    newRequestConsumedRef.current = true
     initialNewRef.current = false
+    initialPrefillRef.current = searchParams.get('prefill') ?? initialPrefillRef.current
+    const launchWindow = window as Window & {
+      __mc_chat_launch?: { ts?: number; message?: string; agent?: string; slotKey?: string; autoSend?: boolean }
+    }
+    const launch = launchWindow.__mc_chat_launch
+    appDraftAgentRef.current = undefined
+    if (!embedded && launch?.autoSend === false && !launch.slotKey
+      && Date.now() - (launch.ts ?? 0) <= 10_000) {
+      // Retain the claimed draft through create failure/retry. onSuccess is
+      // the single owner of the prefill-before-navigation handoff.
+      initialPrefillRef.current = launch.message ?? ''
+      appDraftAgentRef.current = launch.agent
+      delete launchWindow.__mc_chat_launch
+    }
     newSessionRef.current = true
     setNewSlotFailed(false)
     setSidError('')
     if (!embedMode) dispatch(setActiveSlot(null))
     newSlotMutation.mutate()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [locationKey, searchParams, embedded, embedMode, popout, dispatch, newSessionRef, newSlotMutation])
 
   // Choosing a real session explicitly abandons a failed blank-window intent;
   // its banner must not follow the user into the selected conversation.
@@ -456,14 +563,31 @@ export function useChatPageSessionController({
     }
   }, [searchParams, filteredSlots, activeSlot, activeSlotRef, dispatch, embedMode, navigationType, locationKey, locationPathname, locationHash, connected, noUrlSync, navigate, isMobile])
 
-  // Timeout: if slot never appears after 5s, show error.
+  // Timeout: if slot never appears after 5s, show an error. Keep the denied key
+  // so a later authoritative slots frame can revoke that verdict; keeping
+  // `initialSidRef` itself set would re-arm popInFlightRef on every render and
+  // wedge URL synchronization.
+  const deniedSidRef = useRef<{
+    key: string
+    activeSlot: string | null
+    activeSlotChanged: boolean
+    error: string
+  } | null>(null)
+  // Equality at recovery time cannot distinguish "stayed on A" from A -> B -> A.
+  // Latch the first committed change while a denied link is pending; returning
+  // to the deadline's slot must not give the old deep link ownership again.
+  useEffect(() => {
+    const denied = deniedSidRef.current
+    if (denied && activeSlot !== denied.activeSlot) denied.activeSlotChanged = true
+  }, [activeSlot])
   // Gated on `connected` so the timer only runs while the gateway is reachable
   // — otherwise an offline tab would burn its 5s while the resolve effects
   // above are deferred, fire a false "Session not found", clear initialSidRef,
   // and the resolve never happens once the gateway comes back. Re-runs the
   // effect when connected flips so the timer starts fresh on reconnect.
-  // Also gated on `slotsLoaded`: firing is one-way (it clears `initialSidRef`),
-  // so arming before the list lands makes a late arrival unresolvable.
+  // Also gated on `slotsLoaded`: arming before the list lands would reject every
+  // slow first frame. A landed list starts the deadline, but is not assumed to
+  // be the final restored list.
   const slotsLoaded = useAppSelector(s => s.dashboard.slotsLoaded)
   useEffect(() => {
     if (!connected || !slotsLoaded) return
@@ -471,10 +595,17 @@ export function useChatPageSessionController({
     if (!urlSlot) return
     const timer = setTimeout(() => {
       if (initialSidRef.current) {
+        const error = i18nT('pages.chatPage.session_not_found', { name: urlSlot })
+        deniedSidRef.current = {
+          key: urlSlot,
+          activeSlot: activeSlotRef.current,
+          activeSlotChanged: false,
+          error,
+        }
         initialSidRef.current = null
         pendingSidRef.current = false
         popInFlightRef.current = false
-        setSidError(i18nT('pages.chatPage.session_not_found', { name: urlSlot }))
+        setSidError(error)
         // Deliberately does NOT refresh the session on screen. The deep link did
         // own this mount's fetch, so that session's messages can be as stale as
         // Redux left them — but a refresh here races the user: five seconds is
@@ -485,7 +616,30 @@ export function useChatPageSessionController({
       }
     }, 5000)
     return () => clearTimeout(timer)
-  }, [connected, slotsLoaded])
+  }, [connected, slotsLoaded, activeSlotRef])
+
+  // A slots frame can arrive after the deadline while the gateway restores its
+  // full session list. Once it carries the denied key, the old banner is false.
+  // Resolve the original link only if the user is still on the session that was
+  // active when the deadline fired; otherwise clear the lie without snapping
+  // them back over a later choice.
+  useEffect(() => {
+    const denied = deniedSidRef.current
+    if (!denied || !filteredSlots.some(slot => slot.key === denied.key)) return
+    deniedSidRef.current = null
+    if (denied.activeSlotChanged || activeSlotRef.current !== denied.activeSlot) {
+      setSidError(current => current === denied.error ? '' : current)
+      return
+    }
+    // The late frame has disproved the deadline verdict before transcript loading
+    // begins. Retire that stale local notice now; `switchSlot` owns any load
+    // failure through its announced, localized ErrorNotice and structured report.
+    setSidError(current => current === denied.error ? '' : current)
+    popInFlightRef.current = true
+    void dispatch(switchSlot({ key: denied.key, announceOnMissing: true })).then(() => {
+      popInFlightRef.current = false
+    })
+  }, [filteredSlots, activeSlotRef, dispatch])
 
   // Sync activeSlot → ?sid= in URL (persistent deep-link)
   // Skip entirely when embedded — URL belongs to the host app
@@ -663,6 +817,8 @@ export function useChatPageSessionController({
     closeSessionTab,
     drawerPopRef,
     handleResumeSession,
+    appSlotLaunch,
+    setAppSlotLaunch,
     highlightTs,
     initialMidRef,
     initialMsgRef,

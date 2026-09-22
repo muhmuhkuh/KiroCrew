@@ -17,6 +17,7 @@ import {
   Loader,
   RefreshCw,
   SkipForward,
+  TriangleAlert,
   XCircle,
 } from 'lucide-react'
 import { api } from '../api/client'
@@ -32,7 +33,7 @@ import {
   MAX_PULL_REQUEST_SOURCES,
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
-import { sourceProviderMeta } from '../utils/sourceProviderMeta'
+import { sourceProviderMeta, sourceTabQualifier } from '../utils/sourceProviderMeta'
 import CopyBranchButton from './CopyBranchButton'
 import { PierrePatch } from '../pierre'
 import GithubLogo from './icons/GithubLogo'
@@ -378,16 +379,25 @@ const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check
 }
 
 /** State markers for one pull-request tab in the source strip: lifecycle glyph
- * plus, while the pull request is still live, its CI rollup. CI is suppressed
- * once merged or closed — the lifecycle glyph is the terminal signal there.
- * `ChatSidebar.tsx::showsChipCi` applies the same rule to the sidebar chip; the
- * two render the same pull request and must not disagree about its lifecycle. */
+ * plus one health glyph while the pull request is live. Failed CI wins; a merge
+ * conflict otherwise replaces pending/passed CI so an unmergeable branch never
+ * reads as ready. Merged/closed suppress both CI and conflict because lifecycle
+ * is the terminal signal there. `ChatSidebar.tsx::chipStatusGlyph` applies the
+ * same precedence to the sidebar chip. */
 function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   const lifecycle = status?.state
-  const ci = lifecycle === 'merged' || lifecycle === 'closed' ? undefined : status?.ci
-  if (!lifecycle && !ci) return null
+  const terminal = lifecycle === 'merged' || lifecycle === 'closed'
+  const ci = terminal ? undefined : status?.ci
+  const conflicting = !terminal && (
+    status?.mergeable === 'conflicting' || status?.mergeStateStatus === 'dirty'
+  )
+  // Failed CI is already a red, actionable stop signal. Otherwise a settled
+  // conflict outranks a pending/passing rollup, matching the sidebar chip.
+  const showConflict = conflicting && ci !== 'failed'
+  const shownCi = showConflict ? undefined : ci
+  if (!lifecycle && !shownCi && !showConflict) return null
   const life = lifecycle ? LIFECYCLE_META[lifecycle] : null
-  const check = ci ? CI_META[ci] : null
+  const check = shownCi ? CI_META[shownCi] : null
   const LifeIcon = life?.icon
   const CheckIcon = check?.icon
   // Resolved here, in the component body, so a language switch re-renders into
@@ -396,12 +406,18 @@ function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   // through a looked-up object is a shape `scripts/check-i18n-keys.mjs` cannot
   // resolve, which would exempt these sites from every catalog check.
   const lifeLabel = lifecycle ? i18nT(LIFECYCLE_LABEL_KEY[lifecycle]) : ''
-  const checkLabel = ci ? i18nT(CI_LABEL_KEY[ci]) : ''
+  const checkLabel = shownCi ? i18nT(CI_LABEL_KEY[shownCi]) : ''
+  const conflictLabel = showConflict ? i18nT('components.pullRequestPanel.merge_conflicts') : ''
   return (
     <>
       {LifeIcon && life && (
         <span className={`inline-flex shrink-0 ${life.tone}`} aria-label={lifeLabel} title={lifeLabel}>
           <LifeIcon className="lucide-inline" aria-hidden="true" />
+        </span>
+      )}
+      {showConflict && (
+        <span className="inline-flex shrink-0 text-danger" aria-label={conflictLabel} title={conflictLabel}>
+          <TriangleAlert className="lucide-inline" aria-hidden="true" />
         </span>
       )}
       {CheckIcon && check && (
@@ -842,6 +858,17 @@ export default function PullRequestPanel({
 }) {
   const cappedSources = sources.slice(0, MAX_PULL_REQUEST_SOURCES)
   const selected = cappedSources.find(source => source.url === selectedUrl) || cappedSources[0]
+  // A GitLab MR IID is unique only within its project, so tabs read as bare
+  // `MR !1` and two projects sharing an IID become indistinguishable. When the
+  // rendered tabs span more than one distinct project, qualify each tab label
+  // with its project; a single-project panel keeps the concise form. Identity
+  // is host-aware (self-managed GitLab can carry the same group/project path as
+  // gitlab.com), and sources whose project cannot be recovered (Jira, an
+  // unparseable url) never force qualification on their own.
+  const tabQualifier = useMemo(
+    () => sourceTabQualifier(sources.slice(0, MAX_PULL_REQUEST_SOURCES)),
+    [sources],
+  )
   const [tab, setTab] = useState<SourceTab>('changes')
   const [checkPollState, setCheckPollState] = useState({ url: '', failures: 0 })
   const checkPollStateRef = useRef({ url: '', failures: 0 })
@@ -1095,6 +1122,7 @@ export default function PullRequestPanel({
       <div role="tablist" aria-label={i18nT('components.pullRequestPanel.pull_requests')} className="shrink-0 border-b border-border px-2 py-2 flex items-center gap-1 overflow-x-auto">
         {cappedSources.map(item => {
           const itemMeta = sourceProviderMeta(item.provider)
+          const qualifier = tabQualifier(item)
           return (
           <Btn
             key={item.url}
@@ -1115,6 +1143,12 @@ export default function PullRequestPanel({
                   // `1em`, which is 12px in this tab strip, so the neutral glyph
                   // rendered a pixel smaller than every branded one beside it.
                   : <GitPullRequest size={13} className="lucide-inline shrink-0" />}
+            {/* No CSS truncation here: sourceTabQualifier shortens deep paths
+                to their minimal unique trailing suffix, so the discriminating
+                segment is always visible. The full url stays on the Btn's
+                title. The reference (`MR !1`) is the part that must stay
+                legible. */}
+            {qualifier && <span>{qualifier}</span>}
             <span>{itemMeta.refLabel(item.number)}</span>
             <SourceTabState status={statusByUrl[item.url]} />
           </Btn>
