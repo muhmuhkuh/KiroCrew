@@ -205,7 +205,9 @@ class TestFetchSpec(unittest.TestCase):
         self.assertIn("pulls/<number>/files", spec)
 
     def test_unknown_platform_falls_back_to_github(self):
-        self.assertEqual(P.fetch_spec("gitlab"), P.fetch_spec("github"))
+        # "bitbucket" was never a platform; fetch_spec must refuse to invent a
+        # spec for it and fall back to the github default rather than hallucinate.
+        self.assertEqual(P.fetch_spec("bitbucket"), P.fetch_spec("github"))
 
 
 class TestResultStore(unittest.TestCase):

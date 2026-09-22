@@ -111,7 +111,7 @@ def parse_gitlab_repo_url(
 
 def project_path(owner: str, repo: str) -> str:
     """Encode a namespace/project as GitLab's single ``:id`` parameter."""
-    return quote(f"{owner}/{repo}", safe="")
+    return quote("/".join(part for part in (owner, repo) if part), safe="")
 
 
 def resolve_host(host: str, *, allowed_hosts: frozenset[str]) -> str:

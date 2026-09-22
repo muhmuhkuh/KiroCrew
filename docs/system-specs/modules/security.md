@@ -1,5 +1,7 @@
 # Security Module
 
+The gateway-owned `jira_oauth_tokens.json` crew-home leaf is HIDDEN, not READONLY or VISIBLE: no sandboxed agent needs to read these OAuth tokens. The shared hidden-leaf expansion covers standard, cc, and strict modes for default, legacy, and relocated data homes.
+
 ## Overview
 
 Bulk skill enumeration still validates every canonical path against fresh sensitive

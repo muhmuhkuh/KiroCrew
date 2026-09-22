@@ -32,6 +32,7 @@ from kiro_crew.acp.client import (
     resolve_pin_spelling,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_PI,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -8785,11 +8786,16 @@ async def _run_chat(
 
     # ── Slash commands: detect early, before session acquisition ──
     first_word = message.split()[0] if message.strip() else ""
-    _is_cc_provider = is_claude_code(KiroCrewConfig.load().agent.provider)
+    _agent_config = KiroCrewConfig.load().agent
+    _is_cc_provider = is_claude_code(_agent_config.provider)
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
     # must NOT be forwarded to the harness as a command.
-    is_slash = is_harness_slash_command(first_word, cc_provider=_is_cc_provider)
+    is_slash = is_harness_slash_command(
+        first_word,
+        cc_provider=_is_cc_provider,
+        pi_backend=_agent_config.acp_backend == ACP_BACKEND_PI,
+    )
 
     # Block dangerous/local-only commands before acquiring a session
     if first_word in _BLOCKED_SLASH_COMMANDS:

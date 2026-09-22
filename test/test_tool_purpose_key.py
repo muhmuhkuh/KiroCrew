@@ -190,9 +190,14 @@ def test_refinement_purpose_is_redacted() -> None:
 class TestSelectToolTitle:
     """The pill label falls back sensibly when a backend omits the SDK title."""
 
-    def test_description_is_preferred(self) -> None:
+    def test_description_is_ignored_without_shell_classification(self) -> None:
         raw = {"description": "List temp", "command": "ls /tmp"}
-        assert select_tool_title("ls /tmp", raw) == "List temp"
+        assert select_tool_title("ls /tmp", raw) == "ls /tmp"
+
+    def test_non_shell_description_is_not_tool_title(self) -> None:
+        title = "jira_createJiraIssue"
+        raw = {"description": "x" * 1000}
+        assert select_tool_title(title, raw, "other") == title
 
     def test_description_outranks_the_command_for_a_shell_tool(self) -> None:
         """The prose label is the one thing that beats the command."""

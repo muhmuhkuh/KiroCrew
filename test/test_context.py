@@ -425,6 +425,22 @@ class TestContextBuilder:
         assert msg.index("[THEME PERSONA]") < msg.index(marker)
         assert msg.index(marker) < msg.index(header) < msg.index(request)
 
+    def test_build_message_has_no_native_ponytail_policy(self, tmp_path):
+        """Prompt modes belong to the selected harness, not Crew context."""
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        message, _ = builder.build_message(
+            "build it",
+            is_new_session=False,
+            session_key="dashboard:chat-1",
+            interactive=False,
+        )
+        assert "PONYTAIL MODE" not in message
+        assert "Ponytail coding mode" not in message
+
     def test_dashboard_tool_nudges_require_interactive(self, tmp_path):
         """A non-interactive turn (e.g. automation) gets neither the OPTIONS
         reminder nor either dashboard-card tool nudge."""
@@ -677,7 +693,9 @@ class TestContextBuilder:
             skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
             hooks=HookManager(hooks_cfg),
         )
-        msg, hook = builder.build_message("deploy app", is_new_session=False)
+        msg, hook = builder.build_message(
+            "deploy app", is_new_session=False
+        )
         assert msg.startswith("[DEPLOY]")
 
     def test_dashboard_cross_session_removed(self, tmp_path):

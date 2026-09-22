@@ -223,7 +223,11 @@ describe('managing repos you already have', () => {
     api.myRepos.mockResolvedValue({ repos: [], pinned: [], gh_ready: true })
     mount()
     await userEvent.click(await screen.findByRole('button', { name: /Remove acme\/widgets/ }))
-    await waitFor(() => expect(api.unpinRepo).toHaveBeenCalledWith('acme', 'widgets'))
+    // Context forwards optional provider identity so GitLab and self-hosted repos
+    // cannot collapse onto a same-slug GitHub repo; legacy rows pass undefined.
+    await waitFor(() => expect(api.unpinRepo).toHaveBeenCalledWith(
+      'acme', 'widgets', undefined, undefined,
+    ))
   })
 })
 

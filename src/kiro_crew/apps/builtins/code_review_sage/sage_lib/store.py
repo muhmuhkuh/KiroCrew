@@ -86,6 +86,11 @@ DEFAULT_RULE_PACKS: dict[str, str] = {}
 # ``gh`` must be authenticated for each listed host.
 DEFAULT_GITHUB_HOSTS: list[str] = ["github.com"]
 
+# GitLab-compatible hosts (gitlab.com + optional GitLab self-hosted / Deploy
+# targets). Mirrors ``github_hosts``: opt-in self-hosted instances, ``glab``
+# must be authenticated for each listed host (``glab auth login --hostname <host>``).
+DEFAULT_GITLAB_HOSTS: list[str] = ["gitlab.com"]
+
 DEFAULT_CONFIG: dict[str, object] = {
     "schema": "code-review-sage-config",
     "version": 1,
@@ -118,6 +123,8 @@ DEFAULT_CONFIG: dict[str, object] = {
     "rule_packs": DEFAULT_RULE_PACKS,
     # GitHub-compatible hosts (github.com + optional GitHub Enterprise Server).
     "github_hosts": DEFAULT_GITHUB_HOSTS,
+    # GitLab-compatible hosts (gitlab.com + optional self-hosted instances).
+    "gitlab_hosts": DEFAULT_GITLAB_HOSTS,
     # Settled-change filtering defaults.
     "exclude_settled_by_default": True,
 }

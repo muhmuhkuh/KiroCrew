@@ -90,3 +90,23 @@ GITHUB_PAYLOAD = {
     ],
     "comments": [{"user": {"login": "reviewer"}, "body": "add a regression test"}],
 }
+
+# A GitLab merge-request payload as the worker assembles it from `glab api`:
+# the MR object merged with a `changes` array (each carrying new_path + diff)
+# and a `notes` list. Nested group path exercises group/subgroup addressing.
+GITLAB_PAYLOAD = {
+    "iid": 42,
+    "title": "Fix flaky retry in pipeline runner",
+    "description": "Retries raced on the shared lock. Closes #17.",
+    "web_url": "https://gitlab.com/kiro-team/platform/-/merge_requests/42",
+    "state": "opened",
+    "draft": False,
+    "author": {"username": "mlerner"},
+    "target_branch": "main",
+    "sha": "c0ffee0000000000000000000000000000000001",
+    "changes": [
+        {"new_path": "src/worker/runner.py", "diff": _SERVER_DIFF,
+         "old_path": "src/worker/runner.py"},
+    ],
+    "notes": [{"author": {"username": "reviewer"}, "body": "add a regression test"}],
+}

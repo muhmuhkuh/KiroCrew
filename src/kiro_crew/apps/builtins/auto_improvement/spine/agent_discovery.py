@@ -51,9 +51,11 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from collections.abc import Callable
+from contextlib import suppress
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from kiro_crew.llm_helpers import _extract_json_of_type
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
@@ -220,8 +222,7 @@ def prioritize_focus(files: list[str], *, cap: int | None = None, rotate: int = 
 def _is_test_path(rel: str) -> bool:
     p = rel.replace("\\", "/")
     return (
-        p.startswith("test/")
-        or p.startswith("tests/")
+        p.startswith(("test/", "tests/"))
         or "/test/" in p
         or "/tests/" in p
         or Path(p).name.startswith("test_")
@@ -612,10 +613,8 @@ def discover_surfaces_via_agent(
 
     def _log(msg: str) -> None:
         if logger is not None:
-            try:
+            with suppress(Exception):
                 logger.info("agent-discovery: %s", msg)
-            except Exception:  # noqa: BLE001
-                pass
 
     if runner is None:
         _log("no agent runner wired → 0 surfaces (offline)")
@@ -776,10 +775,8 @@ def discover_surfaces_via_agent(
     # Author-first ordering (self-contained leaves before framework/network files) so the
     # cycles spend on candidates whose reproducing test can actually collect + go RED.
     if testability_rank is not None:
-        try:
+        with suppress(Exception):
             surfaces.sort(key=lambda s: testability_rank(s["file"]))
-        except Exception:  # noqa: BLE001 — ordering is a hint; never fail on it
-            pass
     surfaces = surfaces[:limit]
     # ── durable diagnostic record (the WHY behind the count) ──
     _diag_log(

@@ -1839,7 +1839,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # metacharacters — and an unknown-but-well-formed id is rejected downstream
     # by kiro itself rather than silently accepted here. "auto"/"" = defer to
     # the agent config / kiro's own default.
-    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-\[\]]*$"},
+    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-/\[\]]*$"},
     # Per-task-class model overrides. Same grammar as agent.model (the real
     # vocabulary is whatever the backend advertises). "" / "auto" defers to the
     # chat default. `validate_fn` additionally rejects a well-formed id the
@@ -1847,13 +1847,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.role_models.background": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
         "validate_fn": _validate_role_model,
     },
     "agent.role_models.subagent": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
         "validate_fn": _validate_role_model,
     },
     # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
@@ -1864,7 +1864,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
         "validate_fn": _validate_role_model,
     },
     # Content-filter (refusal) fallback model. Single value: "" (default)
@@ -1875,7 +1875,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.refusal_fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
         "validate_fn": _validate_role_model,
     },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},

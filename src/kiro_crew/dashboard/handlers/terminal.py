@@ -14,6 +14,7 @@ import struct
 import subprocess
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -160,7 +161,7 @@ class _TerminalSession:
 
     session_id: str
     master_fd: int
-    proc: "asyncio.subprocess.Process | None" = None
+    proc: asyncio.subprocess.Process | None = None
     winpty: _ConptyBackend | None = None  # WindowsPty (ConPTY) backend on Windows
     cols: int = 80
     rows: int = 24
@@ -562,6 +563,8 @@ async def _resize_terminal(
             except OSError:
                 pass
         else:
+            if fcntl is None or termios is None:
+                return False
             try:
                 fcntl.ioctl(
                     sess.master_fd,  # wokeignore:rule=master
@@ -649,7 +652,8 @@ def _completion_disabled(completion_cfg: dict) -> bool:
     to the default (enabled). ``bool("false") is True``, so coercing would turn a
     hand-edited string into the opposite of what it reads like.
     """
-    return completion_cfg.get("enabled", True) is False
+    value = completion_cfg.get("enabled", True)
+    return isinstance(value, bool) and not value
 
 
 def _resolve_cwd(cfg: dict, requested: str | None) -> str:
@@ -753,16 +757,16 @@ def _proc_cwd(pid: int) -> str | None:
     lsof = next((p for p in _LSOF_PATHS if os.path.isfile(p)), None)
     if not lsof:
         return None  # fail closed rather than resolve via PATH
-    try:
+    with suppress(OSError, subprocess.SubprocessError):
         out = subprocess.run(
             [lsof, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True,
+            text=True,
+            timeout=2,
         ).stdout
         for line in out.splitlines():
             if line.startswith("n") and len(line) > 1:
                 return line[1:]
-    except (OSError, subprocess.SubprocessError):
-        pass
     return None
 
 
@@ -774,7 +778,7 @@ def _proc_cwd(pid: int) -> str | None:
 _CWD_PROBE_TTL_S = 0.4
 
 
-def _session_cwd(sess: "_TerminalSession") -> str | None:
+def _session_cwd(sess: _TerminalSession) -> str | None:
     """Full current working directory of the session's shell, or None.
 
     Memoized on the session for :data:`_CWD_PROBE_TTL_S`, because the answer has
@@ -793,7 +797,7 @@ def _session_cwd(sess: "_TerminalSession") -> str | None:
     return cwd
 
 
-async def _session_cwd_cached(sess: "_TerminalSession") -> str | None:
+async def _session_cwd_cached(sess: _TerminalSession) -> str | None:
     """``_session_cwd`` probed off the event loop, skipping the executor hop
     entirely on a memo hit.
 
@@ -815,7 +819,7 @@ async def _session_cwd_cached(sess: "_TerminalSession") -> str | None:
     return cwd
 
 
-def _session_title(sess: "_TerminalSession") -> str | None:
+def _session_title(sess: _TerminalSession) -> str | None:
     """Best-effort "what is this terminal doing" label: the foreground command
     name while one runs, else the shell's cwd basename. Returns None when it
     can't tell (client keeps its current title, so a host that can resolve
@@ -823,7 +827,9 @@ def _session_title(sess: "_TerminalSession") -> str | None:
 
     The cwd goes through :func:`_session_cwd` rather than :func:`_proc_cwd` so
     that deriving this label shares one probe with the poller's cwd frame."""
-    if not platform_compat.IS_POSIX or sess.master_fd < 0 or sess.proc is None:  # wokeignore:rule=master
+    if (
+        not platform_compat.IS_POSIX or sess.master_fd < 0 or sess.proc is None
+    ):  # wokeignore:rule=master
         return None
     try:
         fg = os.tcgetpgrp(sess.master_fd)  # wokeignore:rule=master
@@ -944,18 +950,18 @@ def _resolve_fence_shells(launched: str) -> dict[str, str]:
     found: dict[str, str] = {}
     for name in _FENCE_SHELL_NAMES:
         candidate = os.path.join(trusted_dir, name)
-        if os.path.islink(candidate):
-            continue  # the link target is outside what was vetted above
-        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
-            continue
         try:
+            if os.path.islink(candidate):
+                continue  # the link target is outside what was vetted above
+            if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+                continue
             st = os.lstat(candidate)
+            if st.st_uid == uid or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                continue  # rewritable in place
+            if os.access(candidate, os.W_OK):
+                continue  # rewritable in place via an ACL the mode bits do not show
         except OSError:
             continue
-        if st.st_uid == uid or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-            continue  # rewritable in place
-        if os.access(candidate, os.W_OK):
-            continue  # rewritable in place via an ACL the mode bits do not show
         found[name] = candidate
     return found
 
@@ -1104,7 +1110,7 @@ def _bash_ready_env(token: str) -> dict[str, str]:
     return env
 
 
-def _consume_ready_marker(sess: "_TerminalSession", data: bytes) -> bool:
+def _consume_ready_marker(sess: _TerminalSession, data: bytes) -> bool:
     """Advance the split-safe Bash marker matcher for one raw PTY read."""
     marker = sess.ready_marker
     if sess.shell_ready or marker is None:
@@ -1120,7 +1126,7 @@ def _consume_ready_marker(sess: "_TerminalSession", data: bytes) -> bool:
     return False
 
 
-def _sess_alive(sess: "_TerminalSession") -> bool:
+def _sess_alive(sess: _TerminalSession) -> bool:
     """Whether the session's child process is still running (either backend)."""
     if sess.winpty is not None:
         try:
@@ -1132,7 +1138,7 @@ def _sess_alive(sess: "_TerminalSession") -> bool:
     return False
 
 
-def _sess_pid(sess: "_TerminalSession") -> int | None:
+def _sess_pid(sess: _TerminalSession) -> int | None:
     """PID of the session's child process (either backend), or None."""
     if sess.winpty is not None:
         return sess.winpty.pid
@@ -1150,28 +1156,21 @@ async def _kill_session(sess: _TerminalSession) -> None:
         sess.winpty = None
         if sess.reader_task is not None:
             sess.reader_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError, Exception):
                 await sess.reader_task
-            except (asyncio.CancelledError, Exception):
-                pass
         loop = asyncio.get_running_loop()
         pid = getattr(wp, "pid", 0)
         # Reap the whole console tree (the shell + anything it spawned) via
         # taskkill /T so a background child can't outlive the closed terminal.
         if pid:
-            try:
-                await platform_compat.kill_process_tree_async(
-                    pid, platform_compat.SIGTERM
-                )
-            except (OSError, ProcessLookupError):
-                pass
+            with suppress(OSError, ProcessLookupError):
+                await platform_compat.kill_process_tree_async(pid, platform_compat.SIGTERM)
         # Free the pseudo-console + handles (TerminateProcess is a backstop).
-        try:
+        with suppress(OSError, RuntimeError):
             await loop.run_in_executor(
-                subprocess_executor(), wp.terminate,  # type: ignore[attr-defined]
+                subprocess_executor(),
+                wp.terminate,  # type: ignore[attr-defined]
             )
-        except (OSError, RuntimeError):
-            pass
         return
     # The child goes FIRST, then the PTY's controller descriptor, and the order
     # is the fix for a real deadlock. Closing the controller end while the reader
@@ -1335,6 +1334,9 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
     registry = _get_registry(request)
     cfg = _get_config(request)
     max_sessions = cfg.get("max_sessions", _MAX_SESSIONS)
+    posix_pty = _pty
+    posix_fcntl = fcntl
+    posix_termios = termios
     # Resolve the shell HERE, before the reservation region below: the
     # resolution is a PATH scan (shutil.which stats every entry) that must run
     # off-loop, and the spawn branches sit between the placeholder reservation
@@ -1344,7 +1346,9 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
     # WS open, now also carrying the fence-shell map the ready frame reports;
     # a reconnect keeps the values its original open resolved.
     shell, rejected_shell, fence_shells = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), _resolve_shell_with_fence_shells, cfg,
+        discovery_executor(),
+        _resolve_shell_with_fence_shells,
+        cfg,
     )
 
     # Check if reconnecting to existing session. A None VALUE under an
@@ -1362,9 +1366,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             source="dashboard",
             resources=f"session={session_id},reservation_in_flight=1",
         )
-        return web.Response(
-            status=409, text="Terminal session is already being opened"
-        )
+        return web.Response(status=409, text="Terminal session is already being opened")
     existing = registry.get(session_id)
     if existing and not _sess_alive(existing):
         # Process died — clean up stale entry
@@ -1429,7 +1431,8 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         if rejected_shell:
             logger.warning(
                 "terminal: configured shell %r not executable; falling back to %r",
-                rejected_shell, shell,
+                rejected_shell,
+                shell,
             )
         cwd = _resolve_cwd(cfg, request.query.get("cwd"))
         if not os.path.isdir(cwd):
@@ -1441,31 +1444,46 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         except Exception as exc:
             registry.pop(session_id, None)  # type: ignore[arg-type]
             _sel().log_api_access(
-                caller=caller, operation="terminal.ws.open",
-                outcome="error", source="dashboard",
+                caller=caller,
+                operation="terminal.ws.open",
+                outcome="error",
+                source="dashboard",
                 resources=f"conpty_spawn_failed={exc}",
             )
             if not ws.closed:
-                await ws.send_str(json.dumps(
-                    {"type": "error", "message": f"Failed to start terminal: {exc}"}
-                ))
+                await ws.send_str(
+                    json.dumps({"type": "error", "message": f"Failed to start terminal: {exc}"})
+                )
                 await ws.close()
             return ws
         sess = _TerminalSession(
-            session_id=session_id, master_fd=-1, proc=None, winpty=wp, ws=ws, shell=shell,  # wokeignore:rule=master
+            session_id=session_id,
+            master_fd=-1,
+            proc=None,
+            winpty=wp,
+            ws=ws,
+            shell=shell,  # wokeignore:rule=master
             fence_shells=fence_shells,
         )
         registry[session_id] = sess
         _sel().log_api_access(
-            caller=caller, operation="terminal.ws.open",
-            outcome="ok", source="dashboard",
+            caller=caller,
+            operation="terminal.ws.open",
+            outcome="ok",
+            source="dashboard",
             resources=f"session={session_id},pid={wp.pid},shell={shell}",
         )
     else:
+        # The branch is selected after the Windows path, but the imports are
+        # optional so type checkers cannot infer the POSIX modules here.
+        assert posix_pty is not None
+        assert posix_fcntl is not None
+        assert posix_termios is not None
         if rejected_shell:
             logger.warning(
                 "terminal: configured shell %r not executable; falling back to %r",
-                rejected_shell, shell,
+                rejected_shell,
+                shell,
             )
         # Spawn new PTY. Bash is a real login shell (`-l`) so the user's own
         # profile chain runs with `shopt -q login_shell` true, and it inherits a
@@ -1473,26 +1491,28 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         # profiles return. Foreground process ownership alone is insufficient: a
         # profile's builtin `read` runs in the shell process and would consume an
         # early command batch.
-        master_fd, worker_fd = _pty.openpty()
+        master_fd, worker_fd = posix_pty.openpty()
         ready_marker: bytes | None = None
         try:
-            fcntl.ioctl(
+            posix_fcntl.ioctl(
                 worker_fd,
-                termios.TIOCSWINSZ,
+                posix_termios.TIOCSWINSZ,
                 struct.pack("HHHH", 24, 80, 0, 0),
             )
             cwd = _resolve_cwd(cfg, request.query.get("cwd"))
-            env = _pty_child_env({
-                "TERM": "xterm-256color",
-                "KIROCREW_TERMINAL": "1",
-                # Export the shell actually being spawned (already resolved to
-                # an absolute path). Without this, a configured shell that
-                # differs from the login shell leaves the inherited $SHELL
-                # pointing at the login shell, so programs that consult it
-                # (vim's :sh, tmux default-shell) open the wrong one. POSIX
-                # branch only: PowerShell does not consult $SHELL.
-                "SHELL": shell,
-            })
+            env = _pty_child_env(
+                {
+                    "TERM": "xterm-256color",
+                    "KIROCREW_TERMINAL": "1",
+                    # Export the shell actually being spawned (already resolved to
+                    # an absolute path). Without this, a configured shell that
+                    # differs from the login shell leaves the inherited $SHELL
+                    # pointing at the login shell, so programs that consult it
+                    # (vim's :sh, tmux default-shell) open the wrong one. POSIX
+                    # branch only: PowerShell does not consult $SHELL.
+                    "SHELL": shell,
+                }
+            )
             # Security: intentionally unsandboxed — this is the user's own
             # interactive terminal (like SSH), not agent-executed code.
             # Auth is enforced at WS handshake via token_auth_middleware.
@@ -1516,9 +1536,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             argv = [shell, "-l"]
             if _is_bash_shell(shell):
                 token = uuid.uuid4().hex
-                ready_marker = (
-                    f"\x1b]697;KiroCrewReady;{token}\x07".encode("ascii")
-                )
+                ready_marker = f"\x1b]697;KiroCrewReady;{token}\x07".encode("ascii")
                 env.update(_bash_ready_env(token))
 
             # RLIMIT_PROFILE_NONE: the user's own interactive shell carries no
@@ -1547,10 +1565,8 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 env=env,
             )
         except Exception as exc:
-            try:
+            with suppress(OSError):
                 os.close(master_fd)
-            except OSError:
-                pass
             registry.pop(session_id, None)  # type: ignore[arg-type]
             # WS already prepared — send error over WS then close
             if not ws.closed:
@@ -1582,32 +1598,36 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             # reported shell. Configured shells whose startup protocol we cannot
             # control fall back to transport-ready.
             sess.shell_ready = True
-            try:
+            with suppress(ConnectionResetError, RuntimeError, OSError):
                 async with sess.send_lock:
                     if sess.ws is ws and not ws.closed:
-                        await ws.send_str(json.dumps({
-                            "type": "ready",
-                            "shell": sess.shell,
-                            "fence_shells": sess.fence_shells,
-                        }))
-            except (ConnectionResetError, RuntimeError, OSError):
-                pass
+                        await ws.send_str(
+                            json.dumps(
+                                {
+                                    "type": "ready",
+                                    "shell": sess.shell,
+                                    "fence_shells": sess.fence_shells,
+                                }
+                            )
+                        )
 
     # --- Read loop: PTY → WebSocket ---
     async def read_pty():
         try:
             loop = asyncio.get_running_loop()
-            if sess.winpty is not None:
-                reader = lambda: sess.winpty.read(4096)  # noqa: E731
-            else:
-                reader = lambda: os.read(sess.master_fd, 4096)  # noqa: E731  # wokeignore:rule=master
+            winpty = sess.winpty
             while True:
-                data = await loop.run_in_executor(None, reader)
+                if winpty is not None:
+                    data = await loop.run_in_executor(None, winpty.read, 4096)
+                else:
+                    data = await loop.run_in_executor(
+                        None, os.read, sess.master_fd, 4096  # wokeignore:rule=master
+                    )
                 if not data:
                     break
                 await _record_and_forward_terminal_output(sess, data)
         except OSError:
-            pass
+            return
 
     if sess.reader_task is None or sess.reader_task.done():
         sess.reader_task = asyncio.ensure_future(read_pty())
@@ -1721,7 +1741,9 @@ async def api_terminal_create(request: web.Request) -> web.Response:
     # Off-loop for the same reason as the spawn sites: the PATH scan must not
     # stall the event loop at request rate.
     shell, rejected_shell = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), _resolve_shell, cfg,
+        discovery_executor(),
+        _resolve_shell,
+        cfg,
     )
     _sel().log_api_access(
         caller=caller,
@@ -1851,7 +1873,7 @@ def _split_path_token(token: str) -> tuple[str, str]:
     idx = token.rfind("/")
     if idx < 0:
         return "", token
-    return token[: idx + 1], token[idx + 1:]
+    return token[: idx + 1], token[idx + 1 :]
 
 
 def _resolve_completion_dir(cwd: str, dir_part: str) -> str:
@@ -2177,8 +2199,8 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "error": "expected JSON body "
-                         "{session_id: string, token?: string, folders_only?: boolean, "
-                         "argv?: string[]}",
+                "{session_id: string, token?: string, folders_only?: boolean, "
+                "argv?: string[]}",
                 "code": "terminal_invalid_body",
             },
             status=400,
@@ -2220,7 +2242,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
             return web.json_response(
                 {
                     "error": "argv must be a non-empty list of plain words whose first "
-                             "entry is a bare command name",
+                    "entry is a bare command name",
                     "code": "terminal_invalid_argv",
                 },
                 status=400,
@@ -2232,7 +2254,9 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
     # this route fires per keystroke, so on a slow home filesystem an inline read
     # would stall every gateway task) and type-checked at both nesting levels.
     completion_cfg = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), _completion_cfg, request,
+        discovery_executor(),
+        _completion_cfg,
+        request,
     )
     if _completion_disabled(completion_cfg):
         # Gated ABOVE the tier split, so `completion.enabled: false` silences the
@@ -2245,9 +2269,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # change. Audited as `ok`: nothing was refused, and naming the state lets
         # an operator tell a configured silence from a broken route.
         _log_complete(caller, "ok", "completion_disabled")
-        return web.json_response(
-            {"dir": None, "prefix": prefix, "entries": [], "truncated": False}
-        )
+        return web.json_response({"dir": None, "prefix": prefix, "entries": [], "truncated": False})
 
     cwd = await _session_cwd_cached(sess)
 
@@ -2264,7 +2286,10 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # and type-checked at both nesting levels — so this branch reuses it
         # rather than paying a second per-keystroke read of config.json.
         cmd_entries, reason = await terminal_commands.complete(
-            argv, token, cwd, completion_cfg.get("commands"),
+            argv,
+            token,
+            cwd,
+            completion_cfg.get("commands"),
         )
         _log_complete(caller, "denied" if reason == "sensitive_path" else "ok", reason)
         # `dir: null` — the same "nothing was resolved on the filesystem" signal
@@ -2285,9 +2310,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # rather than an error the frontend would have to special-case. A null
         # ``dir`` is the signal that nothing was resolved.
         _log_complete(caller, "ok", "no_cwd")
-        return web.json_response(
-            {"dir": None, "prefix": prefix, "entries": [], "truncated": False}
-        )
+        return web.json_response({"dir": None, "prefix": prefix, "entries": [], "truncated": False})
 
     loop = asyncio.get_running_loop()
     # discovery_executor, not subprocess_executor: this is a read-only
@@ -2313,9 +2336,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # special case — and so the response does not disclose whether the path
         # exists.
         _log_complete(caller, "denied", "sensitive_path")
-        return web.json_response(
-            {"dir": None, "prefix": prefix, "entries": [], "truncated": False}
-        )
+        return web.json_response({"dir": None, "prefix": prefix, "entries": [], "truncated": False})
     _log_complete(caller, "ok", "listed")
     return web.json_response(
         {
@@ -2459,10 +2480,9 @@ async def reap_orphaned_terminals(app: web.Application) -> None:
                 if sess is None:
                     continue  # placeholder during ws.prepare()
                 # Reap if disconnected too long
-                if sess.last_ws_disconnect and (now - sess.last_ws_disconnect) > _ORPHAN_TIMEOUT_S:
-                    to_remove.append(sid)
-                # Reap if process died
-                elif not _sess_alive(sess):
+                if (
+                    sess.last_ws_disconnect and (now - sess.last_ws_disconnect) > _ORPHAN_TIMEOUT_S
+                ) or not _sess_alive(sess):
                     to_remove.append(sid)
             for sid in to_remove:
                 removed = registry.pop(sid, None)
@@ -2470,7 +2490,7 @@ async def reap_orphaned_terminals(app: web.Application) -> None:
                     await _kill_session(removed)
                     logger.info("Reaped orphaned terminal session %s", sid)
     except asyncio.CancelledError:
-        pass
+        return
 
 
 async def poll_terminal_titles(app: web.Application) -> None:
@@ -2538,4 +2558,4 @@ async def poll_terminal_titles(app: web.Application) -> None:
                     ):
                         sess.last_cwd = cwd
     except asyncio.CancelledError:
-        pass
+        return

@@ -2880,7 +2880,7 @@ def sandbox_credential_targets(exclude_leaves: tuple[str, ...] = ()) -> tuple[st
 def is_sensitive_bash_command(
     command: str,
     *,
-    enabled_ids: "frozenset[str] | None" = None,
+    enabled_ids: frozenset[str] | None = None,
 ) -> str | None:
     """Refuse a bash command that reaches IMDS or leaks environment credentials.
 

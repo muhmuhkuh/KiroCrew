@@ -32,19 +32,11 @@ import tempfile
 import time
 import uuid
 from collections import deque
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Mapping, Sequence
 from contextlib import aclosing, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import (
-    Any,
-    AsyncGenerator,
-    AsyncIterator,
-    Callable,
-    Collection,
-    Mapping,
-    Sequence,
-    TypeVar,
-)
+from typing import Any, TypeVar
 
 from kiro_crew import (
     acp_tool_gate,
@@ -149,6 +141,7 @@ from kiro_crew.acp.types import (
     METHOD_METADATA,
     METHOD_PROMPT,
     METHOD_REQUEST_PERMISSION,
+    METHOD_SESSION_DELETE,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
     METHOD_SESSION_RESUME,
@@ -229,6 +222,15 @@ from kiro_crew.mcp_gateway.session_servers import (
     pooled_session_servers,
 )
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
+from kiro_crew.pi_support import (
+    PI_EFFORT_ENV,
+    PI_STATE_ENV,
+    _clear_pi_requested_effort,
+    _pi_thinking_levels,
+    _read_pi_state,
+    _set_pi_requested_effort,
+    prepare_pi_environment,
+)
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.mirrors import MIRRORS, mirror_for
 from kiro_crew.recovery.ladder import L3_ACP_RUNTIME as _L3_ACP_RUNTIME
@@ -257,7 +259,11 @@ from kiro_crew.sandbox import (
     wrap_argv_async,
     wrapped_by_crew_sandbox,
 )
-from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    is_sensitive_path,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel
 from kiro_crew.session_token_sig import schedule_session_token_publish
 from kiro_crew.skill_usage import get_global_skill_read_observer
@@ -599,7 +605,7 @@ def _is_safe_oauth_url(url: str) -> bool:
     if not url:
         return False
     lower = url.lower()
-    return lower.startswith("https://") or lower.startswith("http://")
+    return lower.startswith(("https://", "http://"))
 
 
 def _normalize_exe_casing(path: str | None) -> str | None:
@@ -2210,9 +2216,10 @@ def _mentions_skill_file(raw_params: dict | None, command: str | None) -> bool:
         if isinstance(value, str):
             if _SKILL_FILE_BASENAME in value:
                 return True
-        elif isinstance(value, (list, tuple)):
-            if any(isinstance(v, str) and _SKILL_FILE_BASENAME in v for v in value):
-                return True
+        elif isinstance(value, (list, tuple)) and any(
+            isinstance(v, str) and _SKILL_FILE_BASENAME in v for v in value
+        ):
+            return True
     return False
 
 
@@ -2575,9 +2582,12 @@ def compaction_failure_is_transient(params: dict) -> bool:
         if key == "httpStatusCode":
             # ``bool`` is an ``int`` subclass, so a stray True would otherwise
             # compare as 1 and read as a status code.
-            if isinstance(value, int) and not isinstance(value, bool):
-                if value == 429 or 500 <= value < 600:
-                    return True
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and (value == 429 or 500 <= value < 600)
+            ):
+                return True
             continue
         if not isinstance(value, str):
             continue
@@ -4345,7 +4355,7 @@ def _direct_children(pid: int) -> list[int]:
             if children:
                 return children
         except Exception:
-            pass  # fall through to pgrep
+            logger.debug("/proc child scan failed; falling back to pgrep", exc_info=True)
     try:
         # timeout so a hung pgrep cannot occupy a subprocess_executor worker
         # indefinitely (the ps spawns in _get_start_time/_read_basename already
@@ -4634,35 +4644,26 @@ def _select_tool_title(
     *,
     is_shell: bool | None = None,
 ) -> str | None:
-    """Pick the pill label, preferring a human-readable `description` when present.
+    """Pick a safe pill label for one tool call.
 
-    Some backends' Bash tool emits a `description` field alongside `command`
-    (e.g. "List KiroCrew ACP module files" rather than `ls /workplace/...`).
-    We surface it on the pill when supplied, then the literal shell command for
-    a shell tool, and only then the SDK-provided `title`. Used by both
-    `_extract_tool_event` (initial tool_call) and
-    `_extract_tool_call_refinement` (the second-phase tool_call_update from
-    claude-agent-acp) so the title rule stays consistent across both events.
-
-    The command outranks `title` because backends disagree on what `title`
-    holds for a shell call: some send the invocation itself, others a generic
-    kind label ("Run Command") that names no command at all. A genuinely
-    human-readable label arrives as `description`, which still wins.
+    Shell backends may emit a human-readable `description` alongside
+    `command`. Use that description only after the provider has established
+    that this is a shell call. For non-shell tools, `description` is commonly
+    a real argument (for example Jira issue text), not a display label.
 
     `is_shell` overrides the kind-derived classification for a caller holding a
     RESOLVED signal — a tool_call_update may omit `kind` entirely, and reading
     that absence as non-shell would put the generic title back on a pill the
     initial tool_call had already labelled with its command.
     """
-    if isinstance(raw_input, dict):
+    kind_str = kind if isinstance(kind, str) else None
+    shell = _is_shell_kind(kind_str) if is_shell is None else is_shell
+    if shell and isinstance(raw_input, dict):
         desc = raw_input.get("description")
         if isinstance(desc, str) and desc.strip():
             return desc
-    kind_str = kind if isinstance(kind, str) else None
-    shell = _is_shell_kind(kind_str) if is_shell is None else is_shell
-    # Shell kinds only, so an fs tool's operation name ("strReplace") is never
-    # mistaken for a command.
-    if shell and isinstance(raw_input, dict):
+        # Shell kinds only, so an fs tool's operation name ("strReplace") is
+        # never mistaken for a command.
         cmd = raw_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
             return cmd
@@ -4882,6 +4883,11 @@ class AcpClient:
         self._sandbox_cleanup: str | None = None
         self._bound_workspace_fd: int | None = None
         self._spawn_work_dir = str(self._work_dir)
+        self._pi_mcp_config_path: Path | None = None
+        self._pi_state_path: Path | None = None
+        self._pi_effort_path: Path | None = None
+        self._pi_startup_info = ""
+        self._pi_permission_tool_calls: set[str] = set()
         self._process: asyncio.subprocess.Process | None = None
         self._pid: int | None = None
         self._start_time: str | None = None  # start identity for PID-recycle detection
@@ -5339,7 +5345,10 @@ class AcpClient:
         if self.backend not in ACP_BACKENDS_MEMBER_DISPATCH:
             return servers
         # circular import: members' module graph is heavy; resolved at call time.
-        from kiro_crew.members import is_member_session_key, member_dispatch_session_server
+        from kiro_crew.members import (
+            is_member_session_key,
+            member_dispatch_session_server,
+        )
 
         if not is_member_session_key(self._session_key):
             return servers
@@ -7036,11 +7045,34 @@ class AcpClient:
         """Set a session config option (e.g. effort level) via session/set_config_option."""
         if not self._session_id:
             raise AcpError("Cannot set config option before session is initialized")
-        req_id = await self._send_request(
-            "session/set_config_option",
-            {"sessionId": self._session_id, "configId": config_id, "value": value},
-        )
-        await self._wait_for_response(req_id, timeout=10.0)
+        wire_value = value
+        pi_effort = self._is_pi and config_id == "thought_level"
+        if pi_effort:
+            # pi-acp 0.0.33 accepts only through xhigh, while current Pi can
+            # serve a distinct max level. The inner launcher proxy translates
+            # this compatibility value back to max using Pi's own model map.
+            _set_pi_requested_effort(self._pi_effort_path, value)
+            if value == "max":
+                wire_value = "xhigh"
+        try:
+            req_id = await self._send_request(
+                "session/set_config_option",
+                {
+                    "sessionId": self._session_id,
+                    "configId": config_id,
+                    "value": wire_value,
+                },
+            )
+            await self._wait_for_response(req_id, timeout=10.0)
+        except BaseException:
+            if pi_effort:
+                _clear_pi_requested_effort(self._pi_effort_path)
+            raise
+
+    async def delete_session(self, session_id: str) -> None:
+        """Delete an opaque Pi transcript through the adapter's ACP endpoint."""
+        request_id = await self._send_request(METHOD_SESSION_DELETE, {"sessionId": session_id})
+        await self._wait_for_response(request_id, timeout=10.0)
 
     # ── Dynamic Config from ACP ──
 
@@ -7110,6 +7142,11 @@ class AcpClient:
         selector is consumed here.
         """
         logger.debug("_store_session_config keys: %s", list(resp.keys()))
+        if self._is_pi:
+            meta = resp.get("_meta")
+            pi_meta = meta.get("piAcp") if isinstance(meta, dict) else None
+            startup = pi_meta.get("startupInfo") if isinstance(pi_meta, dict) else None
+            self._pi_startup_info = startup if isinstance(startup, str) else ""
         config_options = resp.get("configOptions")
         if isinstance(config_options, list):
             self._acp_config_options = config_options
@@ -7191,7 +7228,9 @@ class AcpClient:
         levels = self.get_valid_effort_levels()
         if levels:
             # circular import: chat_persistence → dashboard → session → acp.client
-            from kiro_crew.dashboard.chat_persistence import update_reasoning_effort_values
+            from kiro_crew.dashboard.chat_persistence import (
+                update_reasoning_effort_values,
+            )
 
             update_reasoning_effort_values(levels)
 
@@ -7229,7 +7268,11 @@ class AcpClient:
         it differently; a hard-coded spelling returns an empty list there, which
         every caller reads as "this model has no effort levels".
         """
-        effort_option = effort_config_option_id(self.backend)
+        if self._is_pi:
+            levels = _pi_thinking_levels(_read_pi_state(self._pi_state_path), self._model)
+            if levels is not None:
+                return levels
+        effort_option = "thought_level" if self._is_pi else effort_config_option_id(self.backend)
         for opt in self._acp_config_options:
             if not isinstance(opt, dict):
                 continue
@@ -7257,10 +7300,8 @@ class AcpClient:
         ``self._sandbox_cleanup``).
         """
         if self._sandbox_cleanup:
-            try:
+            with suppress(OSError):
                 os.remove(self._sandbox_cleanup)
-            except OSError:
-                pass
             self._sandbox_cleanup = None
 
     async def _discard_bound_workspace(self) -> None:
@@ -7894,6 +7935,19 @@ class AcpClient:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
+        if self._is_pi:
+            try:
+                await asyncio.to_thread(
+                    prepare_pi_environment,
+                    env,
+                    agent=self._agent,
+                    session_key=self._session_key or "",
+                )
+                self._pi_mcp_config_path = Path(env["KIROCREW_PI_MCP_CONFIG"])
+                self._pi_state_path = Path(env[PI_STATE_ENV])
+                self._pi_effort_path = Path(env[PI_EFFORT_ENV])
+            except (OSError, RuntimeError) as exc:
+                raise AcpError(str(exc)) from exc
         env["PATH"] = augmented_path(env.get("PATH", ""))
         if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
             # Dormant seam (see _spawn docstring): the adapter's SDK needs a
@@ -8048,6 +8102,9 @@ class AcpClient:
             self._discard_sandbox_cleanup()
             raise
         self._pid = self._process.pid
+        process = self._process
+        pid = self._pid
+        assert process is not None and pid is not None
         # Minted with the process it names, random rather than pid-derived: a
         # pid can be reused by the OS, and the start-time disambiguator is not
         # readable on every platform, so equality on a fresh random id is the
@@ -8081,7 +8138,7 @@ class AcpClient:
                 lambda: asyncio.get_running_loop().run_in_executor(
                     subprocess_executor(),
                     functools.partial(
-                        finish_suspended_spawn, self._process, self._pid, label=_spawn_label
+                        finish_suspended_spawn, process, pid, label=_spawn_label
                     ),
                 )
             )
@@ -8272,10 +8329,8 @@ class AcpClient:
         # Close pipes first to unblock any pending reads/writes
         for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
             if pipe:
-                try:
+                with suppress(Exception):
                     pipe.close()  # type: ignore[union-attr]
-                except Exception:
-                    pass
 
         # Snapshot child PIDs before killing — children in different
         # process groups survive killpg (kiro-cli-chat acp leak).
@@ -8294,7 +8349,7 @@ class AcpClient:
             )
 
         if not force:
-            try:
+            with suppress(ProcessLookupError, OSError):
                 # POSIX: killpg(getpgid) tears down the whole group (setsid at
                 # spawn). Windows: taskkill /T /F walks the child tree instead
                 # (no process groups) — platform_compat dispatches both. Async
@@ -8302,8 +8357,6 @@ class AcpClient:
                 # subprocess_executor so the event loop keeps ticking while
                 # taskkill.exe runs.
                 await platform_compat.kill_process_tree_async(pid, platform_compat.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
             try:
                 await asyncio.wait_for(self._process.wait(), timeout=3.0)
                 # _kill_escaped_children -> _is_our_child -> _get_start_time/
@@ -8316,10 +8369,8 @@ class AcpClient:
         try:
             await platform_compat.kill_process_tree_async(pid, platform_compat.SIGKILL)
         except (ProcessLookupError, OSError):
-            try:
+            with suppress(ProcessLookupError, OSError):
                 self._process.kill()
-            except (ProcessLookupError, OSError):
-                pass
         await _loop.run_in_executor(subprocess_executor(), _kill_escaped_children, merged)
         try:
             await asyncio.wait_for(self._process.wait(), timeout=1.0)
@@ -8509,12 +8560,15 @@ class AcpClient:
         if self._process:
             for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
                 if pipe:
-                    try:
+                    with suppress(Exception):
                         pipe.close()  # type: ignore[union-attr]
-                    except Exception:
-                        pass
         # Clean up sandbox temp files (macOS seatbelt profile)
         self._discard_sandbox_cleanup()
+        pi_mcp_config_path = getattr(self, "_pi_mcp_config_path", None)
+        if pi_mcp_config_path is not None:
+            with suppress(OSError):
+                pi_mcp_config_path.unlink()
+            self._pi_mcp_config_path = None
         # The settings.local.json THIS session seeded is removed by
         # _discard_claude_settings_seed, which every caller awaits in the `try` of
         # the `finally` that reaches here -- it is async because the ownership hash,
@@ -8542,6 +8596,12 @@ class AcpClient:
         # lets installing or toggling a server take effect on the next session, so
         # a replacement process must not inherit this one's snapshot.
         self._session_mcp_cache = None
+        for path in (self._pi_state_path, self._pi_effort_path):
+            if path is not None:
+                with suppress(OSError):
+                    path.unlink()
+        self._pi_state_path = None
+        self._pi_effort_path = None
         self._session_mcp_snapshot = None
         # Same per-spawn freshness rule as the array above: an edited spec must be
         # what the next session's guard judges, not this one's.
@@ -8605,7 +8665,11 @@ class AcpClient:
         # mechanisms key off these files) — the memory-leak this guards against.
         # These untrack helpers live in kiro_crew.session, which imports this
         # module transitively, so they must be imported inline.
-        from kiro_crew.session import _untrack_child_pids, _untrack_pid, _untrack_session_pid
+        from kiro_crew.session import (
+            _untrack_child_pids,
+            _untrack_pid,
+            _untrack_session_pid,
+        )
         from kiro_crew.session_pid import _pid_gone_or_unmanaged
 
         if saved_child_pids:
@@ -9342,9 +9406,8 @@ class AcpClient:
         self._last_activity = time.monotonic()
 
     async def _read_message(self, timeout: float = _READ_TIMEOUT) -> JsonRpcMessage | None:
-        if self._cancelled:
-            if time.monotonic() - self._cancel_ts > self._cancel_grace_secs:
-                raise AcpError("Cancel grace window exceeded; agent unresponsive")
+        if self._cancelled and time.monotonic() - self._cancel_ts > self._cancel_grace_secs:
+            raise AcpError("Cancel grace window exceeded; agent unresponsive")
 
         if self._buffer:
             return self._buffer.popleft()
@@ -9385,15 +9448,16 @@ class AcpClient:
             # EOF — process likely died or closing. Check and avoid busy-loop.
             if self._process and self._process.returncode is not None:
                 if self._stderr_task and not self._stderr_task.done():
-                    try:
+                    with suppress(Exception, asyncio.CancelledError):
                         await asyncio.wait_for(self._stderr_task, timeout=0.5)
-                    except (Exception, asyncio.CancelledError):
-                        pass
                 stderr_tail = (
                     "; ".join(self._stderr_lines) if self.memory_mode == "persistent" else ""
                 )
                 if stderr_tail:
-                    from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+                    from kiro_crew.security import (
+                        redact_credentials,
+                        redact_exfiltration_urls,
+                    )
 
                     stderr_tail, _ = redact_exfiltration_urls(stderr_tail)
                     stderr_tail, _ = redact_credentials(stderr_tail)
@@ -11626,6 +11690,8 @@ class AcpClient:
             text = content.get("text")
             content_type = content.get("type", "text")
             is_thinking = content_type in ("thinking", "reasoning")
+            if self._is_pi and text == self._pi_startup_info:
+                return None, False
             return text, is_thinking
         if kind == UPDATE_AGENT_THOUGHT_CHUNK:
             content = update.get("content", {})
@@ -11683,7 +11749,7 @@ class AcpClient:
         if tokens is not None:
             self.last_prompt_stats.apply_prompt_token_usage(*tokens)
 
-    async def _maybe_audit_tool_call(self, tool_event: "AcpEvent") -> None:
+    async def _maybe_audit_tool_call(self, tool_event: AcpEvent) -> None:
         """Emit a per-tool-call SEL audit for clients with no external audit loop.
 
         App/worker-pool clients (code-review-sage, knowledge llm_pool) run tools
@@ -11735,7 +11801,7 @@ class AcpClient:
         except Exception:
             logger.warning("ACP-layer SEL audit failed", exc_info=True)
 
-    async def _maybe_note_skill_read(self, tool_event: "AcpEvent") -> None:
+    async def _maybe_note_skill_read(self, tool_event: AcpEvent) -> None:
         """Resolve which skills a tool call is about to read, crediting later.
 
         Lives here because the ACP layer is the one place that sees EVERY
@@ -11792,7 +11858,7 @@ class AcpClient:
         if keys and tool_id:
             self._pending_skill_reads[tool_id] = keys
 
-    def _maybe_credit_skill_read(self, tool_result_event: "AcpEvent") -> None:
+    def _maybe_credit_skill_read(self, tool_result_event: AcpEvent) -> None:
         """Credit the reads resolved for a tool call that has now completed.
 
         Only a ``status == "completed"`` result (``tool_final``) credits, so a
@@ -11814,7 +11880,7 @@ class AcpClient:
         except Exception:
             logger.warning("skill-read credit failed", exc_info=True)
 
-    async def _maybe_fire_pre_tool_hooks(self, tool_event: "AcpEvent") -> None:
+    async def _maybe_fire_pre_tool_hooks(self, tool_event: AcpEvent) -> None:
         """Fire the PreToolUse HOOK ENGINE for a tool_call, for audit-source clients.
 
         App/worker-pool clients (code-review-sage, knowledge llm_pool) run their
@@ -11870,7 +11936,7 @@ class AcpClient:
         except Exception:
             logger.warning("ACP-layer PreToolUse hook failed", exc_info=True)
 
-    async def _maybe_fire_post_tool_hooks(self, tool_result_event: "AcpEvent") -> None:
+    async def _maybe_fire_post_tool_hooks(self, tool_result_event: AcpEvent) -> None:
         """Fire the PostToolUse HOOK ENGINE for a tool RESULT, for audit-source clients.
 
         Companion to ``_maybe_fire_pre_tool_hooks``. The Pre-vs-Post split is
@@ -12378,7 +12444,7 @@ class AcpClient:
             return []
         results: list[AcpEvent] = []
         try:
-            with open(jsonl_path, "r") as f:
+            with open(jsonl_path) as f:
                 f.seek(self._jsonl_pos)
                 while True:
                     line = f.readline()
@@ -12451,6 +12517,23 @@ class AcpClient:
             if msg.id is not None:
                 self._pi_gate_request_tool[str(msg.id)] = envelope["toolCallId"]
 
+    def _permission_tool_call_id(self, tool_call: dict) -> str:
+        """Return a trusted Pi tool id, refusing synthetic UI confirmations."""
+        raw_id = tool_call.get("toolCallId", "")
+        if not self._is_pi:
+            return raw_id if isinstance(raw_id, str) else ""
+        raw_input = tool_call.get("rawInput")
+        message = raw_input.get("message", "") if isinstance(raw_input, dict) else ""
+        prefix = "kirocrew-tool-call:"
+        if not isinstance(message, str) or not message.startswith(prefix):
+            raise AcpError("Pi permission request has no trusted tool-call correlation")
+        candidate = message.removeprefix(prefix)
+        known = candidate in self._observed_tool_calls or candidate in self._tool_call_params
+        if not known or candidate in self._pi_permission_tool_calls:
+            raise AcpError("Pi permission request has an unknown or reused tool-call correlation")
+        self._pi_permission_tool_calls.add(candidate)
+        return candidate
+
     def _build_permission_event(self, msg: JsonRpcMessage) -> AcpEvent:
         """Build one permission event through the transport-shared parser.
 
@@ -12459,11 +12542,35 @@ class AcpClient:
         classification distinguishable from a cache miss and preserves cached
         raw parameters across repeated permission frames for the same tool call.
         """
+        permission_msg = msg
+        observed: tuple[str, str] | None = None
+        if self._is_pi:
+            params = msg.params if isinstance(msg.params, dict) else {}
+            tool_call = params.get("toolCall", {})
+            tool_call = tool_call if isinstance(tool_call, dict) else {}
+            tool_call_id = self._permission_tool_call_id(tool_call)
+            observed = self._observed_tool_calls.get(tool_call_id)
+            if observed is not None and tool_call_id not in self._tool_call_params:
+                raw_params = {"command": observed[0]}
+                rendered_input = json.dumps(raw_params, indent=2)
+                safe_input = redact_text(rendered_input)
+                self._tool_call_params[tool_call_id] = raw_params
+                self._tool_call_inputs[tool_call_id] = safe_input
+                self._tool_call_input_redacted[tool_call_id] = safe_input != rendered_input
+                self._tool_call_is_shell[tool_call_id] = observed[1] == "execute"
+            permission_msg = JsonRpcMessage(
+                id=msg.id,
+                method=msg.method,
+                result=msg.result,
+                error=msg.error,
+                params={**params, "toolCall": {**tool_call, "toolCallId": tool_call_id}},
+                fanout_no_owner=msg.fanout_no_owner,
+            )
         # Compat-shaped like the caches below: an instance built without ``__init__``
         # has no nonce, and no nonce means no dialog is ever read as a gate envelope.
         _gate_nonce = getattr(self, "_pi_gate_nonce", "")
         event, recorded = build_permission_event(
-            msg,
+            permission_msg,
             tool_input_cache=self._tool_call_inputs,
             # ``AcpClient`` predates this same-key provenance cache.  Normal
             # instances initialize it in __init__, while legacy/minimal
@@ -12485,6 +12592,8 @@ class AcpClient:
             # ``__init__`` has no nonce, and no nonce means no envelope is trusted.
             gate_envelope_nonce=_gate_nonce or None,
         )
+        if observed is not None:
+            event.title, event.tool_kind = observed
         if recorded is not None:
             self._permission_options[event.request_id] = recorded
         self._note_pi_gate_asked(msg)
@@ -12535,10 +12644,8 @@ class AcpClient:
         if isinstance(metering, list):
             for entry in metering:
                 if isinstance(entry, dict) and entry.get("unit") == "credit":
-                    try:
+                    with suppress(TypeError, ValueError):
                         self.last_prompt_stats.credits += float(entry.get("value", 0) or 0)
-                    except (TypeError, ValueError):
-                        pass
 
     def _handle_compaction_status(self, msg: JsonRpcMessage) -> None:
         """Log a ``_kiro.dev/compaction/status`` notification and, on

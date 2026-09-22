@@ -1907,6 +1907,23 @@ describe('Alt+Shift+S/X model cycling via React Query cache', () => {
 })
 
 describe('Kiro credits pill', () => {
+  beforeEach(async () => {
+    // First-run tests earlier in the file mock themeBoot with mockResolvedValueOnce
+    // (onboarded:false). If one ends before its App consumes that once, the value
+    // leaks into the queue and THIS test's App consumes it — mounting the first-run
+    // tour (with its dialogs) instead of the topbar credits pill. Reset the mock to
+    // the default onboarded contract so a leaked once can't shift the boot state.
+    const { api } = await import('../api/client')
+    vi.mocked(api.themeBoot).mockReset().mockResolvedValue({
+      mode: '',
+      color: '',
+      onboarded: true,
+      import_onboarded: true,
+    } as never)
+    localStorage.setItem('mc-onboarded', '1')
+    localStorage.setItem('mc-import-onboarded', '1')
+  })
+
   it('shows a checking/loading state until usage resolves with plan data', async () => {
     const { api } = await import('../api/client')
     vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: {} } as never)

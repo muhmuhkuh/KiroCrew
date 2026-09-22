@@ -1819,6 +1819,18 @@
         "loading": "加载中…"
       }
     },
+    "goalOwner": {
+      "manifest": {
+        "configuration_1": "启用 Goal Owner，创建包含完成定义的目标，然后通过应用 API 查看或暂停它。",
+        "description": "为您选择自主运行的目标提供有界、可恢复的项目负责人。",
+        "display_name": "目标负责人",
+        "highlight_1": "每个用户目标一条持久记录",
+        "highlight_2": "带明确预算的有界唤醒",
+        "highlight_3": "暂停和恢复不会丢失进度",
+        "highlight_4": "所有者会话与 cron 可安全从崩溃中恢复",
+        "use_case_1": "通过有界的负责人周期运行目标，同时由人控制范围、预算和完成证据。"
+      }
+    },
     "issueRadar": {
       "api": {
         "assignees_changed_elsewhere": "自你加载该 issue 后，指派者已在别处被修改。",
@@ -2242,6 +2254,7 @@
         "https_github_com_owner_repo": "https://github.com/<owner>/<repo>",
         "https_gitlab_com_group_project": "https://gitlab.com/<group>/<project>",
         "issue_radar_reads": "Issue Radar 通过你自己的",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
         "last_contribution": "你上次的贡献：{{when}}",
         "let_s_connect_a_repo": "先连接一个仓库",
         "loading_your_repos": "正在加载你的仓库…",
@@ -2257,6 +2270,10 @@
         "through_your_own": "读取",
         "you_contributed_to": "你参与贡献过",
         "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo",
         "repositories_in_your_organization": "组织中的仓库",
         "no_repositories_in_your_organization_paste_a_url": "组织中没有仓库。请在下方粘贴 URL 以连接一个。",
         "azure_also_needs_the_devops_extension": "Azure DevOps 还需要其专用的 CLI 扩展，使用下面的命令安装一次即可。"
@@ -2274,6 +2291,7 @@
         "format": {
           "last_update": "最后更新",
           "number": "编号",
+          "priority": "优先级",
           "crew_sort_status": "状态",
           "crew_sort_name": "名称",
           "crew_sort_created": "已创建"
@@ -11010,6 +11028,7 @@
         "installed_check_again_to_use": "已安装在本机。点击“重新检查”以识别它。如果这行仍然出现，请在 Settings > About 中重启 {{productName}}。",
         "kas_kiro_agent": "KAS (kiro-agent)",
         "kiro_cli": "Kiro CLI",
+        "pi": "Pi",
         "loading_configuration": "正在加载配置…",
         "mcp_concern_auto_approve": "代理配置文件设定的自动批准规则 — {{name}} 不会套用它们",
         "mcp_concern_denied_tools": "你关掉的工具——在这里仍然可用",

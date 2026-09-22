@@ -343,8 +343,9 @@ def read_repos(root: Path | None = None) -> list[dict]:
     # taking the page down rather than showing one bad row.
     return [_redact_repo(r) for r in repos
             if isinstance(r, dict)
-            and isinstance(r.get("owner"), str) and r["owner"]
-            and isinstance(r.get("repo"), str) and r["repo"]]
+            and isinstance(r.get("owner"), str)
+            and isinstance(r.get("repo"), str) and r["repo"]
+            and (r["owner"] or str(r.get("provider") or "github").lower() == "gitlab")]
 
 
 def _redact_repo(row: dict) -> dict:
@@ -376,27 +377,45 @@ def _write_repos(repos: list[dict], root: Path | None = None) -> Path:
     return path
 
 
-def _same(a: dict, b_owner: str, b_repo: str) -> bool:
-    """Repo identity is case-insensitive on GitHub, so compare that way."""
+def _same(a: dict, b_owner: str, b_repo: str, *, provider: str = "github",
+          host: str = "github.com") -> bool:
+    """Compare the full repo identity, including provider and host."""
+    a_provider = str(a.get("provider") or "github").lower()
+    a_host = str(a.get("host") or "github.com").lower()
+    if a_provider != provider.lower() or a_host != host.lower():
+        return False
+    if a_provider == "gitlab":
+        # GitLab project paths are case-sensitive; preserving that distinction
+        # prevents a case-variant URL from deleting or aliasing another project.
+        return (str(a.get("owner", "")) == b_owner
+                and str(a.get("repo", "")) == b_repo)
     return (str(a.get("owner", "")).lower() == b_owner.lower()
             and str(a.get("repo", "")).lower() == b_repo.lower())
 
 
-def add_repo(owner: str, repo: str, root: Path | None = None) -> list[dict]:
+def add_repo(owner: str, repo: str, root: Path | None = None, *,
+             provider: str = "github", host: str = "github.com") -> list[dict]:
     """Pin a repo (idempotent, most-recent first). Returns the new list."""
     with _REPOS_LOCK:
-        repos = [r for r in read_repos(root) if not _same(r, owner, repo)]
-        repos.insert(0, {
-            "owner": owner, "repo": repo, "full_name": f"{owner}/{repo}",
+        repos = [r for r in read_repos(root)
+                 if not _same(r, owner, repo, provider=provider, host=host)]
+        row = {
+            "owner": owner, "repo": repo,
+            "full_name": f"{owner}/{repo}" if owner else repo,
             "added_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        })
+        }
+        if provider != "github" or host != "github.com":
+            row.update({"provider": provider, "host": host})
+        repos.insert(0, row)
         _write_repos(repos, root)
         return repos
 
 
-def remove_repo(owner: str, repo: str, root: Path | None = None) -> list[dict]:
+def remove_repo(owner: str, repo: str, root: Path | None = None, *,
+                provider: str = "github", host: str = "github.com") -> list[dict]:
     """Unpin a repo. Returns the new list."""
     with _REPOS_LOCK:
-        repos = [r for r in read_repos(root) if not _same(r, owner, repo)]
+        repos = [r for r in read_repos(root)
+                 if not _same(r, owner, repo, provider=provider, host=host)]
         _write_repos(repos, root)
         return repos

@@ -49,7 +49,7 @@ isolation admission. See [the memory contract](memory-skills-hooks.md).
             └──────┬──────┘
                    │  backend id from agent_sdk/backends.py
         ┌──────────┼──────────┬──────────┐
-     kiro-cli   claude-acp   KAS      codex-acp
+  kiro-cli   claude-acp   KAS   codex-acp   pi-acp
 ```
 
 `agent_sdk/backends.py` is the selection authority: it defines the ids, the membership

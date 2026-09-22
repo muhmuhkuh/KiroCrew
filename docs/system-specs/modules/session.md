@@ -1,5 +1,7 @@
 # Session Manager Module
 
+Warm-pool entries are available only to ACP-runtime backends. Process-per-session adapters, including Pi, keep a zero-sized pool at startup and provider-factory reload. Pi opaque resume IDs persist under the `pi` provider label and are never translated into Kiro session IDs.
+
 ## Overview
 
 Maps thread keys to LLMProvider instances (`session.py`). Each thread gets
@@ -1261,6 +1263,7 @@ triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
 
 **Lifecycle:**
+
 - `get_or_create()`: looks up mapping → if found and `.json` file exists,
   sets `resume_session_id` on the ACP client and skips warm pool. After
   `ensure_ready()`, saves the new `session_key → session_id` mapping.
@@ -1708,6 +1711,7 @@ attempts logs a single grep-able WARNING before migrating to Phase 2.
 ### Cross-Provider Continuity
 
 kiro session IDs and the removed provider's session IDs are NOT interchangeable:
+
 - kiro: arbitrary string, stored in `~/.kiro/sessions/cli/<sid>.{json,jsonl}`
 - removed provider: UUID v4, stored in `~/.claude/projects/<encoded-cwd>/<sid>.jsonl`
 
@@ -1720,6 +1724,7 @@ never via session_id translation.
 when a switch is detected (stored SID exists AND providers differ).
 
 **Behavior on switch:**
+
 1. `resume_sid` is discarded (not passed to the new provider process)
 2. `SessionMap.clear_sid(key)` removes the stale SID from persistent state
 3. `_Session.provider_switch_replay = True` flags the session for replay
@@ -1868,6 +1873,7 @@ channels link through the generic ChannelLink mirror map (see
 compatibility.
 
 **API:**
+
 - `SessionManager.set_slack_link(key, thread_ts, channel_id)` — persists to session map
 - `SessionManager.get_slack_link(key) -> (thread_ts | None, channel_id | None)`
 - `SessionManager.get_session_for_thread(thread_ts) -> key | None` — reverse lookup,
@@ -1920,6 +1926,7 @@ does not clear it, so code spanning an await can detect a turn that started and 
 inside that interval.
 
 **Slash commands** (`slack/events.py`):
+
 - `/kirocrew sessions` — lists active sessions with Slack link status
 - `/kirocrew sessions resume <key>` — resumes a session in the current thread
 
@@ -2150,6 +2157,7 @@ only when a `mirror` `ChannelLink` exists on the dashboard-side key:
 ```
 
 **API:**
+
 - `SessionManager.set_mirror_link(key, link)` / `clear_mirror_link(key)` /
   `get_mirror_link(key)` — persist/read the outbound `ChannelLink` (Slack routes
   to `set_slack_link` so its reverse index stays intact).
@@ -2436,12 +2444,14 @@ Walking the process tree would always conclude they are orphaned.  Storing the
 parent PID explicitly avoids this.
 
 **Safety**:
+
 - Zero false positives — only kills PIDs we tracked, only when the specific
   parent session that spawned them is confirmed dead
 - Dead children are silently pruned from the file
 - Bare PID lines (kiro-cli parents) are ignored by MCP cleanup
 
 **Invocation**:
+
 - **At startup**: `cleanup_orphaned_sessions()` calls it after PID-file cleanup
 - **Periodic**: `_cleanup_loop()` calls it alongside idle session expiry (~60s)
 - **At shutdown**: `cleanup_orphaned_sessions()` on signal/exit
@@ -2654,7 +2664,8 @@ sequenceDiagram
 The periodic sweep of `kiro_session_pids.txt` (which kills tracked kiro-cli
 PIDs no longer in `self._sessions`) builds its active set as the union of
 `_collect_active_pids(self._sessions)` + `_pool_pids()` + `_in_flight_pids()`
-+ `_companion_runtime_pids()`, re-checked against the same union in phase 2
+
+- `_companion_runtime_pids()`, re-checked against the same union in phase 2
 before any kill. `_companion_runtime_pids()` returns the live PIDs of
 `self._subagent_runtimes` (companion runtimes multiplexing a parent session's
 subagents) and `self._bg_runtime` (the multiplexed `_bg` runtime), each guarded
@@ -3040,7 +3051,7 @@ Tests: `test/test_session_health.py`, `test/test_sessions_health_cache.py`,
 | TaskRunner decompose | `taskrunner:{task_id}:decompose` | Seconds | Own kiro-cli |
 | TaskRunner review | `taskrunner:{task_id}:review` | Seconds | Own kiro-cli |
 | TaskRunner acceptance | `taskrunner:{task_id}:acceptance` | Seconds | Own kiro-cli |
-| Warm spare | _(in pool queue)_ | Until assigned | Pre-started kiro-cli |
+| Warm spare | *(in pool queue)* | Until assigned | Pre-started kiro-cli |
 
 **Cold-start admission**: `SessionManager._start_sem` bounds provider starts local
 to one manager. The narrower common runtime chokepoint adds a gateway-wide

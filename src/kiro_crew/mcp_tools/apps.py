@@ -58,8 +58,8 @@ def schemas() -> list[dict[str, Any]]:
                     "number": {"type": "integer", "description": "Issue or PR number"},
                     "provider": {
                         "type": "string",
-                        "enum": ["github", "gitlab"],
-                        "description": "Forge the repo lives on (default github)",
+                        "enum": ["github", "gitlab", "jira"],
+                        "description": "Issue tracker or forge the item lives on (default github)",
                     },
                     "host": {
                         "type": "string",

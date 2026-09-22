@@ -1930,6 +1930,18 @@
         "loading": "загрузка..."
       }
     },
+    "goalOwner": {
+      "manifest": {
+        "configuration_1": "Включите Goal Owner, создайте цель с определением готовности, затем просматривайте или приостанавливайте её через API приложения.",
+        "description": "Ограниченный возобновляемый Project Owner для целей, которые вы выбираете запускать автономно.",
+        "display_name": "Владелец целей",
+        "highlight_1": "Одна долговечная запись для каждой цели пользователя",
+        "highlight_2": "Ограниченные пробуждения с явными бюджетами",
+        "highlight_3": "Пауза и возобновление без потери прогресса",
+        "highlight_4": "Отказоустойчивая сверка сессии владельца и cron",
+        "use_case_1": "Запускайте цель в ограниченных циклах владельца, сохраняя контроль человека над областью, бюджетами и доказательствами завершения."
+      }
+    },
     "issueRadar": {
       "api": {
         "assignees_changed_elsewhere": "Исполнители были изменены в другом месте после загрузки этой задачи.",
@@ -2392,6 +2404,7 @@
         "https_github_com_owner_repo": "https://github.com/<owner>/<repo>",
         "https_gitlab_com_group_project": "https://gitlab.com/<group>/<project>",
         "issue_radar_reads": "Issue Radar читает",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
         "last_contribution": "Твой последний вклад: {{when}}",
         "let_s_connect_a_repo": "Подключим репозиторий",
         "loading_your_repos": "Загрузка ваших репозиториев…",
@@ -2407,6 +2420,10 @@
         "through_your_own": "через ваш собственный",
         "you_contributed_to": "Вы участвовали в",
         "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo",
         "repositories_in_your_organization": "Репозитории вашей организации",
         "no_repositories_in_your_organization_paste_a_url": "В вашей организации нет репозиториев. Вставьте URL ниже, чтобы подключить один.",
         "azure_also_needs_the_devops_extension": "Azure DevOps также требует собственное расширение CLI — установите его один раз командой ниже."
@@ -2424,6 +2441,7 @@
         "format": {
           "last_update": "Последнее обновление",
           "number": "Номер",
+          "priority": "Приоритет",
           "crew_sort_status": "Статус",
           "crew_sort_name": "Название",
           "crew_sort_created": "Создано"
@@ -11481,6 +11499,7 @@
         "installed_check_again_to_use": "Установлен на этой машине. Нажмите «Проверить снова», чтобы он был учтён. Если строка осталась, перезапустите {{productName}} в Settings > About.",
         "kas_kiro_agent": "KAS (kiro-agent)",
         "kiro_cli": "Kiro CLI",
+        "pi": "Pi",
         "loading_configuration": "Загрузка конфигурации…",
         "mcp_concern_auto_approve": "Правила автоодобрения, заданные в файле конфигурации агента — {{name}} их не применяет",
         "mcp_concern_denied_tools": "Инструменты, которые ты отключил — здесь они остаются доступными",

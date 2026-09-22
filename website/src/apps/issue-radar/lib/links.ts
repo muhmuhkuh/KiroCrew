@@ -33,16 +33,16 @@ import { type ItemKind, type RepoRef } from '../api'
  * below — `providerKeyOf` maps anything else (an absent provider on a legacy
  * record, a corrupted config entry) onto `github`, which is what such a record
  * actually is. */
-type ProviderKey = 'github' | 'gitlab' | 'azure'
+type ProviderKey = 'github' | 'gitlab' | 'azure' | 'jira'
 
 /** Which provider's grammar a ref follows.
  *
- * Exported because `refLinks` PARSES the same three grammars and must dispatch on
- * exactly the same answer this module builds with — two independent notions of
- * "is this Azure" would let a link be built in one shape and parsed in another. */
+ * Exported because `refLinks` PARSES the same provider grammars and must dispatch
+ * on exactly the same answer this module builds with — two independent notions of
+ * a provider would let a link be built in one shape and parsed in another. */
 export function providerKeyOf(ref?: Pick<RepoRef, 'provider'>): ProviderKey {
   const p = ref?.provider
-  return p === 'gitlab' || p === 'azure' ? p : 'github'
+  return p === 'gitlab' || p === 'azure' || p === 'jira' ? p : 'github'
 }
 
 /** Where a page hangs off: the repository's own path, or the account/project
@@ -184,6 +184,20 @@ const PROVIDERS: Record<ProviderKey, ProviderDescriptor> = {
     membersScope: 'project',
     cliChangeNoun: 'pr',
   },
+  jira: {
+    // Jira has no public default tenant. A connected ref always carries its
+    // allowlisted host, and the connect panel does not build Jira shorthand URLs.
+    defaultHost: '',
+    repoPath: 'browse/{owner}',
+    pageNest: null,
+    changeSegment: 'browse',
+    issuesSegment: 'browse',
+    issuesScope: 'project',
+    itemSegment: null,
+    membersPath: 'browse/{owner}',
+    membersScope: 'project',
+    cliChangeNoun: '',
+  },
 }
 
 /** The table row for a ref's provider.
@@ -210,6 +224,11 @@ function descriptorOf(ref?: Pick<RepoRef, 'provider'>): ProviderDescriptor {
  * wrong link, which is worse than a type error. */
 export function isGitlab(ref?: Pick<RepoRef, 'provider'>): boolean {
   return providerKeyOf(ref) === 'gitlab'
+}
+
+/** True when a ref points at a Jira project (which has no pull requests). */
+export function isJira(ref?: Pick<RepoRef, 'provider'>): boolean {
+  return providerKeyOf(ref) === 'jira'
 }
 
 /** The ref's host, defaulting to the provider's public host for legacy records. */
@@ -245,6 +264,7 @@ function azureProject(ref: RepoRef): string {
 
 /** The repo's landing page on its own host. */
 export function repoWebUrl(ref: RepoRef): string {
+  if (isJira(ref)) return `https://${hostOf(ref)}/browse/${ref.owner}`
   const path = descriptorOf(ref).repoPath
     .replace('{owner}', ref.owner)
     .replace('{repo}', ref.repo)
@@ -285,6 +305,7 @@ export function commitUrlFor(ref: RepoRef, sha: string): string {
  * segment (`_workitems/edit/<id>`), so both the scope and the path shape come
  * from the table rather than from a suffix appended to the repo URL. */
 export function issueUrlFor(ref: RepoRef, number: number): string {
+  if (isJira(ref)) return `https://${hostOf(ref)}/browse/${number}`
   const d = descriptorOf(ref)
   const tail = d.itemSegment ? `${d.itemSegment}/${number}` : `${number}`
   return scopedPath(ref, d.issuesScope, `${d.issuesSegment}/${tail}`)
@@ -292,6 +313,7 @@ export function issueUrlFor(ref: RepoRef, number: number): string {
 
 /** Link to the repo's issue / work-item list. */
 export function issuesUrlFor(ref: RepoRef): string {
+  if (isJira(ref)) return repoWebUrl(ref)
   const d = descriptorOf(ref)
   return scopedPath(ref, d.issuesScope, d.issuesSegment)
 }
@@ -301,6 +323,7 @@ export function issuesUrlFor(ref: RepoRef): string {
  * The path noun differs, not just the host: GitHub serves `/pull/<n>`, GitLab
  * `/-/merge_requests/<n>`, Azure DevOps `/_git/<repo>/pullrequest/<n>`. */
 export function changeUrlFor(ref: RepoRef, number: number): string {
+  if (isJira(ref)) return issueUrlFor(ref, number)
   return repoPagePath(ref, `${descriptorOf(ref).changeSegment}/${number}`)
 }
 
@@ -315,6 +338,7 @@ export function userUrlFor(ref: RepoRef, login: string): string {
 
 /** Link to the page where repo access is administered. */
 export function membersUrlFor(ref: RepoRef): string {
+  if (isJira(ref)) return `https://${hostOf(ref)}/plugins/servlet/project-config/${ref.owner}/summary`
   const d = descriptorOf(ref)
   return scopedPath(ref, d.membersScope, d.membersPath)
 }
@@ -362,6 +386,19 @@ export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
  * "Pull request" and "Pull Request" end up on adjacent screens.
  */
 export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
+  if (isJira(ref)) {
+    return {
+      ...providerTerms(),
+      changeRequest: 'issue',
+      changeRequestTitle: 'Issue',
+      changeRequestPlural: 'issues',
+      changeRequestPluralTitle: 'Issues',
+      changeRequestShort: 'issue',
+      sigil: '',
+      providerName: 'Jira',
+      cli: '',
+    }
+  }
   if (providerKeyOf(ref) === 'azure') {
     return {
       ...providerTerms(),

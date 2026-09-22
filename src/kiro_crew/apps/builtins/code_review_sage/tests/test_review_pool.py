@@ -11,6 +11,7 @@ import threading
 import unittest
 import unittest.mock
 from pathlib import Path
+from unittest.mock import patch
 
 from sage_lib import review_pool as rp
 from sage_lib.review_pool import (
@@ -433,8 +434,47 @@ class TestReviewAgentResolution(unittest.TestCase):
 
     def test_review_work_dir_is_app_root(self):
         wd = _review_work_dir()
-        self.assertIsNotNone(wd)
+        if wd is None:
+            self.fail("review work dir could not be resolved")
         self.assertTrue(wd.replace("\\", "/").endswith("apps/code-review-sage"))
+
+
+class TestPiReviewBackend(unittest.IsolatedAsyncioTestCase):
+    async def test_pi_ignores_legacy_kiro_agent_model_pin(self):
+        with patch.object(rp, "_configured_provider", return_value="pi"), \
+             patch.object(rp, "_get_review_settings", return_value={"model": None, "effort": ""}):
+            self.assertEqual(_reviewer_model("kirocrew"), "auto")
+
+    async def test_pi_ignores_legacy_bare_review_override(self):
+        with patch.object(rp, "_configured_provider", return_value="pi"), \
+             patch.object(rp, "_get_review_settings", return_value={"model": "claude-sonnet-4.6", "effort": ""}):
+            self.assertEqual(_reviewer_model("kirocrew"), "auto")
+
+    async def test_pi_review_uses_pi_acp_client(self):
+        seen = {}
+
+        class FakePiClient:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+            async def stream_events(self, task, timeout):
+                yield _ev(rp.EVENT_TEXT_CHUNK, text="reviewed")
+                yield _ev(rp.EVENT_COMPLETE, stop_reason="end_turn")
+
+            async def shutdown(self):
+                seen["shutdown"] = True
+
+        with patch.object(rp, "_configured_provider", return_value="pi"), \
+             patch.object(rp, "AcpClient", FakePiClient), \
+             patch.object(rp, "_get_review_settings", return_value={"model": None, "effort": ""}):
+            pool = ReviewPool(max_workers=1, work_dir="/tmp/x")
+            await pool.begin_batch()
+            self.assertEqual(await pool.send("review task"), "reviewed")
+            await pool.end_batch()
+
+        self.assertEqual(seen["acp_backend"], rp.ACP_BACKEND_PI)
+        self.assertEqual(seen["model"], "auto")
+        self.assertTrue(seen["shutdown"])
 
 
 class TestReviewEffort(unittest.TestCase):

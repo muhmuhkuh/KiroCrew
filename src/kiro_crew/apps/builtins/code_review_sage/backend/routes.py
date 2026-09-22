@@ -24,6 +24,7 @@ The ``/runs`` registry lets the page render live status and reconstruct it after
 navigating away (the backend owns the run, not ephemeral React state). Per-change
 detail still comes from the on-disk result records the driver writes.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -121,6 +122,7 @@ def _make_progress(run: dict):
     """Build a thread-safe progress callback the driver calls as each change moves
     through its phases (queued -> gating -> deep -> done/blocked/failed). Updates
     are copy-on-write so the /runs reader never sees a half-mutated dict."""
+
     def cb(change_id: str, phase: str, extra: dict | None = None) -> None:
         with _PROGRESS_LOCK:
             prog = dict(run.get("progress") or {})
@@ -129,6 +131,7 @@ def _make_progress(run: dict):
                 entry.update(extra)
             prog[str(change_id)] = entry
             run["progress"] = prog
+
     return cb
 
 
@@ -217,7 +220,8 @@ def _load_runs() -> None:
                 r["posting"] = False
                 r["post_error"] = (
                     "Posting was interrupted by a gateway restart — comments already "
-                    "delivered are marked as sent; post again to send the rest.")
+                    "delivered are marked as sent; post again to send the rest."
+                )
         _RUNS = data[:_RUNS_MAX]
     except Exception:  # pragma: no cover - defensive
         logger.warning("failed to load runs.json", exc_info=True)
@@ -375,7 +379,7 @@ def _claim_changes_under_lock(run: dict, changes: list[str]) -> list[str]:
             intended = head_shas.get(rkey, "")
             rec = index.get(rkey) or {}
             if intended and rec.get("head_sha") == intended:
-                continue   # a concurrent run already reviewed this exact head
+                continue  # a concurrent run already reviewed this exact head
         _INFLIGHT[rkey] = run_id
         _INFLIGHT[skey] = run_id
         _STAGE_OWNER[skey] = rkey
@@ -439,9 +443,11 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             # re-reviewing a head a just-finished run already delivered.
             changes = await asyncio.to_thread(_claim_changes_under_lock, run, changes)
             if not changes:
-                run["summary"] = {"ok": True, "changes": 0,
-                                  "note": "all PRs already reviewed or in flight "
-                                          "in a concurrent run"}
+                run["summary"] = {
+                    "ok": True,
+                    "changes": 0,
+                    "note": "all PRs already reviewed or in flight " "in a concurrent run",
+                }
                 run["status"] = "done"
                 return
             # Bridge the threaded driver to the async pool running on THIS (gateway)
@@ -482,9 +488,12 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                     runtime_error = str(exc)
             try:
                 summary = await asyncio.to_thread(
-                    review_driver.run_review, changes,  # type: ignore[attr-defined]
-                    dispatch=dispatch, progress=_make_progress(run),
-                    run_id=run_id, cancelled=lambda: run_id in _CANCELLED,
+                    review_driver.run_review,
+                    changes,  # type: ignore[attr-defined]
+                    dispatch=dispatch,
+                    progress=_make_progress(run),
+                    run_id=run_id,
+                    cancelled=lambda: run_id in _CANCELLED,
                     preflight=lambda: runtime_error,
                     # One reviewer at a time. Workers share the staging directory and
                     # each has shell and file tools, so two running at once means one
@@ -521,7 +530,8 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                 # same "claimed success, delivered nothing" failure.
                 run["status"] = "error"
                 run["error"] = _first_change_error(summary) or (
-                    "the reviewer produced no result record")
+                    "the reviewer produced no result record"
+                )
             else:
                 # "done" even if SOME changes failed — those are surfaced per change.
                 run["status"] = "done"
@@ -580,11 +590,10 @@ def _first_change_failure(summary: dict) -> tuple[str, str]:
             val = str(rec.get(key) or "").strip()
             if val:
                 sentence = {
-                    "no_review_recorded": "the reviewer finished but wrote no "
-                                          "findings record",
+                    "no_review_recorded": "the reviewer finished but wrote no " "findings record",
                     "review_record_incomplete": "the reviewer wrote a findings "
-                                                "record but never completed the "
-                                                "review",
+                    "record but never completed the "
+                    "review",
                     # Reason-level fallback only: a preflight-failed record
                     # carries the specific runtime message in its error fields,
                     # which the key order above prefers, and the run-level error
@@ -592,7 +601,7 @@ def _first_change_failure(summary: dict) -> tuple[str, str]:
                     # the reason itself always renders as a cause, never as a
                     # bare enum value.
                     "runtime_unavailable": "the reviewer never ran: its agent "
-                                           "runtime is unavailable on this host",
+                    "runtime is unavailable on this host",
                     "review_failed": "the review turn failed",
                 }.get(val, val)
                 return sentence, str(rec.get("skipped_reason") or "").strip()
@@ -614,14 +623,25 @@ def _run_headline(run: dict) -> str:
     if n == 1 and changes:
         link = str(changes[0])
         try:
+            platform = adapters.detect_platform(link)
+        except adapters.AdapterError:
+            platform = ""
+        if platform == "gitlab":
+            try:
+                host, ns, iid = adapters.gitlab_pr_ref(link)
+            except adapters.AdapterError:
+                return link
+            prefix = "" if host == "gitlab.com" else f"{host}/"
+            return f"{prefix}{ns}!{iid}"
+        try:
             host, owner, name, number = adapters.github_pr_ref(link)
         except adapters.AdapterError:
-            return link.rsplit("github.com/", 1)[-1]
+            return link
         # github.com stays host-less (the unambiguous common case); a GitHub
         # Enterprise PR carries its host so two instances' PRs read apart.
         prefix = "" if host == "github.com" else f"{host}/"
         return f"{prefix}{owner}/{name}/pull/{number}"
-    return f"{n} PR{'s' if n != 1 else ''}"
+    return f"{n} change{'s' if n != 1 else ''}"
 
 
 async def _notify_finished(run: dict) -> None:
@@ -655,7 +675,10 @@ async def _notify_finished(run: dict) -> None:
         # state.notify() is the never-raises legacy adapter over the notification
         # bus; run it off the event loop because its delivery sink persists to disk.
         await asyncio.to_thread(
-            state.notify, "agent", title, body,
+            state.notify,
+            "agent",
+            title,
+            body,
         )
     except Exception:  # pragma: no cover - best effort
         logger.debug("code-review-sage: run-finished notification failed", exc_info=True)
@@ -683,7 +706,10 @@ async def _handle_review(request: web.Request) -> web.Response:
 
     if not changes:
         return web.json_response(
-            {"code": "no_reviewable_changes", "error": "no reviewable changes — paste one or more PR/CR links"},
+            {
+                "code": "no_reviewable_changes",
+                "error": "no reviewable changes — paste one or more PR/CR links",
+            },
             status=400,
         )
 
@@ -704,9 +730,7 @@ async def _handle_review(request: web.Request) -> web.Response:
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
 
-    return web.json_response(
-        {"run_id": run["run_id"], "changes": changes, "status": "running"}
-    )
+    return web.json_response({"run_id": run["run_id"], "changes": changes, "status": "running"})
 
 
 def _posting_expected(rec: dict) -> int:
@@ -752,20 +776,23 @@ def _record_reviewed(run: dict) -> None:
     # silent-skip a PR that was never really delivered).
     changes = run.get("changes") or []
     cid_to_rkey = {
-        review_driver.change_id_for(u): review_driver.reviewed_key_for(u)
-        for u in changes
+        review_driver.change_id_for(u): review_driver.reviewed_key_for(u) for u in changes
     }
     reviewed_ok = {
         cid_to_rkey.get(r.get("change_id"))
         for r in per_change
-        if r.get("deep_reviewed") and r.get("post_ok")
+        if r.get("deep_reviewed")
+        and r.get("post_ok")
         and (r.get("posted_comments") or 0) >= _posting_expected(r)
     }
     reviewed_ok.discard(None)
     now = _now()
     rid = run.get("run_id", "")
-    entries = {rkey: {"head_sha": sha, "reviewed_at": now, "run_id": rid}
-               for rkey, sha in shas.items() if sha and rkey in reviewed_ok}
+    entries = {
+        rkey: {"head_sha": sha, "reviewed_at": now, "run_id": rid}
+        for rkey, sha in shas.items()
+        if sha and rkey in reviewed_ok
+    }
     if not entries:
         return
     try:
@@ -775,13 +802,14 @@ def _record_reviewed(run: dict) -> None:
 
 
 async def _list_repo_prs(repo: str) -> tuple[str, list[dict]]:
-    """Resolve host/owner/repo from a repo URL and enumerate its OPEN PRs (via
-    `gh`). Returns ``("<owner>/<repo>", prs)`` (host-qualified for a GitHub
-    Enterprise host). Raises ValueError for a bad URL and RuntimeError for a
-    `gh` failure (mapped to 400/502 by the handlers)."""
-    host, owner, name = adapters.parse_repo_ref(repo)  # raises on unknown host / no owner/repo
-    prs = await asyncio.to_thread(pipeline.list_open_prs, owner, name, host=host)
-    slug = f"{owner}/{name}" if host == "github.com" else f"{host}/{owner}/{name}"
+    """Resolve a GitHub or GitLab repo URL and enumerate its open changes."""
+    platform, host, owner, name = await asyncio.to_thread(adapters.parse_any_repo_ref, repo)
+    if platform == "gitlab":
+        prs = await asyncio.to_thread(pipeline.list_open_gitlab_mrs, owner, name, host=host)
+    else:
+        prs = await asyncio.to_thread(pipeline.list_open_prs, owner, name, host=host)
+    path = f"{owner}/{name}" if owner else name
+    slug = path if host in {"github.com", "gitlab.com"} else f"{host}/{path}"
     return slug, prs
 
 
@@ -790,11 +818,15 @@ async def _handle_repo_prs(request: web.Request) -> web.Response:
     reviewed / not-reviewed / stale (by head SHA). Does NOT start a review."""
     repo = (request.query.get("repo") or "").strip()
     if not repo:
-        return web.json_response({"code": "repo_required", "error": "missing ?repo=<github repo url>"}, status=400)
+        return web.json_response(
+            {"code": "repo_required", "error": "missing ?repo=<github repo url>"}, status=400
+        )
     try:
         slug, prs = await _list_repo_prs(repo)
     except (adapters.AdapterParseError, adapters.UnsupportedPlatform, ValueError) as e:
-        return web.json_response({"code": "invalid_repo_url", "error": f"invalid repo url: {e}"}, status=400)
+        return web.json_response(
+            {"code": "invalid_repo_url", "error": f"invalid repo url: {e}"}, status=400
+        )
     except Exception as e:  # gh not authed / network / repo not found
         logger.warning("repo PR list failed: %s", e, exc_info=True)
         # The provider's text can carry repo paths and token hints, so it is logged
@@ -807,7 +839,7 @@ async def _handle_repo_prs(request: web.Request) -> web.Response:
     out = []
     for pr in prs:
         url = pr.get("url", "")
-        cid = review_driver.change_id_for(url)      # display / response field only
+        cid = review_driver.change_id_for(url)  # display / response field only
         # Read the dedup index with the SAME collision-free key it is written
         # under (reviewed_key_for), NOT the lossy change-id — otherwise every
         # reviewed PR reads back as "new" (read/write key mismatch).
@@ -815,12 +847,15 @@ async def _handle_repo_prs(request: web.Request) -> web.Response:
         rec = index.get(rkey) or {}
         stored = rec.get("head_sha") or ""
         cur = pr.get("head_sha") or ""
-        out.append({
-            **pr, "change_id": cid,
-            "reviewed": bool(stored) and stored == cur,
-            "reviewed_stale": bool(stored) and stored != cur,
-            "reviewed_at": rec.get("reviewed_at", ""),
-        })
+        out.append(
+            {
+                **pr,
+                "change_id": cid,
+                "reviewed": bool(stored) and stored == cur,
+                "reviewed_stale": bool(stored) and stored != cur,
+                "reviewed_at": rec.get("reviewed_at", ""),
+            }
+        )
     return web.json_response({"repo": slug, "prs": out, "count": len(out)})
 
 
@@ -842,11 +877,15 @@ async def _handle_review_repo(request: web.Request) -> web.Response:
     # costly review of every open PR.
     force = body.get("force") is True
     if not repo:
-        return web.json_response({"code": "repo_required", "error": "missing 'repo' (a github repo url)"}, status=400)
+        return web.json_response(
+            {"code": "repo_required", "error": "missing 'repo' (a github repo url)"}, status=400
+        )
     try:
         slug, prs = await _list_repo_prs(repo)
     except (adapters.AdapterParseError, adapters.UnsupportedPlatform, ValueError) as e:
-        return web.json_response({"code": "invalid_repo_url", "error": f"invalid repo url: {e}"}, status=400)
+        return web.json_response(
+            {"code": "invalid_repo_url", "error": f"invalid repo url: {e}"}, status=400
+        )
     except Exception as e:
         logger.warning("repo review-repo failed: %s", e, exc_info=True)
         # Same treatment as the PR-list path: log the provider text, return only a code.
@@ -873,24 +912,29 @@ async def _handle_review_repo(request: web.Request) -> web.Response:
             rec = index.get(rkey) or {}
             if rec.get("head_sha") and rec.get("head_sha") == cur:
                 skipped += 1
-                continue   # already reviewed at this exact head SHA
+                continue  # already reviewed at this exact head SHA
         changes.append(url)
         head_shas[rkey] = cur
 
     if not changes:
-        return web.json_response({
-            "repo": slug, "changes": [], "skipped": skipped, "status": "noop",
-            "message": "all open PRs already reviewed at their current head "
-                       "(use force=true to re-review all)",
-        })
+        return web.json_response(
+            {
+                "repo": slug,
+                "changes": [],
+                "skipped": skipped,
+                "status": "noop",
+                "message": "all open PRs already reviewed at their current head "
+                "(use force=true to re-review all)",
+            }
+        )
 
     run: dict[str, Any] = {
         "run_id": uuid.uuid4().hex[:12],
         "repo": slug,
         "changes": changes,
         "change_ids": [review_driver.change_id_for(c) for c in changes],
-        "head_shas": head_shas,        # consumed by _record_reviewed on success
-        "force": force,                # skip the under-lock re-dedup for a forced run
+        "head_shas": head_shas,  # consumed by _record_reviewed on success
+        "force": force,  # skip the under-lock re-dedup for a forced run
         "status": "running",
         "started_at": _now(),
         "progress": {},
@@ -899,10 +943,15 @@ async def _handle_review_repo(request: web.Request) -> web.Response:
     task = asyncio.create_task(_run_review_bg(run, changes))
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
-    return web.json_response({
-        "run_id": run["run_id"], "repo": slug,
-        "changes": changes, "skipped": skipped, "status": "running",
-    })
+    return web.json_response(
+        {
+            "run_id": run["run_id"],
+            "repo": slug,
+            "changes": changes,
+            "skipped": skipped,
+            "status": "running",
+        }
+    )
 
 
 async def _handle_runs(request: web.Request) -> web.Response:
@@ -928,6 +977,7 @@ async def _handle_runs(request: web.Request) -> web.Response:
 # --- Per-run endpoints -------------------------------------------------------
 # One review = one thread in the UI. These let the page open a specific thread,
 # read its report INLINE (no artifact round-trip), stop it, and dismiss it.
+
 
 def _run_id_param(request: web.Request) -> str:
     """The ``{run_id}`` path param, **validated** rather than repaired.
@@ -959,7 +1009,9 @@ async def _handle_run_detail(request: web.Request) -> web.Response:
         run = _find_run(run_id)
         run = dict(run) if run else None
     if run is None:
-        return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
+        return web.json_response(
+            {"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404
+        )
     return web.json_response({"run": run})
 
 
@@ -976,16 +1028,25 @@ async def _handle_run_report(request: web.Request) -> web.Response:
         known = run is not None
         status = str((run or {}).get("status") or "")
     if not known:
-        return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
+        return web.json_response(
+            {"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404
+        )
     payload = await asyncio.to_thread(report.read_report, None, run_id)
     if payload is None:
         # Not an error: a running run has no report yet, and the page renders
         # progress instead. Say so explicitly rather than 404-ing a live run.
-        return web.json_response({
-            "run_id": run_id, "status": status, "ready": False,
-            "bands": {"red": 0, "yellow": 0, "green": 0}, "rows": [],
-            "generated_at": "", "total": 0, "report_slug": None,
-        })
+        return web.json_response(
+            {
+                "run_id": run_id,
+                "status": status,
+                "ready": False,
+                "bands": {"red": 0, "yellow": 0, "green": 0},
+                "rows": [],
+                "generated_at": "",
+                "total": 0,
+                "report_slug": None,
+            }
+        )
     return web.json_response({"run_id": run_id, "status": status, "ready": True, **payload})
 
 
@@ -1000,17 +1061,25 @@ async def _handle_run_cancel(request: web.Request) -> web.Response:
     async with _LOCK:
         run = _find_run(run_id)
         if run is None:
-            return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
+            return web.json_response(
+                {"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404
+            )
         if run.get("status") != "running":
             return web.json_response(
-                {"code": "run_not_running", "error": f"run is {run.get('status')}, not running"}, status=409)
+                {"code": "run_not_running", "error": f"run is {run.get('status')}, not running"},
+                status=409,
+            )
         _CANCELLED.add(run_id)
         run["cancel_requested_at"] = _now()
         await _save_runs()
-    return web.json_response({
-        "ok": True, "run_id": run_id, "status": "cancelling",
-        "message": "queued changes dropped; a review already in progress will finish",
-    })
+    return web.json_response(
+        {
+            "ok": True,
+            "run_id": run_id,
+            "status": "cancelling",
+            "message": "queued changes dropped; a review already in progress will finish",
+        }
+    )
 
 
 async def _handle_run_delete(request: web.Request) -> web.Response:
@@ -1019,12 +1088,16 @@ async def _handle_run_delete(request: web.Request) -> web.Response:
     async with _LOCK:
         run = _find_run(run_id)
         if run is None:
-            return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
+            return web.json_response(
+                {"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404
+            )
         if run.get("status") == "running":
             # Deleting a live run's dir underneath the driver would corrupt the
             # run in progress — cancel it first.
             return web.json_response(
-                {"code": "run_still_running", "error": "run is still running — cancel it first"}, status=409)
+                {"code": "run_still_running", "error": "run is still running — cancel it first"},
+                status=409,
+            )
         if run.get("posting"):
             # Posting runs on a TERMINAL run, so the status check above does not
             # cover it. The poster is mid-flight through the shared staging dir and
@@ -1032,20 +1105,25 @@ async def _handle_run_delete(request: web.Request) -> web.Response:
             # loses the record of what landed and lets the poster recreate an
             # orphan run dir after the delete.
             return web.json_response(
-                {"code": "run_posting",
-                 "error": "this review is still posting its comments — wait for "
-                          "it to finish"},
-                status=409)
+                {
+                    "code": "run_posting",
+                    "error": "this review is still posting its comments — wait for " "it to finish",
+                },
+                status=409,
+            )
         _RUNS.remove(run)
         await _save_runs()
     await asyncio.to_thread(store.remove_run_dir, run_id)
     return web.json_response({"ok": True, "run_id": run_id})
 
 
-async def _post_comments_bg(run_id: str, run: dict,
-                            change_id: str = "",
-                            keys: list[str] | None = None,
-                            groups: dict[str, list[str] | None] | None = None) -> None:
+async def _post_comments_bg(
+    run_id: str,
+    run: dict,
+    change_id: str = "",
+    keys: list[str] | None = None,
+    groups: dict[str, list[str] | None] | None = None,
+) -> None:
     """Publish a finished run's recorded findings to its pull request(s).
 
     Runs on the same worker pool as a review: the poster is a separate, minimal
@@ -1061,8 +1139,7 @@ async def _post_comments_bg(run_id: str, run: dict,
         try:
             results_out = []
             for i, link in enumerate(run.get("changes") or []):
-                cid = (run.get("change_ids") or [None] * (i + 1))[i] \
-                    or results.safe_change_id(link)
+                cid = (run.get("change_ids") or [None] * (i + 1))[i] or results.safe_change_id(link)
                 # A selection names comments on ONE change, so the others are left
                 # alone rather than having an unrelated key list applied to them.
                 # With `groups`, each change carries its own key list and the
@@ -1076,8 +1153,13 @@ async def _post_comments_bg(run_id: str, run: dict,
                 else:
                     sel = keys
                 out = await asyncio.to_thread(
-                    review_driver.post_recorded, cid, link,
-                    dispatch=dispatch, run_id=run_id, keys=sel)
+                    review_driver.post_recorded,
+                    cid,
+                    link,
+                    dispatch=dispatch,
+                    run_id=run_id,
+                    keys=sel,
+                )
                 out["change_id"] = cid
                 results_out.append(out)
         finally:
@@ -1105,8 +1187,9 @@ async def _post_comments_bg(run_id: str, run: dict,
             remaining = await asyncio.to_thread(_pending_comment_count, run_id, run)
             run["posted_at"] = _now() if remaining == 0 else None
             run["posted_comments"] = posted
-            run["post_error"] = "; ".join(
-                str(r.get("post_error") or "post failed") for r in failed) or None
+            run["post_error"] = (
+                "; ".join(str(r.get("post_error") or "post failed") for r in failed) or None
+            )
             # A successful retry must repair the per-change delivery evidence, not
             # just the run-level counters. `_record_reviewed` reads ONLY
             # `summary.per_change`, so a record still showing the original failure
@@ -1148,11 +1231,12 @@ async def _notify_posted(run: dict, posted: int, failed: bool) -> None:
         body = f"{_run_headline(run)} — {run.get('post_error') or 'the post did not complete'}"
     else:
         title = "Review comments posted"
-        body = (f"{_run_headline(run)} — {posted} comment"
-                f"{'' if posted == 1 else 's'} on the pull request")
+        body = (
+            f"{_run_headline(run)} — {posted} comment"
+            f"{'' if posted == 1 else 's'} on the pull request"
+        )
     try:
-        await asyncio.to_thread(
-            state.notify, "agent", title, body)
+        await asyncio.to_thread(state.notify, "agent", title, body)
     except Exception:
         logger.debug("post notification failed", exc_info=True)
 
@@ -1175,8 +1259,11 @@ async def _handle_run_post(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         body = {}
     raw_keys = body.get("keys")
-    keys = ([str(k) for k in raw_keys if isinstance(k, (str, int))]
-            if isinstance(raw_keys, list) else None)
+    keys = (
+        [str(k) for k in raw_keys if isinstance(k, (str, int))]
+        if isinstance(raw_keys, list)
+        else None
+    )
     change_id = str(body.get("change_id") or "")
     # A deliberate multi-change selection arrives as ONE request carrying a group
     # per change, because `posting` is a per-RUN flag: a client that sent one
@@ -1196,70 +1283,83 @@ async def _handle_run_post(request: web.Request) -> web.Response:
             if not cid:
                 continue
             gk = g.get("keys")
-            parsed[cid] = ([str(k) for k in gk if isinstance(k, (str, int))]
-                           if isinstance(gk, list) else None)
+            parsed[cid] = (
+                [str(k) for k in gk if isinstance(k, (str, int))] if isinstance(gk, list) else None
+            )
         groups = parsed or None
     async with _LOCK:
         run = _find_run(run_id)
         if run is None:
-            return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
+            return web.json_response(
+                {"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404
+            )
         if run.get("status") == "running":
             return web.json_response(
-                {"code": "run_still_running", "error": "this review is still running; wait for it to finish"},
-                status=409)
+                {
+                    "code": "run_still_running",
+                    "error": "this review is still running; wait for it to finish",
+                },
+                status=409,
+            )
         if run.get("posting"):
             return web.json_response(
-                {"code": "already_posting", "error": "already posting this review"}, status=409)
+                {"code": "already_posting", "error": "already posting this review"}, status=409
+            )
         # A selection is always allowed through: "already posted" is now a
         # per-comment fact, and post_recorded drops the keys that already landed.
         if run.get("posted_at") and keys is None and not force:
-            return web.json_response({
-                "code": "already_posted", "error": "this review was already posted",
-                "posted_at": run.get("posted_at"),
-                "posted_comments": run.get("posted_comments"),
-            }, status=409)
+            return web.json_response(
+                {
+                    "code": "already_posted",
+                    "error": "this review was already posted",
+                    "posted_at": run.get("posted_at"),
+                    "posted_comments": run.get("posted_comments"),
+                },
+                status=409,
+            )
         if groups:
             counts = [
-                await asyncio.to_thread(
-                    _pending_comment_count, run_id, run, gk, cid)
+                await asyncio.to_thread(_pending_comment_count, run_id, run, gk, cid)
                 for cid, gk in groups.items()
             ]
             pending = sum(counts)
         else:
-            pending = await asyncio.to_thread(
-                _pending_comment_count, run_id, run, keys, change_id)
+            pending = await asyncio.to_thread(_pending_comment_count, run_id, run, keys, change_id)
         if pending == 0:
-            return web.json_response({
-                "code": "nothing_to_post",
-                "error": "nothing to post — those comments are already on the "
-                         "pull request, this review recorded no findings, or its "
-                         "records were cleared when the report was archived",
-            }, status=409)
+            return web.json_response(
+                {
+                    "code": "nothing_to_post",
+                    "error": "nothing to post — those comments are already on the "
+                    "pull request, this review recorded no findings, or its "
+                    "records were cleared when the report was archived",
+                },
+                status=409,
+            )
         # Posting round-trips the record through the SHARED staging dir
         # (publish_to_shared -> poster turn -> adopt_from_shared). The run is
         # terminal, so its review-time claims are long released — a forced
         # re-review of the same change could be staging there right now, and the
         # two would trade records. Hold the same claim posting needs, refusing
         # rather than interleaving; released in `_post_comments_bg`'s finally.
-        posting_cids = [
-            cid for cid in (run.get("change_ids") or [])
-            if cid in groups
-        ] if groups else [
-            cid for cid in (run.get("change_ids") or [])
-            if not change_id or cid == change_id
-        ]
+        posting_cids = (
+            [cid for cid in (run.get("change_ids") or []) if cid in groups]
+            if groups
+            else [cid for cid in (run.get("change_ids") or []) if not change_id or cid == change_id]
+        )
         async with _RUN_LOCK:
             blocked = [
-                cid for cid in posting_cids
-                if (_INFLIGHT.get(_stage_key(cid)) or run_id) != run_id
+                cid for cid in posting_cids if (_INFLIGHT.get(_stage_key(cid)) or run_id) != run_id
             ]
             if blocked:
                 return web.json_response(
-                    {"code": "change_review_in_flight",
-                     "error": "a review of this change is in flight; posting now "
-                              "would collide with it — try again when it "
-                              "finishes"},
-                    status=409)
+                    {
+                        "code": "change_review_in_flight",
+                        "error": "a review of this change is in flight; posting now "
+                        "would collide with it — try again when it "
+                        "finishes",
+                    },
+                    status=409,
+                )
             for cid in posting_cids:
                 _INFLIGHT[_stage_key(cid)] = run_id
         run["posting"] = True
@@ -1269,13 +1369,17 @@ async def _handle_run_post(request: web.Request) -> web.Response:
     # Keep a strong ref like the review path does, so the poster cannot be
     # garbage-collected mid-flight and leave `posting` set with nothing to clear
     # it — which would 409 every later post and refuse delete for this run.
-    task = asyncio.create_task(
-        _post_comments_bg(run_id, run, change_id, keys, groups))
+    task = asyncio.create_task(_post_comments_bg(run_id, run, change_id, keys, groups))
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
-    return web.json_response({
-        "ok": True, "run_id": run_id, "posting": True, "pending": pending,
-    })
+    return web.json_response(
+        {
+            "ok": True,
+            "run_id": run_id,
+            "posting": True,
+            "pending": pending,
+        }
+    )
 
 
 def _collect_delivered(run: dict, summary: dict) -> None:
@@ -1308,9 +1412,9 @@ def _collect_delivered(run: dict, summary: dict) -> None:
         run["posted_review_ids"] = draft_ids
 
 
-def _pending_comment_count(run_id: str, run: dict,
-                           keys: list[str] | None = None,
-                           change_id: str = "") -> int:
+def _pending_comment_count(
+    run_id: str, run: dict, keys: list[str] | None = None, change_id: str = ""
+) -> int:
     """How many comments this run WOULD still post.
 
     Read-only: it builds the same draft bodies the poster publishes without
@@ -1353,11 +1457,14 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
     async with _LOCK:
         run = _find_run(run_id)
         if run is None:
-            return web.json_response({"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404)
+            return web.json_response(
+                {"code": "run_not_found", "error": f"no such run {run_id!r}"}, status=404
+            )
         existing = run.get("report_slug")
     if existing:
-        return web.json_response({"ok": True, "run_id": run_id, "report_slug": existing,
-                                  "created": False})
+        return web.json_response(
+            {"ok": True, "run_id": run_id, "report_slug": existing, "created": False}
+        )
     rd = store.run_dir(run_id) / "report" / "focus-report.html"
 
     def _archive() -> str | None:
@@ -1374,21 +1481,25 @@ async def _handle_run_archive(request: web.Request) -> web.Response:
     slug = await asyncio.to_thread(_archive)
     if not slug:
         return web.json_response(
-            {"code": "report_archive_failed",
-             "error": "could not archive this report (no report on disk, or the "
-                      "artifact API rejected it)"}, status=502)
+            {
+                "code": "report_archive_failed",
+                "error": "could not archive this report (no report on disk, or the "
+                "artifact API rejected it)",
+            },
+            status=502,
+        )
     await asyncio.to_thread(report.set_report_slug, slug, None, run_id)
     async with _LOCK:
         run = _find_run(run_id)
         if run is not None:
             run["report_slug"] = slug
         await _save_runs()
-    return web.json_response({"ok": True, "run_id": run_id, "report_slug": slug,
-                              "created": True})
+    return web.json_response({"ok": True, "run_id": run_id, "report_slug": slug, "created": True})
 
 
 # --- Repo + PR discovery -----------------------------------------------------
 # So the user picks a PR instead of pasting a URL.
+
 
 async def _handle_recent_repos(request: web.Request) -> web.Response:
     """GET .../recent-repos[?days=N] — repos the ``gh`` user recently worked on.
@@ -1403,11 +1514,17 @@ async def _handle_recent_repos(request: web.Request) -> web.Response:
         try:
             days = int(raw_days)
         except ValueError:
-            return web.json_response({"code": "invalid_days", "error": "days must be an integer"}, status=400)
+            return web.json_response(
+                {"code": "invalid_days", "error": "days must be an integer"}, status=400
+            )
         if days < 0 or days > discovery.MAX_WINDOW_DAYS:
             return web.json_response(
-                {"code": "invalid_days", "error": f"days must be between 0 and {discovery.MAX_WINDOW_DAYS}"},
-                status=400)
+                {
+                    "code": "invalid_days",
+                    "error": f"days must be between 0 and {discovery.MAX_WINDOW_DAYS}",
+                },
+                status=400,
+            )
 
     def _load() -> dict:
         pinned = discovery.read_repos()
@@ -1415,21 +1532,20 @@ async def _handle_recent_repos(request: web.Request) -> web.Response:
         try:
             login = discovery.current_login()
         except discovery.GhSetupError as exc:
-            return {"repos": [], "pinned": pinned, "setup_required": True,
-                    "error": str(exc)}
+            return {"repos": [], "pinned": pinned, "setup_required": True, "error": str(exc)}
         if not login:
             return {"repos": [], "pinned": pinned, "login": None}
         rows, truncated = discovery.list_contributed_repos(login, within_days=days)
         for row in rows:
             row["pinned"] = row["full_name"].lower() in pinned_keys
-        return {"repos": rows, "pinned": pinned, "login": login,
-                "truncated": truncated}
+        return {"repos": rows, "pinned": pinned, "login": login, "truncated": truncated}
 
     try:
         return web.json_response(await asyncio.to_thread(_load))
     except discovery.GhSetupError as exc:
-        return web.json_response({"repos": [], "pinned": [], "setup_required": True,
-                                  "error": str(exc)})
+        return web.json_response(
+            {"repos": [], "pinned": [], "setup_required": True, "error": str(exc)}
+        )
     except discovery.GhError as exc:
         return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
 
@@ -1450,8 +1566,7 @@ async def _handle_my_repos(request: web.Request) -> web.Response:
         try:
             rows, truncated = discovery.list_user_repos()
         except discovery.GhSetupError as exc:
-            return {"repos": [], "pinned": pinned, "setup_required": True,
-                    "error": str(exc)}
+            return {"repos": [], "pinned": pinned, "setup_required": True, "error": str(exc)}
         for row in rows:
             row["pinned"] = row["full_name"].lower() in pinned_keys
         return {"repos": rows, "pinned": pinned, "truncated": truncated}
@@ -1459,27 +1574,45 @@ async def _handle_my_repos(request: web.Request) -> web.Response:
     try:
         return web.json_response(await asyncio.to_thread(_load))
     except discovery.GhSetupError as exc:
-        return web.json_response({"repos": [], "pinned": [], "setup_required": True,
-                                  "error": str(exc)})
+        return web.json_response(
+            {"repos": [], "pinned": [], "setup_required": True, "error": str(exc)}
+        )
     except discovery.GhError as exc:
         return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
 
 
 def _pull_request_ref(link: str) -> dict | None:
-    """Parse a pasted GitHub PR URL into the repo plus the PR's identity.
+    """Parse a pasted GitHub PR or GitLab MR URL into the repo + its identity.
 
-    Returns None for anything that is not a PR link, so the caller can fall back
+    Returns None for anything that is not a PR/MR link, so the caller can fall back
     to repo-URL parsing. Deliberately tolerant about what it accepts and strict
     about what it returns: every field here is produced by the same validated
     parser the review path uses, never by string slicing.
     """
-    if "/pull/" not in (link or ""):
+    text = link or ""
+    platform = None
+    if "/pull/" in text:
+        platform = "github"
+    elif "/-/merge_requests/" in text:
+        platform = "gitlab"
+    if platform is None:
         return None
     try:
-        host, owner, repo, number = adapters.github_pr_ref(link)
+        if platform == "gitlab":
+            host, ns, iid = adapters.gitlab_pr_ref(text)
+            return {
+                "provider": "gitlab",
+                "host": host,
+                "namespace": ns,
+                "iid": int(iid),
+                "url": f"https://{host}/{ns}/-/merge_requests/{iid}",
+                "change_id": adapters.gitlab_change_id(ns, iid, host=host),
+            }
+        host, owner, repo, number = adapters.github_pr_ref(text)
     except (adapters.AdapterParseError, adapters.UnsupportedPlatform, ValueError):
         return None
     return {
+        "provider": "github",
         "host": host,
         "owner": owner,
         "repo": repo,
@@ -1505,6 +1638,8 @@ async def _handle_repos(request: web.Request) -> web.Response:
         body = {}
     owner = str(body.get("owner") or "").strip()
     name = str(body.get("repo") or "").strip()
+    repo_provider = "github"
+    repo_host = "github.com"
     pr: dict | None = None
     if owner and name:
         # An owner/repo pair supplied directly still has to satisfy the same
@@ -1513,7 +1648,9 @@ async def _handle_repos(request: web.Request) -> web.Response:
         try:
             owner, name = adapters.parse_repo_url(f"https://github.com/{owner}/{name}")
         except (adapters.AdapterParseError, adapters.UnsupportedPlatform, ValueError) as e:
-            return web.json_response({"code": "invalid_repo", "error": f"invalid repo: {e}"}, status=400)
+            return web.json_response(
+                {"code": "invalid_repo", "error": f"invalid repo: {e}"}, status=400
+            )
     elif name:
         # A PASTED PR LINK is the common case here: the field is the only place in
         # the app you can type, so that is where a URL from the clipboard lands.
@@ -1528,35 +1665,78 @@ async def _handle_repos(request: web.Request) -> web.Response:
             # the PR box; refuse the pin with that pointer instead.
             if pr.get("host") != "github.com":
                 return web.json_response(
-                    {"code": "unsupported_repo_host",
-                     "error": "GitHub Enterprise repos can't be pinned; paste the "
-                              "PR link in the review box instead"}, status=400)
-            owner, name = pr["owner"], pr["repo"]
+                    {
+                        "code": "unsupported_repo_host",
+                        "error": "GitHub Enterprise repos can't be pinned; paste the "
+                        "PR link in the review box instead",
+                    },
+                    status=400,
+                )
+            if pr.get("provider") == "gitlab":
+                namespace = str(pr.get("namespace") or "")
+                owner, name = namespace.rsplit("/", 1) if "/" in namespace else ("", namespace)
+                repo_provider = "gitlab"
+                repo_host = str(pr.get("host") or "")
+            else:
+                owner, name = pr["owner"], pr["repo"]
+                repo_host = str(pr.get("host") or "github.com")
+            if repo_provider == "github" and repo_host != "github.com":
+                return web.json_response(
+                    {
+                        "code": "unsupported_repo_host",
+                        "error": "GitHub Enterprise repos can't be pinned; paste the "
+                        "PR link in the review box instead",
+                    },
+                    status=400,
+                )
         else:
             try:
-                repo_host, owner, name = adapters.parse_repo_ref(name)
-            except (adapters.AdapterParseError, adapters.UnsupportedPlatform,
-                    ValueError) as e:
-                return web.json_response({"code": "invalid_repo_url", "error": f"invalid repo url: {e}"},
-                                         status=400)
-            if repo_host != "github.com":
+                repo_provider, repo_host, owner, name = adapters.parse_any_repo_ref(name)
+            except (adapters.AdapterParseError, adapters.UnsupportedPlatform, ValueError) as e:
                 return web.json_response(
-                    {"code": "unsupported_repo_host",
-                     "error": "GitHub Enterprise repos can't be pinned; paste the "
-                              "PR link in the review box instead"}, status=400)
+                    {"code": "invalid_repo_url", "error": f"invalid repo url: {e}"}, status=400
+                )
+            if repo_provider == "github" and repo_host != "github.com":
+                return web.json_response(
+                    {
+                        "code": "unsupported_repo_host",
+                        "error": "GitHub Enterprise repos can't be pinned; paste the "
+                        "PR link in the review box instead",
+                    },
+                    status=400,
+                )
     else:
         return web.json_response(
-            {"code": "repo_required", "error": "missing 'owner'+'repo' or a repo url in 'repo'"}, status=400)
+            {"code": "repo_required", "error": "missing 'owner'+'repo' or a repo url in 'repo'"},
+            status=400,
+        )
 
     if request.method == "POST":
-        repos = await asyncio.to_thread(discovery.add_repo, owner, name)
+        repos = await asyncio.to_thread(
+            discovery.add_repo,
+            owner,
+            name,
+            provider=repo_provider,
+            host=repo_host,
+        )
     else:
-        repos = await asyncio.to_thread(discovery.remove_repo, owner, name)
+        repos = await asyncio.to_thread(
+            discovery.remove_repo,
+            owner,
+            name,
+            provider=repo_provider,
+            host=repo_host,
+        )
     out: dict[str, Any] = {"ok": True, "repos": repos}
     if request.method == "POST":
         # Name the added repo explicitly: repos[0] is only it if the store
         # happens to prepend.
-        out["added"] = {"owner": owner, "repo": name}
+        out["added"] = {
+            "owner": owner,
+            "repo": name,
+            "provider": repo_provider,
+            "host": repo_host,
+        }
     if request.method == "POST" and pr is not None:
         # The caller uses this to open the pasted pull request instead of leaving
         # the user to find it in the list.
@@ -1569,6 +1749,7 @@ async def _handle_repos(request: web.Request) -> web.Response:
 # under the "review" section. The generic GET /api/apps/{name}/config already
 # exposes the full config (read), so this route is the WRITE path plus a focused
 # settings view that also enumerates available models, efforts, and namespaces.
+
 
 def _load_known_models() -> list[str]:
     """Selectable models for the review-settings dropdown — the registry's
@@ -1682,7 +1863,7 @@ def _write_review_section(patch: dict) -> dict:
 
 async def _handle_settings(request: web.Request) -> web.Response:
     """GET  -> {settings, models, efforts, namespaces}
-       PUT  body {model?, effort?, active_namespaces?} -> {ok, settings}."""
+    PUT  body {model?, effort?, active_namespaces?} -> {ok, settings}."""
     if request.method == "GET":
         # All of this is synchronous file IO (config read + namespaces dir walk +
         # reviewer_info file read) — offload to a thread so it never blocks the
@@ -1706,6 +1887,7 @@ async def _handle_settings(request: web.Request) -> web.Response:
                 "reviewer": reviewer,
                 "max_concurrent_max": review_pool.MAX_CONCURRENT_CEIL,
             }
+
         return web.json_response(await asyncio.to_thread(_build_settings_response))
     # PUT
     try:
@@ -1724,10 +1906,14 @@ async def _handle_settings(request: web.Request) -> web.Response:
     async def _audit_settings(outcome: str) -> None:
         def _emit() -> None:
             from kiro_crew.sel import sel  # circular import: sel->config->apps cycle
+
             sel().log_api_access(
-                caller="code-review-sage", operation="update_review_settings",
+                caller="code-review-sage",
+                operation="update_review_settings",
                 outcome=outcome,
-                resources="config.json#review(" + ",".join(sorted(body)) + ")")
+                resources="config.json#review(" + ",".join(sorted(body)) + ")",
+            )
+
         try:
             await asyncio.to_thread(_emit)
         except Exception as exc:
@@ -1736,29 +1922,38 @@ async def _handle_settings(request: web.Request) -> web.Response:
     try:
         review = await asyncio.to_thread(_write_review_section, body)
         await _audit_settings("success")
-        return web.json_response({"ok": True, "settings": {
-            "model": review.get("model") or None,
-            "effort": review.get("effort", ""),
-            "active_namespaces": review.get("active_namespaces") or ["default"],
-            "max_concurrent": review.get("max_concurrent") or review_pool.effective_max_concurrent(),
-        }})
+        return web.json_response(
+            {
+                "ok": True,
+                "settings": {
+                    "model": review.get("model") or None,
+                    "effort": review.get("effort", ""),
+                    "active_namespaces": review.get("active_namespaces") or ["default"],
+                    "max_concurrent": review.get("max_concurrent")
+                    or review_pool.effective_max_concurrent(),
+                },
+            }
+        )
     except ValueError as exc:
         # Bad client input (e.g. unknown model) — a 4xx, not a server fault.
         # Audit the rejected attempt (security-relevant: invalid model injection).
         await _audit_settings("denied")
-        return web.json_response({"code": "invalid_request", "ok": False, "error": str(exc)}, status=400)
+        return web.json_response(
+            {"code": "invalid_request", "ok": False, "error": str(exc)}, status=400
+        )
     except Exception as exc:
         corr = uuid.uuid4().hex[:12]
         logger.warning("settings write failed [%s]: %s", corr, exc, exc_info=True)
         return web.json_response(
-            {"code": "internal_error", "ok": False, "error": "internal error", "id": corr}, status=500
+            {"code": "internal_error", "ok": False, "error": "internal error", "id": corr},
+            status=500,
         )
 
 
 async def _handle_namespaces(request: web.Request) -> web.Response:
     """GET    -> {namespaces:[{name, patterns, candidate, active}], active:[...]}
-       POST   body {name}            -> create a namespace
-       DELETE body {name}            -> delete a (non-default) namespace."""
+    POST   body {name}            -> create a namespace
+    DELETE body {name}            -> delete a (non-default) namespace."""
     if request.method == "GET":
         # list_namespaces() walks a dir and the per-namespace loop does a
         # synchronous read_text()+parse for EACH namespace — unbounded sync IO.
@@ -1768,13 +1963,16 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
             active = set(learning.get_active_namespaces())
             out = []
             for n in names:
-                out.append({
-                    "name": n,
-                    "patterns": len(learning.list_patterns(namespace=n)),
-                    "candidate": learning.candidate_count(namespace=n),
-                    "active": n in active,
-                })
+                out.append(
+                    {
+                        "name": n,
+                        "patterns": len(learning.list_patterns(namespace=n)),
+                        "candidate": learning.candidate_count(namespace=n),
+                        "active": n in active,
+                    }
+                )
             return {"namespaces": out, "active": sorted(active)}
+
         try:
             return web.json_response(await asyncio.to_thread(_build_ns_response))
         except Exception as exc:
@@ -1787,7 +1985,9 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
         body = {}
     name = str((body or {}).get("name", "")).strip()
     if not name:
-        return web.json_response({"code": "name_required", "ok": False, "error": "name required"}, status=400)
+        return web.json_response(
+            {"code": "name_required", "ok": False, "error": "name required"}, status=400
+        )
 
     # Audit namespace create/delete (filesystem ops that change the learning
     # scope). log_api_access does synchronous file IO (appends to the audit
@@ -1796,10 +1996,14 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
     async def _audit(operation: str, ok: bool) -> None:
         def _emit() -> None:
             from kiro_crew.sel import sel  # circular import: sel->config->apps cycle
+
             sel().log_api_access(
-                caller="code-review-sage", operation=operation,
+                caller="code-review-sage",
+                operation=operation,
                 outcome="success" if ok else "denied",
-                resources=f"learnings/namespaces/{name}")
+                resources=f"learnings/namespaces/{name}",
+            )
+
         try:
             await asyncio.to_thread(_emit)
         except Exception as exc:
@@ -1822,10 +2026,13 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
         async with _NS_OPS_LOCK:
             if name in _CONSOLIDATING:
                 return web.json_response(
-                    {"code": "consolidation_in_progress",
-                     "error": "a consolidation is running for this namespace — "
-                              "wait for it to finish, then delete"},
-                    status=409)
+                    {
+                        "code": "consolidation_in_progress",
+                        "error": "a consolidation is running for this namespace — "
+                        "wait for it to finish, then delete",
+                    },
+                    status=409,
+                )
 
             # Delete FIRST, prune only on success -- one offloaded helper, since both
             # halves are synchronous file IO that must never run on the event loop.
@@ -1842,17 +2049,17 @@ async def _handle_namespaces(request: web.Request) -> web.Response:
                     sec = _load_review_section()
                     if name in (sec.get("active_namespaces") or []):
                         remaining = [n for n in sec["active_namespaces"] if n != name]
-                        _write_review_section(
-                            {"active_namespaces": remaining or ["default"]})
+                        _write_review_section({"active_namespaces": remaining or ["default"]})
                 except Exception:
-                    logger.debug("could not prune deleted ns from active list",
-                                 exc_info=True)
+                    logger.debug("could not prune deleted ns from active list", exc_info=True)
                 return res
 
             res = await asyncio.to_thread(_delete_then_prune)
         await _audit("delete_namespace", bool(res.get("ok")))  # destructive rmtree
         return web.json_response(res, status=200 if res.get("ok") else 400)
-    return web.json_response({"code": "method_not_allowed", "error": "method not allowed"}, status=405)
+    return web.json_response(
+        {"code": "method_not_allowed", "error": "method not allowed"}, status=405
+    )
 
 
 async def _handle_learnings(request: web.Request) -> web.Response:
@@ -1878,9 +2085,13 @@ async def _handle_learnings(request: web.Request) -> web.Response:
         except Exception:
             candidate = []
         state = dict(_CONSOLIDATE_STATE.get(ns) or {})
-        return {"namespace": ns, "patterns": patterns, "candidate": candidate,
-                "consolidating": bool(state.get("running")),
-                "consolidate_error": state.get("error")}
+        return {
+            "namespace": ns,
+            "patterns": patterns,
+            "candidate": candidate,
+            "consolidating": bool(state.get("running")),
+            "consolidate_error": state.get("error"),
+        }
 
     try:
         # Namespace-scoped file reads + markdown parse are synchronous IO — keep
@@ -1888,8 +2099,15 @@ async def _handle_learnings(request: web.Request) -> web.Response:
         return web.json_response(await asyncio.to_thread(_build))
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("learnings view failed for ns=%s: %s", ns, exc, exc_info=True)
-        return web.json_response({"namespace": ns, "patterns": [], "candidate": [],
-                                  "consolidating": False, "consolidate_error": None})
+        return web.json_response(
+            {
+                "namespace": ns,
+                "patterns": [],
+                "candidate": [],
+                "consolidating": False,
+                "consolidate_error": None,
+            }
+        )
 
 
 # Namespaces with a merge in flight. Consolidation replaces the whole ruleset, so
@@ -1928,10 +2146,7 @@ async def _consolidate_bg(ns: str) -> None:
         # One element per staged entry, not a set: duplicate ids are legitimate
         # (same title+scope re-learned) and the COUNT is what tells
         # clear_candidate how many occurrences this merge is entitled to drop.
-        cand_ids = [
-            p["id"] for p in await asyncio.to_thread(
-                learning.list_candidate, None, ns)
-        ]
+        cand_ids = [p["id"] for p in await asyncio.to_thread(learning.list_candidate, None, ns)]
         # Clear any residue BEFORE dispatching. The worker writes this path and
         # the backend applies it afterwards; a crash between those two steps
         # leaves a stale merge on disk, and the next consolidation whose
@@ -1949,8 +2164,7 @@ async def _consolidate_bg(ns: str) -> None:
         try:
             spawn = await asyncio.to_thread(
                 dispatch,
-                review_driver.build_consolidation_task(
-                    ns, str(live), str(cand), out_path),
+                review_driver.build_consolidation_task(ns, str(live), str(cand), out_path),
             )
         finally:
             await pool.end_batch()
@@ -2009,8 +2223,10 @@ async def _consolidate_bg(ns: str) -> None:
         if not await asyncio.to_thread(learning.parse_patterns, merged):
             _CONSOLIDATE_STATE[ns] = {
                 "running": False,
-                "error": ("the merge produced no recognizable patterns; "
-                          "the ruleset and the staged candidates are unchanged"),
+                "error": (
+                    "the merge produced no recognizable patterns; "
+                    "the ruleset and the staged candidates are unchanged"
+                ),
             }
             return
 
@@ -2021,8 +2237,7 @@ async def _consolidate_bg(ns: str) -> None:
         # releases it, and the delete handler refuses with 409 for that whole span.
         # A second check here would be unreachable, and an unreachable guard implies
         # protection that never actually runs.
-        applied = await asyncio.to_thread(
-            learning.consolidate_apply, merged, None, ns, cand_ids)
+        applied = await asyncio.to_thread(learning.consolidate_apply, merged, None, ns, cand_ids)
         _CONSOLIDATE_STATE[ns] = {
             "running": False,
             "error": None if applied.get("ok") else str(applied.get("error") or "merge rejected"),
@@ -2060,7 +2275,9 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
         body = {}
     ns = str(body.get("namespace") or learning.DEFAULT_NAMESPACE)
     if not (ns == learning.DEFAULT_NAMESPACE or learning._is_valid_ns_name(ns)):
-        return web.json_response({"code": "invalid_namespace", "error": f"invalid namespace {ns!r}"}, status=400)
+        return web.json_response(
+            {"code": "invalid_namespace", "error": f"invalid namespace {ns!r}"}, status=400
+        )
     # Claim the namespace BEFORE the first await. Checking membership and then
     # awaiting the staged count left a window where two concurrent requests for
     # one namespace both passed the guard, then both dispatched a merge against
@@ -2071,9 +2288,12 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
     async with _NS_OPS_LOCK:
         if ns in _CONSOLIDATING:
             return web.json_response(
-                {"code": "consolidation_in_progress",
-                 "error": "a consolidation is already running for this namespace"},
-                status=409)
+                {
+                    "code": "consolidation_in_progress",
+                    "error": "a consolidation is already running for this namespace",
+                },
+                status=409,
+            )
         # Taken under the lock so an in-flight DELETE cannot land between this
         # check and the claim; the delete handler holds the same lock across its
         # whole check + prune + rmtree.
@@ -2086,7 +2306,12 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
     if staged == 0:
         _CONSOLIDATING.discard(ns)
         return web.json_response(
-            {"code": "nothing_to_consolidate", "error": "nothing to consolidate — no learnings are staged"}, status=409)
+            {
+                "code": "nothing_to_consolidate",
+                "error": "nothing to consolidate — no learnings are staged",
+            },
+            status=409,
+        )
 
     _CONSOLIDATE_STATE[ns] = {"running": True, "error": None}
     # Strong ref, as with the review and post paths: a collected merge task would
@@ -2095,8 +2320,7 @@ async def _handle_consolidate(request: web.Request) -> web.Response:
     task = asyncio.create_task(_consolidate_bg(ns))
     _TASKS.add(task)
     task.add_done_callback(_TASKS.discard)
-    return web.json_response({"ok": True, "namespace": ns, "staged": staged,
-                              "running": True})
+    return web.json_response({"ok": True, "namespace": ns, "staged": staged, "running": True})
 
 
 # --- follow-up sessions -----------------------------------------------------
@@ -2144,8 +2368,8 @@ def _require_enabled(handler: _ChatHandler) -> _ChatHandler:
     async def _wrapped(request: web.Request) -> web.Response:
         if not await asyncio.to_thread(is_app_enabled, "code-review-sage"):
             return web.json_response(
-                {"code": "app_disabled",
-                 "error": "code-review-sage is disabled"}, status=403)
+                {"code": "app_disabled", "error": "code-review-sage is disabled"}, status=403
+            )
         return await handler(request)
 
     return _wrapped
@@ -2162,37 +2386,35 @@ async def _handle_chat_get(request: web.Request) -> web.Response:
     change_id = (request.query.get("change_id") or "").strip()
     bad = _chat_params(run_id, change_id)
     if bad:
-        return web.json_response(
-            {"code": bad, "error": "missing run_id or change_id"}, status=400)
-    turns = await asyncio.to_thread(
-        followup.read_transcript, run_id, change_id)
+        return web.json_response({"code": bad, "error": "missing run_id or change_id"}, status=400)
+    turns = await asyncio.to_thread(followup.read_transcript, run_id, change_id)
     async with _LOCK:
         run = _find_run(run_id)
         run_live = run is not None and _is_live(run)
-    desc, reason = await asyncio.to_thread(
-        followup.resumable, run_id, change_id)
+    desc, reason = await asyncio.to_thread(followup.resumable, run_id, change_id)
     # A run still in flight is not offerable even with a descriptor on disk: its
     # first pass may be superseded by a second, which retires that descriptor and
     # leaves an already-open conversation pointing at findings the run replaced.
     if run_live:
         desc, reason = None, followup.ERR_RUN_LIVE
     slot_key = followup.slot_key(run_id, change_id)
-    return web.json_response({
-        "run_id": run_id,
-        "change_id": change_id,
-        "turns": turns,
-        # Whether a follow-up would restore the reviewer's own context. Told to
-        # the UI so it can explain why the button is absent instead of offering
-        # one that opens a session which knows nothing about the review.
-        "resumable": desc is not None,
-        "reason": reason,
-        "slot_key": slot_key,
-        # Whether that session already exists. Without it the panel invites a
-        # returning user to "open" a conversation they already had, with no trace
-        # of it -- which reads as the review having lost it.
-        "followup_open": bool(desc is not None
-                              and _followup_session_exists(slot_key)),
-    })
+    return web.json_response(
+        {
+            "run_id": run_id,
+            "change_id": change_id,
+            "turns": turns,
+            # Whether a follow-up would restore the reviewer's own context. Told to
+            # the UI so it can explain why the button is absent instead of offering
+            # one that opens a session which knows nothing about the review.
+            "resumable": desc is not None,
+            "reason": reason,
+            "slot_key": slot_key,
+            # Whether that session already exists. Without it the panel invites a
+            # returning user to "open" a conversation they already had, with no trace
+            # of it -- which reads as the review having lost it.
+            "followup_open": bool(desc is not None and _followup_session_exists(slot_key)),
+        }
+    )
 
 
 def _followup_session_exists(slot_key: str) -> bool:
@@ -2226,6 +2448,7 @@ async def _ensure_followup_folder(state: Any) -> str:
     folder and build a duplicate. Idempotent — an existing folder is adopted and
     nothing is written.
     """
+
     def _create_or_adopt(folders: list[dict]) -> tuple[bool, str]:
         for f in folders:
             if str(f.get("name", "")).strip() != followup.FOLDER_NAME:
@@ -2251,8 +2474,7 @@ async def _ensure_followup_folder(state: Any) -> str:
     try:
         return str(await state.mutate_folders(_create_or_adopt))
     except Exception:  # noqa: BLE001 - filing is a nicety, the session is not
-        logger.warning("code-review-sage: follow-up folder write failed",
-                       exc_info=True)
+        logger.warning("code-review-sage: follow-up folder write failed", exc_info=True)
         return ""
 
 
@@ -2262,8 +2484,7 @@ def _change_title(run_id: str, change_id: str) -> str:
         rec = results.read_result(change_id, None, run_id) or {}
         return store.redact_text(str(rec.get("title") or ""))
     except Exception:  # pragma: no cover - a title is cosmetic
-        logger.debug("code-review-sage: could not read change title",
-                     exc_info=True)
+        logger.debug("code-review-sage: could not read change title", exc_info=True)
         return ""
 
 
@@ -2286,26 +2507,25 @@ async def _handle_followup_start(request: web.Request) -> web.Response:
     change_id = str(body.get("change_id") or "").strip()
     bad = _chat_params(run_id, change_id)
     if bad:
-        return web.json_response(
-            {"code": bad, "error": "missing run_id or change_id"}, status=400)
+        return web.json_response({"code": bad, "error": "missing run_id or change_id"}, status=400)
     async with _LOCK:
         run = _find_run(run_id)
         run_known = run is not None
         run_live = run is not None and _is_live(run)
     if not run_known:
         return web.json_response(
-            {"code": followup.ERR_RUN_GONE,
-             "error": "the review this belongs to was deleted"}, status=409)
+            {"code": followup.ERR_RUN_GONE, "error": "the review this belongs to was deleted"},
+            status=409,
+        )
     if run_live:
         # A first pass can be superseded by a second one in the same run, and that
         # retires the descriptor. Opening now would hand the user a conversation
         # whose findings the run then replaces, with nothing saying so.
         return web.json_response(
-            {"code": followup.ERR_RUN_LIVE,
-             "error": "this review is still running"}, status=409)
+            {"code": followup.ERR_RUN_LIVE, "error": "this review is still running"}, status=409
+        )
 
-    desc, reason = await asyncio.to_thread(
-        followup.resumable, run_id, change_id)
+    desc, reason = await asyncio.to_thread(followup.resumable, run_id, change_id)
     if desc is None:
         # Literal-status returns rather than one computed `status=`: the
         # error-code contract gate cannot statically verify a site whose status is
@@ -2313,20 +2533,27 @@ async def _handle_followup_start(request: web.Request) -> web.Response:
         # body carries a `code`.
         if reason == followup.ERR_TRANSCRIPT_GONE:
             return web.json_response(
-                {"code": followup.ERR_TRANSCRIPT_GONE,
-                 "error": "the reviewer's session is no longer on disk"},
-                status=409)
+                {
+                    "code": followup.ERR_TRANSCRIPT_GONE,
+                    "error": "the reviewer's session is no longer on disk",
+                },
+                status=409,
+            )
         return web.json_response(
-            {"code": followup.ERR_NO_DESCRIPTOR,
-             "error": "this review did not keep a resumable session"},
-            status=409)
+            {
+                "code": followup.ERR_NO_DESCRIPTOR,
+                "error": "this review did not keep a resumable session",
+            },
+            status=409,
+        )
 
     state = _APP_STATE.get("state")
     sessions = getattr(state, "sessions", None)
     if sessions is None or not hasattr(sessions, "seed_conversation"):
         return web.json_response(
-            {"code": "followup_unavailable",
-             "error": "sessions are not available in this context"}, status=503)
+            {"code": "followup_unavailable", "error": "sessions are not available in this context"},
+            status=503,
+        )
 
     slot_key = followup.slot_key(run_id, change_id)
     # The session-map key a dashboard slot resolves its resume from. Seeded before
@@ -2339,8 +2566,12 @@ async def _handle_followup_start(request: web.Request) -> web.Response:
     mapped = await asyncio.to_thread(sessions.resumable_sid, session_key)
     if not mapped:
         await asyncio.to_thread(
-            sessions.seed_conversation, session_key, desc["sid"],
-            provider=desc["provider"], cwd=desc["cwd"])
+            sessions.seed_conversation,
+            session_key,
+            desc["sid"],
+            provider=desc["provider"],
+            cwd=desc["cwd"],
+        )
         # Read back rather than trust the write: the session map self-prunes an
         # entry whose files are gone, so this doubles as the last check that the
         # transcript is still there. Refusing here is the point — a slot created
@@ -2349,21 +2580,28 @@ async def _handle_followup_start(request: web.Request) -> web.Response:
         mapped = await asyncio.to_thread(sessions.resumable_sid, session_key)
     if not mapped:
         return web.json_response(
-            {"code": followup.ERR_TRANSCRIPT_GONE,
-             "error": "the reviewer's session is no longer on disk"}, status=409)
+            {
+                "code": followup.ERR_TRANSCRIPT_GONE,
+                "error": "the reviewer's session is no longer on disk",
+            },
+            status=409,
+        )
 
     folder_id = ""
     if hasattr(state, "mutate_folders"):
         folder_id = await _ensure_followup_folder(state)
     title = followup.slot_title(
-        change_id, await asyncio.to_thread(_change_title, run_id, change_id))
-    return web.json_response({
-        "ok": True,
-        "slot_key": slot_key,
-        "agent": desc["agent"],
-        "folder_id": folder_id,
-        "title": title,
-    })
+        change_id, await asyncio.to_thread(_change_title, run_id, change_id)
+    )
+    return web.json_response(
+        {
+            "ok": True,
+            "slot_key": slot_key,
+            "agent": desc["agent"],
+            "folder_id": folder_id,
+            "title": title,
+        }
+    )
 
 
 async def _followup_sweep_loop() -> None:
@@ -2373,14 +2611,11 @@ async def _followup_sweep_loop() -> None:
             await asyncio.sleep(_FOLLOWUP_SWEEP_INTERVAL)
             dropped = await asyncio.to_thread(followup.prune)
             if dropped:
-                logger.info(
-                    "code-review-sage: dropped %d idle review transcript(s)",
-                    dropped)
+                logger.info("code-review-sage: dropped %d idle review transcript(s)", dropped)
         except asyncio.CancelledError:  # pragma: no cover - shutdown
             raise
         except Exception:  # pragma: no cover - never let the sweeper die
-            logger.debug("code-review-sage: transcript sweep failed",
-                         exc_info=True)
+            logger.debug("code-review-sage: transcript sweep failed", exc_info=True)
 
 
 def register_routes(app: web.Application) -> None:
@@ -2432,8 +2667,7 @@ def register_routes(app: web.Application) -> None:
     except Exception:  # pragma: no cover - defensive
         pass
     app.router.add_get("/api/apps/code-review-sage/chat", _handle_chat_get)
-    app.router.add_post("/api/apps/code-review-sage/followup",
-                        _handle_followup_start)
+    app.router.add_post("/api/apps/code-review-sage/followup", _handle_followup_start)
     app.router.add_post("/api/apps/code-review-sage/review", _handle_review)
     app.router.add_post("/api/apps/code-review-sage/review-repo", _handle_review_repo)
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)
@@ -2447,22 +2681,17 @@ def register_routes(app: web.Application) -> None:
     # is matched first and never shadowed by the {run_id} pattern.
     app.router.add_get("/api/apps/code-review-sage/runs/{run_id}", _handle_run_detail)
     app.router.add_delete("/api/apps/code-review-sage/runs/{run_id}", _handle_run_delete)
-    app.router.add_get(
-        "/api/apps/code-review-sage/runs/{run_id}/report", _handle_run_report)
-    app.router.add_post(
-        "/api/apps/code-review-sage/runs/{run_id}/cancel", _handle_run_cancel)
-    app.router.add_post(
-        "/api/apps/code-review-sage/runs/{run_id}/archive", _handle_run_archive)
-    app.router.add_post(
-        "/api/apps/code-review-sage/runs/{run_id}/post", _handle_run_post)
+    app.router.add_get("/api/apps/code-review-sage/runs/{run_id}/report", _handle_run_report)
+    app.router.add_post("/api/apps/code-review-sage/runs/{run_id}/cancel", _handle_run_cancel)
+    app.router.add_post("/api/apps/code-review-sage/runs/{run_id}/archive", _handle_run_archive)
+    app.router.add_post("/api/apps/code-review-sage/runs/{run_id}/post", _handle_run_post)
     app.router.add_get("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_put("/api/apps/code-review-sage/settings", _handle_settings)
     app.router.add_get("/api/apps/code-review-sage/namespaces", _handle_namespaces)
     app.router.add_post("/api/apps/code-review-sage/namespaces", _handle_namespaces)
     app.router.add_delete("/api/apps/code-review-sage/namespaces", _handle_namespaces)
     app.router.add_get("/api/apps/code-review-sage/learnings", _handle_learnings)
-    app.router.add_post(
-        "/api/apps/code-review-sage/learnings/consolidate", _handle_consolidate)
+    app.router.add_post("/api/apps/code-review-sage/learnings/consolidate", _handle_consolidate)
 
     async def _shutdown_pool(_app: web.Application) -> None:
         """Retire the reusable review workers when the gateway shuts down."""

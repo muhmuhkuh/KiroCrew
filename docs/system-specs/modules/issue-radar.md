@@ -3,25 +3,20 @@
 ## Overview
 
 Issue Radar is an opt-in (`defaultEnabled: false`) built-in app for tracked-item
-and change-request triage across THREE providers — GitHub, GitLab and Azure
-DevOps (see [Providers](#providers)). It connects one or more repos via the
-user's own vendor CLI session (`gh`, `glab` or `az` — no OAuth app, no PAT held
-by Kiro Crew) and provides a 3-column workbench: browse/filter issues (work
-items on Azure DevOps), view AI-summarized detail + timeline, apply triage
-actions (label, close/reopen), and record per-issue investigation findings
-in a local ledger. A parallel PULL REQUESTS section reuses the same shape —
-filter by lifecycle (open / merged / closed-unmerged), person, draft and label;
-read an AI summary of the description plus the whole review conversation; see
-the automated checks ("auto review") on the head commit; and ACT on a PR without
-leaving for the provider's web UI — approve / request changes, comment, close or
-reopen, merge or arm the provider's own auto-merge, and cancel or re-run CI, per-PR
-or in bulk across a selection (see Pull-Request Actions). A background watcher
-optionally notifies on new issues.
+and change-request triage across FOUR providers — GitHub, GitLab, Azure DevOps
+and Jira (see [Providers](#providers)). It connects repos through the user's own
+vendor CLI (`gh`, `glab` or `az`) or Jira REST credentials — no OAuth app and no
+PAT held by Kiro Crew — and provides a 3-column workbench: browse/filter issues
+(work items on Azure DevOps), view AI-summarized detail + timeline, apply triage
+actions (label, close/reopen), and record per-issue investigation findings in a
+local ledger. A parallel PULL REQUESTS section reuses the same shape for the three
+forge providers; Jira is issues-only. A background watcher optionally notifies on
+new issues.
 
 ## Providers
 
-Three providers are supported, and each is a plain MODULE that mirrors the others
-function-for-function (`github_client`, `gitlab_client`, `azure_client`).
+Four providers are supported. GitHub, GitLab and Azure DevOps are plain modules
+that mirror each other; Jira is an issues-only REST client (`jira_client`).
 `provider.py` owns the identity type (`RepoKey`), the dispatch table and the
 display vocabulary; `ProviderClient` is the protocol the routes require, and
 because a module cannot be statically checked against a Protocol, conformance is
@@ -51,18 +46,22 @@ The reviewed real `glab` and `az` process spawns remain in
 `gitlab_client._glab_run` and `azure_client._az_run`, respectively, which keeps
 the spawn-audit allowlist tied to the same security chokepoints.
 
-| | GitHub | GitLab | Azure DevOps |
-|---|---|---|---|
-| Provider id | `github` | `gitlab` | `azure` |
-| CLI that owns the credential | `gh api` | `glab api` | `az devops invoke` |
-| Host | `github.com` (pinned) | `gitlab.com`, or an allowlisted self-managed `host[:port]` | `dev.azure.com` (pinned) |
-| `RepoKey.owner` carries | owner | group path (`group/subgroup`) | `{organization}/{project}` |
-| Tracked item | issue | issue | work item (**project-scoped**) |
-| Change request | pull request, `#` | merge request, `!` | pull request, `!` |
-| Review verbs | approve / request changes / comment | approve / comment (request changes REFUSED) | comment only (**both verdicts REFUSED** — see below) |
-| Merge methods | `MERGE` / `SQUASH` / `REBASE` | `MERGE` / `SQUASH` (`REBASE` refused) | `MERGE` / `SQUASH` / `REBASE` |
-| Auto-merge | `enablePullRequestAutoMerge` | REFUSED (see below) | `autoCompleteSetBy` |
-| Assignees | a set, capped at 10 | a set (Free keeps only the first) | exactly ONE (`System.AssignedTo`); more than one is REFUSED |
+| | GitHub | GitLab | Azure DevOps | Jira |
+|---|---|---|---|---|
+| Provider id | `github` | `gitlab` | `azure` | `jira` |
+| CLI/API | `gh api` | `glab api` | `az devops invoke` | Jira REST |
+| Host | `github.com` (pinned) | `gitlab.com`, or allowlisted self-managed | `dev.azure.com` (pinned) | `*.atlassian.net`, or allowlisted |
+| `RepoKey.owner` carries | owner | group path | `{organization}/{project}` | project key |
+| Tracked item | issue | issue | work item (**project-scoped**) | issue |
+| Change request | pull request, `#` | merge request, `!` | pull request, `!` | none |
+| Review / merge | supported | provider-limited | provider-limited | refused |
+| Assignees | a set, capped at 10 | a set | exactly one | one or none |
+
+Jira accepts `*.atlassian.net` automatically; self-hosted Jira requires an exact
+entry in `dashboard.jira_hosts`, and the host is rechecked before every API call.
+A Jira connection may carry an optional manual repo mapping for repo-centric UI
+identity, but requests route by project key. Pull requests, reviews, checks and
+workflow runs are refused rather than approximated.
 
 **Every provider is reached by shelling out to its vendor CLI as a raw REST
 passthrough, and Kiro Crew stores NO credential of its own.** `gh api`, `glab api`

@@ -1,0 +1,49 @@
+{
+  "name": "goal-owner",
+  "version": "0.1.0",
+  "displayName": "Goal Owner",
+  "description": "A bounded, resumable Project Owner for goals you choose to run autonomously.",
+  "author": "kirocrew",
+  "license": "MIT",
+  "defaultEnabled": false,
+  "platform": {
+    "os": [
+      "macos",
+      "linux",
+      "windows"
+    ]
+  },
+  "backend": {
+    "hooks": {
+      "routes": "backend.routes:register_routes",
+      "on_startup": "hooks:on_startup",
+      "on_shutdown": "hooks:on_shutdown"
+    }
+  },
+  "permissions": {
+    "api": [
+      "/api/apps/goal-owner",
+      "/api/apps/goal-owner/*"
+    ],
+    "storage": true,
+    "cron": true
+  },
+  "tags": [
+    "autonomous",
+    "goals",
+    "project-management",
+    "bounded-execution"
+  ],
+  "highlights": [
+    "One durable record per user-owned goal",
+    "Bounded wakes with explicit budgets",
+    "Pause and resume without losing progress",
+    "Crash-safe owner-session and cron reconciliation"
+  ],
+  "useCases": [
+    "Run a goal through bounded owner cycles while retaining human control over scope, budgets, and completion evidence."
+  ],
+  "configuration": [
+    "Enable Goal Owner, create a goal with its definition of done, then inspect or pause it through the app API."
+  ]
+}

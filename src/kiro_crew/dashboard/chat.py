@@ -184,4 +184,6 @@ from kiro_crew.dashboard.chat_voice import (  # noqa: F401
 )
 from kiro_crew.security import is_sensitive_path  # noqa: F401
 from kiro_crew.sel import sel  # noqa: F401
-from kiro_crew.trust_patterns import extract_bash_command as _extract_bash_command  # noqa: F401
+from kiro_crew.trust_patterns import (
+    extract_bash_command as _extract_bash_command,  # noqa: F401
+)

@@ -1,12 +1,12 @@
 # Code Review Sage
 
 A self-evolving deep code reviewer packaged as a built-in KiroCrew app. Reviews
-**GitHub pull requests**, learns per-repository from shipped fixes + review
-comments + design discussions, and produces a prioritized **Focus Report** so
-you know which changes actually deserve scrutiny. Findings are read **in the
-app**, next to the pull request they came from — nothing is written to the pull
-request unless you turn on `review.auto_post`, which publishes them as a PENDING
-(draft) review for you to submit.
+**GitHub pull requests and GitLab merge requests**, learns per-repository from
+shipped fixes + review comments + design discussions, and produces a prioritized
+**Focus Report** so you know which changes actually deserve scrutiny. Findings are
+read **in the app**, next to the pull request they came from — nothing is written
+to the pull request unless you turn on `review.auto_post`, which publishes them as
+a PENDING (draft) review for you to submit.
 
 ## Ask the reviewer
 
@@ -42,8 +42,8 @@ the platform's own user-controlled session cleanup.
 
 ## Architecture (V1)
 
-- **Deterministic shell** (`sage_lib/`): data store + self-heal layout, GitHub
-  source adapter, blast-radius signals, result records, scorer/export.
+- **Deterministic shell** (`sage_lib/`): data store + self-heal layout, GitHub +
+  GitLab source adapters, blast-radius signals, result records, scorer/export.
   Token-free, unit-tested.
 - **LLM judgment** (`skills/` + sub-agents): the per-change design gate +
   dimension review and the final report synthesis, each in a clean session.
@@ -57,7 +57,7 @@ the platform's own user-controlled session cleanup.
 
 ```
 code_review_sage/
-├── app.json                 # manifest (GitHub-only; depends on the `gh` CLI)
+├── app.json                 # manifest (GitHub + GitLab; needs `gh` and/or `glab`)
 ├── __init__.py              # exposes register_routes
 ├── backend/
 │   ├── __init__.py
@@ -66,7 +66,7 @@ code_review_sage/
 │   ├── store.py             # data layout self-heal + config
 │   ├── review_driver.py     # code-enforced 1-isolated-spawn-per-change loop
 │   ├── review_pool.py       # reviewer worker pool (config-driven model/effort)
-│   ├── adapters.py          # GitHub PR source adapter
+│   ├── adapters.py          # GitHub + GitLab source adapters
 │   └── ...
 ├── skills/
 │   ├── sage-review/         # review ruleset
@@ -86,25 +86,31 @@ it from the dashboard Apps page, or:
 kirocrew app enable code-review-sage
 ```
 
-Reviewing GitHub PRs requires an authenticated `gh` CLI on the gateway host:
+Reviewing GitHub PRs requires an authenticated `gh` CLI on the gateway host;
+reviewing GitLab MRs needs an authenticated `glab` CLI (gitlab.com works out of
+the box):
 
 ```bash
 gh auth login --hostname github.com
+glab auth login --hostname gitlab.com
 ```
 
-### GitHub Enterprise Server
+### GitHub Enterprise Server / self-hosted GitLab
 
-GitHub Enterprise hosts are opt-in. Add each instance to `github_hosts` in
-`~/.kiro/crew/apps/code-review-sage/data/config.json` (the list replaces the
-default, so keep `github.com` if you still review there) and authenticate `gh`
-for it:
+Enterprise hosts are opt-in. Add GitHub instances to `github_hosts` and GitLab
+instances to `gitlab_hosts` in
+`~/.kiro/crew/apps/code-review-sage/data/config.json` (each list replaces its
+platform default, so keep `github.com`/`gitlab.com` if you still review there)
+and authenticate the matching CLI for it:
 
 ```json
-"github_hosts": ["github.com", "ghe.example.com"]
+"github_hosts": ["github.com", "ghe.example.com"],
+"gitlab_hosts": ["gitlab.com", "gitlab.corp.example"]
 ```
 
 ```bash
 gh auth login --hostname ghe.example.com
+glab auth login --hostname gitlab.corp.example
 ```
 
 Hosts are matched exactly against the parsed URL hostname — never as a

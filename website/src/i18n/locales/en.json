@@ -91,12 +91,12 @@
         "staygreen": "STAYGREEN"
       },
       "manifest": {
-        "description": "Measures a GitHub repository before it changes it. Designs a calibrated performance metric (the ruler), proves the metric is trustworthy against a known win, then runs keep-or-revert improvement cycles: every candidate fix is written in an isolated worktree, gated against an edit allowlist and the repo's own tests, and kept only when the measured win clears the noise band. Survivors are drafted as GitHub pull requests you review and publish yourself.",
+        "description": "Measures a GitHub or GitLab repository before it changes it. Designs a calibrated performance metric (the ruler), proves the metric is trustworthy against a known win, then runs keep-or-revert improvement cycles: every candidate fix is written in an isolated worktree, gated against an edit allowlist and the repo's own tests, and kept only when the measured win clears the noise band. Survivors are drafted as pull requests / merge requests you review and publish yourself.",
         "display_name": "Auto-Improvement",
         "highlight_1": "Proves its own metric first — a run refuses to start on an untrustworthy ruler",
         "highlight_2": "Every candidate is measured A/B, or RED/GREEN for bug fixes, never just 'looks right'",
         "highlight_3": "Keeps a change only when the win clears the measured noise band",
-        "highlight_4": "Drafts GitHub pull requests — draft-only, never published or merged for you",
+        "highlight_4": "Drafts pull requests / merge requests — draft-only, never published or merged for you",
         "highlight_5": "Works on a push-disabled clone, so nothing escapes the sandbox unreviewed",
         "highlight_6": "One resumable chat session per pull request, finding, and run",
         "page_label": "Auto-Improve",
@@ -104,7 +104,7 @@
         "configuration_1": "The gateway host needs git and an authenticated gh CLI; connect a GitHub repository, choose its base branch, and calibrate a ruler before performance runs."
       },
       "setupPanel": {
-        "https_github_com_owner_repo": "https://github.com/owner/repo"
+        "https_github_com_owner_repo": "https://github.com/owner/repo or https://gitlab.com/group/project"
       }
     },
     "autoResearch": {
@@ -1087,6 +1087,18 @@
         "loading": "loading..."
       }
     },
+    "goalOwner": {
+      "manifest": {
+        "configuration_1": "Enable Goal Owner, create a goal with its definition of done, then inspect or pause it through the app API.",
+        "description": "A bounded, resumable Project Owner for goals you choose to run autonomously.",
+        "display_name": "Goal Owner",
+        "highlight_1": "One durable record per user-owned goal",
+        "highlight_2": "Bounded wakes with explicit budgets",
+        "highlight_3": "Pause and resume without losing progress",
+        "highlight_4": "Crash-safe owner-session and cron reconciliation",
+        "use_case_1": "Run a goal through bounded owner cycles while retaining human control over scope, budgets, and completion evidence."
+      }
+    },
     "issueRadar": {
       "components": {
         "agentSessionButton": {
@@ -1414,6 +1426,7 @@
         "https_github_com_owner_repo": "https://github.com/<owner>/<repo>",
         "https_gitlab_com_group_project": "https://gitlab.com/<group>/<project>",
         "issue_radar_reads": "Issue Radar reads",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
         "let_s_connect_a_repo": "Let's Connect a Repo",
         "loading_your_repos": "Loading your repos…",
         "or": "Or",
@@ -1424,7 +1437,11 @@
         "then": ", then",
         "through_your_own": "through your own",
         "you_contributed_to": "You contributed to",
-        "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>"
+        "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo"
       },
       "connectRepoModal": {
         "close": "Close",

@@ -20,6 +20,7 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from kiro_crew.acp_backends import ACP_BACKEND_PI
 from kiro_crew.metrics.sessions import (
     END_REASON_DESTROYED,
     END_REASON_DISCARDED,
@@ -404,7 +405,11 @@ class SessionLifecycleService:
                 # that rebuilt the factory but left them alone kept spawning the
                 # OLD pool size and agent, and the TTL was never re-adopted by
                 # any path. Same clamp as WarmSessionPool._state_from_owner.
-                owner._pool_size = min(constants.max_pool, max(0, cfg.session.pool_size))
+                owner._pool_size = (
+                    0
+                    if getattr(cfg.agent, "acp_backend", "") == ACP_BACKEND_PI
+                    else min(constants.max_pool, max(0, cfg.session.pool_size))
+                )
                 owner._pool_agent = cfg.session.pool_agent or getattr(
                     cfg.agent,
                     "default_agent",
@@ -454,7 +459,11 @@ class SessionLifecycleService:
                 # The same four pool fields refresh_defaults adopts: a reset
                 # handler that loads a disk-edited pool_ttl_secs must not evict
                 # the warm pool at the stale TTL until the watcher's next cycle.
-                owner._pool_size = min(constants.max_pool, max(0, cfg.session.pool_size))
+                owner._pool_size = (
+                    0
+                    if getattr(cfg.agent, "acp_backend", "") == ACP_BACKEND_PI
+                    else min(constants.max_pool, max(0, cfg.session.pool_size))
+                )
                 owner._pool_agent = cfg.session.pool_agent or getattr(
                     cfg.agent,
                     "default_agent",

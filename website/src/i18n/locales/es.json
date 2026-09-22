@@ -1893,6 +1893,18 @@
         "loading": "cargando..."
       }
     },
+    "goalOwner": {
+      "manifest": {
+        "configuration_1": "Activa Goal Owner, crea un objetivo con su definición de terminado y luego inspecciónalo o páusalo mediante la API de la aplicación.",
+        "description": "Un Project Owner acotado y reanudable para los objetivos que elijas ejecutar de forma autónoma.",
+        "display_name": "Propietario de objetivos",
+        "highlight_1": "Un registro duradero por cada objetivo propio del usuario",
+        "highlight_2": "Despertares acotados con presupuestos explícitos",
+        "highlight_3": "Pausa y reanudación sin perder el progreso",
+        "highlight_4": "Reconciliación resistente a fallos de la sesión del propietario y de cron",
+        "use_case_1": "Ejecuta un objetivo en ciclos acotados del propietario y conserva el control humano sobre el alcance, los presupuestos y las pruebas de finalización."
+      }
+    },
     "issueRadar": {
       "api": {
         "assignees_changed_elsewhere": "Los asignados cambiaron en otro lugar desde que cargaste esta incidencia.",
@@ -2342,6 +2354,7 @@
         "https_github_com_owner_repo": "https://github.com/<owner>/<repo>",
         "https_gitlab_com_group_project": "https://gitlab.com/<group>/<project>",
         "issue_radar_reads": "Issue Radar lee",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
         "last_contribution": "Tu última contribución: {{when}}",
         "let_s_connect_a_repo": "Vamos a conectar un repositorio",
         "loading_your_repos": "Cargando tus repositorios…",
@@ -2357,6 +2370,10 @@
         "through_your_own": "a través de tu propio",
         "you_contributed_to": "Contribuiste a",
         "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo",
         "repositories_in_your_organization": "Repositorios de tu organización",
         "no_repositories_in_your_organization_paste_a_url": "No hay repositorios en tu organización. Pega una URL abajo para conectar uno.",
         "azure_also_needs_the_devops_extension": "Azure DevOps también necesita su propia extensión de la CLI, que se instala una vez con el comando de abajo."
@@ -2374,6 +2391,7 @@
         "format": {
           "last_update": "Última actualización",
           "number": "Número",
+          "priority": "Prioridad",
           "crew_sort_status": "Estado",
           "crew_sort_name": "Nombre",
           "crew_sort_created": "Creada"
@@ -11324,6 +11342,7 @@
         "installed_check_again_to_use": "Instalado en esta máquina. Pulsa Comprobar de nuevo para que se detecte. Si este mensaje sigue ahí, reinicia {{productName}} desde Settings > About.",
         "kas_kiro_agent": "KAS (kiro-agent)",
         "kiro_cli": "Kiro CLI",
+        "pi": "Pi",
         "loading_configuration": "Cargando la configuración…",
         "mcp_concern_auto_approve": "Las reglas de aprobación automática que define tu archivo de configuración del agente — {{name}} no las aplica",
         "mcp_concern_denied_tools": "Las herramientas que apagaste: aquí siguen disponibles",

@@ -96,6 +96,15 @@ def parse_batch(text: str) -> list[str]:
     return out
 
 
+def list_open_gitlab_mrs(
+    namespace: str, project: str, *, host: str, timeout: float = 120.0
+) -> list[dict]:
+    """Enumerate open GitLab merge requests through Issue Radar's hardened client."""
+    from kiro_crew.apps.builtins.issue_radar.backend import gitlab_client
+
+    return gitlab_client.list_open_pulls(namespace, project, host=host, timeout=timeout)
+
+
 def list_open_prs(owner: str, repo: str, *, host: str = "github.com",
                   timeout: float = 60.0) -> list[dict]:
     """Enumerate a repo's OPEN pull requests via the authenticated ``gh`` CLI.
@@ -257,11 +266,17 @@ POSTING_SPECS = {
         "anchor": "a comments[] entry {path, line, side:'RIGHT'} against commit_id=<head SHA>",
         "top_anchor": "the review `body` field (a general summary on the pending review)",
     },
+    "gitlab": {
+        "tool": "one `glab api --method POST projects/<url-encoded-namespace>/merge_requests/<iid>/draft_reviews` "
+                "call (creates a DRAFT — non-submitted — review; a human submits it)",
+        "anchor": "a notes[] entry {path, line, position:{new_path, new_line}} anchored against the MR head",
+        "top_anchor": "the draft review `notes` with no path (a general summary note)",
+    },
 }
 
 
 def posting_spec(platform: str) -> dict:
-    """Posting tool + anchoring hint for a platform (GitHub is the only platform)."""
+    """Posting tool + anchoring hint for a platform (GitHub or GitLab)."""
     return POSTING_SPECS.get(platform, POSTING_SPECS["github"])
 
 
@@ -279,29 +294,53 @@ FETCH_SPECS = {
         'the form {...pull, "files":[{filename, patch}], "comments":[...]} and pass '
         "THAT object as the payload"
     ),
+    "gitlab": (
+        "use the `glab` CLI to fetch the MR (the repo may be PRIVATE, so `glab` "
+        "must be authenticated on this host). Parse <namespace>/<iid> from the "
+        "URL, then run `glab api projects/<url-encoded-namespace>/merge_requests/<iid>` "
+        "(MR metadata, e.g. web_url) and `glab api projects/<url-encoded-namespace>/merge_requests/<iid>/changes` "
+        "(per-file diffs; each change has new_path + diff). Merge them into ONE JSON object of "
+        'the form {...mr, "changes":[{new_path, diff}], "notes":[...]} and pass THAT '
+        "object as the payload"
+    ),
 }
 
 
 def fetch_spec(platform: str, host: str = "github.com") -> str:
-    """FETCH instruction for a platform (GitHub is the only platform).
+    """FETCH instruction for a platform (GitHub or GitLab).
 
     For a GitHub Enterprise host the instruction routes every ``gh api`` call to
     that instance's API via ``--hostname`` — the host has already passed the
-    adapters' parsed-hostname allowlist, so it is safe to interpolate."""
+    adapters' parsed-hostname allowlist, so it is safe to interpolate. For a
+    self-hosted GitLab instance ``glab api`` is routed with `--hostname <host>`
+    the same way."""
     spec = FETCH_SPECS.get(platform, FETCH_SPECS["github"])
     h = adapters.canonical_host(host)
     if h:
-        # ALWAYS name the host — including github.com — so the worker's gh
-        # calls can never drift to the CLI's configured default instance.
-        spec += (
-            f". The PR lives on the GitHub host `{h}`: add "
-            f"`--hostname {h}` to EVERY `gh api` call"
-        )
-        if h != "github.com":
+        if platform == "gitlab":
+            # ALWAYS name the host — including gitlab.com — so the worker's glab
+            # calls can never drift to the CLI's configured default instance.
             spec += (
-                f" (`gh` must be authenticated for that host: "
-                f"`gh auth login --hostname {h}`)"
+                f". The MR lives on the GitLab host `{h}`: add "
+                f"`--hostname {h}` to EVERY `glab api` call"
             )
+            if h != "gitlab.com":
+                spec += (
+                    f" (`glab` must be authenticated for that host: "
+                    f"`glab auth login --hostname {h}`)"
+                )
+        else:
+            # ALWAYS name the host — including github.com — so the worker's gh
+            # calls can never drift to the CLI's configured default instance.
+            spec += (
+                f". The PR lives on the GitHub host `{h}`: add "
+                f"`--hostname {h}` to EVERY `gh api` call"
+            )
+            if h != "github.com":
+                spec += (
+                    f" (`gh` must be authenticated for that host: "
+                    f"`gh auth login --hostname {h}`)"
+                )
     return spec
 
 

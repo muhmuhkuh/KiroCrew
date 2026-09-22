@@ -430,7 +430,7 @@ def _build_kiro_model_map() -> dict[str, str]:
         return {}
 
 
-def _load_restore_cfg() -> "KiroCrewConfig | None":
+def _load_restore_cfg() -> KiroCrewConfig | None:
     """Load the config the restore paths read, tolerating a broken file.
 
     Factored out so the async drivers can hoist it into a worker thread —
@@ -566,7 +566,7 @@ def _prefetch_rehydrate_inputs(
     )
 
 
-def _restore_open_slots_steps(state: DashboardState) -> "Iterator[int]":
+def _restore_open_slots_steps(state: DashboardState) -> Iterator[int]:
     """Drive the open-tab restore one tab at a time, yielding the running count.
 
     Exposed as a generator so a plain synchronous caller
@@ -1921,9 +1921,9 @@ def _apply_recent_session(
     meta: dict,
     messages: list[dict],
     *,
-    conv_log: "ConversationLog",
+    conv_log: ConversationLog,
     kiro_model_map: dict[str, str],
-    restore_cfg: "KiroCrewConfig | None",
+    restore_cfg: KiroCrewConfig | None,
     member_identity: tuple[str, str] | None = _IDENTITY_UNRESOLVED,
     agent: str | None = None,
 ) -> None:
@@ -2170,7 +2170,7 @@ def _apply_recent_session(
 
 def _restore_recent_sessions_steps(
     state: DashboardState, window_minutes: int = 30, *, folders_only: bool = False
-) -> "Iterator[int]":
+) -> Iterator[int]:
     """Drive :func:`restore_recent_sessions` one session at a time.
 
     Generator so a plain synchronous caller can spin through it. The event-loop
@@ -2993,10 +2993,10 @@ def _frozen_prefix_and_foreign_appends(
     # genuine window line was mis-classified as a foreign append and DUPLICATED on
     # disk. The bounded multiset below matches them one-for-one regardless of
     # ``ts`` collisions.
-    mid_idx: dict[str, "deque[int]"] = {}
-    exact_idx: dict[tuple[object, object, object], "deque[int]"] = {}
-    ts_idx: dict[object, "deque[int]"] = {}
-    rc_idx: dict[tuple[object, object], "deque[int]"] = {}
+    mid_idx: dict[str, deque[int]] = {}
+    exact_idx: dict[tuple[object, object, object], deque[int]] = {}
+    ts_idx: dict[object, deque[int]] = {}
+    rc_idx: dict[tuple[object, object], deque[int]] = {}
     for _i, e in enumerate(window_entries):
         _ets = e.get("ts")
         _erole = e.get("role")
@@ -3010,7 +3010,7 @@ def _frozen_prefix_and_foreign_appends(
         rc_idx.setdefault((_erole, _econtent), deque()).append(_i)
     consumed = [False] * len(window_entries)
 
-    def _take(dq: "deque[int] | None") -> bool:
+    def _take(dq: deque[int] | None) -> bool:
         """Consume the first not-yet-consumed entry index in ``dq`` (if any)."""
         if not dq:
             return False

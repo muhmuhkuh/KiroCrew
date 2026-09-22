@@ -58,8 +58,12 @@ from kiro_crew.github_runner import (
     provider_executable_candidates,
 )
 from kiro_crew.github_runner import strict_provider_bins as _strict_provider_bins
-from kiro_crew.github_runner import validate_provider_executable as _validate_provider_executable
-from kiro_crew.history_search import register_search_ref_resolver as _register_search_ref_resolver
+from kiro_crew.github_runner import (
+    validate_provider_executable as _validate_provider_executable,
+)
+from kiro_crew.history_search import (
+    register_search_ref_resolver as _register_search_ref_resolver,
+)
 from kiro_crew.history_search import (
     reset_search_ref_resolver_for_tests as _reset_search_ref_resolver,
 )

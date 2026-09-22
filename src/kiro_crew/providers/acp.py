@@ -2158,6 +2158,10 @@ class AcpProvider(LLMProvider):
         """
         if not session_id:
             return
+        if self.is_pi_backend:
+            assert isinstance(self._client, AcpClient)
+            await self._client.delete_session(session_id)
+            return
         sessions_dir = kiro_sessions_dir()
         for suffix in (".json", ".jsonl"):
             target = sessions_dir / f"{session_id}{suffix}"

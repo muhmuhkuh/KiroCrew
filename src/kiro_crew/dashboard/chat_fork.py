@@ -23,7 +23,9 @@ from kiro_crew.dashboard.state import (
     request_slot_origin,
 )
 from kiro_crew.history import carry_provenance
-from kiro_crew.history_projection import drop_persisted_tail_prefix as _drop_persisted_tail_prefix
+from kiro_crew.history_projection import (
+    drop_persisted_tail_prefix as _drop_persisted_tail_prefix,
+)
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 

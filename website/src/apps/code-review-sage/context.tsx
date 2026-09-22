@@ -10,16 +10,34 @@ import {
   useQuery,
   useQueryClient,
   type UseMutationResult,
-} from '@tanstack/react-query'
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-
-import { sageApi } from './api'
-import { changeKey, prRefFromChange, repoOfRun, runCoversChange } from './lib/format'
-import { IDLE_POLL_MS, LIVE_POLL_MS } from './lib/layout'
+} from "@tanstack/react-query";
 import {
-  coerceListTab, coerceMainView, loadUiState, readSnapshot, saveUiState,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+
+import { sageApi } from "./api";
+import {
+  changeKey,
+  prRefFromChange,
+  repoOfRun,
+  runCoversChange,
+} from "./lib/format";
+import { IDLE_POLL_MS, LIVE_POLL_MS } from "./lib/layout";
+import {
+  coerceListTab,
+  coerceMainView,
+  loadUiState,
+  readSnapshot,
+  saveUiState,
   writeSnapshot,
-} from './lib/persist'
+} from "./lib/persist";
 import type {
   ListTab,
   RepoPrsResponse,
@@ -35,60 +53,72 @@ import type {
   Run,
   RunReport,
   UserReposResponse,
-} from './lib/types'
+} from "./lib/types";
 
 /** A repo the picker is currently showing PRs for. */
 export interface ActiveRepo {
-  owner: string
-  repo: string
+  owner: string;
+  repo: string;
+  provider?: "github" | "gitlab";
+  host?: string;
 }
 
 export function repoUrl(r: ActiveRepo): string {
-  return `https://github.com/${r.owner}/${r.repo}`
+  const host =
+    r.host || (r.provider === "gitlab" ? "gitlab.com" : "github.com");
+  const slug = r.owner ? `${r.owner}/${r.repo}` : r.repo;
+  return `https://${host}/${slug}`;
 }
 
 export function repoSlug(r: ActiveRepo): string {
-  return `${r.owner}/${r.repo}`
+  const slug = r.owner ? `${r.owner}/${r.repo}` : r.repo;
+  const host = r.host || "";
+  return host && host !== "github.com" && host !== "gitlab.com"
+    ? `${host}/${slug}`
+    : slug;
 }
 
 export interface SageContextValue {
   // --- Threads (runs) ---
-  runs: Run[]
-  runsLoading: boolean
-  runsError: Error | null
-  pool: PoolStats | null
-  reviewer: ReviewerInfo | null
+  runs: Run[];
+  runsLoading: boolean;
+  runsError: Error | null;
+  pool: PoolStats | null;
+  reviewer: ReviewerInfo | null;
   /** True while any run is live — drives the poll cadence and the rail badge. */
-  anyRunning: boolean
+  anyRunning: boolean;
   /** Runs belonging to the active repo. Empty when no repo is selected. */
-  repoRuns: Run[]
+  repoRuns: Run[];
   /** change_ids covered by a LIVE run. A PR already being reviewed must not be
    *  selectable for a second review — the backend would refuse the duplicate
    *  anyway (the in-flight claim registry), so offering it is a lie. */
   /** Change URLs (via `changeKey`) under review right now. Keyed by URL, not
    *  change_id: that id is a lossily-sanitized filename stem and collides
    *  across repos differing only by `-` vs `_`. */
-  reviewingChangeUrls: Set<string>
-  selectedRunId: string | null
-  selectRun: (runId: string | null) => void
-  activeRun: Run | null
+  reviewingChangeUrls: Set<string>;
+  selectedRunId: string | null;
+  selectRun: (runId: string | null) => void;
+  activeRun: Run | null;
 
   // --- The selected thread's report ---
-  report: RunReport | null
-  reportLoading: boolean
-  reportError: Error | null
+  report: RunReport | null;
+  reportLoading: boolean;
+  reportError: Error | null;
 
   // --- Thread actions ---
-  cancelRun: (runId: string) => void
-  cancelling: boolean
-  deleteRun: (runId: string) => void
-  deleting: boolean
-  archiveRun: (runId: string) => void
-  archiving: boolean
-  archiveError: Error | null
+  cancelRun: (runId: string) => void;
+  cancelling: boolean;
+  deleteRun: (runId: string) => void;
+  deleting: boolean;
+  archiveRun: (runId: string) => void;
+  archiving: boolean;
+  archiveError: Error | null;
   /** Publish a finished run's findings to its pull request (never automatic).
    *  With a selection, only those comments are sent. */
-  postComments: (runId: string, select?: { changeId: string; keys?: string[] }) => void
+  postComments: (
+    runId: string,
+    select?: { changeId: string; keys?: string[] },
+  ) => void;
   /** Publish a selection that spans several changes, ONE request at a time.
    *
    *  The backend rejects a second post while one is in flight (`already_posting`),
@@ -99,111 +129,141 @@ export interface SageContextValue {
   postCommentGroups: (
     runId: string,
     groups: { changeId: string; keys: string[] }[],
-  ) => Promise<void>
-  posting: boolean
+  ) => Promise<void>;
+  posting: boolean;
   /** The selection currently being posted: `undefined` when idle, `null` when the
    *  whole review is going out, otherwise the specific comment keys. */
-  postingSelection?: { changeId: string; keys?: string[] } | null
-  postError: Error | null
+  postingSelection?: { changeId: string; keys?: string[] } | null;
+  postError: Error | null;
 
   // --- Starting a review ---
-  startReview: UseMutationResult<{ run_id: string; changes: string[] }, Error, string[]>
-  startReviewLinks: UseMutationResult<{ run_id: string; changes: string[] }, Error, string>
+  startReview: UseMutationResult<
+    { run_id: string; changes: string[] },
+    Error,
+    string[]
+  >;
+  startReviewLinks: UseMutationResult<
+    { run_id: string; changes: string[] },
+    Error,
+    string
+  >;
   startRepoReview: UseMutationResult<
-    { run_id?: string; repo: string; changes: string[]; skipped: number; status: string; message?: string },
+    {
+      run_id?: string;
+      repo: string;
+      changes: string[];
+      skipped: number;
+      status: string;
+      message?: string;
+    },
     Error,
     { repo: string; force: boolean }
-  >
+  >;
 
   // --- Repo + PR discovery ---
-  pinnedRepos: PinnedRepo[]
-  pinnedLoading: boolean
-  recent: RecentReposResponse | null
-  recentLoading: boolean
-  recentError: Error | null
+  pinnedRepos: PinnedRepo[];
+  pinnedLoading: boolean;
+  recent: RecentReposResponse | null;
+  recentLoading: boolean;
+  recentError: Error | null;
   /** Recent-repo discovery is a live `gh` call, so it is opt-in. */
-  discoveryEnabled: boolean
-  enableDiscovery: () => void
+  discoveryEnabled: boolean;
+  enableDiscovery: () => void;
   /** Every repo the gh user can reach (not just recently-touched ones). */
-  mine: UserReposResponse | null
-  mineLoading: boolean
-  mineError: Error | null
-  refreshMine: () => void
-  pinRepo: (owner: string, repo: string) => void
-  pinRepoUrl: (url: string) => void
-  unpinRepo: (owner: string, repo: string) => void
-  pinError: Error | null
+  mine: UserReposResponse | null;
+  mineLoading: boolean;
+  mineError: Error | null;
+  refreshMine: () => void;
+  pinRepo: (owner: string, repo: string) => void;
+  pinRepoUrl: (url: string) => void;
+  unpinRepo: (
+    owner: string,
+    repo: string,
+    provider?: string,
+    host?: string,
+  ) => void;
+  pinError: Error | null;
 
-  activeRepo: ActiveRepo | null
-  setActiveRepo: (r: ActiveRepo | null) => void
+  activeRepo: ActiveRepo | null;
+  setActiveRepo: (r: ActiveRepo | null) => void;
   /** The PR whose detail + review the detail pane is showing. */
-  selectedPr: PrRef | null
-  selectPr: (pr: PrRef | null) => void
+  selectedPr: PrRef | null;
+  selectPr: (pr: PrRef | null) => void;
   /** The most recent run that covered `selectedPr`, if any. */
-  prRun: Run | null
-  prs: RepoPr[]
-  prsLoading: boolean
-  prsError: Error | null
-  refreshPrs: () => void
+  prRun: Run | null;
+  prs: RepoPr[];
+  prsLoading: boolean;
+  prsError: Error | null;
+  refreshPrs: () => void;
 
   // --- Navigation ---
-  mainView: MainView
-  setMainView: (v: MainView) => void
+  mainView: MainView;
+  setMainView: (v: MainView) => void;
   /** Which learning namespace the Learning view is reading. */
-  selectedNamespace: string | null
-  selectNamespace: (ns: string | null) => void
+  selectedNamespace: string | null;
+  selectNamespace: (ns: string | null) => void;
   /** Which list the middle column shows. */
-  listTab: ListTab
-  setListTab: (t: ListTab) => void
-  expanded: RailSection
-  setExpanded: (s: RailSection) => void
+  listTab: ListTab;
+  setListTab: (t: ListTab) => void;
+  expanded: RailSection;
+  setExpanded: (s: RailSection) => void;
   /** True when the "new review" composer is open in the detail pane. */
-  composing: boolean
-  openComposer: () => void
-  closeComposer: () => void
+  composing: boolean;
+  openComposer: () => void;
+  closeComposer: () => void;
   /** True when the "Add repos" picker owns the detail pane. */
-  addingRepos: boolean
-  openAddRepos: () => void
-  closeAddRepos: () => void
+  addingRepos: boolean;
+  openAddRepos: () => void;
+  closeAddRepos: () => void;
 }
 
-const Ctx = createContext<SageContextValue | null>(null)
+const Ctx = createContext<SageContextValue | null>(null);
 
 export function useSage(): SageContextValue {
-  const v = useContext(Ctx)
-  if (!v) throw new Error('useSage must be used within <SageProvider>')
-  return v
+  const v = useContext(Ctx);
+  if (!v) throw new Error("useSage must be used within <SageProvider>");
+  return v;
 }
 
-const RUNS_KEY = ['code-review-sage', 'runs'] as const
+const RUNS_KEY = ["code-review-sage", "runs"] as const;
 
-export function SageProvider({ children, initialRunId }: {
-  children: ReactNode
-  initialRunId?: string | null
+export function SageProvider({
+  children,
+  initialRunId,
+}: {
+  children: ReactNode;
+  initialRunId?: string | null;
 }) {
-  const qc = useQueryClient()
+  const qc = useQueryClient();
   // Read once, at mount: the last state this app was left in. A `?run=` deep
   // link (from a finished-review notification) is a deliberate destination, so
   // it outranks whatever was restored.
-  const [restored] = useState(loadUiState)
+  const [restored] = useState(loadUiState);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(
-    initialRunId ?? restored.selectedRunId ?? null)
-  const [mainView, setMainView] = useState<MainView>(
-    () => coerceMainView(restored.mainView))
+    initialRunId ?? restored.selectedRunId ?? null,
+  );
+  const [mainView, setMainView] = useState<MainView>(() =>
+    coerceMainView(restored.mainView),
+  );
   // Defaults to the namespace every install has, so opening Learning reads
   // something instead of an empty pane.
-  const [selectedNamespace, selectNamespace] = useState<string | null>('default')
-  const [listTab, setListTab] = useState<ListTab>(
-    () => coerceListTab(restored.listTab))
-  const [expanded, setExpanded] = useState<RailSection>('reviews')
-  const [composing, setComposing] = useState(false)
-  const [addingRepos, setAddingRepos] = useState(false)
+  const [selectedNamespace, selectNamespace] = useState<string | null>(
+    "default",
+  );
+  const [listTab, setListTab] = useState<ListTab>(() =>
+    coerceListTab(restored.listTab),
+  );
+  const [expanded, setExpanded] = useState<RailSection>("reviews");
+  const [composing, setComposing] = useState(false);
+  const [addingRepos, setAddingRepos] = useState(false);
   const [activeRepo, setActiveRepo] = useState<ActiveRepo | null>(
-    restored.activeRepo ?? null)
+    restored.activeRepo ?? null,
+  );
   const [selectedPr, setSelectedPr] = useState<PrRef | null>(
-    initialRunId ? null : restored.selectedPr ?? null)
-  const [discoveryEnabled, setDiscoveryEnabled] = useState(false)
-  const prsRef = useRef<RepoPr[]>([])
+    initialRunId ? null : (restored.selectedPr ?? null),
+  );
+  const [discoveryEnabled, setDiscoveryEnabled] = useState(false);
+  const prsRef = useRef<RepoPr[]>([]);
 
   // --- Runs -----------------------------------------------------------------
   // One query drives the whole thread list. The interval is derived from the
@@ -214,44 +274,44 @@ export function SageProvider({ children, initialRunId }: {
   // showing a skeleton for the round-trip. A live run's status is a few hundred
   // milliseconds out of date for that window — acceptable, and the progress bar
   // corrects itself on the first response.
-  const runsSnapshot = useMemo(() => readSnapshot<RunsResponse>('runs'), [])
+  const runsSnapshot = useMemo(() => readSnapshot<RunsResponse>("runs"), []);
   const runsQuery = useQuery({
     queryKey: RUNS_KEY,
     queryFn: () => sageApi.runs(),
     initialData: runsSnapshot?.data,
     initialDataUpdatedAt: runsSnapshot?.at,
     refetchInterval: (q) =>
-      (q.state.data?.runs ?? []).some((r) => r.status === 'running')
+      (q.state.data?.runs ?? []).some((r) => r.status === "running")
         ? LIVE_POLL_MS
         : IDLE_POLL_MS,
-  })
+  });
   // Memoized so the `activeRun` lookup below (and every consumer that depends on
   // `runs` identity) doesn't see a fresh array on every render.
-  const runs = useMemo(() => runsQuery.data?.runs ?? [], [runsQuery.data])
-  const anyRunning = runs.some((r) => r.status === 'running')
+  const runs = useMemo(() => runsQuery.data?.runs ?? [], [runsQuery.data]);
+  const anyRunning = runs.some((r) => r.status === "running");
   // The middle column is the SELECTED REPO's surface — its pull requests and its
   // reviews. The rail keeps the unfiltered list so a review is always reachable
   // regardless of which repo (if any) is in focus.
   const repoRuns = useMemo(() => {
-    if (!activeRepo) return []
-    const want = repoSlug(activeRepo).toLowerCase()
-    return runs.filter((r) => repoOfRun(r) === want)
-  }, [runs, activeRepo])
+    if (!activeRepo) return [];
+    const want = repoSlug(activeRepo).toLowerCase();
+    return runs.filter((r) => repoOfRun(r) === want);
+  }, [runs, activeRepo]);
   // Keyed by change URL, not change_id: the id is the lossily-sanitized filename
   // stem, so two repos differing only by `-` vs `_` collapse to one id and an
   // unrelated PR would render as already under review (and be un-tickable).
   const reviewingChangeUrls = useMemo(() => {
-    const urls = new Set<string>()
+    const urls = new Set<string>();
     for (const r of runs) {
-      if (r.status !== 'running') continue
-      for (const c of r.changes ?? []) urls.add(changeKey(c))
+      if (r.status !== "running") continue;
+      for (const c of r.changes ?? []) urls.add(changeKey(c));
     }
-    return urls
-  }, [runs])
+    return urls;
+  }, [runs]);
   const activeRun = useMemo(
     () => runs.find((r) => r.run_id === selectedRunId) ?? null,
     [runs, selectedRunId],
-  )
+  );
 
   // Derived from `selectedRunId`, NOT from a fresh search over `runs`. The report
   // query is keyed by `selectedRunId`, so searching live runs for the PR's newest
@@ -263,21 +323,24 @@ export function SageProvider({ children, initialRunId }: {
   // showing someone else's review here. `selectPr` and the run-started handler
   // both set `selectedRunId`, so the intended run still lands.
   const prRun = useMemo(() => {
-    if (!selectedPr || !activeRun) return null
-    return runCoversChange(activeRun, selectedPr.url) ? activeRun : null
-  }, [activeRun, selectedPr])
+    if (!selectedPr || !activeRun) return null;
+    return runCoversChange(activeRun, selectedPr.url) ? activeRun : null;
+  }, [activeRun, selectedPr]);
 
   // Selecting a PR points the report query at that PR's review, so the pane can
   // show an in-flight run's progress or a finished run's findings without a
   // second query keyed differently.
-  const selectPr = useCallback((pr: PrRef | null) => {
-    setSelectedPr(pr)
-    setComposing(false)
-    setAddingRepos(false)
-    if (!pr) return
-    const run = runs.find((r) => runCoversChange(r, pr.url))
-    setSelectedRunId(run?.run_id ?? null)
-  }, [runs])
+  const selectPr = useCallback(
+    (pr: PrRef | null) => {
+      setSelectedPr(pr);
+      setComposing(false);
+      setAddingRepos(false);
+      if (!pr) return;
+      const run = runs.find((r) => runCoversChange(r, pr.url));
+      setSelectedRunId(run?.run_id ?? null);
+    },
+    [runs],
+  );
 
   // --- The selected thread's report ----------------------------------------
   // Polled while its run is live so the report appears the moment it is written;
@@ -287,17 +350,21 @@ export function SageProvider({ children, initialRunId }: {
   // already read paints its findings immediately and refetches behind that,
   // instead of showing a skeleton for the round-trip.
   const reportSnapshot = useMemo(
-    () => (selectedRunId ? readSnapshot<RunReport>(`report:${selectedRunId}`) : undefined),
+    () =>
+      selectedRunId
+        ? readSnapshot<RunReport>(`report:${selectedRunId}`)
+        : undefined,
     [selectedRunId],
-  )
+  );
   const reportQuery = useQuery({
-    queryKey: ['code-review-sage', 'report', selectedRunId],
+    queryKey: ["code-review-sage", "report", selectedRunId],
     queryFn: () => sageApi.runReport(selectedRunId as string),
     enabled: !!selectedRunId,
     initialData: reportSnapshot?.data,
     initialDataUpdatedAt: reportSnapshot?.at,
-    refetchInterval: () => (activeRun?.status === 'running' ? LIVE_POLL_MS : false),
-  })
+    refetchInterval: () =>
+      activeRun?.status === "running" ? LIVE_POLL_MS : false,
+  });
 
   // --- Persistence ----------------------------------------------------------
   // Snapshots are written from the query data rather than inside the query fn so
@@ -306,236 +373,311 @@ export function SageProvider({ children, initialRunId }: {
   // renewing its own expiry.
   useEffect(() => {
     if (runsQuery.data && runsQuery.isSuccess && !runsQuery.isPlaceholderData) {
-      writeSnapshot('runs', runsQuery.data)
+      writeSnapshot("runs", runsQuery.data);
     }
-  }, [runsQuery.data, runsQuery.isSuccess, runsQuery.isPlaceholderData])
+  }, [runsQuery.data, runsQuery.isSuccess, runsQuery.isPlaceholderData]);
 
   useEffect(() => {
     // Only a READY report is worth replaying: a not-ready one describes a moment
     // in a run's life, and showing it again later would misreport a finished
     // review as still working.
     if (selectedRunId && reportQuery.data?.ready && reportQuery.isSuccess) {
-      writeSnapshot(`report:${selectedRunId}`, reportQuery.data)
+      writeSnapshot(`report:${selectedRunId}`, reportQuery.data);
     }
-  }, [selectedRunId, reportQuery.data, reportQuery.isSuccess])
+  }, [selectedRunId, reportQuery.data, reportQuery.isSuccess]);
 
   const invalidateRuns = useCallback(() => {
-    void qc.invalidateQueries({ queryKey: RUNS_KEY })
-  }, [qc])
+    void qc.invalidateQueries({ queryKey: RUNS_KEY });
+  }, [qc]);
 
-  const selectRun = useCallback((runId: string | null) => {
-    setSelectedRunId(runId)
-    if (!runId) return
-    setComposing(false)
-    setAddingRepos(false)
-    // A run over a SINGLE pull request is, to the user, that pull request — so
-    // open it with its full context (description / comments / checks) rather
-    // than a bare run view that drops everything about the PR. Prefer the loaded
-    // list row (it has the title and author already); fall back to deriving a
-    // reference from the change URL, whose missing fields the provider fetch
-    // fills in. Multi-PR runs keep the run view: there is no single subject.
-    const run = runs.find((r) => r.run_id === runId)
-    const changes = run?.changes ?? []
-    if (run && changes.length === 1) {
-      const cid = run.change_ids?.[0] ?? changes[0]
-      // Match on the change URL, not `change_id`: ids collapse across repos, so
-      // an id-equality lookup can return a different PR that happens to share
-      // one and open it instead of the run's actual subject, hiding the report
-      // the user just asked for. The URL is the identity that does not collide.
-      const want = changeKey(changes[0])
-      const known = prsRef.current.find((p) => changeKey(p.url) === want)
-      setSelectedPr(known ?? prRefFromChange(changes[0], cid))
-    } else {
-      setSelectedPr(null)
-    }
-  }, [runs])
+  const selectRun = useCallback(
+    (runId: string | null) => {
+      setSelectedRunId(runId);
+      if (!runId) return;
+      setComposing(false);
+      setAddingRepos(false);
+      // A run over a SINGLE pull request is, to the user, that pull request — so
+      // open it with its full context (description / comments / checks) rather
+      // than a bare run view that drops everything about the PR. Prefer the loaded
+      // list row (it has the title and author already); fall back to deriving a
+      // reference from the change URL, whose missing fields the provider fetch
+      // fills in. Multi-PR runs keep the run view: there is no single subject.
+      const run = runs.find((r) => r.run_id === runId);
+      const changes = run?.changes ?? [];
+      if (run && changes.length === 1) {
+        const cid = run.change_ids?.[0] ?? changes[0];
+        // Match on the change URL, not `change_id`: ids collapse across repos, so
+        // an id-equality lookup can return a different PR that happens to share
+        // one and open it instead of the run's actual subject, hiding the report
+        // the user just asked for. The URL is the identity that does not collide.
+        const want = changeKey(changes[0]);
+        const known = prsRef.current.find((p) => changeKey(p.url) === want);
+        setSelectedPr(known ?? prRefFromChange(changes[0], cid));
+      } else {
+        setSelectedPr(null);
+      }
+    },
+    [runs],
+  );
 
   // --- Thread actions -------------------------------------------------------
   const cancelMut = useMutation({
     mutationFn: (runId: string) => sageApi.cancelRun(runId),
     onSuccess: invalidateRuns,
-  })
+  });
   const deleteMut = useMutation({
     mutationFn: (runId: string) => sageApi.deleteRun(runId),
     onSuccess: (_d, runId) => {
       // Dropping the open thread must clear the selection, or the detail pane
       // would keep rendering a run that no longer exists.
-      setSelectedRunId((cur) => (cur === runId ? null : cur))
-      invalidateRuns()
+      setSelectedRunId((cur) => (cur === runId ? null : cur));
+      invalidateRuns();
     },
-  })
+  });
   const postMut = useMutation({
-    mutationFn: ({ runId, select }: {
-      runId: string
-      select?: { changeId: string; keys?: string[] }
+    mutationFn: ({
+      runId,
+      select,
+    }: {
+      runId: string;
+      select?: { changeId: string; keys?: string[] };
     }) => sageApi.postComments(runId, select),
     // The run's posting/posted fields arrive through the runs poll, so the
     // button's state is driven by the server rather than local optimism.
     onSuccess: invalidateRuns,
-  })
+  });
 
   const postGroupsMut = useMutation({
-    mutationFn: ({ runId, groups }: {
-      runId: string
-      groups: { changeId: string; keys?: string[] }[]
+    mutationFn: ({
+      runId,
+      groups,
+    }: {
+      runId: string;
+      groups: { changeId: string; keys?: string[] }[];
     }) => sageApi.postCommentGroups(runId, groups),
     onSuccess: invalidateRuns,
-  })
+  });
 
   const archiveMut = useMutation({
     mutationFn: (runId: string) => sageApi.archiveRun(runId),
     onSuccess: (_d, runId) => {
-      invalidateRuns()
-      void qc.invalidateQueries({ queryKey: ['code-review-sage', 'report', runId] })
+      invalidateRuns();
+      void qc.invalidateQueries({
+        queryKey: ["code-review-sage", "report", runId],
+      });
     },
-  })
+  });
 
   // --- Starting reviews -----------------------------------------------------
   // Each opens the new thread immediately: the user asked for a review, so the
   // useful next screen is that review's live progress.
-  const onStarted = useCallback((runId: string | undefined) => {
-    invalidateRuns()
-    if (runId) {
-      setComposing(false)
-      setAddingRepos(false)
-      setMainView('reviews')
-      setExpanded('reviews')
-      // Surface the run where it lives: the detail pane shows its progress, and
-      // the middle column switches to the thread list so it is not hidden behind
-      // the tab the user was just on.
-      setListTab('reviews')
-      setSelectedRunId(runId)
-    }
-  }, [invalidateRuns])
+  const onStarted = useCallback(
+    (runId: string | undefined) => {
+      invalidateRuns();
+      if (runId) {
+        setComposing(false);
+        setAddingRepos(false);
+        setMainView("reviews");
+        setExpanded("reviews");
+        // Surface the run where it lives: the detail pane shows its progress, and
+        // the middle column switches to the thread list so it is not hidden behind
+        // the tab the user was just on.
+        setListTab("reviews");
+        setSelectedRunId(runId);
+      }
+    },
+    [invalidateRuns],
+  );
 
   const startReview = useMutation({
     mutationFn: (changes: string[]) => sageApi.review(changes),
     onSuccess: (d) => onStarted(d.run_id),
-  })
+  });
   const startReviewLinks = useMutation({
     mutationFn: (links: string) => sageApi.reviewLinks(links),
     onSuccess: (d) => onStarted(d.run_id),
-  })
+  });
   const startRepoReview = useMutation({
     mutationFn: ({ repo, force }: { repo: string; force: boolean }) =>
       sageApi.reviewRepo(repo, force),
     // A repo review can legitimately start nothing (every PR already reviewed);
     // that comes back as status "noop" with no run_id, so don't navigate.
     onSuccess: (d) => onStarted(d.run_id),
-  })
+  });
 
   // --- Repos ----------------------------------------------------------------
-  const pinnedSnapshot = useMemo(() => readSnapshot<{ repos: PinnedRepo[] }>('repos'), [])
+  const pinnedSnapshot = useMemo(
+    () => readSnapshot<{ repos: PinnedRepo[] }>("repos"),
+    [],
+  );
   const pinnedQuery = useQuery({
-    queryKey: ['code-review-sage', 'repos'],
+    queryKey: ["code-review-sage", "repos"],
     queryFn: () => sageApi.pinnedRepos(),
     initialData: pinnedSnapshot?.data,
     initialDataUpdatedAt: pinnedSnapshot?.at,
-  })
+  });
   const recentQuery = useQuery({
-    queryKey: ['code-review-sage', 'recent-repos'],
+    queryKey: ["code-review-sage", "recent-repos"],
     queryFn: () => sageApi.recentRepos(),
     // A live `gh` call per mount would be rude; the picker turns it on.
     enabled: discoveryEnabled,
     staleTime: 5 * 60_000,
-  })
+  });
 
   const mineQuery = useQuery({
-    queryKey: ['code-review-sage', 'my-repos'],
+    queryKey: ["code-review-sage", "my-repos"],
     queryFn: () => sageApi.myRepos(),
     // Same reasoning as recent-repos: a live `gh` call, so opt in rather than
     // firing on every mount of the app.
     enabled: discoveryEnabled,
     staleTime: 5 * 60_000,
-  })
+  });
 
   useEffect(() => {
     if (pinnedQuery.data && pinnedQuery.isSuccess) {
-      writeSnapshot('repos', pinnedQuery.data)
+      writeSnapshot("repos", pinnedQuery.data);
     }
-  }, [pinnedQuery.data, pinnedQuery.isSuccess])
+  }, [pinnedQuery.data, pinnedQuery.isSuccess]);
 
   const invalidateRepos = useCallback(() => {
-    void qc.invalidateQueries({ queryKey: ['code-review-sage', 'repos'] })
-    void qc.invalidateQueries({ queryKey: ['code-review-sage', 'recent-repos'] })
-    void qc.invalidateQueries({ queryKey: ['code-review-sage', 'my-repos'] })
-  }, [qc])
+    void qc.invalidateQueries({ queryKey: ["code-review-sage", "repos"] });
+    void qc.invalidateQueries({
+      queryKey: ["code-review-sage", "recent-repos"],
+    });
+    void qc.invalidateQueries({ queryKey: ["code-review-sage", "my-repos"] });
+  }, [qc]);
 
   const pinMut = useMutation({
     mutationFn: ({ owner, repo }: ActiveRepo) => sageApi.pinRepo(owner, repo),
-    onSuccess: (_d, v) => { invalidateRepos(); setActiveRepo(v) },
-  })
+    onSuccess: (_d, v) => {
+      invalidateRepos();
+      setActiveRepo(v);
+    },
+  });
   const pinUrlMut = useMutation({
     mutationFn: (url: string) => sageApi.pinRepoUrl(url),
     onSuccess: (d) => {
-      invalidateRepos()
-      const added = d.added ?? d.repos?.[0]
-      if (added) setActiveRepo({ owner: added.owner, repo: added.repo })
+      invalidateRepos();
+      const added = d.added ?? d.repos?.[0];
+      if (added) setActiveRepo(added);
       // A pasted PULL REQUEST link means the user wants that pull request, not a
       // repo they now have to find it in — so open it.
       if (d.pull_request) {
-        setMainView('reviews')
-        setListTab('pulls')
-        setAddingRepos(false)
+        setMainView("reviews");
+        setListTab("pulls");
+        setAddingRepos(false);
         selectPr({
           url: d.pull_request.url,
           change_id: d.pull_request.change_id,
           number: d.pull_request.number,
-        })
+        });
       }
     },
-  })
+  });
   const unpinMut = useMutation({
-    mutationFn: ({ owner, repo }: ActiveRepo) => sageApi.unpinRepo(owner, repo),
+    mutationFn: (r: ActiveRepo) =>
+      sageApi.unpinRepo(r.owner, r.repo, r.provider, r.host),
     onSuccess: (_d, v) => {
-      invalidateRepos()
+      invalidateRepos();
       setActiveRepo((cur) =>
-        cur && cur.owner === v.owner && cur.repo === v.repo ? null : cur)
+        cur &&
+        cur.owner === v.owner &&
+        cur.repo === v.repo &&
+        (cur.provider ?? "github") === (v.provider ?? "github") &&
+        (cur.host ?? "github.com") === (v.host ?? "github.com")
+          ? null
+          : cur,
+      );
     },
-  })
+  });
 
   // --- PRs for the active repo ---------------------------------------------
+  // Pinned repos carry the provider/host, while older UI state only stored the
+  // owner/repo pair. Resolve against the server list before building the URL;
+  // otherwise a restored GitLab repo briefly (or permanently, on a cached error)
+  // falls back to github.com and shows "upstream service error".
+  const queryRepo = useMemo(() => {
+    if (!activeRepo || !pinnedQuery.isSuccess) return null;
+    const exact = pinnedQuery.data?.repos.find(
+      (r) =>
+        r.owner === activeRepo.owner &&
+        r.repo === activeRepo.repo &&
+        (r.provider ?? "github") === (activeRepo.provider ?? "github") &&
+        (r.host ?? "github.com") === (activeRepo.host ?? "github.com"),
+    );
+    if (exact) return exact;
+    return (
+      pinnedQuery.data?.repos.find(
+        (r) => r.owner === activeRepo.owner && r.repo === activeRepo.repo,
+      ) ?? null
+    );
+  }, [activeRepo, pinnedQuery.data, pinnedQuery.isSuccess]);
   // Keyed per repo: switching back to a repo you were just looking at shows its
-  // PRs immediately instead of re-running a `gh` call you already paid for.
-  const prsKey = activeRepo ? `prs:${repoSlug(activeRepo).toLowerCase()}` : ''
-  const prsSnapshot = prsKey ? readSnapshot<RepoPrsResponse>(prsKey) : undefined
+  // PRs immediately instead of re-running a `glab`/`gh` call you already paid for.
+  const prsKey = queryRepo ? `prs:${repoSlug(queryRepo).toLowerCase()}` : "";
+  const prsSnapshot = prsKey
+    ? readSnapshot<RepoPrsResponse>(prsKey)
+    : undefined;
   const prsQuery = useQuery({
-    queryKey: ['code-review-sage', 'repo-prs',
-      activeRepo ? repoSlug(activeRepo) : ''],
-    queryFn: () => sageApi.repoPrs(repoUrl(activeRepo as ActiveRepo)),
-    enabled: !!activeRepo,
+    queryKey: [
+      "code-review-sage",
+      "repo-prs",
+      queryRepo ? repoSlug(queryRepo) : "",
+    ],
+    queryFn: () => sageApi.repoPrs(repoUrl(queryRepo as ActiveRepo)),
+    enabled: !!queryRepo,
     initialData: prsSnapshot?.data,
     initialDataUpdatedAt: prsSnapshot?.at,
     // Reviewed/stale annotations go stale as runs finish, but a `gh` call per
     // focus change is expensive — a minute is a fair compromise, and finishing a
     // run invalidates this key explicitly (see below).
     staleTime: 60_000,
-  })
+  });
 
   useEffect(() => {
     if (prsKey && prsQuery.data && prsQuery.isSuccess) {
-      writeSnapshot(prsKey, prsQuery.data)
+      writeSnapshot(prsKey, prsQuery.data);
     }
-  }, [prsKey, prsQuery.data, prsQuery.isSuccess])
+  }, [prsKey, prsQuery.data, prsQuery.isSuccess]);
 
   // A restored repo that has since been unpinned would leave the column stuck
   // on a repo the rail no longer lists, so drop it once the real list arrives.
   useEffect(() => {
-    const list = pinnedQuery.data?.repos
-    if (!activeRepo || !list) return
-    const known = list.some((r) => r.owner === activeRepo.owner && r.repo === activeRepo.repo)
-    if (!known) setActiveRepo(null)
-  }, [pinnedQuery.data, activeRepo])
+    const list = pinnedQuery.data?.repos;
+    if (!activeRepo || !list) return;
+    const known = list.find(
+      (r) =>
+        r.owner === activeRepo.owner &&
+        r.repo === activeRepo.repo &&
+        (r.provider ?? "github") === (activeRepo.provider ?? "github") &&
+        (r.host ?? "github.com") === (activeRepo.host ?? "github.com"),
+    );
+    if (known) return;
+    // Migrate UI state written before provider/host were persisted. Without
+    // this, a restored GitLab repo falls back to github.com for the first query.
+    const samePath = list.find(
+      (r) => r.owner === activeRepo.owner && r.repo === activeRepo.repo,
+    );
+    if (
+      samePath &&
+      ((samePath.provider ?? "github") !== (activeRepo.provider ?? "github") ||
+        (samePath.host ?? "github.com") !== (activeRepo.host ?? "github.com"))
+    ) {
+      setActiveRepo(samePath);
+    } else if (!samePath) {
+      setActiveRepo(null);
+    }
+  }, [pinnedQuery.data, activeRepo]);
 
   // Same for a restored review: runs are evicted past a cap, so the id may no
   // longer exist. Clearing it avoids a detail pane waiting on a 404 forever.
   useEffect(() => {
-    if (!selectedRunId || !runsQuery.isSuccess) return
+    if (!selectedRunId || !runsQuery.isSuccess) return;
     if (!runs.some((r) => r.run_id === selectedRunId)) {
-      setSelectedRunId(null)
-      setSelectedPr(null)
+      setSelectedRunId(null);
+      setSelectedPr(null);
     }
-  }, [runs, runsQuery.isSuccess, selectedRunId])
+  }, [runs, runsQuery.isSuccess, selectedRunId]);
 
   // Persist where the user is, on every change. Cheap (one small JSON write) and
   // it means a reload — or a trip to another Kiro Crew page — comes back here.
@@ -543,15 +685,15 @@ export function SageProvider({ children, initialRunId }: {
     saveUiState({
       mainView,
       listTab,
-      activeRepo: activeRepo ? { owner: activeRepo.owner, repo: activeRepo.repo } : null,
+      activeRepo: activeRepo ? { ...activeRepo } : null,
       selectedRunId,
       selectedPr,
       detailTab: null,
-    })
-  }, [mainView, listTab, activeRepo, selectedRunId, selectedPr])
+    });
+  }, [mainView, listTab, activeRepo, selectedRunId, selectedPr]);
 
   // Read inside selectRun without adding the polled list to its deps.
-  prsRef.current = prsQuery.data?.prs ?? []
+  prsRef.current = prsQuery.data?.prs ?? [];
 
   const value: SageContextValue = {
     runs,
@@ -584,7 +726,7 @@ export function SageProvider({ children, initialRunId }: {
       // the poster. Sending group 2 as a second request — even strictly after
       // group 1 resolved — got `already_posting`, so the comments chosen on
       // every change after the first were never published.
-      await postGroupsMut.mutateAsync({ runId, groups })
+      await postGroupsMut.mutateAsync({ runId, groups });
     },
     posting: postMut.isPending || postGroupsMut.isPending,
     // WHICH comments are in flight, so a per-finding post marks only the card
@@ -594,7 +736,8 @@ export function SageProvider({ children, initialRunId }: {
     postingSelection: postMut.isPending
       ? (postMut.variables?.select ?? null)
       : undefined,
-    postError: (postMut.error as Error) ?? (postGroupsMut.error as Error) ?? null,
+    postError:
+      (postMut.error as Error) ?? (postGroupsMut.error as Error) ?? null,
 
     startReview,
     startReviewLinks,
@@ -611,13 +754,25 @@ export function SageProvider({ children, initialRunId }: {
     mineLoading: discoveryEnabled && mineQuery.isLoading,
     mineError: (mineQuery.error as Error) ?? null,
     refreshMine: () => {
-      void mineQuery.refetch()
-      void recentQuery.refetch()
+      void mineQuery.refetch();
+      void recentQuery.refetch();
     },
     pinRepo: (owner: string, repo: string) => pinMut.mutate({ owner, repo }),
     pinRepoUrl: (url: string) => pinUrlMut.mutate(url),
-    unpinRepo: (owner: string, repo: string) => unpinMut.mutate({ owner, repo }),
-    pinError: ((pinMut.error ?? pinUrlMut.error ?? unpinMut.error) as Error) ?? null,
+    unpinRepo: (
+      owner: string,
+      repo: string,
+      provider?: string,
+      host?: string,
+    ) =>
+      unpinMut.mutate({
+        owner,
+        repo,
+        provider: provider as ActiveRepo["provider"],
+        host,
+      }),
+    pinError:
+      ((pinMut.error ?? pinUrlMut.error ?? unpinMut.error) as Error) ?? null,
 
     activeRepo,
     setActiveRepo,
@@ -627,7 +782,9 @@ export function SageProvider({ children, initialRunId }: {
     prs: prsQuery.data?.prs ?? [],
     prsLoading: prsQuery.isLoading,
     prsError: (prsQuery.error as Error) ?? null,
-    refreshPrs: () => { void prsQuery.refetch() },
+    refreshPrs: () => {
+      void prsQuery.refetch();
+    },
 
     mainView,
     setMainView,
@@ -639,9 +796,9 @@ export function SageProvider({ children, initialRunId }: {
     setExpanded,
     composing,
     openComposer: () => {
-      setComposing(true)
-      setAddingRepos(false)
-      setSelectedRunId(null)
+      setComposing(true);
+      setAddingRepos(false);
+      setSelectedRunId(null);
     },
     closeComposer: () => setComposing(false),
     addingRepos,
@@ -651,11 +808,11 @@ export function SageProvider({ children, initialRunId }: {
     // the workspace, so throwing away what the user was looking at would be
     // surprising when they dismiss it.
     openAddRepos: () => {
-      setDiscoveryEnabled(true)
-      setAddingRepos(true)
+      setDiscoveryEnabled(true);
+      setAddingRepos(true);
     },
     closeAddRepos: () => setAddingRepos(false),
-  }
+  };
 
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>
+  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

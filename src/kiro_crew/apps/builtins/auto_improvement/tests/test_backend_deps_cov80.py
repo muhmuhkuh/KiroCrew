@@ -1,9 +1,9 @@
 """Dependency preflight — reports rather than repairs.
 
-The interesting behaviour is entirely in the failure shapes: ``gh`` present but not
-logged in must be distinguishable from ``gh`` absent (the first is a `gh auth login`,
-the second an install), and only ``ruff`` may ever be installed — never a system-wide
-install and never an authenticated CLI.
+The interesting behaviour is entirely in the failure shapes: the selected forge CLI
+being present but not logged in must be distinguishable from it being absent (the first
+is an auth-login hint, the second an install), and only ``ruff`` may ever be installed
+— never a system-wide install and never an authenticated CLI.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ class TestGhAuthenticated:
 
         monkeypatch.setattr(deps.subprocess, "run", _boom)
         ok, detail = deps._gh_authenticated()
-        assert ok is False
+        assert not ok
         assert detail == "gh is not on PATH"
 
     def test_a_live_login_is_authenticated(
@@ -92,7 +92,7 @@ class TestGhAuthenticated:
         which["gh"] = _stub_bin("gh")
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(1))
         ok, detail = deps._gh_authenticated()
-        assert ok is False
+        assert not ok
         assert "gh auth login" in detail
 
     @pytest.mark.parametrize(
@@ -109,24 +109,43 @@ class TestGhAuthenticated:
 
         monkeypatch.setattr(deps.subprocess, "run", _run)
         ok, detail = deps._gh_authenticated()
-        assert ok is False
+        assert not ok
         assert detail.startswith("could not run gh auth status:")
 
 
 class TestCheckDeps:
+    def test_gitlab_target_checks_glab_instead_of_gh(
+        self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        which.update({"git": _stub_bin("git"), "glab": _stub_bin("glab")})
+        seen: dict[str, Any] = {}
+
+        def _run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            seen["cmd"] = cmd
+            seen["env"] = kwargs.get("env")
+            return _proc(0)
+
+        monkeypatch.setattr(deps.subprocess, "run", _run)
+        report = deps.check_deps("gitlab", "gitlab.example.com")
+        by_id = {d["id"]: d for d in report["deps"]}
+        assert report["ok"]
+        assert set(by_id) == {"git", "glab", "ruff"}
+        assert seen["cmd"] == ["glab", "auth", "status"]
+        assert seen["env"]["GITLAB_HOST"] == "gitlab.example.com"
+
     def test_everything_present_is_ok_with_nothing_blocking(
         self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         which.update({"git": _stub_bin("git"), "gh": _stub_bin("gh"), "ruff": _stub_bin("ruff")})
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
-        assert report["ok"] is True
+        assert report["ok"]
         assert report["blocking"] == []
         by_id = {d["id"]: d for d in report["deps"]}
         assert set(by_id) == {"git", "gh", "ruff"}
         assert by_id["git"]["detail"] == _stub_bin("git")
-        assert by_id["ruff"]["installable"] is True
-        assert by_id["gh"]["installable"] is False
+        assert by_id["ruff"]["installable"]
+        assert not by_id["gh"]["installable"]
 
     def test_a_missing_required_binary_blocks_the_run(
         self, which: dict[str, str], monkeypatch: pytest.MonkeyPatch
@@ -134,10 +153,10 @@ class TestCheckDeps:
         which["gh"] = _stub_bin("gh")
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
-        assert report["ok"] is False
+        assert not report["ok"]
         assert report["blocking"] == ["git"]
         by_id = {d["id"]: d for d in report["deps"]}
-        assert by_id["git"]["ok"] is False
+        assert not by_id["git"]["ok"]
         assert by_id["git"]["detail"] == "not found on PATH"
 
     def test_a_missing_optional_binary_only_narrows_discovery(
@@ -146,11 +165,11 @@ class TestCheckDeps:
         which.update({"git": _stub_bin("git"), "gh": _stub_bin("gh")})
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
-        assert report["ok"] is True
+        assert report["ok"]
         assert report["blocking"] == []
         ruff = next(d for d in report["deps"] if d["id"] == "ruff")
-        assert ruff["ok"] is False
-        assert ruff["required"] is False
+        assert not ruff["ok"]
+        assert not ruff["required"]
         assert "compile check" in ruff["detail"]
 
     def test_both_required_entries_can_block_at_once(
@@ -159,7 +178,7 @@ class TestCheckDeps:
         monkeypatch.setattr(deps.subprocess, "run", lambda *a, **k: _proc(0))
         report = deps.check_deps()
         assert report["blocking"] == ["git", "gh"]
-        assert report["ok"] is False
+        assert not report["ok"]
 
 
 class TestInstallDeps:

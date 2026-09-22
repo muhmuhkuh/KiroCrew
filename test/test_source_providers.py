@@ -767,7 +767,7 @@ def test_terminal_ttl_is_the_longer_one() -> None:
     assert source._TERMINAL_TTL_SECS > source._CLOSED_TTL_SECS
     assert source._CLOSED_TTL_SECS > source._CACHE_TTL_SECS
     assert source._CLOSED_TTL_SECS > source._CHECK_TTL_SECS
-    assert source._TERMINAL_CHIP_STATES == {"merged", "closed"}
+    assert {"merged", "closed"} == source._TERMINAL_CHIP_STATES
 
 
 @pytest.mark.asyncio
@@ -2895,7 +2895,7 @@ async def test_status_endpoint_audits_cancellation_during_allowlist_warm_up(
     chain. Driven without a TestClient because aiohttp's server turns a handler
     ``CancelledError`` into a connection abort and would mask the re-raise."""
 
-    async def cancel_warm_up() -> "frozenset[str]":
+    async def cancel_warm_up() -> frozenset[str]:
         raise source.asyncio.CancelledError()
 
     monkeypatch.setattr(source, "ensure_gitlab_hosts_loaded", cancel_warm_up)
@@ -9209,7 +9209,7 @@ class TestAdfToMarkdown:
         for node_type in sorted(node_types):
             node = {
                 "type": node_type,
-                "attrs": {name: secret for name in attr_names},
+                "attrs": dict.fromkeys(attr_names, secret),
                 "content": [{"type": "text", "text": "body"}],
             }
             rendered = source._adf_to_markdown({"type": "doc", "content": [node]})
@@ -9971,7 +9971,7 @@ class TestGetJiraAuth:
                 return cls()
 
             def load_credentials(self):
-                host_key = "acme.atlassian.net".encode().hex().upper()
+                host_key = b"acme.atlassian.net".hex().upper()
                 return {
                     "JIRA_API_TOKEN": "global-fallback",
                     f"JIRA_TOKEN_{host_key}": "per-host-secret",
@@ -10014,7 +10014,7 @@ class TestGetJiraAuth:
                 monkeypatch.setenv("JIRA_API_TOKEN", "seeded-global")
                 return {"JIRA_API_TOKEN": "seeded-global"}
 
-        host_key = "acme.atlassian.net".encode().hex().upper()
+        host_key = b"acme.atlassian.net".hex().upper()
         monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
         monkeypatch.setattr(
             source,
@@ -10046,7 +10046,7 @@ class TestGetJiraAuth:
                 return {"JIRA_API_TOKEN": "env-token"}
 
         monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
-        host_key = "acme.atlassian.net".encode().hex().upper()
+        host_key = b"acme.atlassian.net".hex().upper()
         monkeypatch.setattr(
             source,
             "_resolve_jira_token_from_vault",
@@ -10825,7 +10825,7 @@ class _ReapProbe:
 
     def __init__(self, pid: int = 4242) -> None:
         self.pid = pid
-        self.returncode: "int | None" = None
+        self.returncode: int | None = None
         self.kill_calls = 0
         self.wait_calls = 0
         self.communicate_calls = 0
@@ -10851,7 +10851,7 @@ async def test_terminate_process_reaps_via_communicate_not_wait(monkeypatch):
     from kiro_crew import platform_compat
 
     proc = _ReapProbe()
-    tree_kills: "list[tuple[int, int]]" = []
+    tree_kills: list[tuple[int, int]] = []
 
     async def _fake_tree(pid, sig):
         tree_kills.append((pid, sig))

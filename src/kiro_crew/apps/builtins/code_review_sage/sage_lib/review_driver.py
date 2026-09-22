@@ -206,12 +206,20 @@ def _resolve_concurrency(explicit: int | None = None) -> int:
 
 
 def _cid(link: str) -> str:
-    """Derive the change id from a GitHub PR link — filesystem-safe. A PR URL ->
-    ``GH-<owner>-<repo>-<n>`` (matching the id ``adapters.parse_github_payload``
-    records, so the worker's written record and the driver's read hit the same
-    file); otherwise a sanitized fallback (never a raw URL, which is not a valid
-    filename)."""
+    """Derive the change id from a GitHub PR or GitLab MR link — filesystem-safe.
+    A PR URL -> ``GH-<owner>-<repo>-<n>`` (matching the id
+    ``adapters.parse_github_payload`` records) or ``GL-<ns>-<iid>`` (matching
+    ``adapters.parse_gitlab_payload`` records), so the worker's written record and
+    the driver's read hit the same file; otherwise a sanitized fallback (never a
+    raw URL, which is not a valid filename)."""
     try:
+        platform = pipeline.adapters.detect_platform(link)
+    except pipeline.adapters.AdapterError:
+        return results.safe_change_id(link)
+    try:
+        if platform == "gitlab":
+            host, namespace, iid = pipeline.adapters.gitlab_pr_ref(link)
+            return pipeline.adapters.gitlab_change_id(namespace, iid, host=host)
         host, owner, repo, number = pipeline.adapters.github_pr_ref(link)
         return pipeline.adapters.github_change_id(owner, repo, number, host=host)
     except pipeline.adapters.AdapterParseError:
@@ -235,10 +243,18 @@ def reviewed_key_for(link: str) -> str:
     is therefore lossily sanitized (``-`` -> ``_``), which let two different repos
     (``acme/service-api`` vs ``acme/service_api``) with the same PR number collide
     on one dedup key and skip a requested review. The reviewed-index key never
-    names a file, so it uses the lossless canonical identity instead. Falls back to
-    the sanitized change-id for a non-PR link (defensive; repo-review only ever
-    feeds real PR URLs from ``list_open_prs``)."""
+    names a file, so it uses the lossless canonical identity instead (GitHub:
+    ``github_review_key``, GitLab: ``gitlab_review_key``). Falls back to the
+    sanitized change-id for a non-PR link (defensive; repo-review only ever feeds
+    real PR/MR URLs from ``list_open_prs``)."""
     try:
+        platform = pipeline.adapters.detect_platform(link)
+    except pipeline.adapters.AdapterError:
+        return results.safe_change_id(link)
+    try:
+        if platform == "gitlab":
+            host, namespace, iid = pipeline.adapters.gitlab_pr_ref(link)
+            return pipeline.adapters.gitlab_review_key(namespace, iid, host=host)
         host, owner, repo, number = pipeline.adapters.github_pr_ref(link)
         return pipeline.adapters.github_review_key(owner, repo, number, host=host)
     except pipeline.adapters.AdapterParseError:
@@ -246,25 +262,28 @@ def reviewed_key_for(link: str) -> str:
 
 
 def _confirmed_host(link: str) -> str:
-    """The link's validated GitHub host, or ``""`` for a bare legacy change
-    token that names no host at all.
+    """The link's validated GitHub or GitLab host, or ``""`` for a bare legacy
+    change token that names no host at all.
 
     FAILS CLOSED: raises ``AdapterError`` when the link NAMES a host that does
-    not (re)validate against ``allowed_hosts()`` — e.g. a GitHub Enterprise
-    host removed from ``github_hosts`` between run start and prompt build, or
+    not (re)validate against ``allowed_hosts()`` / ``gitlab_allowed_hosts()`` —
+    e.g. a host removed from the allowlist between run start and prompt build, or
     an unreadable config. Producing a prompt for such a link would let its
-    ``gh api`` calls default to PUBLIC github.com and cross GitHub instances
-    (fetching from — or posting an internal enterprise draft onto — a public
-    same-slug PR). A token that names no host (``CR-1``) has no instance to
-    cross to, so it keeps the legacy default-instructions path: ``""`` here
-    means "no host named", never "failed to resolve" — those two cases are
-    deliberately NOT allowed to look identical."""
+    ``gh``/``glab`` api calls default to the PUBLIC instance and cross hosts
+    (fetching from — or posting an internal enterprise PR/MR draft onto — a
+    public same-slug change). A token that names no host (``CR-1``) has no
+    instance to cross to, so it keeps the legacy default-instructions path:
+    ``""`` here means "no host named", never "failed to resolve" — those two
+    cases are deliberately NOT allowed to look identical."""
     try:
-        return pipeline.adapters.github_pr_ref(link)[0]
+        platform = pipeline.adapters.detect_platform(link)
     except pipeline.adapters.AdapterError:
         if pipeline.adapters.link_names_a_host(link):
             raise
         return ""
+    if platform == "gitlab":
+        return pipeline.adapters.gitlab_pr_ref(link)[0]
+    return pipeline.adapters.github_pr_ref(link)[0]
 
 
 def python_command() -> str:

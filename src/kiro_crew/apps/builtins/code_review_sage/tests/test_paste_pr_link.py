@@ -60,6 +60,21 @@ class TestPullRequestRef(unittest.TestCase):
         self.assertIsNone(routes._pull_request_ref("https://github.com/pull/777"))
         self.assertIsNone(routes._pull_request_ref("https://evil.test/o/r/pull/1"))
 
+    def test_parses_a_gitlab_mr_url(self):
+        ref = routes._pull_request_ref(
+            "https://gitlab.com/kirodotdev/KiroCrew/-/merge_requests/42")
+        assert ref is not None
+        self.assertEqual(ref["namespace"], "kirodotdev/KiroCrew")
+        self.assertEqual(ref["iid"], 42)
+        self.assertEqual(ref["change_id"], "GL-kirodotdev_KiroCrew-42")
+
+    def test_parses_a_nested_gitlab_group_mr(self):
+        ref = routes._pull_request_ref(
+            "https://gitlab.com/org/team/sub/Proj/-/merge_requests/7")
+        assert ref is not None
+        self.assertEqual(ref["namespace"], "org/team/sub/Proj")
+        self.assertEqual(ref["change_id"], "GL-org_team_sub_Proj-7")
+
     def test_extra_path_segments_do_not_confuse_it(self):
         ref = routes._pull_request_ref(
             "https://github.com/kirodotdev/KiroCrew/pull/777/files#r123")
@@ -124,9 +139,7 @@ class TestRepoEndpointWithPullRequest(unittest.IsolatedAsyncioTestCase):
         cfg["github_hosts"] = ["github.com", "acme.ghe.com"]
         cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
 
-    async def test_a_ghe_pull_request_cannot_be_pinned(self):
-        # The pinned-repo store carries no host, so pinning would silently target
-        # the wrong instance later; the refusal points at the PR paste flow.
+    async def test_a_ghe_pull_request_can_be_pinned_with_host_identity(self):
         self._allow_ghe_host()
         resp = await routes._handle_repos(_FakeRequest(  # type: ignore[arg-type]
             {"repo": "https://acme.ghe.com/o/r/pull/9"}))
@@ -139,6 +152,20 @@ class TestRepoEndpointWithPullRequest(unittest.IsolatedAsyncioTestCase):
             {"repo": "https://acme.ghe.com/o/r"}))
         self.assertEqual(resp.status, 400)
         self.assertIn("unsupported_repo_host", _text(resp))
+
+    async def test_a_self_hosted_gitlab_repo_is_pinned_with_host_identity(self):
+        cfg_path = store.data_dir() / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["gitlab_hosts"] = ["gitlab.bildungsinnovator.com"]
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        resp = await routes._handle_repos(_FakeRequest(  # type: ignore[arg-type]
+            {"repo": "https://gitlab.bildungsinnovator.com/bildungsinnovator"}))
+        self.assertEqual(resp.status, 200)
+        data = json.loads(_text(resp))
+        self.assertEqual(data["added"]["provider"], "gitlab")
+        self.assertEqual(data["added"]["host"], "gitlab.bildungsinnovator.com")
+        self.assertEqual(data["added"]["owner"], "")
+        self.assertEqual(data["added"]["repo"], "bildungsinnovator")
 
     async def test_pull_request_ref_keeps_the_ghe_host(self):
         self._allow_ghe_host()

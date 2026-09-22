@@ -21,6 +21,8 @@ from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_ACP_RUNTIME
+
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
 else:
@@ -131,7 +133,11 @@ class WarmSessionPool:
     def _state_from_owner(self) -> WarmPoolState:
         cfg = self._owner._cfg
         requested_size = cfg.session.pool_size
-        size = min(self._deps.max_pool, max(0, requested_size))
+        size = (
+            min(self._deps.max_pool, max(0, requested_size))
+            if cfg.agent.acp_backend in ACP_BACKENDS_ACP_RUNTIME
+            else 0
+        )
         if requested_size > self._deps.max_pool:
             self._deps.logger.warning(
                 "pool_size %d exceeds max %d, clamping",

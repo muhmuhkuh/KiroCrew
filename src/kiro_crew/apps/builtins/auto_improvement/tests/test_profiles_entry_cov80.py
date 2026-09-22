@@ -17,8 +17,8 @@ from kiro_crew.apps.builtins.auto_improvement import profiles
 
 
 class TestProfileIds:
-    def test_the_reference_profile_is_selectable(self) -> None:
-        assert profiles.PROFILE_IDS == ("github-repo",)
+    def test_supported_profiles_are_selectable(self) -> None:
+        assert list(profiles.PROFILE_IDS) == ["github-repo", "gitlab-repo"]
 
     def test_the_registry_exports_only_the_ids_and_the_builder(self) -> None:
         assert profiles.__all__ == ["PROFILE_IDS", "build_profile"]

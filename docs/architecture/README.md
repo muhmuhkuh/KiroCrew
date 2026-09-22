@@ -14,6 +14,7 @@ they explain structure and rationale and link out to
 | [context-management.md](context-management.md) | What reaches the model's context: the first-turn block order and its budgets, what repeats per turn, a sub-agent's scope, why a custom agent sees no skills, and how a crew member's session is built. |
 | [security-deep-dive.md](security-deep-dive.md) | The security model as a whole: threat model, trust boundaries, and how the layers compose. |
 | [resource-protection.md](resource-protection.md) | Process limits, sandbox resource controls, and rate limiting. |
+| [adr-autonomous-goal-owner.md](adr-autonomous-goal-owner.md) | Goal / Project Owner architecture decision and boundaries between app lifecycle and existing execution primitives. |
 
 `design-notes/` holds narrow design records that have no owning module spec: see
 [its index](design-notes/README.md).

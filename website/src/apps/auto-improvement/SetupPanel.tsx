@@ -217,6 +217,12 @@ export default function SetupPanel({ config }: { config?: Record<string, unknown
         {configured ? (
           <p className="text-[12px] text-muted">
             {i18nT('autoImprovement.currentRepo')} <span className="text-accent">{display}</span>
+            {/* The forge host (github.com / the GitLab instance) persisted at setup. */}
+            {config?.host ? (
+              <Badge variant="muted" className="ml-2">
+                {String(config.host)}
+              </Badge>
+            ) : null}
             {config?.clone ? (
               <Badge variant="ok" className="ml-2">
                 {i18nT('autoImprovement.pushDisabled')}

@@ -5461,6 +5461,7 @@ class KiroCrewConfig:
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
         create a per-session subdirectory under ``workspace_root()``.
         """
+        from kiro_crew.acp_backends import ACP_BACKEND_PI
         from kiro_crew.providers.acp import (
             AcpProvider,  # circular: acp -> client -> session -> config.loader
         )
@@ -5550,6 +5551,7 @@ class KiroCrewConfig:
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
             )
+            is_pi = _backend == ACP_BACKEND_PI
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
             # key on the backend this session actually gets, not on the
@@ -5575,8 +5577,13 @@ class KiroCrewConfig:
             # dashboard slot's effort, or a sub-agent's resolved "subagent"
             # effort) still wins over all of it.
             _eff = reasoning_effort_override or self.resolve_session_effort(agent, crew_agent)
-            if m and _eff and is_valid_effort(_eff) and model_supports_effort(m):
-                _eff_per_model[m] = _eff
+            # Pi owns model selection when no concrete pin survives scope, but
+            # still needs its native effort override keyed by the auto sentinel.
+            _eff_model = m or (DEFAULT_MODEL if is_pi else "")
+            if _eff_model and _eff and is_valid_effort(_eff) and (
+                is_pi or model_supports_effort(_eff_model)
+            ):
+                _eff_per_model[_eff_model] = _eff
             elif _eff and is_valid_effort(_eff):
                 # Single-authority drop warning: a valid requested effort is
                 # being dropped because the resolved model is empty or not
@@ -5620,9 +5627,9 @@ class KiroCrewConfig:
                 extra_env=extra_env,
                 acp_backend=_backend,
                 effort_per_model=_eff_per_model,
-                tool_search=tool_search,
-                tool_search_min_pct=tool_search_min_pct,
-                tool_search_min_tokens=tool_search_min_tokens,
+                tool_search=None if is_pi else tool_search,
+                tool_search_min_pct=None if is_pi else tool_search_min_pct,
+                tool_search_min_tokens=None if is_pi else tool_search_min_tokens,
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_socket=_gw_socket,
             )

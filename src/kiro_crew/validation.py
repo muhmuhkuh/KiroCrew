@@ -159,7 +159,7 @@ _AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}[a-zA-Z0-9]$|^[a-zA
 ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?\Z")
 
 # Valid model name pattern — alphanumerics, hyphens, dots (e.g. "claude-opus-4.8", "deepseek-3.2")
-_MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]*$")
+_MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/-]*$")
 
 # Content-bound theme-persona consent hash: sha256 rendered as EXACTLY 64
 # lowercase hex chars. This value flows into hmac.compare_digest at the
@@ -2226,7 +2226,7 @@ DEPLOY_ARTIFACT_SCHEMA = ToolSchema(
 # not nested dicts, so a single ``findings`` dict arg would reach the gateway
 # unvalidated. The tool re-assembles the object from these fields.
 
-_ISSUE_RADAR_PROVIDERS = frozenset({"github", "gitlab"})
+_ISSUE_RADAR_PROVIDERS = frozenset({"github", "gitlab", "jira"})
 _ISSUE_RADAR_ITEM_KINDS = frozenset({"issue", "pull"})
 _ISSUE_RADAR_STATUSES = frozenset({"investigating", "resolved", "archived"})
 # Mirrors ``issue_radar.backend.routes.MAX_ITEM_NUMBER``: bounds the number that

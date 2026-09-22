@@ -1856,6 +1856,18 @@
         "loading": "लोड हो रहा है..."
       }
     },
+    "goalOwner": {
+      "manifest": {
+        "configuration_1": "Goal Owner सक्षम करें, पूर्णता की परिभाषा वाला लक्ष्य बनाएँ, फिर ऐप API से उसका निरीक्षण या विराम करें।",
+        "description": "स्वायत्त रूप से चलाने के लिए चुने गए लक्ष्यों हेतु सीमित और फिर से शुरू किए जा सकने वाला Project Owner।",
+        "display_name": "लक्ष्य स्वामी",
+        "highlight_1": "उपयोगकर्ता के प्रत्येक लक्ष्य के लिए एक टिकाऊ रिकॉर्ड",
+        "highlight_2": "स्पष्ट बजट के साथ सीमित वेक",
+        "highlight_3": "प्रगति खोए बिना रोकें और फिर शुरू करें",
+        "highlight_4": "क्रैश-सुरक्षित स्वामी-सत्र और क्रॉन सामंजस्य",
+        "use_case_1": "दायरे, बजट और पूर्णता के प्रमाण पर मानव नियंत्रण रखते हुए सीमित स्वामी चक्रों में लक्ष्य चलाएँ।"
+      }
+    },
     "issueRadar": {
       "api": {
         "assignees_changed_elsewhere": "इस इश्यू को लोड करने के बाद असाइनी कहीं और बदल गए हैं।",
@@ -2292,6 +2304,7 @@
         "https_github_com_owner_repo": "https://github.com/<owner>/<repo>",
         "https_gitlab_com_group_project": "https://gitlab.com/<group>/<project>",
         "issue_radar_reads": "Issue Radar पढ़ता है",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
         "last_contribution": "तुम्हारा पिछला योगदान: {{when}}",
         "let_s_connect_a_repo": "चलिए एक रिपो कनेक्ट करें",
         "loading_your_repos": "आपके रिपो लोड हो रहे हैं…",
@@ -2307,6 +2320,10 @@
         "through_your_own": "आपके अपने",
         "you_contributed_to": "आपने योगदान दिया",
         "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo",
         "repositories_in_your_organization": "तुम्हारे संगठन की रिपॉज़िटरी",
         "no_repositories_in_your_organization_paste_a_url": "तुम्हारे संगठन में कोई रिपॉज़िटरी नहीं है। कनेक्ट करने के लिए नीचे URL पेस्ट करो।",
         "azure_also_needs_the_devops_extension": "Azure DevOps को अपना CLI एक्सटेंशन भी चाहिए, जिसे नीचे दिए गए कमांड से एक बार इंस्टॉल करो।"
@@ -2324,6 +2341,7 @@
         "format": {
           "last_update": "पिछला अपडेट",
           "number": "नंबर",
+          "priority": "प्राथमिकता",
           "crew_sort_status": "स्थिति",
           "crew_sort_name": "नाम",
           "crew_sort_created": "बनाया गया"
@@ -11167,6 +11185,7 @@
         "installed_check_again_to_use": "इस मशीन पर इंस्टॉल है। इसे लेने के लिए “फिर से जाँचें” दबाएँ। इसके बाद भी यह पंक्ति रहे, तो Settings > About से {{productName}} रीस्टार्ट करें।",
         "kas_kiro_agent": "KAS (kiro-agent)",
         "kiro_cli": "Kiro CLI",
+        "pi": "Pi",
         "loading_configuration": "कॉन्फ़िगरेशन लोड हो रहा है…",
         "mcp_concern_auto_approve": "तुम्हारी एजेंट कॉन्फ़िग फ़ाइल जो ऑटो-अप्रूव नियम तय करती है — {{name}} उन्हें लागू नहीं करता",
         "mcp_concern_denied_tools": "जो टूल तुमने बंद किए — यहाँ वे उपलब्ध रहते हैं",

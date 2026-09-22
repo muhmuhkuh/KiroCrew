@@ -1856,6 +1856,18 @@
         "loading": "লোড হচ্ছে..."
       }
     },
+    "goalOwner": {
+      "manifest": {
+        "configuration_1": "Goal Owner সক্ষম করুন, সম্পন্নতার সংজ্ঞাসহ লক্ষ্য তৈরি করুন, তারপর অ্যাপ API দিয়ে তা দেখুন বা বিরতি দিন।",
+        "description": "আপনি স্বয়ংক্রিয়ভাবে চালাতে বেছে নেওয়া লক্ষ্যগুলোর জন্য সীমাবদ্ধ, পুনরায় চালানো যায় এমন প্রজেক্ট ওনার।",
+        "display_name": "লক্ষ্য মালিক",
+        "highlight_1": "প্রতি ব্যবহারকারীর মালিকানাধীন লক্ষ্যের জন্য একটি স্থায়ী রেকর্ড",
+        "highlight_2": "স্পষ্ট বাজেটসহ সীমাবদ্ধ জাগরণ",
+        "highlight_3": "অগ্রগতি না হারিয়ে বিরতি ও পুনরায় শুরু",
+        "highlight_4": "ক্র্যাশ-নিরাপদ ওনার-সেশন ও ক্রন পুনর্মিলন",
+        "use_case_1": "মানুষের হাতে পরিধি, বাজেট ও সম্পন্নতার প্রমাণ রেখে সীমাবদ্ধ ওনার চক্রে একটি লক্ষ্য চালান।"
+      }
+    },
     "issueRadar": {
       "api": {
         "assignees_changed_elsewhere": "আপনি এই ইস্যুটি লোড করার পর অন্য কোথাও অ্যাসাইনি পরিবর্তন হয়েছে।",
@@ -2292,6 +2304,7 @@
         "https_github_com_owner_repo": "https://github.com/<owner>/<repo>",
         "https_gitlab_com_group_project": "https://gitlab.com/<group>/<project>",
         "issue_radar_reads": "Issue Radar পড়ে",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
         "last_contribution": "তোমার সর্বশেষ অবদান: {{when}}",
         "let_s_connect_a_repo": "চলুন একটি রিপো সংযুক্ত করি",
         "loading_your_repos": "আপনার রিপোগুলো লোড হচ্ছে…",
@@ -2307,6 +2320,10 @@
         "through_your_own": "আপনার নিজের মাধ্যমে",
         "you_contributed_to": "আপনি অবদান রেখেছেন এতে",
         "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo",
         "repositories_in_your_organization": "আপনার সংস্থার রিপোজিটরি",
         "no_repositories_in_your_organization_paste_a_url": "আপনার সংস্থায় কোনও রিপোজিটরি নেই। একটি সংযুক্ত করতে নীচে URL পেস্ট করুন।",
         "azure_also_needs_the_devops_extension": "Azure DevOps-এর নিজস্ব CLI এক্সটেনশনও প্রয়োজন, যা নীচের কমান্ড দিয়ে একবার ইনস্টল করুন।"
@@ -2324,6 +2341,7 @@
         "format": {
           "last_update": "সর্বশেষ আপডেট",
           "number": "নম্বর",
+          "priority": "অগ্রাধিকার",
           "crew_sort_status": "স্ট্যাটাস",
           "crew_sort_name": "নাম",
           "crew_sort_created": "তৈরি হয়েছে"
@@ -11167,6 +11185,7 @@
         "installed_check_again_to_use": "এই মেশিনে ইনস্টল করা আছে। এটি নিতে “আবার পরীক্ষা করো” চাপো। তারপরেও এই লেখা থাকলে Settings > About থেকে {{productName}} রিস্টার্ট করো।",
         "kas_kiro_agent": "KAS (kiro-agent)",
         "kiro_cli": "Kiro CLI",
+        "pi": "Pi",
         "loading_configuration": "কনফিগারেশন লোড হচ্ছে…",
         "mcp_concern_auto_approve": "তোমার এজেন্ট কনফিগ ফাইল যে অটো-অ্যাপ্রুভ নিয়ম ঠিক করে — {{name}} সেগুলো প্রয়োগ করে না",
         "mcp_concern_denied_tools": "তুমি যে টুলগুলো বন্ধ করেছ — এখানে সেগুলো ব্যবহারযোগ্য থাকে",

@@ -204,7 +204,11 @@ def _identity(key: provider.RepoKey) -> dict[str, str]:
 
 def _connected(key: provider.RepoKey) -> bool:
     """Whether ``key`` is a connected repo (the authorization gate)."""
-    return store.is_repo_connected(key.owner, key.repo, provider=key.provider, host=key.host)
+    connected = store.is_repo_connected(key.owner, key.repo, provider=key.provider, host=key.host)
+    if connected or key.provider != provider.JIRA or key.repo != key.owner:
+        return connected
+    # Legacy Jira connections could omit the optional Git-slug mapping.
+    return store.is_repo_connected(key.owner, "", provider=key.provider, host=key.host)
 
 
 def _require_enabled(handler):
@@ -320,6 +324,13 @@ async def _handle_connect(request: web.Request) -> web.Response:
     gitlab.com or in the operator's ``dashboard.gitlab_hosts`` allowlist. The
     client cannot nominate a provider here -- that is what keeps a connected-repo
     record, and therefore every later request authorized against it, honest.
+
+    A Jira connection additionally accepts an OPTIONAL ``repo`` field: the
+    manually-mapped Git repo slug the operator wants the Jira project to be
+    associated with (Jira itself has no repo). It is only ever a label — the
+    Jira client ignores it, using ``owner`` (the project key) for all API calls
+    — but it keeps the repo-centric routes/UI consistent and is round-tripped by
+    ``_identity`` so the frontend can address the project.
     """
     try:
         body = await request.json()
@@ -334,15 +345,21 @@ async def _handle_connect(request: web.Request) -> web.Response:
 
     try:
         # Off-loop: on a non-github.com URL this reads the operator's
-        # ``dashboard.gitlab_hosts`` allowlist, and ``KiroCrewConfig.load()`` is
-        # synchronous file I/O + validation. Cheap per call, but it is the
-        # gateway's single event loop, and every other blocking call in this
-        # module is already threaded for the same reason.
+        # ``dashboard.gitlab_hosts`` / ``dashboard.jira_hosts`` allowlists, and
+        # ``KiroCrewConfig.load()`` is synchronous file I/O + validation. Cheap
+        # per call, but it is the gateway's single event loop, and every other
+        # blocking call in this module is already threaded for the same reason.
         key = await asyncio.to_thread(provider.parse_repo_url, url)
     except github_client.RepoUrlError as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
     owner, repo = key.owner, key.repo
+    if key.provider == provider.JIRA:
+        # The operator's manual Git-slug mapping; absent/empty falls back to the
+        # project key so repo-shaped routes retain a stable non-empty identity.
+        repo = _str_field(body, "repo")
+        key = provider.key_from_parts(owner, repo, provider=key.provider, host=key.host)
+
     client = provider.client_for(key)
     pkw = provider.call_kwargs(key)
 

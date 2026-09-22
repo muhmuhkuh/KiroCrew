@@ -115,6 +115,9 @@ EVENT_STRUCTURED_STATUS = "structured_status"
 
 METHOD_INITIALIZE = "initialize"
 METHOD_SESSION_NEW = "session/new"
+# Pi's adapter owns opaque transcripts; unlike kiro-cli files, it must delete
+# them through ACP rather than letting session cleanup infer a filesystem path.
+METHOD_SESSION_DELETE = "session/delete"
 METHOD_SET_MODEL = "session/set_model"
 METHOD_SET_MODE = "session/set_mode"
 METHOD_PROMPT = "session/prompt"

@@ -262,6 +262,9 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # it here extends the same treatment to standard, where a spawned command could
     # otherwise read every Slack/Discord token off disk.
     ".env",
+    # Jira OAuth tokens are read only by the gateway-side Jira client, never
+    # by sandboxed agents; hide them in every mode, including relocated homes.
+    "jira_oauth_tokens.json",
     # App data holding live credentials or owner-authorization bits. Whole DIRECTORY,
     # not the leaf file, because an atomic write renames a sibling temp into place.
     "apps/aws-control/data",
@@ -1587,7 +1590,7 @@ class SandboxCeilingUnsealable(RuntimeError):
     """
 
 
-def _warn_unsealed_ceiling(target: str, exc: "OSError | None") -> None:
+def _warn_unsealed_ceiling(target: str, exc: OSError | None) -> None:
     """Say WHY the spawn is being refused: this ceiling could not be made sealable.
 
     Called immediately before :class:`SandboxCeilingUnsealable` is raised, so the spawn
@@ -4970,7 +4973,7 @@ _PROBE_SPAWN_TIMEOUT_SECONDS = 20.0
 _probe_spawn_unavailable_logged = False
 
 
-def _probe_spawned_death(proc: "subprocess.Popen[bytes]") -> str:
+def _probe_spawned_death(proc: subprocess.Popen[bytes]) -> str:
     """Describe how the spawned probe child ended, for a transient reason string."""
     code = proc.poll()
     if code is None:
@@ -5468,7 +5471,7 @@ def _resolve_agent_executable(executable: str) -> str:
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _ssh_supports_accept_new() -> bool:
     """Return True if the installed ssh supports StrictHostKeyChecking=accept-new (OpenSSH >= 7.6)."""
     try:
@@ -12166,7 +12169,7 @@ _UNSET = object()
 _RESOURCE_PREEXEC: object = _UNSET
 
 
-def resource_limit_preexec() -> "Callable[[], None] | None":
+def resource_limit_preexec() -> Callable[[], None] | None:
     """Return the shared ``preexec_fn`` that caps a spawned child's resources.
 
     This is the companion to :func:`sandboxed_spawn_argv`: the sandbox wrapper
@@ -12223,7 +12226,7 @@ def resource_limit_preexec() -> "Callable[[], None] | None":
 _RESOURCE_SUPERVISOR_ARGV: object = _UNSET
 
 
-def resource_limit_supervisor_argv() -> "tuple[str, ...]":
+def resource_limit_supervisor_argv() -> tuple[str, ...]:
     """Return the supervisor's ``--rlimits=`` argv fragment (empty if none apply).
 
     The alternative to :func:`resource_limit_preexec` for the one spawn that
@@ -12264,7 +12267,7 @@ def resource_limit_supervisor_argv() -> "tuple[str, ...]":
 _SESSION_HOST_PREEXEC: object = _UNSET
 
 
-def session_host_preexec() -> "Callable[[], None] | None":
+def session_host_preexec() -> Callable[[], None] | None:
     """Return a ``preexec_fn`` that *raises* NOFILE for a session host process.
 
     Session hosts (kiro-cli-chat / claude-agent-acp) are **trusted** internal
@@ -12321,7 +12324,7 @@ _BUILD_NOFILE_CEILING = 65536
 _BUILD_RESOURCE_PREEXEC: object = _UNSET
 
 
-def build_resource_limit_preexec() -> "Callable[[], None] | None":
+def build_resource_limit_preexec() -> Callable[[], None] | None:
     """``resource_limit_preexec`` variant for build-class children.
 
     Identical policy except ``max_open_files`` is raised to a still-finite
@@ -12505,7 +12508,7 @@ def spawn_shim_argv(
     return resolved
 
 
-def _shim_prefix_entering_fd(prefix: "tuple[str, ...]", descriptor: int) -> "tuple[str, ...]":
+def _shim_prefix_entering_fd(prefix: tuple[str, ...], descriptor: int) -> tuple[str, ...]:
     """Return *prefix* with ``--chdir-fd`` inserted ahead of its argv separator.
 
     Copied rather than mutated: the prefix is cached per profile, while the
@@ -12516,7 +12519,7 @@ def _shim_prefix_entering_fd(prefix: "tuple[str, ...]", descriptor: int) -> "tup
     return prefix[:-1] + (f"{_SHIM_CHDIR_FD_FLAG}{descriptor}", _SHIM_ARGV_SEPARATOR)
 
 
-def _pass_fds_including(passed: Any, descriptor: int) -> "tuple[int, ...]":
+def _pass_fds_including(passed: Any, descriptor: int) -> tuple[int, ...]:
     """Return *passed* with *descriptor* inherited, leaving its order alone.
 
     The shim can only ``fchdir`` a descriptor the child actually holds, and
@@ -12531,7 +12534,7 @@ def _pass_fds_including(passed: Any, descriptor: int) -> "tuple[int, ...]":
     return existing + (descriptor,)
 
 
-def _preexec_for_profile(profile: str) -> "Callable[[], None] | None":
+def _preexec_for_profile(profile: str) -> Callable[[], None] | None:
     """Legacy ``preexec_fn`` for *profile*, used only when the shim is missing."""
     if profile == RLIMIT_PROFILE_NONE:
         return None
@@ -12543,7 +12546,7 @@ def _preexec_for_profile(profile: str) -> "Callable[[], None] | None":
 
 
 def _resolve_spawn_target(
-    argv: "Sequence[str]", env: "Mapping[str, str] | None", cwd: Any = None
+    argv: Sequence[str], env: Mapping[str, str] | None, cwd: Any = None
 ) -> str:
     """Resolve a bare command NAME against the child's ``PATH``.
 
@@ -12585,8 +12588,8 @@ def _resolve_spawn_target(
 
 
 def _pinned_spawn_path(
-    env: "Mapping[str, str] | None", *, chdir_fd: int | None = None
-) -> "dict[str, str]":
+    env: Mapping[str, str] | None, *, chdir_fd: int | None = None
+) -> dict[str, str]:
     """A copy of *env* whose ``PATH`` keeps only entries safe under a pinned cwd.
 
     For resolving a command when the child's working directory is pinned by
@@ -12625,7 +12628,7 @@ def _pinned_spawn_path(
     source = dict(env if env is not None else os.environ)
     raw = source.get("PATH") or os.defpath
     entries = [entry for entry in raw.split(os.pathsep) if entry and os.path.isabs(entry)]
-    bound_identity: "tuple[int, int] | None" = None
+    bound_identity: tuple[int, int] | None = None
     if chdir_fd is not None:
         try:
             bound_info = os.fstat(chdir_fd)
@@ -12675,7 +12678,7 @@ def _pinned_spawn_path(
     return source
 
 
-def _needs_path_search(argv: "Sequence[str]") -> bool:
+def _needs_path_search(argv: Sequence[str]) -> bool:
     """Whether ``argv[0]`` is a bare name, i.e. whether resolution touches disk."""
     name = argv[0]
     return not (os.sep in name or (os.altsep and os.altsep in name))
@@ -12804,7 +12807,7 @@ async def create_subprocess_limited(
         kwargs.pop("cwd", None)
         pinned_env = search_env
 
-        def _screened_spawn_plan() -> "tuple[dict[str, str], str]":
+        def _screened_spawn_plan() -> tuple[dict[str, str], str]:
             # One worker-thread hop covers the identity screen AND the resolve:
             # the screen opens and walks PATH entries and the resolve stats
             # them, so a stalled NFS/autofs entry would block either one, and
@@ -12849,8 +12852,8 @@ async def create_subprocess_limited(
 
 
 def _prepare_limited_spawn(
-    argv: "Sequence[str]", profile: str, kwargs: "dict[str, Any]", caller: str
-) -> "tuple[list[str], Callable[[], None] | None]":
+    argv: Sequence[str], profile: str, kwargs: dict[str, Any], caller: str
+) -> tuple[list[str], Callable[[], None] | None]:
     """Resolve *argv* into the command to spawn plus the ``preexec_fn`` to pass.
 
     Shared by :func:`run_limited` and :func:`popen_limited`, which differ only in
@@ -12895,11 +12898,11 @@ def _prepare_limited_spawn(
 
 
 def run_limited(
-    argv: "Sequence[str]",
+    argv: Sequence[str],
     *,
     profile: str = RLIMIT_PROFILE_TOOL,
-    **kwargs: "Any",
-) -> "subprocess.CompletedProcess[Any]":
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
     """``subprocess.run`` with resource limits applied AFTER ``exec``.
 
     The synchronous counterpart of :func:`create_subprocess_limited`, and the
@@ -12972,7 +12975,7 @@ def run_limited(
 _INTERPRETER_ENOENT_DELAYS: tuple[float, ...] = (0.25, 0.5, 1.0, 2.0)
 
 
-def _is_transient_interpreter_enoent(exc: OSError, cmd: "Sequence[str]") -> bool:
+def _is_transient_interpreter_enoent(exc: OSError, cmd: Sequence[str]) -> bool:
     """True when ``exc`` is ENOENT for the interpreter WE prepended to ``cmd``.
 
     Deliberately narrow, because ENOENT from ``Popen`` is ambiguous: it is raised
@@ -12994,7 +12997,7 @@ def _is_transient_interpreter_enoent(exc: OSError, cmd: "Sequence[str]") -> bool
     return not os.path.exists(sys.executable)
 
 
-def _retry_interpreter_enoent(exc: OSError, cmd: "Sequence[str]", delay: float) -> bool:
+def _retry_interpreter_enoent(exc: OSError, cmd: Sequence[str], delay: float) -> bool:
     """Decide whether *exc* is a retryable interpreter blip, and log it if so.
 
     The single shared implementation behind all three spawn wrappers
@@ -13029,12 +13032,12 @@ def _retry_interpreter_enoent(exc: OSError, cmd: "Sequence[str]", delay: float) 
 
 
 def popen_limited(
-    argv: "Sequence[str]",
+    argv: Sequence[str],
     *,
     profile: str = RLIMIT_PROFILE_TOOL,
-    abort_retry: "Callable[[], bool] | None" = None,
-    **kwargs: "Any",
-) -> "subprocess.Popen[Any]":
+    abort_retry: Callable[[], bool] | None = None,
+    **kwargs: Any,
+) -> subprocess.Popen[Any]:
     """``subprocess.Popen`` with resource limits applied AFTER ``exec``.
 
     Same contract as :func:`run_limited`, for callers that need the handle

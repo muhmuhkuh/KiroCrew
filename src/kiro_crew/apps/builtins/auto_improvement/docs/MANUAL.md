@@ -1,6 +1,6 @@
 # Auto-Improvement — user manual
 
-An opt-in built-in app that finds and fixes real defects in a GitHub repository, then
+An opt-in built-in app that finds and fixes real defects in a GitHub or GitLab repository, then
 opens them as **draft pull requests** for you to review.
 
 Its central idea: **measure before you change, and never let the agent grade its own
@@ -16,7 +16,7 @@ You need:
 * **`git`** and an authenticated **`gh`** (`gh auth status`). An unauthenticated `gh`
   only fails at the moment a PR is drafted, which is the worst time to discover it — so
   the app checks up front and refuses to start.
-* **A GitHub repository with a Python test suite.** The suite is the app's measuring
+* **A GitHub or GitLab repository with a Python test suite.** The suite is the app's measuring
   instrument, so this is a hard requirement, not a nicety.
 * **`ruff`** (optional). Improves defect discovery; the app degrades cleanly without it.
 
@@ -39,7 +39,9 @@ The gate runs your suite several times per candidate (build → lint → collect
 
 ## 2. Connect a repository
 
-1. Paste an `https://github.com/<owner>/<repo>` URL and click **Connect**.
+1. Paste a repository URL and click **Connect** — `https://github.com/<owner>/<repo>`, or
+   a GitLab project URL `https://gitlab.com/<group>/<project>` (a self-managed instance
+   must be on the `dashboard.gitlab_hosts` allowlist).
 2. Pick a **base branch**.
 
 The app clones into its own scratch directory and immediately **disables push** on that
@@ -48,8 +50,10 @@ run and refuses to start if the check does not hold.
 
 Two refusals you may hit, both deliberate:
 
-* **"Only github.com URLs are supported"** — the host list is an allowlist, not a
-  denylist.
+* **"Only GitHub or allowlisted GitLab URLs are supported"** — GitHub and GitLab
+  (public or on the `dashboard.gitlab_hosts` allowlist) are the accepted hosts; the
+  list is an allowlist, not a denylist. An authenticated `git`/`gh`/`glab` is required
+  to clone and to draft PRs/MRs.
 * **"Existing clone … has origin X, which does not match Y — refusing to reuse it"** —
   usually because `gh` switched between HTTPS and SSH. Delete or move the old scratch
   clone and reconnect. The app will not silently reuse a clone it cannot vouch for.

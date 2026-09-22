@@ -68,6 +68,10 @@ export interface Issue {
   updated_at: string
   created_at?: string
   state?: string
+  /** Provider-native workflow status, present for Jira issues. */
+  status?: string
+  /** Provider-native priority name, present for Jira issues. */
+  priority?: string
   author?: string | null
   assignees?: string[]
   body?: string
@@ -932,10 +936,10 @@ export interface RepoRef {
 
 /** Which forge a repo lives on.
  *
- * `azure` is Azure DevOps on `dev.azure.com`, where `owner` carries
- * `{organization}/{project}` — a slash-joined pair, the same way `owner` carries a
- * nested group path on GitLab. */
-export type SourceProvider = 'github' | 'gitlab' | 'azure'
+ * Azure DevOps uses `dev.azure.com` and carries `{organization}/{project}` in
+ * `owner`; Jira uses an allowlisted host and carries its project key in `owner`.
+ */
+export type SourceProvider = 'github' | 'gitlab' | 'azure' | 'jira'
 
 /** Which provider account an account-scoped endpoint should ask about.
  *
@@ -1263,12 +1267,12 @@ export interface CrewSettingsResponse {
 }
 
 export const issueRadarApi = {
-  connect: async (url: string): Promise<ConnectResponse> => {
+  connect: async (url: string, repo?: string): Promise<ConnectResponse> => {
     const r = await fetch(`${API}/connect`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, ...(repo ? { repo } : {}) }),
     })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()

@@ -420,7 +420,7 @@ def parse_metadata(params: dict[str, Any]) -> tuple[float | None, float]:
                 try:
                     credits += float(entry.get("value", 0) or 0)
                 except (TypeError, ValueError, OverflowError):
-                    pass
+                    continue
     return pct_val, credits
 
 
@@ -587,36 +587,26 @@ def select_tool_title(
     *,
     is_shell: bool | None = None,
 ) -> str | None:
-    """Pick the pill label, preferring a human-readable ``description`` when present.
+    """Pick a safe pill label for one tool call.
 
-    Some backends' Bash tool emits a ``description`` field alongside ``command``
-    (e.g. "List KiroCrew ACP module files" rather than ``ls /workplace/...``).
-    We surface it on the pill when supplied, then the literal shell command for
-    a shell tool, and only then the SDK-provided ``title``. Used for both the
-    initial ``tool_call`` and the second-phase ``tool_call_update`` refinement
-    so the title rule stays consistent across both events.
-
-    The command outranks ``title`` because backends disagree on what ``title``
-    holds for a shell call: some send the invocation itself, others a generic
-    kind label ("Run Command") that names no command at all. Reading the
-    command yields the same pill for the first shape and an informative one for
-    the second, and it is never the weaker choice — a genuinely human-readable
-    label arrives as ``description``, which still wins.
+    Shell backends may emit a human-readable ``description`` alongside
+    ``command``. Use that description only after the provider has established
+    that this is a shell call. For non-shell tools, ``description`` is commonly
+    a real argument (for example Jira issue text), not a display label.
 
     ``is_shell`` overrides the kind-derived classification for a caller holding
     a RESOLVED signal. A ``tool_call_update`` may omit ``kind`` entirely, and
     reading that absence as non-shell would put the generic title back on a
     pill the initial ``tool_call`` had already labelled with its command.
     """
-    if isinstance(raw_input, dict):
+    kind_str = kind if isinstance(kind, str) else None
+    shell = is_shell_kind(kind_str) if is_shell is None else is_shell
+    if shell and isinstance(raw_input, dict):
         desc = raw_input.get("description")
         if isinstance(desc, str) and desc.strip():
             return desc
-    kind_str = kind if isinstance(kind, str) else None
-    shell = is_shell_kind(kind_str) if is_shell is None else is_shell
-    # Shell kinds only, so an fs tool's operation name ("strReplace") is never
-    # mistaken for a command.
-    if shell and isinstance(raw_input, dict):
+        # Shell kinds only, so an fs tool's operation name ("strReplace") is
+        # never mistaken for a command.
         cmd = raw_input.get("command")
         if isinstance(cmd, str) and cmd.strip():
             return cmd
@@ -2668,7 +2658,10 @@ def parse_usage_cost(update: dict[str, Any]) -> float | None:
     amount = _token_count(cost.get("amount"))
     if amount is None or amount < 0:
         return None
-    return float(amount)
+    try:
+        return float(amount)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def parse_prompt_token_usage(result: Any) -> tuple[int, int, int, int] | None:
@@ -2698,7 +2691,10 @@ def parse_prompt_token_usage(result: Any) -> tuple[int, int, int, int] | None:
         n = _token_count(value)
         if n is None or n < 0:
             return 0
-        return int(n)
+        try:
+            return int(n)
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
     return _count(keys[0]), _count(keys[1]), _count(keys[2]), _count(keys[3])
 

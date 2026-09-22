@@ -5,23 +5,23 @@ through a cycle wastes the whole cycle, so the UI asks this up front and can sho
 what to install.
 
 Reports rather than repairs. The upstream version could install its internal
-toolchain packages itself; here the two hard dependencies (``git``, ``gh``) are
-things a user installs and authenticates deliberately — silently installing an
-authenticated CLI on someone's behalf is not this app's business. Only the
-optional linter, which is a plain pip package in the app's own environment, is
-offered as an install.
+toolchain packages itself; here the hard dependencies (``git`` plus ``gh`` or
+``glab`` for the selected forge) are things a user installs and authenticates
+deliberately — silently installing an authenticated CLI on someone's behalf is
+not this app's business. Only the optional linter, which is a plain pip package
+in the app's own environment, is offered as an install.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from typing import Any
 
 from kiro_crew import platform_compat
 from kiro_crew.security import redact_and_truncate
-from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -32,36 +32,54 @@ def _which(binary: str) -> str:
     return shutil.which(binary) or ""
 
 
-def _gh_authenticated() -> tuple[bool, str]:
-    """Whether ``gh`` has a live login.
-
-    Presence on PATH is not enough: an unauthenticated ``gh`` fails only when a
-    pull request is drafted, which is the worst moment to find out.
-    """
-    if not _which("gh"):
-        return False, "gh is not on PATH"
+def _cli_authenticated(
+    binary: str, login_command: str, *, env: dict[str, str] | None = None
+) -> tuple[bool, str]:
+    """Whether a provider CLI is present and has a live login."""
+    if not _which(binary):
+        return False, f"{binary} is not on PATH"
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": _PROBE_TIMEOUT_S,
+    }
+    if env is not None:
+        kwargs["env"] = env
     try:
-        proc = subprocess.run(
-            ["gh", "auth", "status"],
-            capture_output=True,
-            timeout=_PROBE_TIMEOUT_S,
-            **UTF8_TEXT,
-        )
+        proc = subprocess.run([binary, "auth", "status"], **kwargs)
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"could not run gh auth status: {exc}"
+        return False, f"could not run {binary} auth status: {exc}"
     if proc.returncode != 0:
-        return False, "gh is present but not logged in — run `gh auth login`"
+        return False, f"{binary} is present but not logged in — run `{login_command}`"
     return True, "authenticated"
 
 
-def check_deps() -> dict[str, Any]:
+def _gh_authenticated() -> tuple[bool, str]:
+    """Whether ``gh`` has a live login."""
+    return _cli_authenticated("gh", "gh auth login")
+
+
+def _glab_authenticated(host: str = "") -> tuple[bool, str]:
+    """Whether ``glab`` has a live login for the configured GitLab host."""
+    env: dict[str, str] | None = None
+    if host:
+        env = dict(os.environ)
+        env["GITLAB_HOST"] = host
+    return _cli_authenticated("glab", "glab auth login", env=env)
+
+
+def check_deps(provider: str = "github", host: str = "") -> dict[str, Any]:
     """Report every dependency, whether it is satisfied, and how to fix it.
 
     ``required`` entries block a run; an unsatisfied optional entry only narrows
     what discovery can find.
     """
     git_path = _which("git")
-    gh_ok, gh_detail = _gh_authenticated()
+    selected_provider = str(provider or "github").lower()
+    cli_id = "glab" if selected_provider == "gitlab" else "gh"
+    cli_name = "GitLab CLI (glab)" if cli_id == "glab" else "GitHub CLI (gh)"
+    cli_login = "glab auth login" if cli_id == "glab" else "gh auth login"
+    cli_ok, cli_detail = _glab_authenticated(host) if cli_id == "glab" else _gh_authenticated()
     ruff_path = _which("ruff")
 
     deps: list[dict[str, Any]] = [
@@ -75,12 +93,12 @@ def check_deps() -> dict[str, Any]:
             "installable": False,
         },
         {
-            "id": "gh",
-            "name": "GitHub CLI (gh)",
+            "id": cli_id,
+            "name": cli_name,
             "required": True,
-            "ok": gh_ok,
-            "detail": gh_detail,
-            "fix": "install the GitHub CLI, then run `gh auth login`",
+            "ok": cli_ok,
+            "detail": cli_detail,
+            "fix": f"install the {cli_name}, then run `{cli_login}`",
             "installable": False,
         },
         {

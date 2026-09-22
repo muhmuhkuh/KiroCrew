@@ -21,6 +21,10 @@ from sage_lib import store
 # /<owner>/<repo>/pull/<number>[...]. Applied to the PARSED URL path only, AFTER
 # the hostname allowlist check — never to the raw link.
 _PR_PATH_RE = re.compile(r"^/([^/]+)/([^/]+)/pull/(\d+)")
+# Matches the GitLab merge-request path grammar (self-hosted and gitlab.com):
+# /<namespace>/<project>/-/merge_requests/<iid>[...]. GitLab nests groups
+# (group/subgroup), so the project path is everything before `/-/merge_requests/<n>`.
+_MR_PATH_RE = re.compile(r"^(/.+?)/-/merge_requests/(\d+)")
 # A change is a "fix" if its title/description signals a bug/revert/incident.
 FIX_RE = re.compile(r"\b(fix(es|ed)?|revert(s|ed)?|bug|hotfix|regression|incident|patch)\b", re.I)
 # GitHub-style issue reference (e.g. "#204") linked from the PR body.
@@ -72,6 +76,10 @@ class ReviewTarget:
 # URLs.
 _GITHUB_HOST = "github.com"
 _WWW_GITHUB_HOST = "www.github.com"
+# Canonical public-GitLab hostname. Named constant (rather than an inline literal)
+# keeps membership tests on the parsed-host SET from reading as URL-substring checks.
+_GITLAB_HOST = "gitlab.com"
+_WWW_GITLAB_HOST = "www.gitlab.com"
 
 
 def canonical_host(host: str) -> str:
@@ -80,7 +88,11 @@ def canonical_host(host: str) -> str:
     Persisted identities (``repo_identity``, change ids, reviewed keys) use the
     canonical form so the two spellings of github.com map to one record."""
     h = (host or "").strip().lower()
-    return _GITHUB_HOST if h == _WWW_GITHUB_HOST else h
+    if h == _WWW_GITHUB_HOST:
+        return _GITHUB_HOST
+    if h == _WWW_GITLAB_HOST:
+        return _GITLAB_HOST
+    return h
 
 
 def _urlparse_host_path(text: str) -> tuple[str, str]:
@@ -99,7 +111,7 @@ def _urlparse_host_path(text: str) -> tuple[str, str]:
 
 
 def allowed_hosts(config: dict | None = None) -> frozenset[str]:
-    """The exact set of hostnames accepted as GitHub-API-compatible.
+    """The exact set of HOSTNAMES accepted as GitHub-API-compatible.
 
     The single resolution point for "which hosts are acceptable". Sourced from
     ``config.json``'s ``github_hosts`` list — GitHub Enterprise Server hosts are
@@ -111,8 +123,34 @@ def allowed_hosts(config: dict | None = None) -> frozenset[str]:
     exact equality — never a substring, suffix, or regex-on-raw-URL test — so
     ``notgithub.com``, ``github.com.evil.example``, and a permitted host that
     appears only in a URL's path are all refused."""
+    return _hosts_from_config(config, "github_hosts",
+                              {_GITHUB_HOST, _WWW_GITHUB_HOST},
+                              store.DEFAULT_GITHUB_HOSTS)
+
+
+def gitlab_allowed_hosts(config: dict | None = None) -> frozenset[str]:
+    """The exact set of hostnames accepted as GitLab-API-compatible.
+
+    Sibling of ``allowed_hosts`` (GitHub): sourced from ``config.json``'s
+    ``gitlab_hosts`` list — self-hosted GitLab instances are opt-in, mirroring
+    ``glab auth login --hostname`` — and defaults to gitlab.com. ``www.gitlab.com``
+    is accepted whenever ``gitlab.com`` is. Same exact-match semantics as the
+    GitHub allowlist (parse to components, default-deny)."""
+    return _hosts_from_config(config, "gitlab_hosts",
+                              {_GITLAB_HOST, _WWW_GITLAB_HOST},
+                              store.DEFAULT_GITLAB_HOSTS)
+
+
+def _hosts_from_config(config: dict | None, key: str, canon: set[str],
+                       default: list[str]) -> frozenset[str]:
+    """Shared host-allowlist resolution for GitHub and GitLab (identical shape).
+
+    Reads ``config[key]`` (a ``list[str]`` of bare hostnames, URLs tolerated),
+    canonicalizes www→bare for the platform's canonical set, and falls back to
+    the platform default when unset/empty. Encapsulated so the two platforms'
+    allowlists cannot drift in semantics."""
     cfg = config if config is not None else store.read_config_quiet()
-    raw = cfg.get("github_hosts") if isinstance(cfg, dict) else None
+    raw = cfg.get(key) if isinstance(cfg, dict) else None
     hosts: set[str] = set()
     if isinstance(raw, (list, tuple)):
         for entry in raw:
@@ -123,34 +161,38 @@ def allowed_hosts(config: dict | None = None) -> frozenset[str]:
             if h:
                 hosts.add(h)
     if not hosts:
-        hosts = set(store.DEFAULT_GITHUB_HOSTS)
-    # `hosts` holds bare hostnames (never URLs); this is exact set membership.
-    # The two public-GitHub spellings imply each other: `www.github.com`
-    # canonicalizes to `github.com` downstream, so a www-only config must also
-    # accept the canonical form or accepted links would fail to round-trip.
-    if hosts & {_GITHUB_HOST, _WWW_GITHUB_HOST}:
-        hosts.add(_GITHUB_HOST)
-        hosts.add(_WWW_GITHUB_HOST)
+        hosts = set(default)
+    if hosts & canon:
+        hosts.update(canon)
     return frozenset(hosts)
 
 
 def detect_platform(link: str, *, config: dict | None = None) -> str:
-    """Return ``github`` for a PR link on an allowed GitHub host, else raise
-    UnsupportedPlatform.
+    """Return ``github`` or ``gitlab`` for a PR/MR link on an allowed host, else
+    raise UnsupportedPlatform.
 
-    The host is validated against the ``allowed_hosts()`` allowlist by EXACT
+    The host is validated against the GitHub or GitLab allowlist by EXACT
     match of the PARSED URL hostname (not a substring of the raw link), so a
     URL where an allowed host merely appears in the path/query/userinfo (e.g.
     ``https://evil.example/github.com/x/pull/1``) or as a spoofable
     prefix/suffix (``notgithub.com``, ``github.com.evil.example``) is rejected,
     and a malformed URL reads as unsupported rather than raising ``ValueError``.
-    Aligns with SSRF/allowlist guidance (parse to components, default-deny)."""
+    Aligns with SSRF/allowlist guidance (parse to components, default-deny).
+
+    Platform is decided by path grammar on an allowed host: ``/pull/<n>`` on a
+    GitHub allowlisted host is ``github``, ``/-/merge_requests/<n>`` on a GitLab
+    allowlisted host is ``gitlab``. A host present on BOTH allowlists with a
+    matching path resolves by the path grammar (a GitLab path on a GitHub
+    allowlisted host is refused)."""
     if not link or not isinstance(link, str):
         raise UnsupportedPlatform("empty or non-string link")
     host, path = _urlparse_host_path(link)
     if host in allowed_hosts(config) and "/pull/" in path:
         return "github"
-    raise UnsupportedPlatform(f"unsupported link/platform: {link!r} (expected a GitHub PR URL)")
+    if host in gitlab_allowed_hosts(config) and "/-/merge_requests/" in path:
+        return "gitlab"
+    raise UnsupportedPlatform(
+        f"unsupported link/platform: {link!r} (expected a GitHub PR or GitLab MR URL)")
 
 
 def _sanitize_seg(s: str) -> str:
@@ -196,6 +238,40 @@ def github_pr_parts(link: str) -> tuple[str, str, str]:
     return owner, repo, number
 
 
+def gitlab_pr_ref(link: str, *, config: dict | None = None) -> tuple[str, str, str]:
+    """Parse ``(host, namespace, iid)`` from a GitLab MR URL on an
+    allowed GitLab host. Fails fast.
+
+    GitLab nests groups, so the project path is EVERYTHING before
+    ``/-/merge_requests/<n>`` (e.g. ``group/subgroup/project``); it is kept
+    verbatim (not split on ``/``) because the API addresses it as a single
+    URL-escaped ``project_id`` (``group%2Fsubgroup%2Fproject``). Host membership
+    uses the same PARSED-hostname exact-match allowlist as ``detect_platform``;
+    a scheme-less link is tolerated by retrying with ``https://``."""
+    if not link or not isinstance(link, str):
+        raise AdapterParseError(f"not a GitLab MR link: {link!r}")
+    text = link.strip()
+    host, path = _urlparse_host_path(text)
+    if not host and "://" not in text:
+        host, path = _urlparse_host_path("https://" + text)
+    if host not in gitlab_allowed_hosts(config):
+        raise AdapterParseError(f"not a GitLab MR link: {link!r}")
+    m = _MR_PATH_RE.match(path)
+    if not m:
+        raise AdapterParseError(f"not a GitLab MR link: {link!r}")
+    namespace, iid = m.group(1).lstrip("/"), m.group(2)
+    if not namespace or "." in namespace.split("/")[0]:
+        raise AdapterParseError(f"not a GitLab MR link: {link!r}")
+    return canonical_host(host), namespace, iid
+
+
+def gitlab_pr_parts(link: str) -> tuple[str, str]:
+    """Parse ``(namespace, iid)`` from a GitLab MR URL. Callers that need the
+    host use ``gitlab_pr_ref``."""
+    _host, namespace, iid = gitlab_pr_ref(link)
+    return namespace, iid
+
+
 def link_names_a_host(link: str) -> bool:
     """Whether ``link`` plausibly NAMES a network host — an explicit
     ``scheme://`` form (even with an unparseable host) or a leading
@@ -214,6 +290,36 @@ def link_names_a_host(link: str) -> bool:
     if "://" in text:  # a scheme is present but the host is unparseable
         return True
     return "." in text.split("/", 1)[0]
+
+
+def parse_gitlab_repo_ref(link: str, *, config: dict | None = None) -> tuple[str, str, str]:
+    """Parse an allowlisted GitLab URL as ``(host, namespace, project)``."""
+    if not link or not isinstance(link, str):
+        raise UnsupportedPlatform("empty or non-string repo link")
+    host, path = _urlparse_host_path(link)
+    hosts = gitlab_allowed_hosts(config)
+    if host not in hosts:
+        raise UnsupportedPlatform(f"unsupported GitLab repo host: {link!r}")
+    if "/-/" in path:
+        path = path.split("/-/", 1)[0]
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        raise AdapterParseError(f"not a GitLab repo link: {link!r}")
+    parts[-1] = re.sub(r"\.git$", "", parts[-1])
+    segment = re.compile(r"^[A-Za-z0-9._-]+$")
+    if any(part in (".", "..") or not segment.match(part) for part in parts):
+        raise AdapterParseError(f"invalid GitLab namespace/project in {link!r}")
+    return canonical_host(host), "/".join(parts[:-1]), parts[-1]
+
+
+def parse_any_repo_ref(link: str, *, config: dict | None = None) -> tuple[str, str, str, str]:
+    """Parse a GitHub or GitLab repo URL as ``(provider, host, owner, repo)``."""
+    host, _path = _urlparse_host_path(link if isinstance(link, str) else "")
+    if host in allowed_hosts(config):
+        parsed_host, owner, repo = parse_repo_ref(link, config=config)
+        return "github", parsed_host, owner, repo
+    parsed_host, namespace, project = parse_gitlab_repo_ref(link, config=config)
+    return "gitlab", parsed_host, namespace, project
 
 
 def parse_repo_ref(link: str, *, config: dict | None = None) -> tuple[str, str, str]:
@@ -290,6 +396,30 @@ def github_review_key(owner: str, repo: str, number: str | int,
     already-persisted keys byte-identical."""
     h = canonical_host(host) or "github.com"
     return f"{h}/{str(owner).lower()}/{str(repo).lower()}#{number}"
+
+
+def gitlab_change_id(namespace: str, iid: str | int, host: str = "gitlab.com") -> str:
+    """Filesystem-safe, platform-namespaced GitLab change id: ``GL-<ns>-<iid>``.
+
+    Calls it a ``change id`` (matching GitHub's ``GH-…``) so the review path,
+    results store, and reviewed index treat GitLab records exactly like GitHub
+    ones. The project path (``group/subgroup/project``) runs through
+    ``_sanitize_seg`` (``/`` and ``-`` → ``_``) so the id is a valid filename;
+    a non-gitlab.com (self-hosted) host gets a leading sanitized host segment so
+    the same namespace/iid on two hosts cannot share one result file."""
+    h = canonical_host(host)
+    prefix = f"GL-{_sanitize_seg(h)}-" if h and h != "gitlab.com" else "GL-"
+    return f"{prefix}{_sanitize_seg(namespace)}-{iid}"
+
+
+def gitlab_review_key(namespace: str, iid: str | int, host: str = "gitlab.com") -> str:
+    """Collision-free canonical identity for the GitLab reviewed-index key.
+
+    Mirrors ``github_review_key`` (host-qualified, lossless ``/``-joined
+    identity) so GitLab dedup records cannot collide across hosts or between
+    the lossy ``GL-…`` file name and this key."""
+    h = canonical_host(host) or "gitlab.com"
+    return f"{h}/{str(namespace).lower()}#{iid}"
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +568,105 @@ def normalize(link: str, raw_payload: dict | str) -> ReviewTarget:
     platform = detect_platform(link)
     if platform == "github":
         return parse_github_payload(raw_payload, link=link)
+    if platform == "gitlab":
+        return parse_gitlab_payload(raw_payload, link=link)
     raise UnsupportedPlatform(f"unsupported platform: {platform!r}")
+
+
+def parse_gitlab_payload(raw: dict | str, *, link: str | None = None) -> ReviewTarget:
+    """Normalize a GitLab MR payload into a ReviewTarget.
+
+    The worker assembles this payload from ``glab api``: the merge-request
+    object merged with a ``changes`` array (each carrying ``old_path``/``new_path``
+    and ``diff``) and optional ``notes``. Tolerant of field-name variants; fails
+    fast when there is no usable content. ``namespace``/``iid`` are taken from
+    the payload (``web_url`` / ``iid``) and fall back to the link so the adapter
+    works whether or not the caller echoes the URL."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise AdapterParseError(f"payload is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise AdapterParseError("payload must be a JSON object")
+
+    iid = _first(raw, "iid", "number", default="")
+    namespace_host = ""
+
+    # GitLab exposes the project path as `web_url` (https://<host>/<ns>/<proj>)
+    # and/or `references.full` (`<ns>/<proj>!<iid>`); fall back to the link.
+    refs = raw.get("references")
+    ref_full = refs.get("full") if isinstance(refs, dict) else ""
+    web_url = _first(raw, "web_url", "url", default="")
+    namespace = ""
+    for candidate in (link, web_url, ref_full):
+        if not candidate:
+            continue
+        try:
+            lh, lns, li = gitlab_pr_ref(candidate)
+        except AdapterParseError:
+            continue
+        namespace_host = namespace_host or lh
+        namespace = namespace or lns
+        iid = iid or li
+        break
+    if not isinstance(namespace_host, str) or not namespace_host:
+        namespace_host = "gitlab.com"
+
+    if not (namespace and iid):
+        raise AdapterParseError(
+            "could not determine GitLab namespace/MR iid from payload or link")
+
+    description = _first(raw, "description", "body", default="")
+    title = _first(raw, "title", default="") or (description.splitlines()[0] if description else "")
+
+    raw_changes = raw.get("changes") or raw.get("diffs") or raw.get("files") or []
+    files: list[dict] = []
+    for d in raw_changes if isinstance(raw_changes, list) else []:
+        if not isinstance(d, dict):
+            continue
+        path = _first(d, "new_path", "path", "filename", "name", default="")
+        diff = _first(d, "diff", "patch", "unifiedDiff", default="")
+        if path:
+            files.append({"path": path, "diff": diff})
+
+    if not files and not description:
+        raise AdapterParseError("payload has no files and no description")
+
+    author = ""
+    author_obj = raw.get("author")
+    if isinstance(author_obj, dict):
+        author = _first(author_obj, "username", "name", "login", default="")
+    if not author:
+        author = _author_alias(raw)
+
+    revision = (_first(raw, "sha", "diff_refs", default="")
+                or _first(raw, "head_sha", "revision", default=""))
+    if isinstance(revision, dict):
+        revision = _first(revision, "head_sha", "sha", default="")
+    target_branch = (_first(raw, "target_branch", "targetBranch", "base_ref",
+                            default=""))
+
+    comments = raw.get("notes") or raw.get("comments") or raw.get("allComments") or []
+    if not isinstance(comments, list):
+        comments = []
+
+    return ReviewTarget(
+        platform="gitlab",
+        repo_identity=f"{namespace_host}/{namespace}",
+        change_id=gitlab_change_id(namespace, iid, host=namespace_host),
+        url=web_url or f"https://{namespace_host}/{namespace}/-/merge_requests/{iid}",
+        title=title,
+        description=description,
+        linked_issue=extract_linked_issue(description),
+        author=str(author) if author else "",
+        target_branch=target_branch,
+        revision=str(revision),
+        files=files,
+        existing_comments=comments,
+        design_discussion=[],
+        is_fix=detect_is_fix(title, description),
+    )
 
 
 def validate_review_target(target: ReviewTarget) -> list[str]:

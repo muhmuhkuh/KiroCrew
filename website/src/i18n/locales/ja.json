@@ -1889,6 +1889,18 @@
         "loading": "読み込み中…"
       }
     },
+    "goalOwner": {
+      "manifest": {
+        "configuration_1": "Goal Owner を有効にし、完了条件を含む目標を作成してから、アプリ API で確認または一時停止します。",
+        "description": "自律実行する目標のための、上限付きで再開可能なプロジェクトオーナー。",
+        "display_name": "目標オーナー",
+        "highlight_1": "ユーザー所有の目標ごとに1つの永続レコード",
+        "highlight_2": "明示的な予算を持つ上限付きウェイク",
+        "highlight_3": "進捗を失わずに一時停止・再開",
+        "highlight_4": "オーナーセッションと cron のクラッシュセーフな調整",
+        "use_case_1": "範囲、予算、完了の証拠を人が管理しながら、上限付きのオーナーサイクルで目標を実行します。"
+      }
+    },
     "issueRadar": {
       "api": {
         "assignees_changed_elsewhere": "この課題を読み込んだ後、担当者が別の場所で変更されました。",
@@ -2312,6 +2324,7 @@
         "https_github_com_owner_repo": "https://github.com/<owner>/<repo>",
         "https_gitlab_com_group_project": "https://gitlab.com/<group>/<project>",
         "issue_radar_reads": "Issue Radarが読み取ります",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
         "last_contribution": "最後のコントリビューション: {{when}}",
         "let_s_connect_a_repo": "リポジトリを接続しましょう",
         "loading_your_repos": "リポジトリを読み込み中…",
@@ -2327,6 +2340,10 @@
         "through_your_own": "あなた自身の",
         "you_contributed_to": "コントリビューションしたリポジトリ:",
         "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo",
         "repositories_in_your_organization": "組織のリポジトリ",
         "no_repositories_in_your_organization_paste_a_url": "組織にリポジトリがありません。下に URL を貼り付けて接続してください。",
         "azure_also_needs_the_devops_extension": "Azure DevOps には専用の CLI 拡張機能も必要です。下のコマンドで一度インストールしてください。"
@@ -2344,6 +2361,7 @@
         "format": {
           "last_update": "最終更新",
           "number": "番号",
+          "priority": "優先度",
           "crew_sort_status": "ステータス",
           "crew_sort_name": "名前",
           "crew_sort_created": "作成済み"
@@ -11010,6 +11028,7 @@
         "installed_check_again_to_use": "このマシンにインストール済みです。「再度確認」を押すと取り込みます。それでもこの表示が残る場合は、Settings > About から {{productName}} を再起動してください。",
         "kas_kiro_agent": "KAS (kiro-agent)",
         "kiro_cli": "Kiro CLI",
+        "pi": "Pi",
         "loading_configuration": "設定を読み込んでいます…",
         "mcp_concern_auto_approve": "エージェント設定ファイルが定める自動承認ルール — {{name}} はそれを適用しません",
         "mcp_concern_denied_tools": "あなたがオフにしたツール — ここでは使えるままです",

@@ -35,6 +35,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -675,17 +676,13 @@ class AgentRunner:
         try:
             kill_process_tree(popen.pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError, ValueError):
-            try:
+            with suppress(Exception):
                 popen.kill()
-            except Exception:  # noqa: BLE001
-                pass
         try:
             popen.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
-            try:
+            with suppress(Exception):
                 kill_process_tree(popen.pid, SIGKILL)
-            except Exception:  # noqa: BLE001
-                pass
 
     @staticmethod
     def available() -> bool:
@@ -850,6 +847,7 @@ class AgentRunner:
         # longer reach credentials outside the worktree — without removing the only path
         # that works when no in-process provider is configured. Deleting it would turn
         # "no provider" from "degraded but functional" into "silently does nothing".
+        cleanup = None
         try:
             popen, cleanup = self._spawn_sandboxed_agent(cmd, cwd)
         except FileNotFoundError:
@@ -901,31 +899,28 @@ class AgentRunner:
                 ok=False, error=f"{type(e).__name__}: {e}", duration_s=time.monotonic() - t0
             )
 
-        proc = type("P", (), {"returncode": popen.returncode, "stdout": stdout, "stderr": stderr})()
-
         dur = time.monotonic() - t0
-        if proc.returncode != 0:
-            # Redact BEFORE the tail cut: a credential straddling the bound keeps its
-            # right half otherwise, a fragment no downstream pass can match. Tail (not
-            # a head bound) because the END of stderr carries the
-            # actionable error; slicing redacted text can at worst split a marker.
+        if popen.returncode != 0:
             return AgentResult(
                 ok=False,
-                error=f"exit {proc.returncode}: {redact_via_context(proc.stderr or '')[-400:]}",
+                error=f"exit {popen.returncode}: {redact_via_context(stderr or '')[-400:]}",
                 duration_s=dur,
             )
         try:
-            envelope = json.loads(proc.stdout)
+            envelope = json.loads(stdout)
         except json.JSONDecodeError:
             return AgentResult(
                 ok=False,
                 error="unparseable claude json envelope",
                 duration_s=dur,
-                raw={"stdout": proc.stdout[-400:]},
+                raw={"stdout": stdout[-400:]},
             )
 
         result_text = envelope.get("result", "")
-        cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+        try:
+            cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
         with self._cost_lock:
             self._total_cost_usd += cost
         if envelope.get("is_error"):
@@ -946,10 +941,8 @@ class AgentRunner:
         )
 
     def _emit_activity(self, ev: dict) -> None:
-        try:
+        with suppress(Exception):
             self._on_activity(ev)  # type: ignore[misc]
-        except Exception:  # noqa: BLE001 — a sink error must never break the run
-            pass
 
     def _run_streaming(
         self, popen, t0: float, timeout_s: float, *, cwd: str | None = None
@@ -1284,10 +1277,8 @@ class SessionAgentRunner:
     def _emit_activity(self, ev: dict) -> None:
         if self._on_activity is None:
             return
-        try:
+        with suppress(Exception):
             self._on_activity(ev)
-        except Exception:  # noqa: BLE001 — a sink error must never break the run
-            pass
 
     def run(
         self,
@@ -1563,10 +1554,8 @@ class SessionAgentRunner:
             return _finish(ok=True)
         finally:
             if provider is not None:
-                try:
+                with suppress(Exception):
                     await provider.shutdown()
-                except Exception:  # noqa: BLE001
-                    pass
 
     @staticmethod
     async def _reject(provider, rid, *, tool: str = "", session_key: str = "") -> None:
@@ -1635,7 +1624,7 @@ class SessionAgentRunner:
             except Exception:  # noqa: BLE001 - the agent's own timeout covers this
                 logger.debug("reject_tool after audit failure also failed: %s", exc)
             return
-        try:
+        with suppress(Exception):
             # ONE-SHOT, never `always=True`. Persistent approval tells the provider to stop
             # sending permission requests for matching calls (the base contract: "the user
             # picked 'always allow'", and ACP backends may turn it into an `addRules`
@@ -1645,8 +1634,6 @@ class SessionAgentRunner:
             # with its first approval; re-deciding per call is the whole point of routing
             # through here.
             await provider.approve_tool(rid)
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _repro_test_dir(worktree: Path) -> str:

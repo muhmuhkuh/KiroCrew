@@ -39,13 +39,14 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 from urllib.parse import urlparse
 
-from . import azure_client, github_client, gitlab_client
+from . import azure_client, github_client, gitlab_client, jira_client
 from .errors import RepoUrlError
 
 GITHUB = "github"
 GITLAB = "gitlab"
 AZURE = "azure"
-PROVIDERS = (GITHUB, GITLAB, AZURE)
+JIRA = "jira"
+PROVIDERS = (GITHUB, GITLAB, AZURE, JIRA)
 
 DEFAULT_PROVIDER = GITHUB
 DEFAULT_HOST = "github.com"
@@ -96,11 +97,14 @@ class RepoKey:
 
         Azure DevOps puts a literal ``_git`` between the project and the
         repository, because a project holds repositories alongside boards,
-        pipelines and artifacts and the segment is what disambiguates them. Every
-        other provider's repository page is just the namespace path.
+        pipelines and artifacts and the segment is what disambiguates them.
         """
         if self.provider == AZURE:
             return f"https://{self.host}/{self.owner}/_git/{self.repo}"
+        if self.provider == JIRA:
+            # A Jira project's issue list lives at /browse/KEY; the ``repo``
+            # field carries the manually-mapped Git slug, not the Jira page.
+            return f"https://{self.host}/browse/{self.owner}"
         return f"https://{self.host}/{self.owner}/{self.repo}"
 
 
@@ -143,12 +147,21 @@ def normalize_host(raw: object, provider: str) -> str:
     pinned = _PINNED_HOSTS.get(provider)
     if pinned is not None:
         return pinned
+    # GitLab and Jira both key on a host that must survive normalization;
+    # neither defaults a missing host because that could retarget a request.
     return str(raw or "").strip().lower().rstrip(".")
 
 
 def key_from_parts(owner: str, repo: str, provider: object = None, host: object = None) -> RepoKey:
-    """Build a :class:`RepoKey` from loose request/config values."""
+    """Build a :class:`RepoKey` from loose request/config values.
+
+    Jira has no repository half. Use project key as internal fallback when no
+    manual Git mapping exists so repo-shaped routes retain a non-empty identity;
+    Jira API calls still use ``owner`` as project key.
+    """
     resolved_provider = normalize_provider(provider)
+    if resolved_provider == JIRA and owner and not repo:
+        repo = owner
     return RepoKey(
         provider=resolved_provider,
         host=normalize_host(host, resolved_provider),
@@ -181,6 +194,10 @@ def _provider_for_url_host(host: str) -> str:
         return GITHUB
     if host in _AZURE_URL_HOSTS or host.endswith(_AZURE_LEGACY_HOST_SUFFIX):
         return AZURE
+    if host.endswith(".atlassian.net") and len(host) > len(".atlassian.net"):
+        return JIRA
+    if host in jira_client.allowed_hosts():
+        return JIRA
     return GITLAB
 
 
@@ -200,6 +217,14 @@ def parse_repo_url(link: str) -> RepoKey:
     is refused with a GitHub-specific error instead of being parsed as GitLab.
     Parsing once and comparing the host is both correct and what every other
     host check in this app already does.
+
+    GitLab is tried second and only for non-github.com hosts, so a GitHub URL can
+    never be mis-attributed, and the error a user sees for a bad github.com URL
+    stays GitHub-specific rather than becoming a confusing "not a GitLab host".
+
+    Jira is recognized by its host before the GitLab fallback: an allowlisted
+    Jira host (or any ``*.atlassian.net``) is handed to ``jira_client`` so it is
+    never mis-parsed as a GitLab project.
     """
     if not link or not isinstance(link, str):
         raise RepoUrlError("repo link is empty")
@@ -219,6 +244,13 @@ def parse_repo_url(link: str) -> RepoKey:
         # one are the same identity rather than two cache trees.
         namespace, project_repo = azure_client.parse_azure_repo_url(link)
         return RepoKey(provider=AZURE, host=AZURE_HOST, owner=namespace, repo=project_repo)
+    if resolved == JIRA:
+        jira_host, project = jira_client.parse_jira_project_url(
+            link, allowed_hosts=jira_client.allowed_hosts()
+        )
+        # ``repo`` (the mapped Git slug) is unknown at connect time; the connect
+        # handler fills it in from the operator's manual mapping.
+        return RepoKey(provider=JIRA, host=jira_host, owner=project, repo="")
     namespace_host, namespace, project = gitlab_client.parse_gitlab_repo_url(
         link, allowed_hosts=gitlab_client.allowed_hosts()
     )
@@ -389,6 +421,7 @@ _CLIENTS: dict[str, ProviderClient] = {
     GITHUB: cast(ProviderClient, github_client),
     GITLAB: cast(ProviderClient, gitlab_client),
     AZURE: cast(ProviderClient, azure_client),
+    JIRA: cast(ProviderClient, jira_client),
 }
 
 
@@ -405,7 +438,7 @@ def client_for(key: RepoKey) -> ProviderClient:
 
 # Providers whose client needs the target host on every call. GitHub is pinned to
 # github.com inside its own runner and takes none.
-_HOST_BEARING_PROVIDERS = frozenset({GITLAB, AZURE})
+_HOST_BEARING_PROVIDERS = frozenset({GITLAB, AZURE, JIRA})
 
 
 def call_kwargs(key: RepoKey) -> dict[str, str]:
@@ -467,6 +500,14 @@ _TERMS = {
         "provider_name": "Azure DevOps",
         "cli": "az",
     },
+    JIRA: {
+        "change_request": "issue",
+        "change_request_short": "issue",
+        # Jira addresses issues by key (PROJ-123); there is no PR sigil.
+        "change_request_sigil": "",
+        "provider_name": "Jira",
+        "cli": "",
+    },
 }
 
 
@@ -491,6 +532,7 @@ _TRACKED_ITEMS_URL: dict[str, Callable[[RepoKey], str]] = {
     GITHUB: lambda key: f"{key.web_url()}/issues",
     GITLAB: lambda key: f"{key.web_url()}/-/issues",
     AZURE: lambda key: f"https://{key.host}/{key.owner}/_workitems/",
+    JIRA: lambda key: key.web_url(),
 }
 
 

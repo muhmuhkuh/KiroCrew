@@ -24,10 +24,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup, store
 from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
 from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
-from kiro_crew.apps.builtins.auto_improvement.backend import store
 from kiro_crew.apps.builtins.auto_improvement.spine.driver import BudgetCaps
 
 #: Windows' extended-length path prefix. ``os.readlink`` returns an absolute target with
@@ -1335,7 +1334,9 @@ class TestPostAgentRepositorySafety:
         assert "elif pushed is False" in inspect.getsource(Driver._apply_verdict)
         assert "elif pushed is False" in inspect.getsource(Driver._apply_bug_winner)
 
-        from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
+        from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import (
+            CrPipeline,
+        )
 
         reproduce = inspect.getsource(CrPipeline.emit_perf)
         assert reproduce.count('self._retire_if_unsafe("reproduce")') == 2
@@ -1389,7 +1390,9 @@ class TestNestedTargetJoinsItsEvidence:
     """
 
     def test_a_nested_target_slugs_to_its_basename(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend.progress import _target_slug
+        from kiro_crew.apps.builtins.auto_improvement.backend.progress import (
+            _target_slug,
+        )
 
         slug = _target_slug(
             "src/kiro_crew/apps/builtins/auto_improvement/spine/contracts.py::Proposal"
@@ -1400,7 +1403,9 @@ class TestNestedTargetJoinsItsEvidence:
 
     def test_the_slug_matches_the_proposers_own_token(self) -> None:
         """Both sides must derive from the basename, or the join silently breaks again."""
-        from kiro_crew.apps.builtins.auto_improvement.backend.progress import _target_slug
+        from kiro_crew.apps.builtins.auto_improvement.backend.progress import (
+            _target_slug,
+        )
         from kiro_crew.apps.builtins.auto_improvement.spine.proposer import _short
 
         for target in (
@@ -1411,13 +1416,17 @@ class TestNestedTargetJoinsItsEvidence:
             assert _target_slug(target) in _short(target).lower()
 
     def test_a_shallow_target_still_joins(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend.progress import _target_slug
+        from kiro_crew.apps.builtins.auto_improvement.backend.progress import (
+            _target_slug,
+        )
 
         assert _target_slug("src/search.py::negamax_root") == "search_py_negamax_root"
 
     def test_the_slug_is_capped_like_the_cand_id(self) -> None:
         """``_short`` truncates at 48 chars; a longer slug would never be a substring."""
-        from kiro_crew.apps.builtins.auto_improvement.backend.progress import _target_slug
+        from kiro_crew.apps.builtins.auto_improvement.backend.progress import (
+            _target_slug,
+        )
 
         long_target = "src/pkg/" + ("a" * 80) + ".py::Sym"
         assert len(_target_slug(long_target)) <= 48
@@ -1632,7 +1641,9 @@ class TestCheckoutPrecedesProfileBuild:
     def test_checkout_happens_before_build_profile(self, monkeypatch, tmp_path) -> None:
         import kiro_crew.apps.builtins.auto_improvement.profiles as profiles_mod
         from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import RunSupervisor
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            RunSupervisor,
+        )
 
         order: list[str] = []
 
@@ -1662,7 +1673,9 @@ class TestCheckoutPrecedesProfileBuild:
         operate on the wrong revision. A scopeDiffBase makes it worse (mis-scoped fence) but
         the base case is already unsafe."""
         from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import RunSupervisor
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            RunSupervisor,
+        )
 
         monkeypatch.setattr(clone_setup, "checkout_branch", lambda p, b: (False, "no such ref"))
         # UNSCOPED must now refuse too.
@@ -1743,7 +1756,9 @@ class TestActivityFeedIsRedacted:
     """
 
     def test_a_credential_in_agent_text_is_redacted(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import _redact_activity
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            _redact_activity,
+        )
 
         event = {"kind": "tool", "detail": "aws_access_key_id=AKIAIOSFODNN7EXAMPLE"}
         out = _redact_activity(event)
@@ -1752,7 +1767,9 @@ class TestActivityFeedIsRedacted:
     def test_nested_agent_events_are_reached(self) -> None:
         """The agent event is nested under an "agent" key — redacting only the top level
         would miss the field that actually carries the text."""
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import _redact_activity
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            _redact_activity,
+        )
 
         nested = {"agent": {"detail": "aws_access_key_id=AKIAIOSFODNN7EXAMPLE"}}
         assert "AKIAIOSFODNN7EXAMPLE" not in str(_redact_activity(nested))
@@ -1761,14 +1778,18 @@ class TestActivityFeedIsRedacted:
 
     def test_ordinary_text_and_non_strings_survive(self) -> None:
         """Fail-open feed: it must stay readable, and numbers must stay numbers."""
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import _redact_activity
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            _redact_activity,
+        )
 
         event = {"kind": "stage", "cycle": 3, "detail": "running the gate", "ok": True}
         assert _redact_activity(event) == event
 
     def test_appended_activity_is_scanned_end_to_end(self) -> None:
         """Through the real append path, not just the helper."""
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import RunSupervisor
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            RunSupervisor,
+        )
 
         sup = RunSupervisor()
         sup._on_agent_activity({"detail": "aws_access_key_id=AKIAIOSFODNN7EXAMPLE"})
@@ -1872,7 +1893,9 @@ class TestFallbackAuditsEveryToolItUses:
         """Structural: the parsed `tool` event must reach the auditor, not just the UI."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import AgentRunner
+        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import (
+            AgentRunner,
+        )
 
         src = inspect.getsource(AgentRunner)
         assert "_audit_fallback_tool(" in src, "tool_use blocks are still unaudited"
@@ -1893,7 +1916,10 @@ class TestProvisionalCommitMessageCarriesNoModelText:
 
     def test_a_credential_shaped_symbol_survives_into_cand_id(self) -> None:
         """The premise: sanitising to alnum/_/- does NOT remove a key-shaped token."""
-        from kiro_crew.apps.builtins.auto_improvement.spine.proposer import _disambig, _short
+        from kiro_crew.apps.builtins.auto_improvement.spine.proposer import (
+            _disambig,
+            _short,
+        )
         from kiro_crew.security import redact
 
         target = "src/m.py::AKIAIOSFODNN7EXAMPLE"
@@ -2447,7 +2473,9 @@ class TestAQueuedChangeIsNotRecordedAsFiled:
         """
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
+        from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import (
+            CrPipeline,
+        )
 
         src = inspect.getsource(CrPipeline)
         i = src.index('startswith("QUEUED:")')
@@ -2475,7 +2503,9 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
         `os.path.isdir(target)`, and files are masked through a separate list that
         `sandboxed_spawn_argv` does not expose. Passing files is why the first attempt at
         this fix changed nothing."""
-        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as P
+        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import (
+            profile as P,
+        )
 
         targets = P._write_protected_targets()
         for t in targets:
@@ -2483,7 +2513,9 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
 
     def test_it_covers_every_write_protected_path(self) -> None:
         """Derived from the platform list, so a newly-protected path cannot drift uncovered."""
-        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as P
+        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import (
+            profile as P,
+        )
         from kiro_crew.security import write_protected_home_paths
 
         masked = {Path(t) for t in P._write_protected_targets()}
@@ -2497,7 +2529,9 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
         """Structural: resolving the targets is useless unless `_run` actually passes them."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as P
+        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import (
+            profile as P,
+        )
 
         src = inspect.getsource(P._run)
         assert (
@@ -2507,7 +2541,9 @@ class TestAgentTestsCannotWriteKiroCrewConfig:
     def test_a_broken_helper_still_runs_the_suite(self, monkeypatch) -> None:
         """Fail-soft: masking is defense-in-depth. Refusing to run any test would be worse."""
         import kiro_crew.security as security_mod
-        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as P
+        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import (
+            profile as P,
+        )
 
         def _boom():
             raise RuntimeError("unavailable")
@@ -2578,7 +2614,7 @@ class TestTheFallbackNeverBypassesAConfiguredProvider:
             # This class is about the SELECTION (provider vs subprocess vs offline), not the
             # sandbox, so the credential-confinement precondition is satisfied here; the gate
             # has its own class (TestTheLoopRunnerRefusesWithoutCredentialConfinement).
-            patch.object(R, "_credentials_are_unconfined", lambda: ""),
+            patch.object(R, "_credentials_are_unconfined", lambda **_kwargs: ""),
         ):
             return R.RunSupervisor()._build_runner(stop_check=lambda: False)
 
@@ -2750,7 +2786,9 @@ class TestTheWatcherRefusesToRunWithoutEgressAcknowledgement:
         ) is sentinel
 
     def test_the_config_key_is_writable(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend.routes import _CONFIG_WRITABLE
+        from kiro_crew.apps.builtins.auto_improvement.backend.routes import (
+            _CONFIG_WRITABLE,
+        )
 
         assert "watcherAcceptEgressRisk" in _CONFIG_WRITABLE, (
             "the operator cannot set the egress acknowledgement, so the watcher can never run"
@@ -2830,16 +2868,20 @@ class TestTheLoopRunnerRefusesWithoutCredentialConfinement:
         from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
 
         src = inspect.getsource(R.RunSupervisor._build_runner)
-        assert "_credentials_are_unconfined()" in src, (
+        assert "_credentials_are_unconfined(sandbox_mode=" in src, (
             "the loop's runner does not check credential confinement, so a provider-driven "
             "agent can run with the operator's credential stores visible"
         )
-        assert src.index("_credentials_are_unconfined()") < src.index("SessionAgentRunner("), (
+        assert src.index("_credentials_are_unconfined(sandbox_mode=") < src.index(
+            "SessionAgentRunner("
+        ), (
             "the confinement check runs AFTER the runner is constructed — it must refuse first"
         )
 
     def test_the_config_key_is_writable(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend.routes import _CONFIG_WRITABLE
+        from kiro_crew.apps.builtins.auto_improvement.backend.routes import (
+            _CONFIG_WRITABLE,
+        )
 
         assert "acceptUnsandboxedAgentRisk" in _CONFIG_WRITABLE, (
             "the operator cannot acknowledge the risk, so a default install can never run "
@@ -2862,7 +2904,9 @@ class TestAgentRegistrationFailsClosed:
     """
 
     def test_runner_refuses_the_session_runner_when_registration_fails(self, monkeypatch) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import RunSupervisor
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            RunSupervisor,
+        )
         from kiro_crew.apps.builtins.auto_improvement.spine import agent_runner as ar
 
         monkeypatch.setattr(ar.SessionAgentRunner, "available", staticmethod(lambda: True))
@@ -2879,7 +2923,9 @@ class TestAgentRegistrationFailsClosed:
     ) -> None:
         """The happy path must be untouched — this is a guard, not a new refusal."""
         from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
-        from kiro_crew.apps.builtins.auto_improvement.backend.runner import RunSupervisor
+        from kiro_crew.apps.builtins.auto_improvement.backend.runner import (
+            RunSupervisor,
+        )
         from kiro_crew.apps.builtins.auto_improvement.spine import agent_runner as ar
 
         monkeypatch.setattr(ar.SessionAgentRunner, "available", staticmethod(lambda: True))
@@ -2887,7 +2933,7 @@ class TestAgentRegistrationFailsClosed:
         # This test is about REGISTRATION, not the sandbox: satisfy the credential-confinement
         # precondition so it exercises the path it names (see
         # TestTheLoopRunnerRefusesWithoutCredentialConfinement for the gate itself).
-        monkeypatch.setattr(R, "_credentials_are_unconfined", lambda: "")
+        monkeypatch.setattr(R, "_credentials_are_unconfined", lambda **_kwargs: "")
         got = RunSupervisor()._build_runner(stop_check=lambda: False)
         assert isinstance(got, ar.SessionAgentRunner)
 
@@ -3318,7 +3364,9 @@ class TestFallbackAgentInheritsNoCredentials:
         """Structural: the sandboxed spawn must run the strip, not just define it."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import AgentRunner
+        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import (
+            AgentRunner,
+        )
 
         src = inspect.getsource(AgentRunner._spawn_sandboxed_agent)
         assert "strip_credential_env(scrubbed_env)" in src
@@ -3485,7 +3533,9 @@ class TestToolRequestsAreGated:
         ), "the governance gate must run before the app-local denylist"
 
     def test_allowlist_is_enforced_deny_by_default_when_supplied(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import _tool_permitted
+        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import (
+            _tool_permitted,
+        )
 
         assert _tool_permitted("bash", ["Read", "Edit"]) is False
         assert _tool_permitted("execute_bash", ["Read", "Edit"]) is False
@@ -3501,7 +3551,9 @@ class TestToolRequestsAreGated:
         Caught by auditing every `allowed_tools=` caller after wiring the enforcement —
         the first version of the helper did read empty as unrestricted.
         """
-        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import _tool_permitted
+        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import (
+            _tool_permitted,
+        )
 
         assert _tool_permitted("anything", None) is True
         assert _tool_permitted("anything", []) is False
@@ -3519,7 +3571,9 @@ class TestToolRequestsAreGated:
 
     def test_an_unnamed_request_is_refused(self) -> None:
         """An unidentifiable tool is what a crafted request looks like."""
-        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import _tool_permitted
+        from kiro_crew.apps.builtins.auto_improvement.spine.agent_runner import (
+            _tool_permitted,
+        )
 
         assert _tool_permitted("", ["Read"]) is False
 
@@ -4437,7 +4491,9 @@ class TestOneClickCommitWorksInAPushDisabledClone:
         baseline. Measured before the fix: local `work` sat 1 commit ahead of a remote it
         was never pushed to. Raised by the GPT review of this branch.
         """
-        from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            commit as commit_mod,
+        )
 
         upstream, clone, branch = self._upstream_and_clone(tmp_path)
         store.write_json_atomic(
@@ -4897,7 +4953,9 @@ class TestDirectCommitQueueCopyIsReadable:
     """
 
     def test_the_queue_copy_lands_where_the_display_reader_looks(self, tmp_path) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
+        from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import (
+            CrPipeline,
+        )
 
         class _Recipe:
             pr_queue_dir = tmp_path / "queue"
@@ -4959,7 +5017,9 @@ class TestCommitMessageRedactionFailsClosed:
     def test_one_click_commit_message_falls_back_on_a_broken_redactor(
         self, tmp_path, monkeypatch
     ) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            commit as commit_mod,
+        )
 
         def _boom(_t):
             raise RuntimeError("scanner down")
@@ -5005,7 +5065,9 @@ class TestAnUnprovenRulerHaltsThePerfTrack:
     def test_the_backend_default_is_strict(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         src = inspect.getsource(runner_mod.RunSupervisor._build_driver_locked)
         assert 'canary_advisory=_as_bool(config.get("canaryAdvisory"), False)' in src, (
@@ -5063,8 +5125,12 @@ class TestRunStartupSharesTheCloneLock:
         """Behavioral: the checkout cannot proceed while the lock is held elsewhere."""
         import threading
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            commit as commit_mod,
+        )
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         checked_out = threading.Event()
 
@@ -5114,11 +5180,12 @@ class TestRunStartupSharesTheCloneLock:
     def test_the_lock_is_reentrant_so_nesting_cannot_deadlock(self) -> None:
         """`_build_driver` is also reached from `calibrate()`, which may already hold the
         lock; an ordinary Lock would self-deadlock the first time that happened."""
-        from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            commit as commit_mod,
+        )
 
-        with commit_mod.clone_lock():
-            with commit_mod.clone_lock():
-                assert True
+        with commit_mod.clone_lock(), commit_mod.clone_lock():
+            assert True
 
 
 class TestTheProfileImportStaysLazy:
@@ -5145,7 +5212,9 @@ class TestTheProfileImportStaysLazy:
     def test_build_profile_is_imported_inside_the_function(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         src = inspect.getsource(runner_mod.RunSupervisor._build_driver)
         assert "from ..profiles import build_profile" in src, (
@@ -5208,7 +5277,9 @@ class TestRetargetIsAtomicWithRunStartup:
     def test_setup_holds_the_clone_lock_across_clone_and_persist(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_setup_clone)
         assert "clone_lock()" in src, (
@@ -5226,7 +5297,9 @@ class TestRetargetIsAtomicWithRunStartup:
         """The other half of the pair. A lock held by only one side serializes nothing."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_run_start)
         assert "clone_lock()" in src, (
@@ -5238,8 +5311,12 @@ class TestRetargetIsAtomicWithRunStartup:
         """Behavioral, not structural: with the lock held, a would-be run startup must wait."""
         import threading
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            commit as commit_mod,
+        )
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         reached = threading.Event()
 
@@ -5282,7 +5359,9 @@ class TestCalibrationHoldsTheCloneLock:
     def test_the_calibrate_loop_body_is_inside_the_lock(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         src = inspect.getsource(runner_mod.RunSupervisor._calibrate_loop)
         assert "clone_lock()" in src, (
@@ -5296,7 +5375,9 @@ class TestCalibrationHoldsTheCloneLock:
         baseline sampling must sit inside it."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         src = inspect.getsource(runner_mod.RunSupervisor._calibrate_loop)
         # Anchor on the CALLS, not on any substring: prose in the surrounding comments names
@@ -5313,8 +5394,12 @@ class TestCalibrationHoldsTheCloneLock:
         """Behavioral: with the lock held, calibration must not reach the clone."""
         import threading
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            commit as commit_mod,
+        )
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         reached = threading.Event()
 
@@ -5367,7 +5452,9 @@ class TestASuccessfulManualDraftLeavesNoCommitBehind:
     def test_the_success_path_rolls_back_like_every_failure_path(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_draft_pr)
         # Anchor on the SUCCESS arm specifically. A bare count of `_rollback()` calls would
@@ -5392,7 +5479,9 @@ class TestASuccessfulManualDraftLeavesNoCommitBehind:
         is the only durable record that the PR exists, so it is written first."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_draft_pr)
         assert src.index("ledger_admin_record(fp, ref)") < src.index(
@@ -5413,7 +5502,9 @@ class TestTerminalErrorsAreRedacted:
     """
 
     def test_a_credential_in_a_terminal_error_does_not_reach_the_response(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         secret = "AKIAIOSFODNN7EXAMPLE"
         sup = runner_mod.RunSupervisor()
@@ -5427,7 +5518,9 @@ class TestTerminalErrorsAreRedacted:
     def test_the_activity_copy_is_redacted_too(self) -> None:
         """The error is appended to the feed as well; redacting one copy and not the other
         leaves the same string on the same response."""
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         secret = "AKIAIOSFODNN7EXAMPLE"
         sup = runner_mod.RunSupervisor()
@@ -5439,7 +5532,9 @@ class TestTerminalErrorsAreRedacted:
         canary's reported non-clear). A fix applied to one is how the next one drifts."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         # Scan every method EXCEPT `_fail` itself, which is the redaction site: its own
         # assignment is of an already-scanned value, so including it would make the guard
@@ -5803,13 +5898,21 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
         hook/fsmonitor overrides, so a new call site cannot quietly omit them."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup as clone_mod
-        from kiro_crew.apps.builtins.auto_improvement.backend import commit as commit_mod
-        from kiro_crew.apps.builtins.auto_improvement.backend import pr_watchers as pw_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            clone_setup as clone_mod,
+        )
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            commit as commit_mod,
+        )
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            pr_watchers as pw_mod,
+        )
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import (
             pr_recipe as recipe_mod,
         )
-        from kiro_crew.apps.builtins.auto_improvement.spine import agent_discovery as disc_mod
+        from kiro_crew.apps.builtins.auto_improvement.spine import (
+            agent_discovery as disc_mod,
+        )
         from kiro_crew.apps.builtins.auto_improvement.spine import driver as drv
         from kiro_crew.apps.builtins.auto_improvement.spine import gate as gate_mod
         from kiro_crew.apps.builtins.auto_improvement.spine import proposer as prop_mod
@@ -5988,7 +6091,9 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
         RED against the inline pre-fix `_run` (no pin written). Raised by the Opus 5 review."""
         import subprocess as sp
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup as clone_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            clone_setup as clone_mod,
+        )
 
         monkeypatch.setattr(clone_mod, "_push_disabled", lambda _clone: True)
         clone = tmp_path / "clone"
@@ -6734,7 +6839,9 @@ class TestPublicationSurvivesALedgerFailure:
     def test_the_manual_draft_still_resets_when_the_ledger_raises(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_draft_pr)
         marker = "ledger_admin_record(fp, ref)"
@@ -6804,7 +6911,9 @@ class TestWatcherSnapshotsAreRedacted:
     def test_both_watcher_responses_are_redacted(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         for handler in (routes_mod._handle_watchers, routes_mod._handle_watcher_start):
             src = inspect.getsource(handler)
@@ -6818,7 +6927,9 @@ class TestWatcherSnapshotsAreRedacted:
         import json
 
         from kiro_crew.apps.builtins.auto_improvement.backend import pr_watchers as pw
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         secret = "AKIAIOSFODNN7EXAMPLE"
         st = pw.WatcherState(fp="fp1", pr="https://github.com/o/r/pull/1")
@@ -6945,7 +7056,9 @@ class TestARunCannotDoubleStart:
         t.join(timeout=5)
 
     def test_a_second_start_is_refused_before_the_thread_runs(self, monkeypatch) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         sup = runner_mod.RunSupervisor()
         monkeypatch.setattr(sup, "_build_driver", lambda _c: object())
@@ -6965,7 +7078,9 @@ class TestARunCannotDoubleStart:
             )
 
     def test_calibrate_is_refused_while_a_start_is_in_flight(self, monkeypatch) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         sup = runner_mod.RunSupervisor()
         monkeypatch.setattr(sup, "_build_driver", lambda _c: object())
@@ -7012,7 +7127,9 @@ class TestSetupCannotRetargetARunThatStartedMeanwhile:
     def test_the_status_is_rechecked_inside_the_lock(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_setup_clone)
         locked = src[src.index("clone_lock()") :]
@@ -7024,8 +7141,12 @@ class TestSetupCannotRetargetARunThatStartedMeanwhile:
     def test_a_run_that_starts_during_the_wait_blocks_the_retarget(self, monkeypatch) -> None:
         """Behavioral: with the supervisor reporting an active run, the locked section must
         refuse rather than clone."""
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
-        from kiro_crew.apps.builtins.auto_improvement.backend import runner as runner_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            runner as runner_mod,
+        )
 
         class _Running:
             def status(self) -> dict:
@@ -7037,7 +7158,9 @@ class TestSetupCannotRetargetARunThatStartedMeanwhile:
         )
 
     def test_an_idle_supervisor_permits_the_retarget(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         assert routes_mod._run_is_active() is False, "an idle supervisor was reported active"
 
@@ -7060,7 +7183,9 @@ class TestConfigWritesCannotRaceRunStartup:
     def test_the_config_write_takes_the_clone_lock(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_put_config)
         assert "clone_lock()" in src, (
@@ -7071,7 +7196,9 @@ class TestConfigWritesCannotRaceRunStartup:
     def test_the_status_is_rechecked_inside_the_lock(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_put_config)
         locked = src[src.index("clone_lock()") :]
@@ -7084,7 +7211,9 @@ class TestConfigWritesCannotRaceRunStartup:
         """Structural: a fifth hand-rolled copy is how the guarded set drifts."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         for handler in (routes_mod._handle_put_config, routes_mod._handle_setup_clone):
             src = inspect.getsource(handler)
@@ -7109,7 +7238,9 @@ class TestDraftAndCommitRecheckRunStatusInsideTheLock:
     def test_the_draft_route_rechecks_inside_the_lock(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_draft_pr)
         locked = src[src.index("clone_lock()") :]
@@ -7121,7 +7252,9 @@ class TestDraftAndCommitRecheckRunStatusInsideTheLock:
     def test_the_commit_route_rechecks_inside_the_lock(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_commit)
         assert "clone_lock()" in src, (
@@ -7137,7 +7270,9 @@ class TestDraftAndCommitRecheckRunStatusInsideTheLock:
         handlers that must recheck in-lock, so a sixth copy cannot quietly skip it."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         for handler in (
             routes_mod._handle_put_config,
@@ -7432,7 +7567,10 @@ class TestOnlyTheBugTrackMayAddTests:
         )
 
     def test_neither_track_may_MODIFY_an_existing_test(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.spine.contracts import TRACK_BUG, TRACK_PERF
+        from kiro_crew.apps.builtins.auto_improvement.spine.contracts import (
+            TRACK_BUG,
+            TRACK_PERF,
+        )
 
         for track in (TRACK_BUG, TRACK_PERF):
             fence = self._fence(track)
@@ -7445,7 +7583,9 @@ class TestOnlyTheBugTrackMayAddTests:
         """Structural: the fence cannot enforce a track it was never told."""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as gp
+        from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import (
+            profile as gp,
+        )
 
         src = inspect.getsource(gp.GitHubRepoProfile.__init__)
         assert "RepoEditAllowlist(" in src, "the construction site moved"
@@ -7478,7 +7618,9 @@ class TestCommitErrorsReachTheBrowserRedacted:
         import inspect
         import re
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod)
         # Any `"error": str(<something>.get("error")…)` that is not wrapped is a leak. The
@@ -7500,7 +7642,9 @@ class TestCommitErrorsReachTheBrowserRedacted:
         )
 
     def test_a_credential_in_git_stderr_is_scrubbed(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         secret = "AKIAIOSFODNN7EXAMPLE"
         stderr = f"fatal: could not read Username for 'https://x:{secret}@github.com'"
@@ -7511,7 +7655,9 @@ class TestCommitErrorsReachTheBrowserRedacted:
     def test_the_redactor_keeps_the_actionable_part(self) -> None:
         """Scrubbing must not turn every refusal into an opaque blob — D-97 exists so the
         operator learns why the commit failed."""
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         msg = "could not check out main: branch is protected by push policy"
         out = routes_mod._redact_for_display(msg)
@@ -7656,7 +7802,9 @@ class TestWatchersDoNotAutoStartWithoutOptIn:
     """
 
     def test_the_flag_is_writable_and_defaults_off(self) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend.routes import _CONFIG_WRITABLE
+        from kiro_crew.apps.builtins.auto_improvement.backend.routes import (
+            _CONFIG_WRITABLE,
+        )
 
         assert "watcherAutoStart" in _CONFIG_WRITABLE, (
             "the opt-in cannot be turned on through the config API"
@@ -7665,7 +7813,9 @@ class TestWatchersDoNotAutoStartWithoutOptIn:
     def test_a_get_does_not_reconcile_unless_opted_in(self) -> None:
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_watchers)
         assert "watcherAutoStart" in src, (
@@ -7685,7 +7835,9 @@ class TestWatchersDoNotAutoStartWithoutOptIn:
         false.)"""
         import inspect
 
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes as routes_mod
+        from kiro_crew.apps.builtins.auto_improvement.backend import (
+            routes as routes_mod,
+        )
 
         src = inspect.getsource(routes_mod._handle_watchers)
         assert src.count("sweep_orphan_clones") >= 2, (
@@ -7764,7 +7916,9 @@ class TestUnresolvedThreadsActuallyBlockPublish:
     def test_unresolved_counting_matches_the_provider_shape(self) -> None:
         """`_count_unresolved` fed `unresolvedThreads`; it must read the keys the provider
         really writes (`resolved`/`resolvable`), not `isResolved`."""
-        from kiro_crew.apps.builtins.auto_improvement.backend.pr_checks import _count_unresolved
+        from kiro_crew.apps.builtins.auto_improvement.backend.pr_checks import (
+            _count_unresolved,
+        )
 
         pr = {
             "comments": [

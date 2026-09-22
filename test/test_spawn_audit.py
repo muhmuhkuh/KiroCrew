@@ -335,6 +335,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "platform/wheel_engine.py::_verify_signature",
         "platform/wheel_engine.py::build_shadow_venv",
         "platform/wheel_engine.py::verify_shadow_venv",
+        # Pi's RPC bridge runs inside the sandboxed pi-acp subprocess. Its child
+        # is the operator-resolved Pi executable with adapter-generated fixed
+        # RPC flags; the inherited sandbox and scrubbed parent environment cover
+        # the untrusted agent process, while the bridge only forwards JSONL.
+        "pi_support.py::_run_pi_rpc_proxy",
+        # The no-sidecar fallback launches the same operator-resolved Pi command
+        # directly from the already sandboxed adapter process. Its argv consists
+        # of KiroCrew's fixed extensions/config paths plus pi-acp's fixed flags.
+        "pi_support.py::main",
         # The userns probe child: ONE fixed argv, `sys.executable -I -S -c <shim>`,
         # no shell, no cwd, stdin/stdout are the two handshake pipes. Nothing is
         # agent-influenced -- the shim is a module-level string constant and takes
@@ -499,10 +508,20 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Was keyed to `commit_finding` until the checkout+apply block was extracted here so
         # the draft-PR route could reuse it (the detector keys by the ENCLOSING function).
         "apps/builtins/auto_improvement/backend/commit.py::materialize_queued_diff",
-        "apps/builtins/auto_improvement/backend/deps.py::_gh_authenticated",
+        # Fixed provider-auth probes; the binary is selected from the known
+        # provider, and the host is an allowlisted operator setting.
+        "apps/builtins/auto_improvement/backend/deps.py::_cli_authenticated",
         "apps/builtins/auto_improvement/backend/deps.py::install_deps",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_gh",
+        # The MR URL is validated before this fixed `glab mr update --ready`
+        # command; it does not accept agent-selected argv fragments.
+        "apps/builtins/auto_improvement/backend/pr_watchers.py::_gitlab_ready",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_git",
+        # GitLab analog of ``_gh`` above: fixed ``glab mr update <iid> --ready`` argv
+        # (shell=False), iid+project from an already-validated MR URL, host pinned via
+        # ``GITLAB_HOST`` in the child env (token withheld for self-managed) — same
+        # class as ``_gh``, which is allowlisted for the same reason.
+        "apps/builtins/auto_improvement/backend/pr_watchers.py::_gitlab_ready",
         "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_gh_prefers_ssh",
         "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_git",
         # Fixed `git -C <package root> rev-parse HEAD` / `git diff --quiet HEAD -- <root>`
@@ -563,6 +582,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # code — same basis as the ops-mission-control ledger-sync test entries.
         "apps/builtins/auto_improvement/tests/test_agent_discovery_focus.py::_git",
         "apps/builtins/auto_improvement/tests/test_github_profile.py::test_push_disabled_reads_the_sentinel",
+        # Test-only fixed git fixture commands against a tmp repository.
         "apps/builtins/auto_improvement/tests/test_perf_track_propose.py::_git",
         "apps/builtins/auto_improvement/tests/test_pr_watchers.py::_git",
         # Same basis: a fixed `git init/config/add/commit` argv against a tmp_path, building
@@ -601,6 +621,16 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "::test_a_credential_in_the_committer_identity_refuses_to_publish",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr ``run`` on
         # base ``asyncio``) driving the async ``_approve`` coroutine so a REAL SEL
+        # write can be read back off disk. No child process is created.
+        # NOT subprocess spawns: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``) in these synchronous persistence tests. They
+        # drive the in-process cron double and create no child process.
+        "apps/builtins/goal_owner/tests/test_persistence.py::test_reconcile_is_idempotent_and_binds_stable_owner_session",
+        "apps/builtins/goal_owner/tests/test_persistence.py::test_reconcile_adopts_job_after_crash_between_cron_and_store_write",
+        "apps/builtins/goal_owner/tests/test_persistence.py::test_reconcile_removes_wake_when_goal_is_paused",
+        "apps/builtins/goal_owner/tests/test_persistence.py::test_uncertain_store_read_does_not_prune_existing_owner_job",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
+        # ``run`` on base ``asyncio``) driving the async ``_approve`` coroutine so a REAL SEL
         # write can be read back off disk. No child process is created.
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py"
         "::test_a_real_sel_write_produces_a_readable_event",
@@ -1954,7 +1984,7 @@ def _collect_spawn_functions() -> dict[str, str]:
             else:
                 continue
             enc = "<module>"
-            enc_node: ast.AST | None = None
+            enc_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None
             best = -1
             for f in funcs:
                 if f.lineno <= node.lineno <= (f.end_lineno or f.lineno) and f.lineno > best:
@@ -2185,11 +2215,12 @@ def test_bundled_skill_assets_are_not_imported():
             continue
         rel = path.relative_to(_SRC_ROOT).as_posix()
         for node in ast.walk(tree):
-            names: list[str] = []
             if isinstance(node, ast.Import):
                 names = [a.name for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
                 names = [node.module]
+            else:
+                continue
             for name in names:
                 if name in asset_modules or name in asset_packages:
                     offenders.append(f"{rel}:{node.lineno} imports {name}")
@@ -2338,7 +2369,7 @@ def test_gateway_spawns_all_own_session():
     missing: list[str] = []
     spawns = 0
     for node in ast.walk(_gateway_tree()):
-        if not _is_spawn_call(node):
+        if not isinstance(node, ast.Call) or not _is_spawn_call(node):
             continue
         spawns += 1
         if not any(kw.arg == "start_new_session" for kw in node.keywords):
@@ -2407,21 +2438,21 @@ def test_gateway_proc_waits_all_kill_on_timeout_and_cancel():
             timeout_ok = cancel_ok = False
             cursor: ast.AST | None = node
             while cursor is not None and cursor is not func:
-                parent = parents.get(cursor)
-                if isinstance(parent, ast.Try) and cursor in ast.walk(parent):
+                parent_node = parents.get(cursor)
+                if isinstance(parent_node, ast.Try) and cursor in ast.walk(parent_node):
                     # Only count Trys where the wait sits in the BODY (an
                     # already-handling arm re-waiting is the reap, not a site).
                     in_body = any(
-                        cursor is stmt or cursor in ast.walk(stmt) for stmt in parent.body
+                        cursor is stmt or cursor in ast.walk(stmt) for stmt in parent_node.body
                     )
                     if in_body:
-                        for handler in parent.handlers:
+                        for handler in parent_node.handlers:
                             if _handler_kills(handler, proc_name):
                                 if _handler_catches(handler, "TimeoutError"):
                                     timeout_ok = True
                                 if _handler_catches(handler, "CancelledError"):
                                     cancel_ok = True
-                cursor = parent
+                cursor = parent_node
             if not (timeout_ok and cancel_ok):
                 lacking = " and ".join(
                     what
