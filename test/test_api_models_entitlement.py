@@ -328,6 +328,7 @@ def _kiro_request(tmp_path: Path, *providers: MagicMock) -> MagicMock:
     state.sessions.active_providers = MagicMock(return_value=list(providers))
     request = MagicMock()
     request.app = {"kiro_prerequisite_service": service, "state": state}
+    request.query = {}
     return request
 
 

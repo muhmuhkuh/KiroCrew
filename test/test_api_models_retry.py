@@ -58,6 +58,7 @@ def _kiro_request(tmp_path: Path) -> MagicMock:
     )
     request = MagicMock()
     request.app = {"kiro_prerequisite_service": service}
+    request.query = {}
     return request
 
 

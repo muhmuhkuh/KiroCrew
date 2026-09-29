@@ -11,6 +11,11 @@
     "unknown": "Unknown",
     "empty": "Try a different search, category, or source."
   },
+  "chatBackend": {
+    "label": "Backend",
+    "inherit": "Use global default",
+    "managed": "Backend managed by this chat’s owner"
+  },
   "crewCapabilityEditing": {
     "sourceFailed": "Could not validate the saved configuration. Reload from server to retry.",
     "keep": "Hidden value kept. Type to replace.",
@@ -479,7 +484,8 @@
           "sign_in_with_the_gh_cli_to_use_this_filter": "Sign in with the gh CLI to use this filter"
         },
         "filtersSection": {
-          "no_repo_members_found_among_these_issues": "No repo members found among these issues"
+          "no_repo_members_found_among_these_issues": "No repo members found among these issues",
+          "status": "Status"
         },
         "investigateButton": {
           "could_not_check_for_an_existing_investigation_re": "Could not check for an existing investigation — retrying on refresh",
@@ -6607,6 +6613,9 @@
       "show_controls": "Show controls"
     },
     "developer": {
+      "agentBackendTab": {
+        "pi": "Pi"
+      },
       "featurePreviewsTab": {
         "chat_on_a_crew": "Chat on a crew",
         "chat_on_a_crew_desc": "Adds “New chat on crew” to the create menu, which starts a session on a remote instance — another machine you have connected under Settings > Remote Instances. Unfinished: the session opens in that instance’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that instance’s pane.",

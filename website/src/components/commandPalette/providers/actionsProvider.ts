@@ -164,7 +164,7 @@ export function createActionsProvider(
     // An accessor moves the lookup to the consumer's render, where the tab strip
     // reads it. Satisfies `ResourceProvider.label: string`.
     get label() {
-      return i18nT(PROVIDER_LABEL_KEY);
+      return i18nT(PROVIDER_LABEL_KEY)
     },
     icon: inlineIcon(Command),
     search(query: string): Result[] {

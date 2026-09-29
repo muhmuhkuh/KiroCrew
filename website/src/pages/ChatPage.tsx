@@ -268,6 +268,7 @@ import { historyDeleteRefusalMessage } from '../utils/historyDeleteRefusal'
 import ProjectPicker from '../components/ProjectPicker'
 import InboundLinkChip from '../components/InboundLinkChip'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
+import ChatBackendSelect from '../components/ChatBackendSelect'
 
 import ChatInput from '../components/ChatInput'
 import SessionControlHost from '../components/SessionControlHost'
@@ -918,7 +919,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   }, [dispatch])
   const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(effectiveAgents)
   const filteredAgents = filteredAgentsByName
-  const localModels = useAvailableModels()
+  const chatBackend = slots.find(s => s.key === activeSlot)?.acp_backend ?? undefined
+  const localModels = useAvailableModels({ backend: chatBackend })
   // A peer-bound session's shelf must offer the PEER's rosters. Both hooks above
   // read THIS machine same-origin, so a remote session left on them would list
   // crews and models that do not exist over there — accepted by the picker, then
@@ -3752,7 +3754,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const title = currentSlot?.title && currentSlot.title !== currentSlot.key ? currentSlot.title : activeSlot || ''
   const displayMode = approvalMode === 'yolo' ? 'yolo' : currentSlot?.trust ? 'trust' : currentSlot?.trust_reads ? 'trust_reads' : 'normal'
   // Resolve model for existing slots that don't have one stored
-  const _slotAgentName = (currentSlot && !currentSlot.model) ? (currentSlot.agent || defaultAgent || 'default') : ''
+  const _slotAgentName = (currentSlot && currentSlot.acp_backend == null && !currentSlot.model) ? (currentSlot.agent || defaultAgent || 'default') : ''
   const { data: _slotResolvedModel } = useQuery({
     queryKey: ['resolved-model', _slotAgentName, provider.id],
     queryFn: () => provider.resolveModel(_slotAgentName),
@@ -3806,7 +3808,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // verdict — a cached list served while /api/models fails is stale, not
   // authoritative — and is subscribed to rather than read, because it can flip
   // without the list changing.
-  const _modelsDegraded = useModelsDegraded(provider.id)
+  const _modelsDegraded = useModelsDegraded(
+    chatBackend === undefined ? provider.id : `${provider.id}:${chatBackend}`,
+  )
   const shownModel = displayModel(
     currentSlot?.model || resolvedModel || '',
     availableModels,
@@ -7507,6 +7511,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 onChange={setInput}
                 voice={composerVoiceOptions}
               >
+              <ChatBackendSelect slot={currentSlot} />
               <ChatInput
               aboveComposer={
                 <>

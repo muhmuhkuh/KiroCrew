@@ -2312,7 +2312,18 @@ async def api_models(request: web.Request) -> web.Response:
     advertised, because neither accepts an id from that catalog.
     """
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    backend = getattr(cfg.agent, "acp_backend", "")
+    from kiro_crew.agent_sdk.backends import (
+        ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+        ACP_BACKENDS_KIRO_SLASH_COMMANDS,
+        model_registry_namespace,
+        selectable_backends,
+    )
+
+    backend = request.query.get("backend", getattr(cfg.agent, "acp_backend", ""))
+    if backend not in selectable_backends():
+        return web.json_response(
+            {"error": "invalid backend", "code": "invalid_backend"}, status=400
+        )
     if backend == ACP_BACKEND_PI:
         advertised = _advertised_pi_models(request)
         if advertised:
@@ -2330,6 +2341,43 @@ async def api_models(request: web.Request) -> web.Response:
         return web.json_response(
             _codex_models(request, configured_default=_scoped_default(cfg, backend))
         )
+    if backend not in ACP_BACKENDS_KIRO_SLASH_COMMANDS:
+        if backend not in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION:
+            return web.json_response([])
+        namespace = model_registry_namespace(backend)
+        advertised = _advertised_cc_models(request, namespace)
+        if not advertised:
+            advertised = [
+                {"model_name": model, "display_name": model, "description": ""}
+                for model in model_registry.advertised_models(namespace)
+            ]
+        rows: list[dict[str, Any]] = [
+            {"model_name": "auto", "display_name": "Auto", "description": "Backend default"}
+        ]
+        seen = {"auto"}
+        for entry in advertised:
+            name = str(entry.get("model_name", "") or "").strip()
+            key = _normalize_model_key(name)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append(entry)
+        default = _scoped_default(cfg, backend)
+        if default and not advertised and _normalize_model_key(default) not in seen:
+            rows.insert(
+                1,
+                {
+                    "model_name": default,
+                    "display_name": default,
+                    "description": "Configured default",
+                },
+            )
+        for row in rows:
+            row["context_window"] = (
+                model_registry.model_window(row["model_name"])
+                or model_registry.REFERENCE_WINDOW_TOKENS
+            )
+        return web.json_response(rows)
     # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
     # an interactive browser login for ANY subcommand run unauthenticated
     # (--no-interactive does not suppress it, and there is no opt-out env var),

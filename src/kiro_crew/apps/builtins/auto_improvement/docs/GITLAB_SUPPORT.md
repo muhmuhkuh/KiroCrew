@@ -30,7 +30,7 @@ reviewable change. GitHub is the only code host today.
 | 3 | `profiles/__init__.py` | `PROFILE_IDS = ("github-repo",)`; `build_profile` hard-wires `github_repo` | Register `gitlab-repo`; dispatch on provider |
 | 4 | `profiles/github_repo/profile.py` | `GitHubRepoProfile` hard-codes `GitHubPRRecipe` (L1556) | Recipe injected by dispatch; class itself is host-agnostic |
 | 5 | `backend/routes.py` | imports `GitHubPRRecipe` (L30); reads `githubUser` (L845); constructs recipe in the draft-publish path; `POST /setup-clone` returns GitHub-shaped `_ok()` dict | Recipe factory by provider; `provider`/`host` persisted at setup; `gitlabUser` |
-| 6 | Frontend | `AutoImprovementPage.tsx:126` hard-codes `https://github.com/<repo>/commit/<sha>`; `SetupPanel.tsx:194` GitHub placeholder; no profile/provider selector; i18n copy ("GitHub repository to improve", manifest highlights) | Provider/host-aware commit URL; neutral placeholder + provider badge; i18n |
+| 6 | Frontend | `AutoImprovementPage` delegates commit links to `lib/links.ts::commitUrlOf`; `SetupPanel` keeps a GitHub-only placeholder; no profile/provider selector; i18n copy ("GitHub repository to improve", manifest highlights) | Provider/host-aware commit URL; neutral placeholder + provider badge; i18n |
 | 7 | Manifest/docs | `app.json` tag `"github"`, `dependencies.commands: ["git","gh"]`, description; README/MANUAL GitHub-only | Add `glab`, generalize copy |
 | 8 | Tests | `test_pr_recipe.py` (gh flags, github URL extraction — **asserts non-GitHub URLs are rejected**), `test_github_profile.py`, `test_dogfood_learnings.py` host/slug checks, `test_pr_watchers.py` GitHub-shaped status dicts | GitLab-variant tests (below) |
 

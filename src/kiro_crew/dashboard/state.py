@@ -2139,6 +2139,8 @@ class _ChatSlot:
         "agent",
         "agent_kind",
         "model",
+        "acp_backend",
+        "model_backend",
         "_model_withheld",
         "_model_withheld_for",
         "served_model",
@@ -2370,6 +2372,9 @@ class _ChatSlot:
         # notice rather than a per-turn repeat.
         self._welcomed_agent: str = ""
         self.model = model
+        # None inherits the global backend; "" explicitly selects Kiro.
+        self.acp_backend: str | None = None
+        self.model_backend: str | None = None
         # Spawn-time withhold verdict for `model`, and the model id it was
         # computed for. Read through the `model_withheld` property, never these
         # two directly: the pairing is what makes the verdict self-invalidating

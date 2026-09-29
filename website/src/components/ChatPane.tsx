@@ -9,6 +9,7 @@ import ChatMessageList from '../app-sdk/ChatMessageList'
 import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
+import ChatBackendSelect from './ChatBackendSelect'
 import ChatInput, { type ComposerBusyMode } from './ChatInput'
 import ErrorNotice from './ErrorNotice'
 import { Btn } from './ui'
@@ -471,7 +472,8 @@ export default function ChatPane({
   // The pop-up lists the full catalog (a same-name member and template are
   // two rows); every other reader of the roster keeps the name-folded list.
   const agentDD = useFilteredDropdown(agentChoices)
-  const localModels = useAvailableModels()
+  const chatBackend = paneSlot?.acp_backend ?? undefined
+  const localModels = useAvailableModels({ backend: chatBackend })
   const effectiveModels = useMemo<ModelInfo[]>(() => {
     if (!paneRemoteCrew.isRemote) return localModels
     return (paneRemoteCrew.capabilities?.models ?? []).map(model => ({
@@ -502,7 +504,9 @@ export default function ChatPane({
   // a cached list served while /api/models fails is stale and cannot disprove
   // entitlement — and is subscribed to, since it can flip while the served list
   // stays identical.
-  const _modelsDegraded = useModelsDegraded(provider.id)
+  const _modelsDegraded = useModelsDegraded(
+    chatBackend === undefined ? provider.id : `${provider.id}:${chatBackend}`,
+  )
   const shownModel = displayModel(
     paneSlot?.model || '',
     availableModels,
@@ -1570,6 +1574,7 @@ export default function ChatPane({
           onChange={setInput}
           voice={composerVoiceOptions}
         >
+        <ChatBackendSelect slot={paneSlot} />
         <ChatInput
           value={input}
           onChange={setInput}

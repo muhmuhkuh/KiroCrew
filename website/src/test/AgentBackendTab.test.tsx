@@ -697,7 +697,7 @@ describe('AgentBackendTab highlight is not selection', () => {
     expect(row('codex').textContent).toContain('Not checked')
     // A state, not a verb: "Re-check" read as a clickable action beside the Check
     // again button that actually performs one.
-    expect(row('pi').textContent).toContain('Not live')
+    expect(row('Pi').textContent).toContain('Not live')
     expect(row('deepseek').textContent).toContain('Not offered')
 
     // Hidden from assistive tech: the row's DESCRIPTION already states the state as a

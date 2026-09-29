@@ -1383,6 +1383,8 @@ def _rehydrate_slot_from_history(
                 if _prefetched_agent is not None
                 else _restored_agent_name(str(meta.get("linked_session_key") or history_key), meta)
             )
+        slot.acp_backend = meta.get("acp_backend")
+        slot.model_backend = meta.get("model_backend")
         if meta.get("model"):
             # _normalize_model handles deprecation renames. For claude_code sessions,
             # also map a pre-migration raw provider id back to the canonical key so it
@@ -1995,6 +1997,8 @@ def _apply_recent_session(
                 str(meta.get("linked_session_key") or slot_transcript_key(slot_name)), meta
             )
         )
+    slot.acp_backend = meta.get("acp_backend")
+    slot.model_backend = meta.get("model_backend")
     if meta.get("model"):
         # Canonicalize a pre-migration claude_code provider id to the
         # canonical dropdown key (no-op for other providers); reuse the
@@ -3514,6 +3518,8 @@ def _save_slot_to_history(
                     "color_theme": slot.color_theme or "",
                     "memory_mode": slot.memory_mode,
                     "model": slot.model,
+                    "acp_backend": slot.acp_backend,
+                    "model_backend": slot.model_backend,
                     # CLEARABLE: the queued prompts a restore hands back. Written
                     # even when empty, so a drain that emptied the queue is not
                     # left with the pre-drain set on disk (the merge cannot
@@ -3919,6 +3925,8 @@ def _save_slot_to_history(
             if slot.agent:
                 meta_line["agent"] = slot.agent
             meta_line["model"] = slot.model
+            meta_line["acp_backend"] = slot.acp_backend
+            meta_line["model_backend"] = slot.model_backend
             if slot.reasoning_effort:
                 meta_line["reasoning_effort"] = slot.reasoning_effort
             # Unconditional, matching the empty-window merge mirror: None is

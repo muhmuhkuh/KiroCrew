@@ -278,6 +278,7 @@ def _request(*providers) -> MagicMock:
     state = SimpleNamespace(sessions=SimpleNamespace(active_providers=lambda: list(providers)))
     request = MagicMock()
     request.app = {"state": state}
+    request.query = {}
     return request
 
 

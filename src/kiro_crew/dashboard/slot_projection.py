@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from kiro_crew.dashboard.chat_backend import backend_selection_supported
+
 
 def resolved_row_identity(slot: Any) -> str:
     """The identity the sidebar renders this slot under.
@@ -235,6 +237,8 @@ class SlotProjection:
             "agent_kind": getattr(slot, "agent_kind", ""),
             "effective_agent": resolve_effective_agent(slot.agent, slot.project or None),
             "model": slot.model,
+            "acp_backend": slot.acp_backend,
+            "backend_selection_supported": backend_selection_supported(slot),
             # The backend's own withhold verdict for `model`: true = the account
             # cannot run the pin (this session is on the backend default), false
             # = it can, null = not known yet. Carried so the frontend reads the

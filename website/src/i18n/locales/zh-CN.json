@@ -11,6 +11,11 @@
     "unknown": "未知",
     "empty": "请尝试其他搜索词、分类或来源。"
   },
+  "chatBackend": {
+    "label": "后端",
+    "inherit": "使用全局默认值",
+    "managed": "后端由此聊天的所有者管理"
+  },
   "crewCapabilityEditing": {
     "sourceFailed": "无法验证已保存的配置。请从服务器重新加载后重试。",
     "keep": "已保留隐藏值。输入即可替换。",
@@ -301,7 +306,7 @@
       "manifest": {
         "use_case_1": "先证明性能提升可度量或缺陷修复可复现，再将通过筛选的结果转为可审阅的 GitHub 改动。",
         "configuration_1": "网关主机需要安装 git 和已认证的 gh CLI；连接 GitHub 仓库，选择基础分支，并在运行性能任务前校准标尺。",
-        "description": "先度量 GitHub 仓库，再改动它。先设计一个经过校准的性能指标，也就是标尺；再用一个已知改进来证明该指标可信。随后运行“保留或回滚”改进循环：每个候选修复都写在独立 worktree 中，要通过可编辑文件白名单以及仓库自身测试，只有当实测收益超过噪声带时才会保留。留下来的结果会拟为 GitHub 草稿拉取请求，由你自己审阅并发布。",
+        "description": "先度量 GitHub 或 GitLab 仓库，再改动它。设计校准后的性能指标（标尺），用已知收益验证指标可靠，再运行“保留或回滚”改进循环：每个候选修复写入独立 worktree，通过编辑白名单和仓库自身测试，并且只有实测收益超过噪声带时才保留。保留下来的改进会形成 GitHub 拉取请求 / GitLab 合并请求草稿，由你审阅并自行发布。",
         "display_name": "Auto-Improvement",
         "highlight_1": "先证明自己的指标——标尺不可信时，运行会拒绝开始",
         "highlight_2": "每个候选都做 A/B 度量，缺陷修复则用 RED/GREEN，而不是只凭“看起来对”",
@@ -1051,13 +1056,13 @@
       "manifest": {
         "use_case_1": "按风险审查一个或多个 GitHub 拉取请求，查看重点发现，并只暂存值得发布的评论。",
         "configuration_1": "在网关主机上安装并认证 gh CLI，添加仓库，然后在设置中选择审查模型、推理强度和并发数。",
-        "description": "深度审查 GitHub 拉取请求，告诉你哪些改动真正值得关注。每个改动过的文件都在各自独立的代理会话里审查，按影响范围加权，最后按优先级汇总成一份 Focus Report。发现会暂存为 GitHub 草稿审查，在你提交之前不会公开；审查者还会从已上线的修复和过往审查评论里，不断学习仓库真正的标准。",
+        "description": "深入审查 GitHub 拉取请求和 GitLab 合并请求，告诉你哪些改动真正值得关注。每个改动文件都在独立代理会话中审查，按影响范围加权，最终汇总为优先级 Focus Report。发现会暂存为草稿审查（GitHub 待处理审查 / GitLab 草稿审查），在你提交之前不会公开；审查者还会从已上线修复和过往审查评论中持续学习仓库标准。",
         "display_name": "Code Review Sage",
         "highlight_1": "Focus Report 按影响范围给改动排序，风险高的文件先读",
         "highlight_2": "每个改动一个独立的代理会话，发现不会在文件之间串扰",
         "highlight_3": "评审在应用内查看——除非你主动要求，否则不会向你的拉取请求发布任何内容",
         "highlight_4": "按仓库分别学习已上线的修复、审查评论和设计讨论",
-        "highlight_5": "审查 GitHub 拉取请求；需要网关主机上有已认证的 `gh` CLI",
+        "highlight_5": "审查 GitHub 拉取请求和 GitLab 合并请求；网关主机需有已认证的 `gh` 和/或 `glab` CLI",
         "page_label": "Code Review Sage"
       },
       "views": {
@@ -1822,7 +1827,7 @@
     "goalOwner": {
       "manifest": {
         "configuration_1": "启用 Goal Owner，创建包含完成定义的目标，然后通过应用 API 查看或暂停它。",
-        "description": "为您选择自主运行的目标提供有界、可恢复的项目负责人。",
+        "description": "为你选择自主运行的目标提供有界、可恢复的项目负责人。",
         "display_name": "目标负责人",
         "highlight_1": "每个用户目标一条持久记录",
         "highlight_2": "带明确预算的有界唤醒",
@@ -1881,7 +1886,8 @@
           "no_repo_members_found_among_these_issues": "这些 issue 中未找到仓库成员",
           "open": "待处理",
           "requested_by_me": "由我请求",
-          "sort": "排序"
+          "sort": "排序",
+          "status": "状态"
         },
         "investigateButton": {
           "could_not_check_for_an_existing_investigation_re": "无法检查是否已有调查 — 刷新时会重试",
@@ -2305,7 +2311,7 @@
       "manifest": {
         "use_case_1": "对已连接服务商中的 issue 和拉取请求进行分类，同时保留摘要、建议标签和调查历史。",
         "configuration_1": "连接仓库，并在网关主机上认证服务商 CLI：GitHub 使用 gh，GitLab 使用 glab，Azure DevOps 在 macOS、Linux 或 WSL 上使用带扩展的 az。",
-        "description": "一个记得住事的 issue 分类助手。浏览、筛选并分类 GitHub 与 GitLab 的 issue，以及 Azure DevOps 工作项，用 AI 建议标签，为每个条目留调查笔记 — 发现都记在本地账本里，同一件事不会被重复调查。",
+        "description": "一个会记住信息的 issue 分类助手。浏览、筛选并分类 GitHub、GitLab、Azure DevOps 和 Jira issue，使用 AI 建议的标签和逐项调查笔记 — 发现保存在本地账本中，避免重复调查。",
         "display_name": "Issue Radar",
         "highlight_1": "为 issue 和拉取请求生成 AI 摘要与建议标签，每条都附上理由",
         "highlight_2": "每个 issue 的调查笔记都存在本地账本里，同一件事不会被重复调查",
@@ -2315,7 +2321,7 @@
         "highlight_6": "任何写操作都需要仓库的 triage 或 push 权限；只读连接只能给建议",
         "highlight_7": "列出你最近贡献过的仓库，连接一个只需点一下",
         "highlight_8": "在本地缓存 issue、标签和成员，按需刷新",
-        "highlight_9": "支持 GitHub、GitLab 和 Azure DevOps；需要网关主机上有所连接服务商的已认证 CLI（`gh`、`glab` 或 `az`）— 安装时并不要求某一家服务商的 CLI",
+        "highlight_9": "支持 GitHub、GitLab、Azure DevOps 和 Jira；网关主机需提供已连接服务商的认证 CLI 或网关凭据（`gh`、`glab`、`az` 或 JIRA_EMAIL + JIRA_API_TOKEN）— 安装时不要求某个特定服务商的 CLI",
         "page_label": "Issue Radar"
       },
       "views": {
@@ -7159,7 +7165,7 @@
       "tech_codes": "我会写代码",
       "tech_non_technical": "非技术人员",
       "tech_somewhat": "略懂",
-      "tell_kiro_about_you": "介绍一下你自己",
+      "tell_kiro_about_you": "告诉 Kiro 关于你的情况",
       "your_role": "你的角色"
     },
     "pastedChip": {
