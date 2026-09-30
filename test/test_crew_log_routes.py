@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -315,6 +316,41 @@ async def test_a_read_addressed_by_slot_key_folds_that_slot_s_unit():
 
 
 @pytest.mark.asyncio
+async def test_the_projection_routes_refuse_a_slot_keyed_fold_its_owner_serves(monkeypatch):
+    """A slot-keyed fold its OWNER serves (the radar fold: its owner orders the slot's
+    units by what the crew recorded and pins the live unit last) is refused by both
+    projection routes the way an unregistered name is, so a client cannot be handed a
+    part of the record as the whole. The slot-keyed fold this route DOES serve, and
+    the per-unit folds, still answer."""
+    handle = _log()
+    _opened(handle)
+    assert crew_log.OWNER_SERVED_SLOT_PROJECTION == "radar"
+    assert crew_log.OWNER_SERVED_SLOT_PROJECTION in crew_log.SLOT_PROJECTION_NAMES
+    assert crew_log.SLOT_PROJECTION_NAMES != (crew_log.OWNER_SERVED_SLOT_PROJECTION,)
+    for name in (crew_log.OWNER_SERVED_SLOT_PROJECTION,):
+        response = await routes.api_session_crew_log_projection(
+            _request_with_sessions("fold", "chat-7", {"chat-7": SESSION}, name=name)
+        )
+        assert response.status == 400
+        assert _body(response)["code"] == "unknown_projection"
+        _flag_on(monkeypatch)
+        request = _internal_request(
+            f"/api/crew-log/units/{SESSION}/projection/{name}",
+            slots={"chat-owner": _Slot(restricted=False)},
+            match={"unit": SESSION, "name": name},
+        )
+        unit_route = await routes.api_crew_log_unit_projection(request)
+        assert unit_route.status == 400
+        assert json.loads(unit_route.text)["code"] == "unknown_projection"
+    # The slot-keyed fold this route serves, and a per-unit fold, still answer.
+    for name in ("ledger", "status"):
+        fold = await routes.api_session_crew_log_projection(
+            _request_with_sessions("fold", "chat-7", {"chat-7": SESSION}, name=name)
+        )
+        assert fold.status == 200, name
+
+
+@pytest.mark.asyncio
 async def test_the_batch_read_answers_every_fold_from_one_resolution():
     """Every fold, resolved once and folded once, so they cannot disagree.
 
@@ -503,6 +539,50 @@ async def test_the_batch_read_reports_whether_the_writer_owed_anything():
     # The folds are still served: a read that could not confirm the drain is worth
     # less than one that could, and far more than no answer at all.
     assert set(raced["projections"]) == set(crew_log.PROJECTION_NAMES)
+
+
+@pytest.mark.asyncio
+async def test_the_fold_read_says_whether_the_gateway_is_recording(monkeypatch):
+    """An empty fold cannot say why, so the read names the flag state beside it."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    on = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert on["recording"] is True
+    assert "flag_value" not in on
+    assert "env_file" not in on
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "off")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"] == "off"
+    assert off["flag_recognised"] is True
+    from kiro_crew.constants import env_file_display
+
+    assert off["env_file"] == env_file_display()
+
+
+@pytest.mark.asyncio
+async def test_the_fold_read_quotes_only_the_flag_value_that_switched_recording_off(
+    monkeypatch,
+):
+    """The panel names the typo; nothing else from the environment is sent."""
+    handle = _log()
+    _opened(handle)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", " fasle\x1b[31m" + "x" * 80 + " ")
+    monkeypatch.setenv("KIROCREW_TEST_SECRET_NEIGHBOUR", "do-not-send")
+    off = _body(
+        await routes.api_session_crew_log_projections(_request_with_sessions("folds", SESSION, {}))
+    )
+    assert off["recording"] is False
+    assert off["flag_value"].startswith("fasle[31m")
+    assert len(off["flag_value"]) == 40
+    assert "\x1b" not in off["flag_value"]
+    assert off["flag_recognised"] is False
+    assert "do-not-send" not in json.dumps(off)
 
 
 @pytest.mark.asyncio
@@ -769,6 +849,16 @@ class _Sockets:
         self.frames.append((frame, data))
 
 
+def _frames(state: _Sockets, name: str) -> list[dict]:
+    return [data for frame, data in state.frames if frame == name]
+
+
+async def _pass(publisher: routes.CrewLogPublisher, *sessions: str) -> None:
+    """One flush pass over *sessions*, the way a coalesced growth runs."""
+    publisher._dirty.update(sessions)
+    await publisher._flush()
+
+
 @pytest.mark.asyncio
 async def test_a_growth_pushes_one_frame_per_projection():
     handle = _log()
@@ -777,13 +867,81 @@ async def test_a_growth_pushes_one_frame_per_projection():
     state = _Sockets()
     publisher = routes.CrewLogPublisher(state)
     publisher.bind(asyncio.get_running_loop())
-    await publisher._publish(SESSION)
+    assert await publisher._publish(SESSION)
     assert {frame for frame, _ in state.frames} == {routes.FRAME}
-    assert {data["name"] for _, data in state.frames} == set(crew_log.PROJECTION_NAMES)
-    for _, data in state.frames:
+    assert {data["name"] for data in _frames(state, routes.FRAME)} == set(crew_log.PROJECTION_NAMES)
+    for data in _frames(state, routes.FRAME):
         assert data["session_id"] == SESSION
         assert data["seq"] == handle.last_seq
         assert "value" in data
+
+
+@pytest.mark.asyncio
+async def test_a_growth_names_the_slot_to_reread_and_carries_nothing_else():
+    """Slot folds are read through the route; the push only says which slot moved."""
+    handle = _log(slot="dashboard:conductor")
+    _opened(handle, slot="dashboard:conductor")
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    await _pass(publisher, SESSION)
+    assert _frames(state, routes.SLOT_FRAME) == [{"slot": "dashboard:conductor"}]
+    state.frames.clear()
+    _turn(handle, 1)
+    with patch.object(crew_log, "slot_of_session", side_effect=AssertionError("re-read")):
+        await _pass(publisher, SESSION)
+    assert _frames(state, routes.SLOT_FRAME) == [{"slot": "dashboard:conductor"}]
+    state.frames.clear()
+    await _pass(publisher, SESSION)
+    assert state.frames == []
+
+
+@pytest.mark.asyncio
+async def test_one_pass_sends_one_slot_frame_per_slot():
+    for unit in ("s-a", "s-b"):
+        _opened(_log(unit, slot="dashboard:team"), slot="dashboard:team")
+    _opened(_log("s-c", slot="dashboard:other"), slot="dashboard:other")
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    await _pass(publisher, "s-a", "s-b", "s-c")
+    assert sorted(data["slot"] for data in _frames(state, routes.SLOT_FRAME)) == [
+        "dashboard:other",
+        "dashboard:team",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_slot_owner_cache_is_bounded(monkeypatch):
+    monkeypatch.setattr(routes, "MAX_CACHED_SLOT_OWNERS", 2)
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    for index in range(3):
+        unit = f"s-owner{index}"
+        _opened(_log(unit, slot=f"dashboard:{index}"), slot=f"dashboard:{index}")
+        await _pass(publisher, unit)
+    assert list(publisher._slot_owners) == ["s-owner1", "s-owner2"]
+    assert [data["slot"] for data in _frames(state, routes.SLOT_FRAME)] == [
+        "dashboard:0",
+        "dashboard:1",
+        "dashboard:2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_unprovable_slot_sends_no_slot_frame_and_is_asked_again():
+    handle = _log()
+    _opened(handle)
+    state = _Sockets()
+    publisher = routes.CrewLogPublisher(state)
+    publisher.bind(asyncio.get_running_loop())
+    with patch.object(crew_log, "slot_of_session", return_value="") as probe:
+        await _pass(publisher, SESSION)
+        _turn(handle, 1)
+        await _pass(publisher, SESSION)
+    assert probe.call_count == 2
+    assert _frames(state, routes.SLOT_FRAME) == []
 
 
 @pytest.mark.asyncio
@@ -851,7 +1009,7 @@ async def test_a_fold_refusal_does_not_stop_the_other_sessions():
     publisher.bind(asyncio.get_running_loop())
     publisher._dirty.update({"s-good", "s-broken"})
     await publisher._flush()
-    assert {data["session_id"] for _, data in state.frames} == {"s-good"}
+    assert {data["session_id"] for data in _frames(state, routes.FRAME)} == {"s-good"}
 
 
 def test_notify_from_a_writer_thread_does_no_work_of_its_own():
@@ -1091,13 +1249,13 @@ def test_the_flag_name_matches_the_emitters_own_constant():
 
 @pytest.mark.asyncio
 async def test_installing_with_the_flag_off_builds_nothing(monkeypatch):
-    """A launch without the flag must not pay for the subsystem it will not use.
+    """A launch with the flag off must not pay for the subsystem it will not use.
 
     The installer runs on the gateway's boot path. With the crew log off it returns
     without importing the emitter and without constructing a publisher, so a
     disabled launch does no optional work and registers no listener.
     """
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     monkeypatch.setattr(routes, "_publisher", None)
     from kiro_crew.crew_log import emit as crew_log_emit
 
@@ -1197,24 +1355,74 @@ def test_the_caller_name_is_pinned_to_the_mcp_servers_own(monkeypatch):
 
 
 def test_the_enable_hint_names_the_real_flag():
-    assert routes.CREW_LOG_ENV in routes.CREW_LOG_ENABLE_HINT
+    assert routes.CREW_LOG_ENV in routes.crew_log_enable_hint()
 
 
-def test_the_enable_hint_names_the_live_data_home_not_the_legacy_one():
+def test_the_enable_hint_says_to_unset_the_flag_not_to_set_it():
+    """The log is on by default, so the only way to be off is a falsy value."""
+    assert "unset" in routes.crew_log_enable_hint()
+    assert f"{routes.CREW_LOG_ENV}=1" not in routes.crew_log_enable_hint()
+
+
+def test_the_enable_hint_names_the_env_file_the_gateway_reads(monkeypatch, tmp_path):
     """An agent is told to edit this file, so naming the wrong one wastes the turn.
 
-    The live credentials file is ``~/.kiro/crew/.env`` (``config/loader.py``'s own
-    header, and ``config_dir()`` under the default home). ``~/.kirocrew/.env`` is a
-    legacy location that ``sandbox.py`` keeps only to fence a leftover copy;
-    nothing reads configuration from it. A hint naming it sends the reader to an
+    The file read is ``config.loader.env_path()``, which follows ``KIROCREW_HOME``; a
+    hint that hardcodes the default home sends an operator with another home to an
     inert file, and the flag appears not to work.
-
-    Not compared against ``config_dir()``: the suite's isolation fixture overrides
-    the home, so that call answers a ``tmp_path`` here and would pass on either
-    string.
     """
-    assert ".kiro/crew/.env" in routes.CREW_LOG_ENABLE_HINT
-    assert ".kirocrew/" not in routes.CREW_LOG_ENABLE_HINT
+    from kiro_crew.config.loader import env_path
+
+    home = tmp_path / "elsewhere"
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    hint = routes.crew_log_enable_hint()
+    assert str(env_path()).startswith(str(home))
+    assert (
+        str(env_path()) in hint or ("~/" + env_path().relative_to(Path.home()).as_posix()) in hint
+    )
+    assert "~/.kiro/crew/.env" not in hint
+
+
+def test_the_session_ledger_refusal_names_the_env_file_the_gateway_reads(monkeypatch, tmp_path):
+    from kiro_crew import session_ledger
+    from kiro_crew.constants import env_file_display
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
+    with pytest.raises(session_ledger.LedgerUnavailable) as caught:
+        session_ledger._require_crew_log("s-any")
+    assert env_file_display() in str(caught.value)
+    assert "~/.kiro/crew/.env" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "work_ledger",
+        "crew_store",
+        "mcp_ledger",
+    ],
+)
+def test_every_crew_log_off_refusal_names_the_env_file_the_gateway_reads(
+    monkeypatch, tmp_path, refusal
+):
+    """The same file, spelled once, in every place that tells an operator to edit it."""
+    import inspect
+
+    from kiro_crew import session_ledger
+    from kiro_crew.apps.builtins.issue_radar.backend import crew_store
+    from kiro_crew.dashboard.handlers import work_ledger
+    from kiro_crew.mcp_tools import ledger as mcp_ledger
+
+    module = {
+        "session_ledger": session_ledger,
+        "work_ledger": work_ledger,
+        "crew_store": crew_store,
+        "mcp_ledger": mcp_ledger,
+    }[refusal]
+    source = inspect.getsource(module)
+    assert "~/.kiro/crew/.env" not in source
+    assert "env_file_display()" in source
 
 
 def test_the_page_reader_is_the_one_shared_implementation():
@@ -1230,13 +1438,22 @@ def test_the_page_reader_is_the_one_shared_implementation():
 
 def test_a_read_with_the_flag_off_says_how_to_switch_it_on(monkeypatch):
     """MUTATION-SENSITIVE: the agent learns the flag state from THIS refusal."""
-    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(routes.CREW_LOG_ENV, "0")
     request = _internal_request("/api/crew-log/sessions")
     response = asyncio.run(routes.api_crew_log_sessions(request))
     assert response.status == 422
     body = json.loads(response.text)
     assert body["code"] == "crew_log_disabled"
     assert routes.CREW_LOG_ENV in body["error"]
+
+
+def test_a_read_with_the_flag_unset_is_not_refused(monkeypatch):
+    """The crew log is on by default, so an install that never set the flag reads."""
+    monkeypatch.delenv(routes.CREW_LOG_ENV, raising=False)
+    request = _internal_request("/api/crew-log/sessions")
+    response = asyncio.run(routes.api_crew_log_sessions(request))
+    assert response.status != 422
+    assert json.loads(response.text).get("code") != "crew_log_disabled"
 
 
 #: A conductor, its child and its grandchild, plus a session in another tree. The
@@ -1430,6 +1647,166 @@ class TestTheDispatchFence:
         response = asyncio.run(routes.api_crew_log_unit_page(request))
         assert response.status == 403
         assert "does not record what kind of session it is" in json.loads(response.text)["error"]
+
+    def test_an_unreadable_middle_log_refuses_as_unknown_lineage_not_out_of_scope(
+        self, monkeypatch, caplog
+    ):
+        """MUTATION-SENSITIVE: the scan's fault bit reaches the refusal SITE, not the caller.
+
+        The conductor really did dispatch the grandchild, transitively, and the
+        grandchild's own log is intact -- nothing about this request is out of scope.
+        What breaks the chain is the CHILD in the middle: its announce record is
+        present and cannot be read as an entry, so the scan drops that unit's record
+        and the walk finds no node for its slot. ``dispatched_by`` answers False for a
+        missing node whatever put it there, so the only thing that can tell a real
+        absence of lineage from an edge the scan never read is the flag the reading
+        carries.
+
+        What the caller is told is DELIBERATELY the same either way. This door passes
+        the requested unit as the scan's ``preferred``, and a named unit's own read
+        fault feeds the scan's flag, so a caller-visible distinction would let a
+        guessed id that exists-and-is-unreadable be told apart from one that does not
+        exist -- an existence oracle on the boundary this fence exists to keep closed.
+        So the assertion is on the OPERATOR's record: the refusal site says the scan
+        was incomplete, and the wire says only "out of scope".
+
+        Reverting ``dispatch_view`` to ``SessionTree.records()`` reddens it: that
+        accessor drops the fault bit, ``view.incomplete`` is then False, and nothing
+        is logged -- the refusal goes out with no account of why the tree was short.
+
+        The damage is planted as BYTES rather than monkeypatched, because this is the
+        non-transient case: a log is append-only, so a line that cannot be read as an
+        entry stays unreadable for the life of the file, and the scanner caches that
+        verdict. A patched read would exercise the transient case and leave the one
+        that never clears unpinned.
+        """
+        _flag_on(monkeypatch)
+        _dispatch_tree()
+        child_log = lg.crew_log_path(lg.KIND_SESSION, CHILD_UNIT)
+        lines = child_log.read_bytes().split(b"\n")
+        # Line 1 is the header and stays intact, so the unit is still PROVABLE and is
+        # not simply skipped as a stray directory; line 2 is the announce record the
+        # creator edge lives on. It is replaced with a well-formed JSON object that is
+        # not an entry, which is what makes the head read "announced, unreadable"
+        # rather than "not announced yet".
+        assert len(lines) >= 2, lines
+        lines[1] = b'{"not": "an entry"}'
+        child_log.write_bytes(b"\n".join(lines))
+        from kiro_crew.crew_log import read as crew_log_read
+
+        crew_log_read._TREE._heads.clear()
+
+        request = _as_conductor(
+            f"/api/crew-log/units/{GRANDCHILD_UNIT}/page", match={"unit": GRANDCHILD_UNIT}
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.crew_log"):
+            response = asyncio.run(routes.api_crew_log_unit_page(request))
+        assert response.status == 403
+        # The wire carries the ordinary refusal and nothing that distinguishes this
+        # case, which is the security half of the change.
+        assert "does not fall inside that scope" in json.loads(response.text)["error"]
+        # The operator's half: the fault bit reached the refusal site and was recorded
+        # there. This is what fails when the view stops carrying it.
+        assert any("lineage scan was INCOMPLETE" in record.message for record in caplog.records)
+
+    def test_an_intact_store_logs_no_incomplete_scan_when_it_refuses(self, monkeypatch, caplog):
+        """The allow-direction control: the operator signal discriminates.
+
+        Without it, a refusal site that logged "INCOMPLETE" on every denial would
+        satisfy the assertion above while saying nothing true -- the same shape as a
+        guard verified only in its blocking direction. Nothing is damaged here, so the
+        scan is complete, a session in another tree is still refused, and no
+        incomplete-scan record is written.
+        """
+        _flag_on(monkeypatch)
+        _dispatch_tree()
+        request = _as_conductor(
+            f"/api/crew-log/units/{STRANGER_UNIT}/page", match={"unit": STRANGER_UNIT}
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.crew_log"):
+            response = asyncio.run(routes.api_crew_log_unit_page(request))
+        assert response.status == 403
+        assert "does not fall inside that scope" in json.loads(response.text)["error"]
+        assert not any("lineage scan was INCOMPLETE" in r.message for r in caplog.records)
+
+    def test_the_refusal_text_is_identical_whether_the_scan_was_short(self, monkeypatch):
+        """MUTATION-SENSITIVE: no existence oracle at this door.
+
+        The two cases above differ in exactly the way a caller could steer -- this
+        door passes the requested unit as the scan's ``preferred``, so a guessed id
+        that exists and cannot be read sets the flag while a guessed id that does not
+        exist does not. Re-introducing any caller-visible difference between them
+        reddens this: it compares the two bodies for equality rather than asserting a
+        phrase, so it catches a new wording however it is spelled.
+        """
+        _flag_on(monkeypatch)
+        _dispatch_tree()
+        intact = _as_conductor(
+            f"/api/crew-log/units/{STRANGER_UNIT}/page", match={"unit": STRANGER_UNIT}
+        )
+        intact_body = json.loads(asyncio.run(routes.api_crew_log_unit_page(intact)).text)["error"]
+
+        child_log = lg.crew_log_path(lg.KIND_SESSION, CHILD_UNIT)
+        lines = child_log.read_bytes().split(b"\n")
+        lines[1] = b'{"not": "an entry"}'
+        child_log.write_bytes(b"\n".join(lines))
+        from kiro_crew.crew_log import read as crew_log_read
+
+        crew_log_read._TREE._heads.clear()
+
+        short = _as_conductor(
+            f"/api/crew-log/units/{GRANDCHILD_UNIT}/page", match={"unit": GRANDCHILD_UNIT}
+        )
+        short_body = json.loads(asyncio.run(routes.api_crew_log_unit_page(short)).text)["error"]
+        assert short_body == intact_body
+
+    def test_a_listing_only_lineage_fault_is_recorded_by_the_producer_once(
+        self, monkeypatch, caplog
+    ):
+        """MUTATION-SENSITIVE: the listing consumer gets an operator record too.
+
+        A caller that only LISTS never reaches the per-unit refusal door, so the
+        warning that door writes cannot account for the ``truncated`` it is handed.
+        And this fault never clears: a log is append-only, so the scanner caches the
+        verdict and every later reading is short for the life of the file. With no
+        record at the producer, such a caller sees ``truncated`` forever while nothing
+        anywhere says why -- the same failure indistinguishable to an operator that
+        this change exists to remove, one consumer over.
+
+        So the record is asserted at the layer that knows both the cause and WHICH
+        unit carries it, and asserted to fire ONCE across two scans. That second half
+        is the discriminating one: the cache serves every later scan without
+        re-judging, so a warning placed where the cache is READ would satisfy a
+        presence check while writing one line per scan for the life of the log.
+        """
+        _flag_on(monkeypatch)
+        _dispatch_tree()
+        child_log = lg.crew_log_path(lg.KIND_SESSION, CHILD_UNIT)
+        lines = child_log.read_bytes().split(b"\n")
+        assert len(lines) >= 2, lines
+        lines[1] = b'{"not": "an entry"}'
+        child_log.write_bytes(b"\n".join(lines))
+        from kiro_crew.crew_log import read as crew_log_read
+
+        crew_log_read._TREE._heads.clear()
+
+        # The scope_slot is load-bearing: ``list_session_units`` builds its dispatch
+        # view only when a slot is in scope, so an unscoped owner listing never
+        # consults lineage and cannot reach this fault at all. The consumer the gap
+        # belongs to is a conductor listing what it dispatched.
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.crew_log.session_tree"):
+            first = crew_log_read.list_session_units(limit=50, scope_slot=CONDUCTOR_SLOT)
+            second = crew_log_read.list_session_units(limit=50, scope_slot=CONDUCTOR_SLOT)
+
+        # The listing still tells its caller the set is short, exactly as before.
+        assert first["truncated"] is True
+        assert second["truncated"] is True
+        # The producer accounted for it, naming the unit whose bytes carry the fault.
+        judged = [r for r in caplog.records if "creator edge is unknown" in r.message]
+        assert len(judged) == 1, [r.message for r in judged]
+        unit_name = child_log.parent.name
+        assert unit_name, "the fixture resolved no unit directory name"
+        assert unit_name in judged[0].message
 
     @pytest.mark.parametrize(
         ("recorded", "word"),
@@ -2251,39 +2628,252 @@ class TestTheGrantIsRecheckedAfterTheRead:
 
         This route set grows, and a route added without the re-check reads correctly
         in review -- the defect is an ABSENT line, which no assertion about the
-        current routes can see. So the rule is asserted over the module's own source:
-        an agent-door handler that suspends to build a payload must pass through
-        ``_stale_grant_refusal`` before returning it -- the unit routes because the
-        target's class can move while the entries are read, and the listing because its
-        rows were gathered under a scope wider than the caller now holds.
+        current routes can see. So the rule is asserted over the module's own source,
+        and it is asserted as a shape a new route cannot get wrong rather than as a
+        line each route must remember: the re-check has exactly ONE caller, which is
+        the helper that offloads, and the gate and that helper are the only places an
+        agent-door route is allowed to suspend. A route that wants to build a payload
+        off the loop therefore has one way in, and that way re-checks the grant before
+        the route's own shaping ever runs.
         """
         import ast
         import inspect
 
         tree = ast.parse(inspect.getsource(routes))
-        gated = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncFunctionDef):
-                continue
-            called = {
-                n.func.id
-                for n in ast.walk(node)
-                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            }
-            if "_authorize_crew_log_read" not in called:
-                continue
-            body = ast.dump(node)
-            if "to_thread" not in body:
-                # The resolve route answers from memory, so its gate's own check
-                # is already the last read of live state before it returns.
-                continue
-            gated.append(node.name)
-            assert "_stale_grant_refusal" in called, (
-                f"{node.name} suspends after authorizing but never re-checks the "
-                "grant; a caller can acquire a channel link while it reads"
+        functions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        ]
+
+        def _calls(node):
+            # Both spellings count. A bare ``_authorize_crew_log_read(...)`` and an
+            # attribute form such as ``self._authorize_crew_log_read(...)`` name the
+            # same gate, and detection is the permissive direction here: a route whose
+            # gate call goes unrecognised is not treated as a door at all, so none of
+            # the suspension rules below ever reach it. Matching the attribute tail as
+            # well keeps that escape shut.
+            names = set()
+            for n in ast.walk(node):
+                if not isinstance(n, ast.Call):
+                    continue
+                if isinstance(n.func, ast.Name):
+                    names.add(n.func.id)
+                elif isinstance(n.func, ast.Attribute):
+                    names.add(n.func.attr)
+            return names
+
+        # Suspension has three spellings -- ``await``, ``async with``, ``async for``
+        # -- and a route that reaches storage through any of them can answer under a
+        # grant taken before the read. Naming the storage calls to look for would
+        # cover whichever ones are spelled today and miss ``run_in_executor``, an
+        # awaited storage coroutine, or a gather. So the rule is stated from the other
+        # side: these are the only two suspension points a door route may hold, and
+        # anything else that suspends is named back. A route that genuinely needs a
+        # third has to say so here, which is the point at which somebody decides
+        # whether it owes a re-check.
+        allowed_awaits = {"_authorize_crew_log_read", "_offload_then_recheck"}
+        # The set holds bare names only, so an attribute-form await -- ``self.gate()``,
+        # ``mod._offload_then_recheck()`` -- is named back rather than admitted. That is
+        # the fail-closed direction on purpose: the ``ast.unparse`` branch below is there
+        # to print an offender readably, not to widen what passes. A door route that
+        # wants an attribute form spells its bare name here and says why.
+
+        def _suspends_outside(node):
+            offenders = []
+            for n in ast.walk(node):
+                if isinstance(n, (ast.AsyncWith, ast.AsyncFor)):
+                    offenders.append(type(n).__name__)
+                    continue
+                if not isinstance(n, ast.Await):
+                    continue
+                awaited = n.value
+                name = ""
+                if isinstance(awaited, ast.Call):
+                    if isinstance(awaited.func, ast.Name):
+                        name = awaited.func.id
+                    else:
+                        name = ast.unparse(awaited.func)
+                if name not in allowed_awaits:
+                    offenders.append(name or ast.unparse(awaited))
+            return offenders
+
+        rechecking = sorted(f.name for f in functions if "_stale_grant_refusal" in _calls(f))
+        assert rechecking == ["_offload_then_recheck"], (
+            "the re-check is reachable from more than one place, so a route can call "
+            f"it out of order or not at all: {rechecking}"
+        )
+
+        doors = [f for f in functions if "_authorize_crew_log_read" in _calls(f)]
+        for door in doors:
+            outside = _suspends_outside(door)
+            assert not outside, (
+                f"{door.name} suspends at {outside}, outside the gate and the helper, "
+                "so it can answer under a grant taken before the read; offload through "
+                "_offload_then_recheck"
             )
-        # A control: an empty set would satisfy the loop above silently.
-        assert len(gated) == 3, f"expected three offloading routes, found {gated}"
+        folded = sorted(f.name for f in doors if "_offload_then_recheck" in _calls(f))
+        # A control: an empty door set would satisfy the loop above silently.
+        assert folded == [
+            "api_crew_log_sessions",
+            "api_crew_log_unit_page",
+            "api_crew_log_unit_projection",
+        ], f"the agent door's offloading routes are not the three expected: {folded}"
+
+        # A second control with a predictable answer: resolve is an agent-door route
+        # that answers from memory, so it owes no re-check and is admitted by all
+        # three rules above while appearing in none of them.
+        resolve = [f for f in doors if f.name == "api_crew_log_resolve"]
+        assert len(resolve) == 1, "resolve is no longer an agent-door route"
+        assert "_offload_then_recheck" not in _calls(resolve[0])
+        assert "_stale_grant_refusal" not in _calls(resolve[0])
+        assert _suspends_outside(resolve[0]) == []
+
+
+class TestTheOffloadHelperOwnsTheOrder:
+    """The three steps after the gate live in one helper, so the helper is pinned.
+
+    The route cases above prove the sequence end to end. These prove the helper
+    itself, and two of the steps it owns have no other cover: the mapping of a
+    storage refusal to a response, and the rule that the route's own shaping runs
+    only after the re-check has held.
+    """
+
+    def _request(self) -> object:
+        _dispatch_tree()
+        return _as_conductor(f"/api/crew-log/units/{CHILD_UNIT}/page", match={"unit": CHILD_UNIT})
+
+    @pytest.mark.parametrize(
+        ("code", "status", "reported"),
+        [
+            ("invalid_id", 400, "invalid_id"),
+            ("unknown_entry_type", 409, "unknown_entry_type"),
+            ("no_ledger", 422, "no_ledger"),
+            ("", 422, "crew_log_error"),
+        ],
+    )
+    def test_a_storage_refusal_reaches_the_caller_with_a_code_it_can_act_on(
+        self, monkeypatch, code, status, reported
+    ):
+        """MUTATION-SENSITIVE: the refusal is mapped, not raised and not flattened.
+
+        A read can refuse for reasons the caller can do something about -- a
+        malformed unit id is the caller's to fix, a log holding a line this build
+        does not parse is the deployment's -- so each keeps its own status and its
+        own code. Dropping the mapping turns all four into a 500 with no code.
+        """
+        _flag_on(monkeypatch)
+        from kiro_crew.crew_log.errors import CrewLogError
+
+        shaped: list = []
+
+        def _work():
+            raise CrewLogError("the store refused", code=code)
+
+        def _respond(payload):
+            shaped.append(payload)
+            return web.json_response({"shaped": True})
+
+        response = asyncio.run(
+            routes._offload_then_recheck(
+                self._request(), "session_crew_log.read", _work, _respond, unit=CHILD_UNIT
+            )
+        )
+        assert response.status == status
+        body = json.loads(response.text)
+        assert body["code"] == reported
+        assert body["error"] == "the store refused"
+        assert shaped == [], "the route shaped an answer for a read that produced none"
+
+    def test_the_shaping_never_runs_when_the_grant_was_withdrawn(self, monkeypatch):
+        """MUTATION-SENSITIVE: the re-check precedes the shaping, not just the return.
+
+        A helper that shaped first and returned the refusal afterwards would answer
+        correctly and still be wrong: the shaping is the ROUTE's, and running it on a
+        payload the caller may not have means route code has already touched content
+        the withdrawn grant does not cover. So the assertion is that it is not called
+        at all, which no assertion about the response can make.
+        """
+        _flag_on(monkeypatch)
+        read: list = []
+        shaped: list = []
+        refusal = web.json_response({"error": "withdrawn"}, status=403)
+
+        async def _withdrawn(request, operation, *, unit="", listing=False):
+            return refusal
+
+        monkeypatch.setattr(routes, "_stale_grant_refusal", _withdrawn)
+
+        def _work():
+            read.append(1)
+            return {"exists": True}
+
+        def _respond(payload):
+            shaped.append(payload)
+            return web.json_response({"shaped": True})
+
+        response = asyncio.run(
+            routes._offload_then_recheck(
+                self._request(), "session_crew_log.read", _work, _respond, unit=CHILD_UNIT
+            )
+        )
+        assert response is refusal
+        assert read == [1], "the payload was never built, so the order was not exercised"
+        assert shaped == [], "the route's shaping ran under a withdrawn grant"
+
+    def test_the_shaping_receives_the_payload_the_read_produced(self, monkeypatch):
+        """The other half of the order: once the grant holds, the route shapes it.
+
+        Paired with the case above so that "never shapes" cannot pass both. The
+        payload is handed over untouched, which is what lets a route keep a 404 for
+        an absent log and a wrapper key for a fold.
+        """
+        _flag_on(monkeypatch)
+
+        async def _holds(request, operation, *, unit="", listing=False):
+            return None
+
+        monkeypatch.setattr(routes, "_stale_grant_refusal", _holds)
+        payload = {"exists": True, "entries": []}
+        shaped: list = []
+
+        def _respond(seen):
+            shaped.append(seen)
+            return web.json_response({"shaped": True})
+
+        response = asyncio.run(
+            routes._offload_then_recheck(
+                self._request(),
+                "session_crew_log.read",
+                lambda: payload,
+                _respond,
+                unit=CHILD_UNIT,
+            )
+        )
+        assert shaped == [payload]
+        assert shaped[0] is payload
+        assert json.loads(response.text) == {"shaped": True}
+
+    def test_a_route_reaches_the_mapping_for_its_own_read(self, monkeypatch):
+        """The page route answers a storage refusal, not a 500.
+
+        The cases above pin the helper; this pins that a route is wired to it, so a
+        route that stopped offloading through it would not keep this cover.
+        """
+        _flag_on(monkeypatch)
+        _dispatch_tree()
+        from kiro_crew.crew_log.errors import CrewLogError
+
+        def _refusing(*args, **kwargs):
+            raise CrewLogError("bad unit id", code="invalid_id")
+
+        monkeypatch.setattr(routes, "_read_page", _refusing)
+        request = _as_conductor(
+            f"/api/crew-log/units/{CHILD_UNIT}/page", match={"unit": CHILD_UNIT}
+        )
+        response = asyncio.run(routes.api_crew_log_unit_page(request))
+        assert response.status == 400
+        assert json.loads(response.text)["code"] == "invalid_id"
 
 
 class TestTheListingCarriesTheSameScope:
@@ -3438,3 +4028,66 @@ class TestTheListingCarriesTheWorkspaceBoundary:
         assert (
             "changed workspace while this listing was built" in json.loads(response.text)["error"]
         )
+
+
+# --- the work fold on the two projection routes ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_session_route_serves_the_work_fold_through_the_slot():
+    """`GET .../projection/work` on a session resolves the slot its unit's header
+    names and folds every unit of that slot -- the same path `ledger` takes."""
+    handle = CrewLog.create(
+        lg.KIND_SESSION, "s-conductor", owner="raymond", agent="kirocrew", slot="chat-9"
+    )
+    handle.append(
+        "work/recorded",
+        {
+            "slot": "chat-9",
+            "actor": "conductor",
+            "by": "chat-9",
+            "action": "goal",
+            "goal": "ship it",
+            "round": 1,
+            "depth": 0,
+            "event": "goal set",
+            "event_kind": "decision",
+        },
+        src="gateway",
+    )
+    fold = await routes.api_session_crew_log_projection(
+        _request_with_sessions("fold", "chat-9", {"chat-9": "s-conductor"}, name="work")
+    )
+    assert fold.status == 200, fold.text
+    body = _body(fold)
+    assert body["value"]["conductor"]["goal"] == "ship it"
+    assert body["value"]["conductor"]["entries"] == 1
+
+
+def test_the_unit_route_refuses_a_slot_keyed_fold(monkeypatch):
+    _flag_on(monkeypatch)
+    _opened(_log())
+    request = _internal_request(
+        f"/api/crew-log/units/{SESSION}/projection/work",
+        match={"unit": SESSION, "name": "work"},
+    )
+    response = asyncio.run(routes.api_crew_log_unit_projection(request))
+    assert response.status == 400
+    assert json.loads(response.text)["code"] == "slot_projection"
+
+
+def test_the_publisher_is_installed_after_the_listener_binds():
+    """Installing it imports and builds the publisher, so it stays off the boot path.
+
+    ``no-new-work-on-gateway-boot-path``: everything before ``_start_site`` is paid by
+    every launch, and the crew log is on by default. ``start_dashboard`` binds with
+    ``await site.start()`` on its pre-reserved socket.
+    """
+    import inspect
+
+    from kiro_crew.dashboard import server
+
+    source = inspect.getsource(server.start_dashboard)
+    bind = source.index("await site.start()")
+    assert source.count("install_crew_log_publisher(") == 1
+    assert source.index("install_crew_log_publisher(") > bind

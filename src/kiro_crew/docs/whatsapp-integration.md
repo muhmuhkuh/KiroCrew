@@ -39,7 +39,7 @@ configuration allows, and rate-limits unprompted group replies.
    `whatsapp.enabled` for you. It collects no credentials: there is no token, and
    pairing still happens in step 3 below.
 
-3. Open **Settings → Channels → WhatsApp**. With the channel enabled and no
+3. Open **Settings → Messaging Channels → WhatsApp**. With the channel enabled and no
    session on disk, the gateway begins pairing as it starts the channel and holds
    a rotating code. Click **Show pairing code** to see it, then scan with your
    phone: WhatsApp, Settings, Linked devices, Link a device. The code rotates
@@ -150,7 +150,14 @@ listed. Each entry:
   caps unprompted replies per group regardless.
 - `mode: "off"` — keep the entry, mute the group.
 
-Groups are configured from **Settings → Channels → WhatsApp → Groups** rather
+Listing a group lets the agent speak there. It does not let every member drive
+it: in a configured group only you and the numbers in `whatsapp.allowed_wa_ids`
+can make the agent reply, whether by @-mention, by replying to it, or through
+`rules` mode. A message from anyone else is dropped silently (and audited),
+whatever `dm_policy` is set to. Add a number to the allowlist to let that person
+use the agent in the group.
+
+Groups are configured from **Settings → Messaging Channels → WhatsApp → Groups** rather
 than by hand. The picker lists the groups the linked account has joined, which the
 gateway can only report while the channel is connected, and each row carries that
 group's mode, its free-text rules and its cooldown. A group is added at `mention`,
@@ -221,10 +228,13 @@ and exact, so `/stop the presses` reaches the agent as a sentence.
 - **Formatting**: Markdown is converted to WhatsApp's dialect (`*bold*`,
   `_italic_`, ` ``` `code` ``` `); headings become bold lines, bullets become
   `•`, links become `label (url)`.
-- **Interactive choices** degrade to numbered text options: reply with the
-  number. Tappable buttons are not used here. That is this channel's deliberate
-  choice rather than a protocol limit, because whether a recipient's app renders
-  a button sent from a personal linked device is not something we can promise.
+- **Interactive choices are dropped, not numbered**: a completed `[OPTIONS:]`
+  trailer is removed from the reply rather than degraded to a numbered list, so a
+  question whose choices live only there arrives without them. Tappable buttons
+  are not used here either. Not using buttons is this channel's deliberate choice
+  rather than a protocol limit, because whether a recipient's app renders a button
+  sent from a personal linked device is not something we can promise; losing the
+  list is a gap, and [Channel capabilities](channel-capabilities.md) records it.
 - **Reconnect floods**: after a reconnect WhatsApp replays recent history;
   the channel drops replayed messages older than the connection moment
   instead of answering a backlog.
@@ -237,7 +247,7 @@ and exact, so `/stop the presses` reaches the agent as a sentence.
 |---|---|---|
 | `whatsapp.enabled` | `false` | Main switch for the channel. |
 | `whatsapp.dm_policy` | `"self"` | DM access policy (see above). |
-| `whatsapp.allowed_wa_ids` | `[]` | Extra numbers for `allowlist` (digits, country code, no `+`). |
+| `whatsapp.allowed_wa_ids` | `[]` | Extra numbers admitted in DMs under `allowlist` and in every configured group (digits, country code, no `+`). |
 | `whatsapp.groups` | `[]` | Per-group participation rules (see above). |
 | `whatsapp.db_path` | `""` | Read-only. The session store always lives at `<data home>/whatsapp/session.db`, because that path is what the sensitive-path protection matches. |
 | `whatsapp.soft_threshold_pct` | `80` | Nudge you to `/compact` or `/new` once context passes this usage, checked at the end of each turn. |
@@ -272,9 +282,9 @@ and exact, so `/stop the presses` reaches the agent as a sentence.
   naming configured groups that are not groups this account is in. A JID copied by
   hand is the usual cause; the group picker writes the exact form the gate matches.
 - **An attachment in a group was not opened** - files are downloaded only for the
-  account owner and numbers in `whatsapp.allowed_wa_ids`. Group membership admits
-  someone to the conversation, not to your machine, so add the number to the
-  allowlist if you want their photos and documents read.
+  account owner and numbers in `whatsapp.allowed_wa_ids`, the same people whose
+  messages the agent answers in a group. Add the number to the allowlist if you
+  want that person's messages, photos and documents handled.
 
 ## Related docs
 

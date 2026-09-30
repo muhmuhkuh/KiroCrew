@@ -293,28 +293,30 @@ def policy_document() -> dict[str, Any]:
             ],
         },
         {
-            # Account-wide read-only calls that can't be stack-ARN-scoped:
-            # ListStacks enumerates, GetTemplateSummary validates the template
-            # body before a stack exists.
-            "Sid": "CloudFormationRead",
+            # Account-wide read-only discovery that can't be resource-scoped. Four
+            # statements — CloudFormation read (ListStacks enumerates,
+            # GetTemplateSummary validates a template body before a stack exists),
+            # the tagging API (`kirocrew cloud list` discovers instances), the EC2
+            # Describe* set, and the Route53 DNS preflight — all share Effect=Allow,
+            # Resource="*" and no Condition, so they are ONE statement. Merging them
+            # is permission-neutral (identical effective tuple set) and keeps the
+            # policy under IAM's 6,144-char managed-policy cap; every action here is
+            # read-only, so the shared "*" resource grants nothing a split wouldn't.
+            #
+            # NB (Route53DnsPreflight): a private hosted zone bound to the target
+            # VPC can be authoritative for a host the bootstrap downloads from (e.g.
+            # Amazon Q's `q.<region>.amazonaws.com` endpoint zone shadows
+            # desktop-release.q.us-east-1.amazonaws.com), which makes the install
+            # fail on NXDOMAIN with no fallthrough to public DNS. The launch
+            # degrades gracefully without route53:ListHostedZonesByVPC — it just
+            # loses the early warning — so it is safe to omit on an older policy.
+            # ListHostedZonesByVPC does not support resource-level permissions.
+            "Sid": "CloudFormationAndResourceDiscovery",
             "Effect": "Allow",
             "Action": [
                 "cloudformation:ListStacks",
                 "cloudformation:GetTemplateSummary",
-            ],
-            "Resource": "*",
-        },
-        {
-            # `kirocrew cloud list` discovers instances via the tagging API.
-            "Sid": "TagDiscovery",
-            "Effect": "Allow",
-            "Action": ["tag:GetResources"],
-            "Resource": "*",
-        },
-        {
-            "Sid": "Ec2Discovery",
-            "Effect": "Allow",
-            "Action": [
+                "tag:GetResources",
                 "ec2:DescribeInstances",
                 "ec2:DescribeInstanceStatus",
                 "ec2:DescribeImages",
@@ -325,21 +327,8 @@ def policy_document() -> dict[str, Any]:
                 "ec2:DescribeKeyPairs",
                 "ec2:DescribeAvailabilityZones",
                 "ec2:DescribeInstanceTypeOfferings",
+                "route53:ListHostedZonesByVPC",
             ],
-            "Resource": "*",
-        },
-        {
-            # DNS preflight: a private hosted zone bound to the target VPC can be
-            # authoritative for a host the bootstrap downloads from (e.g. Amazon
-            # Q's `q.<region>.amazonaws.com` endpoint zone shadows
-            # desktop-release.q.us-east-1.amazonaws.com), which makes the install
-            # fail on NXDOMAIN with no fallthrough to public DNS. The launch
-            # degrades gracefully without this action — it just loses the early
-            # warning — so it is safe to omit on an older policy.
-            # ListHostedZonesByVPC does not support resource-level permissions.
-            "Sid": "Route53DnsPreflight",
-            "Effect": "Allow",
-            "Action": ["route53:ListHostedZonesByVPC"],
             "Resource": "*",
         },
         {
@@ -410,18 +399,28 @@ def policy_document() -> dict[str, Any]:
             "Resource": "arn:aws:ec2:*:*:vpc/*",
         },
         {
-            # SG rule mutation is gated to KiroCrew-tagged security groups: the
-            # stack's SG carries kirocrew:managed=true from creation
-            # (TagSpecifications), so CFN can add its egress/SSH rules — but a
-            # leaked launcher credential can't Authorize/Revoke rules on an
-            # UNRELATED security group (which would expose other account
-            # resources). Revoke is already in Ec2DestructiveTagged; Authorize is
-            # here.
-            "Sid": "Ec2SecurityGroupRulesTagged",
+            # Tag-gated mutation of resources managed by Kiro Crew: SG-rule
+            # mutation, the destructive SG/tag verbs, and instance lifecycle. All
+            # three share the same Effect + Resource ("*") + Condition
+            # (aws:ResourceTag/kirocrew:managed=true), so they are ONE statement —
+            # merging them is permission-neutral (identical effective tuple set)
+            # and keeps the policy under IAM's 6,144-char managed-policy cap. The
+            # tag gate means a leaked launcher credential can't Authorize/Revoke
+            # rules on, delete/retag, or stop/terminate an UNRELATED (untagged)
+            # resource; the stack's SG + instance carry kirocrew:managed=true from
+            # creation (TagSpecifications), so CFN's own calls still authorize.
+            "Sid": "Ec2ManagedResourceMutateTagged",
             "Effect": "Allow",
             "Action": [
                 "ec2:AuthorizeSecurityGroupEgress",
                 "ec2:AuthorizeSecurityGroupIngress",
+                "ec2:RevokeSecurityGroupIngress",
+                "ec2:DeleteSecurityGroup",
+                "ec2:DeleteTags",
+                "ec2:StopInstances",
+                "ec2:StartInstances",
+                "ec2:TerminateInstances",
+                "ec2:RebootInstances",
             ],
             "Resource": "*",
             "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
@@ -445,32 +444,6 @@ def policy_document() -> dict[str, Any]:
                     "ec2:CreateAction": ["RunInstances", "CreateSecurityGroup"],
                 }
             },
-        },
-        {
-            # Destructive verbs, gated to KiroCrew-tagged resources so a leaked
-            # launcher credential can't delete/retag security groups it never
-            # created. The stack's SG carries kirocrew:managed=true from creation.
-            "Sid": "Ec2DestructiveTagged",
-            "Effect": "Allow",
-            "Action": [
-                "ec2:RevokeSecurityGroupIngress",
-                "ec2:DeleteSecurityGroup",
-                "ec2:DeleteTags",
-            ],
-            "Resource": "*",
-            "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
-        },
-        {
-            "Sid": "Ec2LifecycleTagged",
-            "Effect": "Allow",
-            "Action": [
-                "ec2:StopInstances",
-                "ec2:StartInstances",
-                "ec2:TerminateInstances",
-                "ec2:RebootInstances",
-            ],
-            "Resource": "*",
-            "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
         },
         {
             # Role create MUST carry our SHARED, PRE-CREATED permissions boundary.
@@ -520,9 +493,34 @@ def policy_document() -> dict[str, Any]:
             # that key isn't in PutRolePolicy's request context, so it would deny
             # the call. aws:ResourceTag (not iam:ResourceTag) — verified with the
             # IAM policy simulator that PutRolePolicy honors the global key.
-            "Sid": "IamPutRolePolicyForInstance",
+            #
+            # iam:TagRole is MERGED into this statement: it shares the exact same
+            # Effect + Resource (the kirocrew-ec2-* role ARN) + Condition
+            # (aws:ResourceTag/kirocrew:managed=true), so combining them is
+            # permission-neutral and helps keep the policy under IAM's 6,144-char
+            # cap. TagRole is REQUIRED because CloudFormation's CreateRole passes
+            # the role's Tags inline (the template's InstanceRole.Tags), and AWS
+            # authorizes that inline tagging as iam:TagRole (see AWS docs
+            # id_tags_roles.html) — without it the boundary-gated CreateRole fails
+            # 403 and the launch can't tag the role kirocrew:managed=true. The
+            # aws:ResourceTag gate is the non-spoofable distinguisher, proven live
+            # with a least-privilege assumed-role principal:
+            #   * (a) A boundary-gated CreateRole WITH inline Tags is ALLOWED: at
+            #     CreateRole, AWS evaluates the embedded TagRole authorization with
+            #     aws:ResourceTag reflecting the tags BEING applied, so the
+            #     kirocrew:managed=true tag is already "present" in context → match.
+            #   * (b) A STANDALONE tag-role on a pre-existing unbounded victim
+            #     (which does NOT yet carry kirocrew:managed) is DENIED — the key
+            #     is absent/mismatched → no match. So the launcher can tag roles it
+            #     is creating (which already carry the tag) but CANNOT add the
+            #     managed tag to a role that lacks it — which is what keeps the
+            #     PutRolePolicy/PassRole tag gate non-spoofable.
+            # NB: we do NOT use iam:PermissionsBoundary here — validated live that
+            # AWS does NOT propagate that key into the CreateRole-embedded TagRole
+            # check (it DENIED case (a)); aws:ResourceTag is the key that works.
+            "Sid": "IamPutRolePolicyAndTagRoleOnManaged",
             "Effect": "Allow",
-            "Action": ["iam:PutRolePolicy"],
+            "Action": ["iam:PutRolePolicy", "iam:TagRole"],
             "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
             "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
         },
@@ -530,9 +528,10 @@ def policy_document() -> dict[str, Any]:
             # Non-escalating role/profile management (no boundary condition
             # needed: none of these can widen the role's permissions).
             #
-            # NB: iam:TagRole is NOT here — it is boundary-gated in its OWN
-            # statement below (IamTagRoleWithBoundary). Leaving it unconditioned
-            # here would DEFEAT the aws:ResourceTag gate on PutRolePolicy/PassRole:
+            # NB: iam:TagRole is NOT here — it is tag-gated in the merged
+            # IamPutRolePolicyAndTagRoleOnManaged statement above. Leaving it
+            # unconditioned here would DEFEAT the aws:ResourceTag gate on
+            # PutRolePolicy/PassRole:
             # a leaked launcher credential could TAG a pre-existing, out-of-band,
             # unbounded kirocrew-ec2-* role as kirocrew:managed=true, then inline
             # admin + pass it to EC2. The tag is only non-spoofable if the same
@@ -556,42 +555,6 @@ def policy_document() -> dict[str, Any]:
                 f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
                 f"arn:aws:iam::*:instance-profile/{ROLE_NAME_PREFIX}*",
             ],
-        },
-        {
-            # iam:TagRole is REQUIRED because CloudFormation's CreateRole passes the
-            # role's Tags inline (the template's InstanceRole.Tags), and AWS
-            # authorizes that inline tagging as iam:TagRole (see AWS docs
-            # id_tags_roles.html) — without it the boundary-gated CreateRole fails
-            # 403 and the launch can't tag the role kirocrew:managed=true (which the
-            # PutRolePolicy/PassRole gate then requires). But leaving it
-            # unconditioned would DEFEAT that downstream tag gate: a leaked launcher
-            # credential could tag a pre-existing, out-of-band, UNBOUNDED
-            # kirocrew-ec2-* role kirocrew:managed=true, then inline admin + pass it
-            # to EC2 (the tag is only non-spoofable if the same policy can't apply
-            # it to an arbitrary role).
-            #
-            # Gate: aws:ResourceTag/kirocrew:managed=true — the role must ALREADY be
-            # tagged managed. This is the non-spoofable distinguisher, proven live
-            # with a least-privilege assumed-role principal:
-            #   * (a) A boundary-gated CreateRole WITH inline Tags is ALLOWED: at
-            #     CreateRole, AWS evaluates the embedded TagRole authorization with
-            #     aws:ResourceTag reflecting the tags BEING applied, so the
-            #     kirocrew:managed=true tag is already "present" in context → match.
-            #   * (b) A STANDALONE tag-role on a pre-existing unbounded victim
-            #     (which does NOT yet carry kirocrew:managed) is DENIED — the key is
-            #     absent/mismatched → no match. So the launcher can tag roles it is
-            #     creating (which already carry the tag) but CANNOT add the managed
-            #     tag to a role that lacks it.
-            # NB: we do NOT use iam:PermissionsBoundary here — validated live that
-            # AWS does NOT propagate that key into the CreateRole-embedded TagRole
-            # check (it DENIED case (a)); aws:ResourceTag is the key that works.
-            # This closes the full chain: TagRole(victim) is denied, so
-            # PutRolePolicy/PassRole never get their tag precondition either.
-            "Sid": "IamTagRoleOnManaged",
-            "Effect": "Allow",
-            "Action": ["iam:TagRole"],
-            "Resource": f"arn:aws:iam::*:role/{ROLE_NAME_PREFIX}*",
-            "Condition": {"StringEquals": {f"aws:ResourceTag/{MANAGED_TAG_KEY}": "true"}},
         },
         {
             # The SHARED, IMMUTABLE instance permissions boundary. The launcher
@@ -696,13 +659,13 @@ def policy_document() -> dict[str, Any]:
         },
         {
             # The sensitive verbs — StartSession (interactive shell / tunnel)
-            # and SendCommand (effectively RCE) — are gated to KiroCrew-tagged
-            # INSTANCES so a leaked launcher credential can't open sessions or
-            # run commands on every SSM-managed box in the account (mirrors
-            # Ec2LifecycleTagged). The tag condition is on the instance resource
-            # only: SSM documents don't carry our tag, so gating them too would
-            # (per-resource evaluation) deny the whole call — the documents are
-            # allowed unconditioned in the statement below.
+            # and SendCommand (effectively RCE) — are gated to instances tagged by
+            # Kiro Crew so a leaked launcher credential can't open sessions or
+            # run commands on every SSM-managed box in the account (mirrors the
+            # tag gate on Ec2ManagedResourceMutateTagged). The tag condition is on
+            # the instance resource only: SSM documents don't carry our tag, so
+            # gating them too would (per-resource evaluation) deny the whole call —
+            # the documents are allowed unconditioned in the statement below.
             "Sid": "SsmSessionOnManagedInstances",
             "Effect": "Allow",
             "Action": [
@@ -767,45 +730,65 @@ def policy_document() -> dict[str, Any]:
             "Resource": "arn:aws:ecs:*:*:task/kirocrew-crew-*/*",
         },
         {
-            # An explicit Deny on the interactive session documents AWS ships today,
-            # named one by one. An explicit Deny cannot be overridden by any Allow,
-            # which is the reason this is a Deny statement rather than simply the
-            # absence of these documents from the Allow lists above.
+            # StartSession is denied against everything OUTSIDE this lane's own
+            # resources. The inversion is the whole point: an enumeration of forbidden
+            # documents cannot reach a document that does not exist yet, so an
+            # interactive document AWS ships tomorrow falls outside such a list. Here
+            # it is denied because it is ABSENT from NotResource, so the class is
+            # closed by construction rather than by someone remembering to extend a
+            # list.
             #
-            # What it does NOT do, said plainly because an earlier wording here
-            # claimed otherwise: it does not keep the shell closed against a document
-            # nobody has enumerated. AWS can ship a new interactive document tomorrow
-            # and this statement will not name it. So this list is defense in depth,
-            # not the barrier.
+            # DIRECTION IS LOAD-BEARING. NotResource in a Deny narrows (it denies
+            # everything unnamed); the same keyword in an Allow would widen (it would
+            # grant everything unnamed), which is why the Fargate templates forbid it
+            # outright and why this policy permits it in a Deny alone. That asymmetry
+            # is not left to prose: test_no_allow_statement_inverts_its_resource_list
+            # fails if any Allow here grows a NotResource.
             #
-            # The barrier is that NO Allow in this policy grants ANY interactive
-            # document, so IAM's default deny already refuses them. This Deny only
-            # begins to matter on the day an edit adds such an Allow -- which is the
-            # same day its enumeration gap would matter. Closing the gap needs an
-            # inverted Deny (NotResource), and that shape's failure mode is that a new
-            # resource type in the StartSession authorisation context denies the whole
-            # call: fail-closed, but it reads as an outage. That trade needs a
-            # deliberate operational decision with an owner, so this statement
-            # enumerates and the inversion is tracked separately.
+            # The named resources are this lane's entire legitimate StartSession
+            # authorisation context: the port-forward document (the only document
+            # start_session ever names -- cloud/ssm.py's _PORT_FORWARD_DOC), the EC2
+            # and Fargate targets of the two session lanes, and the session resource
+            # itself. Because EVERY resource a real port-forward presents is named
+            # here, this Deny cannot match a legitimate call -- which holds whichever
+            # subset of them IAM evaluates, and is what makes the inversion safe.
+            #
+            # AWS-RunShellScript is deliberately ABSENT. It is a SendCommand document,
+            # this Deny's Action is StartSession alone, so SendCommand is untouched
+            # while the StartSession half of SsmSessionDocuments' StartSession +
+            # SendCommand pairing stops being granted. That pairing was an over-grant
+            # the API already refused; the inversion retires it as a side effect
+            # instead of leaving it to be reasoned about again.
+            #
+            # ACCEPTED RISK, stated rather than papered over: if AWS adds a NEW
+            # RESOURCE TYPE to the StartSession authorisation context, that resource
+            # is not named here, this Deny matches it, and the whole call fails. The
+            # same applies if a future edit adds a legitimate StartSession Allow and
+            # does not name its resource here. Both fail CLOSED -- the correct
+            # direction for a shell boundary -- but they present as an outage rather
+            # than as a refusal. That makes this a deliberate operational trade with an
+            # owner rather than a hardening to slip into an unrelated change.
             #
             # The Fargate task is permanently shell-capable once enableExecuteCommand
             # is set -- the platform bind-mounts its SSM agent in -- so IAM is the
             # only thing between a principal and a root shell in the container. The
             # load-bearing halves of that are the total absence of ecs:ExecuteCommand
-            # and the absence of any interactive-document Allow. Port-forwarding needs
-            # none of these documents: AWS documents stopping non-ECS-Exec sessions
-            # with a Deny on ssm:StartSession scoped to the task, which would be
-            # pointless if ecs:ExecuteCommand gated the path.
-            "Sid": "DenyInteractiveSessionDocuments",
+            # and the absence of any interactive-document Allow; this Deny is now a
+            # third, and unlike the enumerated version it does not depend on having
+            # guessed tomorrow's document names. Port-forwarding needs none of those
+            # documents: AWS documents stopping non-ECS-Exec sessions with a Deny on
+            # ssm:StartSession scoped to the task, which would be pointless if
+            # ecs:ExecuteCommand gated the path.
+            "Sid": "DenyStartSessionOutsideTheLane",
             "Effect": "Deny",
             "Action": [
                 "ssm:StartSession",
             ],
-            "Resource": [
-                "arn:aws:ssm:*::document/SSM-SessionManagerRunShell",
-                "arn:aws:ssm:*::document/AWS-StartInteractiveCommand",
-                "arn:aws:ssm:*::document/AWS-StartSSHSession",
-                "arn:aws:ssm:*::document/AWS-StartNonInteractiveCommand",
+            "NotResource": [
+                "arn:aws:ssm:*::document/AWS-StartPortForwardingSession",
+                "arn:aws:ec2:*:*:instance/*",
+                "arn:aws:ecs:*:*:task/kirocrew-crew-*/*",
+                "arn:aws:ssm:*:*:session/*",
             ],
         },
         {

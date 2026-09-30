@@ -161,7 +161,11 @@ def _write_runs(payload: str) -> None:
     ``store.remove_run_dir`` are offloaded).
     """
     f = _runs_file()
-    f.parent.mkdir(parents=True, exist_ok=True)
+    # Guarded rather than a bare `mkdir(parents=True)`: the write below refuses a
+    # linked parent, but a bare mkdir has already BUILT the tree inside the link's
+    # target by the time it runs, so the refusal arrives after the directories
+    # exist where the planter wants them. The refusal has to come first.
+    store.mkdir_refusing_links(f.parent)
     # The shared helper replaces through ``replace_with_retry``, so a transient
     # Windows sharing violation does not silently lose the save. It also
     # picks a random mkstemp name, applies the owner-only lockdown to the temp
@@ -1581,6 +1585,25 @@ async def _handle_my_repos(request: web.Request) -> web.Response:
         return web.json_response({"code": "provider_unavailable", "error": str(exc)}, status=502)
 
 
+async def _handle_review_queue(request: web.Request) -> web.Response:
+    """GET .../review-queue — open PRs where the ``gh`` user is a requested
+    reviewer. Like ``/my-repos``, an unusable ``gh`` is a 200 ``setup_required``."""
+    try:
+        rows, truncated = await asyncio.to_thread(discovery.list_review_requested)
+    except discovery.GhSetupError as exc:
+        return web.json_response({"prs": [], "setup_required": True, "error": str(exc)})
+    except discovery.GhError as exc:
+        logger.warning("review queue failed: %s", exc)
+        return web.json_response(
+            {"code": "provider_unavailable", "error": "upstream service error"}, status=502
+        )
+    # The same change id the repo list carries: the detail pane scopes posting by
+    # it, and an empty one would publish every change of a multi-PR run.
+    for row in rows:
+        row["change_id"] = review_driver.change_id_for(row["url"])
+    return web.json_response({"prs": rows, "truncated": truncated})
+
+
 def _pull_request_ref(link: str) -> dict | None:
     """Parse a pasted GitHub PR or GitLab MR URL into the repo + its identity.
 
@@ -2467,6 +2490,9 @@ async def _ensure_followup_folder(state: Any) -> str:
             "hidden": False,
             "parent_id": "",
             "project_dir": "",
+            # Same stamp the dashboard's own folder creators write; the sidebar's
+            # ``created`` folder sort reads it.
+            "created_at": time.time(),
         }
         folders.append(folder)
         return True, str(folder["id"])
@@ -2620,26 +2646,45 @@ async def _followup_sweep_loop() -> None:
 
 def register_routes(app: web.Application) -> None:
     """Register the deterministic review routes on the gateway app."""
+
     # Self-heal: ensure the data layout (dirs + config.json with resolved_paths)
     # exists at startup. Without this, the UI gets {} from the generic config
     # endpoint and shows a perpetual "Initializing…" message because it needs
     # resolved_paths.reports to render the main view.
-    try:
-        store.ensure_layout()
-    except Exception:  # pragma: no cover - never break gateway startup
-        logger.warning("code-review-sage: ensure_layout failed at startup", exc_info=True)
+    #
+    # OFF the event loop, for the same reason as the reap below: `register_routes`
+    # is sync and `start_dashboard` is a coroutine, so anything in this body runs
+    # on the loop, and the layout pass walks each of nine directories' ancestor
+    # chain to refuse a planted link before creating it. On a network-homed or
+    # stalled data directory those walks are exactly the "synchronous filesystem
+    # walk" that freezes the gateway heartbeat.
+    #
+    # An `on_startup` hook keeps the ordering the UI depends on: aiohttp runs
+    # these hooks during runner setup, BEFORE the site accepts a connection, so
+    # the layout is in place before any request can read `resolved_paths`. The
+    # hook is what lets the walk happen in a worker thread while preserving that.
+    async def _ensure_layout_on_startup(_app: web.Application) -> None:
+        try:
+            await asyncio.to_thread(store.ensure_layout)
+        except Exception:  # pragma: no cover - never break gateway startup
+            logger.warning("code-review-sage: ensure_layout failed at startup", exc_info=True)
+
+    app.on_startup.append(_ensure_layout_on_startup)
     _load_runs()  # restore durable job status (mark orphaned 'running' as 'interrupted')
     # A run dir with no registry entry is unreachable residue (crash between the
     # two writes, or an older layout) — reap it once at startup, but OFF the event
     # loop. `register_routes` is a sync function called from `start_dashboard`,
     # which is a coroutine, so everything here runs on the loop: this reap walks
     # every run dir and deletes the unreferenced ones, and its cost grows with
-    # accumulated residue, so on a host with stale runs it stalled gateway startup.
-    # `ensure_layout` and `_load_runs` above stay inline deliberately — they are
-    # bounded, and the routes cannot answer correctly until they have run (an empty
-    # `_RUNS` or missing `resolved_paths` is what the UI renders as a perpetual
-    # "Initializing…"). Cleanup has no such ordering requirement, so it is the one
-    # that can wait.
+    # accumulated residue, so on a host with stale runs it stalls gateway startup.
+    # The layout pass above is a startup hook for the same reason.
+    #
+    # `_load_runs` is the one that stays inline, and it is the cheap one: a single
+    # `read_text` of one registry file, which returns immediately when the file is
+    # absent. What both hooks keep is the ordering the UI depends on -- aiohttp
+    # runs `on_startup` before the site accepts a connection, so a request never
+    # observes a missing `resolved_paths` or an empty `_RUNS`, which is what it
+    # would render as a perpetual "Initializing" message.
 
     async def _reap_on_startup(_app: web.Application) -> None:
         try:
@@ -2673,6 +2718,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/code-review-sage/repo-prs", _handle_repo_prs)
     app.router.add_get("/api/apps/code-review-sage/recent-repos", _handle_recent_repos)
     app.router.add_get("/api/apps/code-review-sage/my-repos", _handle_my_repos)
+    app.router.add_get("/api/apps/code-review-sage/review-queue", _handle_review_queue)
     app.router.add_get("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_post("/api/apps/code-review-sage/repos", _handle_repos)
     app.router.add_delete("/api/apps/code-review-sage/repos", _handle_repos)

@@ -21,10 +21,12 @@ import ChatMessageList, { type VirtualTranscriptHandle } from './ChatMessageList
 import ErrorNotice from '../components/ErrorNotice'
 import { JumpToBottomButton } from './ChatScrollChrome'
 import FollowUpBar from '../components/FollowUpBar'
+import ChatFooter from '../pages/chat/ChatFooter'
 import { deriveFollowUpOptions } from './protocol'
 import { useComposerDraft } from './useComposerDraft'
 import { useAppApi } from './index'
 import type { ChatMessage } from '../types'
+import { loadChatConfig } from '../pages/chat/ChatSettings'
 
 import { i18nT } from '../i18n/t'
 export interface ChatEmbedProps {
@@ -66,6 +68,16 @@ export interface ChatEmbedProps {
    * fixed offset that breaks whenever the composer's height changes.
    */
   aboveComposer?: ReactNode
+  /**
+   * Cap for the composer's auto-grow, in px. The textarea grows with the draft
+   * up to this height, then keeps it and scrolls. Defaults to the shared
+   * `useComposerDraft` cap (240px), which suits a full-height page but not a
+   * host that boxes the embed at a fixed height: there a maxed-out draft takes
+   * most of the box and the transcript above it is squeezed to a few lines. A
+   * fixed-height host passes a proportion of its own box here; the resting
+   * (empty) size is unaffected. Omitted, behaviour is unchanged.
+   */
+  composerMaxHeight?: number
 }
 
 /** Stable empty transcript. A fresh `[]` fallback would be a new identity on every
@@ -88,8 +100,24 @@ interface ChatSlotData {
 export const EMBED_PAGE_LIMIT = 200
 /** The handler clamps `limit` here; a wider ask is silently this. */
 export const EMBED_PAGE_LIMIT_MAX = 500
+/** Poll cadence while the slot runs (see the query's `refetchInterval`). */
+const RUNNING_POLL_MS = 1000
+/** How long a streaming reply must stay unchanged before the working indicator
+ *  takes over from the reply's own caret. The tail only grows once per poll,
+ *  so the window spans two polls: one slow read must not flash the indicator
+ *  under a reply that is still arriving. */
+export const EMBED_STREAM_IDLE_MS = RUNNING_POLL_MS * 2 + 500
 
-function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer }: ChatEmbedProps) {
+function ChatEmbed({
+  slotKey,
+  agent,
+  placeholder,
+  frameless,
+  startAtBottom,
+  onSend,
+  aboveComposer,
+  composerMaxHeight,
+}: ChatEmbedProps) {
   const api = useAppApi()
   const lastHashRef = useRef('')
   // The transcript is ChatMessageList's virtualized mount: it owns the scroller
@@ -110,6 +138,17 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
   const [widened, setWidened] = useState<{ slot: string; limit: number } | null>(null)
   const limit = widened?.slot === slotKey ? widened.limit : EMBED_PAGE_LIMIT
 
+  // An embed is as long-lived as a ChatPane, so a one-shot read would leave it
+  // on the old size after the user changes the setting elsewhere (ChatPane.tsx
+  // follows the same `mc-config-changed`/`focus` reload).
+  const [messageFontSize, setMessageFontSize] = useState(() => loadChatConfig().messageFontSize)
+  useEffect(() => {
+    const reload = () => setMessageFontSize(loadChatConfig().messageFontSize)
+    window.addEventListener('focus', reload)
+    window.addEventListener('mc-config-changed', reload)
+    return () => { window.removeEventListener('focus', reload); window.removeEventListener('mc-config-changed', reload) }
+  }, [])
+
   const { data: slotData, refetch, isPlaceholderData, isError } = useQuery({
     queryKey: ['app-sdk-embed', slotKey, limit],
     queryFn: () => api.get<ChatSlotData>(
@@ -123,7 +162,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
       prevQuery && (prevQuery.queryKey as unknown[])[1] === slotKey ? prev : undefined,
     refetchInterval: (query) => {
       const running = query.state.data?.running ?? false
-      return running ? 1000 : 5000
+      return running ? RUNNING_POLL_MS : 5000
     },
   })
 
@@ -191,7 +230,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
    *  see useComposerDraft's own docs. Picking a follow-up option edits the draft
    *  (matching every other surface) instead of sending immediately. */
   const { draft, setDraft, textareaRef, picked, toggleOption, composition, submitOnEnter } =
-    useComposerDraft({ followUpOptions })
+    useComposerDraft({ followUpOptions, maxHeight: composerMaxHeight })
 
   // startAtBottom follow is owned by the virtualizer behind ChatMessageList.
   // Non-startAtBottom embeds keep the message-arrival smooth scroll: it fires
@@ -299,7 +338,10 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
   )
 
   return (
-    <div className={`flex flex-col h-full min-h-0 overflow-hidden ${frameless ? '' : 'border border-border rounded-lg bg-bg'}`}>
+    <div
+      className={`flex flex-col h-full min-h-0 overflow-hidden ${frameless ? '' : 'border border-border rounded-lg bg-bg'}`}
+      style={{ '--mc-message-font-size': `${messageFontSize}px` } as React.CSSProperties}
+    >
       {!frameless && (
         <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
           <span className={`w-2 h-2 rounded-full shrink-0 ${running ? 'bg-ok animate-pulse' : 'bg-accent'}`} />
@@ -342,6 +384,20 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
           ) : messages.length === 0 && !running ? (
             <div className="text-center text-muted text-[13px] py-10">{i18nT('appSdk.chatEmbed.session_ready_type_a_message_to_start')}</div>
           ) : undefined,
+          // The main chat's working indicator (ChatFooter, shared with ChatPage
+          // and ChatPane), after the last row, so a running turn reads as "the
+          // reply is coming" where the reply will land. The poll carries no
+          // stop or compaction state, so only the plain running branch applies.
+          belowRows: (
+            <ChatFooter
+              running={running}
+              stopping={false}
+              state={running ? 'streaming' : ''}
+              lastRole={tail?.role ?? ''}
+              streamTick={tail?.role === 'streaming' ? (tail.content?.length ?? 0) : 0}
+              streamIdleMs={EMBED_STREAM_IDLE_MS}
+            />
+          ),
         }}
       />
 
@@ -370,7 +426,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
           rows={1}
           {...composition}
           aria-label={i18nT('appSdk.chatEmbed.chat_message')}
-          className="flex-1 min-w-0 min-h-[38px] resize-none overflow-y-auto px-3 py-2 text-sm bg-bg-elevated border border-border rounded-md text-text outline-hidden focus-visible:border-accent transition-colors"
+          className="flex-1 min-w-0 min-h-[38px] resize-none overflow-y-auto px-3 py-2 mc-message-font-text bg-bg-elevated border border-border rounded-md text-text outline-hidden focus-visible:border-accent transition-colors"
           value={draft}
           onChange={e => setDraft(e.target.value)}
           onKeyDown={e => submitOnEnter(e, () => send())}

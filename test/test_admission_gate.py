@@ -18,6 +18,7 @@ import time
 import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -176,7 +177,7 @@ class TestCronAdmissionDeferral:
         # Deferred: never fired, not marked failed, still due next tick.
         assert executed == []
         assert job.last_status is None
-        assert job.id not in svc._running_tasks
+        assert job.id not in svc._claims
         infos = [
             r
             for r in caplog.records
@@ -379,6 +380,211 @@ class TestSpawnAdmissionGate:
         assert unavailable["metadata"]["min_gb"] == 4.5  # floor plus the pending process
         assert unavailable["metadata"]["task"] == "test task"
 
+    @pytest.mark.parametrize(
+        ("configured", "expected_min_gb"),
+        [
+            (0.5, 4.5),  # floor plus one start at the configured cost
+            (2.0, 6.0),  # an operator's higher pin still prices the start
+        ],
+    )
+    def test_the_pending_start_is_priced_at_the_configured_cost(
+        self, configured, expected_min_gb
+    ) -> None:
+        """A start costs what a runtime needs to START, not what a run grew to.
+
+        A run's peak RSS is its whole subtree -- test suites and builds it
+        launched included -- so neither a learned p90 nor a live worker's peak
+        may price the next start: that held ordinary spawns at 10 GB+ on a
+        laptop. A settled worker already sits inside the free-memory reading
+        and owes nothing.
+        """
+        from kiro_crew.subagent import SubagentInfo
+
+        mgr = self._mgr()
+        mgr._agents["heavy"] = SubagentInfo(
+            id="heavy", task="w", peak_rss_gb=7.5, last_rss_gb=1.0, _rss_samples=2, _pid=4242
+        )
+        seen: list[float] = []
+
+        def memory_check(*, min_gb, **_kw):
+            seen.append(min_gb)
+            return True, 32.0
+
+        with (
+            patch("kiro_crew.subagent.check_memory_available", side_effect=memory_check),
+            patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg,
+            patch("kiro_crew.subagent.cached_admission_check", return_value=_refused()),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+        ):
+            mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
+            mock_cfg.load.return_value.agent.subagent_cost_gb = configured
+            mock_sel.return_value.log_tool_invocation = MagicMock()
+
+            mgr.spawn(task="test task", parent_session_key="sess-1")
+
+        assert seen == [pytest.approx(expected_min_gb)]
+
+    def test_low_memory_deferral_names_what_it_needs(self) -> None:
+        """A deferral says how much memory it saw and how much the start needs."""
+        mgr = self._mgr()
+        assert mgr._taskq is not None
+        with (
+            patch("kiro_crew.subagent.check_memory_available", return_value=(False, 3.0)),
+            patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg,
+            patch("kiro_crew.subagent.cached_admission_check", return_value=_admitted()),
+            patch("kiro_crew.subagent.sel") as mock_sel,
+        ):
+            mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
+            mock_cfg.load.return_value.agent.subagent_cost_gb = 0.5
+            mock_sel.return_value.log_tool_invocation = MagicMock()
+
+            info = mgr.spawn(task="test task", parent_session_key="sess-1")
+
+        assert info is not None and info.queued is True
+        call_kwargs = mock_sel.return_value.log_tool_invocation.call_args[1]
+        assert call_kwargs["outcome"] == "deferred_low_memory"
+        assert call_kwargs["metadata"]["startup_cost_gb"] == pytest.approx(0.5)
+        assert call_kwargs["metadata"]["min_gb"] == pytest.approx(4.5)
+        deferred = [e for e in mgr._taskq.events(info.id) if e.kind == "deferred"]
+        reason = str(deferred[-1].data.get("reason")) if deferred else ""
+        assert "3.0 GB available" in reason
+        assert "(0.5 GB per warming start)" in reason
+
+    # ── the deferral reason reaches the UI event and the caller ──────────────
+    #
+    # ``subagent_queued`` carried only a count, so every UI reading it rendered
+    # "queued behind the concurrency limit" for a row the MEMORY guard parked,
+    # and ``POST /api/spawn`` answered ``spawned`` for it. The gate's verdict is
+    # unchanged here; only what it tells the caller is.
+
+    def _spawn_capturing_queued(
+        self, mgr, *, memory: tuple[bool, float], admission: rs.AdmissionDecision
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        """Run ``spawn`` on a live loop and collect every ``subagent_queued`` extra."""
+        events: list[dict[str, Any]] = []
+
+        async def on_event(etype: str, info: Any, extra: dict[str, Any]) -> None:
+            if etype == "subagent_queued":
+                events.append(dict(extra))
+
+        async def run() -> Any:
+            mgr._on_event = on_event
+            with (
+                patch("kiro_crew.subagent.check_memory_available", return_value=memory),
+                patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg,
+                patch("kiro_crew.subagent.cached_admission_check", return_value=admission),
+                patch("kiro_crew.subagent.sel") as mock_sel,
+            ):
+                mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
+                mock_cfg.load.return_value.agent.subagent_cost_gb = 0.5
+                mock_sel.return_value.log_tool_invocation = MagicMock()
+                info = mgr.spawn(task="test task", parent_session_key="sess-1")
+            deadline = time.monotonic() + 2.0
+            while not events and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            return info
+
+        info = asyncio.run(run())
+        return info, events
+
+    def test_low_memory_deferral_names_its_reason_on_the_queued_event(self) -> None:
+        mgr = self._mgr()
+        assert mgr._taskq is not None
+        info, events = self._spawn_capturing_queued(
+            mgr, memory=(False, 3.2), admission=_admitted()
+        )
+        assert info is not None and info.queued is True and info.done is False
+        assert info.queued_reason == "low_memory"
+        assert "3.2 GB available" in info.queued_reason_detail
+        assert events, "the deferral must still emit the advisory queued count"
+        last = events[-1]
+        assert last["queued"] == 1
+        assert last["reason"] == "low_memory"
+        assert last["available_gb"] == pytest.approx(3.2)
+        # spawn_min_memory_gb 4.0 + one warming start at the configured 0.5.
+        assert last["required_gb"] == pytest.approx(4.5)
+
+    def test_posture_critical_deferral_names_its_reason_on_the_queued_event(self) -> None:
+        mgr = self._mgr()
+        assert mgr._taskq is not None
+        info, events = self._spawn_capturing_queued(
+            mgr, memory=(True, 8.0), admission=_refused()
+        )
+        assert info is not None and info.queued is True
+        assert info.queued_reason == "posture_critical"
+        assert info.queued_reason_detail == _refused().reason
+        assert events and events[-1]["reason"] == "posture_critical"
+        assert events[-1]["available_gb"] == pytest.approx(_refused().available_gb)
+        assert "required_gb" not in events[-1]
+
+    def test_parked_defer_publishes_the_label_only_after_the_write_succeeds(self) -> None:
+        """The coroutine dispatcher writes the defer off the loop, after the gate
+        returned. The label must ride on THAT emit: published earlier, a row the
+        store turned out not to hold (refused, not queued) would leave a memory
+        label on the parent for its other, capacity-queued rows to wear."""
+        from kiro_crew.subagent import SubagentInfo
+
+        mgr = self._mgr()
+        store = mgr._taskq
+        assert store is not None
+        events: list[dict[str, Any]] = []
+
+        async def on_event(etype: str, info: Any, extra: dict[str, Any]) -> None:
+            if etype == "subagent_queued":
+                events.append(dict(extra))
+
+        mgr._on_event = on_event
+        wait = {"reason": "low_memory", "available_gb": 3.2, "required_gb": 4.5}
+
+        def _park(agent_id: str) -> SubagentInfo:
+            queued = SubagentInfo(
+                id=agent_id, task="t", parent_session_key="sess-1", queued=True
+            )
+            refused = SubagentInfo(
+                id=agent_id, task="t", parent_session_key="sess-1", done=True, error="refused"
+            )
+            mgr._admission.park_defer(
+                agent_id,
+                reason="low memory: 3.2 GB available, need 4 GB",
+                parent_session_key="sess-1",
+                batch_id="",
+                queued=queued,
+                refused=refused,
+                wait=wait,
+            )
+            return queued
+
+        async def run() -> tuple[Any, Any]:
+            with patch.object(type(mgr), "_announce_rejection", lambda self, info: info):
+                # No row behind this id: the write reports none and the row is
+                # refused -- no label may be left behind.
+                missing = await mgr._admission.finish_parked_defer(_park("ghost"))
+                no_label_after_refusal = dict(mgr._queue_wait)
+                # A real row: the write succeeds and the label rides the emit.
+                rec = mgr._admission.taskq_build_record(
+                    "row1",
+                    {"task": "t", "parent_session_key": "sess-1"},
+                    parent_session_key="sess-1",
+                    memory_store="",
+                    app="",
+                    model="",
+                    allowed_tools=None,
+                    approval_mode=None,
+                )
+                store.accept([rec])
+                held = await mgr._admission.finish_parked_defer(_park("row1"))
+            deadline = time.monotonic() + 2.0
+            while not events and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            return (missing, no_label_after_refusal), held
+
+        (missing, no_label_after_refusal), held = asyncio.run(run())
+        assert missing.done is True and missing.error == "refused"
+        assert no_label_after_refusal == {}
+        assert held.queued is True and held.done is False
+        assert mgr._queue_wait.get("sess-1", {}).get("reason") == "low_memory"
+        assert events and events[-1]["reason"] == "low_memory"
+
 
 # ── config key ───────────────────────────────────────────────────────────────
 
@@ -479,13 +685,13 @@ class TestCronExprPassthrough:
         job.last_run_ts = time.time() - 120
 
         def claiming_check(cfg: object | None = None):
-            svc._executing.add(job.id)  # simulate a manual run claiming it
+            svc._claim_run(job.id, "manual")  # simulate a manual run claiming it
             return _admitted()
 
         with patch("kiro_crew.cron.admission_check", side_effect=claiming_check):
             await svc._on_timer()
         assert executed == []  # revalidated away, no duplicate
-        svc._executing.discard(job.id)
+        svc._claims.pop(job.id, None)
         await svc.stop()
 
     @pytest.mark.asyncio
@@ -493,7 +699,7 @@ class TestCronExprPassthrough:
         self, tmp_path: Path
     ) -> None:
         # Harder variant: the manual run starts AND FINISHES during the
-        # admission await, so the job is not in _executing. An id-only
+        # admission await, so the job holds no claim. An id-only
         # revalidation would double-fire; the live-object _is_due re-check
         # (advanced last_run_ts) must catch it.
         executed: list[str] = []
@@ -767,3 +973,56 @@ class TestCronExprPassthrough:
         # The refresh lock was released, not leaked:
         assert rs._cache_refresh_inflight.acquire(blocking=False)
         rs._cache_refresh_inflight.release()
+
+
+class TestALearnedWholeTreePeakNeverPricesAStart:
+    """A cost log whose p90 is a whole-tree peak does not raise the start bar."""
+
+    def test_a_132_gb_learned_p90_leaves_the_bar_at_floor_plus_start_cost(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.subagent import SubagentManager
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        log = tmp_path / "subagents" / "cost_samples.jsonl"
+        log.parent.mkdir(parents=True)
+        now = time.time()
+        log.write_text(
+            "".join(
+                json.dumps(
+                    {"agent": "kirocrew", "mem_gb": v, "cpu_cores": 1.0, "ts": now - i}
+                )
+                + "\n"
+                for i, v in enumerate([1.2] * 5 + [132.3] * 5)
+            )
+        )
+        sessions = MagicMock()
+        sessions.get_agent_selection.return_value = ("template", "")
+        mgr = SubagentManager(
+            sessions=sessions,
+            ctx_builder=MagicMock(),
+            on_done=MagicMock(),
+            max_concurrent=3,
+        )
+        # A learned p90 published on the manager, where a gate that priced
+        # starts from learned costs would read it. The start bar ignores it.
+        mgr._learned_costs_gb = {"kirocrew": 132.3}  # type: ignore[attr-defined]
+        asked: list[float] = []
+
+        def _check(min_gb: float) -> tuple[bool, float]:
+            asked.append(min_gb)
+            return (85.9 >= min_gb, 85.9)
+
+        with patch(
+            "kiro_crew.subagent.check_memory_available", side_effect=_check
+        ), patch("kiro_crew.subagent.KiroCrewConfig") as mock_cfg, patch(
+            "kiro_crew.subagent.cached_admission_check", return_value=_admitted()
+        ), patch(
+            "kiro_crew.subagent.sel"
+        ):
+            mock_cfg.load.return_value.agent.spawn_min_memory_gb = 4.0
+            mock_cfg.load.return_value.agent.subagent_cost_gb = 0.5
+            info = mgr.spawn(task="t", parent_session_key="s")
+
+        assert asked == [pytest.approx(4.5)]
+        assert info is not None and info.queued is False

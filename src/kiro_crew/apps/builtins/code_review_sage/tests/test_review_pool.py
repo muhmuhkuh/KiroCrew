@@ -48,6 +48,7 @@ class FakeHandle:
         self._script = script or []
         self._gate = gate
         self.approvals: list = []
+        self.rejections: list = []
         self.destroyed = False
 
     async def prompt(self, message, timeout=0):
@@ -59,6 +60,9 @@ class FakeHandle:
 
     async def approve_tool(self, request_id, option_id=None):
         self.approvals.append(request_id)
+
+    async def reject_tool(self, request_id):
+        self.rejections.append(request_id)
 
     async def destroy(self):
         self.destroyed = True
@@ -83,6 +87,7 @@ class FakeRuntime:
         self._seq = 0
         self.script = []
         self.gate = None
+        self.last_handle = None
         FakeRuntime.instances.append(self)
 
     def is_alive(self):
@@ -101,6 +106,7 @@ class FakeRuntime:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         h = FakeHandle(self, sid, script=list(self.script), gate=self.gate)
+        self.last_handle = h
         self.sessions[sid] = h
         self._session_queues[sid] = object()
         # mirror the handle destroy -> pop from _session_queues too
@@ -292,6 +298,71 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
         # find it via the runtime's last created session id
         self.assertEqual(rt._seq, 1)
         await pool.end_batch()
+
+    async def test_policy_deny_is_rejected_before_auto_approval(self):
+        script = [
+            _ev(
+                rp.EVENT_PERMISSION_REQUEST,
+                request_id="r-policy",
+                title="WorkspaceSearch",
+                tool_kind="other",
+            )
+        ]
+        _install_fake_runtime(self, script=script)
+        refusal_for = getattr(rp, "refusal_for", None)
+        self.assertIsNotNone(refusal_for, "review pool has no identity-bearing permission gate")
+        seen = {}
+
+        def _deny(event, **kwargs):
+            seen.update(kwargs)
+            return "policy"
+
+        with unittest.mock.patch.object(rp, "refusal_for", _deny):
+            pool = ReviewPool(agent="review-agent", work_dir=_work_dir(self))
+            expected_agent = pool._agent
+            await pool.begin_batch()
+            await pool.send("t")
+            handle = FakeRuntime.instances[0].last_handle
+            await pool.end_batch()
+
+        self.assertEqual(handle.approvals, [])
+        self.assertEqual(handle.rejections, ["r-policy"])
+        self.assertEqual(seen["session_key"], handle.session_id)
+        self.assertEqual(seen["agent"], expected_agent)
+        self.assertEqual(seen["app"], "code-review-sage")
+        self.assertFalse(seen["security_only"])
+
+    async def test_policy_deny_audit_survives_reject_failure(self):
+        calls: list = []
+
+        class _FakeSel:
+            def log_tool_invocation(self, **kwargs):
+                calls.append(kwargs)
+
+        async def _reject(_handle, _request_id):
+            raise RuntimeError("wire closed")
+
+        script = [
+            _ev(
+                rp.EVENT_PERMISSION_REQUEST,
+                request_id="r-policy",
+                title="WorkspaceSearch",
+                tool_kind="other",
+            )
+        ]
+        _install_fake_runtime(self, script=script)
+        with unittest.mock.patch.object(rp, "refusal_for", lambda *_a, **_kw: "policy"), \
+                unittest.mock.patch.object(rp, "_sel", lambda: _FakeSel()), \
+                unittest.mock.patch.object(FakeHandle, "reject_tool", _reject):
+            pool = ReviewPool(work_dir=_work_dir(self))
+            await pool.begin_batch()
+            with self.assertRaisesRegex(RuntimeError, "wire closed"):
+                await pool.send("t")
+            await pool.end_batch()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["outcome"], "rejected_hook_deny")
+        self.assertEqual(calls[0]["request_id"], "r-policy")
 
     async def test_tool_call_emits_sel_audit(self):
         calls: list = []
@@ -515,6 +586,60 @@ class TestReviewEffort(unittest.TestCase):
 
     def test_write_effort_overlay_never_raises(self):
         _write_effort_overlay("/proc/nonexistent/\x00bad", "claude-sonnet-4.6")
+
+    def test_a_planted_link_at_the_overlay_name_takes_no_bytes(self):
+        """`work_dir` is the review worker's OWN cwd, so it is plantable.
+
+        A by-name `write_text` follows a link at the final component and
+        TRUNCATES whatever it points at, which turns this best-effort overlay
+        into an arbitrary-file-truncation primitive for a prompt-injected worker.
+        The staged replace lands on the NAME instead: the link is replaced, and
+        the file it aliased keeps its bytes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.txt"
+            victim.write_text("keep me\n", encoding="utf-8")
+            settings = Path(tmp) / ".kiro" / "settings"
+            settings.mkdir(parents=True)
+            cli = settings / "cli.json"
+            try:
+                cli.symlink_to(victim)
+            except (OSError, NotImplementedError):
+                self.skipTest("planting the attack needs symlink creation")
+
+            _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me\n",
+                             "the aliased file was written through")
+            self.assertFalse(cli.is_symlink(), "the link survived the publish")
+
+    def test_a_planted_link_at_the_overlay_name_contributes_no_keys(self):
+        """The overlay READS `cli.json` before publishing the merged document.
+
+        The sibling case above covers the write: the publish lands on the name, so
+        the aliased file keeps its bytes. This covers the read, where the harm runs
+        the other way -- a following read copies the aliased document's keys INTO
+        the document published under this name, and the next worker loads that as
+        its own settings. The no-follow read refuses the plant, so the overlay is
+        built from "no settings yet".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.json"
+            victim.write_text('{"borrowed_key": "not-from-this-file"}', encoding="utf-8")
+            settings = Path(tmp) / ".kiro" / "settings"
+            settings.mkdir(parents=True)
+            cli = settings / "cli.json"
+            try:
+                cli.symlink_to(victim)
+            except (OSError, NotImplementedError):
+                self.skipTest("planting the attack needs symlink creation")
+
+            _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
+
+            published = json.loads(cli.read_text(encoding="utf-8"))
+            self.assertNotIn("borrowed_key", published,
+                             "the aliased document's keys were republished")
+            self.assertEqual(list(published), ["chat.modelDefaults"])
 
     def test_reviewer_model_falls_back_to_default(self):
         self.assertEqual(

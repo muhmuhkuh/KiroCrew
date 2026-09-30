@@ -188,7 +188,7 @@ describe('chat sidebar — flat view respects the folder filter', () => {
     // bottom and simply overflows into the menu's own scroll. Anything placed
     // below it would drift out of easy reach. jsdom cannot measure layout, so
     // assert the two contracts that produce the behavior: the menu itself is the
-    // single scroll container, and every folder row follows the Sort by heading.
+    // single scroll container, and every folder row follows the Sort sessions by heading.
     const folders = Array.from({ length: 30 }, (_, i) => ({ id: `f${i}`, name: `folder-${i}`, collapsed: false, order: i }))
     const { getByLabelText, findByTestId } = renderSidebar([looseChat], folders)
     fireEvent.keyDown(getByLabelText('Sort and filter sessions'), { key: 'Enter' })
@@ -200,9 +200,9 @@ describe('chat sidebar — flat view respects the folder filter', () => {
     expect(menu.querySelectorAll('.overflow-y-auto').length).toBe(0)
     const rows = [...menu.querySelectorAll('[data-testid^="folder-filter-f"]')]
     expect(rows.length).toBe(30)
-    const sortLabel = [...menu.children].find(el => el.textContent?.trim() === 'Sort by')!
+    const sortLabel = [...menu.children].find(el => el.textContent?.trim() === 'Sort sessions by')!
     expect(sortLabel).toBeTruthy()
-    // DOCUMENT_POSITION_FOLLOWING (4): the first folder row comes after Sort by.
+    // DOCUMENT_POSITION_FOLLOWING (4): the first folder row comes after Sort sessions by.
     expect(sortLabel.compareDocumentPosition(rows[0]) & 4).toBeTruthy()
   })
 
@@ -236,6 +236,11 @@ describe('chat sidebar — flat view respects the folder filter', () => {
     expect(row.textContent).toContain('1 hidden folder')
     expect(queryByTestId('hidden-reveal-cronsF')).toBeNull() // not at any other level
     expect(queryByTestId('folder-menu-cronsF')).toBeNull()   // still hidden
+    // Root lane: the button carries the session rows' root pad class, no inline pad.
+    const button = row.querySelector('button')!
+    expect(button.hasAttribute('data-folder-hidden-reveal')).toBe(true)
+    expect(button.style.paddingLeft).toBe('')
+    expect(button.className.split(/\s+/)).toContain('pl-2.5')
   })
 
   it('peeking the row open renders the hidden folder\'s real block, and closes again', () => {
@@ -269,6 +274,13 @@ describe('chat sidebar — flat view respects the folder filter', () => {
       [{ ...cronInFolder, folder_id: 'childF' }, looseChat], folders)
     expect(getByTestId('hidden-reveal-parentF').textContent).toContain('1 hidden folder')
     expect(queryByTestId('hidden-reveal-root')).toBeNull()
+    // The row sits in parent's folder body, so it takes the body's row pad via
+    // the `data-folder-hidden-reveal` hook in FOLDER_ROW_PAD_CLS. An inline
+    // paddingLeft would be un-overridable and compound per nesting level.
+    const button = getByTestId('hidden-reveal-parentF').querySelector('button')!
+    expect(button.hasAttribute('data-folder-hidden-reveal')).toBe(true)
+    expect(button.style.paddingLeft).toBe('')
+    expect(button.className.split(/\s+/)).toContain('pl-2.5')
   })
 
   it('reports one row per container, and stays silent under an already-hidden ancestor', () => {

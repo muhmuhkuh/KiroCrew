@@ -11,10 +11,21 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    request["user"] = "local-app"
+    request["app"] = ""
+    state = request.app.get("state")
+    if state is not None:
+        state.owner_id = ""
+    return await handler(request)
+
+
 def _make_app() -> web.Application:
     from kiro_crew.dashboard.handlers import api_kirocrew_config_patch
 
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
+    app["state"] = MagicMock()
     app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
     return app
 
@@ -91,6 +102,7 @@ def _arm(app: web.Application, state: SimpleNamespace) -> None:
     from kiro_crew.dashboard.server import _register_config_watch
 
     app["state"] = state
+    state.set_dynamic_cards_enabled = MagicMock()
     initial = KiroCrewConfig.load()
     _register_config_watch(app, state, initial=initial)  # type: ignore[arg-type]
 
@@ -112,6 +124,8 @@ def _live_state(**overrides) -> SimpleNamespace:
         channel_manager=None,
         _slots={},
         push_slots_update=lambda: None,
+        push_refresh=MagicMock(),
+        notify=MagicMock(),
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -131,6 +145,36 @@ class TestRoleModels:
         assert data["agent"]["role_models"]["subagent"] == "claude-sonnet-4.6"
         # Sibling agent keys survive the nested write.
         assert data["agent"]["approval_mode"] == "auto"
+
+    @pytest.mark.asyncio
+    async def test_a_write_the_publish_floor_refuses_is_a_coded_400_not_a_500(
+        self, tmp_config, monkeypatch
+    ) -> None:
+        """``ConfigWriteRefused`` is a ``ValueError``, but it is the operator's input
+        being declined, not a server failure: it must be answered as a coded 400
+        carrying the floor's one-line instruction, before the generic ``ValueError``
+        arm that reports a malformed section as a 500. The field is not editable
+        through this surface today, so the refusal is raised the way the floor
+        raises it rather than provoked through the body."""
+        from kiro_crew.config import loader as loader_mod
+        from kiro_crew.config.loader import ConfigWriteRefused
+
+        message = (
+            "agent.deepseek_env entry 'DEEPSEEK_API_KEY' holds a literal value, so the "
+            "config write was refused."
+        )
+
+        def refuse(*_args, **_kwargs):
+            raise ConfigWriteRefused(message)
+
+        monkeypatch.setattr(loader_mod, "update_config_locked", refuse)
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "agent.role_models.subagent", "auto")
+            assert resp.status == 400
+            body = await resp.json()
+            assert body["code"] == "config_write_refused"
+            assert body["error"] == message
+        assert json.loads(tmp_config.read_text(encoding="utf-8")) == _seed_config()
 
     @pytest.mark.asyncio
     async def test_role_model_auto_allowed(self, tmp_config) -> None:
@@ -314,6 +358,60 @@ class TestEnumValidator:
         async with TestClient(TestServer(_make_app())) as c:
             resp = await _patch(c, "agent.approval_mode", 123)
             assert resp.status == 400
+
+
+# ── Sidebar folder sort mode ─────────────────────────────────────────────
+
+
+class TestFolderSortRoundTrip:
+    """``dashboard.folder_sort`` is the one stored copy of the sidebar's folder
+    order, written by the sidebar menu and read back by the sidebar AND by the
+    ``kirocrew-dashboard`` MCP server -- so what a PATCH stores must be exactly
+    what a fresh load reads, and nothing outside the mode list may land."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["custom", "name", "created"])
+    async def test_every_mode_round_trips_through_the_config_file(self, tmp_config, mode) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        async with TestClient(TestServer(_make_app())) as c:
+            resp = await _patch(c, "dashboard.folder_sort", mode)
+            assert resp.status == 200, await resp.text()
+        stored = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert stored["dashboard"]["folder_sort"] == mode
+        assert KiroCrewConfig.load().dashboard.folder_sort == mode
+
+    @pytest.mark.asyncio
+    async def test_a_value_outside_the_mode_list_is_refused_and_the_file_untouched(
+        self, tmp_config
+    ) -> None:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        async with TestClient(TestServer(_make_app())) as c:
+            assert (await _patch(c, "dashboard.folder_sort", "name")).status == 200
+            for bad in ("alphabetical", "", "Name", 1, None, ["name"]):
+                resp = await _patch(c, "dashboard.folder_sort", bad)
+                assert resp.status == 400, bad
+        assert KiroCrewConfig.load().dashboard.folder_sort == "name"
+
+    def test_the_allowlist_enum_is_the_loader_list_spelled_once(self) -> None:
+        """Three spellings of the same set -- the dataclass field's enum metadata,
+        the shared constant, and the PATCH allowlist -- pinned equal, so a fourth
+        mode cannot be writable without being loadable or the other way round."""
+        from dataclasses import fields
+
+        from kiro_crew.config.sections import (
+            FOLDER_SORT_DEFAULT,
+            FOLDER_SORT_MODES,
+            DashboardConfig,
+        )
+        from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
+
+        spec = _EDITABLE_CONFIG["dashboard.folder_sort"]
+        assert spec == {"type": "enum", "values": list(FOLDER_SORT_MODES)}
+        field = next(f for f in fields(DashboardConfig) if f.name == "folder_sort")
+        assert field.metadata["enum"] == list(FOLDER_SORT_MODES)
+        assert field.default == FOLDER_SORT_DEFAULT == "custom"
 
 
 # ── Int validator ────────────────────────────────────────────────────────
@@ -755,14 +853,42 @@ class TestDefaultModelPatch:
         _arm(app, state)
         sub = live.subscribe("agent.model", callback=seen.append, name="probe")
         try:
-            async with TestClient(TestServer(app)) as c:
-                assert (await _patch(c, "agent.model", "claude-sonnet-4.5")).status == 200
+            with patch(
+                "kiro_crew.agent.rebuild_agent_config_reporting",
+                return_value=(tmp_config, True),
+            ):
+                async with TestClient(TestServer(app)) as c:
+                    assert (await _patch(c, "agent.model", "claude-sonnet-4.5")).status == 200
         finally:
             sub.cancel()
         assert [c.new.agent.model for c in seen] == ["claude-sonnet-4.5"]
         # A default change must NEVER take the destructive path — that clears
         # _sessions and shuts live providers down, killing in-flight turns.
         state.sessions.reload_provider_factory.assert_not_awaited()
+        state.push_refresh.assert_called_once_with("agents")
+
+    @pytest.mark.asyncio
+    async def test_failed_spec_rebuild_surfaces_error_and_stays_pending(self, tmp_config) -> None:
+        """PATCH persists first, so a failed derived-spec rebuild must be visible
+        and remain queued for the watcher's automatic retry."""
+        from kiro_crew.config import live
+
+        state = _live_state()
+        app = _make_app()
+        _arm(app, state)
+        with patch(
+            "kiro_crew.agent.rebuild_agent_config_reporting",
+            side_effect=OSError("spec directory is read-only"),
+        ):
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.model", "claude-sonnet-4.5")
+                assert resp.status == 200
+
+        state.push_refresh.assert_not_called()
+        state.notify.assert_called_once()
+        assert any(
+            "agent.model" in missed for _subscription, missed in live.watch()._stale.values()
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

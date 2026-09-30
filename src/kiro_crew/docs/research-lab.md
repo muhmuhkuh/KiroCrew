@@ -32,8 +32,8 @@ A campaign can instead use **workflow** mode, which runs the Dynamic Workflow te
 - **Limits** — max cycles (safety cap), idle interval, max sub-questions per round, budget.
 - **In-progress guidance** — user steering injected between cycles: the agent reads
   `guidance.txt` each cycle and incorporates it.
-- **Emergent sub-questions** — findings-driven follow-ups, ranked, depth-decayed, deduped,
-  activated into the checklist, ranked with decay and de-duplicated.
+- **Emergent sub-questions** — findings-driven follow-ups, ranked with depth decay,
+  de-duplicated, and activated into the checklist.
 - **Findings + report** — per-cycle `cycle_NNN.json` cards + consolidated `FINDINGS.md`,
   exportable to the Knowledge Library or as an HTML artifact.
 
@@ -46,13 +46,14 @@ A campaign can instead use **workflow** mode, which runs the Dynamic Workflow te
 ├── guidance.txt           # user nudge: agent reads + incorporates each cycle
 ├── emergent_questions.json # agent writes findings-driven follow-ups; ingested + consumed
 ├── findings/
-│   ├── cycle_001.json      # { cycle, summary, key_insight, sources_checked,
-│   ├── cycle_002.json      #   sources_empty, evidence_strength, verification }
+│   ├── cycle_000.json      # { cycle, summary, key_insight, sources_checked, sources_empty,
+│   ├── cycle_001.json      #   new_findings_count, evidence_strength, verification }
 │   └── ...
 └── FINDINGS.md            # cumulative report
 ```
 
-The agent writes each `cycle_NNN.json` finding card as it completes a cycle.
+The agent writes each `cycle_NNN.json` finding card as it completes a cycle,
+beginning with `cycle_000.json`.
 
 ## Campaign lifecycle
 
@@ -67,7 +68,24 @@ The agent writes each `cycle_NNN.json` finding card as it completes a cycle.
 | `failed` | Unresponsive (no activity past deadline) or execution failure |
 | `stopped` | User-stopped (terminal) |
 
-Pause/resume pauses/resumes the autonudge loop.
+In agent mode, pause/resume pauses/resumes the autonudge loop. In workflow mode, pause
+cancels the workflow run and resume starts a new one that appends to the same findings.
+
+### Who changes a campaign
+
+- **You**, from the dashboard: create, start, pause, resume, stop, fork, add a question,
+  nudge with guidance, export, delete.
+- **The watchdog**, on its own: it moves a running campaign to `complete`, `stagnant`,
+  `needs_input`, `stopped` (the worker ended the run itself) or `failed`. After 24 hours it
+  withdraws the worker's tool auto-approval and waits in `needs_input` until you resume.
+  While the app is disabled it pauses every research loop and withdraws that approval.
+- **One status change at a time.** Your status actions and the watchdog's decisions on the
+  same campaign wait their turn, and a decision the watchdog reached about a run you have
+  since paused and resumed is discarded, never applied to the new run.
+- **The worker** never changes status itself. In agent mode it writes findings,
+  `FINDINGS.md`, `emergent_questions.json`, `questions.json` and, when it decides the research
+  is done, `worker_done.json` before stopping its loop; the watchdog reads those files and
+  decides. In workflow mode the watchdog reads the workflow run instead.
 
 ## Scope and permissions
 

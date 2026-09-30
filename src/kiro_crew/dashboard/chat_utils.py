@@ -12,11 +12,15 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import time
 import uuid
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -36,6 +40,7 @@ from kiro_crew.dashboard.state import (
     MANUAL_RESUME_RECOVERY_PREFIX,
     POSTTOKEN_RECOVERY_PREFIX,
     PROMISE_ONLY_RECOVERY_PREFIX,
+    REFUSAL_FALLBACK_RECOVERY_PREFIX,
     SUBAGENT_COMPLETION_PREFIXES,
     DashboardState,
     _ChatSlot,
@@ -43,15 +48,41 @@ from kiro_crew.dashboard.state import (
     append_and_surface,
     parse_cls_meta,
 )
-from kiro_crew.history import transcript_sort_key
-from kiro_crew.hooks import safe_read_file
+from kiro_crew.execution_context import (
+    ExecutionContext,
+    canonical_memory_mode,
+    read_live_session_execution,
+    rollback_live_session_tightening,
+    stricter_memory_mode,
+    tighten_live_session_execution,
+)
+from kiro_crew.external_text import redact_external_text
+from kiro_crew.history import (
+    is_incognito_transcript,
+    transcript_lock_stems,
+    transcript_sort_key,
+    transcript_stems,
+)
+from kiro_crew.hooks import _HOST_READ_ONLY_BUILTIN_TOOLS, safe_read_file
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
+    EXFILTRATION_REDACTION_TAG_PREFIX,
+    _exempt_exact_hosts,
+    bounded_blocked_links,
     oauth_url_contains_credential,
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.security.credential_sources import bounded_credential_records
+from kiro_crew.security.exfil import (
+    current_scoped_exempt_hosts,
+    restore_allowed_links,
+    scoped_exempt_hosts,
+)
+from kiro_crew.security.redaction_allow import allowed_hosts_for
 from kiro_crew.sel import SecurityEvent, sel
 from kiro_crew.session_surface import has_dashboard_surface, set_dashboard_surfaced
 from kiro_crew.slack.outbound import (
@@ -86,6 +117,74 @@ def chunk_generation() -> str:
     replays. Not a secret and not an identity: it only says "same process".
     """
     return _CHUNK_GENERATION
+
+
+def _resettle_restricted_key(state: DashboardState, name: str) -> None:
+    """Re-derive ``dashboard:{name}``'s restricted marker from whoever owns ``name`` NOW.
+
+    ``state._restricted_keys`` is keyed by SESSION KEY, not by slot identity, so the
+    marker describes whatever object holds the key -- never the object a close happens
+    to be carrying. Every exit of a teardown, and every tightening of a live slot,
+    owes the one postcondition this function IS: ``dashboard:{name}`` is in the set
+    iff the slot currently at ``name`` is restricted, an absent key counting as
+    unrestricted.
+
+    Two shapes of exit need it, and they need opposite answers. An ordinary close
+    pops the slot for good, so the marker must be DROPPED -- otherwise an incognito
+    tab's key stays blocked for every later holder of it. A close that yields the key
+    to a concurrent same-key replacement must re-derive from the REPLACEMENT:
+    ``_is_restricted_session`` tests the key BEFORE it looks at the slot, so an
+    incognito original's leftover marker makes every memory, artifact and mcp-apps
+    call on a PERSISTENT replacement answer 403 for as long as that tab lives.
+
+    Re-derived rather than blindly discarded, because a replacement that is itself
+    restricted has to KEEP the marker: dropping it is the fail-OPEN direction.
+    """
+    key = f"dashboard:{name}"
+    current = state._slots.get(name)
+    if current is not None and current.is_restricted:
+        state._restricted_keys.add(key)
+    else:
+        state._restricted_keys.discard(key)
+
+
+def tighten_live_slot_memory_mode(
+    state: DashboardState,
+    name: str,
+    memory_mode: object,
+    *,
+    expected_slot: _ChatSlot | None = None,
+) -> bool:
+    """Tighten the current slot to *memory_mode* and re-derive its key marker.
+
+    ``expected_slot`` prevents an off-loop save completion for a retired slot
+    from changing a successor. The operation is synchronous so callers perform
+    the slot write and marker update in one event-loop turn.
+    """
+    current = state._slots.get(name)
+    if current is None or (expected_slot is not None and current is not expected_slot):
+        return False
+    current_mode = canonical_memory_mode(getattr(current, "memory_mode", "persistent"))
+    tightened = stricter_memory_mode(current_mode, canonical_memory_mode(memory_mode))
+    changed = tightened != current_mode
+    if changed:
+        current.memory_mode = tightened
+    _resettle_restricted_key(state, name)
+    return changed
+
+
+def apply_pending_slot_memory_mode(state: DashboardState, slot: _ChatSlot) -> bool:
+    """Apply a save thread's folded mode to its still-live slot on the event loop.
+
+    The pending value is never cleared: it is monotonic (a save thread only ever
+    folds it stricter) and tightening is idempotent, so re-applying it is free,
+    while a clear would race a producer that lands between the read and the
+    clear and lose its stricter value until the next turn's read-back.
+    """
+    pending = getattr(slot, "_pending_memory_mode", None)
+    if pending is None:
+        return False
+    return tighten_live_slot_memory_mode(state, slot.key, pending, expected_slot=slot)
 
 
 async def run_config_write(fn, /, *args, **kwargs):
@@ -146,18 +245,25 @@ async def run_config_write(fn, /, *args, **kwargs):
         return result
 
 
-async def drained_to_thread(fn, /, *args):
-    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+async def run_to_completion(aw):
+    """Await *aw* so that a cancellation cannot abandon it part-way.
 
-    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
-    while the worker THREAD keeps running — a handler that then performs
-    cleanup (releasing a lock, removing a staging directory) races its own
-    still-running worker. Shielding the task keeps the await alive until the
-    worker actually finishes, then re-raises the cancellation, so control only
-    ever returns with no mutation in flight. Shared by the agents handler's
-    config writers and the files handler's workspace-copy staging.
+    The awaitable runs as its own task behind ``asyncio.shield``; a
+    ``CancelledError`` delivered to the CALLER is remembered and the caller
+    keeps waiting until the task finishes, then the cancellation is re-raised.
+    The loop, not a single re-await, is what makes that hold under repeated
+    cancellation (a graceful shutdown escalating after its timeout): each
+    re-shield absorbs one more cancel, and only a finished task ends it.
+
+    For a multi-phase write -- a channel saver's config.json commit followed by
+    its ``.env`` credential write, the MCP gateway toggle's persist followed by
+    its live apply -- a cancellation between the phases would leave the stored
+    state and the effective state disagreeing; wrapping the whole transaction
+    here is what keeps the pair consistent. Cancellation is deferred, never
+    swallowed: the caller still unwinds with ``CancelledError`` afterwards, and
+    an exception from the task propagates as usual.
     """
-    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    task = asyncio.ensure_future(aw)
     cancelled: asyncio.CancelledError | None = None
     while True:
         try:
@@ -166,12 +272,26 @@ async def drained_to_thread(fn, /, *args):
         except asyncio.CancelledError as exc:
             if task.cancelled():
                 raise
-            # OUR await was cancelled, not the worker: remember it, keep
-            # draining the still-running thread.
+            # OUR await was cancelled, not the task: remember it, keep waiting
+            # for the still-running work.
             cancelled = exc
     if cancelled is not None:
         raise cancelled
     return result
+
+
+async def drained_to_thread(fn, /, *args):
+    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+
+    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
+    while the worker THREAD keeps running — a handler that then performs
+    cleanup (releasing a lock, removing a staging directory) races its own
+    still-running worker. :func:`run_to_completion` keeps the await alive until
+    the worker actually finishes, then re-raises the cancellation, so control
+    only ever returns with no mutation in flight. Shared by the agents handler's
+    config writers and the files handler's workspace-copy staging.
+    """
+    return await run_to_completion(asyncio.to_thread(fn, *args))
 
 
 # Per-turn compaction-failure backoff. See
@@ -346,6 +466,10 @@ _SLASH_COMMANDS = frozenset(
     }
 )
 
+# Blocked on the kiro path ONLY: the KiroACP harness does not implement /todos
+# and rejects it with an "unknown variant" error, while Claude Code has its own.
+_KIRO_ONLY_BLOCKED_SLASH_COMMANDS = frozenset({"/todos"})
+
 # Commands that exist in kiro-cli's interactive TUI but cannot work in the
 # dashboard (they drive a local terminal: quitting it, pasting from its
 # clipboard, opening an editor, or toggling checkpoint modes the dashboard's
@@ -354,10 +478,9 @@ _SLASH_COMMANDS = frozenset(
 # GET /api/slash-commands suggestion payload, so every surface hides them at
 # once — advertising a command that only yields a warning teaches a gesture
 # that does not work.
-# /todos was removed because the KiroACP harness does not implement it and
-# rejects it with an "unknown variant" error.
-_BLOCKED_SLASH_COMMANDS = frozenset(
-    {"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent", "/todos"}
+_BLOCKED_SLASH_COMMANDS = (
+    frozenset({"/quit", "/exit", "/q", "/chat", "/paste", "/reply", "/editor", "/tangent"})
+    | _KIRO_ONLY_BLOCKED_SLASH_COMMANDS
 )
 
 # Single source of truth for slash-command descriptions surfaced by the
@@ -612,13 +735,14 @@ def _broadcast_compaction_result(
 
 def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") -> None:
     """Emit a SEL audit event when an agent is set, changed, or rejected on a slot."""
+    safe_agent = redact_external_text(agent)
     sel().log(
         SecurityEvent(
             event_id=uuid.uuid4().hex,
             timestamp=datetime.now(tz=timezone.utc).isoformat(),
             event_type="agent_assignment",
             caller_identity=f"dashboard:{slot_key}",
-            agent=agent,
+            agent=safe_agent,
             source="dashboard",
             operation="slot_agent_set",
             outcome=outcome,
@@ -627,7 +751,7 @@ def _emit_agent_assignment(slot_key: str, agent: str, outcome: str = "applied") 
     )
 
 
-def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
+def _validate_tool_name(tool_name: str, *, is_shell: bool = False, canonical_name: str = "") -> str:
     """Validate and sanitize tool display names for hook matching.
 
     ``is_shell`` is the provider-agnostic signal (set at the provider boundary)
@@ -636,11 +760,22 @@ def _validate_tool_name(tool_name: str, *, is_shell: bool = False) -> str:
     on this flag rather than a hardcoded set of provider tool_kind literals
     (e.g. "execute"/"Bash") stops the cap from silently re-breaking long shell
     commands on every engine migration or tool rename.
+
+    ``canonical_name`` is the adapter-authored tool identity that travelled
+    beside the title (``AcpEvent.tool_name``, read from the harness's own
+    ``_meta`` channel, never from the title or the model's ``description``).
+    The length cap protects the case where the title IS the only identity a
+    hook can match on; when a canonical identity is present the title is
+    content (a ``read`` title embeds the paths it reads, exactly as a shell
+    title embeds its command line), so the cap is skipped for it as it is for
+    ``is_shell``. Sanitisation and the empty check apply regardless: only the
+    length predicate is relaxed. A backend that publishes no identity leaves
+    ``canonical_name`` empty and keeps the loud refusal.
     """
     sanitized = sanitize_string(tool_name)
     if not sanitized:
         raise ValueError("Tool name cannot be empty")
-    if not is_shell and len(sanitized) > MAX_TOOL_NAME_LEN:
+    if not is_shell and not canonical_name and len(sanitized) > MAX_TOOL_NAME_LEN:
         raise ValueError(f"Tool name exceeds max length {MAX_TOOL_NAME_LEN}")
     return sanitized
 
@@ -775,6 +910,24 @@ def slot_history_key(slot: _ChatSlot) -> str:
     return _history_key_for(slot.key)
 
 
+def session_key_for(slot_key: str, linked_session_key: str = "") -> str:
+    """:func:`effective_session_key`'s rule, for a slot that does not exist yet.
+
+    The restore paths build slots FROM disk, so a step that has to address the
+    session before the build has only the slot NAME and the persisted
+    ``linked_session_key`` from the transcript's metadata. This is the same
+    relationship :func:`slot_transcript_key` has to the slot's FILE -- except that
+    one resolves the file and cannot recover the session key at all, so it is the
+    wrong fallback here and a channel-born slot would be addressed as a
+    ``dashboard:`` session that does not exist.
+
+    :func:`effective_session_key` delegates to this rather than repeating it: a
+    second spelling of the rule would drift, and a restore asking with a key the
+    live path never uses matches nothing and fails in SILENCE.
+    """
+    return linked_session_key or _history_key_for(slot_key)
+
+
 def effective_session_key(slot: _ChatSlot) -> str:
     """The session key for *slot* — the session its turns run on.
 
@@ -789,9 +942,223 @@ def effective_session_key(slot: _ChatSlot) -> str:
     turns run on, mirroring its links. For the slot's TRANSCRIPT use
     :func:`slot_history_key`, which resolves the unbound-channel-slot case onto
     the file the read paths actually use. Reserve :func:`_history_key_for` for
-    the cases that genuinely start from a slot key with no slot in hand.
+    the cases that genuinely start from a slot key with no slot in hand, and
+    :func:`session_key_for` for the ones that have no slot YET.
     """
-    return getattr(slot, "linked_session_key", "") or _history_key_for(slot.key)
+    return session_key_for(slot.key, getattr(slot, "linked_session_key", "") or "")
+
+
+def replacement_shares_transcript(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
+    """Whether a different slot at *name* writes *slot*'s transcript file."""
+    current = state._slots.get(name)
+    if current is None or current is slot:
+        return False
+    return bool(
+        set(transcript_stems(slot_history_key(current)))
+        & set(transcript_stems(slot_history_key(slot)))
+    )
+
+
+@dataclass(frozen=True)
+class ReplacementTightening:
+    """State changed before a rows-only hand-over write."""
+
+    replacement: _ChatSlot
+    previous_mode: str
+    tightened_mode: str
+    replacement_key: str
+    previous_execution: ExecutionContext | None
+    tightened_execution: ExecutionContext | None
+
+
+def tighten_replacement_to_restricted_original(
+    state: DashboardState, name: str, slot: _ChatSlot
+) -> ReplacementTightening | None:
+    """Tighten a same-transcript replacement before *slot*'s rows are written.
+
+    A rows-only writer can outlive the slot that produced its rows. If another
+    slot has taken over the same key and file, the replacement must become at
+    least as restricted before those rows reach disk; otherwise live-slot gates
+    can derive from private rows while the transcript line is being ratcheted.
+
+    The live carrier compare-and-set runs before the slot or restricted marker
+    mutates. If another turn rebinds the carrier, retry once from a fresh read;
+    a second conflict propagates with every slot-owned value unchanged. Callers
+    therefore receive either a complete tightening plus its rollback witness,
+    or no slot/marker mutation to roll back.
+    """
+    replacement = state._slots.get(name)
+    if replacement is None or replacement is slot:
+        return None
+    if not replacement_shares_transcript(state, name, slot):
+        return None
+    if not slot.messages and slot._disk_older_count <= 0:
+        return None
+    current = canonical_memory_mode(getattr(replacement, "memory_mode", "persistent"))
+    retained = stricter_memory_mode(
+        current, canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
+    )
+    if retained == current:
+        return None
+    # Tighten the replacement's LIVE carrier in place (compare-and-set) rather
+    # than clearing it: a clear evicts the only in-memory record of a live
+    # member-bound session's identity, so the store-binding check for the rest
+    # of that turn sees no execution and skips -- the fail-OPEN direction -- and
+    # the next turn's fold has nothing to fold into. A persistent replacement
+    # has no live carrier (its record is durable, and the save that lands these
+    # rows tightens that record with the line); its next restricted binding
+    # withdraws the vouched entry. Only ever tighter: ``with_mode`` never loosens.
+    replacement_key = effective_session_key(replacement)
+    previous_execution = read_live_session_execution(replacement_key)
+    try:
+        tightened_execution = tighten_live_session_execution(
+            replacement_key, retained, expected=previous_execution
+        )
+    except UnknownMemoryStore:
+        previous_execution = read_live_session_execution(replacement_key)
+        tightened_execution = tighten_live_session_execution(
+            replacement_key, retained, expected=previous_execution
+        )
+    replacement.memory_mode = retained
+    _resettle_restricted_key(state, name)
+    logger.info(
+        "Slot %s: the replacement holding this key was tightened from %s to %s because "
+        "it shares the transcript of the %s original whose rows are being written",
+        name,
+        current,
+        retained,
+        retained,
+    )
+    return ReplacementTightening(
+        replacement=replacement,
+        previous_mode=current,
+        tightened_mode=retained,
+        replacement_key=replacement_key,
+        previous_execution=previous_execution,
+        tightened_execution=tightened_execution,
+    )
+
+
+async def restore_replacement_if_handover_did_not_land(
+    state: DashboardState,
+    name: str,
+    tightened: ReplacementTightening | None,
+    history_key: str,
+) -> bool:
+    """Undo a pre-write tightening only while its exact witness is still current.
+
+    The durable line is read under the same transcript lock every line writer
+    takes, and the generation-guarded carrier rollback runs inside that hold.
+    The carrier registry has its own thread-safe lock, so this worker step does
+    not touch loop-owned slot state. A writer that tightens the line records the
+    live holder's monotonic pending mode after its atomic rewrite and before
+    releasing the transcript lock. Therefore a writer ordered before this read
+    is visible in ``durable_mode``; one ordered after it is visible in
+    ``_pending_memory_mode`` before loop-owned state is loosened. The loop then
+    checks that pending witness plus the exact slot, mode and marker without
+    another await before mutating.
+
+    An unreadable or busy line cannot prove rollback safe and leaves every live
+    restriction in place. Nor can rollback loosen below the locked line: when
+    ``stricter(previous_mode, durable_mode)`` is restricted, mode, marker and
+    carrier all stay at the attempted tightening.
+    """
+    if tightened is None:
+        return False
+    conversation_log = getattr(state, "conversation_log", None)
+    if conversation_log is None:
+        return False
+
+    def _validate_and_rollback_carrier() -> tuple[str, str, bool, bool]:
+        with conversation_log.derivation_hold(transcript_lock_stems(history_key)):
+            metadata, readable = conversation_log.get_metadata_status(history_key)
+            if not readable:
+                return "persistent", "persistent", False, False
+            durable_mode = canonical_memory_mode(metadata.get("memory_mode"))
+            rollback_mode = stricter_memory_mode(tightened.previous_mode, durable_mode)
+            if is_incognito_transcript(rollback_mode):
+                return durable_mode, rollback_mode, True, False
+            rolled_back = rollback_live_session_tightening(
+                tightened.replacement_key,
+                tightened.previous_execution,
+                expected=tightened.tightened_execution,
+            )
+            return durable_mode, rollback_mode, True, rolled_back
+
+    try:
+        durable_mode, rollback_mode, readable, carrier_rolled_back = await asyncio.to_thread(
+            _validate_and_rollback_carrier
+        )
+    except Exception:
+        logger.info(
+            "Slot %s: could not lock and verify the failed hand-over line %s; "
+            "keeping the replacement restricted",
+            name,
+            history_key,
+            exc_info=True,
+        )
+        return False
+    if not readable:
+        logger.info(
+            "Slot %s: the privacy line for %s is unreadable after a failed hand-over; "
+            "keeping the replacement restricted",
+            name,
+            history_key,
+        )
+        return False
+    if is_incognito_transcript(rollback_mode):
+        logger.info(
+            "Slot %s: the locked line for %s requires %s; keeping the replacement at %s",
+            name,
+            history_key,
+            rollback_mode,
+            tightened.tightened_mode,
+        )
+        return False
+    if not carrier_rolled_back:
+        return False
+
+    # Imported lazily: chat_persistence imports this module. The pending read is
+    # the only worker-owned value consulted here; every live-state check and the
+    # mutation below remains in this uninterrupted event-loop turn.
+    from kiro_crew.dashboard.chat_persistence import pending_slot_memory_mode
+
+    replacement = tightened.replacement
+    if state._slots.get(name) is not replacement:
+        return False
+    if canonical_memory_mode(getattr(replacement, "memory_mode", "persistent")) != (
+        tightened.tightened_mode
+    ):
+        return False
+    if f"dashboard:{name}" not in state._restricted_keys:
+        return False
+    pending_mode = pending_slot_memory_mode(replacement)
+    if pending_mode is not None and is_incognito_transcript(pending_mode):
+        # The carrier rollback was atomic with the older line snapshot. A writer
+        # that committed a tighter line afterwards published this pending witness;
+        # restore the carrier tightening while its generation is still the one we
+        # rolled back, and leave the loop-owned mode and marker untouched.
+        try:
+            tighten_live_session_execution(
+                tightened.replacement_key,
+                stricter_memory_mode(tightened.tightened_mode, pending_mode),
+                expected=tightened.previous_execution,
+            )
+        except UnknownMemoryStore:
+            pass
+        return False
+    replacement.memory_mode = rollback_mode
+    _resettle_restricted_key(state, name)
+    logger.info(
+        "Slot %s: restored the replacement from %s to %s because the failed "
+        "hand-over left %s at %s",
+        name,
+        tightened.tightened_mode,
+        rollback_mode,
+        history_key,
+        durable_mode,
+    )
+    return True
 
 
 def subagents_attached(
@@ -1671,9 +2038,7 @@ def _sync_dashboard_slots(state: "DashboardState") -> None:
 def _redact_value(v):  # type: ignore[no-untyped-def]
     """Recursively redact any value (str, dict, list/tuple, or passthrough)."""
     if isinstance(v, str):
-        v, _ = redact_exfiltration_urls(v)
-        v, _ = redact_credentials(v)
-        return v
+        return _redact_for_display(v)
     if isinstance(v, dict):
         return _redact_meta(v)
     if isinstance(v, (list, tuple)):
@@ -1681,6 +2046,121 @@ def _redact_value(v):  # type: ignore[no-untyped-def]
         # containers the event loop is still appending to.
         return [_redact_value(i) for i in list(v)]
     return v
+
+
+#: Every record set a row carries about its own redactions: the key it lives
+#: under, the one bounded constructor that rebuilds it from a transcript line,
+#: and the placeholder tags its text must still hold for the records to describe
+#: anything. One table, so a helper that moves or bounds records covers every
+#: kind at once and a new kind is one row, not a new call site to forget.
+REDACTION_RECORD_FIELDS: dict[str, tuple[Callable[[object], list[dict]], tuple[str, ...]]] = {
+    "blocked_links": (bounded_blocked_links, (EXFILTRATION_REDACTION_TAG_PREFIX,)),
+    "redactions": (bounded_credential_records, tuple(CREDENTIAL_REDACTION_TAGS)),
+}
+
+
+def variant_from_row(row: dict) -> dict:
+    """Stash a row as a variant, taking its redaction records with it.
+
+    The mirror of ``adopt_variant_text``: that one moves a variant onto the row,
+    this one moves the row into the variant list. Both directions carry the
+    records because the records cannot be recovered from the text -- the stashed
+    content is already redacted, so what they describe is gone and a rescan
+    finds nothing to describe. A stash that dropped them would destroy the
+    explanation for good, and the reader switching back would be handed a bare
+    placeholder with no way to learn what was removed.
+    """
+    entry = {"content": row.get("content", ""), "ts": row.get("ts", "")}
+    meta = row.get("meta")
+    if isinstance(meta, dict):
+        # Bounded here, at retention: the row's meta was read off a transcript
+        # line, and a variant list outlives the render that would bound it later.
+        for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items():
+            records = bound(meta.get(key))
+            if records:
+                entry[key] = records
+    return entry
+
+
+def with_bounded_redaction_records(container: dict) -> dict:
+    """``container`` with each redaction record set rebuilt through its one
+    bounded constructor, or removed when nothing valid is left.
+
+    Every place that RETAINS a row's meta or a variant read off a transcript line
+    goes through this, not only the places that display it: a bound applied at
+    render leaves the slot holding whatever the line carried. Returns the same
+    object when there is no such key, so the common row costs nothing.
+    """
+    if not any(key in container for key in REDACTION_RECORD_FIELDS):
+        return container
+    out = dict(container)
+    for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items():
+        if key not in out:
+            continue
+        records = bound(out[key])
+        if records:
+            out[key] = records
+        else:
+            del out[key]
+    return out
+
+
+def drop_records_without_placeholders(container: dict, text: str) -> None:
+    """Remove each record set with no placeholder of its kind in ``text``.
+
+    Records describe one text; a text with no placeholder of their kind has
+    nothing for them to explain.
+    """
+    for key, (_bound, tags) in REDACTION_RECORD_FIELDS.items():
+        if key in container and not any(tag in text for tag in tags):
+            container.pop(key, None)
+
+
+def _variant_for_emit(variant: dict) -> dict:
+    """A regenerate variant as the client receives it: allowed links restored,
+    display-redacted text, and its redaction records rebuilt through their
+    bounded constructors. Runs inside the same allowed-host scope as the row it
+    belongs to, so a variant shows the links its row shows."""
+    bounded = with_bounded_redaction_records(variant)
+    text = bounded.get("content", "")
+    if isinstance(text, str) and "blocked_links" in bounded:
+        text, left = restore_allowed_links(
+            text, bounded["blocked_links"], current_scoped_exempt_hosts()
+        )
+        bounded = {**bounded, "content": text}
+        if left:
+            bounded["blocked_links"] = left
+        else:
+            bounded.pop("blocked_links", None)
+    return with_bounded_redaction_records(
+        {**bounded, "content": redact_display_content(bounded.get("content", ""))}
+    )
+
+
+def adopt_variant_text(row: dict, variant: dict) -> None:
+    """Move a row onto one of its variants, text and redaction records together.
+
+    A record describes ONE text: it names what was removed from a placeholder
+    standing in that text. A caller that takes a variant's content without its
+    records leaves the row explaining something absent from the text on screen.
+    The pair moves through this one function so no site can take half of it --
+    the records are replaced when the variant carries them and REMOVED when it
+    does not, because a variant with no records has nothing to explain.
+    """
+    row["content"] = variant.get("content", "")
+    row["ts"] = variant.get("ts", row.get("ts", ""))
+    meta = row.get("meta")
+    for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items():
+        records = bound(variant.get(key))
+        if records:
+            if not isinstance(meta, dict):
+                meta = {}
+                row["meta"] = meta
+            meta[key] = records
+        elif isinstance(meta, dict):
+            meta.pop(key, None)
+    if isinstance(meta, dict) and not meta:
+        row.pop("meta", None)
 
 
 def _redact_meta(meta: dict) -> dict:
@@ -1708,9 +2188,23 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
     dependency runs chat_persistence -> chat_utils, so keeping it here lets both
     the save path and the emit path share one implementation without a cycle.
     """
+    # Redaction records (REDACTION_RECORD_FIELDS) are born at the redaction that
+    # removed each value (chat_runner._flush_segment) and carried with their
+    # text; the generic string redaction below would blank them. Preserve them
+    # across every role, but the transcript line is attacker-writable, so each
+    # set is rebuilt through its one bounded constructor: it re-validates each
+    # record, drops any that fails on its own -- never the message -- and bounds
+    # the count, because this is a RETENTION point that reads the line and it
+    # runs on every render of the message that holds it.
+    validated_records = {
+        key: bound(meta.get(key)) for key, (bound, _tags) in REDACTION_RECORD_FIELDS.items()
+    }
+
     if role == "mcp_oauth":
         out: dict = {}
         for k, v in list(meta.items()):
+            if k in REDACTION_RECORD_FIELDS:
+                continue
             if k == "oauth_url" and isinstance(v, str):
                 # Two gates, and deliberately NOT a third:
                 #   1. http(s)-only — a tampered history line can't smuggle a
@@ -1737,15 +2231,123 @@ def _redact_meta_for_role(role: str, meta: dict) -> dict:
                 out[k] = v if (safe_scheme and not oauth_url_contains_credential(v)) else ""
             else:
                 out[k] = _redact_value(v)
+        out.update({k: v for k, v in validated_records.items() if v})
         return out
-    return _redact_meta(meta)
+    out = {k: _redact_value(v) for k, v in list(meta.items()) if k not in REDACTION_RECORD_FIELDS}
+    out.update({k: v for k, v in validated_records.items() if v})
+    return out
+
+
+# One process-local LRU shared by HTTP snapshot renders and live WS emission.
+# It retains at most _DISPLAY_REDACTION_CACHE_MAX_ENTRIES entries and 16 MiB of
+# key-input plus output payload; least-recently-used entries leave first, and an
+# individually oversized value bypasses the cache. Each entry retains exactly a
+# fixed-size key -- the 32-byte SHA-256 digest and the input byte length -- plus
+# the redacted output, and every one of those is counted against the byte cap;
+# nothing else, and never the raw credential-bearing key material.
+#
+# The digest covers every input the battery's OUTPUT depends on, not just the
+# text: ``redact_exfiltration_urls`` also reads the active PlatformContext's
+# exempt-host set, which changes mid-process (a companion loads after boot, a
+# policy tightens). Keyed on content alone, a hot entry computed under the old set
+# kept being served -- a tenant link stayed ``[REDACTED]`` after its host was
+# exempted, or a URL the tightened policy now redacts kept displaying in plaintext
+# until eviction. The host set is folded INTO the digest rather than carried as a
+# key component: a container per entry would sit outside the byte cap, and with
+# a large tenant list it would dwarf the payload the cap is declared to bound.
+#
+# The entry cap counts individual STRINGS, and a rendered row costs several --
+# ``_prepare_messages`` redacts the content plus every meta string (a row's
+# unique ``meta.mid`` alone takes a slot) plus each variant. The backend page
+# ceiling is ``SLOT_DETAIL_MAX_LIMIT`` rows, so the cap must hold one full page with headroom:
+# below that, a page's oldest-to-newest pass evicts its own head before the
+# next render reaches it, and the hit rate on exactly the multi-MB sessions this
+# cache exists for collapses to near zero. The 16 MiB byte cap is the real bound.
+#
+# ONE literal for the slot-detail page ceiling. The handler clamps ``?limit=`` to
+# it and the cache cap is derived from it, so raising the page size cannot leave
+# the cache sized for the old one. The frontend mirrors it as
+# ``SLOT_DETAIL_MAX_LIMIT`` in ``website/src/store/chat/paging.ts``.
+SLOT_DETAIL_MAX_LIMIT = 500
+_DISPLAY_REDACTION_STRINGS_PER_ROW = 8
+_DISPLAY_REDACTION_CACHE_MAX_ENTRIES = (
+    SLOT_DETAIL_MAX_LIMIT * _DISPLAY_REDACTION_STRINGS_PER_ROW * 2
+)
+_DISPLAY_REDACTION_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_DisplayRedactionKey = tuple[bytes, int]
+# Per-process HMAC key for the cache digest. The digested text is credential-bearing
+# (the battery exists to redact it), so the key is a keyed MAC rather than a bare
+# hash: a retained digest cannot be checked offline against a guessed plaintext.
+# Random at import, never persisted, never logged; a fresh key per process only
+# means the cache starts cold, which it does anyway.
+_DISPLAY_REDACTION_SALT: bytes = secrets.token_bytes(32)
+_display_redaction_cache: OrderedDict[_DisplayRedactionKey, tuple[str, int]] = OrderedDict()
+_display_redaction_cache_bytes = 0
+_display_redaction_cache_lock = RLock()
+
+
+def _display_redaction_cache_key(text: str) -> tuple[_DisplayRedactionKey, int]:
+    """Digest the exact string entering the battery together with the exempt-host set it reads.
+
+    The key is fixed-size: a 32-byte digest and the input byte length. The host set
+    is sorted and folded into the MAC input behind a NUL separator (a host never
+    contains NUL), so a changed set yields a different key while no per-entry
+    container is retained. The length component constrains a digest collision.
+    The digest is an HMAC under the per-process ``_DISPLAY_REDACTION_SALT``: one
+    hash per lookup, so the cache stays cheaper than the battery it fronts.
+    """
+    raw = text.encode("utf-8", errors="surrogatepass")
+    hosts = "\0".join(sorted(_exempt_exact_hosts() | current_scoped_exempt_hosts())).encode(
+        "utf-8", errors="surrogatepass"
+    )
+    digest = hmac.new(_DISPLAY_REDACTION_SALT, raw + b"\0" + hosts, hashlib.sha256).digest()
+    return (digest, len(raw)), len(raw)
+
+
+def _clear_display_redaction_cache() -> None:
+    """Reset the process-local cache for deterministic tests."""
+    global _display_redaction_cache_bytes
+    with _display_redaction_cache_lock:
+        _display_redaction_cache.clear()
+        _display_redaction_cache_bytes = 0
+
+
+def _display_redaction_cache_info() -> tuple[int, int]:
+    """Return ``(entries, accounted_bytes)`` for invariant tests."""
+    with _display_redaction_cache_lock:
+        return len(_display_redaction_cache), _display_redaction_cache_bytes
 
 
 def _redact_for_display(text: str) -> str:
-    """Apply all redaction passes for dashboard/WS display."""
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
-    return text
+    """Apply all display redactors, reusing only an exact content-hash match."""
+    global _display_redaction_cache_bytes
+    key, input_bytes = _display_redaction_cache_key(text)
+    with _display_redaction_cache_lock:
+        cached = _display_redaction_cache.get(key)
+        if cached is not None:
+            _display_redaction_cache.move_to_end(key)
+            return cached[0]
+
+    redacted, _ = redact_exfiltration_urls(text)
+    redacted, _ = redact_credentials(redacted)
+    entry_bytes = len(key[0]) + input_bytes + len(redacted.encode("utf-8", errors="surrogatepass"))
+    if entry_bytes > _DISPLAY_REDACTION_CACHE_MAX_BYTES:
+        return redacted
+
+    with _display_redaction_cache_lock:
+        cached = _display_redaction_cache.get(key)
+        if cached is not None:
+            _display_redaction_cache.move_to_end(key)
+            return cached[0]
+        _display_redaction_cache[key] = (redacted, entry_bytes)
+        _display_redaction_cache_bytes += entry_bytes
+        while (
+            len(_display_redaction_cache) > _DISPLAY_REDACTION_CACHE_MAX_ENTRIES
+            or _display_redaction_cache_bytes > _DISPLAY_REDACTION_CACHE_MAX_BYTES
+        ):
+            _, (_, evicted_bytes) = _display_redaction_cache.popitem(last=False)
+            _display_redaction_cache_bytes -= evicted_bytes
+    return redacted
 
 
 def redact_display_content(content: Any) -> str:
@@ -1777,9 +2379,7 @@ def redact_display_content(content: Any) -> str:
     if isinstance(redacted, str):
         return redacted
     wire = serialize_wire_content(redacted)
-    wire, _ = redact_exfiltration_urls(wire)
-    wire, _ = redact_credentials(wire)
-    return wire
+    return _redact_for_display(wire)
 
 
 def serialize_wire_content(content: Any) -> str:
@@ -1809,10 +2409,21 @@ def serialize_wire_content(content: Any) -> str:
 
 
 def _remove_queued_by_id(messages: list[dict], queue_id: str) -> bool:
-    """Remove a 'queued' placeholder by queue_id stored in cls JSON."""
+    """Remove a 'queued' placeholder by its queue id.
+
+    Two spellings, matching the two twin shapes: the cron twin stores
+    ``queue_id`` in a JSON ``cls``, while the app twin wears a plain CSS
+    ``cls`` and carries ``queueId`` in ``meta`` (the hydration spelling) —
+    a cls-only match leaves an unreapable ghost row for every app message
+    queued behind a live turn.
+    """
     for i, m in enumerate(messages):
         if m.get("role") != "queued":
             continue
+        meta = m.get("meta")
+        if isinstance(meta, dict) and meta.get("queueId") == queue_id:
+            del messages[i]
+            return True
         try:
             cls = json.loads(m.get("cls", "{}"))
             if cls.get("queue_id") == queue_id:
@@ -2642,6 +3253,97 @@ def classify_empty_turn(activity: EmptyTurnActivity) -> str:
     return EMPTY_CAUSE_OTHER
 
 
+# A current-turn blocker the model can only have invented.  Kiro Crew receives
+# real tool failures through a refusal/error/result frame; a normal end_turn that
+# follows a successful read/search call carries no runtime signal that tools were
+# disabled.  Match the complete terminal response, not just its prefix: otherwise
+# untrusted content could append an action and mint a synthetic action turn.
+_FALSE_CURRENT_TOOL_BLOCKER_RE = re.compile(
+    r"^\s*(?:"
+    r"i(?:'|’)m blocked from further tool execution in the resumed session: "
+    r"the screenshot delivery tools are no longer callable here\."
+    r"|i(?:'|’)m proceeding, but this turn(?:'|’)s tool budget was exhausted "
+    r"immediately after loading the workflow\. "
+    r"No publish or deployment has happened yet\."
+    r")\s*$",
+    re.IGNORECASE,
+)
+_FALSE_CURRENT_TOOL_BLOCKER_NEAR_MISS_RE = re.compile(
+    r"^\s*i(?:'|’)?m\b"
+    r"(?=[^\n]*(?:tool|read|search|fetch))"
+    r"(?=[^\n]*(?:block|unavail|inaccess|no\s+longer|budget|exhaust))"
+    r"[^\n]+$",
+    re.IGNORECASE,
+)
+# Replay additionally admits two first-party discovery tools whose contracts are
+# read-only but which are not auto-approval candidates. Keep the shared host
+# builtins sourced from the approval gate so those identities cannot drift.
+_READ_ONLY_PREPARATION_TOOLS = _HOST_READ_ONLY_BUILTIN_TOOLS | frozenset(
+    {"introspect", "tool_search"}
+)
+
+
+def is_false_current_tool_blocker(final_segment_text: str) -> bool:
+    """Whether the assistant falsely claims THIS turn lost tool execution.
+
+    This is deliberately narrower than a generic ``budget`` search.  A model may
+    legitimately explain a subagent cap or quote an earlier failure; only a
+    first-person claim about the live turn is actionable here.
+    """
+    return bool(_FALSE_CURRENT_TOOL_BLOCKER_RE.search(final_segment_text or ""))
+
+
+def is_false_current_tool_blocker_near_miss(final_segment_text: str) -> bool:
+    """Whether blocker-adjacent text missed the replay grammar.
+
+    Diagnostic only: this predicate never grants replay authority. It lets the
+    runner count wording drift without logging model text or widening the two
+    incident statements accepted by :func:`is_false_current_tool_blocker`.
+    """
+    text = final_segment_text or ""
+    return not is_false_current_tool_blocker(text) and bool(
+        _FALSE_CURRENT_TOOL_BLOCKER_NEAR_MISS_RE.search(text)
+    )
+
+
+def tool_calls_are_read_only_preparation(
+    turn_tool_calls: int,
+    turn_tool_identities: tuple[tuple[str, str, str, bool], ...],
+    successful_tool_call_ids: frozenset[str],
+    *,
+    builtin_identity_trusted: bool,
+) -> bool:
+    """True when every dispatch is a proven successful read-only builtin.
+
+    Each identity is ``(tool_call_id, mcp_server_name, tool_name,
+    tool_identity_trusted)``. The caller must positively prove the serving
+    backend is Kiro, and every name must carry extractor provenance rather than
+    merely being non-empty. MCP tools are excluded even when their names look
+    read-only; their schemas are not owned by this host. Missing provenance,
+    duplicate ids, absent identity, an unknown builtin, an incomplete/failed
+    result, or any count mismatch fails closed.
+    """
+    if not builtin_identity_trusted:
+        return False
+    if turn_tool_calls <= 0 or len(turn_tool_identities) != turn_tool_calls:
+        return False
+    call_ids: list[str] = []
+    for call_id, server_name, tool_name, identity_trusted in turn_tool_identities:
+        if not all(isinstance(value, str) for value in (call_id, server_name, tool_name)):
+            return False
+        if (
+            not call_id
+            or server_name
+            or identity_trusted is not True
+            or tool_name not in _READ_ONLY_PREPARATION_TOOLS
+        ):
+            return False
+        call_ids.append(call_id)
+    if len(set(call_ids)) != len(call_ids):
+        return False
+    return frozenset(call_ids) == successful_tool_call_ids
+
+
 def should_recover_promise_only(
     *,
     stop_reason: str,
@@ -2653,13 +3355,17 @@ def should_recover_promise_only(
     is_cancelled: bool,
     refusal_reasons: list,
     turn_tool_calls: int = 0,
+    turn_tool_identities: tuple[tuple[str, str, str, bool], ...] = (),
+    successful_tool_call_ids: frozenset[str] = frozenset(),
+    builtin_identity_trusted: bool = False,
+    directive_user_origin: bool = False,
     in_stage_execution: bool = False,
     stop_in_progress: bool = False,
     stop_generation_unchanged: bool = True,
     queue_empty: bool = True,
     no_pending_steers: bool = True,
 ) -> bool:
-    """Decide whether to inject ONE promise-only continuation.
+    """Decide whether to inject ONE unacted-turn continuation.
 
     All must hold (each guards a distinct failure mode):
       * NO Stop is in progress (``stop_in_progress`` is the runner's
@@ -2688,22 +3394,26 @@ def should_recover_promise_only(
         those have their own paths and must stay unchanged;
       * it produced visible output (a promise IS visible output) and is not the
         empty-response case (that path owns ``not produced_visible_output``);
-      * the turn made NO tool calls (``turn_tool_calls == 0``). The segment-buffer
-        reset at each tool boundary is not an airtight "never replay an executed
-        action" proxy on its own: a turn that completed a side-effecting tool
-        (e.g. ``send_message``) and then emitted trailing promise-shaped text
-        ("I'll send that now") still matches the detector, and the continuation
-        would REISSUE the completed action (duplicate external message). The
-        promise-only bug is by definition a turn that announced an action and made
-        NO tool call, so requiring a zero tool-call count closes the replay hole
-        directly. A turn that ran a read then promised a further action is excluded
-        too — a false negative, which is the safe direction;
-      * the final segment is a terminal promise-to-act
-        (:func:`is_promise_only_terminal`). Because the runner resets its segment
-        buffer at every tool boundary, ``final_segment_text`` is exactly the text
-        AFTER the last tool call — so a turn that executed a tool and then
-        summarised has a summary here, not a promise; the ``turn_tool_calls`` gate
-        above is the airtight backstop for the same guarantee;
+      * ordinary promise-only recovery still requires ZERO tool calls. A second,
+        narrower shape may contain calls only when every dispatch has a unique id,
+        the runner positively identified the serving backend as Kiro, the provider
+        supplied a canonical non-MCP builtin identity carrying explicit extractor
+        provenance, that identity is one of the fixed read/search/fetch tools,
+        and a final
+        ``status=completed`` result arrived for exactly the same id set. Display
+        ``tool_kind`` and name non-emptiness are never authorization evidence.
+        Unknown/MCP/missing/untrusted identity,
+        duplicate ids, incomplete or failed calls, and every count/status mismatch
+        fail closed. The tool-bearing shape also requires
+        ``directive_user_origin``: the runner replays the authenticated user's
+        exact message, never the model-authored blocker or an announced action.
+        This lets a skill read or deferred-tool search retry without replaying a
+        completed mutation or minting authority from fetched content;
+      * the final segment is either a terminal promise-to-act
+        (:func:`is_promise_only_terminal`) on a zero-call turn, or the narrowly
+        full-matched false current-tool blocker above after read-only preparation.
+        Because the runner resets its segment buffer at every tool boundary,
+        ``final_segment_text`` is exactly the text AFTER the last tool call;
       * this is NOT a stage-execution turn (``in_stage_execution``). A turn run by
         the orchestrator's stage loop must not spawn async recovery: the loop
         records the stage complete and advances before the continuation finishes,
@@ -2723,7 +3433,14 @@ def should_recover_promise_only(
         return False
     if is_cancelled or refusal_reasons:
         return False
-    if turn_tool_calls != 0:
+    if turn_tool_calls != 0 and not tool_calls_are_read_only_preparation(
+        turn_tool_calls,
+        turn_tool_identities,
+        successful_tool_call_ids,
+        builtin_identity_trusted=builtin_identity_trusted,
+    ):
+        return False
+    if turn_tool_calls and not directive_user_origin:
         return False
     if in_stage_execution:
         return False
@@ -2733,6 +3450,8 @@ def should_recover_promise_only(
         return False
     if prompt_depth != 0 or promise_only_retries >= 1:
         return False
+    if turn_tool_calls:
+        return is_false_current_tool_blocker(final_segment_text)
     return is_promise_only_terminal(final_segment_text)
 
 
@@ -2866,6 +3585,33 @@ _MANUAL_CONTINUE_MSG = (
     "request is genuinely complete, say so in one line instead of inventing "
     "further work."
 )
+# Injected INSTEAD of the user's message when a content-filter refusal landed
+# after the turn had already dispatched tool calls and agent.refusal_fallback_model
+# names a different model (chat_runner._refusal_fallback_retry). Replaying the
+# message would run those tool calls a second time, so the session -- moved to
+# the fallback model -- is asked to carry on from the completed work, which is
+# what a person gets by pressing Continue. The nudge goes to the SAME harness
+# session the refused turn ran on (the retention every Continue relies on), and
+# Kiro Crew itself never re-sends the message once a tool ran. Unlike
+# ``_MANUAL_RESUME_MSG`` it offers no restart clause: it is sent only when the
+# turn dispatched a tool, so "nothing was done yet" is never true of it, and a
+# model that cannot see the partial turn (a session that did not keep it) is
+# told to stop rather than start over -- failing safe instead of re-running the
+# writes.
+#
+# Deliberately silent about the content filter and the model swap: the FALLBACK
+# model reads this body, and telling it the request was just declined primes it
+# to decline too. The user learns both from the retry notice card beside it.
+# Not in ``_SYNTHETIC_RECOVERY_MSGS``: the retry turn is recognized by its queue
+# id, not by text, and the turn-start re-arm already skips recovery-kind entries.
+_REFUSAL_FALLBACK_RESUME_MSG = (
+    f"{REFUSAL_FALLBACK_RECOVERY_PREFIX}\n"
+    "The previous turn ended before it finished. Look at the conversation above, "
+    "work out what was already completed, and finish the user's most recent "
+    "request from there. Do NOT re-run steps or tools that already completed "
+    "successfully. If the completed work is not visible in the conversation "
+    "above, do NOT start the request over — say so and stop."
+)
 
 
 class ResetCause(str, Enum):
@@ -2945,6 +3691,11 @@ def is_system_injection(content: str) -> bool:
 #: Structural queue-entry kind for runner-injected recovery instructions.
 SYNTHETIC_RECOVERY_KIND = "synthetic_recovery"
 
+#: Structural kind for a false-tool-blocker retry whose TEXT is the authenticated
+#: user's original request.  It is recovery orchestration (so it breaks merges and
+#: can be purged), but its ``RecoveryPayload.ORIGINAL`` remains user-authored.
+FALSE_TOOL_BLOCKER_REPLAY_KIND = "false_tool_blocker_replay"
+
 #: Row-level kind for the `error` notice appended when a recovery has ALREADY
 #: been queued, so the frontend can tell a pending retry from a terminal failure.
 TRANSIENT_RETRY_KIND = "transient_retry"
@@ -2989,38 +3740,109 @@ MODEL_UNENTITLED_KIND = "model_unentitled"
 #: backend formatted it.
 AUTH_REQUIRED_KIND = "auth_required"
 
+#: Row-level kind for the terminal `error` row a SPENT PLAN ALLOWANCE produces
+#: ("The monthly usage limit has been reached"). Like the two above, no
+#: recovery is queued -- the allowance does not come back until it resets, so a
+#: retry reproduces the rejection -- and the prose stays as the backend
+#: formatted it. The kind exists so a surface that has a NON-inference way to
+#: finish what the turn was for can offer it on the row: the header's "Request
+#: a Feature" action is an agent turn by design, and without this tag the one
+#: moment a user has no inference left was the one moment that action
+#: dead-ended (the frontend must never infer the limit from the prose, which a
+#: copy edit or a translation moves).
+USAGE_LIMIT_KIND = "usage_limit"
+
+#: Row-level kind for the terminal `error` row a SESSION START that never
+#: answered produces (``session/new`` / ``session/load`` timed out -- the
+#: ``session_start_failed`` tag both ACP exception families carry). Unlike the
+#: three kinds above a retry CAN help here once: a cold start under load is
+#: host weather, so the first Resume keeps its button and its behaviour. What
+#: the kind exists for is the SECOND failure in a row. A start that timed out
+#: registered no session, so ``SessionManager.record_failure`` has nothing to
+#: count against and every Resume re-issued the identical ``session/new`` with
+#: no exit condition -- the transcript IS the count. The Continue endpoint
+#: refuses the re-run once two tagged rows sit at the tail with nothing but
+#: recovery rows between them, and the error card swaps Resume for the remedy
+#: (restart the gateway). Decided from the exception's tag, never from the
+#: prose, which a reword or a translation moves.
+SESSION_START_FAILED_KIND = "session_start_failed"
+
 #: Structural queue-entry kinds for system injections.  Classification by kind
 #: tag — set at enqueue time — is unforgeable: a user typing the same prefix
 #: text will not have the kind tag and will correctly classify as plain input.
 SUBAGENT_COMPLETION_KIND = "subagent_completion"
 CRON_NOTIFICATION_KIND = "cron_notification"
+#: An embedded MCP App's ui/message delivery (SEP-1865 return channel) — see
+#: ``dashboard.handlers.mcp_apps.api_mcp_apps_message``. System injection like
+#: the two above: app-authored, never user speech, must break user-message
+#: merges (folding it into a merged user turn would flip server-authored text
+#: into user-authored, persisted, channel-mirrored history).
+MCP_APP_MESSAGE_KIND = "mcp_app_message"
+
+#: Provenance banner wrapped around every app-originated message. Structural
+#: classification is by the queue entry's ``kind`` tag (unforgeable, set at
+#: enqueue time); the banner exists for the MODEL and the transcript reader,
+#: so the turn's text says who authored it. Mirrors ``CRON_NOTIFY_PREFIX``.
+APP_MESSAGE_PREFIX = "[MCP app message from "
+APP_MESSAGE_END = "[End of MCP app message]"
+
+#: Queue-entry kinds whose turns must settle before an Autopilot stage advances.
+STAGE_DELIVERY_KINDS = frozenset((SUBAGENT_COMPLETION_KIND, SYNTHETIC_RECOVERY_KIND))
+
+
+def owned_stage_delivery_entry(boundary: Any, entries: list[dict]) -> dict | None:
+    """Return the first stage-delivery entry owned by *boundary* (S1)."""
+    return next(
+        (
+            entry
+            for entry in entries
+            if entry.get("kind") in STAGE_DELIVERY_KINDS and boundary.owns_entry(entry)
+        ),
+        None,
+    )
+
 
 #: All system-injection kinds (for set-membership checks).
-_SYSTEM_INJECTION_KINDS = frozenset(
-    (SUBAGENT_COMPLETION_KIND, CRON_NOTIFICATION_KIND, SYNTHETIC_RECOVERY_KIND)
+_SYSTEM_INJECTION_KINDS = STAGE_DELIVERY_KINDS | frozenset(
+    (CRON_NOTIFICATION_KIND, MCP_APP_MESSAGE_KIND, FALSE_TOOL_BLOCKER_REPLAY_KIND)
 )
 
 
-def is_synthetic_recovery_item(item: dict) -> bool:
-    """True when a queue ENTRY is a runner-injected synthetic recovery
-    instruction (post-transient CONTINUE / empty-response nudge).
+def app_inject_row(label: str) -> tuple[str, str, dict]:
+    """The ONE builder for an app-delivery transcript row.
 
-    Classification is structural — the ``kind`` tag set at ``queue_insert``
-    time — never content equality: metadata survives any queue transformation
-    (merge, prefixing, truncation) and cannot collide with a user pasting the
-    transcript-visible recovery text verbatim (which must classify as a plain
-    user message)."""
-    return item.get("kind") == SYNTHETIC_RECOVERY_KIND
+    Both delivery paths (direct dispatch in ``handlers/mcp_apps.py`` and the
+    queue drain in ``chat_runner.py``) call this, so the row cannot diverge
+    between them. ``cls`` is a plain CSS class — NEVER a JSON payload: a JSON
+    ``cls`` makes ``_prepare_messages`` replace the stored meta with the
+    cls-derived dict on the HTTP rebuild path, silently dropping
+    ``injectKind`` and with it the row's collapse/fold exemptions. The label
+    travels in ``meta`` only, and is never re-derived from the banner text.
+    """
+    return "inject", "msg msg-inject", {"injectKind": "mcp_app", "appLabel": label}
+
+
+def is_synthetic_recovery_item(item: dict) -> bool:
+    """True when a queue ENTRY is runner-injected recovery orchestration.
+
+    The false-tool-blocker replay carries the authenticated user's own text, but
+    its distinct kind still identifies the runner-owned retry for queue ordering
+    and late-cancellation purge. Payload provenance remains a separate question.
+    """
+    return item.get("kind") in (
+        SYNTHETIC_RECOVERY_KIND,
+        FALSE_TOOL_BLOCKER_REPLAY_KIND,
+    )
 
 
 class RecoveryPayload(str, Enum):
     """Whether a recovery entry's TEXT is runner-authored or the user's own words.
 
     ``build_recovery_requeue`` already draws this line — a continuation once the
-    turn emitted output, the original request before that — but both re-queue
-    under ``SYNTHETIC_RECOVERY_KIND``, because both must render as an inject row
-    rather than a second user bubble. The kind therefore cannot also answer
-    whether the text may be mirrored to a linked thread as user speech.
+    turn emitted output, the original request before that. Most re-queue under
+    ``SYNTHETIC_RECOVERY_KIND``; false-tool-blocker user replays use their own
+    purgeable kind. Neither kind can answer whether text may be mirrored to a
+    linked thread as user speech, so payload remains the authority classifier.
 
     ``str`` mixin (not ``StrEnum``) for Py3.10 compat, matching ``ResetCause``.
     """
@@ -3048,10 +3870,17 @@ def is_synthetic_payload_item(item: dict) -> bool:
     errors are not symmetric: mirroring runner text as if the user typed it
     misattributes machine orchestration, while suppressing a mirror only loses an
     echo of something the user can already see.
+
+    An MCP-App message entry (``MCP_APP_MESSAGE_KIND``) is synthetic by the same
+    asymmetry: its text is app-authored (server-authored), so mirroring it to a
+    linked channel as the human's own words would attribute machine speech to a
+    person.
     """
     payload = item.get("payload")
     if payload:
         return payload == RecoveryPayload.CONTINUATION
+    if item.get("kind") == MCP_APP_MESSAGE_KIND:
+        return True
     return is_synthetic_recovery_item(item)
 
 
@@ -3112,8 +3941,13 @@ def _dequeue_next_message(slot, merge_enabled: bool) -> tuple:
     return item["content"], [item]
 
 
-def _dequeue_next_system_message(slot, *, exclude_cron: bool = False) -> tuple:
-    """Pop the first queued sub-agent-completion or cron injection, leaving
+def _dequeue_next_system_message(
+    slot,
+    *,
+    exclude_cron: bool = False,
+    preferred_id: str = "",
+) -> tuple:
+    """Pop a preferred queued system injection, or the first one, leaving
     plain user messages queued.
 
     Implements the (always-on) queue-during-subagents behavior: while background
@@ -3127,14 +3961,27 @@ def _dequeue_next_system_message(slot, *, exclude_cron: bool = False) -> tuple:
     runs each stage as its own ``_run_chat`` whose tail-drain fires while
     ``_in_stage_execution`` is still set; without this a cron notification
     queued during the plan is pulled BETWEEN stages and starts a turn that
-    scatters the plan's output. Sub-agent completions and synthetic recovery
-    still flow (a stage may legitimately spawn sub-agents or re-queue a
-    continuation) -- only the external cron injection waits for the plan to end.
+    scatters the plan. Sub-agent completions and synthetic recovery still flow
+    (a stage may legitimately spawn sub-agents or re-queue a continuation) --
+    only the external cron injection waits for the plan to end.
+
+    ``preferred_id`` is selected by the stage boundary's single owner predicate.
+    It changes queue order only for that owned row; this helper never re-decides
+    ownership.
     """
+
+    def _eligible(item: dict) -> bool:
+        return is_system_injection_item(item) and not (
+            exclude_cron and item.get("kind") == CRON_NOTIFICATION_KIND
+        )
+
+    if preferred_id:
+        for i, item in enumerate(slot._queue):
+            if item.get("id") == preferred_id and _eligible(item):
+                popped = slot.queue_pop(i)
+                return popped["content"], [popped]
     for i, item in enumerate(slot._queue):
-        if is_system_injection_item(item):
-            if exclude_cron and item.get("kind") == CRON_NOTIFICATION_KIND:
-                continue
+        if _eligible(item):
             popped = slot.queue_pop(i)
             return popped["content"], [popped]
     return None, []
@@ -3362,7 +4209,9 @@ def _expire_dead_child_oauth_meta(role: str, meta: dict, live_child: str) -> dic
     return out
 
 
-def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -> list[dict]:
+def _prepare_messages(
+    messages: list[dict], running: bool, *, live_child: str, workspace: str | None = None
+) -> list[dict]:
     """Prepare messages for API response.
 
     ``live_child`` is the process-instance identity of the ACP child currently
@@ -3373,7 +4222,41 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
     :func:`_live_child_instance` on the event loop, as close to the render as
     possible (a verdict sampled long before use can name a child that has
     since died, serving one stale read).
+
+    ``workspace`` is the slot's workspace: the display redaction relaxes the
+    hosts a reader allowed there, the same hosts the segment flush relaxed, so
+    an allowed link reaches the page it was kept for.
     """
+    with scoped_exempt_hosts(allowed_hosts_for(workspace)):
+        return _prepare_messages_scoped(messages, running, live_child=live_child)
+
+
+def with_allowed_links_restored(m: dict) -> dict:
+    """``m`` with the blocked links its reader has since allowed shown again.
+
+    Runs inside an allowed-host scope (:func:`_prepare_messages` and the live
+    ``chat_message`` frame), before the
+    display redaction, so a restored address is checked by the same pass that
+    let the host through (see :func:`restore_allowed_links`).
+    """
+    text = m.get("content")
+    meta = m.get("meta")
+    if not isinstance(text, str) or not isinstance(meta, dict) or "blocked_links" not in meta:
+        return m
+    records = bounded_blocked_links(meta.get("blocked_links"))
+    new_text, left = restore_allowed_links(text, records, current_scoped_exempt_hosts())
+    if new_text == text:
+        return m
+    new_meta = dict(meta)
+    if left:
+        new_meta["blocked_links"] = left
+    else:
+        new_meta.pop("blocked_links", None)
+    return {**m, "content": new_text, "meta": new_meta}
+
+
+def _prepare_messages_scoped(messages: list[dict], running: bool, *, live_child: str) -> list[dict]:
+    """:func:`_prepare_messages` inside its allowed-host scope."""
     out: list[dict] = []
     for m in _collapse_wire_rows(messages):
         role = m.get("role", "")
@@ -3409,7 +4292,8 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
         # Content may be structured (a legacy or hand-edited row):
         # redact_display_content recurses into it rather than raising.
         if role != "user" and text:
-            m = {**m, "content": redact_display_content(text)}
+            m = with_allowed_links_restored(m)
+            m = {**m, "content": redact_display_content(m.get("content", ""))}
         else:
             # The wire-string invariant covers EVERY row, not just the
             # redacted ones: a structured user row or a falsy container
@@ -3422,11 +4306,13 @@ def _prepare_messages(messages: list[dict], running: bool, *, live_child: str) -
         if msg_out.get("variants"):
             # Snapshot for the same reason as _redact_meta — this runs in a
             # worker thread (slot-detail render offload) while the event
-            # loop may still be appending variants to the live list.
+            # loop may still be appending variants to the live list. A variant's
+            # records are re-validated here exactly as a row's are in
+            # _redact_meta_for_role: they can hold a full address a reader may
+            # open, and a transcript line is attacker-writable, so no record
+            # reaches a client without the serve-time check.
             msg_out["variants"] = [
-                {**v, "content": redact_display_content(v.get("content", ""))}
-                for v in list(msg_out["variants"])
-                if isinstance(v, dict)
+                _variant_for_emit(v) for v in list(msg_out["variants"]) if isinstance(v, dict)
             ]
         meta = parse_cls_meta(m.get("cls", ""))
         if meta is not None:

@@ -920,6 +920,32 @@ class TestShutdown:
         orch.heartbeat_svc.stop.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_shutdown_releases_the_subagent_task_store(self):
+        """Shutdown closes the manager's durable store, and only after cancel_all.
+
+        ``SubagentManager.__init__`` opens a SQLite connection plus a writer thread
+        for the durable task queue; ``cancel_all`` stops the runs but leaves that
+        store open, so a gateway that never calls ``close`` holds the descriptors
+        and the executor for the life of the process. The ORDER is the other half
+        of the contract: ``cancel_all`` is what stops the runs still writing to the
+        store, so closing first would pull the connection out from under them.
+        """
+        order: list[str] = []
+        orch = _make_orchestrator()
+        orch.cron_svc = None
+        orch.heartbeat_svc = None
+        orch.secretary_svc = None
+        orch.subagent_mgr = MagicMock()
+        orch.subagent_mgr.cancel_all = AsyncMock(side_effect=lambda: order.append("cancel_all"))
+        orch.subagent_mgr.close = MagicMock(side_effect=lambda: order.append("close"))
+        orch.sessions = None
+        orch.dashboard_state = None
+        orch._dashboard_runner = None
+        await orch._shutdown()
+        orch.subagent_mgr.close.assert_called_once_with()
+        assert order == ["cancel_all", "close"]
+
+    @pytest.mark.asyncio
     async def test_shutdown_cancels_handler_tasks(self):
         orch = _make_orchestrator()
         task = asyncio.create_task(asyncio.sleep(100))
@@ -1192,6 +1218,44 @@ class TestAutoApplyUpdate:
                 return_value=proc,
             ):
                 await orch._auto_apply_update()
+
+    @pytest.mark.asyncio
+    async def test_failure_path_resolves_the_restart_hint_off_the_event_loop(self):
+        # The except handler prints `restart_command_hint()`, which stats the
+        # per-user unit file under the account's home; a disconnected network
+        # home holds that stat for as long as it is disconnected. Called on the
+        # loop thread, the wait freezes chat and the liveness heartbeat together
+        # with nothing in-band to clear it. The double below stands in for that
+        # slow stat and blocks until the LOOP sets an event: only a hint
+        # resolved off the loop lets the loop run the task that sets it, so a
+        # hint called synchronously on the loop thread times out and answers
+        # `LOOP BLOCKED` instead of the command — deterministic, not a timing
+        # race, because nothing but the loop can set the event.
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        loop_ran = threading.Event()
+
+        def slow_hint() -> str:
+            return "kirocrew restart" if loop_ran.wait(timeout=2.0) else "LOOP BLOCKED"
+
+        async def loop_is_serving() -> None:
+            await asyncio.sleep(0)
+            loop_ran.set()
+
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": "/tmp/proj"}, clear=False),
+            # The first statement inside the handler's `try` raises, so the
+            # failure path is reached before any spawn.
+            patch.object(gw, "git_command_env", side_effect=RuntimeError("disk gone")),
+            patch.object(gw, "restart_command_hint", slow_hint),
+        ):
+            serving = asyncio.ensure_future(loop_is_serving())
+            await orch._auto_apply_update()
+            await serving
+
+        orch.dashboard_state.push_update_progress.assert_called_once_with(
+            "failed", "Restart failed — run: kirocrew restart"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2399,6 +2463,31 @@ class TestSubagentDoneStoppedClassification:
         assert "partial notes so far" in body
 
     @pytest.mark.asyncio
+    async def test_a_parent_end_stop_is_not_announced_as_the_users(self):
+        """The status line and the detail sentence both read the record's own
+        stop origin: a run a parent end cancelled is announced as that, never as
+        a Stop the user pressed."""
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        orch.dashboard_state.get_slot = MagicMock(return_value=None)  # slot gone
+        on_done = self._capture_on_done(orch)
+        info = self._stopped_info()
+        info._stop_origin = "parent conversation ended (retire_kiro_identity_sessions)"
+
+        await on_done(info)
+
+        orch.dashboard_state.notify.assert_called_once()
+        title, body = orch.dashboard_state.notify.call_args.args[1:3]
+        assert "⏹" in title
+        assert "parent conversation ended (retire_kiro_identity_sessions)" in body
+        assert "Stopped by the user" not in body
+        assert "stopped by user" not in body
+        assert "partial notes so far" in body
+
+    @pytest.mark.asyncio
     async def test_stopped_agent_records_neither_success_nor_failure(self):
         """Orchestrator mode: a user stop must not advance orchestration —
         no record_success (killed work is not done work) and no
@@ -2424,6 +2513,103 @@ class TestSubagentDoneStoppedClassification:
 
         tracker.record_success.assert_not_called()
         tracker.record_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_boundary_cancelled_completion_is_not_routed(self):
+        """A completion that lost stage authority never reaches its parent."""
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+
+        tracker = MagicMock()
+        tracker.stopped = False
+        slot = MagicMock()
+        slot.key = "gone"
+        slot.mode = "orchestrator"
+        slot._orch_tracker = tracker
+        slot.running = False
+        slot.task = None
+        slot._subagent_deliveries_inflight = 0
+        slot._subagents_inline_collected = set()
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        on_done = self._capture_on_done(orch)
+        info = self._stopped_info()
+        info._stage_boundary_cancelled = True
+        info.batch_id = "cancelled-wave"
+        info.batch_total = 1
+
+        run_chat = AsyncMock()
+        with patch("kiro_crew.slack.gateway._run_chat", run_chat):
+            await on_done(info)
+            await asyncio.sleep(0)
+
+        run_chat.assert_not_awaited()
+        slot.queue_append.assert_not_called()
+        orch.dashboard_state.notify.assert_not_called()
+        orch.subagent_mgr.finalize_batch.assert_called_once_with("cancelled-wave")
+        assert "cancelled-wave" not in orch._batch_progress
+
+    @pytest.mark.asyncio
+    async def test_completed_owner_revoked_while_report_waits_is_not_routed(self):
+        """Cancellation that lands during report bookkeeping wins before route."""
+        from kiro_crew.dashboard.state import StageBoundary
+
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = _mock_context_builder()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+
+        owner = "owner-a"
+        tracker = MagicMock()
+        tracker.stopped = False
+        slot = MagicMock()
+        slot.key = "gone"
+        slot.mode = "orchestrator"
+        slot._orch_tracker = tracker
+        slot.running = False
+        slot.task = None
+        slot._in_stage_execution = False
+        slot._subagent_deliveries_inflight = 0
+        slot._subagents_inline_collected = set()
+        slot.stage_boundary = StageBoundary(stage=1, generation=owner)
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        on_done = self._capture_on_done(orch)
+        info = self._stopped_info()
+        info.user_stopped = False
+        info.result = "completed before cancellation"
+        info._stage_boundary_owner = owner
+        info.batch_id = "cancel-race-wave"
+        info.batch_total = 2
+        bookkeeping_started = asyncio.Event()
+        release_bookkeeping = asyncio.Event()
+
+        async def _blocked_pending(*_args):
+            bookkeeping_started.set()
+            await release_bookkeeping.wait()
+            return False
+
+        run_chat = AsyncMock()
+        with (
+            patch(
+                "kiro_crew.slack.gateway._subagent_batch_pending",
+                side_effect=_blocked_pending,
+            ),
+            patch("kiro_crew.slack.gateway._run_chat", run_chat),
+        ):
+            routing = asyncio.create_task(on_done(info))
+            await bookkeeping_started.wait()
+            info.user_stopped = True
+            info._stage_boundary_cancelled = True
+            release_bookkeeping.set()
+            await routing
+            await asyncio.sleep(0)
+
+        run_chat.assert_not_awaited()
+        slot.queue_append.assert_not_called()
+        orch.dashboard_state.notify.assert_not_called()
 
 
 class TestSubagentFinalSummaryDirective:
@@ -3379,6 +3565,7 @@ class TestRunMethod:
         stall = threading.Event()
         original_write_marker = run_marker.write_marker
         original_clear_marker = run_marker.clear_marker
+        original_clear_late = run_marker.clear_late_marker_write
 
         def stalled_write_marker(port):
             events.append("write-start")
@@ -3390,8 +3577,13 @@ class TestRunMethod:
             events.append("clear")
             original_clear_marker(port)
 
+        def recording_clear_late(port):
+            events.append("late-clear")
+            return original_clear_late(port)
+
         monkeypatch.setattr(run_marker, "write_marker", stalled_write_marker)
         monkeypatch.setattr(run_marker, "clear_marker", recording_clear_marker)
+        monkeypatch.setattr(run_marker, "clear_late_marker_write", recording_clear_late)
         marker = run_marker.marker_path(orch._dashboard_port)
         pid_marker = run_marker.pid_path(orch._dashboard_port)
         assert marker.exists()
@@ -3434,7 +3626,7 @@ class TestRunMethod:
             # worker would wake later and write markers OUTSIDE tmp_path.
             stall.set()
             for _ in range(200):  # up to ~10s; normally a few ms
-                if "write-start" not in events or events.count("clear") >= 2:
+                if "write-start" not in events or "late-clear" in events:
                     break
                 await asyncio.sleep(0.05)
 
@@ -3448,9 +3640,17 @@ class TestRunMethod:
         # timed-out clear. The writer thread must then self-clear them
         # (same thread, no event-loop callback os._exit could beat),
         # otherwise a stopped gateway leaves stale runtime state behind.
+        #
+        # The thread's clear is ``clear_late_marker_write``, scoped to the
+        # generation: it may run after the listener is free, where a location
+        # does not identify its owner, so it removes only this process's own
+        # write and only while the pid record still names this process. The
+        # shutdown-side ``clear_marker`` runs once and holds the listener.
         assert "write-end" in events
         assert events.index("write-end") > events.index("clear")
-        assert events.count("clear") == 2  # timed-out clear + writer self-clear
+        assert events.count("clear") == 1  # the timed-out shutdown clear
+        assert events.count("late-clear") == 1  # the writer's own self-clear
+        assert events.index("late-clear") > events.index("write-end")
         assert not marker.exists()
         assert not pid_marker.exists()
 
@@ -3687,6 +3887,123 @@ class TestSubagentDone:
 
         orch.dashboard_state.notify.assert_not_called()
         orch.dashboard_state.push_slots_update.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_dashboard_completion_routes_to_exact_run_owner(self):
+        """A tagged run routes to its owner even when another alias armed later."""
+        from kiro_crew.dashboard.state import StageBoundary, _ChatSlot
+        from kiro_crew.subagent import SubagentInfo
+
+        orch, mock_sm = self._setup_orch_with_subagent_mgr()
+        on_done = mock_sm.call_args[1]["on_done"]
+        parent = "dashboard:chat-1"
+        canonical = _ChatSlot("chat-1")
+        canonical.mode = "chat"
+        first = _ChatSlot("chat-1-first")
+        first.mode = "chat"
+        first.linked_session_key = parent
+        first.stage_boundary = StageBoundary(
+            stage=1,
+            generation="first-owner",
+            parent_session_keys={parent},
+            armed_at=2,
+        )
+        first._in_stage_execution = True
+        second = _ChatSlot("chat-1-second")
+        second.mode = "chat"
+        second.linked_session_key = parent
+        second.stage_boundary = StageBoundary(
+            stage=1,
+            generation="second-owner",
+            parent_session_keys={parent},
+            armed_at=1,
+        )
+        second._in_stage_execution = True
+        orch.dashboard_state._slots = {
+            canonical.key: canonical,
+            first.key: first,
+            second.key: second,
+        }
+        orch.dashboard_state.get_slot = MagicMock(return_value=canonical)
+
+        info = SubagentInfo(id="alias-agent", task="alias task", parent_session_key=parent)
+        info.done = True
+        info.result = "alias result"
+        info._stage_boundary_owner = second.stage_boundary.owner or ""
+        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock) as run_chat:
+            await on_done(info)
+            await asyncio.sleep(0)
+
+        assert not canonical._queue
+        assert not first._queue
+        assert not first._subagent_delivery_pending
+        assert len(second._queue) == 1
+        assert second._subagent_delivery_pending
+        assert second.stage_boundary.owns_entry(second._queue[0])
+        status_payload = next(
+            call.args[1]
+            for call in orch.dashboard_state.broadcast_ws.call_args_list
+            if call.args[0] == "subagent_status"
+        )
+        assert status_payload["slot"] == second.key
+        run_chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_released_boundary_routes_to_live_canonical_slot(self):
+        """A retry cannot keep an owner after that exact boundary is released."""
+        from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
+        from kiro_crew.dashboard.state import StageBoundary, _ChatSlot
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+        from kiro_crew.subagent import SubagentInfo
+
+        orch, mock_sm = self._setup_orch_with_subagent_mgr()
+        on_done = mock_sm.call_args[1]["on_done"]
+        manager = orch.subagent_mgr
+        parent = "dashboard:chat-1"
+        canonical = _ChatSlot("chat-1")
+        canonical.mode = "chat"
+        canonical.stage_boundary = StageBoundary(
+            stage=1,
+            generation="released-owner",
+            parent_session_keys={parent},
+        )
+        canonical.stage_boundary.clear()
+        orch.dashboard_state._slots = {canonical.key: canonical}
+        orch.dashboard_state.get_slot = MagicMock(return_value=canonical)
+        orch.dashboard_state.subagents = manager
+
+        old = SubagentInfo(id="old", task="failed", parent_session_key=parent)
+        old.done = True
+        old.error = "boom"
+        old._stage_boundary_owner = "released-owner"
+        old.execution_context = ExecutionContext(
+            None, MemoryStoreRef("default"), "template", "kirocrew"
+        )
+        retry = SubagentInfo(id="retry", task="failed", parent_session_key=parent)
+        manager.get.return_value = old
+        manager.spawn.return_value = retry
+        request = MagicMock()
+        request.app = {"state": orch.dashboard_state}
+        request.match_info = {"agent_id": old.id}
+        request.get.return_value = None
+        response = await api_spawn_retry(request)
+        assert response.status == 200
+        retry._stage_boundary_owner = manager.spawn.call_args.kwargs["_stage_boundary_owner"]
+
+        canonical.stage_boundary.arm(2)
+        canonical.stage_boundary.parent_session_keys.add(parent)
+        canonical._in_stage_execution = True
+        retry.done = True
+        retry.result = "retry result"
+        with patch("kiro_crew.slack.gateway._run_chat", new_callable=AsyncMock) as run_chat:
+            await on_done(retry)
+            await asyncio.sleep(0)
+
+        assert retry._stage_boundary_owner == ""
+        assert len(canonical._queue) == 1
+        assert canonical._queue[0]["kind"] == "subagent_completion"
+        orch.dashboard_state.notify.assert_not_called()
+        run_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_dashboard_slot_busy_queues(self):
@@ -4141,7 +4458,7 @@ class TestAutoApplyUpdateVenvPath:
                                 "kiro_crew.slack.gateway.build_frontend_async",
                                 new_callable=AsyncMock,
                             ):
-                                with patch("os.execv", side_effect=OSError("test")):
+                                with patch("os.execv"):
                                     with patch("shutil.which", return_value=None):
                                         await orch._auto_apply_update()
 
@@ -4211,7 +4528,7 @@ class TestAutoApplyUpdateVenvPath:
                                 "kiro_crew.slack.gateway.build_frontend_async",
                                 new_callable=AsyncMock,
                             ) as mock_build:
-                                with patch("os.execv", side_effect=OSError("test")):
+                                with patch("os.execv"):
                                     # Resolves: the optional kiro-cli step runs.
                                     with patch(
                                         "kiro_crew.kiro_cli.resolve_kiro_cli",
@@ -4275,7 +4592,7 @@ class TestAutoApplyUpdateVenvPath:
                                 "kiro_crew.slack.gateway.build_frontend_async",
                                 new_callable=AsyncMock,
                             ):
-                                with patch("os.execv", side_effect=OSError("test")):
+                                with patch("os.execv"):
                                     with patch(
                                         "kiro_crew.kiro_cli.resolve_kiro_cli",
                                         return_value="/opt/pinned/bin/kiro-cli",
@@ -4323,7 +4640,7 @@ class TestAutoApplyUpdateVenvPath:
                                 "kiro_crew.slack.gateway.build_frontend_async",
                                 new_callable=AsyncMock,
                             ):
-                                with patch("os.execv", side_effect=OSError("test")):
+                                with patch("os.execv"):
                                     with patch(
                                         "kiro_crew.kiro_cli.resolve_kiro_cli",
                                         return_value="/opt/pinned/bin/kiro-cli",
@@ -4369,7 +4686,7 @@ class TestAutoApplyUpdateVenvPath:
                                 "kiro_crew.slack.gateway.build_frontend_async",
                                 new_callable=AsyncMock,
                             ) as mock_build:
-                                with patch("os.execv", side_effect=OSError("test")):
+                                with patch("os.execv"):
                                     with patch(
                                         "kiro_crew.kiro_cli.resolve_kiro_cli",
                                         return_value=None,
@@ -5073,7 +5390,7 @@ class TestAutoApplyUpdateResetPath:
                     with patch(
                         "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
                     ) as mock_build:
-                        with patch("os.execv", side_effect=OSError("test")):
+                        with patch("os.execv"):
                             with patch("shutil.which", return_value=None):
                                 await orch._auto_apply_update()
 
@@ -5138,7 +5455,7 @@ class TestAutoApplyUpdateResetPath:
                     with patch(
                         "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
                     ):
-                        with patch("os.execv", side_effect=OSError("test")):
+                        with patch("os.execv"):
                             with patch("shutil.which", return_value=None):
                                 await orch._auto_apply_update()
 
@@ -5204,7 +5521,7 @@ class TestAutoApplyUpdateResetPath:
                             "kiro_crew.slack.gateway.build_frontend_async",
                             new_callable=AsyncMock,
                         ):
-                            with patch("os.execv", side_effect=OSError("test")):
+                            with patch("os.execv"):
                                 with patch("shutil.which", return_value=None):
                                     await orch._auto_apply_update()
 
@@ -5407,7 +5724,7 @@ class TestAutoApplyUpdateResetPath:
                             "kiro_crew.slack.gateway.build_frontend_async",
                             new_callable=AsyncMock,
                         ):
-                            with patch("os.execv", side_effect=OSError("test")):
+                            with patch("os.execv"):
                                 with patch("shutil.which", return_value=None):
                                     await orch._auto_apply_update()
 
@@ -5475,7 +5792,7 @@ class TestAutoApplyUpdateResetPath:
                     with patch(
                         "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
                     ):
-                        with patch("os.execv", side_effect=OSError("test")):
+                        with patch("os.execv"):
                             with patch("shutil.which", return_value=None):
                                 await orch._auto_apply_update()
 
@@ -5592,7 +5909,7 @@ class TestAutoApplyUpdateResetPath:
                     with patch(
                         "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
                     ):
-                        with patch("os.execv", side_effect=OSError("test")):
+                        with patch("os.execv"):
                             with patch("shutil.which", return_value=None):
                                 await orch._auto_apply_update()
 
@@ -5628,7 +5945,7 @@ class TestAutoApplyUpdateResetPath:
                     with patch(
                         "kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock
                     ):
-                        with patch("os.execv", side_effect=OSError("test")):
+                        with patch("os.execv"):
                             with patch("shutil.which", return_value=None):
                                 await orch._auto_apply_update()
 
@@ -8342,7 +8659,7 @@ class TestCountInFlightWork:
 
 class TestCallbackSafeUpdateRestart:
     @pytest.mark.asyncio
-    async def test_pre_fence_timeout_defers_without_closing_sessions(self, monkeypatch):
+    async def test_pre_fence_timeout_defers_without_closing_sessions(self, monkeypatch, tmp_path):
         orch = _make_orchestrator()
         orch.dashboard_state = None
         sessions = SimpleNamespace(
@@ -8355,10 +8672,20 @@ class TestCallbackSafeUpdateRestart:
         monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda _timeout: None)
         reexec = MagicMock()
         monkeypatch.setattr(gw.platform_compat, "reexec_python_module", reexec)
-        respawn = MagicMock(return_value="/python")
+        # A real file: the restart establishes that the interpreter exists before it
+        # tears anything down, so a synthetic path would defer for the WRONG reason
+        # and this test would pass without ever reaching the drain it is about.
+        interpreter = tmp_path / "python.exe"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gw.platform_compat.chmod_safe(interpreter, 0o700)
+        respawn = MagicMock(return_value=str(interpreter))
 
         await orch._restart_after_update(respawn)
 
+        # The deferral under test is the one the pre-fence drain causes, so assert it
+        # was actually reached; without this the early no-target deferral satisfies
+        # every assertion below and the test measures nothing.
+        orch._drain_update_callback_work.assert_awaited()
         assert orch._update_apply_deferred is True
         assert orch._pending_update_respawn is respawn
         sessions.fence_update_restart.assert_not_called()
@@ -8366,7 +8693,7 @@ class TestCallbackSafeUpdateRestart:
         reexec.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_restart_fences_then_closes_and_final_drains(self, monkeypatch):
+    async def test_restart_fences_then_closes_and_final_drains(self, monkeypatch, tmp_path):
         order: list[str] = []
         orch = _make_orchestrator()
         orch.dashboard_state = None
@@ -8386,8 +8713,14 @@ class TestCallbackSafeUpdateRestart:
             "reexec_python_module",
             lambda *_args, **_kwargs: order.append("exec"),
         )
+        # A real file, for the same reason as the test above: with a synthetic path
+        # the restart establishes no target and returns before the first drain, so
+        # ``order`` stays empty and this ordering is never exercised.
+        interpreter = tmp_path / "python.exe"
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        gw.platform_compat.chmod_safe(interpreter, 0o700)
 
-        await orch._restart_after_update(lambda: "/python")
+        await orch._restart_after_update(lambda: str(interpreter))
 
         assert order == ["drain:30.0", "fence", "close", "drain:None", "exec"]
         assert orch._pending_update_respawn is None
@@ -8930,6 +9263,27 @@ class TestWheelApplyReadsTheCapabilityCommand:
         assert handlers._update_info["latest_version"] == "9.9.9"
         assert handlers._update_info["check_status"] == "succeeded"
         ds.push_refresh.assert_called_with("update_available")
+
+    @pytest.mark.asyncio
+    async def test_provider_check_publishes_command_ownership_when_up_to_date(self, monkeypatch):
+        """The status frame must say a command owns updates even when the
+        provider finds nothing and no dashboard-side check has run."""
+        import kiro_crew.dashboard.handlers as handlers
+        import kiro_crew.platform.update_governance as gov
+        from kiro_crew.platform.update_provider import CommandProvider, UpdateCheckResult
+
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        handlers._update_info.clear()
+        monkeypatch.setattr(gov, "update_required", lambda _v: False)
+        provider = CommandProvider(check_command="c", apply_command="a")
+        provider.check = AsyncMock(  # type: ignore[method-assign]
+            return_value=UpdateCheckResult(available=False)
+        )
+
+        await orch._check_for_updates_via_provider(provider)
+
+        assert handlers._update_info["managed_by"] == "command"
 
     @pytest.mark.asyncio
     async def test_auto_update_busy_defers_provider_apply(self, monkeypatch):

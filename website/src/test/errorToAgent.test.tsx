@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ErrorNotice from '../components/ErrorNotice'
 import { mergeIntoDraft } from '../utils/chatDrafts'
@@ -448,6 +448,39 @@ describe('ErrorNotice', () => {
     expect(screen.getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
   })
 
+  it('names the dismiss control from dismissLabel when given, "Dismiss" otherwise, as its label AND its tooltip', () => {
+    // The icon-only ✕ carries one name two ways: `aria-label` for the
+    // accessibility tree and `title` as the tooltip, so a sighted user hovering
+    // it reads the same promise a screen reader announces -- the one place a
+    // REMEMBERED dismissal can say what it commits to before the click.
+    const onDismiss = vi.fn()
+    const { unmount } = render(<ErrorNotice message="disk is full" onDismiss={onDismiss} dismissLabel="Dismiss: hide this until it changes" />)
+    const control = screen.getByRole('button', { name: 'Dismiss: hide this until it changes' })
+    expect(control).toHaveAttribute('title', 'Dismiss: hide this until it changes')
+    fireEvent.click(control)
+    expect(onDismiss).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument()
+    unmount()
+    render(<ErrorNotice message="disk is full" onDismiss={onDismiss} variant="inline" />)
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toHaveAttribute('title', 'Dismiss')
+  })
+
+  it('is always the alert in the danger tone: there is no muted or status register for an error', () => {
+    // `errors-use-error-notice`: a failure toned down to a polite status is
+    // still a failure. Whatever a caller passes, the notice renders as
+    // `role="alert"` in the danger tone; a caller that does not want it seen
+    // does not render it.
+    for (const variant of ['block', 'inline'] as const) {
+      const { unmount } = render(<ErrorNotice message="disk is full" askAgent onDismiss={() => {}} variant={variant} />)
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+      const alert = screen.getByRole('alert')
+      expect(alert.className).toContain('text-danger')
+      expect(alert.className).not.toContain('text-muted')
+      expect(alert).not.toHaveAttribute('data-tone')
+      unmount()
+    }
+  })
+
   it('renders with no Redux or Router context — the crash-fallback contract', () => {
     // No <Provider>, no <MemoryRouter>: a boundary fallback cannot assume either.
     expect(() => render(<ErrorNotice message="tree threw" askAgent />)).not.toThrow()
@@ -547,5 +580,52 @@ describe('ErrorNotice', () => {
 
     render(<ErrorNotice message="oops" />)
     expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument()
+  })
+
+  it('dismissLabelVisible shows dismissLabel as visible text that is also the accessible name and tooltip', async () => {
+    // Without it the control is the icon-only X -- named by `dismissLabel` or
+    // the generic "Dismiss", with no text of its own -- the shape every
+    // existing consumer renders.
+    const { unmount } = render(<ErrorNotice message="oops" onDismiss={() => {}} dismissLabel="Dismiss: hide this until it changes" />)
+    const bare = screen.getByRole('button', { name: 'Dismiss: hide this until it changes' })
+    expect(bare.textContent).toBe('')
+    // The single-row shape every existing consumer's tests read: no wrapping.
+    expect(screen.getByRole('alert').className).not.toContain('flex-wrap')
+    unmount()
+
+    // With it, a caller whose dismissal is a step in the user's task (it
+    // re-enables a button) shows that same one string on the control itself, so
+    // the path back is discoverable without reading the paragraph that mentions
+    // it -- one name, read three ways.
+    const onDismiss = vi.fn()
+    const first = render(
+      <ErrorNotice message="oops" onDismiss={onDismiss} dismissLabel="Dismiss notice and re-enable Install" dismissLabelVisible askAgent />,
+    )
+    const labelled = screen.getByRole('button', { name: 'Dismiss notice and re-enable Install' })
+    expect(labelled).toHaveTextContent('Dismiss notice and re-enable Install')
+    expect(labelled).toHaveAttribute('aria-label', 'Dismiss notice and re-enable Install')
+    expect(labelled).toHaveAttribute('title', 'Dismiss notice and re-enable Install')
+    expect(screen.queryByRole('button', { name: /^dismiss$/i })).not.toBeInTheDocument()
+    // A labelled control is wide, and shares the row with the message and the
+    // agent hand-off: at 320px the three cannot stand side by side, so the row
+    // wraps and the label takes a full-width line of its own below the message
+    // (rejoining the row at `md`) -- one node for the action at every width.
+    const alert = screen.getByRole('alert')
+    expect(alert.className).toContain('flex-wrap')
+    expect(alert.className).toContain('md:flex-nowrap')
+    const line = labelled.parentElement!
+    expect(line.className).toContain('basis-full')
+    expect(line.className).toContain('md:basis-auto')
+    expect(line.className).toContain('justify-end')
+    expect(alert.lastElementChild).toBe(line)  // below the message and the hand-off
+    expect(screen.getAllByRole('button', { name: 'Dismiss notice and re-enable Install' })).toHaveLength(1)
+    await userEvent.click(labelled)
+    expect(onDismiss).toHaveBeenCalledOnce()
+    first.unmount()
+
+    // The inline variant shows the same one string under the same flag.
+    render(<ErrorNotice message="oops" variant="inline" onDismiss={() => {}} dismissLabel="Dismiss to retry" dismissLabelVisible />)
+    expect(screen.getByRole('button', { name: 'Dismiss to retry' })).toHaveTextContent('Dismiss to retry')
+    expect(screen.getByRole('button', { name: 'Dismiss to retry' })).toHaveAttribute('title', 'Dismiss to retry')
   })
 })

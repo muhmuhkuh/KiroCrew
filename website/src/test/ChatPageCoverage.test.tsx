@@ -33,15 +33,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, act, waitFor, fireEvent, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
+import { flushSync } from 'react-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ApiError } from '../api/client'
+import { loadDrafts } from '../utils/chatDrafts'
 import { ThemeProvider } from '../hooks/useTheme'
 import type { RootState } from '../store'
 import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
-import { sseAutomation } from '../store/chatSlice'
+import { createSlot, sseAutomation } from '../store/chatSlice'
 import type { ChatMessage } from '../types'
 import { structuredMonitorLoop } from './monitorFixtures'
 import { normalizeAutomationRecord, type AutomationRecord } from '../monitoring/automation'
@@ -74,7 +76,11 @@ interface UserMessageProps {
 let userMsgProps: UserMessageProps | null = null
 
 interface ChatInputProps {
+  value?: string
+  onChange?: (v: string) => void
+  onFileSelect?: (path: string, kind: 'file' | 'dir', token?: string) => void
   onAgentClick?: (rect: DOMRect) => void
+  onModelClick?: (rect: DOMRect) => void
   automation?: { kind?: string } | null
   automationCreationReady?: boolean
   automationSnapshotFailed?: boolean
@@ -92,6 +98,12 @@ interface DefaultAgentRowProps {
 }
 let agentDropdownProps: AgentDropdownListProps | null = null
 let defaultAgentRowProps: DefaultAgentRowProps | null = null
+
+interface ModelEffortDropdownProps {
+  onSetDefault: () => void
+  onManageModels?: () => void
+}
+let modelDropdownProps: ModelEffortDropdownProps | null = null
 
 vi.mock('../components/QueueStack', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/QueueStack')>()
@@ -141,14 +153,23 @@ vi.mock('../components/AgentDropdownList', () => ({
   DefaultAgentRow: (props: DefaultAgentRowProps) => { defaultAgentRowProps = props; return null },
 }))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
+vi.mock('../components/ModelEffortDropdown', () => ({
+  default: (props: ModelEffortDropdownProps) => { modelDropdownProps = props; return null },
+}))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
-vi.mock('../components/ChatInput', () => ({
-  default: (props: ChatInputProps) => {
-    chatInputProps = props
-    return null
-  },
-}))
+vi.mock('../components/ChatInput', async () => {
+  // The page hands the text over through the Composer root's draft store, not
+  // a `value` prop; the stand-in reads it the way the real ChatInput does.
+  const { useComposerDraftText } = await import('../chat-core/composer/Composer')
+  return {
+    default: function ChatInputStub(props: ChatInputProps) {
+      const draft = useComposerDraftText()
+      chatInputProps = draft === null ? props : { ...props, value: draft }
+      return null
+    },
+  }
+})
 vi.mock('../components/WelcomeView', () => ({ default: () => null }))
 vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, SIDEBAR_MAX: 500 }))
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
@@ -226,7 +247,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -282,6 +304,13 @@ interface RenderOpts {
   url?: string
 }
 
+/** Where a deep link out of the page landed — ChatPage renders nothing
+ *  there, so the probe is the only witness. */
+function RouteProbe() {
+  const loc = useLocation()
+  return <span data-testid="route-probe">{loc.pathname + loc.search}</span>
+}
+
 /** Renders ChatPage, then pushes `messages` into the active slot.
  *
  *  The messages are dispatched AFTER mount rather than preloaded: ChatPage's
@@ -330,6 +359,7 @@ function renderChatPage(messages: ChatMessage[], opts: RenderOpts = {}) {
           <MemoryRouter initialEntries={['/chat/chat-1']}>
             <Routes>
               <Route path="/chat/:slug?" element={<ChatPage mode="" />} />
+              <Route path="*" element={<RouteProbe />} />
             </Routes>
           </MemoryRouter>
         </ThemeProvider>
@@ -358,6 +388,7 @@ beforeEach(() => {
   chatInputProps = null
   agentDropdownProps = null
   defaultAgentRowProps = null
+  modelDropdownProps = null
   sessionStorage.clear()
   setItemSpy.mockClear()
   window.history.replaceState({}, '', '/chat')
@@ -602,6 +633,35 @@ describe('ChatPage default-agent footer row', () => {
     expect(defaultAgentRowProps!.agentName).toBe('kirocrew')
     act(() => { defaultAgentRowProps!.onSetDefault() })
     await waitFor(() => expect(setDefault).toHaveBeenCalledWith('kirocrew'))
+  })
+})
+
+describe('ChatPage model picker deep links', () => {
+  // Settings → Chat is a SubNav rail: a link that names no page opens the
+  // first one (Transcript), where neither model control lives and the
+  // highlight never resolves. Both affordances must name the Models page.
+  async function openModelPicker() {
+    await waitFor(() => expect(chatInputProps?.onModelClick).toBeTypeOf('function'))
+    act(() => { chatInputProps!.onModelClick!({ left: 40, top: 80 } as DOMRect) })
+    await waitFor(() => expect(modelDropdownProps).not.toBeNull())
+  }
+
+  it('"Set as default" lands on Settings → Chat → Models with the default-model highlight', async () => {
+    renderChatPage([])
+    await openModelPicker()
+    act(() => { modelDropdownProps!.onSetDefault() })
+    await waitFor(() => expect(screen.getByTestId('route-probe').textContent)
+      .toBe('/settings/chat/models?highlight=chat.default-model'))
+  })
+
+  it('"Manage models" lands on Settings → Chat → Models with the hidden-models highlight', async () => {
+    apiMocks.dashboardConfig = vi.fn().mockResolvedValue({ model_picker_configured: false })
+    renderChatPage([])
+    await openModelPicker()
+    await waitFor(() => expect(modelDropdownProps?.onManageModels).toBeTypeOf('function'))
+    act(() => { modelDropdownProps!.onManageModels!() })
+    await waitFor(() => expect(screen.getByTestId('route-probe').textContent)
+      .toBe('/settings/chat/models?highlight=key%3Adashboard.model_picker_hidden_models'))
   })
 })
 
@@ -1081,6 +1141,53 @@ describe('ChatPage URL prompt hand-off', () => {
     expect(prefillWrites().at(-1)).toMatchObject({ slotKey: 'chat-9', prompt: 'look into this' })
   })
 
+  it('keeps text typed during the token create in the old session instead of losing it to the prompt', async () => {
+    const token = tokenFor({ prompt: 'look into this', channel: 'C123', thread_ts: '1700.5' })
+    let resolveCreate: (v: { key: string; title: string }) => void = () => {}
+    apiMocks.createChatSlot = vi.fn().mockImplementation(() => new Promise(r => { resolveCreate = r }))
+    renderChatPage([], { url: `/chat?token=${token}` })
+
+    await waitFor(() => expect(apiMocks.createChatSlot).toHaveBeenCalled())
+    act(() => { chatInputProps?.onChange?.('typed during the link') })
+    await act(async () => { resolveCreate({ key: 'chat-9', title: 'chat-9' }) })
+
+    await waitFor(() => expect(apiMocks.slackLink).toHaveBeenCalledWith('chat-9', 'C123', '1700.5'))
+    await waitFor(() => expect(chatInputProps?.value).toBe('look into this'))
+    // The token flow writes its own prompt, so the typed text is not carried;
+    // it stays as the old session's draft instead of vanishing.
+    await waitFor(() => expect(loadDrafts()['chat-1']).toBe('typed during the link'))
+  })
+
+  it('a file staged in the same batch as the create resolving keeps its caption in the old session', async () => {
+    // Earlier tests leave a prefill hand-off (sessionStorage) and staged drafts
+    // (localStorage) behind; either would change what this activation carries.
+    sessionStorage.clear()
+    localStorage.clear()
+    apiMocks.createChatSlot = vi.fn().mockImplementation(() => new Promise(() => {}))
+    const { store } = renderChatPage([])
+    await waitFor(() => expect(chatInputProps).not.toBeNull())
+
+    act(() => { void store.dispatch(createSlot(undefined)) })
+    const requestId = store.getState().chat.foregroundCreateId
+    expect(requestId).toBeTruthy()
+    act(() => { chatInputProps?.onChange?.('caption for the file') })
+    // The file and the create's activation commit in ONE React batch, so the
+    // carry decision must read the render-current staged files, not a ref that
+    // an effect declared later has not synced yet.
+    act(() => { flushSync(() => {
+      chatInputProps?.onFileSelect?.('/work/notes.txt', 'file')
+      store.dispatch({
+        type: createSlot.fulfilled.type,
+        payload: { key: 'chat-77', title: 'chat-77' },
+        meta: { arg: undefined, requestId, requestStatus: 'fulfilled', originActiveSlot: 'chat-1', activate: true },
+      })
+    }) })
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-77'))
+    expect(chatInputProps?.value).toBe('')
+    await waitFor(() => expect(loadDrafts()['chat-1']).toBe('caption for the file'))
+  })
+
   it('ignores a token whose payload carries no prompt, but still strips it', async () => {
     const token = tokenFor({ channel: 'C123' })
     const createSpy = apiSpy('createChatSlot')
@@ -1102,7 +1209,8 @@ describe('ChatPage search scope disclosure', () => {
 
   it('qualifies the scope while the paging cursor does not describe the active slot', async () => {
     // switchSlot.pending nulls the cursor key while leaving slotHasMore describing
-    // the outgoing slot, so false here is not this slot's answer (chatSlice:3575).
+    // the outgoing slot, so false here is not this slot's answer
+    // (slotSwitch.ts in store/chat).
     const { store } = renderChatPage([msg('assistant', 'hello there', { ts: 'a1' })], {
       chat: { slotMessages: {} },
     })

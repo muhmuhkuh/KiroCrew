@@ -3,8 +3,12 @@ import { findTokenRanges, type PasteBlock } from '../utils/pasteTokens'
 
 /** Shared typography between the chat textarea and this highlight mirror. MUST
  *  stay identical to the textarea's box/font classes or the chip backgrounds
- *  drift off the token text. */
-export const INPUT_TYPO = 'px-4 pt-3 pb-1 text-sm font-body leading-normal'
+ *  drift off the token text. The size is the message font setting
+ *  (`mc-message-font-text`, styles/message-font-size.css): what the user types
+ *  is sized like what they read. Every composer surface — textarea, this
+ *  mirror, the Lexical editor and its placeholder, the Suspense fallback —
+ *  shares this one constant, which is what keeps their metrics identical. */
+export const INPUT_TYPO = 'px-4 pt-3 pb-1 mc-message-font-text font-body leading-normal'
 
 interface Props {
   value: string
@@ -21,7 +25,9 @@ interface Props {
  * the transparent-background textarea; its text is transparent so only the
  * token chips' backgrounds show, while the real textarea text + caret + native
  * selection stay on top and fully interactive. Vertical scroll is synced by the
- * textarea's onScroll handler (see ChatInput).
+ * textarea's onScroll handler (see ChatInput). The mirror fills its wrapper, so
+ * the textarea must be `display: block` (ChatInput) for the two boxes to be the
+ * same height; otherwise their scroll ranges differ and the chips drift.
  */
 const PasteHighlightLayer = forwardRef<HTMLDivElement, Props>(function PasteHighlightLayer({ value, blocks }, ref) {
   const ranges = findTokenRanges(value, blocks)

@@ -324,6 +324,66 @@ async def test_me_reports_both_expiries(state: RefreshStateManager) -> None:
 
 
 @pytest.mark.asyncio
+async def test_me_reports_whether_the_requests_own_query_token_authenticated() -> None:
+    """``token_accepted`` mirrors the middleware's record of which credential won.
+
+    This endpoint is not owner-gated, so an authenticated-but-owner-denied
+    session answers 200 on its cookie alone, and the middleware replaces an
+    invalid ``?token=`` with that cookie. Both cases are 200 with the same
+    ``user_id``, so the client exchanging a pasted token can only tell them apart
+    from this field. Absent (an older middleware) reads as not accepted, which
+    keeps a prompt up rather than dismissing one nothing vouches for.
+    """
+    accepted = _mk("GET", "/api/auth/me", user="alice")
+    accepted["auth_from_query_token"] = True
+    assert _body(await h.api_auth_me(accepted))["token_accepted"] is True
+
+    fell_back = _mk("GET", "/api/auth/me", user="alice")
+    fell_back["auth_from_query_token"] = False
+    assert _body(await h.api_auth_me(fell_back))["token_accepted"] is False
+
+    unpublished = _mk("GET", "/api/auth/me", user="alice")
+    assert _body(await h.api_auth_me(unpublished))["token_accepted"] is False
+
+
+@pytest.mark.asyncio
+async def test_me_reports_owner_authorization_separately_from_token_acceptance() -> None:
+    """A VALID token can be accepted and still be denied by the owner gate.
+
+    Token validity is signature, expiry and nonce; the owner decision happens
+    after. So a token minted before ``KIROCREW_OWNER_ID`` was configured is
+    accepted -- and its subject is still the bootstrap one the gate refuses. A
+    caller recovering an owner denial that read only ``token_accepted`` would
+    drop its prompt on such a token while every owner-gated call kept failing,
+    so the two questions are answered separately.
+    """
+
+    class _State:
+        owner_id = "real-owner"
+
+    def _dashboard_request(user: str) -> web.Request:
+        request = _mk("GET", "/api/auth/me", user=user, app_keys={"state": _State()})
+        # The predicate reads this to tell a person from an app token.
+        request["app"] = ""
+        request["auth_from_query_token"] = True
+        return request
+
+    owner = _body(await h.api_auth_me(_dashboard_request("real-owner")))
+    assert owner["token_accepted"] is True
+    assert owner["owner_ok"] is True
+
+    pre_owner = _body(await h.api_auth_me(_dashboard_request("local-app")))
+    assert pre_owner["token_accepted"] is True
+    assert pre_owner["owner_ok"] is False
+
+    # An app that cannot answer the question reads as not authorized, rather
+    # than raising or defaulting to authorized.
+    cannot_answer = _mk("GET", "/api/auth/me", user="real-owner")
+    cannot_answer["auth_from_query_token"] = True
+    assert _body(await h.api_auth_me(cannot_answer))["owner_ok"] is False
+
+
+@pytest.mark.asyncio
 async def test_me_reads_session_exp_from_the_validated_credential(
     state: RefreshStateManager,
 ) -> None:
@@ -994,3 +1054,87 @@ async def test_logout_records_a_noop_when_the_access_cookie_was_not_revocable(
     request = _mk("POST", "/api/auth/logout", cookies={f"mc_token_{PORT}": "junk"})
     await h.api_auth_logout(request)
     assert ("", "access_cookie_revoked", "noop", "") in audit
+
+
+@pytest.mark.asyncio
+async def test_a_refused_rotation_leaves_an_audit_row_like_every_other_outcome(
+    state: RefreshStateManager, audit: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one outcome caused by a storage fault must not be the one with no audit trail.
+
+    Every other end of this endpoint writes a ``refresh_token_use`` row -- ``ok``,
+    ``reuse_detected``, ``grace_replay``, ``invalid``, ``rate_limited``, and the reuse path's
+    own unpersisted case. The 503 for an unpersisted rotation logged only, so an owner
+    reconstructing "why did every session stop refreshing" from the audit trail saw nothing
+    at all for the requests that were actually refused.
+    """
+    token, chain_id, jti, _exp = generate_refresh_token("alice")
+
+    # Make the store's write fail, which is what drives the handler down the 503 branch.
+    monkeypatch.setattr(type(state), "mark_consumed", lambda self, *a, **kw: False, raising=True)
+
+    request = _mk(cookies={refresh_cookie_name(str(PORT)): token})
+    response = await h.api_auth_refresh(request)
+
+    assert response.status == 503, (
+        "the unpersisted rotation did not reach the refusal branch, so this pin is not "
+        f"exercising the case it names (status={response.status})"
+    )
+    assert _body(response)["code"] == "refresh_state_unavailable"
+
+    outcomes = [row[2] for row in audit if row[1] == "refresh_token_use"]
+    assert "rotation_not_persisted" in outcomes, (
+        "a refused rotation wrote no audit row, so the audit trail is silent about the one "
+        f"outcome an operator has to act on; rows seen={outcomes}"
+    )
+    assert not state.is_consumed(jti) and chain_id, (
+        "the refusal must leave the presented token unburned -- publishing nothing is the "
+        "whole point of the 503"
+    )
+
+
+@pytest.mark.asyncio
+async def test_logout_on_a_degraded_store_still_revokes_and_does_not_claim_success(
+    state: RefreshStateManager, audit: list, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A storage fault must not turn logout into a no-op that answers 200.
+
+    A degraded store makes `validate_refresh_token` fail closed, which sent logout down the
+    invalid-cookie arm: the chain was revoked neither on disk NOR in memory -- strictly worse
+    than before the degraded mark existed, when the in-memory revocation at least held for
+    the life of the process. The endpoint still answered `200 {"logged_out": true}`, and the
+    next write to succeed cleared the mark, after which the un-revoked cookie validated again
+    for the rest of its TTL. That is the replay the revocation exists to stop.
+    """
+    token, chain_id, _jti, _exp = generate_refresh_token("alice")
+
+    # Degrade the store the way a full disk does, without touching the endpoint's own code.
+    monkeypatch.setattr(
+        rt, "atomic_write", lambda *a, **kw: (_ for _ in ()).throw(OSError(28, "No space"))
+    )
+    state.mark_consumed(
+        "jti-forces-degrade",
+        chain_id="other-chain",
+        exp=time.time() + 86400,
+        ip="1.2.3.4",
+        replacement="{}",
+    )
+    assert state.degraded_reason(), "the store did not degrade, so this pin proves nothing"
+
+    request = _mk(path="/api/auth/logout", cookies={refresh_cookie_name(str(PORT)): token})
+    response = await h.api_auth_logout(request)
+
+    assert state.is_chain_revoked(chain_id), (
+        "the chain was not revoked even in memory, so this process keeps accepting a cookie "
+        "the user just logged out -- and a later successful write clears the degraded mark "
+        "that was the only thing refusing it"
+    )
+    assert response.status == 503, (
+        "logout reported success while the revocation record did not reach disk, so the "
+        f"caller believes a chain is dead that the next restart accepts (status={response.status})"
+    )
+    outcomes = [row[2] for row in audit if row[1] == "refresh_token_logout"]
+    assert "invalid_refresh" not in outcomes, (
+        "the audit row blames the cookie for what is a storage fault, which sends the "
+        f"operator looking in the wrong place; rows={outcomes}"
+    )

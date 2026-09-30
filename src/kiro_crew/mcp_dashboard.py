@@ -26,7 +26,8 @@ update a tag (rename, recolor, status flag), and add or remove tags on a live
 session — no tag delete, so nothing here can strip a label from every session
 at once, and the assignment is a DELTA the endpoint applies compare-and-set
 against the revision this server read, so an agent never clobbers a tag the
-person clicked on meanwhile. Every tool is a thin proxy over the dashboard's
+person clicked on meanwhile. It can pin or unpin a live session with the same
+ownership rules as tagging one. Every tool is a thin proxy over the dashboard's
 existing endpoints (loopback +
 ``X-Internal-Secret``); the endpoints keep owning every tree invariant, and the
 gateway audits each write with the caller's declared component name — this
@@ -70,6 +71,8 @@ from __future__ import annotations
 
 import logging
 import re as _re
+import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -77,6 +80,8 @@ from urllib.parse import quote
 # to the gateway lives in ``mcp_core``. Importing it costs 341ms/40MB in this
 # process (measured) — under ``mcp_computer``'s own import cost, because
 # mcp_core's heavy dependencies are function-local.
+from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.sections import FOLDER_SORT_DEFAULT, FOLDER_SORT_MODES
 from kiro_crew.dashboard.chat_folders import (
     _folder_owner_app,
     _subtree_holds_foreign_folder,
@@ -90,23 +95,36 @@ from kiro_crew.mcp_core import (
     require_strict_session_key,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
+from kiro_crew.mcp_tool_titles import with_titles
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.validation import (
+    BROADCAST_RESPONSE_MARGIN_SECS,
+    BROADCAST_TARGET_ALLOWANCE_SECS,
     CHAT_FOLDER_CREATE_SCHEMA,
     CHAT_FOLDER_FILE_SELF_SCHEMA,
     CHAT_FOLDER_MOVE_SCHEMA,
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
+    CHAT_SESSION_PIN_SCHEMA,
     CHAT_TAG_ASSIGN_SCHEMA,
     CHAT_TAG_CREATE_SCHEMA,
     CHAT_TAG_LIST_SCHEMA,
     CHAT_TAG_UPDATE_SCHEMA,
+    MAX_BROADCAST_TARGETS,
     MCP_DASHBOARD_SCHEMAS,
+    SESSION_ADOPT_SCHEMA,
+    SESSION_BROADCAST_SCHEMA,
     SESSION_CLOSE_SCHEMA,
     SESSION_CREATE_SCHEMA,
+    SESSION_FORK_SCHEMA,
     SESSION_READ_MESSAGE_SCHEMA,
+    SESSION_RELEASE_SCHEMA,
+    SESSION_REVIVE_SCHEMA,
     SESSION_SEND_SCHEMA,
+    SESSION_SET_MODEL_SCHEMA,
+    SESSION_STATUS_SCHEMA,
     SESSION_STOP_SCHEMA,
+    SESSION_SUMMARY_SCHEMA,
     validate_tool_args,
 )
 
@@ -123,10 +141,18 @@ SERVER_VERSION = "1.0.0"
 #: be gated for identity but reachable from a channel agent.
 SESSION_CONTROL_TOOLS: tuple[str, ...] = (
     "session_create",
+    "session_fork",
     "session_stop",
+    "session_set_model",
     "session_close",
+    "session_revive",
     "session_send",
+    "session_broadcast",
+    "session_status",
+    "session_adopt",
+    "session_release",
     "session_read_message",
+    "session_summary",
 )
 
 # The folder endpoints store ``name[:100]``. Mirroring the number here is what
@@ -149,10 +175,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Show the user's SIDEBAR folder tree — the folders they organize "
                 "their chat sessions in — with the live sessions filed in each one. "
-                "Folders are listed in the SAME ORDER the sidebar draws them (each "
-                "parent's children in their stored order), so the sequence you read "
-                "here is the one the person sees — which is what makes it safe to "
-                "pick a ``before``/``after`` anchor for chat_folder_move. Returns per "
+                "Folders are listed in the SAME ORDER the sidebar draws them, in the "
+                "person's folder sort mode (custom = their stored positions, name = "
+                "natural alphabetical, created = newest first); the header line names "
+                "the active mode. In custom mode the sequence you read here is the "
+                "one the person sees, which is what makes it safe to pick a "
+                "``before``/``after`` anchor for chat_folder_move. In name or created "
+                "mode the listing says so and warns that an anchor sets the stored "
+                "position without changing the displayed order. Returns per "
                 "folder: id, human path, project directory, default "
                 "agent, and how many archived (history) sessions are filed there; "
                 "then one line per live session (slot key + title) nested under it, "
@@ -173,8 +203,11 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Omit ``parent`` (or pass 'root') for a top-level folder. Creating a "
                 "folder never moves anything — file sessions into it with "
                 "chat_folder_move_session. An app agent may create at the top level "
-                "or inside a folder it created itself, and the new folder belongs to "
-                "it; creating inside one of the person's folders is refused."
+                "inside a folder it created itself, or directly inside the folder "
+                "its own session is filed in; the new folder belongs to it. Creating "
+                "anywhere else in the person's folders is refused. A crew member "
+                "follows the same rule. An existing same-name folder of yours is "
+                "reused; one that is not yours is refused, never duplicated."
             ),
             "inputSchema": {
                 "type": "object",
@@ -209,10 +242,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "``new_parent`` the anchor chooses the parent, which is how you "
                 "reorder a folder without moving it. chat_folder_tree lists folders "
                 "in the same order the sidebar draws them, so read it first to pick "
-                "the anchor. An app agent may move only a folder it created itself, "
+                "the anchor. A position is a STORED position: the sidebar shows it "
+                "in its custom folder order, and when the person has sorted folders "
+                "by name or creation date (chat_folder_tree's header says which) an "
+                "anchor changes nothing they see until they switch back. An app "
+                "agent may move only a folder it created itself, "
                 "and only to the top level or under another of its own; positioning "
                 "is refused outright when it would renumber siblings the app does "
-                "not own."
+                "not own. A crew member is bound by the same own-folders-only rule."
             ),
             "inputSchema": {
                 "type": "object",
@@ -250,7 +287,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "folder id or human path — the folder must already exist "
                 "(chat_folder_create makes one). Metadata only: the session keeps its "
                 "transcript, model, and any running turn. ARCHIVED (history) sessions "
-                "cannot be moved — revive one into the sidebar first, then call this."
+                "cannot be moved — bring one back with session_revive first, then call this. "
+                "An app agent may file only its own sessions; a crew member may file "
+                "only a session it owns or created."
             ),
             "inputSchema": {
                 "type": "object",
@@ -318,7 +357,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "``status`` marks it a status tag (one a Trello-style column can "
                 "filter on). Create only — rename, recolor or reflag with chat_tag_update; "
                 "this server can never delete a tag, so nothing here can lose a label "
-                "the person put on a session."
+                "the person put on a session. An app agent and a crew member cannot "
+                "write the shared vocabulary at all (a coined tag has no owner in the "
+                "person's list); they read it with chat_tag_list and assign existing "
+                "tags with chat_tag_assign."
             ),
             "inputSchema": {
                 "type": "object",
@@ -346,7 +388,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "and columns filtering on it keep filtering on it — a rename changes "
                 "the label people see, nothing else. This server can create and "
                 "update tags but never delete one, so nothing here can lose a label "
-                "the person put on a session."
+                "the person put on a session. An app agent and a crew member cannot "
+                "write the shared vocabulary; they assign existing tags with "
+                "chat_tag_assign instead."
             ),
             "inputSchema": {
                 "type": "object",
@@ -376,8 +420,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "person changes the session's tags at the same moment the call fails "
                 "with the current list instead of overwriting their click; re-read and "
                 "retry. Metadata only: the transcript, model and any running turn are "
-                "untouched. ARCHIVED (history) sessions cannot be tagged — revive one "
-                "into the sidebar first."
+                "untouched. ARCHIVED (history) sessions cannot be tagged — bring one back "
+                "with session_revive first. An app agent may tag only its own sessions; "
+                "a crew member may tag only a session it owns or created."
             ),
             "inputSchema": {
                 "type": "object",
@@ -401,6 +446,34 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "chat_session_pin",
+            "description": (
+                "Pin or unpin a LIVE chat session in the sidebar. ``session`` is a slot "
+                "key or 'dashboard:<slot>' session key from chat_folder_tree, or a "
+                "session's exact title when that title is unique. ``pinned`` is true to "
+                "pin, false to unpin; asking for the state the session already has "
+                "writes nothing and reports it. chat_folder_tree marks pinned sessions "
+                "``[pinned]``. Metadata only: the transcript, model and any running "
+                "turn are untouched. ARCHIVED (history) sessions cannot be pinned — "
+                "bring one back with session_revive first. An app agent may pin only its own "
+                "sessions; a crew member may pin only a session it owns or created."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "Slot key, 'dashboard:<slot>' session key, or exact unique session title.",
+                    },
+                    "pinned": {
+                        "type": "boolean",
+                        "description": "true to pin, false to unpin.",
+                    },
+                },
+                "required": ["session", "pinned"],
+            },
+        },
+        {
             "name": "session_create",
             "description": (
                 "Open a NEW chat session, pre-named and bound to the agent you pick, so a "
@@ -409,7 +482,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "close it — so use it to stand up a workstream alongside this one (watch a "
                 "build, grind a long refactor) rather than to hide work. It starts empty: "
                 "the person is the one who types the first message into it. Returns its "
-                "key; pass that as `target` to the other session tools."
+                "key; pass that as `target` to the other session tools. To open a session "
+                "that already CARRIES a transcript (splitting your own investigation into "
+                "several sessions), use session_fork instead."
             ),
             "inputSchema": {
                 "type": "object",
@@ -440,6 +515,80 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "creation — a folder id or a '/'-separated human path. Missing "
                             "path segments are created (mkdir -p), like chat_folder_create's "
                             "`parent`. Omit to leave the session at the top level."
+                        ),
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Model the new session starts on, pinned exactly as if the "
+                            "person had picked it in the session's model dropdown: an id "
+                            "from that same list, or 'auto'. Omit to use the agent's or "
+                            "the global default. A well-formed id the account cannot serve "
+                            "is accepted here but withheld at the session's first turn: "
+                            "the turn succeeds on the account's default model, and the only "
+                            "signal is a notice in that session's transcript. The person "
+                            "can still change it later."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+        {
+            "name": "session_fork",
+            "description": (
+                "Open a NEW chat session that CARRIES the transcript of an existing one — "
+                "the same thing as the dashboard's Fork button. The child holds a copy of "
+                "the source's messages up to and including the fork point (the whole "
+                "transcript by default), so it starts with the context already built "
+                "instead of empty; use it to split a long investigation into several "
+                "sessions that each know what was found so far. By default the source is "
+                "YOUR OWN session. The child inherits the source's agent, model, memory "
+                "store and mode, project and folder exactly as a human fork does — there "
+                "is deliberately no agent, model or mode override here (a fork must stay "
+                "inside the memory boundary its transcript came from); to open a session "
+                "bound to a different agent use session_create. It starts IDLE: the copied "
+                "messages are history, and no turn runs until you session_send into it or "
+                "the person types. It appears in the user's sidebar like any other session, "
+                "for them to read, take over and close. Returns its key; pass that as "
+                "`target` to the other session tools."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "The session to copy from: a session key from list_sessions, a "
+                            "slot key, or its exact unique title. Omit to fork YOUR OWN "
+                            "session. Forking another session requires the same "
+                            "authorization as reading it with session_read_message."
+                        ),
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": (
+                            "Short name for the new session, shown in the sidebar. Omit to "
+                            "keep the fork's own `Fork of <source title>`."
+                        ),
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": (
+                            "Sidebar folder to file the new session into — a folder id or a "
+                            "'/'-separated human path, created if missing (mkdir -p), the same "
+                            "as session_create's `folder`. Omit to leave it in the source's "
+                            "folder."
+                        ),
+                    },
+                    "at_message_index": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Fork point: the position of the LAST message to carry, counting "
+                            "the source's user and assistant messages from 0 (system and "
+                            "tool rows are not counted). Messages after it are left behind. "
+                            "Omit to carry the whole transcript."
                         ),
                     },
                 },
@@ -473,10 +622,41 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "session_set_model",
+            "description": (
+                "Change the model another session runs on. Only an IDLE session takes "
+                "the change: if the target has a turn or sub-agents in flight the call "
+                "fails with 'session busy, model not changed' and nothing changes. To "
+                "force it, stop the target with session_stop first, then retry. The "
+                "model is applied when the target's next turn starts, after the same "
+                "permission check runs again; if the target has become channel-linked "
+                "or otherwise out of reach by then, the change is dropped. The "
+                "conversation is kept. 'auto', 'Auto (Jev)' and sessions bound to a "
+                "remote crew are refused."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "Model to switch to: a canonical key or provider id, e.g. "
+                            "'sonnet' or 'opus'. 'auto' is owner-only."
+                        ),
+                    },
+                },
+                "required": ["target", "model"],
+            },
+        },
+        {
             "name": "session_close",
             "description": (
                 "Close another session — the same thing as pressing the ✕ on that tab. "
-                "The conversation is archived to history (it can be reopened later); "
+                "The conversation is archived to history (session_revive brings it back); "
                 "this is NOT a permanent delete, but it does dismiss the live tab and, "
                 "if the target is mid-turn, cancels that turn first and discards its "
                 "work. Use it to tidy up a peer session you created and are done with "
@@ -491,6 +671,51 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "target": {
                         "type": "string",
                         "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "session_revive",
+            "description": (
+                "Bring an ARCHIVED (history) session back into the live sidebar — the "
+                "mirror of session_close. The conversation reopens as a live tab with "
+                "its full transcript, the same thing as clicking it in the History tab; "
+                "nothing runs until someone sends it a message. Use it when a closed "
+                "session is the right home for new work (an investigation to continue, "
+                "a session to tag or file), then address it with the returned key: "
+                "session_send, session_read_message, chat_folder_move_session and "
+                "chat_tag_assign all work on it afterwards. A session that is already "
+                "open is refused with its live key — just use that. Only dashboard "
+                "sessions in the caller's own workspace are addressable; a crew member "
+                "or agent-created session may revive only a session it created itself, verified against "
+                "the gateway's crew-log lineage (on by default; refused ownership_unverified "
+                "when the log is off, unseeded, or predates the session)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "The archived session: its slot key (``chat-7-...``), its "
+                            "'dashboard:<slot>' session key, the transcript name "
+                            "list_sessions reports, or its exact title when that title "
+                            "is unique among archived sessions."
+                        ),
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": (
+                            "Sidebar folder to file the revived session into once it is live "
+                            "— a folder id or a '/'-separated human path; missing path "
+                            "segments are created (mkdir -p), like session_create's `folder`. "
+                            "Filing is best-effort AFTER the revive has landed: the result's "
+                            "`filed` says whether it happened, and a revive whose filing "
+                            "failed still succeeds (the session is live, unfiled). Omit to "
+                            "leave it where it was."
+                        ),
                     },
                 },
                 "required": ["target"],
@@ -543,6 +768,148 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "session_broadcast",
+            "description": (
+                "Send ONE message to several peer sessions at once — the fan-out "
+                "counterpart of session_send, for when the thing you have to say "
+                "is true of every worker rather than of one. Omit `targets` and it "
+                "goes to every session YOU created, which is the usual case for a "
+                "conductor; name them to reach a subset. `mode` picks the delivery "
+                "and is required, because the two are different instructions: "
+                "`queue` waits for each target's current turn to end (use it for "
+                "'the base moved, rebase before you push'), while `steer` cuts "
+                "into every running turn so each target reads it mid-work (use it "
+                "for 'stop, that issue is already fixed'). Every target is checked "
+                "the same way a single session_send is, so this can reach nothing "
+                "a session_send could not. PARTIAL DELIVERY IS NORMAL and the "
+                "result says so per target: a session that was closed, went "
+                "incognito, or belongs to an app is one refused row and the rest "
+                "still get the message — read the rows rather than assuming all or "
+                "nothing. Poll the targets afterwards with session_read_message, "
+                "or take the roster with session_status."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": (
+                            "The message every target receives. It becomes each "
+                            "one's next user-role turn and is tagged as a "
+                            "broadcast in their transcripts, so a worker can tell "
+                            "an instruction its siblings also got from one aimed "
+                            "at it alone. Write it so it is true for all of them."
+                        ),
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["queue", "steer"],
+                        "description": (
+                            "`queue`: each target runs the message when its "
+                            "current turn ends (an idle one starts immediately). "
+                            "`steer`: cut into the turn already running so the "
+                            "target reads it mid-work; on an idle target it starts "
+                            "a turn either way, and where mid-turn injection is "
+                            "unavailable that target falls back to its queue "
+                            "rather than being dropped. No default — say which."
+                        ),
+                    },
+                    "targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Session keys or exact titles, as session_send takes "
+                            "them. Omit to reach every session you created. A "
+                            "repeated target is delivered to once."
+                        ),
+                    },
+                },
+                "required": ["message", "mode"],
+            },
+        },
+        {
+            "name": "session_status",
+            "description": (
+                "List the sessions YOU stood up and what each one is doing right "
+                "now — the roster a conductor patrols. Each row is `working` (a "
+                "turn is in flight, wait), `queued` (idle with messages waiting), "
+                "`idle` (open and doing nothing — this is the one that needs a "
+                "decision), `gone` (the crew log remembers the session and the "
+                "dashboard no longer holds it: closed, archived, or lost with the "
+                "process that ran it — re-dispatch it or drop it, there is nothing "
+                "left to message), or `unknown` (birth metadata records that you "
+                "created it, but neither a live session nor an attested crew-log "
+                "edge exists — it was created and its fate is not recorded, so "
+                "read it before you re-dispatch it). `gone` is the reason to use "
+                "this instead of "
+                "reading sessions one at a time: a worker that vanished is absent "
+                "from any live list, so a live list cannot tell a worker that died "
+                "from one you never dispatched. Read both quality fields before "
+                "trusting the count: `tree` describes the crew-log roster and "
+                "`history` describes transcript birth metadata. For either one, "
+                "`readable` means that source was read completely, `incomplete` "
+                "means its rows may be missing, and `unreadable` means that "
+                "durable source was unavailable. `roster_omitted` is separate "
+                "again: it counts rows this reply dropped because the three "
+                "sources' union exceeded the row bound, which no source's quality "
+                "field describes. The result caveats each gap "
+                "under its own source name. READ-only."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "session_adopt",
+            "description": (
+                "Take another session UNDER yours, so the sidebar shows it nested "
+                "beneath this one and you are recorded as the session that holds "
+                "it. Use it when you are taking over work someone else started: "
+                "adopt each session you are now running, and the sessions THEY "
+                "opened come with them, because the tree hangs on the session and "
+                "not on a path. A session that already has a parent can be "
+                "adopted — that is the takeover — and the parent it had is kept in "
+                "the record. Refused if the target is already above you in the "
+                "tree, which would make a loop. Nothing about the target's work "
+                "changes: it keeps its own conversation, its turns and its tools. "
+                "session_release undoes it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "session_release",
+            "description": (
+                "Let a session out from under its parent, so it stands on its own "
+                "in the sidebar again. The counterpart of session_adopt, and the "
+                "only way to undo one. You may release a session you hold, and you "
+                "may release YOURSELF from whoever holds you — so a session whose "
+                "conductor has stopped running is not stuck under it. Refused for a "
+                "session that has no parent, and for one that hangs under somebody "
+                "else. Sessions the released one holds stay with it: it keeps its "
+                "own subtree and only its own edge upward goes."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": (
+                            "Session key from list_sessions, or its exact title. Your "
+                            "own key releases you from your parent."
+                        ),
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
             "name": "session_read_message",
             "description": (
                 "Read the tail of another session's transcript, plus whether it is still "
@@ -576,6 +943,31 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "required": ["target"],
             },
         },
+        {
+            "name": "session_summary",
+            "description": (
+                "Read another session's intent summary: the short digest the dashboard's "
+                "summary panel shows (each goal with its status, progress and next steps, "
+                "plus recurring project notes), and whether the session is still working. "
+                "Use it on a patrol cycle to learn what a peer is doing without paging its "
+                "transcript with session_read_message. It is a CACHED read and never spends "
+                "a model call: the dashboard writes the summary at turn end, only when the "
+                "operator has turned session summaries on, so it can be absent or `stale` "
+                "(older than the latest turns). Fall back to session_read_message for "
+                "anything newer or more exact. Authorized exactly as session_read_message "
+                "is. READ-only."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
     ]
 
 
@@ -585,7 +977,7 @@ def _list_tools() -> list[dict[str, Any]]:
     Reaching this process at all means an agent spec referenced this server, so
     the assignment already happened; there is nothing left to gate here.
     """
-    return _tool_definitions()
+    return with_titles(SERVER_NAME, _tool_definitions())
 
 
 def _get_rows(path: str) -> tuple[list[dict], str | None]:
@@ -607,6 +999,46 @@ def _get_rows(path: str) -> tuple[list[dict], str | None]:
         if err:
             return [], str(err)
     return [], f"unexpected response shape from {path}"
+
+
+def _read_folder_sort_setting() -> object:
+    """The raw ``dashboard.folder_sort`` value from the gateway's config on disk.
+
+    Read the way the other MCP tools read a dashboard setting (the probe timeout
+    in ``mcp_discovery``, the quarantine threshold in ``mcp_quarantine``):
+    through the loader from ``config.json``, NOT through ``GET
+    /api/config/kirocrew``. That route is cookie-authenticated only -- it is in
+    neither internal-secret allowlist -- and admitting it to read one enum would
+    open the whole config surface, PATCH included, to every secret-bearing
+    caller. The sidebar menu's PATCH persists to the same file before it
+    answers, so this read sees the menu's last choice; the loader has reduced
+    the stored value to the known set, and the local overlay file is merged the
+    same way for both readers.
+    """
+    return KiroCrewConfig.load().dashboard.folder_sort
+
+
+def _chat_folder_sort_mode() -> tuple[str, str | None]:
+    """The person's sidebar folder sort mode.
+
+    ``dashboard.folder_sort`` is the ONE stored copy of the preference: the
+    sidebar menu writes it through the config PATCH allowlist, the sidebar reads
+    it back through its config query, and the tree tool reads the same file, so
+    the two cannot draw the tree in different orders. Returns ``(mode, None)``,
+    or ``("custom", error)`` when the read itself failed -- ``custom`` being the
+    stored-order listing every earlier build produced. A value outside the known
+    set also reads as ``custom``, without an error: the loader has already
+    reduced the stored value to a known one, so that can only be a build skew,
+    not a broken read. The caller decides what to say about an error: the tree
+    is still worth listing when only its ordering is in doubt.
+    """
+    try:
+        raw = _read_folder_sort_setting()
+    except Exception as exc:  # noqa: BLE001 -- said in the header, not raised
+        return FOLDER_SORT_DEFAULT, f"{type(exc).__name__}: {exc}"
+    if isinstance(raw, str) and raw in FOLDER_SORT_MODES:
+        return raw, None
+    return FOLDER_SORT_DEFAULT, None
 
 
 # Sidebar folder ids are minted as ``uuid.uuid4().hex[:12]``
@@ -755,14 +1187,109 @@ def _chat_folder_name_key(folder: dict) -> bytes:
     return text.translate(_ASCII_FOLD).encode("utf-16-be", "surrogatepass")
 
 
-def _chat_folder_siblings(folders: list[dict], parent_id: str) -> list[dict]:
+def _chat_folder_created(folder: dict) -> float | None:
+    """A folder's creation stamp as the sidebar reads it, or ``None`` when it has none.
+
+    ``created_at`` is epoch seconds written by every folder creator since the
+    sidebar's ``created`` sort existed; a row from before that carries no key. The
+    acceptance rule is ``_chat_folder_order``'s, for the same reason: this value
+    orders the ``created`` mode on both sides, so only a real, finite JSON number
+    counts and everything else reads as "no stamp" identically here and in the
+    sidebar's ``folderCreated``. Both sides clamp to the range JavaScript holds
+    exactly, and an unbounded int is clamped BEFORE the ``float`` call because
+    ``float(10**400)`` raises -- and this is a sort key, so nothing here may.
+    """
+    value = folder.get("created_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, int):
+        value = max(-_CHAT_FOLDER_ORDER_LIMIT, min(_CHAT_FOLDER_ORDER_LIMIT, value))
+    stamp = float(value)
+    if stamp != stamp or stamp in (_POS_INF, _NEG_INF):  # NaN, ±Infinity
+        return None
+    return max(-float(_CHAT_FOLDER_ORDER_LIMIT), min(float(_CHAT_FOLDER_ORDER_LIMIT), stamp))
+
+
+_DIGIT_RUNS = _re.compile(r"[0-9]+|[^0-9]+")
+
+
+def _chat_folder_natural_key(folder: dict) -> tuple[tuple[Any, ...], ...]:
+    """The ``name`` sort mode's key: case-folded natural order, ``01.`` < ``02.`` < ``10.``.
+
+    The folded name is cut into maximal runs of ASCII digits and of everything
+    else, and the runs are compared position by position. A digit run compares by
+    its integer value -- leading zeros stripped, then length, then the digits, so
+    the value is compared without ever being converted to a number and an
+    arbitrarily long run cannot overflow on either side. A text run compares as
+    ``_chat_folder_name_key`` does (UTF-16 code units of the ``A``-``Z``-folded
+    text). Where a digit run meets a text run, the digit run sorts first; where
+    every compared run is equal, the shorter name sorts first.
+
+    Only ``0``-``9`` is a digit, deliberately: ``str.isdigit`` reads the
+    interpreter's Unicode tables where the sidebar's ``/[0-9]/`` does not, and a
+    key that agrees with ``folderTree.naturalNameCompare`` by construction is the
+    whole point -- ``chat_folder_tree`` in this mode must list what the sidebar
+    draws. Ties (``01`` against ``1``) fall through to the ``custom`` key.
+    """
+    name = folder.get("name")
+    text = (name if isinstance(name, str) else "").translate(_ASCII_FOLD)
+    key: list[tuple[Any, ...]] = []
+    for run in _DIGIT_RUNS.findall(text):
+        if "0" <= run[0] <= "9":
+            digits = run.lstrip("0")
+            key.append((0, len(digits), digits.encode("ascii")))
+        else:
+            key.append((1, run.encode("utf-16-be", "surrogatepass")))
+    return tuple(key)
+
+
+def _chat_folder_sort_key(mode: str) -> Callable[[dict], tuple[Any, ...]]:
+    """The sibling sort key for one folder sort mode.
+
+    ``custom`` is the stored ``order`` then the folded name -- the only order that
+    existed before the mode did, and the one every placement (``before``/``after``)
+    is computed in. ``name`` and ``created`` are VIEW orders layered on top: each
+    ends in the ``custom`` key so two folders the mode cannot separate keep the
+    order the person arranged, and so the whole key stays total on both sides.
+    ``created`` is newest first, the direction the sidebar's session list already
+    reads in; a folder with no stamp sorts as older than every stamped one.
+
+    An unknown mode reads as ``custom`` rather than raising, because this is
+    called from a listing an agent depends on and the loader has already reduced
+    the stored value to a known one.
+    """
+
+    def custom(folder: dict) -> tuple[Any, ...]:
+        return (_chat_folder_order(folder), _chat_folder_name_key(folder))
+
+    if mode == "name":
+        return lambda f: (_chat_folder_natural_key(f), *custom(f))
+    if mode == "created":
+
+        def created(folder: dict) -> tuple[Any, ...]:
+            stamp = _chat_folder_created(folder)
+            return (1, 0.0, *custom(folder)) if stamp is None else (0, -stamp, *custom(folder))
+
+        return created
+    return custom
+
+
+def _chat_folder_siblings(
+    folders: list[dict], parent_id: str, mode: str = FOLDER_SORT_DEFAULT
+) -> list[dict]:
     """Direct children of ``parent_id``, in the order the sidebar renders them.
 
-    The comparator mirrors the sidebar's own (``folderTree.bySidebarOrder`` sorts
-    each parent's children by ``order`` then name), because a caller saying "put
-    this after that" means after what the PERSON SEES. Sorting by ``order`` alone
-    would disagree with the rendered list wherever two siblings share a number,
-    which the store permits.
+    The comparator mirrors the sidebar's own (``folderTree.folderComparator``
+    sorts each parent's children by the person's folder sort mode -- stored
+    ``order`` then name in ``custom``), because a caller saying "put this after
+    that" means after what the PERSON SEES. Sorting by ``order`` alone would
+    disagree with the rendered list wherever two siblings share a number, which
+    the store permits.
+
+    ``mode`` defaults to ``custom`` because that is the order a POSITION lives in:
+    the placement helpers call this to find the gap a ``before``/``after`` anchor
+    names, and a gap only exists in the stored order. The tree LISTING passes the
+    person's mode instead, so it shows what the sidebar shows.
 
     The name key is ``_chat_folder_name_key``, which folds ``A``-``Z`` and compares
     the UTF-16 encoding, so ``Apple`` sorts between ``alpha`` and ``apricot``.
@@ -771,7 +1298,7 @@ def _chat_folder_siblings(folders: list[dict], parent_id: str) -> list[dict]:
     for which mappings are left alone and why.
     """
     kids = [f for f in folders if f.get("id") and str(f.get("parent_id") or "") == parent_id]
-    return sorted(kids, key=lambda f: (_chat_folder_order(f), _chat_folder_name_key(f)))
+    return sorted(kids, key=_chat_folder_sort_key(mode))
 
 
 # ``ChatSidebar``'s ``renderFolderBlock`` returns nothing for ``depth > 10``, so a
@@ -783,14 +1310,19 @@ def _chat_folder_siblings(folders: list[dict], parent_id: str) -> list[dict]:
 _SIDEBAR_MAX_DRAWN_DEPTH = 10
 
 
-def _chat_folder_render_order(folders: list[dict]) -> list[tuple[str, int]]:
-    """``(folder_id, depth)`` in sidebar render order — pre-order, siblings by order.
+def _chat_folder_render_order(
+    folders: list[dict], mode: str = FOLDER_SORT_DEFAULT
+) -> list[tuple[str, int]]:
+    """``(folder_id, depth)`` in sidebar render order — pre-order, siblings by ``mode``.
 
     Depth-first from the top level, so a child always follows its parent, which
-    is the shape the sidebar draws. Two defences the sidebar also carries: a row
-    whose ``parent_id`` names a folder absent from this list renders at the top
-    level rather than being dropped, and a parent cycle can neither loop the walk
-    nor swallow the folders caught in it (those are appended at the end).
+    is the shape the sidebar draws. Siblings sort with ``_chat_folder_sort_key``
+    for the person's folder sort mode, at every depth, because the sidebar applies
+    its comparator to every parent's children alike. Two defences the sidebar also
+    carries: a row whose ``parent_id`` names a folder absent from this list renders
+    at the top level rather than being dropped, and a parent cycle can neither
+    loop the walk nor swallow the folders caught in it (those are appended at the
+    end).
 
     Depth is clamped to ``_SIDEBAR_MAX_DRAWN_DEPTH`` so the indentation cannot claim
     a level the sidebar does not draw. Every row is still listed at that depth: an
@@ -805,8 +1337,9 @@ def _chat_folder_render_order(folders: list[dict]) -> list[tuple[str, int]]:
             continue
         parent = str(folder.get("parent_id") or "")
         by_parent.setdefault(parent if parent in known else "", []).append(folder)
+    sort_key = _chat_folder_sort_key(mode)
     for kids in by_parent.values():
-        kids.sort(key=lambda f: (_chat_folder_order(f), _chat_folder_name_key(f)))
+        kids.sort(key=sort_key)
 
     out: list[tuple[str, int]] = []
     seen: set[str] = set()
@@ -876,7 +1409,12 @@ def _ambiguous_segment_error(seg: str, matches: list[dict]) -> str:
 
 
 def _resolve_chat_folder_ref(
-    ref: str, folders: list[dict], *, create_missing: bool, session_key: str | None = None
+    ref: str,
+    folders: list[dict],
+    *,
+    create_missing: bool,
+    session_key: str | None = None,
+    before_create: Callable[[str], str | None] | None = None,
 ) -> tuple[str, list[str], str | None]:
     """Resolve a sidebar-folder reference to a folder id. THE resolution chokepoint.
 
@@ -930,7 +1468,11 @@ def _resolve_chat_folder_ref(
     # the two readings are compared would mutate the tree on a reference we are
     # about to refuse.
     walked, created, walk_err = _walk_chat_folder_segments(
-        ref, folders, create_missing=create_missing and not exact, session_key=session_key
+        ref,
+        folders,
+        create_missing=create_missing and not exact,
+        session_key=session_key,
+        before_create=before_create,
     )
     if walk_err:
         return "", created, walk_err
@@ -957,7 +1499,12 @@ def _resolve_chat_folder_ref(
 
 
 def _walk_chat_folder_segments(
-    ref: str, folders: list[dict], *, create_missing: bool, session_key: str | None = None
+    ref: str,
+    folders: list[dict],
+    *,
+    create_missing: bool,
+    session_key: str | None = None,
+    before_create: Callable[[str], str | None] | None = None,
 ) -> tuple[str, list[str], str | None]:
     """Walk a ``/``-separated path segment by segment. ONE walk, two modes.
 
@@ -970,11 +1517,31 @@ def _walk_chat_folder_segments(
     ``folders`` is appended in place for each created row so a later path render
     sees it. Created names come back even alongside an error, so a partial
     mkdir -p is reported rather than silently left behind.
+
+    Two checks run before the FIRST folder is created, so a walk that would
+    stop part-way stops with nothing made. Every segment's length is tested up
+    front. ``before_create`` is called once, with the id of the deepest folder
+    that already exists, just before the first create; an error it returns
+    ends the walk there. It is how ``session_create`` asks whether the create
+    itself would be refused before any folder exists for it.
     """
     walked = ""
     parent = ""
     created: list[str] = []
-    for raw in [s.strip() for s in ref.split("/") if s.strip()]:
+    checked_before_create = before_create is None
+    segments = [s.strip() for s in ref.split("/") if s.strip()]
+    if create_missing:
+        for raw in segments:
+            seg = redact(raw)
+            if len(seg) > _MAX_FOLDER_NAME:
+                return (
+                    "",
+                    created,
+                    f"folder name too long ({len(seg)} chars): "
+                    f"`{seg[:40]}…` — keep each path segment to "
+                    f"{_MAX_FOLDER_NAME} characters or fewer",
+                )
+    for raw in segments:
         # Redact BEFORE the lookup, not only before the write. The name is
         # agent-authored and lands in durable state the sidebar re-renders on
         # every visit, so it gets the egress pass (same reason issue-radar
@@ -1006,13 +1573,54 @@ def _walk_chat_folder_segments(
             continue
         if not create_missing:
             return "", created, None
+        if not checked_before_create and before_create is not None:
+            checked_before_create = True
+            refused = before_create(parent)
+            if refused:
+                return "", created, refused
         made = _post(
             "/api/chat/folders",
             {"name": seg, "parent_id": parent},
             session_key=session_key,
         )
+        if made.get("code") == "folder_name_exists":
+            # The endpoint refuses an agent a same-name sibling under its lock.
+            # Either a concurrent walk created this segment after our read, or
+            # the folder exists but this caller's view of the tree omits it (a
+            # crew member reads only its own folders). Re-read once: the first
+            # case resolves to the winner's folder, the second is refused
+            # rather than forked into a duplicate beside the one it cannot see.
+            fresh, fresh_err = _get_rows("/api/chat/folders")
+            if fresh_err:
+                return "", created, redact(str(fresh_err))
+            folders[:] = fresh
+            matches = _chat_folder_children(folders, parent, seg)
+            if len(matches) > 1:
+                return "", created, _ambiguous_segment_error(seg, matches)
+            if matches:
+                walked = str(matches[0].get("id") or "")
+                parent = walked
+                continue
+            return (
+                "",
+                created,
+                (
+                    f"a folder named `{seg}` already exists there and is not one "
+                    "this session can file into, so no duplicate was created — "
+                    "use a path under a folder you created, or a different name"
+                ),
+            )
         if made.get("error"):
             return "", created, str(made["error"])
+        if made.get("reused"):
+            # The endpoint handed back this caller's own same-name folder, which
+            # a concurrent walk created after our read. Nothing new exists.
+            made = {k: v for k, v in made.items() if k != "reused"}
+            if not any(str(f.get("id") or "") == str(made.get("id") or "") for f in folders):
+                folders.append(made)
+            walked = str(made.get("id") or "")
+            parent = walked
+            continue
         folders.append(made)
         created.append(str(made.get("name") or seg))
         walked = str(made.get("id") or "")
@@ -1027,7 +1635,11 @@ def _resolve_chat_folder_id(ref: str, folders: list[dict]) -> tuple[str, str | N
 
 
 def _ensure_chat_folder_path(
-    ref: str, folders: list[dict], *, session_key: str
+    ref: str,
+    folders: list[dict],
+    *,
+    session_key: str,
+    before_create: Callable[[str], str | None] | None = None,
 ) -> tuple[str, list[str], str | None]:
     """Resolve a parent-folder reference, creating missing segments (mkdir -p).
 
@@ -1035,7 +1647,9 @@ def _ensure_chat_folder_path(
     segments are real folders, and each must be created under the identity the
     caller's gate verified rather than one the write helper re-derives.
     """
-    return _resolve_chat_folder_ref(ref, folders, create_missing=True, session_key=session_key)
+    return _resolve_chat_folder_ref(
+        ref, folders, create_missing=True, session_key=session_key, before_create=before_create
+    )
 
 
 def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None]:
@@ -1077,8 +1691,8 @@ def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None
         # could file a session that merely happens to be TITLED with that key.
         return "", (
             f"no live session has the key {redact(bare)} — call chat_folder_tree "
-            "for slot keys. An ARCHIVED session cannot be moved: revive it into "
-            "the sidebar first"
+            "for slot keys. An ARCHIVED session cannot be moved: bring it back "
+            "with session_revive first"
         )
     if len(titled) == 1:
         return titled[0], None
@@ -1089,7 +1703,7 @@ def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None
         )
     return "", (
         f"no live session matches {redact(ref)} — call chat_folder_tree for slot "
-        "keys. An ARCHIVED session cannot be moved: revive it into the sidebar first"
+        "keys. An ARCHIVED session cannot be moved: bring it back with session_revive first"
     )
 
 
@@ -1414,6 +2028,128 @@ def _refuse_tree_shaping_if_unverifiable(verb: str) -> tuple[str, str, str | Non
     return caller_key, scope, None
 
 
+def _resolve_folder_for_new_session(
+    folder_ref: str, verb: str, preflight: Callable[[str], str | None] | None = None
+) -> tuple[str, str, str, str | None]:
+    """``(folder_id, folder_label, made_note, error)`` for filing a NEW session.
+
+    Shared by ``session_create``, ``session_fork`` and ``session_revive``, which file a session the same
+    way: the reference is resolved with ``chat_folder_create``'s `parent`
+    semantics -- missing path segments are CREATED -- and creating folders is
+    tree shaping, so the same gate applies rather than a second authorization
+    path: a caller that could not reshape the tree by creating a folder must not
+    reach the same write by naming the path here. The gate's verified key is what
+    the segment creation writes under, per its own contract.
+
+    An empty reference resolves to ``("", "", "", None)``: nothing to file.
+    ``made_note`` names any path segments the mkdir -p walk created, and it is
+    reported on BOTH outcomes -- those segments persist even when the create
+    itself is then refused, the same partial-report posture chat_folder_create
+    takes, since folder deletion is deliberately not a capability this server
+    has.
+
+    ``preflight`` closes that gap for the common case. The walk calls it just
+    before its first create, with the deepest folder that already exists, and
+    it returns an error string when the session create itself would be
+    refused. That refusal ends the walk with nothing made, so a create that
+    cannot succeed leaves no empty folder behind. Only a refusal that appears
+    between the preflight and the create (a race, or a folder-create rate limit
+    hit part-way down the path) can still strand segments.
+    """
+    if not folder_ref:
+        return "", "", "", None
+    gate_key, _gate_app, gate = _refuse_tree_shaping_if_unverifiable(verb)
+    if gate:
+        return "", "", "", gate
+    # An app-scoped caller may create folders, but it can NEVER complete a
+    # session create or fork (the endpoints refuse `app_scoped_caller`), so
+    # resolving the folder for it would only leave created path segments behind
+    # for a call that cannot succeed. This is a side-effect guard, not a second
+    # authorization home: the endpoint's refusal stays authoritative for the
+    # create itself.
+    scope_rows, scope_err = _get_rows("/api/chat/slots")
+    if scope_err:
+        return "", "", "", redact(f"Error: {scope_err}")
+    if _caller_app_scope(gate_key, scope_rows):
+        return (
+            "",
+            "",
+            "",
+            (
+                "Error: an app-scoped session cannot create sessions, so there is "
+                "nothing to file — folder resolution is refused before it would "
+                "create path segments for a create that cannot succeed."
+            ),
+        )
+    chat_folders, folders_err = _get_rows("/api/chat/folders")
+    if folders_err:
+        return "", "", "", redact(f"Error: {folders_err}")
+    fld_id, created_segments, fld_err = _ensure_chat_folder_path(
+        folder_ref, chat_folders, session_key=gate_key, before_create=preflight
+    )
+    made_note = ""
+    if created_segments:
+        made_note = f" (created folder path: {'/'.join(created_segments)})"
+    if fld_err:
+        # Refuse the whole create: the caller asked for a session filed in this
+        # folder, and "created but unfiled" would silently honor half of that.
+        # No SESSION exists yet; path segments the mkdir -p walk already created
+        # DO persist and are reported in `made_note`.
+        return "", "", made_note, redact(f"Error: {fld_err}{made_note}")
+    return fld_id, _chat_folder_paths(chat_folders).get(fld_id, fld_id), made_note, None
+
+
+def _summary_time(value: object) -> str:
+    """The sidecar's ``generated_at`` (a ``time.time()`` float) as UTC ISO-8601."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(value)))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "at an unknown time"
+
+
+def _render_session_summary(resp: dict[str, Any]) -> str:
+    """Render a ``/api/session-control/summary`` body as compact text.
+
+    The route has already bounded and redacted every field; this only formats
+    it and says where the route left something out.
+    """
+    state_line = "still working" if resp.get("running") else "idle"
+    head = f"\U0001f9ed `{resp.get('target', '')}` — {resp.get('title', '')} ({state_line})"
+    if not resp.get("enabled"):
+        return (
+            f"{head}\nSession summaries are switched off on this gateway "
+            "(session_summary.enabled), so there is no digest to read. Use "
+            "session_read_message instead."
+        )
+    intents = [i for i in (resp.get("intents") or []) if isinstance(i, dict)]
+    if not intents:
+        return (
+            f"{head}\nNo summary has been written for this session yet (one is written "
+            "at turn end once the session has enough turns). Use session_read_message "
+            "instead."
+        )
+    when = _summary_time(resp.get("generated_at"))
+    stale = " — STALE: newer turns exist." if resp.get("stale") else "."
+    lines = [head, f"Summary written {when}{stale}"]
+    for intent in intents:
+        lines.append(f"- [{intent.get('state') or '?'}] {intent.get('title', '')}")
+        lines.extend(f"    progress: {p}" for p in intent.get("progress") or [])
+        if intent.get("progress_omitted"):
+            lines.append(f"    ({intent['progress_omitted']} earlier progress item(s) not shown)")
+        lines.extend(f"    next: {st}" for st in intent.get("next_steps") or [])
+        if intent.get("next_steps_omitted"):
+            lines.append(f"    ({intent['next_steps_omitted']} more next step(s) not shown)")
+    if resp.get("intents_omitted"):
+        lines.append(f"({resp['intents_omitted']} older intent(s) not shown.)")
+    notes = resp.get("constraints") or []
+    if notes:
+        lines.append("Project notes:")
+        lines.extend(f"- {n}" for n in notes)
+    if resp.get("constraints_omitted"):
+        lines.append(f"({resp['constraints_omitted']} more project note(s) not shown.)")
+    return "\n".join(lines)
+
+
 def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     """Dispatch one validated tool call."""
     caller_key = ""
@@ -1442,57 +2178,32 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     if name == "session_create":
         args = validate_tool_args(args, SESSION_CREATE_SCHEMA)
         payload: dict[str, Any] = {"title": args.get("title", ""), "agent": args.get("agent", "")}
-        folder_ref = str(args.get("folder") or "")
-        folder_label = ""
-        made_note = ""
-        if folder_ref:
-            # Filing at creation resolves the reference with
-            # ``chat_folder_create``'s `parent` semantics — missing path segments
-            # are CREATED — and creating folders is tree shaping, so the same
-            # gate applies rather than a second authorization path: a caller
-            # that could not reshape the tree by creating a folder must not
-            # reach the same write by naming the path here. The gate's
-            # verified key is what the segment creation writes under, per its
-            # own contract.
-            gate_key, _gate_app, gate = _refuse_tree_shaping_if_unverifiable(
-                "filing a new session at creation"
-            )
-            if gate:
-                return gate
-            # An app-scoped caller may create folders, but it can NEVER complete
-            # session_create (the endpoint refuses `app_scoped_caller`), so
-            # resolving the folder for it would only leave created path
-            # segments behind for a call that cannot succeed. This is a
-            # side-effect guard, not a second authorization home: the
-            # endpoint's refusal stays authoritative for the create itself.
-            scope_rows, scope_err = _get_rows("/api/chat/slots")
-            if scope_err:
-                return redact(f"Error: {scope_err}")
-            if _caller_app_scope(gate_key, scope_rows):
-                return (
-                    "Error: an app-scoped session cannot create sessions, so there is "
-                    "nothing to file — folder resolution is refused before it would "
-                    "create path segments for a create that cannot succeed."
+        if args.get("model"):
+            payload["model"] = args["model"]
+
+        def _preflight_create(deepest_id: str) -> str | None:
+            # The same create, as a dry run, against the folder the new path
+            # segments would hang from. Its refusal is the real create's.
+            probe = {**payload, "dry_run": True}
+            if deepest_id:
+                probe["folder_id"] = deepest_id
+            checked = _post("/api/session-control/create", probe, session_key=caller_key)
+            if checked.get("error"):
+                return redact(
+                    f"Error: could not create a session: {checked['error']} "
+                    "(no folder was created)"
                 )
-            chat_folders, folders_err = _get_rows("/api/chat/folders")
-            if folders_err:
-                return redact(f"Error: {folders_err}")
-            fld_id, created_segments, fld_err = _ensure_chat_folder_path(
-                folder_ref, chat_folders, session_key=gate_key
-            )
-            if created_segments:
-                made_note = f" (created folder path: {'/'.join(created_segments)})"
-            if fld_err:
-                # Refuse the whole create: the caller asked for a session filed
-                # in this folder, and "created but unfiled" would silently honor
-                # half of that. No SESSION exists yet; path segments the mkdir -p
-                # walk already created DO persist and are reported in
-                # `made_note` — the same partial-report posture
-                # chat_folder_create takes, since folder deletion is
-                # deliberately not a capability this server has.
-                return redact(f"Error: {fld_err}{made_note}")
+            return None
+
+        fld_id, folder_label, made_note, fld_err = _resolve_folder_for_new_session(
+            str(args.get("folder") or ""),
+            "filing a new session at creation",
+            preflight=_preflight_create,
+        )
+        if fld_err:
+            return fld_err
+        if fld_id:
             payload["folder_id"] = fld_id
-            folder_label = _chat_folder_paths(chat_folders).get(fld_id, fld_id)
         resp = _post(
             "/api/session-control/create",
             payload,
@@ -1501,10 +2212,38 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         if resp.get("error"):
             return redact(f"Error: could not create a session: {resp['error']}{made_note}")
         filed = f" filed in `{folder_label}`" if folder_label else ""
+        on_model = f" on model `{resp['model']}`" if resp.get("model") else ""
         return redact(
-            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}.{made_note} "
+            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}{on_model}.{made_note} "
             "It is empty and waiting in the user's sidebar; watch it with "
             "session_read_message."
+        )
+
+    if name == "session_fork":
+        args = validate_tool_args(args, SESSION_FORK_SCHEMA)
+        payload = {"source": args.get("source", ""), "title": args.get("title", "")}
+        if args.get("at_message_index") is not None:
+            payload["at_message_index"] = args["at_message_index"]
+        fld_id, folder_label, made_note, fld_err = _resolve_folder_for_new_session(
+            str(args.get("folder") or ""), "filing a forked session at creation"
+        )
+        if fld_err:
+            return fld_err
+        if fld_id:
+            payload["folder_id"] = fld_id
+        resp = _post(
+            "/api/session-control/fork",
+            payload,
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return redact(f"Error: could not fork the session: {resp['error']}{made_note}")
+        filed = f" filed in `{folder_label}`" if folder_label else ""
+        return redact(
+            f"\U0001f500 Forked `{resp.get('source')}` into `{resp.get('target')}` "
+            f"({resp.get('title')}) carrying {resp.get('messages')} message(s){filed}."
+            f"{made_note} It is idle and waiting in the user's sidebar; seed it with "
+            "session_send and watch it with session_read_message."
         )
 
     if name == "session_stop":
@@ -1530,6 +2269,19 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return f"\u2139\ufe0f `{target}`: {info} — nothing to stop."
         return f"\U0001f6d1 Stop sent to `{target}`. Its transcript now shows the stop card."
 
+    if name == "session_set_model":
+        args = validate_tool_args(args, SESSION_SET_MODEL_SCHEMA)
+        resp = _post(
+            "/api/session-control/set-model",
+            {"target": args["target"], "model": args["model"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not change that session's model: {resp['error']}"
+        target = resp.get("target", args["target"])
+        model = resp.get("model") or "auto"
+        return redact(f"\U0001f501 `{target}` will switch to `{model}` when its next turn starts.")
+
     if name == "session_close":
         args = validate_tool_args(args, SESSION_CLOSE_SCHEMA)
         resp = _post(
@@ -1543,6 +2295,32 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         return (
             f"\U0001f5d1\ufe0f Closed `{target}` — the tab is dismissed and the "
             "conversation archived to history (it can be reopened later)."
+        )
+
+    if name == "session_revive":
+        args = validate_tool_args(args, SESSION_REVIVE_SCHEMA)
+        payload_r: dict[str, Any] = {"target": args["target"]}
+        fld_id, folder_label, made_note, fld_error = _resolve_folder_for_new_session(
+            str(args.get("folder") or ""), "filing a revived session"
+        )
+        if fld_error:
+            return fld_error
+        if fld_id:
+            payload_r["folder_id"] = fld_id
+        resp = _post("/api/session-control/revive", payload_r, session_key=caller_key)
+        if resp.get("error"):
+            return redact(f"Error: could not revive that session: {resp['error']}{made_note}")
+        target = resp.get("target", args["target"])
+        filed = f" and filed in `{folder_label}`" if resp.get("filed") and folder_label else ""
+        unfiled_note = (
+            " (the folder could not be applied; the session keeps its previous placement)"
+            if fld_id and not resp.get("filed") and resp.get("folder_id") != fld_id
+            else ""
+        )
+        return redact(
+            f"\u267b\ufe0f Revived `{target}` ({resp.get('title')}) with "
+            f"{resp.get('messages', 0)} messages{filed}.{unfiled_note}{made_note} It is open and idle "
+            "in the user's sidebar; session_send starts its next turn."
         )
 
     if name == "session_send":
@@ -1580,6 +2358,200 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             f"when the current turn ends.{queued_note} Poll with session_read_message."
         )
 
+    if name == "session_broadcast":
+        args = validate_tool_args(args, SESSION_BROADCAST_SCHEMA)
+        payload = {"message": args["message"], "mode": args["mode"]}
+        # The VALUE decides, not the key: the validator keeps an explicit JSON
+        # `null` as the field's `None` default, so a presence test would send
+        # `None` into `list()`. `None` and omission both select the default
+        # audience, while an explicitly empty list is still forwarded for the
+        # backend to refuse rather than widened to that audience here.
+        if args.get("targets") is not None:
+            payload["targets"] = list(args["targets"])
+        resp = _post(
+            "/api/session-control/broadcast",
+            payload,
+            # The backend delivers SEQUENTIALLY, so one request covers up to
+            # `MAX_BROADCAST_TARGETS` deliveries and the 30-second default would
+            # expire mid-fleet: the client then reports a failure for a broadcast
+            # the server went on to deliver, discarding the per-target report that
+            # is this verb's whole contract, and the caller's natural retry
+            # delivers the whole message twice.
+            #
+            # The same per-target allowance the backend ENFORCES per delivery, read
+            # from one name so the two cannot drift. Multiplied by the cap because
+            # the deliveries are sequential, then given the shared response margin:
+            # the client budget must EXCEED the backend's worst-case delivery time,
+            # never merely equal it, or the per-target report can still be lost.
+            timeout=(
+                MAX_BROADCAST_TARGETS * BROADCAST_TARGET_ALLOWANCE_SECS
+                + BROADCAST_RESPONSE_MARGIN_SECS
+            ),
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not broadcast: {resp['error']}"
+        rows = resp.get("results") or []
+        requested = int(resp.get("requested", len(rows)) or 0)
+        delivered = int(resp.get("delivered", 0) or 0)
+        mode = str(resp.get("mode", args["mode"]))
+        if resp.get("audience_empty"):
+            # Not an error, and said plainly: a conductor before its first dispatch
+            # is in this state, and "delivered to 0 of 0" reads like a failure.
+            return (
+                "\U0001f4e3 Nothing to broadcast to — you have not created any "
+                "session that is still open. Name `targets` to reach a session you "
+                "did not create, or open one with session_create."
+            )
+        verb = "Steered" if mode == "steer" else "Queued for"
+        lines = [f"\U0001f4e3 {verb} {delivered}/{requested} session(s):"]
+        for row in rows:
+            target = str(row.get("target", ""))
+            if not row.get("ok"):
+                lines.append(
+                    f"  \u274c `{target}` — {row.get('error', 'refused')} "
+                    f"({row.get('code', 'unknown')})"
+                )
+            elif row.get("steered"):
+                lines.append(f"  \u2705 `{target}` — cut into its running turn")
+            elif row.get("started"):
+                lines.append(f"  \u2705 `{target}` — started a turn on it")
+            else:
+                # A steer that could not be injected lands here, for the reason
+                # session_send spells out: reporting a plain queue would leave the
+                # caller believing that target was interrupted.
+                fell_back = " (steer fell back to the queue)" if mode == "steer" else ""
+                lines.append(f"  \u2705 `{target}` — queued until its turn ends{fell_back}")
+        if delivered < requested:
+            lines.append(
+                "Some targets were not reached — the rows above say which and why. "
+                "Nothing retries them for you."
+            )
+        return redact("\n".join(lines))
+
+    if name == "session_status":
+        validate_tool_args(args, SESSION_STATUS_SCHEMA)
+        resp = _get("/api/session-control/status", caller_key)
+        if resp.get("error"):
+            return f"Error: could not read your session roster: {resp['error']}"
+        rows = resp.get("sessions") or []
+        tree = str(resp.get("tree", "unreadable"))
+        history = str(resp.get("history", "readable"))
+        quality_notes: list[str] = []
+        if tree == "incomplete":
+            quality_notes.append(
+                "The crew-log roster read was INCOMPLETE, so this count is a floor: "
+                "a session you created may be missing from it."
+            )
+        elif tree == "unreadable":
+            quality_notes.append(
+                "The crew-log roster was unreadable (crew log off, or not seeded "
+                "yet), so this lists only sessions that are still open — a worker "
+                "that was lost would not appear."
+            )
+        if history == "incomplete":
+            quality_notes.append(
+                "The transcript-metadata roster read was INCOMPLETE, so a session "
+                "created before its first crew-log edge may be missing."
+            )
+        elif history == "unreadable":
+            quality_notes.append(
+                "The transcript-metadata roster was unreadable, so archived birth "
+                "records could not complete this answer."
+            )
+        # The union cut, caveated under its OWN name. Three states, not two: the
+        # field ABSENT (an older backend that does not compute it) says nothing and
+        # must not claim a cut, zero says the union was retained whole, and a
+        # published value that will not read as a number is a cut whose size is
+        # unknown -- which is not the same as no cut and gets its own sentence.
+        omitted_raw = resp.get("roster_omitted")
+        if omitted_raw is not None:
+            try:
+                roster_cut = int(omitted_raw)
+            except (TypeError, ValueError):
+                roster_cut = -1
+            if roster_cut > 0:
+                quality_notes.append(
+                    f"{roster_cut} more session(s) you created are NOT listed: the "
+                    "three rosters' union exceeded this reply's row bound. Name a "
+                    "session directly to read it."
+                )
+            elif roster_cut < 0:
+                quality_notes.append(
+                    "Sessions you created may be missing: this reply reported a "
+                    "roster overflow without a readable count."
+                )
+        if not rows:
+            empty = "\U0001f4cb You have no sessions open or on record."
+            if quality_notes:
+                empty += " " + " ".join(quality_notes)
+            return empty
+        status_lines = [f"\U0001f4cb {len(rows)} session(s) you stood up:"]
+        for row in rows:
+            target = str(row.get("target", ""))
+            status = str(row.get("status", ""))
+            if status == "gone":
+                status_lines.append(
+                    f"  \U0001faa6 `{target}` — gone (the crew log has it, the "
+                    "dashboard does not: closed, archived, or lost)"
+                )
+                continue
+            title = str(row.get("title", ""))
+            depth = int(row.get("queue_depth", 0) or 0)
+            queued = f", {depth} queued" if depth else ""
+            if status == "unknown":
+                # Its OWN mark, not the glyph map's default. Falling through to that
+                # default draws idle's sleep glyph -- "open and doing nothing", the
+                # one status that means no decision is needed -- for a row whose
+                # actual meaning is the opposite: nothing here knows whether this
+                # session finished or was lost.
+                status_lines.append(
+                    f"  \u2753 `{target}` ({title}) — unknown (you created it; "
+                    "neither a live session nor the crew log accounts for it)"
+                )
+                continue
+            mark = {"working": "\U0001f503", "queued": "\u23f8\ufe0f"}.get(status, "\U0001f4a4")
+            status_lines.append(f"  {mark} `{target}` ({title}) — {status}{queued}")
+        status_lines.extend(quality_notes)
+        return redact("\n".join(status_lines))
+
+    if name == "session_adopt":
+        args = validate_tool_args(args, SESSION_ADOPT_SCHEMA)
+        resp = _post(
+            "/api/session-control/adopt",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not adopt that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        previous = resp.get("previous_parent") or ""
+        took_over = (
+            f" It was under `{previous}` before, and that is recorded."
+            if previous
+            else " It was a root before."
+        )
+        return (
+            f"\U0001f91d Adopted `{target}` — the sidebar now nests it under this "
+            f"session, along with anything it opened.{took_over}"
+        )
+
+    if name == "session_release":
+        args = validate_tool_args(args, SESSION_RELEASE_SCHEMA)
+        resp = _post(
+            "/api/session-control/release",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not release that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        previous = resp.get("previous_parent") or ""
+        return (
+            f"\U0001f513 Released `{target}` from `{previous}` — it stands on its own "
+            "in the sidebar again, keeping whatever it opened under itself."
+        )
+
     if name == "session_read_message":
         args = validate_tool_args(args, SESSION_READ_MESSAGE_SCHEMA)
         query = f"target={quote(str(args['target']))}&limit={args.get('limit', 20)}"
@@ -1593,6 +2565,10 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         queued = resp.get("queue_depth", 0)
         if queued:
             state_line += f", {queued} message(s) queued"
+        if resp.get("model"):
+            state_line += f", model {redact(str(resp['model']))}"
+        if resp.get("pending_model"):
+            state_line += f", pending model {redact(str(resp['pending_model']))} for its next turn"
         head_line = (
             f"\U0001f4d6 `{resp.get('target', '')}` — {resp.get('title', '')} "
             f"({state_line}; total={resp.get('total', 0)})"
@@ -1634,6 +2610,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         )
         return "\n".join(read_lines)
 
+    if name == "session_summary":
+        args = validate_tool_args(args, SESSION_SUMMARY_SCHEMA)
+        resp = _get(f"/api/session-control/summary?target={quote(str(args['target']))}", caller_key)
+        if resp.get("error"):
+            return f"Error: could not read that session's summary: {resp['error']}"
+        return _render_session_summary(resp)
+
     if name == "chat_folder_tree":
         validate_tool_args(args, CHAT_FOLDER_TREE_SCHEMA)
         chat_folders, folders_err = _get_rows("/api/chat/folders")
@@ -1642,6 +2625,11 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         chat_slots, slots_err = _visible_chat_slots()
         if slots_err:
             return f"Error: {slots_err}"
+        # Read AFTER the two rows reads, which are the ones that can legitimately
+        # refuse (a filtered caller, a gone slot). A failed mode read does not
+        # abort the listing -- the header says the order is assumed instead -- so
+        # the tree stays readable when only its ordering is in doubt.
+        sort_mode, mode_err = _chat_folder_sort_mode()
         tree_paths = _chat_folder_paths(chat_folders)
         # Group live sessions by folder up front so an id that no longer has a
         # folder row (a slot pointing at a deleted folder) still surfaces under
@@ -1667,12 +2655,40 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         tree_lines = [
             f"\U0001f5c2\ufe0f Sidebar folder tree — {len(chat_folders)} folder"
             f"{'' if len(chat_folders) == 1 else 's'}, {len(chat_slots)} live session"
-            f"{'' if len(chat_slots) == 1 else 's'}:"
+            f"{'' if len(chat_slots) == 1 else 's'} (folder order: {sort_mode}"
+            f"{'' if not mode_err else ', assumed — could not read the dashboard settings: ' + mode_err}):"
         ]
-        # Sidebar ORDER, not alphabetical. This tool is how an agent reads the
-        # tree before repositioning a folder, so listing it by path would show a
+        if sort_mode != FOLDER_SORT_DEFAULT:
+            # The listing below is what the person sees, but a POSITION is a
+            # stored-order concept: in a name or created sort the before/after
+            # anchors chat_folder_move takes still write the stored (custom)
+            # position, which this view does not display. Say so up front, or an
+            # agent will "move A after B", re-read the tree, and see nothing move.
+            tree_lines.append(
+                f"Folders are sorted by {sort_mode}, so a before/after anchor passed "
+                "to chat_folder_move sets the stored (custom) position without "
+                "changing the order shown here; it becomes visible when the person "
+                "switches the sidebar back to the custom folder order."
+            )
+        if sort_mode == "created":
+            # A folder from before the ``created_at`` stamp existed has none, so
+            # the created key puts it after every stamped row, in the stored order
+            # -- the same rule the sidebar's ``folderCreated`` applies, and the
+            # sidebar's menu says the same thing under its rows. An agent reading
+            # a tree whose tail is in stored order must not take that tail for a
+            # date order.
+            unstamped = sum(1 for f in chat_folders if _chat_folder_created(f) is None)
+            if unstamped:
+                tree_lines.append(
+                    f"{unstamped} folder{'' if unstamped == 1 else 's'} with no created_at "
+                    "(made before the stamp existed) list last, in the stored (custom) "
+                    "order, not by date."
+                )
+        # Sidebar ORDER, not alphabetical (unless the person's mode IS by name).
+        # This tool is how an agent reads the tree before repositioning a folder,
+        # so listing it in any order the sidebar does not draw would show a
         # sequence the person never sees and make `before`/`after` a guess.
-        for fid, depth in _chat_folder_render_order(chat_folders):
+        for fid, depth in _chat_folder_render_order(chat_folders, sort_mode):
             fpath = tree_paths.get(fid, "?")
             row = next((f for f in chat_folders if str(f.get("id")) == fid), {})
             meta_bits = []
@@ -2301,6 +3317,83 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         if removed:
             parts.append(f"removed {removed}")
         return redact(f"Session `{slot_key}`: {'; '.join(parts)}. Tags now: {shown}.")
+    if name == "chat_session_pin":
+        args = validate_tool_args(args, CHAT_SESSION_PIN_SCHEMA)
+        want = args["pinned"]
+        # Like chat_folder_move_session, this writes to a session OTHER than the
+        # caller's, so identity is resolved STRICTLY and the verified key rides
+        # on the write unchanged — see that tool for why the lenient walk is
+        # unsafe here.
+        caller_key, strict_err = require_strict_session_key(
+            "Error: cannot verify which session is calling, so this pin change is "
+            "refused — pinning another session requires a caller identity the "
+            "gateway can vouch for.",
+            server=SERVER_NAME,
+        )
+        if not caller_key:
+            return strict_err
+        # Channel containment is enforced HERE, at dispatch, and not only by the
+        # CHANNEL_AGENT_BLOCKED_TOOLS name match: that match runs at the
+        # permission prompt, which an auto-approved call never reaches. A
+        # channel agent acts on thread text other people wrote, and nothing at
+        # the route refuses a ``channel:`` caller, so it is refused before any
+        # session is listed.
+        if caller_key.startswith("channel:"):
+            try:
+                from kiro_crew.sel import sel
+
+                sel().log_tool_invocation(
+                    session_key=caller_key,
+                    source="mcp",
+                    tool_name=name,
+                    tool_kind=SERVER_NAME,
+                    outcome="rejected_blocked_tool",
+                )
+            except Exception:
+                # Stdio-silent: stderr would corrupt the JSON-RPC stream. The
+                # refusal below holds either way.
+                pass
+            return (
+                "Error: chat_session_pin is not available to channel agents — "
+                "pinning rearranges the person's sidebar, and a channel agent acts "
+                "on thread text other people wrote."
+            )
+        chat_slots, slots_err = _visible_chat_slots()
+        if slots_err:
+            return f"Error: {slots_err}"
+        slot_key, slot_err = _resolve_chat_slot_key(args["session"], chat_slots)
+        if slot_err:
+            return redact(f"Error: {slot_err}")
+        verb = "Pinned" if want else "Unpinned"
+        slot_row = next((s for s in chat_slots if str(s.get("key") or "") == slot_key), {})
+        # No client-side "already in that state" shortcut: the list read above
+        # can be stale, so the route decides under its lock, after the
+        # generation and ownership re-checks, and reports ``changed``.
+        # ``expected_created`` pins the write to the slot generation resolved
+        # above, the same token chat_folder_file_self sends; the endpoint
+        # checks it under its lock, so a slot key recreated for a different
+        # conversation in between is refused instead of pinned.
+        pin_body: dict[str, Any] = {"pinned": want}
+        slot_created = str(slot_row.get("created") or "")
+        if slot_created:
+            pin_body["expected_created"] = slot_created
+        d = _patch(
+            f"/api/chat/slots/{quote(slot_key, safe='')}/pin",
+            pin_body,
+            session_key=caller_key,
+        )
+        if d.get("error"):
+            if d.get("code") == "session_gone":
+                return redact(
+                    f"Error: session `{slot_key}` closed or was replaced after it was "
+                    "resolved. Nothing was written — call chat_folder_tree to see "
+                    "the current sessions."
+                )
+            return redact(f"Error: {d['error']}")
+        if d.get("changed") is False:
+            state_word = "pinned" if want else "not pinned"
+            return redact(f"No change: session `{slot_key}` is already {state_word}.")
+        return redact(f"{verb} session `{slot_key}`.")
     return f"Error: unknown tool '{name}'"
 
 

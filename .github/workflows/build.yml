@@ -187,10 +187,10 @@ jobs:
           # resolves relative to the bundle wherever it lands.
           New-Item -ItemType Directory -Force (Join-Path $out "bin") | Out-Null
           Set-Content -Encoding ascii -LiteralPath (Join-Path $out "bin\kirocrew.cmd") `
-            -Value @('@echo off', '"%~dp0..\python.exe" -s -m kiro_crew %*')
+            -Value @('@echo off', '"%~dp0..\python.exe" -s -P -m kiro_crew %*')
           # Self-containment gate, same as the packaging script's: a missing
           # dependency must fail here, not at gateway boot.
-          & $python -s -m kiro_crew --version
+          & $python -s -P -m kiro_crew --version
           if ($LASTEXITCODE -ne 0) {
             throw "the bundled backend is NOT self-contained under PYTHONNOUSERSITE=1."
           }
@@ -210,7 +210,7 @@ jobs:
 
       # No -SkipGatewayValidation: the payload above has a real interpreter, so
       # the script's gateway leg runs and requires /api/ready within its own
-      # 30-second ceiling.
+      # 50-second ceiling.
       #
       # -MinStartupPycs 750 rather than the script's 1000 default: that default
       # describes the FULL release bundle, which also carries the voice extras
@@ -344,3 +344,39 @@ jobs:
           name: desktop-linux-${{ runner.arch }}
           path: website/electron/dist/*.AppImage
           if-no-files-found: warn
+
+  # Install the macOS DMG for real and launch the app it carries -- the same
+  # script build-desktop.yml runs on nightly and release, here on the PR that
+  # changed a packaging path. Runs only when the macOS leg ran (the matrix drops
+  # it for PRs that touched no packaging path), and reads that leg's artifact.
+  # macOS bills at 10x: one job, bounded ceilings inside the script.
+  smoke-install-macos:
+    needs: [desktop-matrix, build-desktop]
+    if: contains(needs.desktop-matrix.outputs.os, 'macos-15')
+    name: Smoke-install macOS DMG (launch + bundled kiro-cli)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download macOS build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-macos-arm64
+          path: dist
+
+      - name: Install the DMG, launch the app, prove the bundled kiro-cli
+        run: ./scripts/smoke-macos-install.sh dist
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-install-smoke-evidence
+          path: |
+            ${{ runner.temp }}/kirocrew-smoke-*/logs/*
+            ~/Library/Logs/*/gateway-launch.log
+          if-no-files-found: warn
+          retention-days: 14

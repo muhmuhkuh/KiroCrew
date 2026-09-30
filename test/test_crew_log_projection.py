@@ -9,7 +9,11 @@ batch implementation would be free to break.
 
 from __future__ import annotations
 
+import copy
 import json
+import math
+import os
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -83,8 +87,8 @@ def _tool(
 # --- writing a fixture that has to be LONG --------------------------------- #
 #
 # A bound in this module is a bound on retained state, so reaching one costs as
-# many entries as the bound itself, and ``FOLD_CHUNK_ENTRIES`` is 1024 -- 2049
-# entries to cross it twice. One ``append`` per entry is one cross-process lock,
+# many entries as the bound itself, and the largest fixture here runs past 2048
+# entries. One ``append`` per entry is one cross-process lock,
 # one tail scan and one ``os.fsync`` EACH, which measures 76-90 ms per entry on
 # the Windows CI runner: that puts a 2049-entry fixture at 156-185 s against a
 # 180 s per-test cap. A breach there does not fail one test. Windows has no
@@ -266,6 +270,86 @@ def test_incremental_matches_from_scratch_at_every_split(name):
         resumed = crew_log.advance(first, entries[cut:])
         assert crew_log.projection_of(resumed).value == whole, f"{name} disagrees at cut {cut}"
         assert resumed.last_seq == (entries[-1].seq if entries else 0)
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_the_kernel_definition_folds_to_what_advance_folds(name):
+    """The wrapper the kernel drives and the ``advance`` surface reach one value.
+
+    ``advance`` deep-copies once and steps the whole span; the kernel drives one entry
+    at a time through a copy the fold declared. Two ways of arriving at the same fold,
+    so they are pinned against each other -- a copier or an ``affects`` set that was
+    wrong would show up here as a different number.
+    """
+    entries = _entries(_busy_log())
+    definition = crew_log._SessionFold(crew_log._FOLDS[name])
+    state = definition.init()
+    for entry in entries:
+        state = definition.apply(state, entry)
+
+    assert definition.view(state) == crew_log.fold(name, entries)
+    # The version the kernel is handed is THIS fold's, not the module maximum: a bump
+    # to one fold must retire that fold's savepoints and leave the others standing, and
+    # comparing against the maximum here would pass while the wrapper published the
+    # wrong number for every fold below it.
+    assert definition.state_version == crew_log.fold_state_version(name)
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_a_fold_never_reaches_into_the_state_it_was_handed(name):
+    """MUTATION-SENSITIVE: ``apply`` copies before it steps, so its input is intact.
+
+    This is what keeps each fold's declared ``copy_state`` honest. A copier that misses
+    a nested container still produces the RIGHT value -- the step edits the object it
+    meant to edit -- but it edits the caller's state along with it, and a caller holding
+    an earlier bundle would then watch its value move underneath it. Nothing raises
+    either way, so this test is the only thing that catches the miss.
+
+    Checked at every position, because the container a copier misses often does not
+    exist until the fold has something in it: ``tools`` has no per-name row to share
+    until a tool has been called.
+    """
+    entries = _entries(_busy_log())
+    definition = crew_log._SessionFold(crew_log._FOLDS[name])
+    state = definition.init()
+    for entry in entries:
+        before = copy.deepcopy(state)
+        grown = definition.apply(state, entry)
+        assert state == before, f"{name} edited the state it was handed at seq {entry.seq}"
+        state = grown
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_an_entry_a_fold_declares_untouched_really_moves_nothing(name):
+    """MUTATION-SENSITIVE: ``affects`` may be wider than the truth, never narrower.
+
+    Returning the state unchanged is how ``apply`` tells the kernel this entry moved
+    nothing, and the kernel believes it: a type wrongly left out of ``affects`` drops a
+    real change and serves a stale value for as long as the fold sits there. So for
+    every entry the wrapper skipped, the step is run on a copy to prove it would indeed
+    have changed nothing.
+
+    The opposite error is not a bug and is not asserted against: a type wrongly
+    INCLUDED costs a copy, and a spurious frame to a client watching the change feed.
+    """
+    entries = _entries(_busy_log())
+    fold_spec = crew_log._FOLDS[name]
+    definition = crew_log._SessionFold(fold_spec)
+    state = definition.init()
+    skipped = 0
+    for entry in entries:
+        grown = definition.apply(state, entry)
+        if grown is state:
+            skipped += 1
+            probe = fold_spec.copied(state)
+            fold_spec.step(probe, entry)
+            assert probe == state, (
+                f"{name} treats {entry.type} as untouched, but its step moves the "
+                f"state at seq {entry.seq}"
+            )
+        state = grown
+    if fold_spec.affects is not None:
+        assert skipped > 0, f"{name} declares a type set but skipped nothing to prove it"
 
 
 @pytest.mark.parametrize("name", crew_log.PROJECTION_NAMES)
@@ -454,6 +538,206 @@ def test_usage_bills_injected_context_per_source():
     assert context["estimated_turns"] == 1
     assert context["by_source"]["memory"] == {"blocks": 2, "tokens": 25, "chars": 100}
     assert context["by_source"]["system"] == {"blocks": 1, "tokens": 25, "chars": 100}
+
+
+def test_usage_bills_every_source_that_spends_and_says_which_spent_what():
+    """A session's bill is its turns PLUS its children PLUS its helpers.
+
+    A total that billed turns alone would read a session that spent most of its
+    budget on subagents as cheap, and would fold none of the credits
+    ``background/completed`` carries. The split beside the total is what keeps the
+    total readable: one number cannot say whether the spend was the user's turns or
+    a wave of children.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7, "credits": 1.0}, src=GATEWAY)
+    handle.append(
+        "background/completed", {"kind": "title", "model": "haiku", "credits": 0.5}, src=GATEWAY
+    )
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 3.5
+    assert value["credits_by_source"] == {
+        "turn": {"credits": 2.0, "reported": 1},
+        "subagent": {"credits": 1.0, "reported": 1},
+        "background": {"credits": 0.5, "reported": 1},
+    }
+    # The turn-scoped count still answers for turns alone: it is what tells a reader
+    # how many of the session's turns the turn bucket covers.
+    assert value["turns"]["credits_reported"] == 1
+
+
+def test_usage_bills_a_child_that_failed_against_the_subagent_bucket():
+    """A run the user stopped still billed for the turns it attempted."""
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append(
+        "subagent/failed",
+        {"agent_id": "sub-1", "outcome": "stopped", "ms": 3, "credits": 0.75},
+        src=GATEWAY,
+    )
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.75
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.75, "reported": 1}
+
+
+#: Every charge shape the fold refuses, and why each one is not a measurement of
+#: spend. They are one list because they are one rule: a charge is billed only when
+#: it is a real number this fold can add to a running total and defend afterwards.
+#: ``nan`` and the infinities cannot be added -- every later sum is non-finite too,
+#: ``round`` keeps it so, and the savepoint persists it, so the total is poisoned for
+#: the life of the unit. A negative can be added, and that is the problem: it REDUCES
+#: a total, so a session reads as having spent less than it did, and no later entry
+#: corrects it. ``json`` round-trips all five without complaint.
+_UNUSABLE_CHARGES = [float("nan"), float("inf"), float("-inf"), -0.5, -1.0e9]
+
+
+@pytest.mark.parametrize("source", ["subagent/completed", "subagent/failed"])
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_child(bad, source):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append(source, {"agent_id": "sub-1", "credits": bad}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_background_helper(bad):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("background/completed", {"kind": "title", "credits": bad}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["background"] == {"credits": 0.0, "reported": 0}
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_turn(bad):
+    """One rule for all three spenders, including the one that predates the buckets.
+
+    The turn path is where a charge has always been read, so leaving it out would
+    make the rule depend on which spender wrote the line -- and the poisoned total it
+    produces is the same total.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    _turn(handle, 2, credits=bad)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["turn"] == {"credits": 2.0, "reported": 1}
+    assert value["turns"]["credits_reported"] == 1
+    assert value["by_model"]["opus"]["credits"] == 2.0
+
+
+def test_usage_survives_a_charge_too_large_to_be_a_float():
+    """A JSON integer is unbounded, so a charge can be unrepresentable, not just wrong.
+
+    ``float()`` raises ``OverflowError`` on a 400-digit int, and nothing between
+    ``_usage_step`` and ``fold_session`` catches it, so the whole fold would fail on
+    one bad entry rather than skipping it. The fold's contract is that a line it
+    cannot interpret costs that line, never the projection.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "credits": 10**400}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+def test_usage_refuses_a_charge_that_would_overflow_the_running_total():
+    """Two charges that are each finite can still sum to infinity.
+
+    This is the case an input check cannot see: both values pass every test that
+    looks at them alone. Only the RESULT of the addition is wrong, and once it is
+    stored the savepoint keeps it, so the invariant has to be checked after the add
+    rather than before it.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=1.0e308)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "credits": 1.0e308}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert math.isfinite(value["credits"])
+    assert value["credits"] == 1.0e308
+    assert value["credits_by_source"]["turn"] == {"credits": 1.0e308, "reported": 1}
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+    assert math.isfinite(value["by_model"]["opus"]["credits"])
+
+
+def test_usage_counts_a_charge_of_exactly_zero_as_measured():
+    """Zero is the one falsy charge that IS a measurement, so it stays counted.
+
+    A provider that reports ``0.0`` explicitly measured zero, which is a different
+    fact from a closer that reported nothing -- and ``reported`` is the field that
+    tells those two apart. The refusals above are values that cannot be summed or
+    that move a total the wrong way; zero is neither.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=0.0)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.0
+    assert value["credits_by_source"]["turn"] == {"credits": 0.0, "reported": 1}
+
+
+def test_usage_does_not_read_an_unmetered_child_as_a_free_one():
+    """A closer with no ``credits`` key measured nothing, which is not zero."""
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+def test_timeline_keeps_a_child_run_duration():
+    """``ms`` is what subagent and step entries call their measured duration.
+
+    ``duration_ms`` is the turn entry's spelling, so a copied-key list carrying only
+    that one keeps a child's run time out of the timeline entirely.
+    """
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7, "credits": 1.0}, src=GATEWAY)
+
+    moments = crew_log.fold_timeline(_entries(handle))["moments"]
+    closer = [m for m in moments if m["type"] == "subagent/completed"]
+    assert len(closer) == 1
+    assert closer[0]["ms"] == 7
+    assert closer[0]["credits"] == 1.0
 
 
 def test_usage_splits_cost_by_model():
@@ -736,6 +1020,206 @@ def test_fold_session_continues_from_an_earlier_bundle():
     second = crew_log.fold_session(SESSION, since=first)
     assert second.last_seq > first.last_seq
     assert second.projection("usage").value == crew_log.fold_usage(_entries(handle))
+
+
+def test_fold_session_incremental_refuses_a_backward_seq_like_a_fold_from_the_start():
+    """A non-advancing seq in the tail refuses BOTH ways -- never one way only.
+
+    The append-only writer cannot produce a duplicate or backward seq, so one
+    in the file is external damage. A fold from the start refuses it in
+    ``advance``. Without the walked-entry guard, an incremental read drops the
+    record below its resume seq unexamined and folds on -- two reads of the
+    same bytes disagree and a reader cannot tell which answer it is getting.
+    The guard in ``iter_from`` makes the incremental read refuse the same
+    damage with the same code.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    last_line = path.read_bytes().splitlines(keepends=True)[-1]
+    with open(path, "ab") as damaged:
+        damaged.write(last_line)  # byte-identical copy: the last seq appears twice
+    _turn(handle, 2)  # a real turn past the damage, so the incremental read walks over it
+
+    with pytest.raises(CrewLogError) as from_start:
+        crew_log.fold_session(SESSION)
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert from_start.value.code == lg.CODE_BAD_DATA
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_incremental_refuses_a_backward_tail_after_real_growth():
+    """A regressed physical tail cannot hide valid growth from a cached fold."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+
+    _turn(handle, 2)
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    earlier_line = next(
+        line
+        for line in path.read_bytes().splitlines(keepends=True)
+        if json.loads(line).get("seq") == bundle.last_seq
+    )
+    with open(path, "ab") as damaged:
+        damaged.write(earlier_line)
+
+    with pytest.raises(CrewLogError) as from_start:
+        crew_log.fold_session(SESSION)
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert from_start.value.code == lg.CODE_BAD_DATA
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_incremental_refuses_same_size_rewrite_of_folded_seq():
+    """A same-size rewrite behind the resume point must invalidate the cache."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    before = path.stat()
+    lines = path.read_bytes().splitlines(keepends=True)
+    damaged = json.loads(lines[-2])
+    damaged["seq"] = json.loads(lines[-3])["seq"]
+    replacement = (
+        json.dumps(damaged, ensure_ascii=True, separators=(",", ":"), sort_keys=False).encode()
+        + b"\n"
+    )
+    assert len(replacement) == len(lines[-2])
+    lines[-2] = replacement
+    path.write_bytes(b"".join(lines))
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    assert path.stat().st_size == before.st_size
+
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_incremental_refuses_older_segment_seq_regression():
+    """A seq regression in a NON-newest segment must invalidate the fast path.
+
+    ``handle.path`` names only the newest segment, so a fingerprint taken from
+    it alone never sees an older segment move -- the fast return would serve the
+    cached bundle while a cold fold refuses the log. The fingerprint covers the
+    whole segment set for exactly this case.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    _turn(handle, 2)
+    del handle
+
+    # Split the single-segment log into two valid segments: the head keeps the
+    # early records, ``log.<first_seq>.jsonl`` carries the tail. Each segment
+    # begins with the header line, as the raw walks expect.
+    head = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    lines = head.read_bytes().splitlines(keepends=True)
+    header, records = lines[0], lines[1:]
+    keep, moved = records[: len(records) // 2], records[len(records) // 2 :]
+    first_moved_seq = json.loads(moved[0])["seq"]
+    head.write_bytes(header + b"".join(keep))
+    (head.parent / f"log.{first_moved_seq}.jsonl").write_bytes(header + b"".join(moved))
+
+    handle = CrewLog.open(lg.KIND_SESSION, SESSION)
+    bundle = crew_log.fold_session(SESSION, log=handle)
+
+    # Regress a seq INSIDE the older segment, same byte length, and touch only
+    # that older file -- the newest segment never changes, which is what the
+    # newest-only fingerprint could not see.
+    before = head.stat()
+    old_lines = head.read_bytes().splitlines(keepends=True)
+    damaged = json.loads(old_lines[-1])
+    damaged["seq"] = json.loads(old_lines[-2])["seq"] if len(old_lines) > 2 else damaged["seq"]
+    replacement = (
+        json.dumps(damaged, ensure_ascii=True, separators=(",", ":"), sort_keys=False).encode()
+        + b"\n"
+    )
+    assert len(replacement) == len(old_lines[-1])
+    old_lines[-1] = replacement
+    head.write_bytes(b"".join(old_lines))
+    os.utime(head, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+    with pytest.raises(CrewLogError) as incremental:
+        crew_log.fold_session(SESSION, since=bundle)
+
+    assert incremental.value.code == lg.CODE_BAD_DATA
+
+
+def test_fold_session_unchanged_fast_path_does_not_walk_entries(monkeypatch):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+    calls = 0
+    original = CrewLog.iter_from
+
+    def counting(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counting)
+    unchanged = crew_log.fold_session(SESSION, since=bundle)
+
+    assert unchanged == bundle
+    assert calls == 0
+
+
+def test_fold_session_old_bundle_without_size_walks_once(monkeypatch):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+    old_bundle = replace(bundle, size=None)
+    calls = 0
+    original = CrewLog.iter_from
+
+    def counting(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counting)
+    refreshed = crew_log.fold_session(SESSION, since=old_bundle)
+
+    assert refreshed.projection("usage") == bundle.projection("usage")
+    assert refreshed.size is not None
+    assert refreshed.mtime_ns is not None
+    assert calls == 1
+
+
+def test_fold_session_old_bundle_without_mtime_walks_once(monkeypatch):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    bundle = crew_log.fold_session(SESSION)
+    old_bundle = replace(bundle, mtime_ns=None)
+    calls = 0
+    original = CrewLog.iter_from
+
+    def counting(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counting)
+    refreshed = crew_log.fold_session(SESSION, since=old_bundle)
+
+    assert refreshed.projection("usage") == bundle.projection("usage")
+    assert refreshed.mtime_ns is not None
+    assert calls == 1
 
 
 def test_fold_session_rebuilds_when_the_log_is_shorter_than_the_bundle():
@@ -1158,39 +1642,61 @@ def test_a_log_recreated_under_a_held_handle_is_folded_again_rather_than_spliced
 # --------------------------------------------------------------------------- #
 
 
-def test_a_cold_fold_crossing_the_chunk_boundary_matches_the_whole_file(monkeypatch):
-    """Folding a span in chunks is the same value as folding it whole.
+def test_a_cold_fold_streams_the_log_rather_than_holding_it(monkeypatch):
+    """A long cold fold holds ONE entry at a time, and the value is unaffected.
 
-    ``fold_session`` reads the log one bounded chunk at a time so a cold fold of a
-    long log does not hold the whole thing in memory. That is only safe if the
-    chunk boundary is invisible in the result, so this drives a log well past
-    ``FOLD_CHUNK_ENTRIES``, compares against the from-scratch fold, AND counts the
-    passes -- otherwise the test would still pass if the chunking were removed.
+    ``fold_session`` hands the projection kernel the log as a stream and the kernel
+    folds each entry through every unit as it arrives, so what a cold fold of a long
+    log holds is one entry rather than the file. That is only safe if consuming it
+    piecemeal is invisible in the result, so this drives a log past two thousand
+    entries, compares against the from-scratch fold, AND checks the interleaving --
+    otherwise the test would still pass if the whole log were materialized first.
+
+    The interleaving is the part worth pinning: at the moment of the Nth fold step,
+    exactly N entries have come out of the reader. A pass that read the file into a
+    list would have every entry out before the first step.
     """
     handle = _log()
     _opened(handle)
-    # Two entries per tool, so this clears the chunk boundary several times over.
+    # Two entries per tool, so this clears two thousand entries several hundred over.
     items: list[dict[str, Any]] = []
-    for index in range(crew_log.FOLD_CHUNK_ENTRIES):
+    for index in range(1024):
         items.extend(_tool_items(1, f"c{index}", "fs_read"))
     _append_grouped(handle, items)
-    assert handle.last_seq > crew_log.FOLD_CHUNK_ENTRIES
+    assert handle.last_seq > 2048
 
-    passes = []
-    real_advance_all = crew_log._advance_all
-
-    def counting(checkpoints, chunk):
-        passes.append(len(chunk))
-        return real_advance_all(checkpoints, chunk)
-
-    monkeypatch.setattr(crew_log, "_advance_all", counting)
-    chunked = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value
+    # Folded before the instruments go in, so its own read is not counted.
     whole = crew_log.fold_tools(_entries(handle))
-    assert chunked == whole
-    assert chunked["calls"] == crew_log.FOLD_CHUNK_ENTRIES
-    # More than one pass, and no pass bigger than the chunk bound.
-    assert len(passes) > 1
-    assert max(passes) <= crew_log.FOLD_CHUNK_ENTRIES
+
+    yielded = [0]
+    real_iter_from = CrewLog.iter_from
+
+    def counted_iter_from(self, from_seq, **kwargs):
+        for entry in real_iter_from(self, from_seq, **kwargs):
+            yielded[0] += 1
+            yield entry
+
+    interleaving: list[tuple[int, int]] = []
+    real_apply = crew_log._SessionFold.apply
+
+    def counted_apply(self, state, entry):
+        interleaving.append((yielded[0], len(interleaving) + 1))
+        return real_apply(self, state, entry)
+
+    monkeypatch.setattr(CrewLog, "iter_from", counted_iter_from)
+    monkeypatch.setattr(crew_log._SessionFold, "apply", counted_apply)
+
+    streamed = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value
+
+    assert streamed == whole
+    assert streamed["calls"] == 1024
+    assert len(interleaving) > 2048, "the whole log was folded"
+    assert [out for out, _ in interleaving] == [
+        step for _, step in interleaving
+    ], "the reader ran ahead of the fold, so entries were held rather than streamed"
+    assert [out for out, _ in interleaving] == [
+        step for _, step in interleaving
+    ], "the reader ran ahead of the fold, so entries were held rather than streamed"
 
 
 def test_a_grouped_fixture_is_the_log_one_append_at_a_time_writes(monkeypatch):

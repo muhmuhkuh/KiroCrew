@@ -76,8 +76,56 @@ Other shared modules:
 - `AgentSelector.tsx` (portal dropdown with ARIA)
 - `layout.ts` (`LAYOUT` numeric constants: nav widths, sidebar width, max message
   width, topbar height, log line cap)
-- `InfoTip.tsx`, `MarkdownRenderer.tsx` (highlight.js syntax highlighting),
+- `InfoTip.tsx`, `MarkdownRenderer.tsx` (the markdown renderer, with highlight.js
+  syntax highlighting; its owners are mapped [below](#the-markdown-renderer)),
   `TypewriterText.tsx`
+- `ResizeHandle.tsx` + `hooks/useColumnResize` (the drag grip between two PANES)
+- `ColumnResizer.tsx` + `hooks/useTableColumnWidths` (the drag grip on a TABLE
+  column) — see below
+
+### User-resizable table columns
+
+A data table whose values get truncated lets the user drag its column
+boundaries: `useTableColumnWidths(storageKey, specs)` holds the overrides (one
+`localStorage` key per table) and `<ColumnResizer>` is the grip. On a `ui/table`
+table, render the header cell as `ResizableTableHead`, or pass `style` and
+`resizer` to `SortableTableHead`; both live in `SortableHeader.tsx`.
+
+It assumes a **fixed-layout** table in the shape the Schedule jobs table
+documents: every resizable column declares a px width, exactly one column
+declares none and absorbs the spare, and the table's `min-width` is the px
+columns plus a floor for that residual. Three rules follow, and the first two
+are what a review should check:
+
+- **Move the table's `min-width` by `cols.extra`.** A fixed layout does not
+  shrink content to fit, so a column that grows while `min-width` stands still
+  takes its pixels out of the residual column and draws that column's content
+  over its neighbour. Widening a column must cost horizontal scroll, never
+  another column.
+- **Each `base` restates that column's `w-[Npx]` class, and a test holds them
+  equal** (`SchedulePage.columnContract.test.ts` is the model). The classes stay
+  the source of the defaults, so an untouched table renders exactly as it did
+  before it was resizable: `style()` returns `undefined` and `extra` is `0`.
+- **Leave the residual, a checkbox gutter and a pinned `sticky` column fixed.**
+  The residual has no width to drag, and a pinned column's overflow cue anchors
+  on its literal width.
+
+An **auto-layout** table cannot adopt this by adding grips: there a width is a
+hint the browser renegotiates against content, so a drag would not track the
+pointer. Migrate it to the fixed-layout shape first.
+
+A resizable header cell spells `relative` in its own class string, literally:
+the grip is absolutely positioned and resolves against the nearest positioned
+ancestor, and `shadcn/require-static-classes` rejects a className a
+design-system component builds from an opaque value -- so the header components
+pass `className` through untouched and the column-contract test holds every
+resizable header to it.
+
+The grip is the ARIA window-splitter widget (focusable, arrow keys, Enter or a
+double-click to reset one column). Because it is focusable content with its own
+label, a header cell that hosts one needs `aria-labelledby` pointing at its
+visible label, or the grip's name is appended to the column header and announced
+with every cell. The two header components above already do this.
 
 `src/kirocrew-ui/index.ts` re-exports the subset that apps may import as
 `@kirocrew/app-sdk/ui`. Adding a primitive there makes it app-facing API, so add
@@ -95,6 +143,39 @@ under every theme (`npm run storybook`); see
 one today. A story is the cheapest place to look at a new variant or prop, so add
 or update one when you touch a primitive that has one; a per-primitive
 requirement is not in force until the change that makes CI render stories.
+
+### The markdown renderer
+
+`components/MarkdownRenderer.tsx` is the renderer's only import path. Its default
+export (the memoized component), its named exports and its module id are what
+the consumers import and what about 150 specs mock, so all three stay there. It
+is also the composition root: what has to be decided in one place lives in it,
+and every other concern has one owner under `components/markdown/`.
+
+| Owner | Holds |
+|---|---|
+| `MarkdownRenderer.tsx` | the ordered remark and rehype chains, and the parser built from them that the source repairs read (`AUTOLINK_PARSER`); `MD_COMPONENTS`, the element-to-renderer map, with the fence `code` override and the link overrides `MdAnchor` / `MdParagraph`; the per-block source passes and their order (`MarkdownBlock`); fence dispatch (`BlockRenderer`); the root component and its providers |
+| `markdown/contexts.ts` | every context the pipeline's modules share, each created once; the facade re-exports the six public ones (`MediaApprovedCtx` stays private to `markdown/remoteMedia.tsx`, which both provides and reads it) |
+| `markdown/linkTargets.ts`, `markdown/pathReferences.ts` | what a link or code span points at: artifact routes, unfurl eligibility, open sessions; path candidates, `file:line` suffixes, probe resolution and activation |
+| `markdown/sanitize.ts` | the tag and attribute allowlist (`rehypeSanitize`) and `remarkVerbatimUnknownTags` |
+| `markdown/treeTransforms.ts` | fenced-code marking, block unwrapping, soft breaks, source positions, position-stable root keys |
+| `markdown/streamingEffects.ts` | the streaming tail's glow, reveal and caret |
+| `markdown/linkBoundaryRepair.ts` | the source-level link repairs gated on remark's own parse: CJK autolink boundaries and refused link destinations |
+| `markdown/elements.tsx` | the restyle-only element overrides and the sanitizer-derived attribute forwarding they share (`sp` / `spa`) |
+| `markdown/InlineCode.tsx`, `markdown/copyFeedback.tsx` | the inline-code chips (path, session, work item, copy) and the copy outcome every chip shares |
+| `markdown/MarkdownTable.tsx` | a table and its Markdown / CSV copy row |
+| `markdown/ImgWithFallback.tsx`, `markdown/remoteMedia.tsx` | images (local-path routing, the layout reserve, the broken-image chip) and the click-to-load gate for remote images, video and audio |
+| `markdown/MermaidBlock.tsx` | lazily loaded mermaid, its `initialize` config (`securityLevel: 'strict'`), and the diagram's box and font gates, source view and downloads |
+| `markdown/Lightbox.tsx` | the image viewer and `dispatchLightbox` |
+
+Imports run one way. The facade imports the owners, and nothing under
+`components/markdown/` imports the facade: a module that did would receive the
+stub in every spec that mocks the renderer. Consumers keep importing from the
+facade for the same reason. Three things must stay in the facade's own text: the
+seven remark/rehype package imports (`test/test_source_providers.py` pins that
+set against the backend converter), `import '../utils/hljs'`
+(`hljsCoreOnly.test.ts`), and the two lines the i18n added-line gate counts, in
+`MdAnchor` and `stripStrayToolUseTags`.
 
 ### Which switcher
 
@@ -265,6 +346,20 @@ All `dangerouslySetInnerHTML` content goes through DOMPurify, via
 
 A bypass is an XSS bug, so there is no "just this once" case.
 
+The markdown renderer sets no `dangerouslySetInnerHTML`. Raw HTML in markdown
+prose enters its tree only through `rehype-raw`. In the chain
+`MarkdownRenderer.tsx` composes (`rehypeBoundRawDepth`, `rehype-raw`,
+`rehypeMarkFencedCode`, `rehypeUnwrapBlocks`, `rehypeSanitize`, `rehype-katex`)
+the two passes between `rehype-raw` and `rehypeSanitize` only mark and restructure
+the tree; they add no attribute the sanitizer would not judge. Every pass that injects
+elements of its own (the streaming effects, the redaction markers, the stable
+root keys) is appended after sanitize. Two fences take other paths: a widget
+renders in `WidgetFrame`'s sandboxed iframe, and `MermaidBlock` inserts the SVG
+mermaid drew under `securityLevel: 'strict'`. The allowlist and the verbatim pass
+below live in `components/markdown/sanitize.ts`; the facade re-exports both, so a
+second surface that admits raw HTML reuses the one policy instead of carrying a
+copy.
+
 The shared markdown pass `remarkVerbatimUnknownTags` preserves unknown single
 tags as inert source text, including their case, bare attributes and quoted `>`
 characters. Its single-tag recognizer scans each character with a fixed set of
@@ -285,12 +380,21 @@ Add a new protocol to `ALLOWED_PROTOCOLS` in that file, and only there. Each
 addition widens what a model-authored or user-pasted link can launch on the host,
 so treat it as a security change, not a formatting one.
 
+How a refused destination RENDERS is part of the contract (issue #9925): the
+transform's rejection sentinel is `''`, and `MdAnchor`'s `!href` guard renders
+the label as inert text with **no anchor** — never `<a href="">`, whose empty
+href resolves to the current page — matching `md-notebook/Preview.tsx`'s
+`href ? <a …> : <span>` trade. A test that pins an anchor existing for a
+destination the transform rejects is pinning a defect. (Known outstanding
+violation: mochi's `ChatPanel` markdown anchors, tracked in #9944.)
+
 One deliberate, key-scoped exception exists: a Windows absolute path
 (`WINDOWS_ABS_PATH_RE` — drive letter or UNC) is passed through **for image
 `src` only**, because `defaultUrlTransform` parses `C:` as an unknown scheme and
 would blank the sender's own uploaded image (issue #3497). The invariant that
-makes it safe: `ImgWithFallback` routes every local path to the same-origin
-`/api/file-raw` endpoint, so the raw filesystem path never reaches the DOM, and
+makes it safe: `ImgWithFallback` (`components/markdown/ImgWithFallback.tsx`)
+routes every local path to the same-origin `/api/file-raw` endpoint, so the raw
+filesystem path never reaches the DOM, and
 the shape (single letter + separator) cannot express `javascript:`/`data:`
 payloads. Widening that regex or its key scope is a security change — the same
 constant also decides which paths are treated as local file reads, so the two
@@ -345,6 +449,33 @@ Real-time updates arrive on a single WebSocket at `/api/ws`, read through
 `useWebSocket`, which reconnects with capped exponential backoff (1s doubling to a
 10s ceiling) and re-fetches state through Redux on reconnect instead of reloading
 the page.
+
+`src/hooks/useWebSocket.ts` is the composition point and the only import path:
+it holds the frame routing table (one `case` per frame type), the silence
+watchdog and the connect wiring, and it composes the owners in
+`src/hooks/websocket/`. `connection.ts` owns the socket, its backoff and its
+best-effort sends, and exposes the connection-scoped refs the open sequence and
+the arms share; `reconnectCatchUp.ts` owns the first-connect and reconnect
+sequences, in order, including their subscribe and focus frames;
+`streamBuffers.ts` owns the per-frame coalescing of chat, reasoning, subagent
+and sidebar-recency streams. Frame families live with their domain:
+`chatStream.ts` and `turnCompletion.ts` (transcript frames, and what `chat_done`
+means after its row), `approvals.ts` and `composerCards.ts` (coordinator
+approvals; question, follow-up and folder cards), `slotList.ts`,
+`bundleReload.ts` (the `dashboard` status frame), `serverState.ts` (the
+server-owned caches), `automationSeed.ts` and `voicePlayback.ts`;
+`workflowRuns.ts` reconciles the workflow rows those frames fold, `attention.ts`
+owns the unread / read-relay rules and the focus senders, and `browserEvents.ts`
+owns the window events that re-broadcast a frame. `frames.ts` decodes the
+`/api/ws` envelope and types its `FrameData` for the router, and `retiredIds.ts`
+holds the watermarked retired-id logs `approvals.ts` and `composerCards.ts`
+share (and `resolvedSince`). The router's other arms are written inline. A new
+frame gets its `case` in the router; when it needs state an owner keeps, the arm
+calls that owner (or reads a ref the owner exposes) rather than reaching into
+it. An owner receives its dependencies (`dispatch`, `queryClient`, the socket
+connection and peer owners) as arguments and never imports the facade; outside
+`src/hooks/websocket/` only the facade imports an owner, and owners import each
+other only along the edges `src/test/useWebSocket.ownership.test.ts` lists.
 
 Redux Toolkit (`src/store/index.ts`) holds the cross-page shell state in **four**
 slices:
@@ -491,9 +622,56 @@ accessible outline suppressor, `backdrop-blur-xs` is the 4px blur, and the
 
 Colors come from CSS custom properties defined in `src/index.css`, including the
 semantic roles `--aim`, `--clarify`, and the `--diff-*` family. Never a hardcoded
-`#hex` / `rgb()` / `rgba()` literal; see
+`#hex` / `rgb()` / `rgba()` literal, and never a raw palette class
+(`text-green-500`, `bg-amber-400`): state colors are `text-ok` / `text-warn` /
+`text-danger` / `text-info`, and a running state is `text-accent`. See
 [theming-contract](theming-contract.md) for the variable set, the stable class
-hooks, and the checker.
+hooks, and the checkers.
+
+Three of those rules are enforced by `@shadcn/lint` inside the blocking
+`eslint src/ --max-warnings 0` gate (configured in `eslint.config.js`, the
+`shadcn` block):
+
+- `shadcn/no-raw-colors` — a palette class or a literal SVG `fill`/`stroke`
+  where a token belongs. Use the token; a logo whose colors are the artwork's
+  own gets a file-level override (see `KiroGhost.tsx`).
+- `shadcn/no-unknown-classes` — a class Tailwind emits no CSS for. Usually a
+  typo, a v3 spelling (`outline-none`, `resize-vertical`), or a class whose
+  stylesheet was deleted. A class that IS real but lives outside the theme's
+  import graph — an app stylesheet authored as a TS template string, a
+  selector hook a Playwright spec locates by — is listed in the rule's `allow`
+  with the file that owns it; the entry allows a name, it generates no CSS.
+- `shadcn/require-static-classes` — a `className` on a `ui/` primitive built
+  from a value the linter cannot read (an imported constant, a function call,
+  an array `join`). Keep the class strings in the file that applies them: a
+  shared class string becomes a small wrapper component (`FilterMenuLabel`),
+  a helper call gets a `cn(...)`.
+
+`shadcn/no-restyle` — a `className` that changes what a `ui/` primitive owns
+(its color, spacing, shape, typography) — is off in that gate: a few hundred
+call sites restyle primitives today and the gate is a hard zero, so turning it
+on is a design decision (fix the sites or write per-component contracts), not a
+lint toggle. What IS enforced is that the backlog cannot grow.
+`scripts/check-restyle-ratchet.mjs` (`npm run lint:restyle-ratchet`, run by
+CI beside the phantom-classes gate) lints with the rule through its own config
+(`allow: ['layout']`, so margins and widths pass) and holds every file at the
+count recorded in `scripts/restyle-baseline.json`: a file whose count rises, or
+a file with findings and no entry, fails the build; a file whose count fell
+fails too, until you record the drop with
+`npm run lint:restyle-ratchet -- --update-baseline`, which only ever lowers a
+number or prunes an entry that reached 0 — so progress is locked in, not left
+to a log line. Lowering a count is the only edit the script makes; the one hand
+edit is moving an entry to a file's new path when the file moves (the count may
+not grow). It is a separate script rather than ESLint's bulk suppressions
+because editors lint through the Node API, which ignores the suppressions
+file, and the CLI loads that file for every config, which would fail the i18n
+eslint run on "unused" entries. Adding a restyle to a file at its
+ceiling means using the primitive's own variant or size prop, keeping layout
+classes at the call site, or wrapping the primitive in a small named component
+that carries the class in the component file — not raising the number.
+`no-inline-styles` and `no-arbitrary-values` stay off by design — inline
+`style={}` is the mandated method for apps, and translucent theme surfaces are
+`bg-[color-mix(…)]` because the color tokens carry no alpha channel.
 
 Built-in themes are picked in Settings, Display tab, and the choice syncs across
 instances. Each theme has a dark and a light block, and the default theme's

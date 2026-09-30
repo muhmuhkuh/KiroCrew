@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { usePanelTabs, openPanelView, __resetPanelTabs, useAnyLiveAppTab, useAllAppTabs } from '../hooks/usePanelTabs'
+import { usePanelTabs, openPanelView, __resetPanelTabs, useAnyLiveAppTab, useAllAppTabs, evictDocumentBodies, purgeDocumentBodiesForRedactionChange, documentBodyEpochNow } from '../hooks/usePanelTabs'
 import { shouldMountSidePanel, isSidePanelHidden } from '../pages/chat/sidePanelMount'
 
 // App-contributed tab descriptors are an ARGUMENT to `usePanelTabs`, not something
@@ -71,7 +71,7 @@ describe('usePanelTabs', () => {
   })
 
   it('openFile dedupes on path, titles by basename, and carries the origin slot', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
     act(() => result.current.openFile('/src/pages/ChatPage.tsx', 'body-1', 'slot-a'))
     expect(result.current.tabs).toHaveLength(1)
     expect(result.current.activeTab).toMatchObject({
@@ -84,13 +84,92 @@ describe('usePanelTabs', () => {
     expect(result.current.activeTab?.content).toBe('body-2')
   })
 
+  it('routes the file tab into the NAMED slot bucket, not the bound one (#9921 split panes)', () => {
+    // Split view shares ONE opener across panes but each pane owns its own
+    // slot. A file opened from pane B must land in B's bucket AND be stamped B,
+    // or the tab vanishes when B becomes active (it would sit in the bound
+    // active slot A's bucket, keyed elsewhere). Same contract openView holds.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    // Bound to A; open a file for pane B (the shared-opener situation).
+    act(() => result.current.openFile('/x/spec.md', 'body', 'pane-b'))
+    expect(result.current.tabs).toEqual([]) // A's bucket is untouched
+
+    rerender({ slot: 'pane-b' })
+    expect(result.current.tabs.map(t => t.id)).toEqual(['file:/x/spec.md'])
+    expect(result.current.activeTab).toMatchObject({ slot: 'pane-b', content: 'body' })
+  })
+
+  it('evictDocumentBodies drops clean file bodies and diff tabs, keeps dirty buffers, in every slot', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+    const b = renderHook(() => usePanelTabs('slot-b', mock.descriptors))
+    act(() => a.result.current.openFile('/clean.md', 'AKIA-raw-while-off', 'slot-a'))
+    act(() => a.result.current.openFile('/dirty.md', 'on-disk', 'slot-a'))
+    act(() => a.result.current.patchTab('file:/dirty.md', { content: 'user edits' }))
+    act(() => a.result.current.openDiff('/clean.md', 'AKIA-raw-while-off', 'AKIA-raw-while-off'))
+    act(() => b.result.current.openFile('/other.md', 'raw-too', 'slot-b'))
+    let touched = 0
+    act(() => { touched = evictDocumentBodies() })
+    expect(touched).toBe(3)
+    const clean = a.result.current.tabs.find(t => t.id === 'file:/clean.md')
+    expect(clean).toBeTruthy()
+    expect(clean?.content).toBeUndefined() // rehydrates through /api/file-read
+    expect(clean?.savedContent).toBeUndefined()
+    const dirty = a.result.current.tabs.find(t => t.id === 'file:/dirty.md')
+    expect(dirty?.content).toBe('user edits') // unsaved work is never discarded
+    expect(a.result.current.tabs.some(t => t.kind === 'diff')).toBe(false)
+    expect(b.result.current.tabs.find(t => t.id === 'file:/other.md')?.content).toBeUndefined()
+    // Focus survives on a still-present tab.
+    expect(a.result.current.tabs.some(t => t.id === a.result.current.activeId)).toBe(true)
+  })
+
+  it('evictDocumentBodies leaves a host leading-tab focus alone (it lives outside the bucket)', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors, { leadingIds: ['notes'] }))
+    act(() => a.result.current.openFile('/clean.md', 'raw', 'slot-a'))
+    act(() => a.result.current.openDiff('/clean.md', 'raw', 'raw'))
+    act(() => a.result.current.setActive('notes'))
+    expect(a.result.current.activeId).toBe('notes')
+    act(() => { evictDocumentBodies() })
+    // The diff tab is gone, the file body is gone, and the focus is still the host's tab.
+    expect(a.result.current.tabs.some(t => t.kind === 'diff')).toBe(false)
+    expect(a.result.current.activeId).toBe('notes')
+  })
+
+  it('evictDocumentBodies refocuses only when the focused tab was a dropped diff', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+    act(() => a.result.current.openFile('/clean.md', 'raw', 'slot-a'))
+    act(() => a.result.current.openDiff('/clean.md', 'raw', 'raw'))
+    expect(a.result.current.activeId).toBe('diff:/clean.md')
+    act(() => { evictDocumentBodies() })
+    expect(a.result.current.activeId).toBe('file:/clean.md')
+  })
+
+  it('every eviction moves the document-body epoch, so a read that straddles it can tell', () => {
+    const before = documentBodyEpochNow()
+    act(() => { evictDocumentBodies() })
+    expect(documentBodyEpochNow()).toBe(before + 1)
+    act(() => { evictDocumentBodies() })
+    expect(documentBodyEpochNow()).toBe(before + 2)
+  })
+
+  it('purgeDocumentBodiesForRedactionChange resets both file caches and evicts the tab bodies', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+    act(() => a.result.current.openFile('/clean.md', 'AKIA-raw-while-off', 'slot-a'))
+    const reset: unknown[][] = []
+    // RESET, not remove: a mounted observer must drop its result and refetch.
+    act(() => purgeDocumentBodiesForRedactionChange({ resetQueries: f => { reset.push(f.queryKey) } }))
+    expect(reset).toEqual([['file-read'], ['file-diff']])
+    expect(a.result.current.tabs.find(t => t.id === 'file:/clean.md')?.content).toBeUndefined()
+  })
+
   it('re-opening a file with unsaved edits focuses it and keeps the edited buffer', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
     act(() => result.current.openFile('/notes.md', 'on-disk', 'slot-a'))
     // The user types into the editor (MarkdownPanel patches content per edit).
     act(() => result.current.patchTab('file:/notes.md', { content: 'user edits' }))
     // Something re-opens the same path — another chip, the Files tab row.
-    act(() => result.current.openFile('/notes.md', 'on-disk'))
+    act(() => result.current.openFile('/notes.md', 'on-disk', 'slot-a'))
     expect(result.current.tabs).toHaveLength(1)
     expect(result.current.activeId).toBe('file:/notes.md')
     // The buffer survives; the on-disk bytes do not revert it silently.
@@ -99,7 +178,7 @@ describe('usePanelTabs', () => {
   })
 
   it('re-opening a dirty text tab keeps its edits reachable: the disk binary verdict is not applied to the preserved buffer', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot', mock.descriptors))
     act(() => result.current.openFile('/a.bin', 'x', 'slot', { binary: false }))
     act(() => result.current.patchTab('file:/a.bin', { content: 'x edited' }))
 
@@ -116,7 +195,7 @@ describe('usePanelTabs', () => {
   })
 
   it('re-opening a CLEAN tab does apply the incoming disk binary verdict', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot', mock.descriptors))
     act(() => result.current.openFile('/a.bin', 'x', 'slot', { binary: false }))
     // No unsaved edits (buffer === baseline): the disk read replaces both the
     // buffer and its verdict, so the sibling branch does stamp binary: true.

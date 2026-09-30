@@ -46,7 +46,7 @@ the difference is whether the heading can ever have a sibling above it:
   gap depend on it. (A conditionally rendered `Modal` does NOT have this effect: it
   `createPortal`s to `document.body` and never occupies a sibling slot.)
 - **A heading that repeats within one tab** (`SettingsSection`, used many times per
-  Settings tab; `LocalStorageDebug`'s section headings) keeps `mt-4`, because the gap
+  Settings tab; `LocalStorageDebug`'s section headings) keeps `mt-6`, because the gap
   between two sections is real, and pairs it with `first:mt-0`. The fragment adds no DOM
   node, so every section header is a sibling in one parent and only the leading one
   matches — and when a tab renders something of its own above the first section, the
@@ -55,7 +55,7 @@ the difference is whether the heading can ever have a sibling above it:
 Measured at 390px with `website/scripts/capture-side-panel-pane-inset.mjs`, which reports
 the divider→first-in-flow-box distance per tab: all 31 renderable tabs across the three
 pages now read 12px. Residual differences in where the first *pixel* lands (21px on
-Connections, on Developer > System, on Settings > Remote Instances) are a control's own internal
+Connections, on Developer > System, on Settings > Remote Crew) are a control's own internal
 padding — a sub-tab's or a segmented button's tap target — not stacked page padding, and
 tightening those would shrink a touch target.
 
@@ -97,8 +97,22 @@ every completed turn pays for it. The message footers (`ICON_ACTION_ROW_CLS` in
 `touchActions.ts`) are 36 wide x 32 high on touch for that reason, the same shape ChatGPT's
 response-actions row uses (40 x 32); 32 clears the 24px floor. Width is also what keeps a
 row on one line: six actions plus an en-US timestamp fit 390px at 36, and wrapped at 40.
-The rule is for rows of icon-only actions; a lone button, or one carrying a text label, keeps
-`HOVER_NONE_ACTION_BTN_CLS` / `HOVER_NONE_ACTIONS_ROW_CLS` and their 40px square.
+The rule is for rows of icon-only actions; a hover-revealed lone button, or one carrying a
+text label, keeps `HOVER_NONE_ACTION_BTN_CLS` / `HOVER_NONE_ACTIONS_ROW_CLS` and their 40px
+square, and an always-visible icon control takes `mc-touch-hit` (next entry).
+
+**An always-visible icon control gets its 44px from `mc-touch-hit`, not from padding.** The
+`mc-touch-hit` / `mc-touch-hit-y` / `mc-touch-hit-end` classes (`index.css`, the block after
+the `.scrollbar-overlay` coarse rule) add an invisible `::after` that extends only the hit
+area to 44px on each axis where the control is smaller, so drawn size and layout do not
+change; use them on header, top-bar and row kebabs, toggles and split-button segments (`-y`
+for a segment with neighbours on both sides, `-end` for the last segment, which grows away
+from its neighbour). `HOVER_NONE_*` stays the tool for hover-revealed action clusters, which
+must first be forced visible under `hover: none` and then grow their real padding to 40px.
+The predicate is `pointer: coarse` rather than `hover: none` because the hit area is about
+pointer precision, and hover capability is a separate question. The `::after` cannot reach
+past the nearest `overflow: hidden` ancestor, since a clipped part of a box is not
+hit-testable, so a host inside such a wrapper must lift the clip under the same query.
 
 **`overflow: hidden` on ANY ancestor kills `position: sticky` — use `overflow: clip`.**
 Same family: a `transform` on an ancestor re-anchors `position: fixed` children, and
@@ -133,16 +147,16 @@ one.
 
 **Count the surfaces this rule binds before believing it holds.** There are **three**
 full-viewport magnify overlays — the image viewer (`Lightbox` in
-`MarkdownRenderer.tsx`), the diagram viewer (`DiagramLightbox.tsx`), and the
+`components/markdown/Lightbox.tsx`, exported through `MarkdownRenderer.tsx`), the
+diagram viewer (`DiagramLightbox.tsx`), and the
 screenshot viewer in `pages/AppDetailPage.tsx`. Each one needs its own gesture: a
 diagram viewer without one is unmagnifiable by any gesture, because its content is
 fit-scaled vector whose labels are smallest at exactly the state it opens in. Checking the
 documented example is not enough — count the instances, because a rule reads as satisfied
-when its example obeys it. The image and diagram viewers
-share `hooks/usePinchZoom.ts` (contact tracking, focal anchoring, pan clamping),
-so a further such surface gets the gesture by using the hook rather than by
-re-deriving the math — and `touch-none` on the transform target is what opts it out
-of the root's `pan-x pan-y`.
+when its example obeys it. All three viewers share `hooks/usePinchZoom.ts`
+(contact tracking, focal anchoring, pan clamping), so a further such surface gets the
+gesture by using the hook rather than by re-deriving the math. `touch-none` on the
+transform target is what opts it out of the root's `pan-x pan-y`.
 
 **A trackpad is a third input class, not a touchscreen.** A trackpad pinch emits no
 pointer events at all, so it reaches none of the contact-tracking code: Blink
@@ -190,15 +204,14 @@ labels come out the same apparent size.
 
 The guard that enforces this sweeps **both** `components/**` and `pages/**`, because
 a magnify overlay can live in either and a population scoped to one directory counts
-instances of a set it has itself narrowed. `AppDetailPage.tsx` is carried in that
-guard as a named, issue-linked exception rather than excluded by the glob: an
-exception a reader can see is a debt with an owner, a glob boundary is not. Giving it
-the gesture is tracked separately because its overlay also owns arrow-key navigation
-between screenshots and click-to-dismiss, so a pinch there has to be reconciled with
-a prev/next seam the other two do not have.
+instances of a set it has itself narrowed. All three viewers now satisfy the hook
+requirement directly. `AppDetailPage.screenshotLightbox.zoom.test.tsx` separately pins
+the screenshot viewer's reconciliation with arrow-key navigation, paging, and
+click-to-dismiss — the prev/next seam the other two do not have.
 
-Code blocks take the other legitimate route and scroll
-horizontally instead. And note what is *not* lost — the OS Display Zoom setting sits
+Code blocks (`CodeBlock.tsx`) and markdown tables (the scroll wrapper in
+`components/markdown/MarkdownTable.tsx`) take the other legitimate route and
+scroll horizontally instead. And note what is *not* lost — the OS Display Zoom setting sits
 outside the viewport contract and still magnifies anything. A browser tab's own
 text-size control does too, but it is **not** a fallback in the installed app: a
 standalone PWA has no Safari toolbar to reach it from, so on a home-screen install
@@ -259,6 +272,91 @@ Carbon's five-action cap, Apple's "define which items move to the overflow menu"
 is what `AUTOSDE.yaml`'s `max-two-buttons-per-row` encodes. Wrapping such a row below `md`
 keeps the controls reachable, but it is an interim, not the answer.
 
+## The phone chat page has ONE top bar
+
+Below `md` the chat route used to stack two bars: the shell's (logo -> nav drawer,
+search square, readout capsule, bell) over the page's own title row (sessions
+toggle, title, pop-out, activity panel). Two bars cost 84px of a 844px screen for
+chrome and offered a phone user two drawers for one gesture. There is now one bar,
+the shell's, and the chat page fills it:
+
+| cell | who renders it | what is in it |
+|---|---|---|
+| leading (`auto`) | `App.tsx` | the crew switcher (when a remote crew exists) and downstream widgets (while they exist); usually empty. Not the update pill: beside a remote crew's chip + dropdown it was a third action, so on this page a pending update is the first item of the overflow menu (`UpdatePill variant="menu-item"`, same lifecycle label) |
+| centre (`minmax(0,1fr)`) | `ChatPage.tsx`, by `createPortal` into `#mobile-topbar-slot` | sessions toggle, then ONE control that is the session title with the menu chevron flush after it (`ChatHeaderMenu` `triggerLabel`); Rename and Auto-title are items of that menu (`SessionActionsMenu` `onRename` / `onAutoTitle`), and Rename swaps in the shared title editor. That menu leaves out its pop-out / focus-popped-out rows here (`omitPopout`): the trailing ⋯ menu is the phone's window menu and carries them, and the same row in two adjacent menus read as two different actions. Nothing else: the inline row's Autopilot InfoTip and `InboundLinkChip` would each be a third control, so the mode is read from the session menu's Autopilot row and a two-way link's actions from its Linked surfaces section |
+| trailing (`auto`, `.tb-trail`) | `App.tsx`, plus a portal into `#mobile-topbar-trail-slot` | exactly two: the bell, then the page's overflow menu (update when pending, pop out or focus the popped-out window, activity panel, split view). The update row reads `<status> — Open update settings`: a menu row is read as an action, and the row only navigates to Settings › About, so it names that outcome instead of implying a download or restart. The update row is a lazy chunk inside its own `ErrorBoundary`, so a chunk that fails to load costs the row, not the page (a rejection would otherwise reach the route boundary); the fallback is an inline `ErrorNotice` plus its `ErrorNoticeMenuItem` hand-off (`errors-use-error-notice`), never `null`, because this menu is the update's only phone home and a silent gap would hide the failure |
+
+That is the `topbar-single` header variant (`index.css`), applied only while
+`isMobile && isChat`. **Its side cells are plain flex divs, not `.tb-left` /
+`.tb-right`.** Those two are inline-size containers for the collapse ladders, and
+a size container in an `auto` track has no content size to give, so it collapses
+to its padding and clips its contents -- the measurement is recorded in
+`test/topbarMenuButtonNarrow.test.ts`, and `test/topbarSingleVariant.test.ts`
+pins that no container class reaches the variant's side cells. The single bar
+has no ladder to run (the readout capsule is not rendered on it), so it needs no
+containers. `.tb-trail` keeps `.tb-right`'s padding/negative-margin pair for the
+bell badge's 4px overhang.
+
+The hand-off is the same shape as the desktop activity panel's `#activity-bar-slot`:
+the page resolves the slot element with `useShellSlot` (lazy initialiser plus a
+MutationObserver for the breakpoint-crossing case), and derives "the row is in the
+bar" from the ELEMENT, never from `isMobile` -- the two can disagree for a render on
+a crossing, and the inline row, the fixed corner sessions button, the transcript's
+64px header spacer and the split view's inline toggle all key off that one flag so
+the row is in exactly one place. Where the shell renders no slot (the popout
+window, an embedded host, a desktop width) the page keeps its inline row: a missing
+target degrades to yesterday's layout, never to no title.
+
+**What left the bar, and where it went.** The readout capsule (connection dot,
+metrics, credits) is not rendered on the phone at all: a phone user does not act on
+a resource readout, and the bar's right side holds two controls (bell + overflow
+menu) by the max-two-buttons-per-row rule. The capsule's one generic job -- the
+dot turning red on a transport drop -- is taken by `mobile-offline-strip`: a 24px
+`Gateway offline -- reconnecting` strip hanging off the bar (absolute, so the
+header's three-child invariant holds), rendered while `isMobile && !connected &&
+!authRequired`, `pointer-events-none` because it hangs over the top 24px of whatever
+`<main>` paints. Auth expiry keeps its own banner from `api/client.ts`, so the strip
+stays quiet then rather than pointing at the transport when pasting a token is the
+fix -- visibly: the banner has no live region and the capsule's sr-only carrier is not
+rendered on the phone, so an sr-only `role="status"` span (`mobile-offline-sr`) announces
+the auth-specific cause. `App.mobileSingleTopbar.test.tsx` pins both states. The search square moved off the bar into the two phone drawers, same
+label, same command palette: the chat drawer's rail pins it at the foot (below), and
+the nav drawer carries it as a row in its bottom group, so every non-chat phone page
+still reaches it. The capsule's credits segment is also the desktop's door to the
+account modal (balance, sign-in state, `KiroAccountModal`), so the same two drawers
+carry a **Kiro Account** entry -- a row in the nav drawer's bottom group and a tile
+in the chat drawer's rail, both between Capabilities and Settings, both opening the
+modal. On the Kiro backend it is always there (the modal's Refresh fills an empty
+reading); on any other harness only for a reading the desktop segment would show --
+`kiroAccountEntry = kiroCreditSurface || (reading !== null && !pillHidden)`, the
+segment's own derivation minus the warming `null`, where the desktop's spinner would
+become a nav row blinking in and out. Same test file pins both states.
+Off the chat route the phone header keeps the logo -> nav drawer
+and the bell, and renders an empty centre spacer so the header still has three
+in-flow children -- with two, the actions group would be auto-placed into the `auto`
+centre track and collapse.
+
+**The chat page's ONE drawer carries the main navigation.** Its sessions
+`OverlayDrawer` (unchanged width, slide, scrim, keyboard inset and Back handling)
+now holds a 72px icon rail on the left -- the shell's, rendered by `App.tsx` and
+handed down through `MobileNavRailContext` -- beside the sessions pane. The rail is
+built from the same registry as the desktop rail (`advertisedNavItems`,
+`sortedAppGroup`, the Bottom group) through the same `NavItem`, with `touch` for a
+64x56 `rounded-xl` tile carrying a 10px caption under the glyph (a finger cannot summon
+the desktop rail's hover tip), a full-opacity muted glyph (the desktop rail's 70% dimming
+measured 3.4:1 on these flat tiles) and the desktop rail's selected paint, on a
+`bg-bg-accent` surface that reads apart from the `bg-bg-elevated` pane. The brand mark on
+top is the "home" control (chat root; a cold reader tapped it expecting that), named `Home`
+(`nav.home`) for what it does rather than for the brand it shows; Search is pinned at
+its foot, captioned `Search all` (`nav.search_short`) because it sits one pane away from the
+sessions pane's "Search sessions..." field and a reader could not tell the two apart. Because the drawer minted a duplicate history entry on open
+(`pushDrawerEntry`), rows behave in two ways: the row for the page the user is on
+only closes the drawer, and a row that leaves the page navigates with `replace`
+so Back returns to the chat rather than to a second copy of it. The shell's nav
+drawer has no trigger on this route and its header swipe is gated off
+(`useDrawerSwipe(shellRef, { enabled: isMobile && !isChat })`); the chat
+container already claims its own swipe via `data-owns-swipe`.
+
 ## A horizontal drag on mobile belongs to the nav drawer unless a page claims it
 
 The mobile nav drawer is bound app-wide: **one** `useDrawerSwipe` on the shell
@@ -315,8 +413,9 @@ copying:
   is inside the shell.
 - **Content that scrolls horizontally** already claims the gesture by being
   scrollable: the hook defers to the nearest horizontally-scrollable ancestor
-  **outright**, whatever its scroll position. Wide code blocks, markdown tables and
-  diagram strips need nothing declared. The deference is deliberately not the
+  **outright**, whatever its scroll position. Wide code blocks, markdown tables
+  (`components/markdown/MarkdownTable.tsx`) and diagram strips (the Mermaid host in
+  `components/markdown/MermaidBlock.tsx`) need nothing declared. The deference is deliberately not the
   nested-scroll handoff you would give a scrollable PARENT — deferring only while
   the inner scroller still had somewhere to go meant a freshly rendered code block,
   which sits at `scrollLeft: 0`, handed the very first rightward drag to the drawer

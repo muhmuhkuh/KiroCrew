@@ -572,3 +572,166 @@ The consequence for how you write a test:
       between scanners; a growth/linearity ratchet measures the algorithm's own work
       (bytes produced, items visited), not wall-clock and not interpreter call counts
       (`str.join` is one C call at any length)
+- [ ] Nothing assumes `tmp_path` is OUTSIDE a git repository: a fixture whose verdict comes
+      from an upward walk (nearest `.git`, `install.sh` + `setup.cfg`, project markers from
+      the cwd, git discovery) plants the boundary it reads — a developer's `TMPDIR` may sit
+      inside the checkout, and in a linked worktree the `.git` such a walk finds is a FILE
+- [ ] A nested `python -m pytest` on files under `tmp_path` passes its own `-c <ini>`,
+      `--rootdir` and `--color=no`: otherwise it adopts the repository's ini, and the
+      repo `addopts` reshape the very output the outer test greps
+- [ ] A stub for an `os.*` function reached through a module alias
+      (`monkeypatch.setattr("<mod>.os.unlink", ...)`) forwards every non-owned call to the
+      saved real function with `*args, **kwargs` INTACT — dropping `dir_fd` re-aims pytest's
+      own `rmtree` at the cwd — and asserts a bare relative name never reaches the stub
+- [ ] A test that compiles or imports a throwaway source under `tmp_path` keeps its bytecode
+      there (`sys.pycache_prefix` under `tmp_path`, or the suite's `no_bytecode()` helper),
+      because the suite-wide mirror is keyed on the absolute source path and a per-run path
+      never gets read again
+- [ ] A fixture needing a SHORT path (`AF_UNIX` `sun_path`, a redaction-sensitive path) calls
+      `tmpdir_helpers.short_tmp_base()` — never a literal `/tmp`, and never
+      `tempfile.gettempdir()`, which is too long under a pinned `TMPDIR`
+- [ ] No raw `os.kill(pid, 0)` in test code — it TERMINATES the target on Windows; route
+      liveness through `platform_compat.pid_exists`/`pid_liveness`, and any teardown signal
+      to a pid published by a child captures the target's identity at spawn and revalidates
+      before signalling
+- [ ] Every fetch seam a code path can take is routed, not just the one the happy path uses
+      (a JSON + text stub still lets a BLOB fetch reach the network)
+- [ ] A skip condition is decidable the same way on every run of one host: no ctime tick, no
+      "did a real tool answer in time", no "did an earlier test in this worker arm a hook" —
+      build the condition, resolve it from disk, or measure in a fresh interpreter
+- [ ] A handle the object under test opens for the process lifetime (a store's SQLite
+      connection + writer thread, a lazily-opened index) is closed by the fixture that built
+      it; when production has no close path, that gap is the finding
+- [ ] No exception INSTANCE in a `parametrize` list (`pytest.param(OSError(...))`): the
+      instance lives for the module, `raise err` hangs a `__traceback__` on it, and the
+      frames on that traceback keep every local alive — a handle, a lease, a socket — for
+      the rest of the worker. Parametrize the errno and build the exception inside the test
+- [ ] A test that asserts process-global "nothing retained" state (`lease._held`, a
+      registry, a pool) is only as good as the files that share the worker: the file that
+      exercises the failure path pins the same table empty in its own teardown, so the
+      retention is reported where it was created rather than forty files later
+- [ ] "Let it finish" is never a fixed `sleep`: wait on the state you are about to assert
+      (poll it off-loop under a bounded deadline, or await its event) — two 200 ms sleeps
+      that were enough at `-n0` read `starting` for every row on a loaded Windows worker
+- [ ] A store that hands each THREAD its own connection (`KnowledgeStore`) is torn down with
+      `_close_all_for_tests()`, never `close()` — `close()` releases the calling thread's handle and
+      leaves the ones `asyncio.to_thread` workers opened; and every inline `VectorMemoryStore`
+      / `SkillsLoader` / `SubagentManager` goes through the module's `opened` register-and-close
+      fixture, because an unclosed `sqlite3.Connection` is a self-cycle on 3.11+ and refcounting
+      never frees its `db`/`-wal`/`-shm`
+- [ ] A fixture that plants a path under `tmp_path` and asserts a production "not under
+      `$HOME`" refusal does NOT fire pins `Path.home` (the seam the product reads) to a
+      sibling that is not an ancestor of the fixture — a developer's `TMPDIR` may sit inside
+      home — and a mirror test plants INSIDE the patched home to prove the refusal still fires
+- [ ] A helper that asserts a WARNING count filters `caplog.records` by the logger the test
+      enabled (`rec.name == <logger>`), never the unfiltered root capture: an executor thread
+      another test's `SessionManager` armed logs on its own logger mid-test; and a test that
+      builds a real `SessionManager` relies on conftest's `_no_boot_sandbox_sweep` pin rather
+      than patching the sweep itself unless the sweep is its subject
+- [ ] A teardown that signals a pid the body has already proven dead (a reaped root, a
+      grandchild init collected) signals only while `process_start_time` still matches the
+      identity recorded at spawn, and refuses an unpinned pid; a "nonexistent pid" probe uses a
+      number above `/proc/sys/kernel/pid_max`, not a convention
+- [ ] A resolver the product caches for the process (`functools.lru_cache`d `ssh -V`,
+      `code_fingerprint()`) is pinned at MODULE scope with an explicit opt-out fixture — pinning
+      only the flagged tests moves the real spawn to the next reader; a class-local copy of a
+      conftest fixture re-implements ALL of its pins or requests the original instead
+- [ ] A production `git -C <scratch>` spawn the test cannot pass `cwd=` to runs under a
+      fixture `monkeypatch.chdir(tmp_path)`, so nothing inherits the checkout as process cwd;
+      the product keeps `cwd=None` there on purpose (a missing clone must stay git's rc=128,
+      not a `FileNotFoundError` before git runs)
+- [ ] A backend a daemon reaps on disconnect goes through the pool's TRACKED reap
+      (`pool.spawn_shutdown`), never an inline `await shutdown()` in a handler's `finally`:
+      teardown cancels the handler after the backend has left the map, and the child then
+      belongs to nobody
+- [ ] A child whose environment or argv the test must READ BACK through the kernel
+      (`KERN_PROCARGS2`, `/proc/<pid>/environ`) is a non-platform binary -- the test's own
+      `sys.executable` -- never `sleep` or `env`: macOS 26 answers an argv-only record for
+      Apple platform binaries even to a same-uid reader, so the oracle reads `None` and a
+      "refused" assertion passes for the wrong reason
+- [ ] The bounds on nested `python -m pytest` runs fit INSIDE the per-test `--timeout`: N
+      sequential children each capped at 60 s inside a 120 s test can only fail the test
+      ahead of pytest-timeout, never protect it; independent children run concurrently
+      (wall = the slowest) and each gets the outer budget less a margin
+- [ ] A handle the product REWRITES asynchronously (a claim's `.task` that the run swaps for
+      its inner task) is never read off shared state after an awaited response -- take it
+      from the seam that hands it over (`attach_run_task`), or the assertion names whichever
+      task won the race
+- [ ] A fixture never answers a production path with a FIXED absolute host location to keep
+      a golden host-free: the product WRITES into the window it is handed (`record_owner`
+      unlinks `.owner`, the gate probe `shutil.rmtree`s it), and a path that "never exists"
+      is one `mkdir` on some host away from a real deletion -- answer a real directory under
+      `tmp_path` and stub the golden's env contribution instead
+- [ ] A test whose red survives neither running the file ALONE nor running it WITHOUT
+      `-p probe_plugin` is the probe's finding, not the suite's: a per-test observer that
+      reaches `os.path` through the module a spied test patches records itself as the code
+      under test
+- [ ] A child that polices its OWN peak memory reads `/proc/self/status` `VmHWM` on Linux,
+      never `getrusage(RUSAGE_SELF).ru_maxrss`: `execve` seeds `ru_maxrss` with the parent's
+      high-water mark, so a child of a 2 GiB xdist worker (or gateway) reads over its ceiling
+      before it has parsed a byte -- green at `-n0`, red under the suite; the test that pins
+      it plants a BLOATED PARENT and asserts the child still finishes
+- [ ] A test that plants a fake executable under `tmp_path` and expects a guard LATER than
+      the working-tree fence to fire pins the fence root (`_WORKTREE_ROOT`) to a `tmp_path`
+      sibling that is not the fake's ancestor -- under a repo-internal `TMPDIR` the fence
+      wins first, and a patched `which()` that answers the fake for `git` too can hide it on CI
+- [ ] A module that boots the REAL `start_dashboard` pins
+      `hooks_integration._lifecycle_dispatcher` / `_route_registry` to `None` BEFORE the boot
+      (so `monkeypatch` restores them); a module whose assertions assume "never booted" says
+      so with an autouse pin. Attribute a flaky 409 by its BODY (`hooks disable failed: ...
+      MagicMock ... await`), not by the endpoint that answered
+- [ ] A PTY test that asserts a child receives a signal gates the send on
+      `os.tcgetpgrp` on the PTY's own descriptor leaving the shell's group -- the line-discipline ECHO of the
+      command is not proof the shell has read it (`VINTR` flushes unread input and the test
+      passes with no child ever born) -- and reaps the session group in a `finally`; a spawn
+      that hands a shell a terminal resets inherited `SIG_IGN` to `SIG_DFL` first, because a
+      backgrounded launcher's ignored SIGINT survives `exec` into every descendant
+- [ ] A module-scoped autouse fixture never wraps the module in
+      `mock.patch.dict(os.environ, {...})`: the keys are live between tests for every module
+      the worker runs meanwhile, while the function-scoped conftest floor already overrides the
+      home during each body -- set the feature flag per test with `monkeypatch.setenv`
+- [ ] A memoised per-file read on a tree scan (`lru_cache` on `_read_text`, a `tuple(...)`
+      corpus helper) keeps every file resident for the process; the seam streams, and the test
+      consumes the iterator (count, path set, `zip(strict=True)`) instead of materialising it
+- [ ] A test's own `kiro-cli --version` is never the HOST's: every agent-spec write reaches
+      `installed_kiro_cli_version()`, cached per process, so the module pins it to
+      `SPEC_PERMISSIONS_MIN_VERSION` (house fixture) or the host's install decides the
+      contract under test
+- [ ] A coreutil a real-bash harness must neutralise (`sleep` in a retry backoff) is a shell
+      FUNCTION defined at the top of the driver script, never an executable planted earlier on
+      `PATH`: Git for Windows' `bin\bash.exe` launcher prepends `/usr/bin` to whatever `PATH`
+      it is handed, so the shim never wins there and every failing case sleeps the whole
+      budget; record each call and assert the SCHEDULE, not the clock
+- [ ] A Windows Job `ActiveProcessLimit` sized as "this child and nothing else" is
+      `1 + platform_compat.python_launcher_hops()`: a venv's `Scripts\python.exe` is a
+      redirector that spawns the real interpreter as its child, so a ceiling of exactly one
+      refuses the spawn it was meant to bound (exit 101, `Unable to create process using`)
+- [ ] A test that asserts a key PASSES THROUGH a scrub (`HOME`, `PATH`) plants that key in the
+      parent first — CI runners export `HOME` on Windows, a server session does not, and the
+      assertion otherwise measures the host
+- [ ] A refusal raised by an object that holds a process-global resource (a crew-log handle
+      and its write lease) is asserted through a CLASS-based context manager whose `__exit__`
+      copies the exception's fields into a plain record and returns -- never
+      `pytest.raises(...) as exc` (the `ExceptionInfo` and the test frame form a cycle that
+      keeps `append`'s `self` alive until the cyclic collector runs) and never a
+      `@contextlib.contextmanager` (throwing into a generator adds the same cycle through the
+      generator's frame); the file's autouse teardown pins the table (`lease._held`) empty
+      without `gc.collect()`
+- [ ] A stand-in handed to a table that judges liveness by probe (`RUNTIME_TENANCY._alive`
+      reads `is_alive` / `is_process_alive`) either answers the probe or its test releases the
+      claim itself -- a fake with neither is alive for the rest of the worker -- and a stubbed
+      `_dispose_*` still owes every release the real one performs
+- [ ] A test that hands the reaper a reset that never returns (`_hanging_reset`) pins
+      `_RESET_TIMEOUT` the way its sibling classes do; a passing test whose wall time lands on a
+      product constant (30.0 s, 60.0 s) with the CPU idle is spending that constant, not
+      measuring it -- `classify.py`'s TIMEOUT-SHAPED rows name them
+- [ ] `monkeypatch.delenv(key, raising=False)` on a key that is ABSENT records no undo: when the
+      product then `os.environ.setdefault`s it, `setenv` the key first so the fixture's undo
+      removes whatever the product leaves
+- [ ] A harness that runs a real shell script SUPPLIES every tool the script requires that
+      the host may lack (`jq` beside the `gh` and `curl` it already stubs) as a shell
+      function in its `BASH_ENV` file, implementing exactly the invocations the script
+      makes and failing loudly on any other -- never a `pytest.skip` on the missing tool,
+      which is a loosened ratchet (`a-ratchet-may-only-tighten`); probe the host through
+      the bash the script will run under, not `shutil.which`, and prefer the real binary
+      where that bash has one

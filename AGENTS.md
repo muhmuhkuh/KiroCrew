@@ -10,9 +10,11 @@ open before touching that subsystem: see
 
 Kiro Crew is an open-source personal AI agent: chat from the web dashboard, the
 CLI, or a messaging channel like Slack and Discord; run multi-step tasks
-unattended; schedule cron jobs; keep memory across sessions. It drives an LLM
-through the KiroACP provider (the ACP adapter running `kiro-cli` over ACP
-JSON-RPC) plus MCP tools.
+unattended; schedule cron jobs; keep memory across sessions.
+
+Kiro Crew's sole LLM provider speaks ACP. Its default backend runs `kiro-cli`
+over ACP JSON-RPC; other verified ACP harnesses are selected with
+`agent.acp_backend`. MCP tools supply the agent's host capabilities.
 
 - **Backend:** Python package `kiro_crew` in `src/kiro_crew/`. **Frontend:** React
   + TS + Vite SPA in `website/`, built into `src/kiro_crew/static/dist/` and served
@@ -43,9 +45,10 @@ in the **same commit** when you change what it documents.
 | `acp/`, kiro-cli transport, providers | [acp-client](docs/system-specs/modules/acp-client.md) + [providers](docs/system-specs/modules/providers.md) |
 | picking or defaulting a model anywhere | [model-selection](docs/system-specs/common/model-selection.md) + [model-fallback](docs/system-specs/modules/model-fallback.md) |
 | adding or adapting an agent harness (BYO, KAS, claude) | [harness-parity](docs/system-specs/modules/harness-parity.md) (invariants) + [harness-parity-gate](docs/ci/harness-parity-gate.md) (CI) |
-| an agent spec: `agent_discovery.py`, `agent_spec_format.py`, `agent.py`'s spec writers, `acp/kas_agents.py`, or any field a spec carries | [agent-spec-fields](src/kiro_crew/docs/agent-spec-fields.md) (what each field does, per backend) + [agent-host-contract](docs/system-specs/modules/agent-host-contract.md) (the per-harness table) |
+| an agent spec: `agent_discovery.py`, `agent_spec_format.py`, `agent.py`'s spec writers and `agent_materialization/`, `acp/kas_agents.py`, or any field a spec carries | [agent-spec-fields](src/kiro_crew/docs/agent-spec-fields.md) (what each field does, per backend) + [agent-host-contract](docs/system-specs/modules/agent-host-contract.md) (the per-harness table) |
 | the publicly selectable Claude backend | [claude-code-provider](docs/system-specs/modules/claude-code-provider.md) |
 | sessions, slots, session keys, PIDs | [session](docs/system-specs/modules/session.md) + [history](docs/system-specs/modules/history.md) |
+| killing a runtime, leases and tenancies, sweeps and reapers, `runtime_ownership.py`, `runtime_reconcile.py`, `session_pid.py`'s kill paths | [runtime-ownership](docs/system-specs/modules/runtime-ownership.md) |
 | session summaries, the chat summary panel, intent extraction | [session-summary](docs/system-specs/modules/session-summary.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
 | `context.py`, `context_blocks.py`, what reaches the model's context | [context-management](docs/architecture/context-management.md) |
@@ -78,6 +81,7 @@ in the **same commit** when you change what it documents.
 | build, install, dev mode | [CONTRIBUTING.md](CONTRIBUTING.md) + [install](docs/guides/install.md) |
 | cutting a release | [release](docs/build/release.md) |
 | `CHANGELOG.md` | [changelog](docs/build/changelog.md) |
+| a user-facing label, wording, placement or behaviour a person may already have decided | [docs/decisions/README.md](docs/decisions/README.md) |
 | errors, retries, user-facing failure text | [error-handling](docs/system-specs/common/error-handling.md) |
 | what this public fork must never re-introduce | [oss-fork-boundaries](docs/system-specs/oss-fork-boundaries.md) |
 | any doc: moving, renaming, indexing it | [docs/README.md](docs/README.md) |
@@ -200,6 +204,9 @@ gate locally with
 - MUST read the owning spec under `docs/system-specs/` before changing the code it
   covers, and MUST update it in the SAME commit.
 - MUST NOT create additional markdown files unless explicitly instructed.
+- MUST grep `docs/decisions/` before changing a recorded label, placement or
+  behaviour; an entry is reversed only by a new superseding entry a maintainer
+  wrote, never by an edit, a friction report or a review finding.
 - Everything else about adding, moving, indexing and linting a doc — including
   `scripts/docs-lint.sh` — is [docs/README.md](docs/README.md). Treat
   `docs/task-specs/` as an archive, never as current context.
@@ -221,6 +228,24 @@ gate locally with
 Types the PR-title gate in `code-review.yml` accepts: `feat`, `fix`, `docs`,
 `style`, `refactor`, `perf`, `test`, `chore`, `ci`, `build`, `revert`. **One
 logical change per commit**, and at most two commits per PR.
+
+### PR description
+
+`gh pr create --body` / `--body-file` bypasses the GitHub template, so build the
+body from `.github/PULL_REQUEST_TEMPLATE.md` yourself: keep every heading
+verbatim and fill in the `**Goal:**` line. PR Hygiene fails a body missing the
+required sections; check it before opening with
+`out="$(mktemp)"; PR_BODY="$(cat <file>)" GITHUB_OUTPUT="$out" bash .github/scripts/pr-description-check.sh; cat "$out"`.
+
+### PR goal is frozen
+
+The `**Goal:**` line, `## Why it matters` and `## Not a goal` are written once,
+when the PR opens. Never edit them on your own, not even to match the diff. A
+finding outside the goal is rebutted or deferred, never absorbed by widening the
+goal. A defect in code this PR adds or changes is always in scope and gets fixed;
+'out of goal' applies only to new scope — a new feature, surface, or hardening this
+PR does not need. Edit them only when a human explicitly asks, and say why in a PR
+comment.
 
 ## CHANGELOG.md
 

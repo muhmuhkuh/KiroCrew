@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 
+from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.config import KiroCrewConfig, config_dir
 from kiro_crew.config.loader import workspace_dir_for
 from kiro_crew.config.paths import project_agents_dir
@@ -21,18 +22,23 @@ _MAX_SOURCE_BYTES = ESSENTIAL_MAX_CHARS * 4
 _MAX_DIRECTORY_ENTRIES = 2048
 _MAX_DOCUMENTS = 64
 
+# A resources entry is a URI string this reader may open, or an object whose
+# keys are kiro-cli's schema. The alias records the shape, not those keys.
+ResourceDeclaration = str | dict[str, object]
+
 
 class MemberEssentialContextError(ValueError):
     """A declared essential source cannot be included completely and safely."""
 
 
-def _declared_document_count(resources: list) -> int:
+def _declared_document_count(resources: list[ResourceDeclaration]) -> int:
     """How many declared resources can become essential documents.
 
-    Only ``file://`` declarations are ever read; ``skill://``, ``knowledge://``
-    and other schemes stay on demand and never enter the essentials snapshot,
-    so they must not consume the document budget either. An agent that declares
-    seventy skills and no files loads zero documents.
+    Only ``file://`` declarations are ever read; ``skill://`` strings and
+    object-form ``knowledgeBase`` declarations stay on demand and never enter
+    the essentials snapshot, so they must not consume the document budget
+    either. An agent that declares seventy skills and no files loads zero
+    documents.
     """
     return sum(1 for r in resources if isinstance(r, str) and r.startswith("file://"))
 
@@ -279,7 +285,9 @@ def resolve_template_path(template: str, project: str | None = None) -> Path | N
         admitted = validate_file_path(project)
         if admitted is None:
             raise MemberEssentialContextError(f"Essential project {project}: cannot be read safely")
-        for path in project_agent_files(Path(admitted)):
+        for path in project_agent_files(
+            Path(admitted), operation="member_essentials", source="context"
+        ):
             spec = _read_agent_spec(path, operation="member_essentials", source="context")
             if spec is None and path.stem == template:
                 raise MemberEssentialContextError(
@@ -320,6 +328,32 @@ def resolve_relative_prompt_path(
         return None
 
 
+def _admitted_project_root(project: str | None) -> Path | None:
+    """The member's project as the essential readers may open it, or ``None``."""
+    if not project:
+        return None
+    admitted = validate_file_path(project)
+    if admitted is None:
+        raise MemberEssentialContextError(f"Essential project {project}: cannot be read safely")
+    project_root = Path(admitted)
+    _refuse_managed_source(project_root)
+    return project_root
+
+
+def member_inherits_default_resources(project: str | None) -> bool:
+    """Whether kiro-cli hands a member in its admitted *project* the default resources.
+
+    Global and workspace steering plus ``AGENTS.md``. Settings that cannot be
+    read keep inheritance; the caller decides whether kiro-cli serves the
+    session at all, since a kiro-cli setting changes nothing on another harness.
+    Computed once per member turn by the caller that knows the provider and
+    handed to :func:`documents_for_member` and the folder-steering dedup, so a
+    document under a ``.kiro/steering`` root is delivered by exactly one of them
+    whichever way the workspace decides.
+    """
+    return acp_driver.inherits_default_resources(_admitted_project_root(project))
+
+
 def documents_for_member(
     template: str,
     project: str | None,
@@ -329,25 +363,25 @@ def documents_for_member(
     conditional_index: bool = False,
     context_settings: bool = False,
     trigger_text: str = "",
+    inherits_default_resources: bool = True,
 ) -> list[tuple[str, str]]:
     """Read actual project instructions and the owner's declared template sources.
 
     Native project steering defaults to always; manual, auto and fileMatch
     documents are deliberately left to their native trigger. Generic product
     prompts keep their existing provider/session-start path.
+
+    *inherits_default_resources* is the caller's verdict on whether the session's
+    harness hands the member kiro-cli's default resources (global and workspace
+    steering, ``AGENTS.md``). It defaults to inheriting because only a session
+    kiro-cli serves can opt out, and only that caller knows which harness it has.
     """
-    from kiro_crew.agent import _prompt_path
+    from kiro_crew.agent import is_managed_prompt
     from kiro_crew.agent_discovery import _read_agent_spec
 
     documents: list[tuple[str, str]] = []
     seen: set[Path] = set()
-    project_root = None
-    if project:
-        admitted = validate_file_path(project)
-        if admitted is None:
-            raise MemberEssentialContextError(f"Essential project {project}: cannot be read safely")
-        project_root = Path(admitted)
-        _refuse_managed_source(project_root)
+    project_root = _admitted_project_root(project)
 
     def add(path: Path, root: Path, *, steering: bool = False) -> None:
         if Path(os.path.abspath(path)) in seen:
@@ -419,17 +453,25 @@ def documents_for_member(
         if len(documents) > _MAX_DOCUMENTS:
             raise MemberEssentialContextError(f"Essential source {path}: too many documents")
 
-    if include_project and not native_only:
+    # kiro-cli appends its default resources (global and workspace steering,
+    # AGENTS.md) to a custom agent only while the workspace inherits them. A
+    # member whose workspace opts out loads just what its template declares, so
+    # the snapshot must not re-add the operator's global steering behind it.
+    inherits = include_project and not native_only and inherits_default_resources
+    if inherits:
         for path in _matches(Path.home(), ".kiro/steering/**/*.md"):
             add(path, Path.home(), steering=True)
 
     if project_root is not None and include_project and not native_only:
-        for name in ("AGENTS.md", "SOUL.md"):
+        # SOUL.md is Crew's own member file, not a kiro-cli default resource, so
+        # the opt-out leaves it in place.
+        for name in ("AGENTS.md", "SOUL.md") if inherits else ("SOUL.md",):
             path = project_root / name
             if path.exists() or path.is_symlink():
                 add(path, project_root)
-        for path in _matches(project_root, ".kiro/steering/**/*.md"):
-            add(path, project_root, steering=True)
+        if inherits:
+            for path in _matches(project_root, ".kiro/steering/**/*.md"):
+                add(path, project_root, steering=True)
 
     spec_path = resolve_template_path(template, project)
     if spec_path is None:
@@ -449,9 +491,10 @@ def documents_for_member(
     prompt = spec.get("prompt", "")
     if not isinstance(prompt, str):
         raise MemberEssentialContextError(f"Essential template {spec_path}: prompt must be text")
-    # Forks inherit the product prompt URI too. Its provider/session-start
-    # injection is independent of the template name and the install directory.
-    if prompt and prompt != f"file://{_prompt_path()}":
+    # A fork inherits the managed contract; essentials omit it because the
+    # session-start injection delivers it once, regardless of template name or
+    # install directory (see is_managed_prompt).
+    if prompt and not is_managed_prompt(prompt):
         if prompt.startswith("file://"):
             path = Path(prompt[7:]).expanduser()
             if path.is_absolute():
@@ -488,10 +531,10 @@ def documents_for_member(
         )
     resources = spec.get("resources", [])
     if include_project and (
-        not isinstance(resources, list) or any(not isinstance(r, str) for r in resources)
+        not isinstance(resources, list) or any(not isinstance(r, (str, dict)) for r in resources)
     ):
         raise MemberEssentialContextError(
-            f"Essential template {spec_path}: resources must be a list of strings"
+            f"Essential template {spec_path}: resources must be a list of declarations"
         )
     if include_project and isinstance(resources, list):
         if _declared_document_count(resources) > _MAX_DOCUMENTS:
@@ -531,12 +574,24 @@ def _resource_pattern(path: Path, root: Path) -> str:
         raise MemberEssentialContextError(f"Essential source {path}: outside {root}")
     try:
         return str(path.relative_to(admitted_root))
-    except ValueError as exc:
-        raise MemberEssentialContextError(f"Essential source {path}: outside {root}") from exc
+    except ValueError:
+        pass
+    # The reverse layout: the declaration carries the link spelling while the
+    # root is already resolved (a project root is stored resolved). Only the
+    # declaration's glob-free ANCESTORS are screened, never its tail, so a link
+    # below the root is still refused: by the walk in :func:`_matches` for a
+    # glob, and by the containment check in :func:`_read` for a literal path.
+    for ancestor in reversed(path.parents):
+        if any(c in ancestor.name for c in "*?["):
+            break
+        admitted = validate_file_path(str(ancestor))
+        if admitted is not None and Path(admitted) == admitted_root:
+            return str(path.relative_to(ancestor))
+    raise MemberEssentialContextError(f"Essential source {path}: outside {root}")
 
 
 def _resource_paths(
-    resources: list[str], source_root: Path, absolute_root: Path
+    resources: list[ResourceDeclaration], source_root: Path, absolute_root: Path
 ) -> list[tuple[Path, Path]]:
     paths: list[tuple[Path, Path]] = []
     if _declared_document_count(resources) > _MAX_DOCUMENTS:
@@ -544,7 +599,7 @@ def _resource_paths(
             "Essential resource declaration exceeds the document limit"
         )
     for resource in resources:
-        if not resource.startswith("file://"):
+        if not isinstance(resource, str) or not resource.startswith("file://"):
             continue
         path = Path(resource[7:]).expanduser()
         root = absolute_root if path.is_absolute() else source_root
@@ -567,12 +622,13 @@ def projected_resource_documents(definition: dict, cwd: str) -> dict[str, str]:
 
     No implicit project scan and no template reread: project overrides cannot
     substitute their resources for the global definition KAS actually registers.
-    Conditional inclusion stays with the native selector; skill/knowledge URI
-    resources keep their on-demand behavior and are never treated as full text.
+    Conditional inclusion stays with the native selector; skill URI resources
+    and object-form ``knowledgeBase`` declarations keep their on-demand
+    behavior and are never treated as full text.
     """
     resources = definition.get("resources", [])
-    if not isinstance(resources, list) or any(not isinstance(r, str) for r in resources):
-        raise MemberEssentialContextError("Projected resources must be a list of strings")
+    if not isinstance(resources, list) or any(not isinstance(r, (str, dict)) for r in resources):
+        raise MemberEssentialContextError("Projected resources must be a list of declarations")
     documents: dict[str, str] = {}
     for path, root in _resource_paths(resources, Path(cwd), Path.home()):
         if str(path) in documents:
@@ -595,13 +651,21 @@ def kiro_launch_documents(template: str, project: str | None) -> list[tuple[str,
     """Selected resources plus Kiro's implicit AGENTS/always-steering scan.
 
     SOUL is not an implicit native source. Conditional modes vary by engine and
-    version, so this responsibility includes only default/always steering.
+    version, so this responsibility includes only default/always steering. The
+    implicit scan applies only while the workspace inherits kiro-cli's default
+    resources, as it does natively; this model is kiro-cli's by construction, so
+    it takes that verdict itself, once.
     """
+    inherits = member_inherits_default_resources(project)
     declared = dict(documents_for_member(template, project, native_only=True))
-    for source, body in documents_for_member(template, project):
+    for source, body in documents_for_member(
+        template, project, inherits_default_resources=inherits
+    ):
         path = Path(source)
         if path.name == "AGENTS.md" or "steering" in path.parts:
             declared[source] = body
+    if not inherits:
+        return list(declared.items())
     for path in _matches(Path.home(), ".kiro/steering/**/*.md"):
         body = _read(path, Path.home())
         fields, _ = split_frontmatter(body, STEERING_LOADER)

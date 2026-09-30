@@ -1,30 +1,28 @@
 ---
 title: Overload resilience — durable task queue, admission before allocation, adaptive concurrency, layered recovery
-status: accepted
-revision: v3
+status: partial
+revision: v4
 author: bolichen
 created: 2026-09-12
 last-audited: 2026-09-12
 audited-at: 6f056722b
 doc-pr:
 implementation-prs: []
-tracking-issues: []
+tracking-issues: ["#15244"]
 supersedes: [rfc-durable-run-coordinator.md]
 superseded-by: []
 ---
 # RFC: Overload resilience — durable task queue, admission before allocation, adaptive concurrency, layered recovery
 
-- Status: accepted (owner decision 2026-09-12 14:21: ONE PR, no design questions
-  back). Every design element ships in a single PR on branch
-  `fix/gatewayd-overload-liveness`, whose first slice (the gatewayd supervisor no
-  longer kills a daemon that is merely busy; the stub reconnect budget rises from
-  60s to 600s) is already on the branch and is treated as landed. The supervisor
-  half of that slice was solved on `main` by #10455's escalated probe while this
-  branch was in review, so this branch's own gate for it is SUBTRACTED rather
-  than shipped — see the slice-0 row in §12.
-  §12 names the internal waves; §13 records every decision with the
-  config flag that reverses it. §14 folds the owner's 2026-09-12 15:12 addendum
-  (unified waits, yielding, nested recovery) into the same PR.
+- Status: implemented on main in [#10521](https://github.com/kirodotdev/KiroCrew/pull/10521).
+  The shipped contracts are [`../system-specs/modules/taskq.md`](../system-specs/modules/taskq.md),
+  [`../system-specs/modules/adaptive-concurrency.md`](../system-specs/modules/adaptive-concurrency.md),
+  and the linked module specifications they reference. The durable task store,
+  admission and host budgets, session-start collection, adaptive controller,
+  recovery and wait states, TaskRunner/workflow adapters, API, and dashboard
+  surface all shipped in that PR. The dedicated-runtime parent checkpoint-pause
+  remains explicitly excluded by decision Q3. The delivery plan below is retained
+  as the historical pre-merge record.
 - Author: bolichen (Bolin Chen). Requirements: the 2026-09-12 spec
   (`overload-resilience/SPEC.md` in the crew workspace); code investigation
   `subagents/081a6e0a`; GPT-6 review `subagents/99cae534` (verdict REDESIGN, its
@@ -104,7 +102,8 @@ compose multiplicatively with the row above them.
 |---|---|---|---|---|
 | `SubagentManager._max_concurrent` (`resolve_max_subagents`) | active subagent runs, gateway-wide | auto (`compute_max_subagents`, floor 3) | queue in memory | base |
 | `subagent_spawn_stagger_secs` | subagent starts | 0.25s | queue | — |
-| `check_memory_available` / `cached_admission_check` | new subagent spawns | `resource_critical_gb` 2.0 | REFUSE | — |
+| `check_memory_available` (spawn floor) | new subagent spawns | `spawn_min_memory_gb` 4.0 plus the warming-start reserve (`subagent_cost_gb` 0.5 per warming dedicated start, or the learned per-run cost or a live dedicated peak when higher); Q8 moves the floor to 3.0 | DEFER to the durable queue; legacy spawns REFUSE | — |
+| `cached_admission_check` / `admission_check` (posture gate) | new subagent spawns (cached read), cron firings (uncached read) | `resource_critical_gb` 2.0 | DEFER to the durable queue; interval and one-shot (`every` / `at`) cron firings wait for the next admitted tick (cron-expression jobs are not deferred); legacy spawns REFUSE | — |
 | `_COLD_START_MAX_CONCURRENT` (`_ColdStartAdmission`) | runtime spawn+`initialize`, per event loop | 2 | wait | — (does not cover `session/new` on an existing runtime) |
 | `_SESSION_NEW_TIMEOUT` / `session_start_timeout_secs` | one `session/new` | 90s | `AcpRequestTimeout` → dedicated-process fallback | amplifies ×(1 runtime + N stubs) |
 | `WorkerPool._task_sema` / `_start_sema` | workflow / app workers | 5 / 2 | wait | × per pool instance |
@@ -425,8 +424,19 @@ window and the `2.0s` stagger this RFC first proposed. Both were changed because
 the original pair could not reach a user's configured ceiling: a ×0.5 decrease
 fires on one lag spike while a flat 20-success bar at cap 1 needs twenty serial
 runs to earn cap 2, and a 2.0s stagger takes over two minutes to fill 64 slots
-even once the cap allows them. The climb is bounded by what the host's memory and
-CPU size the cap at, so a faster rule cannot exceed the machine. Doubling is
+even once the cap allows them. The climb is bounded by `user_max` alone, judged
+against the live pressure signals in each sample; it is NOT clamped to a figure
+predicted from past peak memory and CPU per agent. Such a prediction prices every
+slot at the busiest agent's burst (one build-heavy run at 20 cores and 9 GB) and
+pins a 32-core host with 96 GB free at the fresh-start cap for the life of the
+process, under a controller that sees only clean samples -- the loop exists so
+that many sessions can ask for many workers, be admitted up to the ceiling the
+user chose, and queue on real pressure rather than be refused for a guess. Memory
+over-commit is the one unrecoverable failure and is guarded live (the pressure
+line gates increases, the critical line cuts, the spawn gate defers cold starts
+that would breach `spawn_min_memory_gb` plus unobserved growth); CPU over-commit
+only slows work, which is the pressure the loop already backs off from, so CPU
+is not a sizing term for the auto ceiling either. Doubling is
 one-way per process: the first corroborated pressure or pause retires it and the
 controller stays in congestion avoidance for that process lifetime.
 
@@ -771,6 +781,42 @@ Question text is kept as asked; the decision below it is final for this PR.
   (the ladder constant `SESSION_RECOVERY_MAX_ATTEMPTS` is the ONE source for
   every stall budget). A key with no reader is a promise the config cannot keep;
   each returns as a key only with the consumer in the same change.
+- **Q8 (2026-09-30).** The spawn floor `agent.spawn_min_memory_gb` defaults to
+  4.0 GB, an absolute headroom figure that predates #12203 (`default=4.0` at
+  `4a945956e^`); #12203 added the cold-start reserve
+  `_startup_memory_reserve_gb` on top of it. What does the default have to be
+  for the floor to admit work on the hardware most operators run?
+  **Decision:** the default is 3.0 GB; the reserve on top of it is unchanged, so
+  the bar for the first cold start of a batch is 3.5 GB and 4.0 GB for the
+  second. Grounds: the floor is compared with a probe whose composition differs
+  per platform. On macOS that probe is `subagent._macos_available_memory_gb`,
+  reached from `check_memory_available`: `_macos_vm_reclaimable_pages` sums
+  free + inactive + speculative + purgeable pages and excludes active, wired
+  and compressed pages. The recorder's posture samples read the same function
+  through `resource_status.probe`, so the figures below are measured through
+  the probe the floor compares against; `platform_compat._macos_available_mib`
+  is a tighter sum behind `host_available_mib`, which the floor does not read.
+  Through that probe a 16 GB Apple silicon host in ordinary desktop use read a
+  median of 4.84 GB over one day of recorder samples (n = 3010; p25 4.48, p75
+  5.26, min 2.55, max 8.28; 26 % of samples below 4.5 GB and 59 % below 5.0 GB)
+  while
+  `sysctl kern.memorystatus_vm_pressure_level` read 1 (normal) and
+  `sysctl kern.memorystatus_level`, the kernel's free-memory percentage, read
+  49; at 4.0 the first row of a batch was admitted about three quarters of the
+  day and the second less than half (#15244, #14592). 3.0 keeps the floor a full 1 GB above
+  `resource_critical_gb` and below the `resource_pressure_gb` advisory tier, so
+  the ladder reads 4.0 advisory / 3.0 floor / 2.0 critical. Measured cost on
+  the same host: at a 2.5 floor two dedicated workers were admitted and the
+  kernel moved from `kern.memorystatus_level` 49 with
+  `kern.memorystatus_vm_pressure_level` 1 (normal) to `kern.memorystatus_level`
+  33 to 44 with `kern.memorystatus_vm_pressure_level` 2 (warn) for as long as
+  they ran, which is why the default stops at 3.0 rather than at the bottom of
+  the 2 to 3 GB range the operator asked for. A stored 4.0 is reported through the
+  superseded-defaults registry and never rewritten. Reversal:
+  `agent.spawn_min_memory_gb=4.0` restores the previous bar; `0` disables the
+  floor and the cold-start reserve together (unchanged). Not decided here: a
+  platform-aware floor (scaling to total RAM, or gating on the kernel's
+  pressure level on macOS) stays open under #15244.
 
 ## 14. Waits, yielding and nested recovery (owner addendum, 2026-09-12 15:12)
 

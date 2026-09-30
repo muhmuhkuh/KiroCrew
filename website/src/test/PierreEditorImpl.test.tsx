@@ -202,7 +202,13 @@ describe('PierreEditorImpl surface selection', () => {
 
     expect(lastSurface().kind).toBe('file')
     expect(view.getByTestId('pierre-file')).toBeInTheDocument()
-    expect(lastSurface().props.file).toBe(FILE)
+    // The seam re-derives the cacheKey from live contents (Pierre's line-cache
+    // contract), so the surface carries the same name/contents with a
+    // content-derived key rather than the caller's raw object.
+    const rendered = lastSurface().props.file as FileContents
+    expect(rendered.name).toBe(FILE.name)
+    expect(rendered.contents).toBe(FILE.contents)
+    expect(rendered.cacheKey).toBe(contentCacheKey(FILE.name, FILE.contents))
     expect(lastSurface().props.edit).toBe(true)
   })
 
@@ -216,7 +222,9 @@ describe('PierreEditorImpl surface selection', () => {
 
     expect(lastSurface().kind).toBe('file')
     expect(view.getByTestId('pierre-file')).toBeInTheDocument()
-    expect(lastSurface().props.file).toBe(oversized)
+    const degraded = lastSurface().props.file as FileContents
+    expect(degraded.contents).toBe(oversized.contents)
+    expect(degraded.cacheKey).toBe(contentCacheKey(oversized.name, oversized.contents))
     expect(lastSurface().props.edit).toBe(true)
     expect(lastSurface().props.editorOptions).toBeTruthy()
   })
@@ -229,7 +237,9 @@ describe('PierreEditorImpl surface selection', () => {
     expect(lastSurface().kind).toBe('diff')
     expect(view.getByTestId('pierre-diff')).toBeInTheDocument()
     expect(lastSurface().props.oldFile).toBeNull()
-    expect(lastSurface().props.newFile).toBe(FILE)
+    const newFile = lastSurface().props.newFile as FileContents
+    expect(newFile.contents).toBe(FILE.contents)
+    expect(newFile.cacheKey).toBe(contentCacheKey(FILE.name, FILE.contents))
   })
 
   it('keys the baseline on its own contents, not the filename', () => {
@@ -339,6 +349,107 @@ describe('PierreEditorImpl surface selection', () => {
   })
 })
 
+describe('PierreEditorImpl cacheKey contract', () => {
+  // Pierre's `isLineCacheForFile` trusts `file.cacheKey` alone and never
+  // re-reads `contents`, so a caller that keeps a STABLE key across keystrokes
+  // (to hold the editing session and caret) would leave a grown buffer reusing a
+  // stale N-row highlight array — `processFileResult` then indexes past it and
+  // throws "Line doesnt exist" on Return. The seam owns that contract so every
+  // caller (CodeEditor, PapyrusEditor, any future one) is correct at once.
+  const seedFile = (contents: string): FileContents => ({
+    name: 'main.tex',
+    contents,
+    cacheKey: 'papyrus:main.tex:0', // a FROZEN session key, as callers now hand
+  })
+
+  it('derives a content-tracking cacheKey when the buffer grows a line', () => {
+    const { rerender } = mount({ file: seedFile('a\nb\nc\n') })
+    const before = (lastSurface().props.file as FileContents).cacheKey
+
+    // The caller hands the SAME frozen session key but longer contents (a new
+    // line typed). The pre-fix seam passed that frozen key straight to Pierre.
+    rerender({ file: seedFile('a\nb\nc\nd\n') })
+    const after = (lastSurface().props.file as FileContents).cacheKey
+
+    expect(after).not.toBe(before)
+    expect(after).toBe(contentCacheKey('main.tex', 'a\nb\nc\nd\n'))
+  })
+
+  it('moves the cacheKey on an in-line edit that keeps the line count', () => {
+    const { rerender } = mount({ file: seedFile('a\nb\nc\n') })
+    const before = (lastSurface().props.file as FileContents).cacheKey
+
+    rerender({ file: seedFile('a\nbb\nc\n') })
+    expect((lastSurface().props.file as FileContents).cacheKey).not.toBe(before)
+  })
+
+  it('never hands Pierre the caller’s frozen session key', () => {
+    mount({ file: seedFile('a\nb\nc\n') })
+    // The frozen key defines the React remount identity / caret session; it must
+    // NOT be what Pierre keys its line cache on.
+    expect((lastSurface().props.file as FileContents).cacheKey).not.toBe('papyrus:main.tex:0')
+  })
+
+  // The caller echoes each edit Pierre emits back as `file.contents`. A new
+  // cacheKey makes Pierre's editor rebuild its document and reset selections
+  // (caret to line 1, focus lost); new contents under the old key re-render
+  // against a stale line cache ("Line doesnt exist" on Return). Either way the
+  // echo must leave Pierre's `file` input exactly as it was.
+  it.each([
+    ['an in-line edit', 'a\nbb\nc\n'],
+    ['a Return that grows the buffer', 'a\nb\n\nc\n'],
+  ])('keeps Pierre’s file input unchanged when the caller echoes %s', (_label, typed) => {
+    const { rerender } = mount({ file: seedFile('a\nb\nc\n') })
+    const before = lastSurface().props.file as FileContents
+    const announceChange = attachEditor().options.onChange as (file: FileContents) => void
+
+    act(() => announceChange({ ...before, contents: typed }))
+    rerender({ file: seedFile(typed) })
+
+    expect(lastSurface().props.file).toBe(before)
+  })
+
+  it('still reseeds Pierre when the source changes from outside after an edit', () => {
+    const { rerender } = mount({ file: seedFile('a\nb\nc\n') })
+    const seeded = lastSurface().props.file as FileContents
+    const announceChange = attachEditor().options.onChange as (file: FileContents) => void
+    act(() => announceChange({ ...seedFile(''), contents: 'a\nbb\nc\n' }))
+    rerender({ file: seedFile('a\nbb\nc\n') })
+
+    // Cancel: the host puts the seed text back, which Pierre never emitted. The
+    // key must move even though the text matches the seed, or Pierre keeps the
+    // edited document on screen.
+    rerender({ file: seedFile('a\nb\nc\n') })
+    const reseeded = lastSurface().props.file as FileContents
+    expect(reseeded.contents).toBe('a\nb\nc\n')
+    expect(reseeded.cacheKey).not.toBe(seeded.cacheKey)
+  })
+
+  it('reseeds Pierre when an outside change restores the text a recovery remount rendered', () => {
+    const { rerender } = mount({ file: seedFile('a\nb\nc\n') })
+    const announceChange = attachEditor().options.onChange as (file: FileContents) => void
+    act(() => announceChange({ ...seedFile(''), contents: 'saved\n' }))
+    rerender({ file: seedFile('saved\n') })
+
+    pierre.poolState.current = { phase: 'recovering', generation: 1 }
+    rerender({ file: seedFile('saved\n') })
+    pierre.poolState.current = { phase: 'ready', generation: 2, pool: {} }
+    rerender({ file: seedFile('saved\n') })
+    const remounted = lastSurface().props.file as FileContents
+    expect(remounted.contents).toBe('saved\n')
+
+    const announceReplacementChange = attachEditor().options.onChange as (file: FileContents) => void
+    act(() => announceReplacementChange({ ...seedFile(''), contents: 'draft\n' }))
+    rerender({ file: seedFile('draft\n') })
+
+    // Cancel back to the saved text, which is exactly what the remount rendered.
+    rerender({ file: seedFile('saved\n') })
+    const reseeded = lastSurface().props.file as FileContents
+    expect(reseeded.contents).toBe('saved\n')
+    expect(reseeded.cacheKey).not.toBe(remounted.cacheKey)
+  })
+})
+
 
   it('preserves the latest in-memory draft across worker recovery and later edits', () => {
     const mounted = mount()
@@ -407,6 +518,19 @@ it('keeps long recovery text vertically scrollable', () => {
   expect(fallback).not.toBeNull()
   expect(fallback?.className).toContain('h-full')
   expect(fallback?.className).toContain('overflow-auto')
+})
+
+it('carries the caller className onto the recovery branch too', () => {
+  // The caller's className is the surface's size cap (a chat block caps it
+  // at 480px). Applying it only on the Virtualizer would leave the recovery
+  // grid unbounded whenever highlighting is down.
+  const mounted = mount({ className: 'max-h-[480px]' })
+  pierre.poolState.current = { phase: 'recovering', generation: 1 }
+  mounted.rerender()
+
+  const fallback = mounted.view.container.querySelector('.pierre-editor-fallback')
+  expect(fallback).not.toBeNull()
+  expect(fallback!.parentElement!.className).toContain('max-h-[480px]')
 })
 
 it('transfers focus through recovery and back to the replacement editor', () => {

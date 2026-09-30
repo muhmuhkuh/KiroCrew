@@ -129,18 +129,30 @@ class TestUnresolvableScopeRefuses:
             "GIT_COMMITTER_EMAIL": "t@t",
         }
         root.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True, env=env)
+        # ``cwd=root`` on every spawn: a test's git must never inherit pytest's working
+        # directory (the checkout) as the child's cwd.
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(root)], check=True, env=env, cwd=str(root)
+        )
         (root / "f.txt").write_text("x\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=env)
-        subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True, env=env)
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True, env=env, cwd=str(root))
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "-qm", "init"], check=True, env=env, cwd=str(root)
+        )
         return root
 
-    def test_an_unresolvable_scope_base_refuses_to_build_the_profile(self, tmp_path) -> None:
+    def test_an_unresolvable_scope_base_refuses_to_build_the_profile(
+        self, tmp_path, monkeypatch
+    ) -> None:
         import pytest
 
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as gp
 
         clone = self._repo(tmp_path / "clone")
+        # The profile's own ``scope.scoped_relpaths`` addresses the clone with ``-C`` and
+        # passes no ``cwd``, so that git inherits the process cwd -- by default the
+        # pytest worker's, which is this checkout. Pin it to the scratch clone.
+        monkeypatch.chdir(clone)
         # Matches on the CONSEQUENCE, not the cause: the guard deliberately does not
         # distinguish "does not resolve" from "resolves but cannot be diffed" (both widen
         # the fence identically), so asserting cause-specific wording would pin a
@@ -152,7 +164,9 @@ class TestUnresolvableScopeRefuses:
                 scope_base="origin/no-such-branch",
             )
 
-    def test_a_resolvable_base_with_an_empty_diff_scopes_to_NOTHING(self, tmp_path) -> None:
+    def test_a_resolvable_base_with_an_empty_diff_scopes_to_NOTHING(
+        self, tmp_path, monkeypatch
+    ) -> None:
         """base == HEAD must scope to the EMPTY SET, not fall through to unscoped.
 
         REPLACES an assertion that `_scope is None` here, on the reasoning that "there is
@@ -167,6 +181,7 @@ class TestUnresolvableScopeRefuses:
         from kiro_crew.apps.builtins.auto_improvement.profiles.github_repo import profile as gp
 
         clone = self._repo(tmp_path / "clone")
+        monkeypatch.chdir(clone)  # see the sibling above: the profile's git inherits cwd
         prof = gp.GitHubRepoProfile(
             clone_path=clone, pr_queue_dir=tmp_path / "queue", scope_base="HEAD"
         )

@@ -24,9 +24,11 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path, PurePath, PurePosixPath
 
-from kiro_crew import pinned_fs, platform_compat
+from kiro_crew import crew_teams, pinned_fs, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
-from kiro_crew.config.paths import config_dir
+from kiro_crew.agent_discovery import parsed_agent_specs
+from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
+from kiro_crew.config.paths import config_dir, kiro_agents_dir
 from kiro_crew.mcp_cron import _log_cron_denial, _vet_shell_command
 from kiro_crew.member_memory_backup import hold_stores_for_read
 from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME, is_host_local_store_state
@@ -62,8 +64,8 @@ EXPORT_EXCLUDE = frozenset(
         # skills/ trees, so an entry here would silently drop any USER file that
         # happens to share the name. They need no entry: root-level export is a
         # hard-coded allowlist (config.json, hooks.json, crons.json,
-        # notifications.jsonl, project_dir, workspace_dir), so a root beacon file is
-        # never selected in the first place.
+        # notifications.jsonl, project_dir, workspace_dir, crew-teams/teams.json), so a
+        # root beacon file is never selected in the first place.
         "session_map.json",
         "kiro_session_pids.txt",
         "kiro_pids.txt",
@@ -422,6 +424,87 @@ def _add_from_fd(zf: zipfile.ZipFile, fd: int, arcname: str) -> None:
         shutil.copyfileobj(src, dest)
 
 
+_MANAGED_TEMPLATES = frozenset(Path(name).stem for name in OWNED_KIRO_AGENT_FILES)
+
+#: The template warnings ride a response header (export) and a summary (import), so
+#: both are bounded: at most this many names, each cut to this many characters.
+MAX_TEMPLATE_WARNINGS = 20
+MAX_TEMPLATE_NAME_CHARS = 64
+
+
+def _clip(name: str) -> str:
+    if len(name) <= MAX_TEMPLATE_NAME_CHARS:
+        return name
+    return name[: MAX_TEMPLATE_NAME_CHARS - 1] + "\u2026"
+
+
+def crew_template_refs(config_path: Path) -> list[tuple[str, str]]:
+    """``(crew, kiro_agent)`` for each crew row in *config_path* that names a template.
+
+    The two config-level selectors that also name a template, ``agent.default_agent``
+    and ``session.pool_agent``, are listed under those keys in place of a crew name.
+    A bundle never carries ``<kiro home>/agents``, so every name listed here must
+    already exist on whichever machine applies the config. The templates Kiro Crew
+    writes itself (``OWNED_KIRO_AGENT_FILES``) are left out: every install
+    regenerates them. An unreadable, malformed or pathologically nested file
+    answers ``[]``: this feeds a warning, never a refusal.
+    """
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        rows = data.get("agents")
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return []
+    named = [
+        (str(crew), row.get("kiro_agent"))
+        for crew, row in (rows.items() if isinstance(rows, dict) else ())
+        if isinstance(row, dict)
+    ]
+    for section, key in (("agent", "default_agent"), ("session", "pool_agent")):
+        block = data.get(section)
+        if isinstance(block, dict):
+            named.append((f"{section}.{key}", block.get(key)))
+    return sorted(
+        (holder, template)
+        for holder, template in named
+        if isinstance(template, str) and template and template not in _MANAGED_TEMPLATES
+    )
+
+
+def unbundled_agent_templates() -> tuple[list[str], int]:
+    """The agent templates this install's crews name -- none of them ride an export.
+
+    Returns ``(names, more)``: at most :data:`MAX_TEMPLATE_WARNINGS` clipped names,
+    and how many further names were left out.
+    """
+    names = sorted({template for _crew, template in crew_template_refs(_mc_dir() / "config.json")})
+    kept = names[:MAX_TEMPLATE_WARNINGS]
+    return [_clip(n) for n in kept], len(names) - len(kept)
+
+
+def missing_crew_templates(config_path: Path) -> tuple[list[dict[str, str]], int]:
+    """Crew rows in *config_path* whose ``kiro_agent`` template is not installed here.
+
+    Returns ``(rows, more)``, bounded like :func:`unbundled_agent_templates`.
+
+    Matches a spec by its ``name`` field or file stem, the same test the config
+    loader applies when it resolves a crew's template.
+    """
+    refs = crew_template_refs(config_path)
+    if not refs:
+        return [], 0
+    installed: set[str] = set()
+    for data, path in parsed_agent_specs(
+        kiro_agents_dir(), operation="portability", source="dashboard"
+    ):
+        installed.add(path.stem)
+        if isinstance(data, dict) and isinstance(data.get("name"), str):
+            installed.add(data["name"])
+    missing = [(crew, template) for crew, template in refs if template not in installed]
+    kept = missing[:MAX_TEMPLATE_WARNINGS]
+    rows = [{"crew": _clip(crew), "kiro_agent": _clip(template)} for crew, template in kept]
+    return rows, len(missing) - len(kept)
+
+
 def create_export_zip() -> tuple[bytes, dict]:
     """Create a zip archive of KiroCrew state. Returns (zip_bytes, manifest_dict)."""
     mc = _mc_dir()
@@ -448,6 +531,14 @@ def create_export_zip() -> tuple[bytes, dict]:
             if src.is_file() and not src.is_symlink():
                 zf.write(str(src), f"{prefix}/{fname}")
                 contents_summary[fname] = src.stat().st_size
+
+        # The crewmate team list: one document in its own directory. Written by name like
+        # the core files above -- the directory holds nothing else that rides (its lock
+        # file is this host's runtime state), so the pinned tree walk below is not needed.
+        teams_src = mc / "crew-teams" / "teams.json"
+        if teams_src.is_file() and not teams_src.is_symlink():
+            zf.write(str(teams_src), f"{prefix}/crew-teams/teams.json")
+            contents_summary["crew-teams/teams.json"] = teams_src.stat().st_size
 
         # SQLite databases via backup API
         for db_name in ("memory.db", "memory_index.db"):
@@ -626,6 +717,17 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     dropped job is gone; a paused one is fully restored and simply waiting to be
     switched on. Rewrites *crons_path* in place. A missing file is left alone.
 
+    The store is read and written as UTF-8, never through the locale codepage.
+    Cron job names are operator-authored text and routinely non-ASCII — the same
+    reason ``snapshot._merge_crons``, which merges this very file a few lines
+    later in ``apply_import_zip``, pins ``encoding="utf-8"`` on both ends. A bare
+    ``read_text()`` here decodes the archive's UTF-8 with the host codepage, and
+    both outcomes are wrong: a codepage that cannot decode the bytes raises
+    ``UnicodeDecodeError``, which IS a ``ValueError`` and therefore lands in the
+    recovery arm below — replacing a perfectly good backup with an empty store
+    and reporting it as unreadable — while a codepage that decodes most bytes
+    (cp1252) yields mojibake that the rewrite below then persists to disk.
+
     Three rules, each closing a different way an archive can act on the host:
 
     1. A job that is not an object, or whose ``schedule`` is not one, is DROPPED.
@@ -654,12 +756,12 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     if not crons_path.is_file():
         return [], []
     try:
-        data = json.loads(crons_path.read_text())
+        data = json.loads(crons_path.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         # Unparseable bytes are not installable as a cron store either, but they
         # are also not something this function can reason about — an empty store
         # is the only safe thing to hand the loader.
-        crons_path.write_text(json.dumps({"jobs": []}, indent=2))
+        crons_path.write_text(json.dumps({"jobs": []}, indent=2), encoding="utf-8")
         return [_UNREADABLE_STORE], []
     # A store whose top level is not an object, or whose `jobs` is not a list, is
     # REPLACED rather than left alone. `CronService._load` treats such a document
@@ -667,7 +769,7 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
     # user is TOLD the store was unreadable at import time, instead of the
     # gateway silently starting with an empty schedule later.
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-        crons_path.write_text(json.dumps({"jobs": []}, indent=2))
+        crons_path.write_text(json.dumps({"jobs": []}, indent=2), encoding="utf-8")
         return [_UNREADABLE_STORE], []
     jobs = data["jobs"]
 
@@ -733,7 +835,7 @@ def _sanitize_imported_crons(crons_path: Path) -> tuple[list[str], list[str]]:
 
     if changed:
         data["jobs"] = kept
-        crons_path.write_text(json.dumps(data, indent=2))
+        crons_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return dropped, paused
 
 
@@ -742,23 +844,88 @@ def _strip_host_local_store_state(snap: Path) -> None:
 
     The export's own filter (`_keep_store_for_export`) keeps these out on the way out; this
     is the same predicate applied on the way in, so an import is not the one direction in
-    which a hand-built archive can plant them. Walked top-down and pruned at the first
-    matching component, so a whole ``.execution-logs/`` or ``<store>/backups/`` goes as
-    one removal.
+    which a hand-built archive can plant them. Pruned at the first matching component, so a
+    whole ``.execution-logs/`` or ``<store>/backups/`` goes as one removal.
+
+    An absent or non-directory ``memory_stores`` is a no-op, answered by the pin chain
+    below rather than by a by-name ``is_dir()`` probe ahead of it -- that probe would be
+    the screen-then-act shape this traversal exists to remove.
     """
-    root = snap / MEMORY_STORES_DIR_NAME
-    if not root.is_dir():
-        return
-    for path in sorted(root.rglob("*"), key=lambda p: len(p.parts)):
-        if not path.exists() and not path.is_symlink():
-            continue  # inside a subtree an earlier iteration already removed
-        rel = (MEMORY_STORES_DIR_NAME, *path.relative_to(root).parts)
-        if not is_host_local_store_state(rel):
-            continue
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(str(path))
-        else:
-            path.unlink()
+
+    # Every directory is PINNED before its entries are judged, and each entry is acted
+    # on through that pin. ``os.walk`` could not be made safe here: its own descent
+    # re-check is ``os.path.islink``, which a Windows directory junction answers False
+    # to, so a junction planted after the screen below was still descended and an entry
+    # OUT THERE whose relative name matched the predicate was unlinked -- a delete
+    # outside the extracted archive entirely. The extraction directory is only
+    # owner-restricted, which does not exclude a same-UID agent process, so the swap
+    # needs no cooperation from the archive. A link is removed when the predicate
+    # matches it and is never descended either way, because what it points at is not in
+    # this archive.
+    #
+    # The pin starts at the EXTRACTION ROOT, not at ``memory_stores``. Pinning only the
+    # leaf leaves its ancestors reached by name at open time, and ``snap`` itself is one
+    # of them -- it comes from a by-name ``iterdir()`` in that same owner-only
+    # directory, so an agent that swaps ``snap`` for a directory link between the
+    # listing and this open redirects the whole strip and the delete lands outside the
+    # archive after all. The chain below is what makes the sentence above true:
+    # ``snap.parent`` is this process's own freshly created extraction directory and is
+    # the anchor, and every component under it is opened THROUGH the pin above it.
+    def _empty(pinned: platform_compat.PinnedDirectory) -> None:
+        """Remove every entry under *pinned*, through pins the whole way down."""
+        for name in sorted(pinned.names()):
+            if pinned.is_link(name) or not pinned.is_dir(name):
+                pinned.unlink(name)
+                continue
+            _remove_dir(pinned, name)
+
+    def _remove_dir(pinned: platform_compat.PinnedDirectory, name: str) -> None:
+        """Remove the real directory *name* and its whole subtree."""
+        sub = pinned.child_if_real_dir(name)
+        if sub is None:
+            # Replaced since the screen, and being removed either way. A real directory
+            # re-raises out of the helper, which is also how the depth refusal past
+            # ``PINNED_TREE_MAX_DEPTH`` leaves here: an archive nested past the bound
+            # fails the import rather than being imported half-stripped.
+            pinned.unlink(name)
+            return
+        with sub:
+            _empty(sub)
+        pinned.rmdir(name)
+
+    def _strip(pinned: platform_compat.PinnedDirectory, rel: tuple[str, ...]) -> None:
+        for name in sorted(pinned.names()):
+            here = (*rel, name)
+            matched = is_host_local_store_state((MEMORY_STORES_DIR_NAME, *here))
+            if pinned.is_link(name) or not pinned.is_dir(name):
+                if matched:
+                    pinned.unlink(name)
+                continue
+            if matched:
+                # Removed whole, so its contents are never judged individually.
+                _remove_dir(pinned, name)
+                continue
+            sub = pinned.child_if_real_dir(name)
+            if sub is None:
+                # Replaced since the screen. Not descended, and NOT removed: the
+                # predicate did not match it, so it is not this function's to delete.
+                continue
+            with sub:
+                _strip(sub, here)
+
+    with platform_compat.pinned_directory(snap.parent) as work_pin:
+        snap_pin = work_pin.child_if_real_dir(snap.name)
+        if snap_pin is None:
+            # Not a real directory under the pin: either absent, or replaced with a link
+            # since it was listed. Either way there is nothing of THIS archive to strip,
+            # and following it is the harm.
+            return
+        with snap_pin:
+            stores_pin = snap_pin.child_if_real_dir(MEMORY_STORES_DIR_NAME)
+            if stores_pin is None:
+                return
+            with stores_pin:
+                _strip(stores_pin, ())
 
 
 def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
@@ -896,8 +1063,11 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
         # would otherwise install a torn `memory_stores/<name>/memory.db` verbatim, and
         # the member fails at its next open with the archive long gone. Refused here,
         # nothing has been written; the exception reaches the handler as a refusal.
+        # `crew-teams` rides the same check: replace copies the tree whole through
+        # `_do_replace`, merge copies the document where the destination has none, and
+        # both would otherwise install a document the team store's reader refuses.
         _refuse_corrupt_source_databases(
-            snap, ["memory"], mc_for_merge=None if mode == "replace" else mc
+            snap, ["memory", "crew-teams"], mc_for_merge=None if mode == "replace" else mc
         )
 
         if mode == "replace":
@@ -910,7 +1080,17 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                 if fpath.is_file() and is_sensitive_path(str(fpath)):
                     fpath.unlink()
             auto_dir = snap / "skills" / "auto"
-            if auto_dir.is_dir():
+            # ``is_link_or_junction`` FIRST, not a bare ``is_dir()``: a Windows
+            # directory JUNCTION answers ``is_dir()`` True and ``is_symlink()``
+            # False, and it is the only directory link an unprivileged Windows
+            # writer can plant in the extraction tree. ``shutil.rmtree`` follows
+            # a junction into its target, so an ``is_dir()``-only guard let a
+            # junction planted at this name aim the delete OUTSIDE the extracted
+            # archive. ``unlink_link_or_junction`` removes the LINK, never what it
+            # points at; only a real directory reaches ``rmtree``.
+            if platform_compat.is_link_or_junction(auto_dir):
+                platform_compat.unlink_link_or_junction(auto_dir)
+            elif auto_dir.is_dir():
                 shutil.rmtree(str(auto_dir))
             # A platform that cannot pin a directory by descriptor refuses this
             # staging pass, and the refusal is allowed to propagate. An earlier
@@ -950,6 +1130,16 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                     shutil.copy2(str(snap / "crons.json"), str(mc / "crons.json"))
                     summary["items"].append("crons (copied)")
 
+            # The team list, like hooks.json: installed only where the destination has
+            # none -- decided and written under the store's own lock, document only, so
+            # a concurrent team write neither loses to the import nor overwrites it.
+            # Validated above by the team store's own reader, before anything moved.
+            teams_snap = snap / crew_teams.TEAMS_DIR_NAME / crew_teams.TEAMS_FILE_NAME
+            if teams_snap.is_file() and crew_teams.install_document(
+                teams_snap, mc / crew_teams.TEAMS_DIR_NAME, only_if_absent=True
+            ):
+                summary["items"].append("crew-teams (copied)")
+
             if (snap / "hooks.json").is_file():
                 if not (mc / "hooks.json").is_file():
                     shutil.copy2(str(snap / "hooks.json"), str(mc / "hooks.json"))
@@ -963,8 +1153,25 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
 
             if (snap / "notifications.jsonl").is_file():
                 if (mc / "notifications.jsonl").is_file():
-                    _merge_notifications(snap / "notifications.jsonl", mc / "notifications.jsonl")
-                    summary["items"].append("notifications (merged)")
+                    # A platform that cannot pin raises
+                    # NotificationCopyUnsupported from inside the merge, exactly
+                    # as the copy branch does below -- record it as skipped and
+                    # let the import proceed. A link/FIFO/hardlink refusal on a
+                    # capable platform raises OSError and aborts instead, because
+                    # that is a bad or hostile source.
+                    try:
+                        _merge_notifications(
+                            snap / "notifications.jsonl", mc / "notifications.jsonl"
+                        )
+                        summary["items"].append("notifications (merged)")
+                    except NotificationCopyUnsupported as exc:
+                        # Zero records imported: flag it machine-readably so the
+                        # handler logs the import as partial, not a flat ok --
+                        # exactly as the crons refusal above does. A flat ok would
+                        # tell the API caller the import succeeded over records
+                        # left behind, the failure class this whole change removes.
+                        summary["items"].append(f"notifications (SKIPPED: {exc})")
+                        summary.setdefault("refused_merges", []).append("notifications")
                 else:
                     # Not `copy2`: it installed records the live file's own reader
                     # refuses, and that reader loses the whole file to one of them.
@@ -982,6 +1189,7 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                         summary["items"].append("notifications (copied)")
                     except NotificationCopyUnsupported as exc:
                         summary["items"].append(f"notifications (SKIPPED: {exc})")
+                        summary.setdefault("refused_merges", []).append("notifications")
 
             for dirname in ("workspace", "plan_memory"):
                 sd = snap / dirname
@@ -1020,4 +1228,17 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                         shutil.copy2(str(item), str(target))
                 summary["items"].append("skills (merged, auto/ skipped)")
 
+    # Warn, never refuse: the rows are already written, and a template can be
+    # installed afterwards without importing again.
+    try:
+        missing, more = missing_crew_templates(mc / "config.json")
+    except Exception:  # RecursionError included
+        # The import is already written: a spec this cannot read costs the warning,
+        # never the import's success.
+        logger.warning("Could not check crew agent templates after import", exc_info=True)
+        missing, more = [], 0
+    if missing:
+        summary["missing_agent_templates"] = missing
+    if more:
+        summary["missing_agent_templates_more"] = more
     return summary

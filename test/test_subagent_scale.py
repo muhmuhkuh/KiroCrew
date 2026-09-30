@@ -17,12 +17,20 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import pathlib
+import re
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew import subagent as subagent_module
+from kiro_crew.subagent import (
+    _RUN_ID_HEX_CHARS,
+    SubagentDelivery,
+    SubagentInfo,
+    SubagentManager,
+)
 from kiro_crew.subagent_scale import SubagentEventCoalescer
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
@@ -482,6 +490,125 @@ class TestBatchIdentity:
         assert events[0][2]["outcome"] == "stopped"
 
     @pytest.mark.asyncio
+    async def test_stage_owned_queued_stop_holds_its_parent_report_barrier(self):
+        """The next stage waits until its queued predecessor reports stopped."""
+        from kiro_crew.subagent import stage_boundary_owner_for_run
+
+        report_started = asyncio.Event()
+        release_report = asyncio.Event()
+        announced: list[SubagentInfo] = []
+
+        async def on_done(info):  # type: ignore[no-untyped-def]
+            announced.append(info)
+            report_started.set()
+            await release_report.wait()
+
+        parent = "dashboard:one"
+        owner = "stage-owner"
+        mgr = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx(),
+            on_done=on_done,
+        )
+        mgr._queue = [
+            {
+                "task": "stage-owned queued task",
+                "_preassigned_id": "q-stage-stop",
+                "parent_session_key": parent,
+                "_stage_boundary_owner": owner,
+            }
+        ]
+        mgr._emit_queue_depth = MagicMock()
+
+        assert await mgr.cancel("q-stage-stop") is True
+        await report_started.wait()
+        barrier = asyncio.create_task(mgr.wait_for_parent_reports(parent, owner))
+        await asyncio.sleep(0)
+
+        assert stage_boundary_owner_for_run(announced[0]) == owner
+        assert not barrier.done(), "the next stage captured a late queued-stop report"
+
+        release_report.set()
+        assert await barrier is True
+
+    def test_stage_boundary_owner_survives_every_run_reconstruction_site(self):
+        """Every run copy keeps the boundary token that admitted its source."""
+        import inspect
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.handlers.messaging import (
+            _stage_boundary_owner_for_parent,
+            _stage_boundary_slot_for_parent,
+            api_spawn_retry,
+        )
+        from kiro_crew.dashboard.state import StageBoundary
+        from kiro_crew.subagent_manager.admission.gate import _GateMixin
+        from kiro_crew.subagent_manager.cancellation import CancellationCoordinator
+        from kiro_crew.subagent_manager.continuation import ContinuationCoordinator
+
+        requirements = {
+            "spawn": (SubagentManager.spawn, "_stage_boundary_owner=_stage_boundary_owner"),
+            "spawn result": (
+                SubagentManager.spawn,
+                "result._stage_boundary_owner = _stage_boundary_owner",
+            ),
+            "queued spawn": (
+                _GateMixin.spawn_impl,
+                '"_stage_boundary_owner": _stage_boundary_owner',
+            ),
+            "retry": (
+                api_spawn_retry,
+                "_stage_boundary_owner_for_parent(state, old.parent_session_key)",
+            ),
+            "respawn": (
+                CancellationCoordinator._schedule_cancel_recovery_impl,
+                "self._manager._run(info)",
+            ),
+            "queued stop": (
+                CancellationCoordinator._report_queued_stop_impl,
+                '_stage_boundary_owner=str(params.get("_stage_boundary_owner") or "")',
+            ),
+            "automatic follow-up": (
+                ContinuationCoordinator._deliver_followups_impl,
+                "_stage_boundary_owner=stage_boundary_owner_for_run(info)",
+            ),
+            "synthetic failure": (
+                ContinuationCoordinator._announce_followup_failure_impl,
+                "synthetic._stage_boundary_owner = stage_boundary_owner_for_run(info)",
+            ),
+            "channel parent": (
+                _stage_boundary_slot_for_parent,
+                "effective_session_key(candidate) == parent",
+            ),
+        }
+        missing = [
+            site
+            for site, (function, needle) in requirements.items()
+            if needle not in inspect.getsource(function)
+        ]
+        continuation_source = inspect.getsource(ContinuationCoordinator._continue_prelude_impl)
+        if (
+            continuation_source.count("_stage_boundary_owner=_stage_boundary_owner")
+            != continuation_source.count("SubagentInfo(") + 1
+        ):
+            missing.append("continuation result")
+        assert missing == [], f"stage boundary owner dropped at: {missing}"
+
+        parent = "slack:123.456"
+        boundary = StageBoundary(stage=1, generation="stage-owner")
+        slot = SimpleNamespace(
+            key="slack_123.456",
+            linked_session_key=parent,
+            stage_boundary=boundary,
+        )
+        state = SimpleNamespace(_slots={slot.key: slot})
+        with patch(
+            "kiro_crew.dashboard.handlers.messaging.dashboard_slot_key",
+            return_value="",
+        ):
+            assert _stage_boundary_owner_for_parent(state, parent) == "stage-owner"
+
+    @pytest.mark.asyncio
     async def test_stop_parent_removes_its_queued_agents_before_start(self):
         mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
         mgr._queue = [
@@ -566,6 +693,52 @@ class TestBatchIdentity:
 
         assert (stopped, queued) == (1, 0)
         mgr.cancel.assert_awaited_once_with("run")
+
+    @pytest.mark.asyncio
+    async def test_stop_boundary_includes_approval_waiters_and_preserves_sibling(self):
+        parent = "dashboard:shared"
+        owner_a, owner_b = "owner-a", "owner-b"
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
+        running_a = SubagentInfo(
+            id="run-a",
+            task="run-a",
+            parent_session_key=parent,
+            _stage_boundary_owner=owner_a,
+        )
+        approval_a = SubagentInfo(
+            id="approval-a",
+            task="approval-a",
+            parent_session_key=parent,
+            _stage_boundary_owner=owner_a,
+        )
+        approval_a._awaiting_approval = True
+        approval_a._exec_started = None
+        running_b = SubagentInfo(
+            id="run-b",
+            task="run-b",
+            parent_session_key=parent,
+            _stage_boundary_owner=owner_b,
+        )
+        mgr._agents = {info.id: info for info in (running_a, approval_a, running_b)}
+        waits = {
+            info.id: asyncio.create_task(asyncio.Event().wait()) for info in mgr._agents.values()
+        }
+        mgr._tasks = dict(waits)
+        mgr._fire_event = AsyncMock()
+        mgr._write_tombstone = MagicMock()
+        mgr._record_cost = MagicMock()
+
+        try:
+            stopped, queued = await mgr.cancel_for_boundary(parent, owner_a)
+            await asyncio.gather(waits[running_a.id], waits[approval_a.id], return_exceptions=True)
+
+            assert (stopped, queued) == (2, 0)
+            assert waits[running_a.id].cancelled()
+            assert waits[approval_a.id].cancelled(), "spawn-approval waiter stayed parked"
+            assert not waits[running_b.id].done(), "sibling owner was cancelled"
+        finally:
+            waits[running_b.id].cancel()
+            await asyncio.gather(waits[running_b.id], return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_spawn_counts_submissions_once_per_member(self):
@@ -914,7 +1087,7 @@ def _wire_hold_settlement(orch, slot, mgr):
     Returns ``(ledger, settled)``: the content-keyed debts still parked, and
     the id batches the manager was asked to settle.
     """
-    ledger: dict[str, list[str]] = {}
+    ledger: dict[str, list[SubagentDelivery]] = {}
     slot.note_pending_subagent_delivery = MagicMock(
         side_effect=lambda content, ids: ledger.setdefault(content, []).extend(ids)
     )
@@ -923,12 +1096,16 @@ def _wire_hold_settlement(orch, slot, mgr):
     )
     settled: list[list[str]] = []
 
-    async def _record_settle(ids):
-        settled.append(list(ids))
+    async def _record_settle(deliveries):
+        settled.append([delivery.agent_id for delivery in deliveries])
 
     mgr.settle_queued_delivery = MagicMock(side_effect=_record_settle)
     orch.dashboard_state.subagents = mgr
     return ledger, settled
+
+
+def _ledger_ids(ledger) -> list[list[str]]:
+    return [[delivery.agent_id for delivery in debts] for debts in ledger.values()]
 
 
 class TestWaveDigest:
@@ -958,6 +1135,8 @@ class TestWaveDigest:
         info.error = error
         info.result = f"result {i}"
         info.result_path = f"/tmp/w{i}/result.txt"
+        info.elapsed = 10.0 + i
+        info.credits = 0.25 + i
         return info
 
     @pytest.mark.asyncio
@@ -1011,6 +1190,8 @@ class TestWaveDigest:
         # Chunk 1 carries the first 10 members' lines, exception-first.
         assert first.index("w2") < first.index("w0")
         assert "/tmp/w0/result.txt" in first
+        assert "Usage: 2.25 credits · 12s" in first
+        assert "0.25 credits · 10s" in first
         # Chunk 2 (final): summary counts + release guidance, and ONLY the
         # remaining members' lines (chunk buffers reset between flushes).
         assert "Batch results 2/2" in final
@@ -1361,7 +1542,8 @@ class TestWaveDigest:
         delivered tombstone would hide it from orphan reconciliation after a
         restart). The gateway must NOT settle them at chunk COMPOSITION
         either (routing could still fail); instead it stashes each chunk's
-        held OK ids on that chunk's FLUSHING member (``_digest_settle_ids``)
+        held OK deliveries on that chunk's FLUSHING member
+        (``_digest_settle_deliveries``)
         and settlement waits for the route that owns the hand-off: the
         dashboard route below detaches the ids when the injection turn is
         launched and owes them to the turn's CONSUMPTION through the slot's
@@ -1424,8 +1606,8 @@ class TestWaveDigest:
         # manager once the turn consumed the digest, so what is asserted is the
         # hand-off, not a residue left on the member: the member is
         # left clean and the ids reach the manager exactly once, per chunk.
-        assert members[9]._digest_settle_ids == []
-        assert members[11]._digest_settle_ids == []
+        assert members[9]._digest_settle_deliveries == []
+        assert members[11]._digest_settle_deliveries == []
         # Each debt leads with the FLUSHING member's own id: its tombstone is
         # deferred to the same consumption (`_delivery_queued`), closing the
         # identical loss window for the flusher's own result.
@@ -1447,11 +1629,17 @@ class TestWaveDigest:
         mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
         marked: list[str] = []
         info = SubagentInfo(id="last", task="t")
-        info._digest_settle_ids = ["h1", "h2"]
-        with patch("kiro_crew.subagent.mark_delivered", side_effect=marked.append):
-            mgr._settle_digest_holds(info)
+        info._digest_settle_deliveries = [
+            SubagentDelivery("h1", 1.0, 0.1),
+            SubagentDelivery("h2", 2.0, 0.2),
+        ]
+        with patch(
+            "kiro_crew.subagent.mark_delivered",
+            side_effect=lambda agent_id, **_: marked.append(agent_id),
+        ):
+            await mgr._settle_digest_holds(info)
         assert marked == ["h1", "h2"]
-        assert info._digest_settle_ids == []  # idempotent re-entry safe
+        assert info._digest_settle_deliveries == []  # idempotent re-entry safe
         # Structural guarantee: the settle call sits AFTER the awaited
         # _on_done inside the same try-block, so an _on_done exception
         # (routing failure / crash) skips it entirely. The terminal report
@@ -1464,7 +1652,7 @@ class TestWaveDigest:
 
         src = inspect.getsource(TerminalCoordinator._report_terminal_impl)
         on_done_pos = src.index("await asyncio.wait_for(self._manager._on_done(info)")
-        settle_pos = src.index("self._manager._settle_digest_holds(info)")
+        settle_pos = src.index("await self._manager._settle_digest_holds(info)")
         assert settle_pos > on_done_pos
 
     @pytest.mark.asyncio
@@ -1472,7 +1660,7 @@ class TestWaveDigest:
         """Ownership: the dashboard route hands off asynchronously, so a
         bare ``_on_done`` return is not proof the digest reached the parent.
 
-        ``_report_terminal`` settles ``info._digest_settle_ids`` right after
+        ``_report_terminal`` settles ``info._digest_settle_deliveries`` right after
         ``_on_done`` returns. On the dashboard branch that return happens while
         the injection turn is still a *pending task* — so a shutdown or a
         cancelled slot turn between the two leaves the held siblings carrying
@@ -1548,12 +1736,12 @@ class TestWaveDigest:
             )
 
             flusher = members[9]
-            assert flusher._digest_settle_ids == [], (
+            assert flusher._digest_settle_deliveries == [], (
                 "the flushing member must not still be carrying the settle ids "
                 "while the hand-off is unconfirmed: the run loop settles that "
                 "list as soon as _on_done returns, which is now"
             )
-            assert list(ledger.values()) == [owed], (
+            assert _ledger_ids(ledger) == [owed], (
                 "the ids — the flusher's own tombstone included — are parked "
                 "in the slot's delivery ledger, owed, not settled: a process "
                 "death here leaves them tombstone-free and recoverable by "
@@ -1644,7 +1832,7 @@ class TestWaveDigest:
             "shutdown here loses the digest, and a delivered tombstone would "
             "hide the held results from orphan reconciliation forever"
         )
-        assert members[9]._digest_settle_ids == [], (
+        assert members[9]._digest_settle_deliveries == [], (
             "the ids must have left the flushing member, so the run loop's "
             "settle on the bare _on_done return is a no-op for this route too"
         )
@@ -1657,7 +1845,7 @@ class TestWaveDigest:
         # drain settles them all once a turn actually consumes the announce.
         held = [members[i].id for i in range(9)]
         assert list(ledger.keys()) == [queued[0]["content"]]
-        assert ledger[queued[0]["content"]] == [members[9].id] + held
+        assert [d.agent_id for d in ledger[queued[0]["content"]]] == [members[9].id] + held
 
     @pytest.mark.asyncio
     async def test_an_auth_required_turn_is_not_a_confirmed_hand_off(self):
@@ -1725,12 +1913,12 @@ class TestWaveDigest:
             "a signed-out CLI never received the digest — the held siblings' "
             "results are still only on disk"
         )
-        assert members[9]._digest_settle_ids == [], (
+        assert members[9]._digest_settle_deliveries == [], (
             "and the run loop must not settle them either: the ids left the "
             "flushing member when the turn was launched"
         )
         held = [members[i].id for i in range(9)]
-        assert list(ledger.values()) == [[members[9].id] + held], (
+        assert _ledger_ids(ledger) == [[members[9].id] + held], (
             "the debt — the flusher's own tombstone included — stays owed, "
             "tombstone-free and recoverable, rather than settled on a clean "
             "return that delivered nothing"
@@ -1783,12 +1971,12 @@ class TestWaveDigest:
             "a failed hand-off must not tombstone the held siblings — their "
             "results are still only on disk"
         )
-        assert members[9]._digest_settle_ids == [], (
+        assert members[9]._digest_settle_deliveries == [], (
             "and the run loop must not settle them either: the ids left the "
             "flushing member when the turn was launched"
         )
         held = [members[i].id for i in range(9)]
-        assert list(ledger.values()) == [
+        assert _ledger_ids(ledger) == [
             [members[9].id] + held
         ], "the debt stays parked for a recovery replay to claim"
 
@@ -1919,11 +2107,14 @@ class TestWaveDigest:
         )
         solo.done = True
         solo.result = "solo result"
+        solo.elapsed = 12.0
+        solo.credits = 0.25
         with patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat):
             await on_done(solo)
             await _settle(lambda: len(injected) >= 1, what="the per-agent completion injected")
         assert len(injected) == 1
         assert injected[0].startswith("[Subagent completion event]")
+        assert "Usage: 0.25 credits · 12s" in injected[0]
         assert "Batch results" not in injected[0]
 
 
@@ -2063,17 +2254,26 @@ class TestDigestHoldDeadline:
         mgr = self._mgr()
         info = SubagentInfo(id="flush", task="t", batch_id="wv")
         info._digest_flush_only = True
-        info._digest_settle_ids = ["h0", "h1"]
+        info._digest_settle_deliveries = [
+            SubagentDelivery("h0", 1.0, 0.1),
+            SubagentDelivery("h1", 2.0, 0.2),
+        ]
 
         marked: list[str] = []
         mgr._on_done = AsyncMock(side_effect=RuntimeError("routing blew up"))
-        with patch("kiro_crew.subagent.mark_delivered", side_effect=marked.append):
+        with patch(
+            "kiro_crew.subagent.mark_delivered",
+            side_effect=lambda agent_id, **_: marked.append(agent_id),
+        ):
             await mgr._announce_digest_flush(info)
         assert marked == []  # failure → nothing tombstoned
-        assert info._digest_settle_ids == ["h0", "h1"]
+        assert [d.agent_id for d in info._digest_settle_deliveries] == ["h0", "h1"]
 
         mgr._on_done = AsyncMock()
-        with patch("kiro_crew.subagent.mark_delivered", side_effect=marked.append):
+        with patch(
+            "kiro_crew.subagent.mark_delivered",
+            side_effect=lambda agent_id, **_: marked.append(agent_id),
+        ):
             await mgr._announce_digest_flush(info)
         assert marked == ["h0", "h1"]
 
@@ -2260,7 +2460,7 @@ class TestDigestHoldDeadline:
         # slot's delivery ledger. The forced hold-deadline flush is
         # one of the settle callers, so it inherits the same ownership rule
         # without a second code path.
-        assert flush._digest_settle_ids == []
+        assert flush._digest_settle_deliveries == []
         await _settle(lambda: bool(settled), what="the flushed holds settled")
         assert settled == [["s0", "s1"]]
 
@@ -2346,6 +2546,39 @@ class TestRetryGating:
         assert resp.status == 200
         assert mgr.spawn.call_args.args[0] == "original raw task"
         assert mgr.spawn.call_args.kwargs["parent_session_key"] == "dashboard:m"
+
+    @pytest.mark.asyncio
+    async def test_retry_inherits_original_active_stage_boundary_owner(self):
+        """Retry ownership stays with the failed work while its boundary is active."""
+        from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
+        from kiro_crew.dashboard.state import StageBoundary
+        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
+
+        parent = "dashboard:m"
+        failed = SubagentInfo(id="f1", task="failed", parent_session_key=parent)
+        failed.done = True
+        failed.error = "boom"
+        failed._stage_boundary_owner = "stage-owner"
+        failed.execution_context = ExecutionContext(
+            None, MemoryStoreRef("default"), "template", "kirocrew"
+        )
+        mgr = self._mgr_with(failed)
+        mgr.spawn = MagicMock(return_value=SubagentInfo(id="n1", task="failed"))
+        request = self._request(mgr, "f1")
+        request.app["state"]._slots = {
+            "m": MagicMock(
+                stage_boundary=StageBoundary(
+                    stage=1,
+                    generation="stage-owner",
+                    parent_session_keys={parent},
+                )
+            )
+        }
+
+        resp = await api_spawn_retry(request)
+
+        assert resp.status == 200
+        assert mgr.spawn.call_args.kwargs["_stage_boundary_owner"] == "stage-owner"
 
 
 # ── 6. Durable task queue at scale ───────────────────────────────────
@@ -2487,3 +2720,390 @@ class TestDurableQueueScale:
         assert store.count(state=model.DONE) == 199
         assert len(mgr_queue := second._queue) == 0, mgr_queue
         assert second._running_count == 0
+
+
+# ── 7. Run-id minting ────────────────────────────────────────────────
+
+
+class TestRunIdMinting:
+    """The width of a run id is what keeps it unique, and one draw site owns it.
+
+    At 8 hex characters an id was 32 bits, so 2000 spawns on one host collided
+    about once in 2,100 times, and the collision did not read as one: identity
+    is assigned before registration, so the caller was handed the id and the
+    accept then failed on the duplicate primary key, reaching the user as
+    ``task store write failed``. 16 characters is 64 bits, which puts the same
+    2000 draws at about 1 in 10**13 -- no registry to seed, nothing to read, and
+    no place for a spawn path to forget the check.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_minted_id_is_sixteen_hex_characters(self):
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=4)
+        await mgr.wait_taskq_ready()
+        assert _RUN_ID_HEX_CHARS == 16
+        for _ in range(50):
+            assert re.fullmatch(r"[0-9a-f]{16}", mgr._mint_agent_id())
+
+    @pytest.mark.asyncio
+    async def test_every_spawned_id_carries_the_full_width(self):
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=1)
+        await mgr.wait_taskq_ready()
+        mgr._spawn_stagger_secs = 0.0
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(SubagentManager, "_run", new=AsyncMock()),
+        ):
+            ids = [mgr.spawn(f"t{i}", parent_session_key="dashboard:s1").id for i in range(40)]
+        # Running and queued alike: the gate assigns one identity and every exit
+        # path carries it, so a queued row must not be narrower than a started one.
+        assert len(set(ids)) == 40
+        assert [i for i in ids if not re.fullmatch(r"[0-9a-f]{16}", i)] == []
+
+    def test_the_width_is_the_uniqueness_argument(self):
+        # 2000 draws, birthday bound n**2 / (2 * space). The 8-character id this
+        # replaces sat at ~1/2100, which CI hit as a red 2000-spawn shard.
+        space = 2 ** (4 * _RUN_ID_HEX_CHARS)
+        assert 2000**2 / (2 * space) < 1e-12
+        assert 2000**2 / (2 * 2**32) > 1e-4
+
+    @pytest.mark.asyncio
+    async def test_every_character_of_the_id_is_random(self):
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=4)
+        await mgr.wait_taskq_ready()
+        drawn = [mgr._mint_agent_id() for _ in range(200)]
+        # A v4 UUID spends its 13th hex character on the fixed version digit, so
+        # the first 16 characters of one carry 60 bits, not the 64 the width
+        # advertises. Every position has to vary or the bound above is wrong.
+        for pos in range(_RUN_ID_HEX_CHARS):
+            assert len({d[pos] for d in drawn}) > 1, pos
+
+    def test_one_draw_site_owns_the_width(self):
+        import kiro_crew.subagent_manager as manager_pkg
+
+        package = pathlib.Path(manager_pkg.__file__).parent
+        component_draws = [
+            f"{path.relative_to(package)}:{lineno}"
+            for path in sorted(package.rglob("*.py"))
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if "urandom" in line or "uuid4()" in line
+        ]
+        # The gate, the continuation coordinator and the wave digest all ask the
+        # manager for an id. A new spawn path that draws its own would reopen the
+        # collision at whatever width it picked, so none of them may draw.
+        assert component_draws == []
+
+        source = pathlib.Path(subagent_module.__file__).read_text(encoding="utf-8")
+        assert source.count("os.urandom(") == 1
+        assert "uuid4()" not in source
+        mint = source.split("def _mint_agent_id", 1)[1].split("\n    def ", 1)[0]
+        assert "os.urandom(_RUN_ID_HEX_CHARS // 2).hex()" in mint
+
+
+# ── 8. Queued-depth events against the durable store ─────────────────────
+
+
+class TestQueuedDepthReachesZero:
+    """The ``subagent_queued`` depth a parent receives must end at 0.
+
+    The pump emits the parent's depth right after popping a row from the
+    window. That row's durable state is still QUEUED until its claim lands,
+    and it is in none of the store count's exclusion sets (not windowed, not
+    registered, not admitting). Counting it there makes every emit between
+    pop and claim one higher than the window: a 4-cap, 5-spawn wave reads
+    4, 3, 2, 1 and stops, and the dashboard chip clears its "waiting" count
+    only on 0, so one agent stays "waiting" under a finished turn. The pump
+    marks the popped row dispatching and the count excludes it until
+    ``spawn`` has answered for it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_last_pop_publishes_zero_with_a_store_attached(self):
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=4)
+        await mgr.wait_taskq_ready()
+        assert mgr._taskq is not None, "this test is about the store-backed count"
+        mgr._spawn_stagger_secs = 0.0
+        depths: list[int] = []
+        real_fire = mgr._fire_event
+
+        async def fire(etype, info, extra=None):
+            if etype == "subagent_queued" and info.parent_session_key == "dashboard:s1":
+                depths.append(int((extra or {}).get("queued", -1)))
+            return await real_fire(etype, info, extra)
+
+        mgr._fire_event = fire  # type: ignore[method-assign]
+        started: list[str] = []
+
+        async def run(self, info):
+            started.append(info.id)
+            await asyncio.sleep(0.05)
+            info.done = True
+            self._claim_finalize(info)
+            if self._release_slot(info):
+                self._running_count -= 1
+                self._drain_queue()
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(SubagentManager, "_run", new=run),
+        ):
+            for i in range(5):
+                mgr.spawn(f"t{i}", parent_session_key="dashboard:s1", batch_id="b1")
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+                if len(started) == 5 and mgr._running_count == 0 and not mgr._queue:
+                    # let the in-flight depth emits land
+                    for _ in range(5):
+                        await asyncio.sleep(0.02)
+                    break
+        assert len(started) == 5
+        assert mgr.queued_count_for("dashboard:s1") == 0
+        assert mgr._dispatching_ids == set()
+        assert depths, "no subagent_queued event reached the parent"
+        assert depths[-1] == 0, f"depth sequence never reached 0: {depths}"
+        # Once the last waiting row is popped, nothing may report it as waiting again.
+        first_zero = depths.index(0)
+        assert all(d == 0 for d in depths[first_zero:]), depths
+
+    def test_dispatching_rows_are_excluded_from_dispatch_reads_only(self):
+        """Two exclusion sets, on purpose. The pump's refill and the depth the
+        chip shows leave a popped row out (it is being started); a parent's
+        Stop and every other pending-work read keep seeing it, because a row in
+        exactly that popped-unclaimed state is the one a Stop must still reach."""
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=4)
+        mgr._dispatching_ids.add("popped-row")
+        assert "popped-row" in mgr._admission.taskq_dispatch_excluded_ids()
+        assert "popped-row" not in mgr._admission.taskq_excluded_ids()
+        mgr._dispatching_ids.discard("popped-row")
+        assert "popped-row" not in mgr._admission.taskq_dispatch_excluded_ids()
+
+    @pytest.mark.asyncio
+    async def test_a_popped_but_unclaimed_row_still_counts_as_pending_work(self):
+        """The reset-deferral guards read ``has_pending_work_for`` /
+        ``queued_count_for``. While the pump holds a popped row between the pop
+        and its claim, the parent still has accepted work that has not run: a
+        cron teardown that read "nothing pending" here would reset the parent
+        before the child starts. Only the chip's depth leaves the row out."""
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=1)
+        await mgr.wait_taskq_ready()
+        assert mgr._taskq is not None
+        mgr._spawn_stagger_secs = 0.0
+        hold = asyncio.Event()
+        released = asyncio.Event()
+        depths: list[int] = []
+        real_fire = mgr._fire_event
+
+        async def fire(etype, info, extra=None):
+            if etype == "subagent_queued" and info.parent_session_key == "dashboard:s1":
+                depths.append(int((extra or {}).get("queued", -1)))
+            return await real_fire(etype, info, extra)
+
+        mgr._fire_event = fire  # type: ignore[method-assign]
+
+        async def slow_policy(fn, *a, **kw):
+            hold.set()
+            await released.wait()
+            return fn(*a, **kw)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(SubagentManager, "_run", new=AsyncMock()),
+            patch("asyncio.to_thread", new=slow_policy),
+            patch.object(type(mgr._admission), "pump_off_loop", True),
+        ):
+            first = mgr.spawn("t0", parent_session_key="dashboard:s1")
+            second = mgr.spawn("t1", parent_session_key="dashboard:s1")
+            assert second.queued
+            first.done = True
+            mgr._claim_finalize(first)
+            assert mgr._release_slot(first)
+            mgr._running_count -= 1
+            mgr._drain_queue()
+            await asyncio.wait_for(hold.wait(), 5)
+            assert second.id in mgr._dispatching_ids and not mgr._queue
+            # The guards' reading: the row is still this parent's work.
+            assert await mgr.has_pending_work_for_async("dashboard:s1") is True
+            assert mgr.queued_count_for("dashboard:s1") == 1
+            assert await mgr.queued_count_for_async("dashboard:s1") == 1
+            # The chip's reading: the row is being started, not waiting.
+            assert mgr._queued_depth("dashboard:s1", for_dispatch=True) == 0
+            released.set()
+            for _ in range(25):
+                await asyncio.sleep(0.02)
+        assert mgr._dispatching_ids == set()
+        assert depths and depths[-1] == 0, depths
+
+    @pytest.mark.asyncio
+    async def test_stop_all_reaches_a_popped_but_unclaimed_row(self):
+        """The pump has popped the row and is between the pop and the claim
+        (its policy read is on a thread) when the parent stops everything. The
+        row is in no window and has no ``_agents`` record, so the store sweep
+        is the only one that can see it -- and it must."""
+        from kiro_crew.taskq import model
+
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=1)
+        await mgr.wait_taskq_ready()
+        assert mgr._taskq is not None
+        mgr._spawn_stagger_secs = 0.0
+        hold = asyncio.Event()
+        released = asyncio.Event()
+
+        async def slow_policy(fn, *a, **kw):
+            # The pump's off-loop spec read: park here so the popped row sits
+            # unclaimed while the parent's Stop runs.
+            hold.set()
+            await released.wait()
+            return fn(*a, **kw)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(SubagentManager, "_run", new=AsyncMock()),
+            patch("asyncio.to_thread", new=slow_policy),
+            patch.object(type(mgr._admission), "pump_off_loop", True),
+        ):
+            first = mgr.spawn("t0", parent_session_key="dashboard:s1")
+            second = mgr.spawn("t1", parent_session_key="dashboard:s1")
+            assert second.queued
+            first.done = True
+            mgr._claim_finalize(first)
+            assert mgr._release_slot(first)
+            mgr._running_count -= 1
+            mgr._drain_queue()
+            await asyncio.wait_for(hold.wait(), 5)
+            # Popped, marked, unclaimed, and invisible to the in-memory sweeps.
+            assert second.id in mgr._dispatching_ids
+            assert not mgr._queue
+            assert second.id not in mgr._agents or mgr._agents[second.id].queued
+            _running, queued_stopped = await mgr.cancel_for_parent("dashboard:s1")
+            released.set()
+            for _ in range(25):
+                await asyncio.sleep(0.02)
+        assert queued_stopped == 1, "Stop all did not reach the popped row"
+        row = mgr._taskq.get(second.id)
+        assert row is not None and row.state not in (
+            model.QUEUED,
+            model.ADMITTED,
+            model.STARTING,
+            model.RUNNING,
+        ), row.state
+        assert not (
+            second.id in mgr._agents and not mgr._agents[second.id].done
+        ), "row started after Stop all"
+        assert mgr._dispatching_ids == set()
+
+    @pytest.mark.asyncio
+    async def test_an_unavailable_claim_publishes_the_row_as_waiting(self):
+        """A claim the store cannot take leaves the row QUEUED. The re-entry's
+        depth emit is the one the chip reads next, so it must count the row
+        (1), never a dispatching-masked 0."""
+        from kiro_crew import taskq as _taskq
+
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=1)
+        await mgr.wait_taskq_ready()
+        assert mgr._taskq is not None
+        mgr._spawn_stagger_secs = 0.0
+        depths: list[tuple[int, frozenset[str]]] = []
+        real_fire = mgr._fire_event
+
+        async def fire(etype, info, extra=None):
+            if etype == "subagent_queued" and info.parent_session_key == "dashboard:s1":
+                depths.append(
+                    (int((extra or {}).get("queued", -1)), frozenset(mgr._dispatching_ids))
+                )
+            return await real_fire(etype, info, extra)
+
+        mgr._fire_event = fire  # type: ignore[method-assign]
+        store = mgr._taskq
+        real_claim = store.claim
+        outage: dict[str, str] = {}
+
+        def claim(agent_id, *a, **kw):
+            if agent_id == outage.get("id"):
+                raise _taskq.TaskStoreUnavailable("probe outage")
+            return real_claim(agent_id, *a, **kw)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(SubagentManager, "_run", new=AsyncMock()),
+            patch.object(store, "claim", new=claim),
+        ):
+            first = mgr.spawn("t0", parent_session_key="dashboard:s1")
+            second = mgr.spawn("t1", parent_session_key="dashboard:s1")
+            assert second.queued
+            outage["id"] = second.id
+            # The first run finishes and releases its slot; the drain pops the
+            # queued row and its claim hits the outage.
+            first.done = True
+            mgr._claim_finalize(first)
+            if mgr._release_slot(first):
+                mgr._running_count -= 1
+                mgr._drain_queue()
+            for _ in range(50):
+                await asyncio.sleep(0.02)
+                if depths and depths[-1][0] == 1 and not mgr._dispatching_ids:
+                    break
+        assert mgr._dispatching_ids == set(), "mark leaked past a failed claim"
+        assert depths and depths[-1][0] == 1, f"failed claim published {depths[-3:]}"
+        assert mgr.queued_count_for("dashboard:s1") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_dispatch_that_raises_leaves_no_mark(self):
+        """A leaked mark would exclude the durable row from every refill, so a
+        spawn that raises while dispatching must not leave one behind."""
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=1)
+        await mgr.wait_taskq_ready()
+        mgr._spawn_stagger_secs = 0.0
+        real_spawn = mgr.spawn
+        boom: dict[str, str] = {}
+
+        def spawn(*a, **kw):
+            if kw.get("_from_queue") and kw.get("_preassigned_id") == boom.get("id"):
+                raise RuntimeError("probe: dispatch raised")
+            return real_spawn(*a, **kw)
+
+        with (
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch.object(SubagentManager, "_run", new=AsyncMock()),
+        ):
+            first = mgr.spawn("t0", parent_session_key="dashboard:s1")
+            second = mgr.spawn("t1", parent_session_key="dashboard:s1")
+            assert second.queued
+            boom["id"] = second.id
+            mgr.spawn = spawn  # type: ignore[method-assign]
+            first.done = True
+            mgr._claim_finalize(first)
+            assert mgr._release_slot(first)
+            mgr._running_count -= 1
+            # The inline pump does not catch a raising ``spawn``; the raise
+            # reaches the caller, and the mark must already be gone by then.
+            with pytest.raises(RuntimeError, match="probe: dispatch raised"):
+                mgr._drain_queue()
+        assert mgr._dispatching_ids == set(), "mark leaked past a raising dispatch"
+        assert second.id not in mgr._admission.taskq_excluded_ids()
+
+    @pytest.mark.asyncio
+    async def test_a_raise_before_the_pick_is_logged_not_rethrown(self, caplog):
+        """A store error in the awaits ahead of the pick reaches the pass's own
+        handler and is logged; the mark cleanup after it walks an empty pick
+        instead of raising over the handler."""
+        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=1)
+        await mgr.wait_taskq_ready()
+        assert mgr._taskq is not None
+
+        async def boom():
+            raise RuntimeError("probe: store read failed before the pick")
+
+        with (
+            patch.object(mgr, "retry_pending_boundary_cancellations", new=boom),
+            caplog.at_level("ERROR"),
+        ):
+            await mgr._drain_queue_pass()  # must not raise
+        assert any("drain pump failed" in r.getMessage() for r in caplog.records)
+        assert not any("UnboundLocalError" in (r.exc_text or "") for r in caplog.records)

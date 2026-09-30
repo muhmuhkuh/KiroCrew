@@ -7,7 +7,7 @@ import json
 import logging
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
@@ -16,20 +16,29 @@ from kiro_crew import shutdown_event
 from kiro_crew.dashboard.chat_utils import effective_session_key, subagent_event_slot
 from kiro_crew.dashboard.origin import check_origin
 from kiro_crew.dashboard.state import (
+    PERSISTED_SUBAGENT_REPLAY_KEEP,
+    PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
     _safe_folder_tree,
     _slots_serialization_note,
 )
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
+from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_CAPABILITY, SLOT_PATCH_WS_FLAG
 from kiro_crew.dashboard.ws_event_scope import (
+    DASHBOARD_USER_AUDITEE,
     _audit_allow,
     _audit_deny,
     effective_allowed_events,
     filter_slots_for_app,
+    global_event_declared,
     load_declared_events_for_connect,
+    persisted_precap_denial_reason,
+    persisted_precap_readings,
+    persisted_replay_denial_reason,
     slots_envelope_extras,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.subagent_persistence import PanelRecords, read_panel_records
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +70,8 @@ async def _status_frame(state: DashboardState) -> dict[str, Any]:
 SUBAGENT_REPLAY_BATCH_THRESHOLD = 8
 
 SIDE_RESULT_EVENT = "chat.side_result"
+#: A reply landing in a thread on a crewmate chat message (``chat_threads``).
+THREAD_REPLY_EVENT = "chat.thread_reply"
 SIDE_QUEUE_EVENT = "chat.side_queue"
 SIDE_KIND = "side"
 
@@ -81,6 +92,37 @@ def _subagent_replay_has_owner(frame: object) -> bool:
         return False
     slot = data.get("slot")
     return isinstance(slot, str) and bool(slot.strip())
+
+
+def build_persisted_subagent_frame(record: dict, *, redact: Callable[[str], str]) -> dict:
+    """Build the ``subagent_done`` replay frame for one persisted run record.
+
+    Separate from the reconnect handler for the same reason
+    :func:`build_subagent_snapshot` is: the handler around it needs a live
+    aiohttp WebSocket, so a field that goes missing in here is hard to catch
+    from the outside.
+
+    The caller's own redactor is passed in rather than imported, so these frames
+    carry exactly the treatment the live frames beside them get.
+    """
+    error = str(record.get("error") or "")
+    return {
+        "type": "subagent_done",
+        "data": {
+            "id": str(record.get("id") or ""),
+            # Same mapping the live frames use; a raw prefix-strip tags a card
+            # with a slot no tab reads.
+            "slot": subagent_event_slot(str(record.get("parent_session") or "")),
+            "elapsed": float(record.get("elapsed") or 0.0),
+            "error": redact(error) if error else None,
+            # The tombstone records the run's own outcome, so a user stop stays a
+            # stop here rather than being flattened into a failure.
+            "stopped": bool(record.get("stopped")),
+            "outcome": str(record.get("outcome") or ""),
+            "task": redact(str(record.get("task") or "")),
+            "agent": redact(str(record.get("agent") or "")),
+        },
+    }
 
 
 def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
@@ -143,7 +185,11 @@ def _audit_grant_quietly(app: str, event: str) -> None:
     envelope field), the periodic ``dashboard`` status frame, and the
     ``subscribe_logs`` ring replay -- so ``ws_event_allowed`` never sees them
     and none of them would otherwise leave an SEL record, even though each is
-    a permission decision ``AUTOSDE.yaml`` requires one for.
+    a permission decision ``AUTOSDE.yaml`` requires one for. The same three
+    sends reach a dashboard-user socket on identical grounds, so each site
+    records the grant for BOTH socket kinds, under :func:`_grant_auditee`'s
+    label -- a dashboard user has an empty app claim, and recording it as the
+    app would file the owner's grants under ``<unknown>``.
 
     One helper rather than the same ``try``/``except`` inlined at each site:
     the swallow is the load-bearing part and needs to behave identically
@@ -156,6 +202,21 @@ def _audit_grant_quietly(app: str, event: str) -> None:
         _audit_allow(app or "<unknown>", event)
     except Exception:
         logger.debug("ws: SEL audit for %s grant failed", event, exc_info=True)
+
+
+def _grant_auditee(ws: web.WebSocketResponse, ws_app: str) -> str:
+    """Return the SEL ``caller`` a grant on this socket is recorded under.
+
+    A dashboard-user socket is identified by the positive ``_is_dashboard_user``
+    flag and carries an empty app claim, so it gets the reserved
+    ``DASHBOARD_USER_AUDITEE`` label -- the same one the broadcast chokepoint
+    (``WebSocketHub._ws_client_allowed``) uses, so one socket kind has one
+    identity in the trail whichever path delivered the frame. Every other
+    socket is recorded as its app.
+    """
+    if ws.get("_is_dashboard_user", False):
+        return DASHBOARD_USER_AUDITEE
+    return ws_app
 
 
 def broadcast_side_result(
@@ -206,6 +267,60 @@ def broadcast_side_result(
     # steer echoes are the owner's own conversation, and an app that asks the HTTP API
     # about a slot it does not own gets a 404.
     state.broadcast_ws_owners(SIDE_RESULT_EVENT, payload)
+
+
+def broadcast_thread_reply(
+    state: DashboardState,
+    *,
+    slot_key: str,
+    mid: str,
+    run_id: str,
+    role: str,
+    content: str,
+    is_error: bool = False,
+    final: bool = False,
+    ts: float | None = None,
+    reply: dict[str, object] | None = None,
+) -> None:
+    """Broadcast one frame of a reply thread (``dashboard/chat_threads.py``).
+
+    ``{type: "chat.thread_reply", data: payload}``: ``mid`` names the parent
+    message the thread hangs off, ``run_id`` groups the streamed deltas of one
+    crewmate reply, and the terminal frame (``final``) carries the stored
+    ``reply`` record so the panel can replace its streamed text with the row the
+    store holds. Owner-only, like the side chat: a thread is the owner's own
+    conversation. Same channel discipline as ``chat.side_result`` -- a receiver
+    that does not subscribe never sees it, so thread frames stay out of the main
+    transcript by construction.
+
+    Sent only while ``dashboard.crewmate_threads`` is on. The routes refuse
+    before any turn starts, so this guard covers the one turn that was already
+    running when the flag went off: its frames are dropped, and the reply it
+    stores is served again once the flag is back on. The watcher's snapshot is
+    the read (a plain attribute, never a disk load on the loop); before the
+    watcher has one, the frame is dropped too -- the flag is off by default and
+    a frame nobody can act on is the cheaper mistake.
+    """
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    if cfg is None or not cfg.dashboard.crewmate_threads:
+        return
+    payload: dict[str, object] = {
+        "slot": slot_key,
+        "mid": mid,
+        "run_id": run_id,
+        "role": role,
+        "content": redact_credentials(redact_exfiltration_urls(content)[0])[0],
+        "ts": ts if ts is not None else time.time(),
+    }
+    if is_error:
+        payload["is_error"] = True
+    if final:
+        payload["final"] = True
+    if reply is not None:
+        payload["reply"] = reply
+    state.broadcast_ws_owners(THREAD_REPLY_EVENT, payload)
 
 
 def broadcast_side_queue(
@@ -462,6 +577,16 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
     ws["_app"] = ws_app
     ws["_is_dashboard_user"] = request.get("is_dashboard_user", False)
     ws["_allowed_events"] = allowed_events
+    # A tab whose bundle applies ``slot_patch`` frames says so in ``?caps=``;
+    # without the declaration (an older bundle, a companion window, an app
+    # token) the socket keeps receiving the full ``slots`` list for every
+    # metadata edit. Dashboard users only: the frame bypasses the app scope gate.
+    # ``getattr``: request doubles in the suite are plain dicts with no query.
+    query = getattr(request, "query", None) or {}
+    declared_caps = {cap.strip() for cap in str(query.get("caps", "")).split(",")}
+    ws[SLOT_PATCH_WS_FLAG] = bool(ws["_is_dashboard_user"]) and (
+        SLOT_PATCH_CAPABILITY in declared_caps
+    )
 
     # Push current slots immediately so sidebar populates without waiting.
     # App tokens get only the slots their manifest scope allows.
@@ -520,12 +645,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             # never receives the tree, so its generation would describe data the
             # app does not have.
             envelope_extras["foldersGeneration"] = state.folders_generation()
-        if not ws.get("_is_dashboard_user", False) and "yolo" in envelope_extras:
-            # Handing an app token the live blanket-approval override is a
-            # grant of operator security posture, not slot data, and this
-            # initial push writes to the socket directly -- so record it here
-            # or it goes unrecorded entirely.
-            _audit_grant_quietly(ws_app, "slots_yolo")
+        if "yolo" in envelope_extras:
+            # Handing a socket the live blanket-approval override is a grant
+            # of operator security posture, not slot data, and this initial
+            # push writes to the socket directly -- so record it here or it
+            # goes unrecorded entirely. Dashboard users included: they always
+            # receive the field, and until this was ungated the owner's own
+            # socket was the one kind whose grant left no record.
+            _audit_grant_quietly(_grant_auditee(ws, ws_app), "slots_yolo")
         snapshot_frame = {
             "type": "slots",
             "data": slots_data,
@@ -550,6 +677,19 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             logger.warning("slots connect snapshot failed to serialize", exc_info=True)
             raise
         await ws.send_str(snapshot_payload)
+        # One-shot per-member event-log baseline, to THIS socket only, right
+        # after the connect snapshot and before any later broadcast can reach
+        # it -- so the client's held member_projection frames can be pruned
+        # against a lastSeqs baseline it received first. Owner surface only:
+        # app tokens never receive member_projection / members_subscribed (both
+        # are classified owner-only in ws_event_scope), so skip them here too.
+        if is_dashboard_user:
+            # Isolated: a failure to send this baseline must not take the
+            # provider refresh scheduling below down with it.
+            try:
+                await state.send_members_subscribed(ws)
+            except Exception:
+                logger.debug("members_subscribed baseline not sent", exc_info=True)
         if owner_request or is_dashboard_user:
             # Issue links carry no check status — skip them so the scheduler
             # never hands an issue URL to the pull-request-only chip fetch.
@@ -609,12 +749,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     # dashboard-user tokens and keep the full snapshot.
                     for _owner_only in ("branch", "commit"):
                         data.pop(_owner_only, None)
-                    # Tier 0 admits every app unconditionally, but the decision
-                    # is still a grant per ``AUTOSDE.yaml`` -- this frame is
-                    # sent directly rather than through the broadcast
-                    # chokepoint, so nothing else records it. The dedup window
-                    # already bounds the 5-second interval to one record.
-                    _audit_grant_quietly(ws_app, "dashboard")
+                # Tier 0 admits every socket unconditionally, but the decision
+                # is still a grant per ``AUTOSDE.yaml`` -- this frame is sent
+                # directly rather than through the broadcast chokepoint, so
+                # nothing else records it. Outside the app-token narrowing
+                # above on purpose: the dashboard user receives the full frame
+                # and that is a grant too. The dedup window already bounds the
+                # 5-second interval to one record.
+                _audit_grant_quietly(_grant_auditee(ws, ws_app), "dashboard")
                 try:
                     await ws.send_json({"type": "dashboard", "data": data})
                 except Exception:
@@ -715,6 +857,73 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
     # provider subprocess. App tokens never render status either way.
     _run_status_driver = owner_request
     check_task = asyncio.create_task(_refresh_check_loop()) if _run_status_driver else None
+
+    # Background task, ONLY for a connection that declared the `sessions` scope:
+    # recompute session health on a timer so `session_health_changed` fires for a
+    # verdict that moves with the CLOCK. Same shape of bug as the frozen PR chips
+    # above: the verdict is computed only when `GET /api/sessions/health` is
+    # requested, so a turn crossing the stall threshold, a queue draining, or a
+    # cap being cut produces no signal unless somebody happens to poll -- and the
+    # subscriber that most needs the signal is exactly the one whose manifest does
+    # not list that path, so it cannot poll.
+    #
+    # Gated on the declaration rather than started for every socket because the
+    # driver exists solely to feed this event: a host where no app declared
+    # `sessions` has no possible recipient, so it should run no driver at all
+    # instead of recomputing health forever for nobody. A dashboard user carries
+    # no declaration set (it is not gated by declarations) and no dashboard
+    # surface subscribes to this signal -- it reads the endpoint directly, which
+    # it is entitled to -- so it drives nothing either.
+    #
+    # This is work avoidance, not the permission decision: delivery is still
+    # judged per frame by `_send_ws_all` -> `ws_event_allowed` against the LIVE
+    # scope, so a declaration revoked mid-connection stops the frames even though
+    # this connect-time reading already started the driver.
+    #
+    # refresh_session_health is TTL-gated and single-flighted, so every declaring
+    # socket together still costs at most one computation per interval; it spends
+    # no credentials and reads no provider, which is why this is not owner-only
+    # like the check driver.
+    async def _refresh_health_loop() -> None:
+        # Function-local import: ws.py is imported by handlers/side.py (via the
+        # handlers package), so importing handlers.sessions at module scope closes
+        # a ws -> handlers.sessions -> handlers/__init__ -> handlers.side -> ws
+        # cycle. The cadence is the handler's OWN cache TTL rather than a second
+        # constant, so the driver cannot drift out of step with the gate it
+        # depends on for single-flighting.
+        from kiro_crew.dashboard.handlers.sessions import (
+            _HEALTH_REFRESH_SECS,
+            refresh_session_health,
+        )
+
+        while not ws.closed and not shutdown_event.is_set():
+            # Guard the BODY, not the loop: one transient failure must log and
+            # keep the driver alive rather than silently reverting to the
+            # signal-only-on-poll behaviour this loop exists to fix.
+            #
+            # Refresh FIRST, then sleep. The first computation in a process is
+            # the silent baseline, so a driver that slept before its first tick
+            # would let a verdict that moved during that sleep BECOME the
+            # baseline and never signal it; computing at connect time pins the
+            # baseline to what the subscriber sees when it connects. TTL-gated,
+            # so a burst of connects still costs one computation. The sleep sits
+            # OUTSIDE the guard so a refresh that keeps failing waits out the
+            # interval like a successful one instead of spinning.
+            try:
+                await refresh_session_health(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("session health refresh tick failed; continuing", exc_info=True)
+            await asyncio.sleep(_HEALTH_REFRESH_SECS)
+
+    # Function-local import for the same boot-path reason the loop above imports
+    # its handler seam locally: `session_health` is not otherwise on ws.py's
+    # import graph, and ws.py is imported while the gateway is starting.
+    from kiro_crew.dashboard.session_health import SESSION_HEALTH_EVENT
+
+    _run_health_driver = global_event_declared(SESSION_HEALTH_EVENT, allowed_events)
+    health_task = asyncio.create_task(_refresh_health_loop()) if _run_health_driver else None
     # The resume prefetch this socket's most recent slot_focused frame armed.
     # Tracked per connection so a focus change (or blur/disconnect) cancels
     # only this socket's speculation, never another window's.
@@ -757,11 +966,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     exc_info=True,
                                 )
                             continue
-                        if not ws.get("_is_dashboard_user", False):
-                            # Mirror the deny branch above: the grant is a
-                            # permission decision too, and only the deny side
-                            # left an SEL record before this.
-                            _audit_grant_quietly(ws_app, "subscribe_logs")
+                        # Mirror the deny branch above: the grant is a
+                        # permission decision too, and only the deny side left
+                        # an SEL record before this. Not gated on the socket
+                        # kind: the dashboard user is admitted to the ring
+                        # replay on the same grounds, and skipping the record
+                        # for that socket left the privileged log history the
+                        # one hand-over the trail never showed.
+                        _audit_grant_quietly(_grant_auditee(ws, ws_app), "subscribe_logs")
                         state.subscribe_logs(ws)
                         # Replay log ring buffer
                         for entry in list(_log_ring):
@@ -882,6 +1094,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                                 "child_session": getattr(a, "conversation_key", "")
                                                 or f"subagent:{a.id}",
                                                 "elapsed": a.elapsed,
+                                                "credits": a.credits,
                                                 "error": _r(a.error) if a.error else None,
                                                 "stopped": a.user_stopped,
                                                 "outcome": a.outcome,
@@ -894,6 +1107,136 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     )
                                 except Exception:
                                     pass
+                        # Durable rebuild source. Every frame above comes from
+                        # gateway memory, so a replacement process has none to
+                        # replay and the tab stays empty until something new
+                        # spawns. The persisted run folders answer for the runs
+                        # this process never tracked. Ids already collected are
+                        # excluded, so a live frame is never displaced by a disk
+                        # record, and the disk frames join THIS list rather than
+                        # a parallel send: the owner check, the per-socket scope
+                        # gate and the batch packaging below then apply to them
+                        # on exactly the same terms.
+                        try:
+                            _seen = {
+                                str(_f["data"]["id"])
+                                for _f in _replay
+                                if isinstance(_f.get("data"), dict) and _f["data"].get("id")
+                            }
+
+                            # Slot ownership is read on the LOOP, twice, and never
+                            # from the worker thread. Once here as a snapshot, so
+                            # the row cap is sized over the records this socket may
+                            # actually see; then again after the thread returns,
+                            # which is the authoritative check. A slot's owner can
+                            # flip while the scan runs -- keys are caller-supplied
+                            # and not app-namespaced, so another app can reclaim
+                            # one -- and a decision taken off-loop would be read
+                            # from state this socket does not describe.
+                            # Ownership and visibility are two INDEPENDENT live
+                            # bounds, and both belong before the cap: a record
+                            # this socket may not see, or whose run another app
+                            # owns, would otherwise spend a slot its own visible
+                            # runs need, and the cut count would be computed over
+                            # records that were never this socket's to receive.
+                            # Taken together on the loop, at one instant.
+                            _owner_now, _visible_now = persisted_precap_readings(
+                                state,
+                                ws_app,
+                                ws.get("_allowed_events", frozenset()),
+                                dashboard_user=bool(ws.get("_is_dashboard_user", False)),
+                            )
+
+                            def _admit_persisted(_rec: dict) -> bool:
+                                """Both pre-cap bounds, sizing the cap.
+
+                                Withholding is itself the permission decision, so
+                                it audits under the reason it had. The records
+                                that survive are decided again on the loop, and
+                                the two sets are disjoint, so nothing is audited
+                                twice.
+                                """
+                                _reason = persisted_precap_denial_reason(
+                                    _owner_now,
+                                    _visible_now,
+                                    subagent_event_slot(str(_rec.get("parent_session") or "")),
+                                    _rec,
+                                )
+                                if _reason:
+                                    _audit_deny(ws_app or "<dashboard>", "subagent_done", _reason)
+                                    return False
+                                return True
+
+                            _persisted = await asyncio.to_thread(
+                                read_panel_records,
+                                keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+                                max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+                                exclude_ids=_seen,
+                                admit=_admit_persisted,
+                            )
+                        except Exception:
+                            logger.debug("Persisted subagent replay failed", exc_info=True)
+                            _persisted = PanelRecords([], 0, False)
+                        _overflow = _persisted.overflow
+                        if _overflow or _persisted.overflow_is_lower_bound:
+                            # Said out loud once per rebuild, to the operator
+                            # rather than the client: a cut tail otherwise reads
+                            # as a population that never held those runs. The
+                            # WARNING carries the count and is the whole report:
+                            # a truncation refuses nobody, so it is not a
+                            # permission decision and stays out of the SEL deny
+                            # stream, where an operator has to be able to see the
+                            # ownership refusals. No client reads a count it
+                            # cannot act on, so it stays off the wire too.
+                            logger.warning(
+                                "subagent replay truncated: %s%d eligible persisted run(s) "
+                                "past the %d cap%s",
+                                "at least " if _persisted.overflow_is_lower_bound else "",
+                                _overflow,
+                                PERSISTED_SUBAGENT_REPLAY_KEEP,
+                                (
+                                    " (scan window saturated, so older admissible runs "
+                                    "may not have been inspected)"
+                                    if _persisted.overflow_is_lower_bound
+                                    else ""
+                                ),
+                            )
+                        for _rec in _persisted.records:
+                            try:
+                                # The authoritative gate, on the loop, against
+                                # state as it is NOW rather than as the snapshot
+                                # found it. A record the snapshot admitted and
+                                # this rejects had its slot reclaimed mid-scan.
+                                _slot = subagent_event_slot(str(_rec.get("parent_session") or ""))
+                                _why = persisted_replay_denial_reason(state, _slot, _rec)
+                                if _why:
+                                    _audit_deny(ws_app or "<dashboard>", "subagent_done", _why)
+                                    continue
+                                # The grant leaves a record too, at the point the
+                                # decision is made and under the same identity its
+                                # refusals use. This replay writes to the socket
+                                # directly, so ``ws_event_allowed`` never sees the
+                                # frame, and a dashboard user short-circuits
+                                # ``_ws_client_allowed`` unconditionally -- the two
+                                # places a grant would otherwise be recorded. Left
+                                # out, the deny reasons above are the only trace the
+                                # check ran at all, so an operator cannot tell a
+                                # rebuild that delivered a run from one that never
+                                # considered it.
+                                #
+                                # Unconditional rather than dashboard-user only,
+                                # because this records THIS check's decision, not
+                                # the per-slot scope gate's below: the two are
+                                # different questions and an app socket legitimately
+                                # produces one record for each. ``api_spawn_list``
+                                # already records its grant unconditionally for this
+                                # same ownership decision, and a surface that
+                                # recorded it on one reader and not the other would
+                                # make the trail depend on which reader asked.
+                                _audit_grant_quietly(ws_app or "<dashboard>", "subagent_done")
+                                _replay.append(build_persisted_subagent_frame(_rec, redact=_r))
+                            except Exception:
+                                pass
                         # Per-slot scope gate on the reconnect replay. The
                         # broadcast chokepoint covers live events, but this
                         # replay writes to the socket directly, so it must
@@ -925,7 +1268,10 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                 # and cost the app its whole replay, so keep
                                 # this send and the per-item filter together.
                                 await ws.send_json(
-                                    {"type": "subagent_snapshot_batch", "data": {"items": _replay}}
+                                    {
+                                        "type": "subagent_snapshot_batch",
+                                        "data": {"items": _replay},
+                                    }
                                 )
                             else:
                                 for _frame in _replay:
@@ -990,6 +1336,8 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         status_task.cancel()
         if check_task is not None:
             check_task.cancel()
+        if health_task is not None:
+            health_task.cancel()
         # A prefetch still debouncing for a closed dashboard serves nobody.
         if _focus_task is not None and not _focus_task.done():
             _focus_task.cancel()

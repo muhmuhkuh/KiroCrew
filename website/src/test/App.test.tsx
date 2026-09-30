@@ -4,13 +4,15 @@ import { MOBILE_BREAKPOINT } from '../hooks/useIsMobile'
 import { join } from 'node:path'
 import { render, screen, act, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
-import App from '../App'
-import { sseConnected, sseDisconnected } from '../store/dashboardSlice'
+import App, { NavBadge } from '../App'
+import { sseConnected, sseDisconnected, markSlotUnread } from '../store/dashboardSlice'
 import { openActivityPanel, sseSubagentQueued } from '../store/chatSlice'
+import { SHORTCUTS_ENABLED_KEY } from '../hooks/useKeyboardShortcuts'
 import SegmentedControl from '../components/SegmentedControl'
 import { ApiError } from '../api/client'
 import { safeSetItem } from '../utils/safeStorage'
 import { FEATURE_REQUEST_PROMPT_FALLBACK } from '../prompts/featureRequest'
+import { consumeChatHandoff } from '../utils/errorReport'
 
 /** A failure `POST /api/chat/slots/{slot}/agent` really can return today. */
 const REAL_FAILURE = 'invalid agent name'
@@ -57,6 +59,17 @@ vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => <div data-testid=
 vi.mock('../pages/CapabilitiesPage', () => ({ default: () => <div data-testid="capabilities-page">CapabilitiesPage</div> }))
 vi.mock('../pages/NotificationsPage', () => ({ default: () => <div data-testid="notifications-page">NotificationsPage</div> }))
 vi.mock('../pages/SchedulePage', () => ({ default: () => <div data-testid="schedule-page">SchedulePage</div> }))
+// A lazy route whose first chunk fetch rejects, then succeeds when retried.
+// The factory count models the browser re-attempting the dynamic import after
+// a transient gateway or stale-chunk failure.
+const hooksPageMock = vi.hoisted(() => ({ attempts: 0 }))
+vi.mock('../pages/HooksPage', () => {
+  hooksPageMock.attempts += 1
+  if (hooksPageMock.attempts === 1) {
+    throw new Error('Failed to fetch dynamically imported module: HooksPage')
+  }
+  return { default: () => <div data-testid="hooks-page">HooksPage</div> }
+})
 vi.mock('../hooks/useWebSocket', () => ({ useWebSocket: () => ({ subscribeLogs: () => {} }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: vi.fn(() => ({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })) }))
 vi.mock('../providers/context', () => ({ useProvider: () => ({ id: 'acp' }) }))
@@ -68,6 +81,9 @@ vi.mock('../api/client', () => ({
     status: vi.fn().mockResolvedValue({ uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 }),
     sessionsUsage: vi.fn().mockResolvedValue({ usage: { credits_used: 3044, credits_covered: 3044, credits_overage: 0, credits_plan: 10000, resets: '2026-07-01', plan: 'KIRO POWER', cost_usd: 0, overage_rate: '0.04', bonus_credits: [{ name: 'Launch bonus', used: 250, total: 1000, days_left: 30 }], email: 'owner@example.com', account_type: 'Social' } }),
     listApps: vi.fn().mockResolvedValue([]),
+    // A NON-Kiro harness by default, so the credit pill's Kiro-only surfaces
+    // (the no-reading dash) stay off unless a test names the kiro backend.
+    kirocrewConfig: vi.fn().mockResolvedValue({ agent: { acp_backend: 'claude' } }),
     system: vi.fn().mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 }),
     chatSlotAgent: vi.fn().mockResolvedValue({}),
     chatSlotReasoningEffort: vi.fn().mockResolvedValue({}),
@@ -416,9 +432,10 @@ describe('App routing', () => {
     expect(shell!.className).toContain('supports-[height:100dvh]:h-dvh')
   })
 
-  it('redirects /agents to the Agent Capabilities panel', () => {
+  // CapabilitiesPage is a lazy route chunk, so it lands after a Suspense tick.
+  it('redirects /agents to the Agent Capabilities panel', async () => {
     renderWithProviders(<App />, { route: '/agents' })
-    expect(screen.getByTestId('capabilities-page')).toBeInTheDocument()
+    expect(await screen.findByTestId('capabilities-page')).toBeInTheDocument()
   })
 
   // /projects now resolves through BuiltinAppRoute -> BUILTIN_COMPONENT_REGISTRY
@@ -437,6 +454,53 @@ describe('App routing', () => {
   it('renders logs page at /logs', () => {
     renderWithProviders(<App />, { route: '/logs' })
     expect(screen.getByTestId('logs-page')).toBeInTheDocument()
+  })
+
+  // Route-only pages load through React.lazy; each must still mount behind its
+  // Suspense boundary once its chunk resolves.
+  it.each([
+    ['/notifications', 'notifications-page'],
+    ['/schedule', 'schedule-page'],
+    ['/capabilities', 'capabilities-page'],
+  ])('renders the lazy route page at %s', async (route, testId) => {
+    renderWithProviders(<App />, { route })
+    expect(await screen.findByTestId(testId)).toBeInTheDocument()
+  })
+
+  // A rejected lazy import must stay inside its route area, preserve its
+  // diagnostic for agent hand-off, and recover when the user retries the fetch.
+  it('recovers a lazy route after its first chunk load fails', async () => {
+    // React and ErrorBoundary both report the caught throw on console.error;
+    // it is the expected outcome here, not noise to fail on.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      sessionStorage.clear()
+      const view = renderWithProviders(<App />, { route: '/hooks' })
+      const notice = await screen.findByRole('alert')
+      const caughtDiagnostic = '[vitest] There was an error when mocking a module.'
+      expect(notice).toHaveTextContent("This page couldn't load. Check the connection to the gateway, then try again.")
+      expect(notice).toHaveTextContent(caughtDiagnostic)
+      expect(screen.getByRole('button', { name: 'Try Again' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Reload page' })).toBeInTheDocument()
+      // The nav rail is still rendered around the failed route.
+      expect(screen.getByText('Sessions')).toBeInTheDocument()
+      expect(screen.getByText('Settings')).toBeInTheDocument()
+
+      fireEvent.click(within(notice).getByRole('button', { name: 'Ask the agent' }))
+      expect(consumeChatHandoff()).toContain(`- Message: ${caughtDiagnostic}`)
+
+      // The hand-off navigates to chat. Remounting the failed route models the
+      // user returning before retrying; the rejected React.lazy wrapper remains.
+      view.unmount()
+      renderWithProviders(<App />, { route: '/hooks' })
+      expect(await screen.findByRole('alert')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Try Again' }))
+
+      expect(await screen.findByTestId('hooks-page')).toBeInTheDocument()
+      expect(hooksPageMock.attempts).toBe(2)
+    } finally {
+      consoleError.mockRestore()
+    }
   })
 
   it('redirects unknown routes to /chat', () => {
@@ -749,6 +813,92 @@ describe('App routing', () => {
     act(() => { store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 })) })
 
     expect(await screen.findByLabelText('2 subagents in flight')).toBeInTheDocument()
+    // In flow beside the unread badge and the shortcut hint, not `absolute
+    // right-8` layered over them — see the overlap regression test below.
+    expect((await screen.findByLabelText('2 subagents in flight')).className).not.toContain('absolute')
+  })
+
+  it('keeps the expanded unread badge and the row shortcut hint out of each others space', async () => {
+    // Regression: the badge was `absolute right-2`, i.e. OUT of the row's flex
+    // line, while the shortcut hint is an in-flow span at the row's right edge —
+    // so on a Sessions row with one unread the badge painted ON TOP of the chord
+    // and the row advertised a keystroke you could not read.
+    //
+    // Pinned two ways, because either assertion alone still passes against the
+    // bug: the badge must be IN FLOW (an absolute badge overlaps a sibling at any
+    // count width, and jsdom computes no layout so a geometry check would be
+    // vacuous here), AND it must follow the chord in the same flex line, so the
+    // fix is not "the chord is the thing pushed off the right edge instead".
+    localStorage.removeItem('mc-nav')
+    localStorage.removeItem(SHORTCUTS_ENABLED_KEY)
+    const store = createTestStore()
+
+    renderWithProviders(<App />, { route: '/chat', store })
+
+    // The chord's presence is the precondition: with shortcuts off there is
+    // nothing for the badge to cover and the rest of this would pass vacuously.
+    const chord = await screen.findByTestId('nav-shortcut-chat')
+    // Seed the unread AFTER the mount slot fetch settles — `fetchSlots.fulfilled`
+    // drains unread keys naming no live slot, so seeding earlier would race it.
+    await waitFor(() => expect(store.getState().dashboard.slotsLoaded).toBe(true))
+    act(() => { store.dispatch(markSlotUnread({ slot: 'background', ts: '2026-01-01T00:00:05Z' })) })
+
+    const badge = await screen.findByLabelText('1 unread conversations')
+    expect(badge.className).not.toContain('absolute')
+    expect(badge.parentElement).toBe(chord.parentElement)
+    expect(chord.compareDocumentPosition(badge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('keeps an app rows run-state mark in the same flex line as its count pill', async () => {
+    // The count pill moving into the row's line is only a class closure if every
+    // right-edge mark moves with it. This one is the sibling that was left: an app
+    // row renders BOTH this mark and an `appBadges`-driven pill, so while the mark
+    // stayed at a fixed 32px offset a 2-3 digit pill grew left underneath it and
+    // reproduced the original bug one component over. Rendering `NavBadge`
+    // directly rather than staging an installed app keeps the assertion on the
+    // composition, which is where the property lives.
+    const store = createTestStore()
+
+    renderWithProviders(
+      // `NavBadge` strips the `app-` prefix before reading `appBadges`.
+      <NavBadge navId="app-demo" collapsed={false} appBadges={{ demo: 999 }} runState="running" />,
+      { store }
+    )
+
+    const mark = await screen.findByLabelText('A scheduled job of this app is running')
+    const pill = await screen.findByLabelText('999 updates')
+    expect(mark.className).not.toContain('absolute')
+    // Same flex line as the pill, so the two cannot intersect at any digit count.
+    expect(mark.parentElement).toBe(pill.parentElement)
+  })
+
+  it('names what each right-edge count is counting, for sighted users too', async () => {
+    // The two indicators are now reliably CO-VISIBLE (that is the point of the
+    // fix above), so a bare "1" pill beside a bare bot glyph and "2" has to be
+    // tellable apart without a screen reader. Both carry the label as `title`.
+    //
+    // The title is the label ALONE, deliberately: the labels are plural phrases,
+    // so reusing the aria string would render a visible "1 unread conversations"
+    // at count 1. The count is already in the pill, so the title does not repeat
+    // it — asserted below, or the grammar defect returns the moment someone
+    // "helpfully" switches these back to ariaLabel.
+    localStorage.removeItem('mc-nav')
+    const store = createTestStore()
+
+    renderWithProviders(<App />, { route: '/chat', store })
+
+    await waitFor(() => expect(store.getState().dashboard.slotsLoaded).toBe(true))
+    act(() => { store.dispatch(markSlotUnread({ slot: 'background', ts: '2026-01-01T00:00:05Z' })) })
+    act(() => { store.dispatch(sseSubagentQueued({ slot: 'background', queued: 2 })) })
+
+    const badge = await screen.findByLabelText('1 unread conversations')
+    const activity = await screen.findByLabelText('2 subagents in flight')
+    expect(badge).toHaveAttribute('title', 'unread conversations')
+    expect(activity).toHaveAttribute('title', 'subagents in flight')
+    // Count 1 against a plural phrase is the case that reads wrong, so pin that
+    // the title carries no digit rather than only pinning the happy string.
+    expect(badge.getAttribute('title')).not.toMatch(/\d/)
+    expect(activity.getAttribute('title')).not.toMatch(/\d/)
   })
 
   it('surfaces the collapsed hover label on keyboard focus and is Enter-activatable', async () => {
@@ -1331,13 +1481,16 @@ describe('App routing', () => {
         // cannot leave it queued for a later, unrelated message.
         { source: 'feature-request', maxAge: 60 },
       )
-      // sendTurn's dashboard wire passes (message, slot, agent, signal, memoryMode, steer).
+      // sendTurn's dashboard wire passes (message, slot, colorTheme, signal,
+      // meta, steer). `meta` carries only the seeded turn's correlation id
+      // (#13342): the hidden instructions ride the context seed above, never
+      // the visible message.
       expect(api.sendChat).toHaveBeenCalledWith(
         'I’d like to request a feature!',
         'feature-slot',
         expect.any(String),
         expect.any(AbortSignal),
-        undefined,
+        { sendId: expect.stringMatching(/^s-/), featureRequest: true },
         undefined,
       )
     })
@@ -1426,7 +1579,7 @@ describe('TopbarMetrics widget', () => {
   it('shows only the Activity toggle button when metricsOpen is not set', () => {
     localStorage.removeItem('mc-topbar-metrics')
     renderWithProviders(<App />, { route: '/chat' })
-    expect(screen.getByTitle('System metrics')).toBeInTheDocument()
+    expect(screen.getByLabelText('System metrics')).toBeInTheDocument()
     expect(screen.queryByText(/CPU /)).not.toBeInTheDocument()
     expect(screen.queryByText(/MEM /)).not.toBeInTheDocument()
   })
@@ -2032,8 +2185,85 @@ describe('Kiro credits pill — edge cases', () => {
     expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument()
   })
 
-  it('auto-closes the modal if usage resolves to unavailable while it is open', async () => {
+  it('shows the no-reading dash for that same payload on the Kiro backend', async () => {
     const { api } = await import('../api/client')
+    // Same `available:false`, but the selected harness IS kiro-cli (`agent.acp_backend`
+    // is the kiro id, the empty string): kiro-cli holds no reading yet, and the
+    // modal this dash opens is where the user refreshes. Hiding it here would hide
+    // the one recovery path; on any other harness there is nothing to refresh.
+    vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: '' } } as never)
+    vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { available: false } } as never)
+    renderWithProviders(<App />, { route: '/chat' })
+    const pill = await screen.findByTitle('Kiro credit usage — no balance reading yet; open to refresh')
+    expect(pill).toHaveTextContent('—')
+    expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument()
+  })
+
+  it('auto-closes the modal if usage resolves to unavailable while it is open (non-Kiro provider)', async () => {
+    // The pill hides for `none` on a non-Kiro harness (the mock's default
+    // backend is claude), so a modal opened during the warm-up would be left
+    // open behind a pill that no longer exists, with nothing to refresh.
+    const { api } = await import('../api/client')
+    let resolveUsage: (v: unknown) => void = () => {}
+    vi.mocked(api.sessionsUsage).mockReturnValue(new Promise(r => { resolveUsage = r }) as never)
+    renderWithProviders(<App />, { route: '/chat' })
+    const pill = await screen.findByTitle(/Kiro credit usage/)
+    fireEvent.click(pill)
+    expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'Kiro Account' })).toBeInTheDocument()
+    await act(async () => { resolveUsage({ usage: { available: false } }); await Promise.resolve() })
+    await waitFor(() => expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Kiro Account' })).not.toBeInTheDocument())
+    expect(screen.queryByTitle(/Kiro credit usage/)).not.toBeInTheDocument()
+  })
+
+  it('renders its own dash when the backend setting could not be read, and retries that read from the modal', async () => {
+    // `available:false` AND the config read failed: neither "no plan on kiro"
+    // nor "not the kiro harness" is established, so the pill must not vanish
+    // as if the non-Kiro verdict had been reached. A dash with its own label,
+    // and behind it a notice with the retry.
+    const { api } = await import('../api/client')
+    // The first read fails; the retry the modal triggers is left IN FLIGHT, so
+    // the test can see what the segment does while the query is refetching.
+    vi.mocked(api.kirocrewConfig)
+      .mockRejectedValueOnce(new ApiError(500, 'config store unreadable'))
+      .mockReturnValue(new Promise(() => {}) as never)
+    vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { available: false } } as never)
+    renderWithProviders(<App />, { route: '/chat' })
+
+    const CONFIG_TITLE = 'Kiro credit usage — could not read the backend setting; open to retry'
+    const pill = await screen.findByTitle(CONFIG_TITLE)
+    expect(pill).toHaveTextContent('—')
+    expect(screen.queryByTitle('Kiro credit usage — no balance reading yet; open to refresh')).not.toBeInTheDocument()
+    // The mock keeps its history across this file's tests: count relative to now.
+    const configReads = vi.mocked(api.kirocrewConfig).mock.calls.length
+
+    fireEvent.click(pill)
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent('Could not load settings, so your balance can’t be shown.')
+    expect(within(alert).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: /^Refresh$/ })).toBeEnabled()
+    // Opening the modal re-asks for the config: the shared client never lets
+    // the query go stale by itself, so this is the only retry there is.
+    await waitFor(() => expect(vi.mocked(api.kirocrewConfig).mock.calls.length).toBeGreaterThan(configReads))
+    // While that retry is in flight the query is back to `pending` with its
+    // error cleared. The segment must NOT drop to the hidden non-Kiro shape
+    // for that window: the dash, the notice and the modal all stay.
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(screen.getByTitle(CONFIG_TITLE)).toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'Kiro Account' })).toBe(dialog)
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not load settings, so your balance can’t be shown.')
+    expect(within(dialog).queryByText('No balance reading is available for this account yet.')).not.toBeInTheDocument()
+    vi.mocked(api.kirocrewConfig).mockReset().mockResolvedValue({ agent: { acp_backend: 'claude' } } as never)
+  })
+
+  it('keeps the modal open when usage resolves to no reading on the Kiro backend', async () => {
+    // Same payload, but the pill stays as the no-reading dash here, and the
+    // modal it opens is where Refresh lives -- closing it would take the one
+    // recovery path away at the moment it is needed.
+    const { api } = await import('../api/client')
+    vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: '' } } as never)
     let resolveUsage: (v: unknown) => void = () => {}
     vi.mocked(api.sessionsUsage).mockReturnValue(new Promise(r => { resolveUsage = r }) as never)
     renderWithProviders(<App />, { route: '/chat' })
@@ -2042,6 +2272,12 @@ describe('Kiro credits pill — edge cases', () => {
     expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
     await act(async () => { resolveUsage({ usage: { available: false } }); await Promise.resolve() })
     await waitFor(() => expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument())
+    await screen.findByTitle('Kiro credit usage — no balance reading yet; open to refresh')
+    // Past any close (and its exit animation): still the same dialog, with Refresh.
+    await new Promise(resolve => setTimeout(resolve, 600))
+    const dialog = screen.getByRole('dialog', { name: 'Kiro Account' })
+    expect(within(dialog).getByText('No balance reading is available for this account yet.')).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: /^Refresh$/ })).toBeEnabled()
   })
 
   it('never renders NaN when credit fields arrive non-finite', async () => {
@@ -2052,5 +2288,21 @@ describe('Kiro credits pill — edge cases', () => {
     // pill (which would otherwise show "NaN / NaN") never appears.
     await waitFor(() => expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument())
     expect(screen.queryByText(/NaN/)).not.toBeInTheDocument()
+  })
+})
+
+describe('import outcome notice', () => {
+  it('is mounted once, above the layout branch, so every layout renders it', () => {
+    // The row's menu closes on the picker's blur, so an import's outcome only
+    // reaches the user through this notice. The popout, embed and dashboard
+    // layouts each render a session menu; mounting above the branch that picks
+    // among them is what keeps a new layout from shipping without it.
+    // Read from source: standing up the popout and embed shells here would
+    // mean faking the window-level flags each branch keys on.
+    const src = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8')
+    const mounts = src.split('<ImportSessionOutcomeNotice />').length - 1
+    expect(mounts).toBe(1)
+    expect(src.indexOf('<ImportSessionOutcomeNotice />')).toBeLessThan(src.indexOf('{isPopout ? ('))
+    expect(src.indexOf('<ImportSessionOutcomeNotice />')).toBeGreaterThan(src.indexOf('<WsContext.Provider'))
   })
 })

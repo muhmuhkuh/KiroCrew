@@ -111,10 +111,6 @@ def _refuses(command):
     return MARKER is not None and MARKER in command
 
 
-def sensitive_path_refusal(command, *args, **kwargs):
-    return "stub sensitive path" if TIER == "sensitive_path_refusal" and _refuses(command) else None
-
-
 def is_sensitive_bash_command(command, *args, **kwargs):
     if TIER == "is_sensitive_bash_command" and _refuses(command):
         return "stub sensitive: %s" % MARKER
@@ -203,7 +199,7 @@ def fence(
 ) -> dict:
     """What fake fence a test wants staged; :func:`run_fix` writes it.
 
-    ``tier`` names which of the four checks refuses the marker; ``omit`` deletes one
+    ``tier`` names which of the three checks refuses the marker; ``omit`` deletes one
     check from the fake module, which is what a tree missing a tier looks like.
     """
     return {"marker": marker, "available": available, "tier": tier, "omit": omit}
@@ -291,7 +287,14 @@ def run_fix(
     timeout: int = 30,
     env: dict[str, str] | None = None,
     extra: list[str] | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Drive the staged ``verify_fix.py`` as the conductor does: a child process.
+
+    ``cwd`` defaults to the worktree -- the directory the conductor launches the
+    gate from -- and is never the checkout this test process inherited. A test
+    that is ABOUT where a relative argument resolves passes its own.
+    """
     argv = [
         sys.executable,
         str(staged / "verify_fix.py"),
@@ -311,7 +314,13 @@ def run_fix(
     if env:
         child.update(env)
     return subprocess.run(
-        argv, capture_output=True, text=True, encoding="utf-8", timeout=300, env=child
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        env=child,
+        cwd=str(cwd or worktree),
     )
 
 
@@ -478,7 +487,6 @@ class TestABrokenGoldenPathRejectsTheFix:
     @pytest.mark.parametrize(
         "tier, tag",
         [
-            ("sensitive_path_refusal", "sensitive-path"),
             ("is_sensitive_bash_command", "sensitive-bash"),
             ("audit_bash_exfiltration", "exfil"),
             ("is_denied", "deny-rules"),
@@ -515,7 +523,7 @@ class TestHoldsIsUnreachableWhileAnythingIsUnverifiable:
     def test_a_tree_missing_one_tier_is_unverifiable(
         self, staged: Path, tmp_path: Path, worktree: Path
     ) -> None:
-        """Three checks out of four is coverage lost, not three permits."""
+        """Two checks out of three is coverage lost, not two permits."""
         db = tmp_path / "findings.db"
         a_golden_path(staged, command="gh pr view 1 --json state")
         install_verifier(staged, VERIFIER_REJECTED)
@@ -1134,6 +1142,7 @@ class TestInvalidInputIsTwoNotAVerdict:
             text=True,
             encoding="utf-8",
             timeout=120,
+            cwd=str(tmp_path),
         )
         assert result.returncode == EXIT_INVALID, result.stdout
 
@@ -1156,6 +1165,7 @@ class TestInvalidInputIsTwoNotAVerdict:
             text=True,
             encoding="utf-8",
             timeout=120,
+            cwd=str(tmp_path),
         )
         assert result.returncode == EXIT_INVALID
         assert "not a git checkout" in result.stderr
@@ -1175,6 +1185,7 @@ class TestInvalidInputIsTwoNotAVerdict:
             text=True,
             encoding="utf-8",
             timeout=120,
+            cwd=str(tmp_path),
         )
         assert result.returncode == EXIT_INVALID
         assert "not a directory" in result.stderr
@@ -1231,7 +1242,7 @@ class TestTheShippedCorpusIsALiveGate:
     def test_every_shipped_shell_row_is_permitted_by_the_real_deny_composite(
         self, mod, rows: list[dict]
     ) -> None:
-        """All four tiers, in the tool gate's order -- the same composite the probe
+        """Every tier the gate applies to shell text, in its order -- the same composite the probe
         applies and `scripts/deny_diff.py` measures."""
         import kiro_crew.security as security
 
@@ -1795,7 +1806,7 @@ class TestTheContractCannotSteerTheGateThatReadsIt:
         assert "src/kiro_crew/sandbox.py" in payload(result)["contract"]["why"]
 
     def test_a_relative_contract_path_is_resolved_before_it_is_used(
-        self, staged: Path, tmp_path: Path, monkeypatch
+        self, staged: Path, tmp_path: Path
     ) -> None:
         """The child runs with ``cwd`` inside the worktree, so a relative path is a trap.
 
@@ -1814,9 +1825,15 @@ class TestTheContractCannotSteerTheGateThatReadsIt:
         )
         a_golden_path(staged, kind="flow", command="monitor_start")
         install_verifier(staged, VERIFIER_REJECTED)
-        monkeypatch.chdir(outside)
+        # The child's own cwd is what the relative name resolves against, so it is
+        # passed to the child rather than set on the test worker -- a chdir there
+        # is process-wide and outlives a failing assertion.
         result = run_fix(
-            staged, tmp_path / "findings.db", worktree, extra=["--contract", "held.json"]
+            staged,
+            tmp_path / "findings.db",
+            worktree,
+            extra=["--contract", "held.json"],
+            cwd=outside,
         )
         assert result.returncode == EXIT_BROKEN, result.stdout
         body = payload(result)

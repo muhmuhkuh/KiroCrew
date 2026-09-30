@@ -430,7 +430,7 @@
       "id": "chat.auto-compact-threshold",
       "label": "Auto-Compact Threshold",
       "tab": "chat",
-      "route": "/settings/chat?highlight=key%3Asession.autocompact_pct",
+      "route": "/settings/chat/advanced?highlight=key%3Asession.autocompact_pct",
       "description": "Context usage % at which auto-compaction triggers. Lower = more frequent compaction, longer sessions",
       "configKey": "session.autocompact_pct"
     },
@@ -438,67 +438,67 @@
       "id": "chat.auto-open-git-in-side-panel",
       "label": "Auto-Open Git in Side Panel",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.auto-open-git-in-side-panel",
+      "route": "/settings/chat/sidepanel?highlight=chat.auto-open-git-in-side-panel",
       "description": "Expand the side panel to the Git tab each time you start a chat in a git project. The Git tab is created either way."
     },
     {
       "id": "chat.background-effort",
       "label": "Background Effort",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.background-effort"
+      "route": "/settings/chat/models?highlight=chat.background-effort"
     },
     {
       "id": "chat.background-model",
       "label": "Background Model",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.background-model"
+      "route": "/settings/chat/models?highlight=chat.background-model"
     },
     {
       "id": "chat.compact-empty-folders",
       "label": "Compact Empty Folders",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.compact-empty-folders",
+      "route": "/settings/chat/sessions?highlight=chat.compact-empty-folders",
       "description": "A folder with no chats takes one row instead of two, and its New chat button moves onto the folder's own row"
     },
     {
       "id": "chat.completion-event-characters",
       "label": "Completion Event Characters",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.completion-event-characters"
+      "route": "/settings/chat/advanced?highlight=chat.completion-event-characters"
     },
     {
       "id": "chat.completion-event-truncation",
       "label": "Completion Event Truncation",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.completion-event-truncation",
+      "route": "/settings/chat/advanced?highlight=chat.completion-event-truncation",
       "description": "Which part of a subagent's stream to keep when injecting its completion event into the parent session. Head preserves the start (default, matches legacy behavior). Tail preserves the final summary. Both keeps a slice from each end with a marker between them."
     },
     {
       "id": "chat.confirm-before-closing-session",
       "label": "Confirm Before Closing Session",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.confirm-before-closing-session",
+      "route": "/settings/chat/sessions?highlight=chat.confirm-before-closing-session",
       "description": "Show a confirmation dialog when closing a session"
     },
     {
       "id": "chat.content-width",
       "label": "Content Width",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.content-width",
+      "route": "/settings/chat/transcript?highlight=chat.content-width",
       "description": "Compact is the original view. Comfortable and Full use more screen space."
     },
     {
       "id": "chat.content-filter-fallback-model",
       "label": "Content-filter fallback model",
       "tab": "chat",
-      "route": "/settings/chat?highlight=key%3Aagent.refusal_fallback_model",
+      "route": "/settings/chat/models?highlight=key%3Aagent.refusal_fallback_model",
       "configKey": "agent.refusal_fallback_model"
     },
     {
       "id": "chat.default-memory-mode",
       "label": "Default Memory Mode",
       "tab": "chat",
-      "route": "/settings/chat?highlight=key%3Adashboard.default_memory_mode",
+      "route": "/settings/chat/sessions?highlight=key%3Adashboard.default_memory_mode",
       "description": "Persistent uses what it knows and saves new memory. Incognito uses what it knows but saves no new memory. Temporary starts blank and saves no new memory. Every chat still appears in History. You can change the mode for any chat.",
       "configKey": "dashboard.default_memory_mode"
     },
@@ -506,118 +506,139 @@
       "id": "chat.default-model",
       "label": "Default Model",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.default-model",
+      "route": "/settings/chat/models?highlight=chat.default-model",
       "description": "Which model new sessions start with when their agent pins none. Set a model per agent under Capabilities → Agents, or pick one inside a session to override it there."
     },
     {
       "id": "chat.default-reasoning-effort",
       "label": "Default Reasoning Effort",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.default-reasoning-effort",
+      "route": "/settings/chat/models?highlight=chat.default-reasoning-effort",
       "description": "How long models think before answering by default. Higher is slower and costs more. Only available on reasoning-capable models (Opus, Sonnet, Fable, GPT-5.x)."
     },
     {
       "id": "chat.default-to-autopilot-mode",
       "label": "Default to Autopilot Mode",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.default-to-autopilot-mode",
+      "route": "/settings/chat/sessions?highlight=chat.default-to-autopilot-mode",
       "description": "New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions."
     },
     {
       "id": "chat.describe-your-role",
       "label": "Describe your role",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.describe-your-role",
+      "route": "/settings/chat/aboutyou?highlight=chat.describe-your-role",
       "description": "Kiro uses this description to adapt vocabulary and examples to your role."
+    },
+    {
+      "id": "chat.double-click-to-edit-your-messages",
+      "label": "Double-click to edit your messages",
+      "tab": "chat",
+      "route": "/settings/chat/transcript?highlight=chat.double-click-to-edit-your-messages",
+      "description": "When off, a double-click on your message selects a word as in any text."
     },
     {
       "id": "chat.fallback-model",
       "label": "Fallback model",
       "tab": "chat",
-      "route": "/settings/chat?highlight=key%3Aagent.fallback_model",
+      "route": "/settings/chat/models?highlight=key%3Aagent.fallback_model",
       "configKey": "agent.fallback_model"
     },
     {
       "id": "chat.feature-tips",
       "label": "Feature Tips",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.feature-tips"
+      "route": "/settings/chat/discovery?highlight=chat.feature-tips"
     },
     {
       "id": "chat.file-change-chips",
       "label": "File Change Chips",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.file-change-chips",
+      "route": "/settings/chat/transcript?highlight=chat.file-change-chips",
       "description": "How file diff chips appear below assistant messages"
     },
     {
       "id": "chat.folder-suggestions",
       "label": "Folder suggestions",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.folder-suggestions",
+      "route": "/settings/chat/sessions?highlight=chat.folder-suggestions",
       "description": "Offer to file a new session into a matching folder once it has a title."
     },
     {
       "id": "chat.follow-up-bar-layout",
       "label": "Follow-Up Bar Layout",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.follow-up-bar-layout",
+      "route": "/settings/chat/composer?highlight=chat.follow-up-bar-layout",
       "description": "Multiline wraps suggestions onto multiple rows. Single line keeps them on one horizontally-scrollable row."
     },
     {
       "id": "chat.history-expanded",
       "label": "History Expanded",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.history-expanded",
+      "route": "/settings/chat/sessions?highlight=chat.history-expanded",
       "description": "Expand history sidebar by default"
     },
     {
       "id": "chat.link-previews",
       "label": "Link Previews",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.link-previews",
+      "route": "/settings/chat/transcript?highlight=chat.link-previews",
       "description": "Show a favicon and page title instead of the raw URL. This machine then fetches every link the model outputs, so each linked site sees a request from your IP address."
     },
     {
       "id": "chat.mcp-apps-in-side-panel",
       "label": "MCP Apps in Side Panel",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.mcp-apps-in-side-panel",
+      "route": "/settings/chat/sidepanel?highlight=chat.mcp-apps-in-side-panel",
       "description": "Render interactive MCP Apps (such as Excalidraw diagrams) in the right side panel instead of inline in the chat. The panel opens automatically."
     },
     {
       "id": "chat.merge-queued-messages",
       "label": "Merge Queued Messages",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.merge-queued-messages",
+      "route": "/settings/chat/composer?highlight=chat.merge-queued-messages",
       "description": "Combine follow-up messages into a single labeled prompt while the agent is busy"
+    },
+    {
+      "id": "chat.message-font-size",
+      "label": "Message Font Size",
+      "tab": "chat",
+      "route": "/settings/chat/transcript?highlight=chat.message-font-size",
+      "description": "Font size for the conversation, in every session: message text, code, tables, suggested replies and the message input. The Compact content width grows to match. Sidebar, session list and the rest of the interface are unaffected."
+    },
+    {
+      "id": "chat.minimap-location",
+      "label": "Minimap location",
+      "tab": "chat",
+      "route": "/settings/chat/transcript?highlight=chat.minimap-location",
+      "description": "When located on the right edge, the minimap replaces the scroll bar."
     },
     {
       "id": "chat.pin-the-latest-turn",
       "label": "Pin the latest turn",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.pin-the-latest-turn",
+      "route": "/settings/chat/transcript?highlight=chat.pin-the-latest-turn",
       "description": "Keep the most recent turn visible as a sticky banner once it scrolls above the fold."
     },
     {
       "id": "chat.plain-diffs",
       "label": "Plain diffs",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.plain-diffs",
+      "route": "/settings/chat/transcript?highlight=chat.plain-diffs",
       "description": "Render diffs as plain unified-diff text instead of syntax-highlighted colour. Uses less memory on large diffs."
     },
     {
       "id": "chat.pr-and-issue-chips-on-session-cards",
       "label": "PR and Issue Chips on Session Cards",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.pr-and-issue-chips-on-session-cards",
+      "route": "/settings/chat/sessions?highlight=chat.pr-and-issue-chips-on-session-cards",
       "description": "Show a chip on each session's sidebar card for every pull request, merge request and issue mentioned in that session. Turning it off also stops the periodic provider calls that keep those chips up to date."
     },
     {
       "id": "chat.prevent-sleep-while-running",
       "label": "Prevent sleep while running",
       "tab": "chat",
-      "route": "/settings/chat?highlight=key%3Adashboard.prevent_sleep",
+      "route": "/settings/chat/advanced?highlight=key%3Adashboard.prevent_sleep",
       "description": "Keep your computer awake while a task is running",
       "configKey": "dashboard.prevent_sleep"
     },
@@ -625,34 +646,34 @@
       "id": "chat.quick-send",
       "label": "Quick Send",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.quick-send"
+      "route": "/settings/chat/composer?highlight=chat.quick-send"
     },
     {
       "id": "chat.response-verbosity",
       "label": "Response Verbosity",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.response-verbosity",
+      "route": "/settings/chat/transcript?highlight=chat.response-verbosity",
       "description": "How terse the agent's prose is. Ultra-concise keeps the whole reply short: answer first, bullets over paragraphs, no filler. Code, commands, and error strings stay verbatim at every level; security warnings always appear but stay brief, and multi-step instructions stay complete. Answer-only goes further and drops explanation entirely: one sentence at most, and detail only when you ask for it — or when a decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that you need the reasoning to choose correctly."
     },
     {
       "id": "chat.restore-sessions",
       "label": "Restore Sessions",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.restore-sessions",
+      "route": "/settings/chat/sessions?highlight=chat.restore-sessions",
       "description": "Re-open recently active sessions on startup"
     },
     {
       "id": "chat.restore-window",
       "label": "Restore Window",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.restore-window",
+      "route": "/settings/chat/sessions?highlight=chat.restore-window",
       "description": "Time window for session restoration"
     },
     {
       "id": "chat.selectable-models",
       "label": "Selectable Models",
       "tab": "chat",
-      "route": "/settings/chat?highlight=key%3Adashboard.model_picker_hidden_models",
+      "route": "/settings/chat/models?highlight=key%3Adashboard.model_picker_hidden_models",
       "description": "Choose which advertised models appear in Chat model pickers. Auto and an active session model always remain visible.",
       "configKey": "dashboard.model_picker_hidden_models"
     },
@@ -660,140 +681,140 @@
       "id": "chat.send-shortcut",
       "label": "Send shortcut",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.send-shortcut"
+      "route": "/settings/chat/composer?highlight=chat.send-shortcut"
     },
     {
       "id": "chat.session-summaries",
       "label": "Session summaries",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.session-summaries",
+      "route": "/settings/chat/sessions?highlight=chat.session-summaries",
       "description": "Summarize each session by intent. Uses tokens on turns that change the session."
     },
     {
       "id": "chat.show-context-percentage",
       "label": "Show Context Percentage",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.show-context-percentage",
+      "route": "/settings/chat/transcript?highlight=chat.show-context-percentage",
       "description": "Display usage percentage next to the context progress bar"
     },
     {
       "id": "chat.show-context-tokens",
       "label": "Show Context Tokens",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.show-context-tokens",
+      "route": "/settings/chat/transcript?highlight=chat.show-context-tokens",
       "description": "Display used and total tokens next to the context progress bar"
     },
     {
       "id": "chat.show-pasted-text-in-full",
       "label": "Show Pasted Text in Full",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.show-pasted-text-in-full"
+      "route": "/settings/chat/composer?highlight=chat.show-pasted-text-in-full"
     },
     {
       "id": "chat.show-thinking-inline",
       "label": "Show Thinking Inline",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.show-thinking-inline",
+      "route": "/settings/chat/transcript?highlight=chat.show-thinking-inline",
       "description": "Show intermediate reasoning text between tool calls instead of collapsing everything"
     },
     {
       "id": "chat.show-timestamps",
       "label": "Show Timestamps",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.show-timestamps",
+      "route": "/settings/chat/transcript?highlight=chat.show-timestamps",
       "description": "Display time on each message"
     },
     {
       "id": "chat.simplified-tool-call-names",
       "label": "Simplified Tool Call Names",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.simplified-tool-call-names",
+      "route": "/settings/chat/transcript?highlight=chat.simplified-tool-call-names",
       "description": "When enabled, inline tool pills show simplified tool use purpose instead of the exact command being run"
     },
     {
       "id": "chat.soft-stop-budget-seconds",
       "label": "Soft-stop budget (seconds)",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.soft-stop-budget-seconds"
+      "route": "/settings/chat/composer?highlight=chat.soft-stop-budget-seconds"
     },
     {
       "id": "chat.spell-check-message-input",
       "label": "Spell Check Message Input",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.spell-check-message-input",
+      "route": "/settings/chat/composer?highlight=chat.spell-check-message-input",
       "description": "Underline misspelled words in the message input with a red squiggle. Turn it off to stop the red underlines while you type."
     },
     {
       "id": "chat.split-side-by-side-diffs",
       "label": "Split (side-by-side) diffs",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.split-side-by-side-diffs",
+      "route": "/settings/chat/transcript?highlight=chat.split-side-by-side-diffs",
       "description": "Show old and new code in two columns; off shows one unified column. Changing it here or on any diff sets it everywhere."
     },
     {
       "id": "chat.split-view-session-grid",
       "label": "Split View (Session Grid)",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.split-view-session-grid"
+      "route": "/settings/chat/sessions?highlight=chat.split-view-session-grid"
     },
     {
       "id": "chat.subagent-effort",
       "label": "Subagent Effort",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.subagent-effort"
+      "route": "/settings/chat/models?highlight=chat.subagent-effort"
     },
     {
       "id": "chat.subagent-model",
       "label": "Subagent Model",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.subagent-model"
+      "route": "/settings/chat/models?highlight=chat.subagent-model"
     },
     {
       "id": "chat.tail-only-fork",
       "label": "Tail-only Fork",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.tail-only-fork",
+      "route": "/settings/chat/sessions?highlight=chat.tail-only-fork",
       "description": "Fork keeps only the messages after the chosen point instead of those up to it."
     },
     {
       "id": "chat.technical-comfort",
       "label": "Technical Comfort",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.technical-comfort",
+      "route": "/settings/chat/aboutyou?highlight=chat.technical-comfort",
       "description": "Sets how deep explanations go — plain language vs. full technical detail"
     },
     {
       "id": "chat.text-link-patterns",
       "label": "Text Link Patterns",
       "tab": "chat",
-      "route": "/settings/chat?highlight=key%3Adashboard.link_patterns",
+      "route": "/settings/chat/transcript?highlight=key%3Adashboard.link_patterns",
       "configKey": "dashboard.link_patterns"
     },
     {
       "id": "chat.text-streaming-style",
       "label": "Text Streaming Style",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.text-streaming-style",
+      "route": "/settings/chat/transcript?highlight=chat.text-streaming-style",
       "description": "Immediate mode shows raw chunks as they arrive. Smooth mode buffers and fades text in at a steady pace."
     },
     {
       "id": "chat.what-enter-does-while-the-agent-is-working",
       "label": "What Enter does while the agent is working",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.what-enter-does-while-the-agent-is-working"
+      "route": "/settings/chat/composer?highlight=chat.what-enter-does-while-the-agent-is-working"
     },
     {
       "id": "chat.widget-density",
       "label": "Widget Density",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.widget-density",
+      "route": "/settings/chat/transcript?highlight=chat.widget-density",
       "description": "How aggressively the agent uses inline widgets for visual content"
     },
     {
       "id": "chat.your-role",
       "label": "Your Role",
       "tab": "chat",
-      "route": "/settings/chat?highlight=chat.your-role",
+      "route": "/settings/chat/aboutyou?highlight=chat.your-role",
       "description": "Kiro matches vocabulary and examples to your professional background"
     },
     {
@@ -864,6 +885,20 @@
       "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
     },
     {
+      "id": "developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help",
+      "label": "Also send snippets of recalled memories so Jev can drop the ones that do not help",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.also-send-snippets-of-recalled-memories-so-jev-can-drop-the-ones-that-do-not-help",
+      "description": "When the assistant asks its own memory a question, the entries closest in wording come back. This also sends each one's id and the first 200 characters of its text to Jev, which then says which ones to keep. It can only remove them — never add one, never reorder them — and if it is slow or unreachable they all come back as before. Passwords and keys are replaced before anything is sent. Off until you turn it on, even if the switch above is already on."
+    },
+    {
+      "id": "developer.also-send-the-conversation-and-tool-call-inputs-so-jev-can-score-compaction",
+      "label": "Also send the conversation and tool-call inputs so Jev can score compaction",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.also-send-the-conversation-and-tool-call-inputs-so-jev-can-score-compaction",
+      "description": "Every time context fills up and {{productName}} compacts a session automatically, this sends that conversation and the inputs of the tool calls in it to Jev, and asks which ones would have been worth keeping. Tool OUTPUT is never sent — only how many characters it was. Passwords and keys are replaced before anything is sent. It is a measurement: the compaction happens exactly as it does now whatever Jev answers, and the answer appears as one line on the compaction notice. It is wider than sending one tool call's arguments — a whole session's conversation goes, not one call — so it is off until you turn it on, whatever else you have already agreed to."
+    },
+    {
       "id": "developer.also-send-tool-call-arguments-so-jev-can-flag-risky-calls",
       "label": "Also send tool-call arguments so Jev can flag risky calls",
       "tab": "developer",
@@ -871,18 +906,25 @@
       "description": "In a session that approves its own tool calls, this also sends the name and arguments of each call to Jev, which then puts a note on the ones it thinks are worth a look. Passwords and keys are replaced before anything is sent. It changes nothing about which tool calls are allowed. Off until you turn it on, even if the switch above is already on."
     },
     {
+      "id": "developer.artifact-deploy",
+      "label": "Artifact Deploy",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.artifact-deploy",
+      "description": "Publish an artifact to a public HTTPS URL in your own AWS account. Off by default: every deploy spends money in your account and serves the content on the open internet."
+    },
+    {
       "id": "developer.chat-on-a-crew",
       "label": "Chat on a crew",
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.chat-on-a-crew",
-      "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote instance — another machine you have connected under Settings > Remote Instances. Unfinished: the session opens in that instance’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that instance’s pane."
+      "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote crew — another machine you have connected under Settings > Remote Crew. Unfinished: the session opens in that crew’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that crew’s pane."
     },
     {
-      "id": "developer.crew-members",
-      "label": "Crew Members",
+      "id": "developer.crewmates",
+      "label": "Crewmates",
       "tab": "developer",
-      "route": "/settings/developer?highlight=developer.crew-members",
-      "description": "The Crew Members page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on."
+      "route": "/settings/developer?highlight=developer.crewmates",
+      "description": "The Crewmates page: every agent you have, each with its own thread. Still being built, so it is not offered until you turn this on."
     },
     {
       "id": "developer.decisions-jev",
@@ -899,11 +941,39 @@
       "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals"
     },
     {
-      "id": "developer.remote-instance-sessions",
-      "label": "Remote instance sessions",
+      "id": "developer.earlier-conversation-one-decision-may-carry-in-characters",
+      "label": "Earlier conversation one decision may carry, in characters",
       "tab": "developer",
-      "route": "/settings/developer?highlight=developer.remote-instance-sessions",
-      "description": "Merge a connected remote instance's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished."
+      "route": "/settings/developer?highlight=developer.earlier-conversation-one-decision-may-carry-in-characters",
+      "description": "Earlier messages of yours and of the agent go with the question, newest first, up to this many characters. Tool output is never sent. Zero sends the message on its own, which is what the main Jev switch was agreed for, so a larger number sends more off the machine."
+    },
+    {
+      "id": "developer.jev-api-key",
+      "label": "Jev API key",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.jev-api-key",
+      "description": "Kept in this dashboard's secret store on the machine that runs Kiro Crew, never in config.json, and never shown again once you save it."
+    },
+    {
+      "id": "developer.model-for-the-small-model-judge",
+      "label": "Model for the small-model judge",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.model-for-the-small-model-judge",
+      "description": "Only used when the judge above is the small model. Leave it on the judge agent's own model unless you want a cheaper one."
+    },
+    {
+      "id": "developer.remote-crew-sessions",
+      "label": "Remote crew sessions",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.remote-crew-sessions",
+      "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished."
+    },
+    {
+      "id": "developer.reply-threads-on-crewmate-chat-messages",
+      "label": "Reply threads on crewmate chat messages",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.reply-threads-on-crewmate-chat-messages",
+      "description": "Let any message in a crewmate's chat carry its own reply thread, opened in the side panel while the chat stays visible. Off, the Reply in thread control is not offered and existing threads are hidden, not deleted."
     },
     {
       "id": "developer.run-a-local-gateway",
@@ -920,25 +990,38 @@
       "description": "Inbound webhook tokens, registered contexts, and run history. The API works; the page is not finished."
     },
     {
+      "id": "developer.which-judge-answers",
+      "label": "Which judge answers",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.which-judge-answers"
+    },
+    {
       "id": "display.command-completion",
       "label": "Command completion",
       "tab": "display",
-      "route": "/settings/display?highlight=key%3Adashboard.terminal.completion.enabled",
+      "route": "/settings/display/terminal?highlight=key%3Adashboard.terminal.completion.enabled",
       "description": "Show the completion popup while typing in the Terminal. Enter runs the line you typed; to take a suggestion, press ↑/↓ then Enter, or Tab. Off hides the popup; your shell's own Tab completion still works.",
       "configKey": "dashboard.terminal.completion.enabled"
+    },
+    {
+      "id": "display.custom-font",
+      "label": "Custom font",
+      "tab": "display",
+      "route": "/settings/display/zoom?highlight=display.custom-font",
+      "description": "The font the whole dashboard uses, including chat, the composer, and sidebar session and folder names. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders its glyphs and a programming font shows its ligatures."
     },
     {
       "id": "display.default-for-new-sessions",
       "label": "Default for New Sessions",
       "tab": "display",
-      "route": "/settings/display?highlight=display.default-for-new-sessions",
+      "route": "/settings/display/sidebar?highlight=display.default-for-new-sessions",
       "description": "None, auto-cycle, or pick a fixed color."
     },
     {
       "id": "display.default-shell",
       "label": "Default shell",
       "tab": "display",
-      "route": "/settings/display?highlight=key%3Adashboard.terminal.shell",
+      "route": "/settings/display/terminal?highlight=key%3Adashboard.terminal.shell",
       "description": "Shell the built-in terminal launches — an absolute path or a command on PATH. Leave empty to use the system default ($SHELL).",
       "configKey": "dashboard.terminal.shell"
     },
@@ -946,92 +1029,98 @@
       "id": "display.display-mode",
       "label": "Display Mode",
       "tab": "display",
-      "route": "/settings/display?highlight=display.display-mode",
+      "route": "/settings/display/sidebar?highlight=display.display-mode",
       "description": "How the session color is applied to the row."
+    },
+    {
+      "id": "display.enable-ligatures",
+      "label": "Enable ligatures",
+      "tab": "display",
+      "route": "/settings/display/zoom?highlight=display.enable-ligatures",
+      "description": "Render programming ligatures (=>, !=, ->) when the custom font has them. Code and diffs in messages are unaffected."
     },
     {
       "id": "display.font",
       "label": "Font",
       "tab": "display",
-      "route": "/settings/display?highlight=display.font",
+      "route": "/settings/display/terminal?highlight=display.font",
       "description": "Font for the built-in terminal. Pick one installed on the machine you view the dashboard from, or type any font name — a Nerd Font renders Powerline and prompt-theme glyphs."
     },
     {
       "id": "display.font-family",
       "label": "Font Family",
       "tab": "display",
-      "route": "/settings/display?highlight=display.font-family",
+      "route": "/settings/display/zoom?highlight=display.font-family",
       "description": "UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own."
     },
     {
       "id": "display.font-size",
       "label": "Font size",
       "tab": "display",
-      "route": "/settings/display?highlight=display.font-size",
+      "route": "/settings/display/terminal?highlight=display.font-size",
       "description": "Text size in the built-in terminal, measured in pixels."
     },
     {
       "id": "display.highlight-recent-sessions",
       "label": "Highlight recent sessions",
       "tab": "display",
-      "route": "/settings/display?highlight=display.highlight-recent-sessions",
+      "route": "/settings/display/sidebar?highlight=display.highlight-recent-sessions",
       "description": "Highlight the N most-recently-active sessions with a graded accent stripe (0 = off). Saved to your Kiro Crew config."
     },
     {
       "id": "display.intensity",
       "label": "Intensity",
       "tab": "display",
-      "route": "/settings/display?highlight=display.intensity",
+      "route": "/settings/display/sidebar?highlight=display.intensity",
       "description": "How visible the color tint is on sidebar rows."
     },
     {
       "id": "display.interface",
       "label": "Interface",
       "tab": "display",
-      "route": "/settings/display?highlight=display.interface",
+      "route": "/settings/display/view?highlight=display.interface",
       "description": "Chat bubbles or CLI-style line-by-line output"
     },
     {
       "id": "display.language",
       "label": "Language",
       "tab": "display",
-      "route": "/settings/display?highlight=display.language",
+      "route": "/settings/display/view?highlight=display.language",
       "description": "Language for the dashboard interface."
     },
     {
       "id": "display.mode",
       "label": "Mode",
       "tab": "display",
-      "route": "/settings/display?highlight=display.mode",
+      "route": "/settings/display/theme?highlight=display.mode",
       "description": "Light or dark appearance for the dashboard"
     },
     {
       "id": "display.palette",
       "label": "Palette",
       "tab": "display",
-      "route": "/settings/display?highlight=display.palette",
+      "route": "/settings/display/sidebar?highlight=display.palette",
       "description": "Choose a color palette for your sidebar sessions."
-    },
-    {
-      "id": "display.spend-a-few-credits-to-check-your-balance",
-      "label": "Spend a few credits to check your balance",
-      "tab": "display",
-      "route": "/settings/display?highlight=key%3Adashboard.usage_text_scrape_enabled",
-      "description": "When your usage data is not available for free, your balance can still be checked by sending one billed message, about every 10 minutes while a dashboard tab is open. Each check spends a small number of credits.",
-      "configKey": "dashboard.usage_text_scrape_enabled"
     },
     {
       "id": "display.theme",
       "label": "Theme",
       "tab": "display",
-      "route": "/settings/display?highlight=display.theme",
+      "route": "/settings/display/theme?highlight=display.theme",
       "description": "Select a theme for the dashboard"
+    },
+    {
+      "id": "display.translucent-panels",
+      "label": "Translucent panels",
+      "tab": "display",
+      "route": "/settings/display/view?highlight=display.translucent-panels",
+      "description": "Show the top bar, the tab bar, the message box, the suggestion chips and the search fields as frosted glass over the content that scrolls under them. Off, they are solid cards."
     },
     {
       "id": "display.zoom-level",
       "label": "Zoom Level",
       "tab": "display",
-      "route": "/settings/display?highlight=display.zoom-level"
+      "route": "/settings/display/zoom?highlight=display.zoom-level"
     },
     {
       "id": "instances.auto-connect-crews",
@@ -1042,7 +1131,7 @@
     },
     {
       "id": "instances.enable-remote-crew-management",
-      "label": "Enable remote instance management",
+      "label": "Enable remote crew management",
       "tab": "instances",
       "route": "/settings/instances?highlight=key%3Ainstances.enabled",
       "configKey": "instances.enabled"
@@ -1051,96 +1140,110 @@
       "id": "notifications.sound-category-approval",
       "label": "Approvals and questions",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-approval",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-approval",
       "description": "When the agent needs a tool approval or an answer"
     },
     {
       "id": "notifications.sound-category-turn",
       "label": "Conversation handoffs",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-turn",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-turn",
       "description": "When a conversation finishes or pauses for your input"
     },
     {
       "id": "notifications.sound-category-cron",
       "label": "Cron",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-cron",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-cron",
       "description": "Scheduled job completions"
     },
     {
       "id": "notifications.sound-category-all",
       "label": "Default (all categories)",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-all",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-all",
       "description": "Fallback sound when no category-specific override is set"
     },
     {
       "id": "notifications.sound-category-heartbeat",
       "label": "Heartbeat",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-heartbeat",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-heartbeat",
       "description": "Heartbeat task results"
+    },
+    {
+      "id": "notifications.mark-sessions-unread-only-when-they-need-you",
+      "label": "Mark sessions unread only when they need you",
+      "tab": "notifications",
+      "route": "/settings/notifications/alerts?highlight=notifications.mark-sessions-unread-only-when-they-need-you",
+      "description": "A background session is marked unread when its agent finishes or waits on your answer, instead of on every new message."
     },
     {
       "id": "notifications.notify-when-a-background-chat-finishes",
       "label": "Notify when a background chat finishes",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.notify-when-a-background-chat-finishes",
+      "route": "/settings/notifications/alerts?highlight=notifications.notify-when-a-background-chat-finishes",
       "description": "Shows a system notification naming the chat that finished, but only while this window is minimized or behind another app."
     },
     {
       "id": "notifications.play-sound-on-new-notifications",
       "label": "Play sound on new notifications",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.play-sound-on-new-notifications"
+      "route": "/settings/notifications/sound?highlight=notifications.play-sound-on-new-notifications"
     },
     {
       "id": "notifications.sound-category-agent",
       "label": "Proactive agent messages",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-agent",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-agent",
       "description": "When the agent proactively messages you outside a chat"
+    },
+    {
+      "id": "notifications.show-a-banner-for-new-notifications",
+      "label": "Show a banner for new notifications",
+      "tab": "notifications",
+      "route": "/settings/notifications/alerts?highlight=notifications.show-a-banner-for-new-notifications",
+      "description": "A card slides in under the top bar when a notification arrives, then tucks into the bell."
     },
     {
       "id": "notifications.sound-category-skills",
       "label": "Skills",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-skills",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-skills",
       "description": "New skill candidates awaiting your approval"
     },
     {
       "id": "notifications.sources",
       "label": "Sources",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sources",
+      "route": "/settings/notifications/sources?highlight=notifications.sources",
       "description": "Mute notification sources or override their priority. Muted notifications stay in history but never badge, sound, or banner."
     },
     {
       "id": "notifications.sound-category-subagent",
       "label": "Subagent",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-subagent",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-subagent",
       "description": "Background subagent completions"
     },
     {
       "id": "notifications.sound-category-taskrunner",
       "label": "Tasks",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-taskrunner",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-taskrunner",
       "description": "Task Runner completions"
     },
     {
       "id": "notifications.volume",
       "label": "Volume",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.volume"
+      "route": "/settings/notifications/sound?highlight=notifications.volume"
     },
     {
       "id": "notifications.sound-category-hook",
       "label": "Webhook",
       "tab": "notifications",
-      "route": "/settings/notifications?highlight=notifications.sound-category-hook",
+      "route": "/settings/notifications/percategory?highlight=notifications.sound-category-hook",
       "description": "External hook triggers"
     },
     {
@@ -1198,6 +1301,13 @@
       "route": "/settings/security/posture?highlight=security.live-security-posture"
     },
     {
+      "id": "security.redact-credentials-in-files-the-dashboard-opens-for-you",
+      "label": "Redact credentials in files the dashboard opens for you",
+      "tab": "security",
+      "route": "/settings/security/redaction?highlight=security.redact-credentials-in-files-the-dashboard-opens-for-you",
+      "description": "Off shows files the dashboard opens for you — the chat side panel's Files tab, and the Library and Artifacts previews — as written, in your own dashboard only. On by default. Conversations in this dashboard, Slack, and messaging channels stay redacted. Changing it reloads the files you have open (unsaved edits are kept) and closes file-comparison (diff) views."
+    },
+    {
       "id": "security.trust-every-third-party-app",
       "label": "Trust every third-party app",
       "tab": "security",
@@ -1241,7 +1351,7 @@
       "label": "Auto-generate skills from sessions",
       "tab": "skills",
       "route": "/settings/skills?highlight=key%3Askills.auto_create_from_sessions",
-      "description": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on the Skills tab for review — nothing goes live without your approval (see below).",
+      "description": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on Agent Capabilities → Skills for review — nothing goes live without your approval (see below).",
       "configKey": "skills.auto_create_from_sessions"
     },
     {
@@ -1264,7 +1374,6 @@
       "label": "Auto-submit when I finish speaking",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.endpointing",
-      "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
       "configKey": "stt.endpointing"
     },
     {
@@ -1299,15 +1408,13 @@
       "id": "voice.dictation-panel",
       "label": "Dictation panel",
       "tab": "voice",
-      "route": "/settings/voice?highlight=voice.dictation-panel",
-      "description": "Show an animated panel while recording instead of the thin status bar. Falls back to the bar when the browser lacks WebGL2 or your system requests reduced motion."
+      "route": "/settings/voice?highlight=voice.dictation-panel"
     },
     {
       "id": "voice.enabled",
       "label": "Enabled",
       "tab": "voice",
-      "route": "/settings/voice?highlight=voice.enabled",
-      "description": "Transcribe voice into the message box when you click the mic"
+      "route": "/settings/voice?highlight=voice.enabled"
     },
     {
       "id": "voice.engine",
@@ -1330,35 +1437,17 @@
       "configKey": "stt.language_code"
     },
     {
-      "id": "voice.live-transcript-refresh-ms",
-      "label": "Live transcript refresh (ms)",
-      "tab": "voice",
-      "route": "/settings/voice?highlight=key%3Astt.partial_interval_ms",
-      "description": "How often the transcript is redrawn while you speak. Lower feels more immediate and costs more processing.",
-      "configKey": "stt.partial_interval_ms"
-    },
-    {
       "id": "voice.microphone",
       "label": "Microphone",
       "tab": "voice",
-      "route": "/settings/voice?highlight=voice.microphone",
-      "description": "Input device used to capture your voice"
+      "route": "/settings/voice?highlight=voice.microphone"
     },
     {
       "id": "voice.model",
       "label": "Model",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.model",
-      "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
       "configKey": "stt.model"
-    },
-    {
-      "id": "voice.pause-that-ends-a-phrase-ms",
-      "label": "Pause that ends a phrase (ms)",
-      "tab": "voice",
-      "route": "/settings/voice?highlight=key%3Astt.silence_ms",
-      "description": "How much silence commits what you just said. Lower reacts sooner; higher tolerates thinking pauses.",
-      "configKey": "stt.silence_ms"
     },
     {
       "id": "voice.piper-binary",
@@ -1379,7 +1468,6 @@
       "label": "Provider",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.provider",
-      "description": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe uploads your audio to AWS.",
       "configKey": "stt.provider"
     },
     {
@@ -1421,7 +1509,6 @@
       "label": "Streaming",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.streaming",
-      "description": "Show the transcript in the input box as you speak, instead of only when you stop.",
       "configKey": "stt.streaming"
     },
     {
@@ -1430,6 +1517,14 @@
       "tab": "voice",
       "route": "/settings/voice?highlight=voice.tap-vs-hold-cutoff",
       "description": "Only used by “Both”. Hold the key longer than this to talk; a quicker tap starts recording and leaves it on."
+    },
+    {
+      "id": "voice.tidy-up-transcripts-with-ai",
+      "label": "Tidy up transcripts with AI",
+      "tab": "voice",
+      "route": "/settings/voice?highlight=key%3Astt.polish",
+      "description": "Sends the finished text, never the audio, to the AI model you already chat with, which fixes punctuation and capitalisation. Your words are never changed.",
+      "configKey": "stt.polish"
     },
     {
       "id": "voice.voice",

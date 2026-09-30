@@ -33,7 +33,7 @@ In practice the loop stopped at every `--rounds` exit 30: the parent collected t
 retrospective, posted the remove / replace / keep verdicts as a menu, and waited.
 That turned an every-third-round review into a mandatory user gate, which is the
 opposite of what the loop is for. The verdicts are almost always decidable from the
-intent comment and the defect the mechanism was added for, so the skill now names
+PR body's frozen goal and the defect the mechanism was added for, so the skill names
 the pick order and a default, and lists the only four situations where a human
 supplies something the agent cannot. Recurrence is the trigger for the review, not
 a reason to hand the PR back.
@@ -115,12 +115,15 @@ owes a `Breaking:` line plus a writer sweep re-run on fresh `origin/main` right
 before the last push, with that sha written into the body. `green_age.py` asks that
 question of the tests; the sweep asks it of the callers.
 
-The section is deliberately absent from `fork-pr-description.yml`'s
-`REQUIRED_SECTIONS`. That list is matched against the body of every open fork PR
-on each `edited`/`synchronize`, so adding a heading to it would fail every body
-written before this change -- a red that says nothing about the diff. The rule
-reaches the author through the template's own prompt and through prepare-pr's
-Phase 1.5 instead, where it costs an existing PR nothing.
+The section is deliberately absent from `REQUIRED_SECTIONS` in
+`.github/scripts/pr-description-check.sh`, the list PR Hygiene and
+`fork-pr-description.yml` both check. That list is matched against the body of
+every open PR on each `edited`/`synchronize`, so adding a heading to it would fail
+every body written before this change -- a red that says nothing about the diff.
+The rule reaches the author through the template's own prompt and through
+prepare-pr's Phase 1.5 instead, where it costs an existing PR nothing. The frozen
+goal sections pay that cost on purpose: a PR with no goal is exactly what the
+gate exists to stop, so its red does say something about the PR.
 
 ## Why force-with-lease must be SHA-pinned
 
@@ -279,11 +282,32 @@ are the other alternative and are worse on both counts: they leak content, and G
 Camo blocks them on private repos.
 
 The review lanes read the same URL the author wrote: the UX lane's blind read
-downloads the `user-attachments` links from the PR body (a committed image still
-counts), and the screenshot-evidence gate accepts them as visual evidence. Dragging
-a file into the description in the web UI produces an identical URL, so a fork
-contributor without push access — the one case `--attach` refuses — reaches the same
-place by hand, and a human reviewer and the lanes see one convention, not two.
+downloads the `user-attachments` links from the PR body, and the screenshot-evidence
+gate accepts them as visual evidence. Dragging a file into the description in the web
+UI produces an identical URL, so a human reviewer and the lanes see one convention.
+
+**The one scoped exception: a contributor with no write access on the repository.**
+`gh --attach` uploads through an endpoint that answers read permission with a 404
+(cli/cli#14302), so a fork contributor has no CLI path to an attachment at all; the
+web-UI drag is their only one. For them, and only them, committing the media under
+`temp-screenshots/<topic>/` (`git add -f`, past the ignore rule) and referencing the
+repository-relative path from the body is admissible evidence:
+`.github/scripts/pr-committed-evidence.sh` reads the blobs out of the object store for
+the fork lanes, and the screenshot-evidence gate accepts a still-linked committed
+path. The exception does not weaken the rule for anyone who CAN attach: every reason
+above still holds for them, and the cost below is one they would pay for nothing.
+
+**What the exception costs, and which part is irreversible.** When the PR merges,
+the committed file becomes a tracked file on `main` and a blob in history. The tracked
+file is the reversible half: the merging maintainer removes it in a follow-up
+`chore(evidence): drop the committed review media of #<n>` PR, so review media never
+accumulates on the tip again (the sweep that emptied the tree took out 1,739 files
+and 286 MB). The blob is the irreversible half: a deletion commit leaves it in every
+clone's pack, and only a history rewrite removes it, which that sweep deliberately
+deferred. The cost is accepted because it is bounded — fork PRs are the minority, the
+evidence script refuses a file over its size ceiling, and the guidance asks for two or
+three shots — and because it never lands silently: the files are in the diff the
+maintainer squash-merges. The merge-time steps are in `docs/ci/ci-and-reviews.md`.
 
 ## Why the closing-keyword check reads the API back
 
@@ -339,9 +363,11 @@ runs over 25 hours with 23 approval blocks, zero pushes, and a healthy-looking
 registry. Heartbeat runs under a strict name allowlist (`HEARTBEAT_SAFE_TOOLS`) with
 no shell and no `git push`, so it cannot amend a commit at all.
 
-`pr_watch` is exempted only for a pure-watch stretch because it reads no comment
+`monitor_watch` is exempted only for a pure-watch stretch because it reads no comment
 bodies. A round is complete when every check finished **and** every bot posted, and
-`pr_watch` cannot see the second half of that condition.
+a provider-typed watch cannot see the second half of that condition. There is no
+script-cron watcher to exempt: a cron holding a copy of the retired driver is
+refused on every tick and auto-paused.
 
 ## Why arming cannot be confirmed from the reply
 

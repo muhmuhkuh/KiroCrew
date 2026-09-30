@@ -18,11 +18,20 @@ from kiro_crew.apps.builtins import BUILTIN_NAMES
 from kiro_crew.apps.routes import register_app_routes
 from kiro_crew.constants import env_flag_enabled
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.handlers import redaction as redaction_handlers
 from kiro_crew.dashboard.handlers.tunnel import api_tunnel_status
 
 
 def register(app: web.Application) -> None:
     """Register the system routes on *app*."""
+    # Redaction cards: allowed hosts (Settings -> Security).
+    app.router.add_get(
+        "/api/redaction/allowed-hosts", redaction_handlers.api_redaction_allowed_hosts
+    )
+    app.router.add_post("/api/redaction/allowed-hosts", redaction_handlers.api_redaction_allow_host)
+    app.router.add_delete(
+        "/api/redaction/allowed-hosts", redaction_handlers.api_redaction_revoke_host
+    )
     # Misc (notifications GET/clear and send-message via _register_mcp_routes)
     app.router.add_get("/api/notifications", handlers.api_notifications)
     app.router.add_delete("/api/notifications", handlers.api_notification_delete)
@@ -39,6 +48,12 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/update", handlers.api_update_apply)
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/channel", handlers.api_update_channel)
+    # A terminal `kirocrew update` on a git checkout pokes this so the running
+    # gateway drops its stale update verdict and re-checks now, instead of the
+    # About badge waiting up to 12h for the next poll. Self-authenticates over
+    # loopback + the local secret (the token-auth middleware lets the POST
+    # through via its method-scoped bypass), like /api/logout.
+    app.router.add_post("/api/update/revalidate", handlers.api_update_revalidate)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
     # In-app wheel update step-up (RFC OQ7): the SPA arms, only the host
     # approves. Arm/status are ordinary authenticated routes; approve
@@ -65,6 +80,10 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/sessions/memory", handlers.api_sessions_memory)
     app.router.add_get("/api/sessions/health", handlers.api_sessions_health)
     app.router.add_get("/api/sessions/usage", handlers.api_sessions_usage)
+    # The account modal's Refresh button: runs the same free API-then-/usage
+    # refresh the timer runs, now. The handler applies the kiro-unverified check
+    # the GET applies and refuses a second refresh while one is in flight (409).
+    app.router.add_post("/api/sessions/usage/refresh", handlers.api_sessions_usage_refresh)
     # Durable task queue + capacity view. The literal /summary is registered
     # before the /{task_id} pattern for the same reason /sessions/search is.
     app.router.add_get("/api/tasks", handlers.api_tasks_list)
@@ -169,6 +188,10 @@ def register(app: web.Application) -> None:
         "/api/file-delivery/consent/approve", handlers.api_file_delivery_consent_approve
     )
     app.router.add_delete("/api/file-delivery/consent", handlers.api_file_delivery_consent_delete)
+    # Credential-redaction switch. Owner-gated in the handler, like the consent
+    # routes above: its only legitimate caller is the owner's browser.
+    app.router.add_get("/api/security/credential-redaction", handlers.api_credential_redaction_get)
+    app.router.add_put("/api/security/credential-redaction", handlers.api_credential_redaction_put)
     app.router.add_get("/api/approvals", handlers.api_approvals)
     app.router.add_post("/api/approvals/{id}/{action}", handlers.api_approval_resolve)
 

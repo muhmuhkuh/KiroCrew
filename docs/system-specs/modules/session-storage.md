@@ -21,6 +21,20 @@ A conversation's bytes live in two places, owned by two programs:
 | Transcript | `<data home>/sessions/<stem>.jsonl` + `sessions/archive/<stem>__<stamp>.jsonl` | Dashboard history, search, memory consolidation |
 | Replay log | `<kiro home>/sessions/cli/<sid>.json` + `<sid>.jsonl` | kiro-cli, to resume a session |
 
+A third store rides along when the session recorded one: its crew logs,
+`<data home>/crew-log/sessions/<unit>/`, one unit per ACP session id the
+conversation ran under (a reset or model switch starts a new one). A unit joins
+the session whose transcript its header's `slot` names, else the replay log with
+its own id, else it is a row of its own. Its bytes and newest mtime count toward
+the session, and a session any of whose units is mapped is active.
+A report that cannot list every unit answers with what it could; `move_to_trash`
+refuses instead, because a session staged without its crew logs would leave them
+behind attached to no row.
+The dashboard's move re-reads the LIVE session map, where a resume's mapping lands
+before its deferred file write, and stages a session's units inside the same hold of
+`session_map._MAP_LOCK` that `SessionMap.set` takes, so a resume either lands first
+and keeps the session, or waits until its units have moved.
+
 That split is an implementation detail. `StorageReport` carries no per-store
 breakdown and the HTTP payload has no field from which one could be derived, so a
 client can only present a session as one thing with one size. An inventory row
@@ -293,7 +307,8 @@ reclaimable.
 
 `title` and `first_message` are conversation content, so they pass
 `redact_exfiltration_urls()` then `redact_credentials()` — the same order
-`_serialize_artifact` uses. `origin` gets the same treatment: a session id is
+`dashboard/handlers/artifacts.py::_serialize` uses. `origin` gets the same
+treatment: a session id is
 rendered, `_UNIT_ID_RE` admits the alphanumeric shape of an access-key id, and a
 credential pasted into an id would otherwise reach the dashboard verbatim.
 
@@ -314,6 +329,31 @@ registering the module fails
 `TestAMalformedTitleCannotCrashTheList` covers the type guard.
 
 ## The trash
+
+### Crew logs are staged in the crew-log tree, not in the batch
+
+The batch directory is agent-writable and the crew-log tree is hidden from the
+sandbox, and a staged file is later RESTORED into the live tree. A crew log waiting
+in the batch could be edited into entries the gateway then reads as its own, so
+crew logs never enter it. After a session's files are staged and its manifest entry
+is written, each of its units is renamed under its sole lease
+(`crew_log.store.stage_unit`) to `<data home>/crew-log/trash/<batch>/<uid>/`, and both
+parent directories are synced before the move counts. Windows refuses to rename a
+directory holding an open handle, and the lease is one, so there the lease is released
+first and the same refusal stops a writer that took it in the gap. A unit a writer
+still holds is left in place. Restore puts a session's units back before its files,
+refusing an occupied name. Each unit is held (`.trash-hold`, synced with its directory) before it
+is published -- a hold that cannot be synced keeps it staged -- and released only once the
+whole session is back, and a history delete never takes a held unit, so a retention sweep running in between
+cannot expire half of a session that is being restored. When the rest of a restore then fails and a unit it
+already put back cannot be staged again -- a resumed session now leases it, or a sync
+fails -- that unit stays live while its session stays in the batch. It is HELD: a
+`.trash-hold` file in the unit directory keeps the retention sweep off it, and
+`<uid>/held` beside the session's staging lists it, so the hold is released when that
+session is restored whole or its batch is emptied. Only emptying the batch the user selected removes its
+crew-log staging: the batch directory is agent-writable, so a batch missing from it
+approves nothing, and its staging is kept. `list_trash` adds the staged crew-log bytes
+to each batch.
 
 Staged batches live at `<data home>/trash/sessions/<batch id>/`, with each file
 kept under a `cli/` or `crew/` subdirectory. The two halves can share a filename,
@@ -449,7 +489,7 @@ removed on another one's approval. `_remove_scanned_dirs()` therefore renames th
 name to `.<name>.removing-<random>` in the same parent, re-checks dev/ino there
 against the approved map, and removes THAT. A swap that beats the rename moves
 the intruder within its own parent instead of deleting it, and is then refused and
-renamed back by `_restore_staged_dir()`, so a refusal never leaves a directory
+renamed back by `pinned_fs.remove_dir_verified()`, so a refusal never leaves a directory
 under a name the user cannot recognise. Removal by name is what the coarse batch
 path and the manifest already avoid this way.
 `test_a_directory_swapped_after_its_identity_check_is_not_removed` covers the
@@ -522,7 +562,7 @@ precondition. A filesystem without hard links refuses `os.link` outright, and th
 probe cannot see that -- it tests whether the OS accepts `dir_fd`, not what the MOUNT
 supports. Failing there would leave the batch holding data with no manifest, the exact loss
 this recovery exists to prevent. A non-`EEXIST` failure therefore falls back to an
-EXCLUSIVE CREATE and a copy (`_copy_back_exclusive()`), not to a rename after checking the
+EXCLUSIVE CREATE and a copy (`pinned_fs.put_back_no_clobber()`), not to a rename after checking the
 name is free: that check and that rename are two syscalls, and a file arriving between them
 is replaced -- the same trusted-a-name mistake every other guard here exists to remove.
 `O_CREAT | O_EXCL` decides in ONE syscall, so there is no window to lose, and it needs no
@@ -540,7 +580,7 @@ still listable, and the debris is left for a human.
 "Removing a link destroys nothing" describes the link the scan SAW, not whatever
 holds that name when the pass runs: a regular file moved onto a recorded link's
 name is data, and unlinking it would be the loss the file pass's identity check
-exists to prevent. `_scan_batch()` therefore records each link's inode rather than
+exists to prevent. `pinned_fs.scan_tree_pinned()` therefore records each link's inode rather than
 just its path, and the pass demands `S_ISLNK` plus the recorded dev/ino before
 unlinking. This closes the scan-to-unlink interval; the two syscalls between the
 check and the unlink remain the same POSIX residual the leaf file has, for the same
@@ -581,7 +621,7 @@ The SCAN that produces that map has a check-to-use window of its own, and it is 
 place that could not be allowed to trust a name: every other guard here is downstream of
 the map it builds. `scandir` lists a name and the child is opened a moment later, so a rename
 in between records the REPLACEMENT's inode -- the approval then blesses the impostor and the
-delete, validating faithfully against that map, removes it. `_scan_batch()` compares the
+delete, validating faithfully against that map, removes it. `pinned_fs.scan_tree_pinned()` compares the
 opened descriptor's inode against `entry.inode()` from the listing and refuses on a
 mismatch.
 `test_a_directory_swapped_between_the_listing_and_the_open_is_refused` covers it, and the

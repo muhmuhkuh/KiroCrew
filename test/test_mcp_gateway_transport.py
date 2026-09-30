@@ -16,6 +16,7 @@ Three jobs:
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import shutil
 import socket
@@ -25,10 +26,34 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
-from tmpdir_helpers import SHORT_TMP_PREFIX
+from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
+from kiro_crew import code_fingerprint as cf
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import transport
+
+
+@pytest.fixture(autouse=True)
+def _no_git_fingerprint(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``code_fingerprint()`` without a git spawn, per test, cache isolated.
+
+    ``GatewayManager._start_locked`` and ``run_gatewayd`` both warm
+    ``code_fingerprint()`` before ``prepare_dir``, and the cached fingerprint is
+    of ``_PACKAGE_ROOT`` -- THIS checkout -- so a cold read runs
+    ``git -C <checkout> rev-parse HEAD`` and ``git diff HEAD`` on the developer's
+    own repository from a pool thread with the worker's cwd inherited; which test
+    pays depends on run order (whoever reads first after a ``cache_clear``).
+    Nothing in this module reads the value, so the trusted-git resolver is pinned
+    to "absent" -- the product's own no-spawn arm, the mtime rule -- exactly as
+    ``test_mcp_gateway_daemon_lifecycle.py`` does. The cache is cleared on both
+    sides so the pinned value neither reuses a real one nor leaks to a module
+    that must match a child daemon's real fingerprint.
+    """
+    monkeypatch.setattr(cf, "trusted_git_bin", lambda: None)
+    cf.code_fingerprint.cache_clear()
+    yield
+    cf.code_fingerprint.cache_clear()
+
 
 # --- Address resolution ------------------------------------------------------
 
@@ -214,12 +239,16 @@ def sock_dir(tmp_path: Path) -> Iterator[Path]:
     total to 132 bytes and failed on every macOS checkout while passing on Linux,
     where the shorter ``/tmp`` and the 108-byte cap both help.
 
-    ``/tmp`` directly, with a short unique leaf: the path stays ~25 bytes, so it
-    fits on either platform regardless of how the test is named. Only the tests
-    that actually bind a socket need this; the ones asserting path arithmetic
+    The short base comes from ``tmpdir_helpers.short_tmp_base()`` -- the ONE seam
+    the suite has for "a temp dir short enough for ``sun_path``" -- rather than a
+    literal ``/tmp`` spelled here: a second spelling of the same platform rule is
+    what let the two drift, and whatever root that helper hands out (today the
+    system temp root; a run-owned short root once the floor grows one) applies to
+    this module's binds without a per-site edit. Only the tests that actually
+    bind a socket need this; the ones asserting path arithmetic
     (``lock_path_for``, ``resolve_address``) are unaffected and keep ``tmp_path``.
     """
-    base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "gwsock-", dir="/tmp"))
+    base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "gwsock-", dir=short_tmp_base()))
     try:
         yield base
     finally:
@@ -839,6 +868,91 @@ def test_probe_live_reports_an_unknown_error_as_dead(
     assert transport.probe_live("C:/state/gateway.sock") is False
 
 
+# --- POSIX probe reachable from Windows --------------------------------------
+
+
+class _ScriptedConnectSocket:
+    """Stub socket whose ``connect`` raises a scripted exception (or nothing)."""
+
+    def __init__(self, connect_exc: BaseException | None) -> None:
+        self._connect_exc = connect_exc
+
+    def settimeout(self, _timeout: float) -> None:
+        pass
+
+    def connect(self, _address: str) -> None:
+        if self._connect_exc is not None:
+            raise self._connect_exc
+
+    def close(self) -> None:
+        pass
+
+
+def _force_posix_probe_branch(
+    monkeypatch: pytest.MonkeyPatch, connect_exc: BaseException | None
+) -> None:
+    """Route ``probe_live`` into its POSIX branch with a stub socket factory."""
+    monkeypatch.setattr(pc, "IS_WINDOWS", False)
+    monkeypatch.setattr(
+        transport,
+        "_socket",
+        type(
+            "FakeSocketModule",
+            (),
+            {
+                "AF_UNIX": 1,
+                "SOCK_STREAM": 2,
+                "timeout": socket.timeout,
+                "socket": staticmethod(lambda *args: _ScriptedConnectSocket(connect_exc)),
+            },
+        ),
+    )
+
+
+def test_probe_live_treats_a_connect_timeout_as_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect that times out is an inconclusive probe, not a dead endpoint.
+
+    A real timeout is only one of the inconclusive shapes a loaded daemon can
+    produce; whichever it is, the endpoint must not be taken away. Reporting a
+    timeout as dead would let ``remove_stale`` unlink a live daemon's socket.
+    """
+    _force_posix_probe_branch(monkeypatch, socket.timeout("timed out"))
+    assert transport.probe_live("/state/gateway.sock") is True
+
+
+def test_probe_live_treats_a_full_backlog_eagain_as_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real Linux full-backlog case: a non-blocking connect fails EAGAIN.
+
+    ``settimeout`` makes the socket non-blocking, so on Linux a ``connect()``
+    against a full accept backlog fails at once with ``EAGAIN``
+    (``BlockingIOError``) rather than raising ``socket.timeout``. That is the
+    exact condition the fix protects -- a healthy but overloaded daemon -- so
+    it must report live, not dead.
+    """
+    _force_posix_probe_branch(monkeypatch, BlockingIOError(errno.EAGAIN, "try again"))
+    assert transport.probe_live("/state/gateway.sock") is True
+
+
+def test_probe_live_treats_a_refused_connect_as_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The true negative stays negative: a refused connect means no listener."""
+    _force_posix_probe_branch(monkeypatch, ConnectionRefusedError(111, "refused"))
+    assert transport.probe_live("/state/gateway.sock") is False
+
+
+def test_probe_live_treats_a_missing_socket_as_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other conclusive negative: the socket name does not exist."""
+    _force_posix_probe_branch(monkeypatch, FileNotFoundError(errno.ENOENT, "no such file"))
+    assert transport.probe_live("/state/gateway.sock") is False
+
+
 @pytest.mark.asyncio
 async def test_serve_rejects_a_loop_without_pipe_support(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -949,10 +1063,18 @@ async def test_manager_offloads_prepare_dir_from_the_event_loop(
 async def test_gatewayd_offloads_prepare_dir_from_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from unittest.mock import AsyncMock
+
     from kiro_crew.mcp_gateway import gatewayd as gw
 
     probe = _LoopProbe()
     monkeypatch.setattr(gw.transport, "prepare_dir", probe)
+    # ``run_gatewayd`` warms the code fingerprint before ``prepare_dir``, and a
+    # cold fingerprint runs the host's real ``git`` against the checkout (the
+    # value is process-cached, so whether THIS test spawns it depends on which
+    # test ran first in the worker). Pin the seam the daemon reads: this test
+    # is about where ``prepare_dir`` runs, not about what the code is.
+    monkeypatch.setattr(gw, "warm_code_fingerprint", AsyncMock(return_value="fp-test"))
     # Lose the singleton election immediately after prepare_dir so the daemon
     # returns without binding anything.
     monkeypatch.setattr(gw.transport, "acquire_singleton_lock", lambda _p: None)

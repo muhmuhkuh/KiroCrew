@@ -1,7 +1,8 @@
-import { forwardRef, type ReactNode } from 'react'
-import { ListFilter, X } from 'lucide-react'
+import { forwardRef, type ComponentProps, type ReactNode } from 'react'
+import { ListFilter, Search, X } from 'lucide-react'
 
-import { SearchInput } from './ui'
+import { Glass } from './Glass'
+import { DropdownMenuContent, DropdownMenuLabel } from './ui/dropdown-menu'
 import { cn } from '../lib/utils'
 
 /**
@@ -11,6 +12,14 @@ import { cn } from '../lib/utils'
  * keeps the typed text clear of those controls. Shared with the Crew Members
  * roster so both lists carry the same field; `src/test/searchFilterBar.parity.test.tsx`
  * pins both pages to it.
+ *
+ * The field is a Liquid Glass pane (components/Glass.tsx, the chip recipe at a
+ * 10px radius) and floats over the list inside a `ListDock`,
+ * so the rows scroll under it the way the transcript scrolls under the
+ * composer. The `<input>` inside is transparent: the pane IS the field's
+ * surface. Like every glass pane (the composer, the mobile Settings capsule)
+ * it does not change on focus -- maintainer decision, no ring, no tint or edge
+ * step; the caret is the indicator -- so the input carries no ring of its own.
  *
  * Trailing controls are 24px (`w-6`) buttons in a `gap-0.5` row 4px from the
  * field's right edge. The input's right padding and the clear button's
@@ -22,6 +31,9 @@ import { cn } from '../lib/utils'
 const INPUT_PAD_RIGHT = [12, 36, 56] as const
 const CLEAR_RIGHT = [8, 32, 56] as const
 const CLEAR_WIDTH = 20
+/** Rounded, not a capsule: the list rows under it are `rounded-md` boxes, and a
+ *  32px field at the composer's 16px would read as a pill among rectangles. */
+const FIELD_RADIUS = 10
 
 export function SearchFilterBar({
   value, onChange, placeholder, clearLabel, trailing, trailingCount, className, inputTestId, ...inputProps
@@ -35,17 +47,21 @@ export function SearchFilterBar({
    *  friends. Pass `trailingCount` when the count is not one control per child. */
   trailing?: ReactNode
   trailingCount?: number
-  /** Wrapper spacing; the sidebar's `px-2 pt-2 pb-1` by default. */
+  /** Wrapper spacing; `px-2 pt-2` by default. No bottom padding: inside the
+   *  ListDock the pane's bottom edge IS the dock's edge, so rows scrolling
+   *  under emerge at the glass, not from a strip of gap below it. */
   className?: string
   inputTestId?: string
 } & Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'placeholder' | 'className'>) {
   const n = Math.min(trailingCount ?? (trailing ? 1 : 0), INPUT_PAD_RIGHT.length - 1)
   const padRight = INPUT_PAD_RIGHT[n] + (value ? CLEAR_WIDTH : 0)
   return (
-    <div className={cn('px-2 pt-2 pb-1', className)}>
-      <div className="relative">
-        <SearchInput
-          className="w-full"
+    <div className={cn('px-2 pt-2', className)}>
+      <Glass variant="chip" radius={FIELD_RADIUS} className="glass-shadow w-full" data-testid="search-field-glass">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none" aria-hidden="true" />
+        <input
+          /* focus-cue-ok: maintainer decision -- the Glass host does not change on focus (no ring, no tint or edge step, never the accent), the same rule as the composer and the mobile Settings capsule; the caret is the indicator, and a ring on the input itself is not wanted. */
+          className="w-full bg-transparent border-none rounded-full pl-8 py-1.5 text-text text-[13px] font-body outline-hidden placeholder:text-muted/70"
           placeholder={placeholder}
           value={value}
           onChange={e => onChange(e.target.value)}
@@ -70,7 +86,7 @@ export function SearchFilterBar({
             {trailing}
           </div>
         )}
-      </div>
+      </Glass>
     </div>
   )
 }
@@ -108,11 +124,20 @@ export const FilterMenuButton = forwardRef<HTMLButtonElement, {
   },
 )
 
-/** Section label inside the filter menu (`FILTER`, `SORT BY`). */
-export const FILTER_MENU_LABEL_CLS = 'text-[11px] uppercase tracking-[.04em]'
+/** Section label inside the filter menu (`FILTER`, `SORT BY`). A component
+ *  rather than an exported class string so the design-system lint can read the
+ *  classes where they are applied: it follows a className only within a file. */
+export function FilterMenuLabel({ className, ...props }: ComponentProps<typeof DropdownMenuLabel>) {
+  return <DropdownMenuLabel className={cn('text-[11px] uppercase tracking-[.04em]', className)} {...props} />
+}
 
-/** Width bounds of the filter menu: wide enough for a row, never past a phone viewport. */
-export const FILTER_MENU_CONTENT_CLS = 'min-w-[180px] max-w-[calc(100vw-1rem)]'
+/** The filter menu's panel: wide enough for a row, never past a phone viewport.
+ *  Radix sizes the popper wrapper to `max-content`, so without the cap the
+ *  inline pickers' caption sentences (a phone renders them here instead of in
+ *  a flyout) would stretch the menu past the screen edge. */
+export function FilterMenuContent({ className, ...props }: ComponentProps<typeof DropdownMenuContent>) {
+  return <DropdownMenuContent className={cn('min-w-[180px] max-w-[calc(100vw-1rem)]', className)} {...props} />
+}
 
 /** The row of dismissible chips under a list's search row while any filter is
  *  on — the at-rest marker that the list is narrowed. `px-3` is one step wider

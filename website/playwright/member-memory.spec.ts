@@ -351,19 +351,24 @@ test('an empty private memory opens its exact member conversation and reuses the
   await expect(page).toHaveURL(url => url.pathname === '/members' && url.searchParams.get('member') === owner.name)
   const memberHeader = page.getByTestId('member-thread-header')
   await expect(memberHeader.getByText(owner.name, { exact: true })).toBeVisible()
-  await expect(memberHeader.getByRole('button', { name: 'Edit member', exact: true })).toBeAttached()
+  // The identity pill is the edit entry: a button NAMED by the crewmate (its
+  // content) whose tooltip -- the accessible description -- says what it opens.
+  const identityPill = memberHeader.getByTestId('member-identity-pill')
+  await expect(identityPill).toHaveRole('button')
+  await expect(identityPill).toContainText(owner.name)
+  await expect(identityPill).toHaveAttribute('title', 'Edit crewmate')
   await expect(page.getByPlaceholder(/message/i)).toBeVisible()
 
   const panelToggle = page.getByTestId('member-panel-toggle')
   if (await panelToggle.isVisible()) await panelToggle.click()
-  await page.getByTestId('side-panel-leading-tab').click()
-  const summary = page.getByTestId('member-crew-summary')
-  const memoryStatus = summary.getByText('This member uses Member memory (V2).', { exact: true })
-  await expect(memoryStatus).toBeVisible()
-  const manageMemory = summary.getByRole('button', { name: 'Manage memory', exact: true })
-  await manageMemory.scrollIntoViewIfNeeded()
-  await expect(memoryStatus).toBeInViewport({ ratio: 1 })
-  await expect(manageMemory).toBeInViewport({ ratio: 1 })
+  // The panel opens on the crewmate's own tabs (Notes / Work log / Dashboard);
+  // the memory binding is a setting and lives on the crew editor only (asserted
+  // below in the editor case), so the panel body must not restate it.
+  await page.getByTestId('side-panel-leading-tab-crew-notes').click()
+  const notes = page.getByTestId('member-notes')
+  await expect(notes).toBeVisible()
+  await expect(notes.getByText(`${owner.name} hasn't written any notes yet.`, { exact: true })).toBeVisible()
+  await expect(page.getByTestId('side-panel-leading-body').getByText(/member memory/i)).toHaveCount(0)
   await page.screenshot({ path: testInfo.outputPath('member-memory-members-status.png'), fullPage: false, animations: 'disabled' })
 
   // The roster reads dm.json from disk, so this checks the saved binding rather
@@ -438,7 +443,7 @@ test('a legacy configured default member keeps V1 while new members receive inde
     let editor = page.getByRole('dialog').filter({ has: page.getByTestId('crew-editor-identity') })
     await expect(editor).toBeVisible()
     await editor.getByRole('tab', { name: /^Workspace · Memory(?: Shared)?$/ }).click()
-    const guidance = editor.getByText('This member keeps its current memory (V1). Member memory (V2) is only available when creating a new crew member.', { exact: true })
+    const guidance = editor.getByText('This crewmate keeps its current memory (V1). Its own memory (V2) is only available when creating a new crewmate.', { exact: true })
     await expect(guidance).toBeVisible()
     await expect(editor.getByRole('button', { name: 'Create private memory', exact: true })).toHaveCount(0)
     await expect(editor.getByText(/This member cannot return to its previous memory/)).toHaveCount(0)
@@ -456,7 +461,7 @@ test('a legacy configured default member keeps V1 while new members receive inde
     editor = page.getByRole('dialog').filter({ has: page.getByTestId('crew-editor-identity') })
     await expect(editor).toBeVisible()
     await editor.getByRole('tab', { name: /^Workspace · Memory(?: Shared)?$/ }).click()
-    await expect(editor.getByText('This member uses Member memory (V2).', { exact: true })).toBeVisible()
+    await expect(editor.getByText('This crewmate has its own memory (V2).', { exact: true })).toBeVisible()
     await expect(editor.getByRole('button', { name: 'Create private memory', exact: true })).toHaveCount(0)
     await expect(editor.getByRole('button', { name: 'Manage memory', exact: true })).toBeEnabled()
     const workspace = editor.getByRole('combobox', { name: 'Workspace', exact: true })

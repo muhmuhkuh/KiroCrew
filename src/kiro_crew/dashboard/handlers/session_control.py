@@ -24,6 +24,7 @@ from kiro_crew.dashboard.handlers._shared import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.sel import sel
+from kiro_crew.validation import MAX_BROADCAST_TARGETS, MAX_SHORT_STRING
 
 logger = logging.getLogger(__name__)
 
@@ -109,13 +110,14 @@ async def _private_caller_refusal(request: web.Request) -> web.Response | None:
     # is a different predicate and stays there. All reads run off the loop in one
     # hop and fail closed on an unreadable config, so this gate never opens wider
     # than the two switches behind it.
-    from kiro_crew.members import is_member_session_key
-
     session_key = _read_session_key(request)
 
     def _caller_is_member_and_reachable() -> bool:
-        is_member = is_member_session_key(session_key) or sc._store_is_member_owned(scope)
-        return is_member and (sc.member_dispatch_enabled() or sc.session_control_enabled())
+        # The SHARED predicate the chat folder/tag gate also uses
+        # (``handlers/_shared.py``'s ``private_chat_route_refusal``), so the two
+        # surface gates cannot drift on who a member is or when the surface is
+        # reachable for it.
+        return sc.member_admitted_to_scoped_surface(session_key, scope)
 
     if await asyncio.to_thread(_caller_is_member_and_reachable):
         # Admitted AS A MEMBER. Record that on the request so the route carries it
@@ -203,11 +205,18 @@ def _refusal(exc: sc.SessionControlError) -> web.Response:
     if exc.status == 429:
         return web.json_response({"error": exc.message, "code": exc.code}, status=429)
     if exc.status == 500:
-        # A genuine server-side failure — `close_target` raises this for the three
-        # close-path failures (nudge retire / app hook / history save), each of
-        # which left the tab open with every partial step rolled back. It is not a
-        # client error, so it must not degrade to 400.
+        # A genuine server-side failure: `close_target` raises this for the four
+        # close-path failures (history write running / nudge retire / app hook /
+        # history save), each of which left the tab open with every partial step
+        # rolled back. It is not a client error, so it must not degrade to 400.
         return web.json_response({"error": exc.message, "code": exc.code}, status=500)
+    if exc.status == 503:
+        # A retryable server-side failure -- `revive_session` raises this when the
+        # reopen write could not land (`reopen_failed`) or a refused resume could
+        # not confirm its `closed` marker restored (`reopen_rollback_failed`).
+        # The distinction from 500 is the remedy: try again, or close from the
+        # History tab. Neither is a client error, so neither degrades to 400.
+        return web.json_response({"error": exc.message, "code": exc.code}, status=503)
     return web.json_response({"error": exc.message, "code": exc.code}, status=400)
 
 
@@ -236,6 +245,11 @@ async def api_session_control_create(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     try:
         body = await _body(request)
+        # Strictly typed, never truthiness: the string "false" is truthy, and a
+        # caller asking for a real create must never get a silent preview.
+        dry_run = body.get("dry_run", False)
+        if not isinstance(dry_run, bool):
+            raise sc.SessionControlError("dry_run must be a boolean", code="invalid_field_type")
         # Warmed AFTER the body read, which suspends: a config edit landing in that
         # window would change the fingerprint and leave `create_session`'s own
         # synchronous gate re-reading the file on the loop. Nothing suspends between
@@ -247,6 +261,50 @@ async def api_session_control_create(request: web.Request) -> web.Response:
             title=str(body.get("title") or ""),
             agent=str(body.get("agent") or ""),
             folder_id=str(body.get("folder_id") or ""),
+            model=str(body.get("model") or ""),
+            dry_run=dry_run,
+            # The fence verdict this request's admission already settled, for the
+            # same reason every other route forwards it as
+            # `precomputed_ownership_fenced`: `create_session` consults it after
+            # many suspensions, and the inline predicate re-derives member status
+            # from the mutable config record. Here it decides whether the child
+            # may be bound to a member's private store.
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_fork(request: web.Request) -> web.Response:
+    """POST /api/session-control/fork — open a session carrying another's transcript."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        # Strictly typed: this body is model-controlled, and `bool` is an `int`
+        # subclass, so `True` would otherwise read as fork point 1.
+        at_index = body.get("at_message_index")
+        if at_index is not None and (isinstance(at_index, bool) or not isinstance(at_index, int)):
+            raise sc.SessionControlError(
+                "at_message_index must be a non-negative integer", code="invalid_field_type"
+            )
+        source = body.get("source", "")
+        if not isinstance(source, str):
+            raise sc.SessionControlError("source must be a string", code="invalid_field_type")
+        # Warmed AFTER the body read, for the reason `api_session_control_create`
+        # gives: nothing suspends between here and `fork_session`'s own gate.
+        await sc.prewarm_enabled_check()
+        result = await sc.fork_session(
+            state,
+            caller_session_key=_read_session_key(request),
+            source=source,
+            title=str(body.get("title") or ""),
+            folder_id=str(body.get("folder_id") or ""),
+            at_message_index=at_index,
+            caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:
         return _refusal(exc)
@@ -275,6 +333,30 @@ async def api_session_control_stop(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def api_session_control_set_model(request: web.Request) -> web.Response:
+    """POST /api/session-control/set-model — change an idle session's model."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # No prewarm here, for the reason `api_session_control_stop` gives.
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        model = body.get("model")
+        if not isinstance(model, str):
+            raise sc.SessionControlError("model must be a string", code="bad_request")
+        result = await sc.set_model_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            model=model,
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
 async def api_session_control_close(request: web.Request) -> web.Response:
     """POST /api/session-control/close — archive another session (tab ✕)."""
     refused = await _require_internal(request)
@@ -290,6 +372,28 @@ async def api_session_control_close(request: web.Request) -> web.Response:
             state,
             caller_session_key=_read_session_key(request),
             target=_target(body),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_revive(request: web.Request) -> web.Response:
+    """POST /api/session-control/revive — bring an archived session back (mirror of close)."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # No prewarm here either: `revive_session` warms the SEL logger and the
+    # config after its own SEL prewarm, the same ordering `close_target` uses.
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        result = await sc.revive_session(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            folder_id=str(body.get("folder_id") or ""),
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:
@@ -329,6 +433,139 @@ async def api_session_control_send(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def api_session_control_broadcast(request: web.Request) -> web.Response:
+    """POST /api/session-control/broadcast — deliver one message to several sessions."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        message = body.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise sc.SessionControlError("message is required", code="message_required")
+        # The MODE is required and typed, never inferred. A missing or misspelled
+        # mode must not fall back to either delivery: defaulting to the queue would
+        # silently swallow a caller's request to interrupt, and defaulting to the
+        # steer would interrupt sessions a caller only meant to leave a note for.
+        mode = body.get("mode")
+        if not isinstance(mode, str) or mode not in sc.BROADCAST_MODES:
+            raise sc.SessionControlError(
+                f"mode must be one of {', '.join(sc.BROADCAST_MODES)}",
+                code="invalid_broadcast_mode",
+            )
+        targets = body.get("targets")
+        if targets is not None:
+            # Strictly typed for the reason `fork`'s index is: this body is
+            # model-controlled. A bare string would iterate as its characters and
+            # broadcast to one session per letter.
+            if not isinstance(targets, list) or not all(isinstance(t, str) for t in targets):
+                raise sc.SessionControlError(
+                    "targets must be an array of strings", code="invalid_field_type"
+                )
+            # BOUNDED HERE, at the point of retention, before anything resolves.
+            # The MCP schema's `maxItems` is not this boundary: an in-sandbox agent
+            # shell reaches this route directly with a body of its own, so a bound
+            # that exists only in the client is no bound at all.
+            #
+            # The count first. `broadcast_to_targets` refuses an oversized audience
+            # too, but reaching that refusal means resolving every name on the way,
+            # and each resolution copies the authorized-slot set and walks it twice
+            # (`_resolve_slot`) with nothing awaited in between. A list of a million
+            # short strings is therefore millions of synchronous passes that occupy
+            # the event loop first and are refused second. Refusing the length here
+            # makes the cost of an oversized list one integer comparison.
+            if len(targets) > MAX_BROADCAST_TARGETS:
+                raise sc.SessionControlError(
+                    f"a broadcast reaches at most {MAX_BROADCAST_TARGETS} sessions "
+                    f"and this one names {len(targets)}; send to a named subset "
+                    "instead",
+                    code="too_many_targets",
+                )
+            # Then each element. A target is a session key, transcript stem, or
+            # exact title -- all short by construction -- and an unresolved name is
+            # RETAINED in the audience and echoed back in its own refusal row, so
+            # without this a single 60 MiB string is casefolded, compared against
+            # every candidate title, and then held for the report.
+            for element in targets:
+                if len(element) > MAX_SHORT_STRING:
+                    raise sc.SessionControlError(
+                        f"a target name exceeds {MAX_SHORT_STRING} characters; pass "
+                        "a session key, transcript name, or exact title",
+                        code="target_too_long",
+                    )
+        result = await sc.broadcast_to_targets(
+            state,
+            caller_session_key=_read_session_key(request),
+            message=message,
+            mode=mode,
+            targets=targets,
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_status(request: web.Request) -> web.Response:
+    """GET /api/session-control/status — the sessions this caller stood up, and their state."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # At the top like `read`: there is no body to parse. The awaited coroutine's
+    # synchronous gate runs before its first suspension, so nothing yields between
+    # this prewarm and that gate; its history scan suspends only after the gate.
+    await sc.prewarm_enabled_check()
+    state: DashboardState = request.app["state"]
+    try:
+        result = await sc.created_session_status(
+            state,
+            caller_session_key=_read_session_key(request),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_adopt(request: web.Request) -> web.Response:
+    """POST /api/session-control/adopt — take another session under this one."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        result = await sc.adopt_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_release(request: web.Request) -> web.Response:
+    """POST /api/session-control/release — let a session out from under its parent."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        result = await sc.release_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
 async def api_session_control_read(request: web.Request) -> web.Response:
     """GET /api/session-control/read — read another session's transcript tail."""
     refused = await _require_internal(request)
@@ -358,6 +595,30 @@ async def api_session_control_read(request: web.Request) -> web.Response:
             target=target,
             limit=limit,
             since=since,
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_summary(request: web.Request) -> web.Response:
+    """GET /api/session-control/summary — read another session's cached intent summary."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # Same placement as `read`: query parsing is synchronous, and `read_summary`
+    # runs its gate before its first await.
+    await sc.prewarm_enabled_check()
+    state: DashboardState = request.app["state"]
+    try:
+        target = (request.query.get("target") or "").strip()
+        if not target:
+            raise sc.SessionControlError("target is required", code="target_required")
+        result = await sc.read_summary(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=target,
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:

@@ -3,12 +3,12 @@
 ## Overview
 
 `onboarding_import.py` migrates a user's setup from another AI agent into
-KiroCrew. It runs from the first-run onboarding flow (after the Kiro CLI
+Kiro Crew. It runs from the first-run onboarding flow (after the Kiro CLI
 prerequisite gate, before the theme tour) and from Settings on demand.
 
 The module is a **projection**, not a mirror: it reads a foreign layout and
-writes only into KiroCrew's own containers through KiroCrew's own APIs. It never
-invents a storage format, never writes a file KiroCrew does not otherwise read,
+writes only into Kiro Crew's own containers through Kiro Crew's own APIs. It never
+invents a storage format, never writes a file Kiro Crew does not otherwise read,
 and never copies a foreign store verbatim.
 
 Three phases, always in this order:
@@ -28,6 +28,103 @@ Antigravity CLI reuses `~/.gemini` rather than claiming a directory of its own.
 Gemini CLI stopped serving Pro/Ultra/free individual accounts on 2026-06-18 and
 Antigravity replaced it, so that one root holds both a displaced Gemini CLI
 user's config and a current Antigravity install.
+
+## Structure and ownership
+
+The engine is four owners behind one facade. Each module imports only the
+modules listed above it in this table, so there is no cycle and any module can be
+the first one a process imports.
+
+| Module | Owns |
+|--------|------|
+| `onboarding_scan.py` | The scan accumulator (`_Scan`), the candidate item (`_Item`, whose `fingerprint` is the identity the ledger and outcomes key on) and `CATEGORY_IDS`. Also: the never-raising probes (`_exists_safe`, `_is_link_like`, `_stat_kind`); bounded, symlink-safe reads (`_safe_regular_file`, `_walk_files`, `_read_bytes`); the parsers (JSON, JSON5, TOML through the `_toml` tomllib/tomli ladder, and YAML through `_load_no_alias_yaml`); the SQLite snapshot helpers, including the hardlink refusal in `_sqlite_database_is_safe`; and the shared content screens: `_sanitize_text`, `_count_secret_fields`, `_decoded_value_is_unsafe`, and the skill activation screen (`_frontmatter`, `_column0_activation_declared`, `_skill_package`, which refuses `triggers`). It is the only module that calls the credential redactor, so it is the "Onboarding import" row of `security_posture._REDACTION_SINKS`. Category-specific refusals (the MCP field allowlist and URL/argument secret checks, the persona identity guard, schedule semantics) sit with their projection in `onboarding_plan.py`. |
+| `onboarding_plan.py` | The normalized plan. It holds the category projections that turn parsed foreign data into `_Item` payloads through those screens (instructions and the identity guard, memories, database directives, MCP specs, skills, schedules, workspaces, settings). It also holds in-scan dedup (`_deduplicate_items`), the per-source summary, the plan document (`_plan_from_scans`), and the readers `apply_import` uses (`_selected_pairs`, `_plan_roots`, …). |
+| `onboarding_sources/` | The package's `__init__.py` is the registry: the builtin descriptors, `_normalize_source`, the per-context cache behind `_sources()`, root and context resolution (`_source_roots`, `_source_context`), failure-isolated dispatch (`_scan_source`), and the managed / superseded MCP name sets. Each adapter module (`codex`, `claude_code`, `gemini`, `openclaw`, `hermes`, `lineage`) knows one layout. It reads file and database content only through the bounded readers in `onboarding_scan.py` and projects it through `onboarding_plan.py`; path probes (`exists`, `is_file`, `is_dir`, `iterdir`, `glob`) and the `is_sensitive_path` / `contains_injection` screens are called directly. OpenClaw's bespoke root and context rules and the Hermes `%LOCALAPPDATA%` root live in their adapters. |
+| `onboarding_apply.py` | The file-backed half of apply: the ledger (`_load_ledger`, `_record_ledger`, `_write_json`), the conflict strategies and restore copies, and the writers whose destination is a Kiro Crew file (`_write_workspace`, `_write_settings`, `_write_mcp`, `_write_skill`). |
+| `onboarding_import.py` | The facade and the run-level orchestration: `detect_sources`, `preview_import` / `_preview`, `apply_import` (the rescan, the per-item dispatch loop and the ledger flush discipline), `_source_exists`, and the writers into Kiro Crew's own stores: `_write_instruction`, `_write_memory`, `_write_schedule`. |
+
+Placement rules that are load-bearing:
+
+- **The store writers stay in the facade.** The persistence-switch inventory
+  (`test_persistence_writer_inventory.py`) and the cron probe inventory
+  (`test_cron_store_unreadable_boundaries.py`) name them as
+  `onboarding_import.py::<function>`. The dispatch loop stays beside them rather
+  than behind a writer table.
+- **The Claude Code presence probe stays in the facade.** `_source_exists`
+  accepts a `claude_code` root that is absent when `~/.claude.json` sits beside
+  it; the adapter reads that same file for its configs.
+  `test_agent_sdk_provider_identity.py` pins the `"claude_code"` source-id literal
+  to `onboarding_import.py`, and this probe is where the facade uses it.
+- **Code outside the engine reaches names through the facade.** The dashboard
+  handler, `mcp_cleanup`, the managed-MCP registration tests and the frontmatter
+  tests import them; specs and comments cite others by their
+  `onboarding_import.<name>` path. The facade re-exports each as the owner's own
+  object. `test_onboarding_import_refactor_contract.py` pins the list, pins that
+  each re-export is the owner's object, and pins that the entry points and store
+  writers are defined in the facade itself.
+- **A patch on the facade reaches every call site.** The caps
+  (`_MAX_FILES`, `_MAX_WALK_ENTRIES`, `_MAX_DB_ROWS`, `_MAX_DB_BYTES`,
+  `_MAX_SKILL_BYTES`, `_MAX_SKILL_PACKAGE_BYTES`, `_MAX_MCP_SERVERS`,
+  `_MAX_IMPORTED_LESSONS`) and the helpers `_has_symlink_component`,
+  `_install_skill_tree`, `_sqlite_columns`, `_scan_lineage_install`,
+  `_preserve_replaced_tree`, `_preserve_replaced_json`, `_toml`, `url2pathname`,
+  `_is_link_like` and `_write_json` are mirrored the same way as the
+  `kiro_crew.security` facade: `onboarding_import._EXPORTS` maps each name to the
+  dotted name of the one module that holds it (the Gemini adapter for the
+  standard library's `url2pathname`, since that is where its call site looks it
+  up), and that module's namespace is the only place the value lives. The facade
+  binds none of the 18 names. A read resolves the owner through `sys.modules` on
+  each access (PEP 562 `__getattr__`), and the facade's module class forwards a
+  set or a delete to the owner, so `monkeypatch.setattr`, its undo,
+  `mock.patch` and `mock.patch.object` on `onboarding_import.<name>` land in the
+  owner and restore the owner's own original. Every reader outside the owner --
+  the facade's `_source_exists`, `_preview` and ledger flush, and the apply
+  owner, the registry and the adapters -- reads the name off the owner module at
+  call time instead of holding its own `from ... import` copy, so the patch
+  reaches it too. `mock.patch` with a truthy `create` through the facade is the
+  one spelling this cannot serve: its exit deletes the name, which reaches the
+  owner, and then skips the restore. An AST guard in
+  `test_onboarding_import_refactor_contract.py` reads every file under `test/`
+  and every `tests/` package under `src/` whose text contains
+  `onboarding_import`. It fails on a `patch`, `patch.object`, `patch.dict` or
+  `patch.multiple` call or decorator whose target resolves to a mirrored name on
+  the facade and whose `create` -- keyword, positional or a splat -- is anything
+  but the literal `False`. `patch` is recognised when reached through
+  `unittest.mock` or `mock` bound by an import (aliased or not), an assignment,
+  an `import_module` result or a `sys.modules` entry, and when `patch` or one of
+  its three methods is itself bound by a `from ... import` or an assignment. A
+  target resolves to the facade through a dotted string (literals, module-level
+  string constants and the facade's `__name__`, joined by an f-string or `+`) or
+  through a name bound to the facade by an import, an assignment, an
+  `import_module` result, a `sys.modules` entry, or a call to a function in the
+  same file that returns one of these. Assignment chains are followed to a fixed
+  point, file-wide. It does not resolve a facade or `patch` received as a fixture
+  or parameter or fetched with `getattr`, nor read a file whose only spelling of
+  the module name is split across string literals. Once the target is the
+  facade, a name only computed at runtime is a hit too. The one exemption is an
+  explicit allowlist keyed on (path, test); the scan must equal it exactly, and
+  it is empty. Each rule is pinned on a synthetic source it must flag and one it
+  must ignore. The same file pins that the owner is the only engine module
+  binding each seam, that the facade's own code reads no mirrored name as a bare
+  global, that the facade's `TYPE_CHECKING` block imports every mirrored name
+  from its owner, that an owner already in `sys.modules` is read, written and
+  restored without a call to `importlib.import_module`, and drives a behavioral
+  scenario through every cross-module reader it finds in the source. `__all__` is derived from the
+  facade's bindings plus the table, so a star import carries `url2pathname` too.
+  `_MAX_LESSONS_TOTAL` and `make_sync_embed_fn` are read by the facade itself
+  and are not mirrored. The facade also keeps `shutil` and
+  `platform_compat` as attributes, the same module objects the owners use.
+- **One logger.** Every owner logs through `kiro_crew.onboarding_import`, the
+  name operators and tests filter import warnings on.
+- **Managed MCP names are read from the live registry.** `_scan_source` wires the
+  registry's own `_managed_mcp_names` into `_Scan.managed_mcp_names`. The MCP
+  projection calls it exactly where and as often as it always has, so no
+  projection module imports the registry. A scan built any other way refuses
+  instead of guessing.
+- **Deferred imports stay deferred.** The dashboard MCP sidecar lock,
+  `configured_mcp_aliases` and `CronService` are imported at their one call
+  site. Importing the engine never loads the dashboard, MCP discovery or cron.
+  `mcp_cleanup` in turn imports the facade lazily.
 
 ## Scope: what is migrated
 
@@ -54,17 +151,17 @@ looks like a gap — reopen the decision in this spec first.
 
 | Excluded | Why |
 |----------|-----|
-| **Sessions / conversation transcripts** | Not industry practice — no surveyed agent migrates transcripts. A transcript is a record of a conversation with a *different* model under a *different* system prompt; replayed into KiroCrew it is misleading context, not useful memory. Reading it also requires hard-coding each source's private JSONL/SQLite schema, which fails **silently** when upstream drifts. Removing it deletes the module's largest and most fragile surface. See "Session-import removal". |
-| **Persona / `SOUL.md` as a persona** | KiroCrew's persona surface is theme-pack persona, governed by `capabilities.theme_persona`. Importing a foreign persona document *as a persona* would inject third-party text into the agent's identity through a path that bypasses that gate. The **directive content** of such a file is still migrated — as memory (below) — but its persona role is dropped. |
+| **Sessions / conversation transcripts** | Not industry practice — no surveyed agent migrates transcripts. A transcript is a record of a conversation with a *different* model under a *different* system prompt; replayed into Kiro Crew it is misleading context, not useful memory. Reading it also requires hard-coding each source's private JSONL/SQLite schema, which fails **silently** when upstream drifts. Removing it deletes the module's largest and most fragile surface. See "Session-import removal". |
+| **Persona / `SOUL.md` as a persona** | Kiro Crew's persona surface is theme-pack persona, governed by `capabilities.theme_persona`. Importing a foreign persona document *as a persona* would inject third-party text into the agent's identity through a path that bypasses that gate. The **directive content** of such a file is still migrated — as memory (below) — but its persona role is dropped. |
 | **Credentials of any kind** | `~/.claude/.credentials.json`, `~/.codex/auth.json`, `.env`, `auth-profiles.json`, gateway tokens, provider API keys. Never read. MCP `env`/`headers` keys matching the secret patterns are stripped and counted into `secret_count`. |
 | **Runtime state** | Subagent records, tool results, checkpoints, hook state, in-flight task state. Not user data. |
-| **Architecture-specific config** | Plugin/hook/binding/agent-list configs, memory-backend selection, provider and model mappings. KiroCrew is KiroACP-only, so provider/model translation has no destination. |
+| **Architecture-specific config** | Plugin/hook/binding/agent-list configs, memory-backend selection, provider and model mappings. Kiro Crew is KiroACP-only, so provider/model translation has no destination. |
 | **Opaque binary stores** | Foreign SQLite memory stores are reported as `unsupported_memory_database`, never parsed. |
-| **Allow-lists (as opposed to deny-lists)** | A foreign `permissions.allow` *widens* the security boundary. Importing it would let a foreign config grant tool access inside KiroCrew's own gate. Deny rules only. |
+| **Allow-lists (as opposed to deny-lists)** | A foreign `permissions.allow` *widens* the security boundary. Importing it would let a foreign config grant tool access inside Kiro Crew's own gate. Deny rules only. |
 
 ## Destination mapping: the memory hierarchy
 
-Imported instruction/knowledge content is rewritten into KiroCrew's existing
+Imported instruction/knowledge content is rewritten into Kiro Crew's existing
 memory tiers. Tier choice is driven by two properties — **context priority**
 (`context.py` per-section caps) and **durability**.
 
@@ -169,7 +266,7 @@ dropped, a merely *truncated* one is not) and `contains_injection` (dropped as
 
 ### Foreign workspace-scope columns: sentinel vs. real scoping
 
-A foreign memory store may carry a workspace/scope column. KiroCrew's own memory
+A foreign memory store may carry a workspace/scope column. Kiro Crew's own memory
 tables have none, so a genuinely workspace-scoped row has no faithful destination
 and is reported `scoped_memory_unsupported`.
 
@@ -239,7 +336,7 @@ request carries a strategy; the default is the safest one.
 
 | Strategy | Behavior |
 |----------|----------|
-| `skip` (**default**) | Keep KiroCrew's existing item untouched; report the incoming one as `conflict`. |
+| `skip` (**default**) | Keep Kiro Crew's existing item untouched; report the incoming one as `conflict`. |
 | `rename` | Import alongside the existing item under a derived non-colliding name. |
 | `overwrite` | Replace the existing item, after writing a restore copy. |
 
@@ -480,7 +577,7 @@ user is still running.
 Hermes's own import tooling writes foreign skills into
 `skills/claude-code-imports/`, `skills/codex-imports/`, and
 `skills/openclaw-imports/`, and merges foreign `MEMORY.md`/`USER.md` into its
-own. A user who migrated Claude Code → Hermes → KiroCrew would otherwise import
+own. A user who migrated Claude Code → Hermes → Kiro Crew would otherwise import
 the same skill twice under two different `source_id`s — which **neither** the
 fingerprint (source-scoped) **nor** the destination check (different target dir)
 can catch.
@@ -537,7 +634,7 @@ The engine owns source identity. `_sources()` resolves and normalizes the regist
 |----------|-------|------|
 | `GET /api/onboarding/import/scan` | detect + dry run | — |
 | `POST /api/onboarding/import/apply` | apply | `{sources: [{id, categories: [...]}], conflict_strategy?}` — `conflict_strategy` is one of `skip`/`rename`/`overwrite`; absent = `skip`, unrecognized = 400 |
-| `POST /api/onboarding/import/state` | onboarding bookkeeping | `{completed: bool}` |
+| `PUT /api/onboarding/import/state` | onboarding bookkeeping | `{completed: bool}` |
 
 Each endpoint is owner-only: the handlers call `require_owner_dashboard_request`
 after authentication. With no `owner_id` configured the gate accepts the signed

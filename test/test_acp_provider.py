@@ -324,6 +324,8 @@ class TestToLlmEventFieldParity:
             return default + 1.5
         if default is None:
             return {"sentinel": field.name}
+        if isinstance(default, tuple):
+            return (("sentinel-" + field.name, None),)
         return None
 
     def test_all_acp_event_fields_forwarded_or_allowlisted(self):
@@ -657,6 +659,74 @@ class TestEffortControl:
         assert ok is False
         assert "claude-opus-4.7" not in provider._effort_per_model
         cco.assert_called_once()
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kiro_clear_effort_keeps_the_entry_when_the_overlay_lock_is_busy(self):
+        # Nothing changed: not the file, and not the map once the entry goes
+        # back. Neither bool can say that -- both make the handler commit the
+        # cleared slot value, so the UI would read "default" over an overlay
+        # that still holds the level. None is the third outcome, which the
+        # handler answers with a retryable 409 and no commit.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        with patch("kiro_crew.providers.acp._clear_cli_overlay_effort", return_value=False):
+            ok = await provider.clear_effort()
+        assert ok is None
+        assert provider._effort_per_model["claude-opus-4.7"] == "high"
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kiro_clear_to_default_does_not_push_when_the_overlay_write_fails(self):
+        # Clearing to a workspace default writes the overlay and pushes live. The
+        # FILE is what a respawn reads, so a live push over a write that did not
+        # persist reports a default the next spawn replaces with the level just
+        # cleared. Nothing is pushed, the override goes back, and the third
+        # outcome tells the handler to commit nothing.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "high"}
+        provider._effort_defaults = {"claude-opus-4.7": "low"}
+        with patch.object(type(provider), "_apply_effort_overlay", return_value=False):
+            ok = await provider.clear_effort()
+        assert ok is None
+        assert provider._effort_per_model["claude-opus-4.7"] == "high"
+        provider._client.send_command.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_kiro_effort_rollback_follows_the_file_when_the_rewrite_fails(self):
+        # The live push failed, so change_effort rolls the prior level back and
+        # rewrites the overlay to match. When THAT rewrite also fails the file
+        # keeps the attempted level and construction re-seeds from it, so the map
+        # follows the file instead of reporting an undo the next spawn contradicts.
+        from kiro_crew.acp.client import AcpError
+
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {"claude-opus-4.7": "low"}
+        provider._client.send_command = AsyncMock(side_effect=AcpError("push failed"))
+        calls = []
+
+        def _apply(self_, **kwargs):
+            calls.append(kwargs)
+            # The pre-push write persists; the rollback rewrite loses the lock.
+            return len(calls) == 1
+
+        with patch.object(type(provider), "_apply_effort_overlay", _apply):
+            with pytest.raises(AcpError):
+                await provider.change_effort("xhigh")
+        assert provider._effort_per_model["claude-opus-4.7"] == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_kiro_change_effort_does_not_push_when_the_overlay_write_fails(self):
+        # The FILE is what a respawn reads, so pushing live over a write that did
+        # not persist reports a change the next reset undoes. The override is
+        # rolled back and the caller is told, rather than the session running a
+        # level the workspace does not hold.
+        provider = self._effort_provider(backend="", model="claude-opus-4.7")
+        provider._effort_per_model = {}
+        with patch.object(type(provider), "_apply_effort_overlay", return_value=False):
+            with pytest.raises(RuntimeError, match="could not persist effort"):
+                await provider.change_effort("high")
+        assert "claude-opus-4.7" not in provider._effort_per_model
         provider._client.send_command.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1299,13 +1369,24 @@ class TestStartKiroRuntimeModelEntitlement:
         provider._client._resume_session_id = ""  # straight to create_session
         return provider
 
-    async def _run(self, model, advertised):
+    async def _run(self, model, advertised, *, probe=None, probe_raises=False):
         provider = self._kiro_provider(model)
         handle = MagicMock()
         handle.session_id = "kiro-sess-1"
         handle.store_session_config = MagicMock()
         handle.set_model = AsyncMock()
         handle.available_models = [{"modelId": m, "name": m} for m in advertised]
+        # The spawn-time withhold revalidates once via refresh_available_models
+        # before dropping a pin. Default: the probe agrees with the startup
+        # snapshot (returns it unchanged), so existing behaviour is preserved.
+        if probe_raises:
+            handle.refresh_available_models = AsyncMock(side_effect=RuntimeError("boom"))
+        elif probe is not None:
+            handle.refresh_available_models = AsyncMock(
+                return_value=[{"modelId": m, "name": m} for m in probe]
+            )
+        else:
+            handle.refresh_available_models = AsyncMock(return_value=list(handle.available_models))
         runtime = MagicMock()
         runtime.pid = 4321
         runtime.spawn = AsyncMock()
@@ -1342,6 +1423,55 @@ class TestStartKiroRuntimeModelEntitlement:
     async def test_auto_sentinel_never_reaches_the_check(self):
         handle = await self._run("auto", ["claude-sonnet-4.6"])
         handle.set_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pin_absent_from_startup_snapshot_is_applied_when_the_probe_reveals_it(self):
+        # FP1: the startup snapshot was captured inside the race window and
+        # omits an entitled pin. Revalidating once before withholding reveals it,
+        # so the pin IS applied rather than silently dropped for the session.
+        handle = await self._run(
+            "claude-opus-4.8",
+            ["claude-sonnet-4.6"],
+            probe=["claude-sonnet-4.6", "claude-opus-4.8"],
+        )
+        handle.refresh_available_models.assert_awaited_once()
+        handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_spawn_withhold_revalidation_forces_a_fresh_probe(self):
+        # D1: dropping a configured pin is a one-shot decision, not a burst, so
+        # its revalidation passes force=True — it must not honour a no-evidence
+        # failure the picker read path cached in the shared attempt-clock window.
+        handle = await self._run(
+            "claude-opus-4.8",
+            ["claude-sonnet-4.6"],
+            probe=["claude-sonnet-4.6", "claude-opus-4.8"],
+        )
+        handle.refresh_available_models.assert_awaited_once()
+        assert handle.refresh_available_models.await_args.kwargs.get("force") is True
+        # The probe agrees the pin is genuinely not entitled -> withhold as today.
+        handle = await self._run(
+            "claude-opus-4.8", ["claude-sonnet-4.6"], probe=["claude-sonnet-4.6"]
+        )
+        handle.refresh_available_models.assert_awaited_once()
+        handle.set_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_probe_failure_leaves_the_withhold_in_place(self):
+        # A failed probe is no evidence: keep the snapshot verdict (withhold),
+        # fail open exactly as today.
+        handle = await self._run("claude-opus-4.8", ["claude-sonnet-4.6"], probe_raises=True)
+        handle.set_model.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_qualifier_only_miss_resolves_via_the_fold_without_probing(self):
+        # O2: a `<namespace>::bare-id` pin the session advertises BARE resolves
+        # through resolve_pin_spelling with zero wire traffic. The fold runs
+        # FIRST, so no throwaway session/new (refresh_available_models) is opened
+        # on this common cold-start path; the bare id is what reaches set_model.
+        handle = await self._run("openrouter::z-ai/glm-5.3-flash", ["auto", "z-ai/glm-5.3-flash"])
+        handle.refresh_available_models.assert_not_awaited()
+        handle.set_model.assert_awaited_once_with("z-ai/glm-5.3-flash")
 
 
 def test_child_fidelity_aware_survives_client_replacement():
@@ -1409,10 +1539,12 @@ def test_to_llm_event_preserves_mcp_identity_trusted():
         is_shell=False,
         mcp_server_name="example-server",
         tool_name="get-item",
+        tool_identity_trusted=True,
         mcp_identity_trusted=True,
     )
     assert src.child_mcp_identity_trusted is True
     out = AcpProvider._to_llm_event(src)
+    assert out.tool_identity_trusted is True
     assert out.mcp_identity_trusted is True
     assert out.child_mcp_identity_trusted is True
     assert out.child_unconditional_grant_eligible is True
@@ -1427,5 +1559,6 @@ def test_to_llm_event_preserves_mcp_identity_trusted():
         tool_name="get-item",
     )
     out_untrusted = AcpProvider._to_llm_event(src_untrusted)
+    assert out_untrusted.tool_identity_trusted is False
     assert out_untrusted.mcp_identity_trusted is False
     assert out_untrusted.child_mcp_identity_trusted is False

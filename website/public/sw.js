@@ -88,6 +88,18 @@ self.addEventListener('fetch', e => {
   // ── Skip rules (let the browser handle these natively) ──────────────
   // Cross-origin (CDN scripts, analytics, RUM)
   if (url.origin !== self.location.origin) return
+  // A URL carrying a `token` query parameter is a sign-in link (the owner's
+  // `kirocrew token` link, `/?token=...`). Only the gateway's auth middleware can
+  // honour it: it exchanges the link token for a session cookie and redirects. If
+  // the worker answers instead, the exchange never happens — the cached shell
+  // boots with no session, /api/status answers 403 and the page reads "Session
+  // expired". That is exactly what a phone did when the network-first fetch below
+  // failed and fell back to the cached shell. So the worker never answers such a
+  // request (navigation or otherwise) and, being skipped here, never caches its
+  // response either. Placed before every other rule so no later prefix can
+  // re-claim it. The name is checked by presence, not value: an empty or stale
+  // token is still the gateway's to judge.
+  if (url.searchParams.has('token')) return
   // Core API
   if (url.pathname.startsWith('/api')) return
   // Single-use sandboxed documents for artifact/widget iframes. Two reasons this
@@ -97,6 +109,12 @@ self.addEventListener('fetch', e => {
   // mode === 'navigate', so the offline fallback would serve the SPA shell
   // (/index.html) INTO the widget frame instead of the document.
   if (url.pathname.startsWith('/sandbox-doc/')) return
+  // Standalone app-window documents. These are full top-level applications,
+  // not SPA routes: serving the cached dashboard shell into a frameless overlay
+  // can create an always-on-top, full-display dashboard with no close controls.
+  // Leave navigation and failures to the browser. Electron app-window hosts
+  // already fail closed on 4xx/5xx and transport errors.
+  if (url.pathname.startsWith('/app-windows/')) return
   // App backends (e.g. /apps/dev-fleet/api/*)
   if (url.pathname.startsWith('/apps/')) return
   // Vite content-hashed assets — the immutable HTTP cache still owns them, so

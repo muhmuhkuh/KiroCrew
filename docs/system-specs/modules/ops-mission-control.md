@@ -159,7 +159,7 @@ not that git resolves them for you. Two things make it work:
 Measured end to end: two divergent ledgers → real `git merge` → conflicted file → 4 raw
 entries read as **3**, shared lesson collapsed with both fingerprints preserved.
 
-#### 2a. Record format version (`LedgerEntry.v`, `LEDGER_RECORD_V1 = 1`)
+### 2a. Record format version (`LedgerEntry.v`, `LEDGER_RECORD_V1 = 1`)
 
 `ledger.jsonl` is the one artifact that **leaves the machine**: `ledger_sync` git-pushes it
 and teammates on *different Kiro Crew builds* pull it, so an older instance can be handed a
@@ -269,7 +269,7 @@ misleading rows.
 each one HALF of the bar, so neither answers "how much of this ledger would an agent
 propose without checking" — showing only those two overstated the ledger's authority.
 
-### 2a. The sync loop, and where it is driven from
+### 2c. The sync loop, and where it is driven from
 
 The daily `ledger-hygiene` pass (`POST /ledger/hygiene`) is the only caller of the git
 transport and the vector index. Order is load-bearing: **pull → hygiene → index → push**.
@@ -283,6 +283,29 @@ and `dispatch`'s semantic recall queried an index `import_pending` never populat
 a real install recall returned zero hits forever while every unit test passed. Two modules
 can be individually correct and collectively dead; only an integration caller proves
 otherwise.
+
+The index stage builds its store with the install's `memory.episodic_max_count` and
+`memory.episodic_dedup_threshold`, and `import_pending` cursors an entry only when the store
+wrote it or reported it as a duplicate or unacceptable. A V1 store at its cap refuses
+merge-only writes; `import_pending` reads that verdict from `write_episodic_outcome()`
+(`AT_CAPACITY`, decided inside the transaction that refused the row, so a concurrent cap
+raise or eviction cannot turn it into a duplicate), stops, and leaves that entry and the
+rest off the cursor. A later pass indexes them once `memory.episodic_max_count` is raised or
+an unrelated delete (an operator delete, stale retirement) drops the active count below the
+cap; cap eviction by other writers always leaves the count AT the cap, so it never frees a
+slot for the importer. The pause is logged as a warning naming how many entries are left
+pending, because the result counts alone match a caught-up run. Pinned by `TestCapacityRefusal` in `test_ledger_index.py`.
+
+Dispatch prepares the other half of semantic retrieval: after claiming an incident it
+binds the process-wide cached embed callable to its short-lived store, attempts one
+interactive query embedding with a five-second queue/admission budget, and passes that
+vector explicitly into `ledger_index.search_similar`. Native inference already running
+cannot be interrupted and may finish after that budget. `VectorMemoryStore.search_episodic` does
+not embed `query_text`; without that boundary the advertised semantic leads are only FTS5
+keyword matches. A cold, unavailable, stale-space, busy, or failing embedder yields no
+query vector and dispatch immediately retains the same tag-scoped keyword search. The
+model loads in the background; dispatch never calls `wait_ready`, and semantic recall
+remains optional to claiming and fingerprint matches.
 
 **Four fatal bugs were found by a real two-instance roundtrip against a bare remote,
 every one of which the mocked-git tests passed** (`test/test_omc_ledger_sync_coverage.py`):
@@ -542,7 +565,7 @@ than temporarily.
 
 The contract: **an action in `EXPIRING_ACTIONS` always carries a positive, bounded
 expiry**, clamped by `resolve_silence_secs` into `(0, MAX_SILENCE_SECS]` at the
-authorization boundary in `routes._handle_action` — not in each adapter. A sink must not
+authorization boundary in the `/incident/action` handler (`_handle_action`) — not in each adapter. A sink must not
 be able to opt out of the bound by forgetting to check, because an unbounded suppression
 is the single outcome the verb exists to prevent. Unparseable or non-positive input
 yields the DEFAULT, never "no expiry".
@@ -621,7 +644,7 @@ install that is the ONLY path, because `cloudwatch` and `webhook` register no `A
 and every action falls through to `noop` — so exercising the proposal flow, which is exactly
 what an operator is told to do before granting real authority, **demoted their own proven
 knowledge for a write nobody made**. Verified: act mode plus one scoped cloudwatch rule took
-a verified/high/2-use entry to `miss_count=1` and off the fast path. `routes._handle_action`
+a verified/high/2-use entry to `miss_count=1` and off the fast path. The `/incident/action` handler
 therefore gates on `result.ok and not result.simulated`.
 
 **Only some verbs are verifiable** (`VERIFIABLE_ACTIONS = {resolve, silence}`). An `ack`
@@ -654,7 +677,8 @@ duration. "Both" is load-bearing and was the follow-up finding: the fix first la
 payload alone — so an approved Datadog resolve still got a five-minute recheck against a
 four-hour mute. That is the second time these two paths drifted (the first: the approved path
 did not arm verification at all), so a structural test now pins the CONVERGENCE — it parses
-`routes` and fails if the two call sites pass different duration expressions, which is cheaper
+the whole HTTP surface (`routes.py` and every `http_routes` module) and fails if the two call
+sites pass different duration expressions, which is cheaper
 than rediscovering the drift from a false ledger miss.
 Reported by the ADAPTER rather than inferred at the boundary because only the adapter knows
 its provider aliased one verb onto another. Review proposed dropping `ACTION_RESOLVE` from
@@ -869,8 +893,8 @@ treating garbage as false silently disables a detection the operator believes is
 and treating it as true silently enables one they never asked for. `_FALSY` is
 therefore listed explicitly rather than inferred as "not truthy".
 
-`INSUFFICIENT_DATA` is the CloudWatch equivalent of a *table freshness*
-checks — a pipeline that silently stopped running looks healthy when you only watch
+`INSUFFICIENT_DATA` is the CloudWatch equivalent of a *table-freshness*
+check — a pipeline that silently stopped running looks healthy when you only watch
 `ALARM`. It stays opt-in (noisy on accounts with idle resources), but the provider
 `detail` now says so, because an opt-in nobody is told about is one nobody uses.
 
@@ -1337,7 +1361,7 @@ the five that are: the audit question "what does this refusal depend on?" has an
 not always a config key. Here the dependency was on a PRIVATE method existing, so implementing
 the documented interface correctly was enough to make the refusal inapplicable. `_shift_sync` now
 falls back to awaiting the public coroutine via `asyncio.run` — safe on this path specifically,
-because `authorize_action` already runs in a worker thread (`routes._authorize` puts it there so
+because `authorize_action` already runs in a worker thread (`_authorize` puts it there so
 a blocking `gh api user` cannot freeze the loop), and a worker thread has no loop to re-enter. If
 a loop IS running the source is skipped with a warning rather than raising inside a security
 gate. A companion's coroutine is bounded by `_ASYNC_SHIFT_TIMEOUT_SECS`, and a timeout or raise
@@ -1579,12 +1603,14 @@ the gate**, and no code disagreed.
 
 Authority is now a value rather than a comment:
 
-- **`routes._authorize(signal, action)`** runs the gate and is the ONLY place an
-  `_Authorized` permit is constructed. A test pins that, because a permit minted next to
-  the write would be a rubber stamp.
-- **`routes._execute_authorized(sink, permit, payload)`** is the ONLY caller of
-  `ActionSink.execute`. A test asserts that call site count is exactly one, so a future
-  third caller fails CI instead of shipping an ungated write.
+- **`_authorize(signal, action)`** (in `backend/http_routes/actions.py`, re-exported as
+  `routes._authorize`) runs the gate and is the ONLY place an `_Authorized` permit is
+  constructed. A test scanning `routes.py` and every `http_routes` module pins that, because
+  a permit minted next to the write would be a rubber stamp.
+- **`_execute_authorized(sink, permit, payload)`**, beside it, is the ONLY caller of
+  `ActionSink.execute`. A test walking the whole `backend/` tree asserts that call site count
+  is exactly one, so a future third caller — in any module, at any depth — fails CI instead of
+  shipping an ungated write.
 - The permit carries the signal and action it was minted for, and the executor reads the
   write's target **from the permit** rather than from a parallel argument — so spending a
   `comment` permit on a `resolve` is unrepresentable, not merely rejected.
@@ -1751,8 +1777,9 @@ One site was subtler than the others:
 *`build`* off the loop while still evaluating `describe()` on it, because arguments are
 computed before the call. Moving a slow call off-loop does not move its arguments.
 
-Guarded two ways: a static check that no `rotation.describe` call in `routes.py` sits
-outside a `to_thread`, and a behavioural one that ticks a heartbeat coroutine during a
+Guarded two ways: a static check that no `rotation.describe` call on the HTTP surface
+(`routes.py` and every `http_routes` module) sits outside a `to_thread` — and that it sees
+exactly those three sites, so it cannot pass by finding none — and a behavioural one that ticks a heartbeat coroutine during a
 `/rotation` request and fails if the loop stalls.
 
 #### Every stored-file read on a request path is off-loop
@@ -1813,7 +1840,8 @@ cannot silently re-expose the app while the first two still pass.
 Two guards, both asserting the class rather than the known sites — the per-site version of
 this lesson has now been learned twice:
 
-- no `store.*`/`ledger.*` file-parsing call in `routes.py` sits outside a `to_thread`;
+- no `store.*`/`ledger.*` file-parsing call in any coroutine under `backend/` — the HTTP surface
+  included — sits outside a `to_thread`;
 - no slow call is *evaluated as an argument* to `to_thread`. `to_thread(f, g())` moves `f`
   off-loop and runs `g` on it, reads as fixed at a glance, and shipped once
   (`to_thread(handover.build, providers, rotation.describe(shift))`).
@@ -1834,6 +1862,25 @@ disabled, so **every** handler is wrapped in `_require_enabled` (403 when
 disabled). `test_routes.py::test_every_registered_handler_is_gated` walks the
 router and fails if a route lacks the wrapper, so a newly added route cannot ship
 ungated.
+
+**`routes.py` is the composition root; the handler bodies are its projections.** The gate,
+the SEL audit writer (`_audit`), the redaction floor (`_safe_outbound`), the ledger indexer
+and the literal registration table stay in `routes.py`, because the gateway, the manifest,
+the security posture registry and the tests all address that module. Each route's body lives
+in a `backend/http_routes/` projection (see Files). A projection never imports `routes`; one
+that calls a facade seam — `get_registry`, `_audit`, `_safe_outbound`, `put_secret`,
+`delete_secret`, `merge_provider_config`, `_index_ledger_safely` — takes it as a keyword-only
+parameter with no default, and the same-named `routes` handler passes its CURRENT binding on
+every call, so `mock.patch.object(routes, <seam>)` reaches every call site that reads it
+(`is_app_enabled` is read by the gate itself). A helper behind a handler receives the seam
+from that handler the same way. The six routes whose projection calls no seam register the
+projection itself. Every other name `routes.py` defined is a re-export of its owner's object, or one of
+three adapters that keep `_schedule_verification`, `_execute_stored_proposal` and
+`_settings_write_or_refuse` callable with their historic signatures: patching it on `routes`
+changes what `routes.<name>` returns, not what a projection calls. `test_routes_composition_contract.py` pins the seams site by site, the registration
+table, every name `routes.py` defined and its signature, and the structure (one-statement handlers, no
+module-scope seam binding in a projection, no import of `routes`, no redactor call in a
+projection, one logger name for the whole surface).
 
 Secrets are **write-only** over HTTP: `PUT .../secret` accepts a value, and no read
 endpoint ever returns one (`describe_secrets` reports set/unset only). Unknown
@@ -2331,7 +2378,7 @@ watching an empty conversation", and that sentence was the only thing enforcing 
 misfollowed turn produced an incident whose panel silently showed nothing — a failure with no
 error anywhere, which is the shape this app treats as a defect.
 
-`routes.canonical_slot_key(incident_id)` now computes it and **no resolution path reads
+`canonical_slot_key(incident_id)` (in `backend/http_routes/board.py`) now computes it and **no resolution path reads
 `incident.slot_key`**. That was already how every consumer behaved: the frontend derives the
 key from the incident id (`IncidentChat.incidentSlotKey`) and never reads the field, and both
 backend call sites already fell back to this exact expression. The field stays on the record
@@ -2439,7 +2486,7 @@ reset. The trailing-`permission`-message check matters because the slot's
 `pending_approval` flag LAGS the transcript — relying on the flag alone leaves the
 board wrong for that gap.
 
-**Read through the slot's PUBLIC contract.** `routes._slot_state` asks
+**Read through the slot's PUBLIC contract.** `_slot_state` (`backend/http_routes/board.py`) asks
 `_ChatSlot.to_dict()`, which the core keeps correct, rather than deriving
 `pending_approval` from `slot._approval_futures` itself. It used to do the latter, and
 review flagged it: a private attribute of another module is not a contract, so a core
@@ -2486,17 +2533,13 @@ upstream of this app:
   the user was the one turn they could not answer. Fixed in #5487: the approval
   row (preview + buttons) now renders in both disclosure states. Pinned by
   `website/src/test/collapsibleToolGroupApproval.test.tsx`.
-- A **failed** approval rendered as "Approved". `submitDecision` optimistically flips the
-  card and relies on the promise `onApprove` returns to reject so its catch can roll that
-  back — but `ChatEmbed.handleApprove` called `approveMutation.mutate()`, which returns
-  `void` and swallows the rejection. So on a failed POST the card claimed success, the
-  buttons vanished, and the agent stayed parked on a decision that never reached it: silent
-  every time, with no way to retry. **This rollback wiring is NOT in the tree**: `ChatEmbed`
-  still calls `approveMutation.mutate(...)` and `ChatMessageListProps.onApprove` is typed
-  `=> void`, so the rejection dies at the type boundary and the rollback cannot fire on the
-  one mount that renders the row. The fix (return `mutateAsync`, widen the prop type to
-  `void | Promise<unknown>`, pin with a rejecting-handler test) is tracked separately —
-  see #5524.
+- A **failed** approval used to render as "Approved". `submitDecision` optimistically
+  flips the card and relies on the promise returned by `onApprove` to reject so its catch
+  can restore the buttons. `ChatEmbed` now returns `approveMutation.mutateAsync(...)`, and
+  `ChatMessageListProps.onApprove` requires `Promise<unknown>`, so a failed POST reaches
+  that rollback instead of leaving the agent parked behind an undelivered decision. Pinned
+  through the real message-list and tool-group chain by
+  `website/src/test/ChatEmbed.approvalRollback.test.tsx`.
 
 Layout: the embed scrolls via `h-full` + an inner `flex-1 overflow-y-auto`, so an
 ancestor MUST bound its height (`IncidentChat` owns a fixed-height flex column with
@@ -2593,6 +2636,15 @@ path documents: a loaded companion's declared patterns apply, and an enterprise 
 fails to compose its companion fails CLOSED rather than silently falling back to public
 patterns.
 
+**One floor, defined in `routes.py`.** The ledger write (`POST /ledger` redacts pattern and fix
+before the content-addressed id is computed) goes through the same `_safe_outbound`: it is the
+identical two-pass composition, so one definition serves the action note, the approved
+proposal's stored note, the transition's `diagnosis`/`resolution` and the ledger entry. It stays
+in `routes.py` because that module is the registered `security_posture` redaction sink for the
+ledger write, and the call-site guard classifies redaction by module; the projections that
+redact receive it from the facade as a seam, and none of them names a redactor itself (a
+composition test pins that no `http_routes` module matches the guard's pattern).
+
 ### It stores no Slack credential — by design
 
 The app has **no** bot-token field and adds nothing to its keystone secret store.
@@ -2614,7 +2666,7 @@ credential.
 
 There is no module-level gateway-state accessor in Kiro Crew (state is per
 `web.Application`), so the client is threaded in from the route layer:
-`routes._slack_client(request)` → `slack_out.client_from_state(...)` →
+`_slack_client(request)` (`backend/http_routes/_shared.py`) → `slack_out.client_from_state(...)` →
 `publish/post_detail/publish_all(..., client)`, and `dispatch.run_cycle(
 slack_client=...)`. `None` is always a quiet no-op, which is what lets every send
 be tested without a gateway.
@@ -2671,7 +2723,7 @@ token whose secret lives at `~/.kiro/crew/apps/<name>/.app_secret`, and
 `backend.entryPoint`; this app declares `backend.routes`, so no secret exists (verified
 on disk — `dev-fleet`/`file-explorer`/`workflows` have one, this app does not). And even
 with a secret, a handler that HTTP-calls its own gateway needs an auth token and can
-deadlock the loop — the same reason `routes._slot_state` and
+deadlock the loop — the same reason `_slot_state` and
 `slack_out.link_thread_to_investigation` read through `DashboardState`.
 
 So `notify_out._push` re-implements what the handler owns, in the handler's order:
@@ -2688,7 +2740,7 @@ failing pushes nothing, because at a 120-second heartbeat an hour of downtime wo
 otherwise be 30 identical toasts — the unchanged condition `SKILL.md`'s noise discipline
 forbids. A source absent from the *before* map counts as "was ok" on purpose: its first
 failure is news, and it is usually a provider the operator has just configured.
-`routes._handle_transition` captures the pre-transition status for the same reason —
+The transition handler (`_handle_transition`) captures the pre-transition status for the same reason —
 `update_fields` re-enters `transition` with the same status.
 
 **Nothing is pushed on a claim.** A claim is the heartbeat working correctly and already
@@ -2707,8 +2759,8 @@ deep link: the page selects an incident from React state and reads no query para
 silent until an operator flips the toggle. Not a credential, so it lives in plain
 `config.json` alongside the Slack channel id.
 
-**Redacted at the producer, both passes**, matching `store.write_log` and
-`registry.gather_evidence` rather than `slack_out` (which runs core only). Measured, not
+**Redacted at the producer, both passes**, matching `store.write_log`,
+`registry.gather_evidence`, and `slack_out._safe`. Measured, not
 assumed: core `security.redact` leaves `401 from https://api.datadoghq.com?api_key=<hex>`
 untouched and `secrets.redact_tokens` catches it. `DashboardState._deliver_note` also
 redacts centrally, so this is belt-and-braces — and it is what earns the row in
@@ -2798,13 +2850,11 @@ nobody reads is the noise this app exists to avoid — so `sops/handover.md` shi
 
 ## Crons (manifest-declared)
 
-**`rotation-check` ships ENABLED; the other three ship paused.** This is a cold-start
-requirement, not an inconsistency. `dispatch` is armed by the `on_shift` tier, and the
-only thing that arms that tier is the rotation-check cron — and **nothing flips a
-manifest `enabled: false`**. Ship rotation-check paused too and a user enables the app,
-configures CloudWatch, and it never fires: the store listing's "the on-shift tier arms
-and disarms itself" was impossible. Found by asking what a stranger's install actually
-does, not by reading code.
+**`rotation-check` and `ledger-hygiene` ship ENABLED; `dispatch` and `reconcile`
+ship paused.** Only `on_shift` jobs may ship paused because `/rotation/arm` only changes
+that tier. `rotation-check` must start live to arm it; otherwise a user can enable the app
+and configure CloudWatch while dispatch never starts. `ledger-hygiene` starts live and
+is primary-gated by its route instead of by cron arming.
 
 Safe to arm because its SOP's **step 0** exits with no output when no provider reports
 `configured: true`, so a fresh install pays nothing for a 5-minute poller. Both halves
@@ -2904,9 +2954,10 @@ looking through.
 This app is portable, and the three places that could break it are pinned by tests rather
 than left to review:
 
-- **Resource limits come from the shim wrappers, not a raw `preexec_fn`.** Both
-  external-binary spawns (`git` for ledger sync, `gh` for the rotation login) route
-  through `create_subprocess_limited` / `run_limited`, which deliver the resource caps
+- **Resource limits come from the shim wrappers, not a raw `preexec_fn`.** All three
+  external-binary spawn paths (`git` for ledger sync and `gh` for the rotation login or
+  GitHub Issues) route through `create_subprocess_limited` / `run_limited`, which deliver
+  the resource caps
   after `exec` via the spawn shim and fall back to `resource_limit_preexec()` only on a
   host with no usable shim. That fallback returns `None` off POSIX, which is what makes
   the spawns portable — `preexec_fn` is unsupported on Windows and passing *any*
@@ -2942,7 +2993,32 @@ review time, not to simulate the platform.
   plus `investigation_brief`
 - `.../backend/notify_out.py` — the local notification bus as an output channel: three
   declared channels, the replicated manifest + rate-limit guards, edge-triggered pushes
-- `.../backend/routes.py` — HTTP surface (`register_routes(app)`, full paths)
+- `.../backend/routes.py` — the HTTP surface's composition root: `register_routes(app)` with
+  every full path, the `_require_enabled` gate, `_audit`, the `_safe_outbound` redaction floor
+  (the registered sink for the ledger write), `_index_ledger_safely`, a handler for each of the
+  nineteen routes whose projection calls a seam (the other six register the projection
+  itself), three signature-preserving adapters, and re-exports of every other name `routes.py`
+  defined. It must stay this plain module at this path: `app.json`, the package `__init__`, the
+  security posture registry and the SOP→route scanner all address it.
+- `.../backend/http_routes/` — the handler bodies, one module per slice (none imports `routes`):
+  - `_shared.py` — `_json_body`, `_require_bool`, `_store_read_refusal`, `_slack_client`, the
+    surface's logger (named for `backend.routes`, so a log filter keeps matching) and the
+    seam types;
+  - `board.py` — the read-only projections the dashboard polls: `/state`, `/handover`,
+    `/incidents`, `/incident`, `/signals`, `/providers`, `/rotation`, with
+    `canonical_slot_key`, `_slot_state` and `_ledger_sync_status`;
+  - `lifecycle.py` — incident lifecycle writes: `/incident/transition`, `/incident/claim`,
+    `/dispatch`;
+  - `actions.py` — provider-write authority: `/incident/action`, the propose loop and its
+    `/proposals` queue, the `_Authorized` permit, `_authorize`, `_execute_authorized`,
+    `_sink_refuses`, `_execute_stored_proposal` and `_schedule_verification`;
+  - `configuration.py` — writes to this instance's configuration: provider config and
+    secrets, `/settings` (with `_settings_write_or_refuse` and the remote/branch/login
+    guards) and `/rotation/arm`;
+  - `ledger.py` — `/ledger` read, write and delete, `/ledger/contradictions`,
+    `/ledger/hygiene`;
+  - `webhook.py` — the bounded, signed `/webhook` ingress: `_read_capped` and
+    `_webhook_reject_status`.
 - `.../backend/providers/` — the four Protocols + public adapters; the package
   `__init__` also owns config read/merge (`merge_provider_config`, `set_top_level`)
 - `src/kiro_crew/builtin_skills/ops-mission-control/` — the agent skill AND the
@@ -3198,7 +3274,7 @@ line-anchored so a genuinely internal reference in that file is still caught.
 
 ## Tests
 
-`src/kiro_crew/apps/builtins/ops_mission_control/tests/` — 647 tests:
+`src/kiro_crew/apps/builtins/ops_mission_control/tests/` — 1,134 collected tests across 23 files:
 
 - `test_models.py` — fingerprint stability, normalization fallbacks, transition
   grammar, mode algebra
@@ -3208,7 +3284,18 @@ line-anchored so a genuinely internal reference in that file is still caught.
   autonomy gate incl. blanket-rule refusal, ledger dedupe/decay
 - `test_providers.py` — ADD-only registry, fan-out resilience, central redaction,
   adapters unconfigured-not-raising, webhook fail-closed
-- `test_routes.py` — namespace containment, every-route-gated, secrets never echoed
+- `test_routes.py` — namespace containment, every-route-gated, secrets never echoed; its
+  source guards (permit minting, the single `sink.execute` caller, off-loop reads, the note
+  floor, the slot key, verification convergence) scan the whole HTTP surface — `routes.py`
+  plus every `http_routes` module, enumerated from the package directory — and carry floors
+  on what they must find, so a moved call site cannot turn one into a vacuous pass
+- `test_routes_composition_contract.py` — the facade/projection contract: the frozen
+  registration table, the enable gate answering before any body is read on every route,
+  webhook ingress order (size before enqueue, signature before parse, a retriable 503 with
+  `Retry-After`), an approved proposal executing exactly once under a double or concurrent
+  approval, a stale client unable to move a replacement incident, cancellation leaving no
+  half-done write, every name `routes.py` defined with its signature, every seam controlling every call site
+  (through the helpers a handler calls, too), and the structure that keeps it so
 - `test_dispatch.py` — cycle silence (an unchanged firing signal must not
   re-announce), claim cap under a 50-alarm storm, ledger matching + fast path +
   post-increment use count, recurrence-matches-ancestor, rotation gate, one broken
@@ -3223,8 +3310,8 @@ line-anchored so a genuinely internal reference in that file is still caught.
   the MAX rather than the incoming value.
 - `test_config_routes.py` — **secret field refused on the config route**, unknown
   field/provider refused, merge preserves untouched fields, invalid mode refused,
-  and manifest-cron assertions (all four present, all paused, all silent and
-  stateless, exactly one schedule each)
+  and manifest-cron assertions (all four present, only `on_shift` jobs paused,
+  all silent and stateless, exactly one schedule each)
 
 Frontend: `website/src/test/opsMissionControl.test.ts` (route registration, panel-parity
 assertions read from the .tsx source, and the pure helpers `describeSourceHealth` /

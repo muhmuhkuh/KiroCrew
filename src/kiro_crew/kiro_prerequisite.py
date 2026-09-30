@@ -39,6 +39,7 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -46,25 +47,23 @@ import sys
 import tempfile
 import time
 import urllib.request
-from collections.abc import Awaitable, Callable, Coroutine, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import hooks, identity_stores, platform_compat
+from kiro_crew import _process_group_supervisor, hooks, identity_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_files import AGENT_FILENAME, LITE_AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import CRED_KIRO_API_KEY, read_env_file_credential
 from kiro_crew.config.paths import config_dir
 from kiro_crew.executors import kiro_spawn_executor
-from kiro_crew.kiro_cli import (
-    find_kiro_cli_candidates,
-    known_kiro_cli_dirs,
-)
+from kiro_crew.kiro_cli import find_kiro_cli_candidates, is_bundled_kiro_cli, known_kiro_cli_dirs
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     corroborate_launcher_refusal,
+    create_subprocess_limited,
     launcher_refusal,
     resource_limit_supervisor_argv,
     sandboxed_spawn_argv,
@@ -89,7 +88,15 @@ OFFICIAL_INSTALL_DOCS_URL = "https://kiro.dev/cli/"
 # website/docs/i18n-catalog.md — "A literal token the user must type must never be
 # a catalog value"). Served in the status payload so the UI has one source of
 # truth for it rather than hardcoding a second copy that can drift.
-KIRO_CLI_LOGIN_COMMAND = "kiro-cli login"
+# The argument tails are split out so login_commands_for() can compose the
+# bundled-copy form (absolute path + same tail) without duplicating flag
+# literals that would drift. They carry the leading space DELIBERATELY: the
+# read-only-probe tripwire in test_kiro_prerequisite.py forbids the standalone
+# quoted token a spawn argv element would have, and these are display strings
+# the user types, never argv.
+_LOGIN_TAIL = " login"
+_SSO_LOGIN_TAIL = " login --use-device-flow --license pro"
+KIRO_CLI_LOGIN_COMMAND = f"kiro-cli{_LOGIN_TAIL}"
 # The organization-SSO counterpart, served alongside the bare command so the gate
 # can offer both instead of one ambiguous line. Both flags are load-bearing:
 # ``--use-device-flow`` is what makes the others take effect at all (kiro-cli
@@ -99,7 +106,82 @@ KIRO_CLI_LOGIN_COMMAND = "kiro-cli login"
 # failure this exists to prevent: on the portal, a free Builder ID sits as a
 # visual peer of organization SSO, so a user on an SSO plan can sign in to the
 # wrong tier and only discover it when models are missing.
-KIRO_CLI_SSO_LOGIN_COMMAND = "kiro-cli login --use-device-flow --license pro"
+KIRO_CLI_SSO_LOGIN_COMMAND = f"kiro-cli{_SSO_LOGIN_TAIL}"
+
+
+def login_commands_for(
+    binary: str,
+    environ: Mapping[str, str],
+) -> tuple[str, str, bool]:
+    """Sign-in commands for the RESOLVED binary, plus whether it is bundled.
+
+    The desktop app's bundled kiro-cli (``KIROCREW_BUNDLED_KIRO_DIR``) is not
+    on the user's shell PATH, so when it is the copy that resolved, the served
+    commands must carry the binary's absolute path — otherwise the setup gate
+    asserts "installed" while its only on-screen instruction fails with
+    command-not-found on a fresh machine. POSIX paths use shell quoting. Windows
+    commands name PowerShell explicitly, which also lets the same copied command
+    run from cmd.exe. An operator's ``KIROCREW_KIRO_BIN`` override gets the same
+    treatment when its resolved file is not what the user's shell would run as
+    ``kiro-cli``: the bare command would then fail or sign in a different
+    install. Any other resolution keeps the bare constants: the binary is on
+    PATH by construction there.
+    """
+    bundled = is_bundled_kiro_cli(binary, environ)
+    if bundled or _is_off_path_override(binary, environ):
+        if platform_compat.IS_WINDOWS:
+            # A quoted executable path alone is data in PowerShell; its call
+            # operator is required. Wrapping the command in powershell.exe keeps
+            # this one display string runnable from both PowerShell and cmd.exe.
+            # The user's terminal is outside the gateway's process tree, so the
+            # KIRO_NO_AUTO_UPDATE the Electron shell sets does not reach this
+            # run; upstream compiles the startup self-update only for Windows,
+            # and without the switch a fresh sign-in would rewrite the sealed
+            # bundled exe. ``Set-Item`` rather than ``$env:`` because an outer
+            # interactive PowerShell interpolates ``$env:`` inside the double
+            # quotes before powershell.exe ever sees it.
+            quoted = binary.replace("'", "''")
+            prefix = (
+                'powershell.exe -NoProfile -Command "Set-Item Env:KIRO_NO_AUTO_UPDATE 1; '
+                f"& '{quoted}'"
+            )
+            suffix = '"'
+        else:
+            prefix = shlex.quote(binary)
+            suffix = ""
+        return f"{prefix}{_LOGIN_TAIL}{suffix}", f"{prefix}{_SSO_LOGIN_TAIL}{suffix}", bundled
+    return KIRO_CLI_LOGIN_COMMAND, KIRO_CLI_SSO_LOGIN_COMMAND, False
+
+
+def _is_off_path_override(binary: str, environ: Mapping[str, str]) -> bool:
+    """Whether *binary* came from ``KIROCREW_KIRO_BIN`` and sits in no ``PATH``
+    directory, so a bare ``kiro-cli`` typed in the user's shell would not run it.
+
+    Pure string work, like :func:`is_bundled_kiro_cli`: the callers run on the
+    event loop, so no ``which``/stat may happen here. A directory match is the
+    whole test -- an override named ``kiro-cli-chat`` inside a ``PATH`` dir is
+    left bare, which is the pre-existing behaviour for every ``PATH`` install.
+    """
+    override = environ.get("KIROCREW_KIRO_BIN", "")
+    if not override or not binary:
+        return False
+    if os.path.normpath(override) != os.path.normpath(binary):
+        return False
+    binary_dir = os.path.normpath(os.path.dirname(binary))
+    path_dirs = {
+        os.path.normpath(entry) for entry in environ.get("PATH", "").split(os.pathsep) if entry
+    }
+    return binary_dir not in path_dirs
+
+
+# Why ``update_cli`` refuses the desktop app's bundled copy. Shown verbatim in the
+# gate's ``cli_update_error``: the binary sits inside a signed, read-only app
+# bundle, so an in-place self-update either fails or breaks the app's signature
+# seal, and the next app update is what replaces it.
+BUNDLED_CLI_UPDATE_REFUSAL = (
+    "This kiro-cli ships inside the desktop app and is updated with the app, "
+    "not on its own. Update Kiro Crew to get a newer kiro-cli."
+)
 # The command that updates the CLI in place. Unlike the install/sign-in steps
 # above, which Kiro Crew only ever NAMES for the user to run, this one IS run on
 # the user's behalf (see :meth:`KiroPrerequisiteService.update_cli`): it is the
@@ -222,6 +304,82 @@ try:
     _PROCESS_GROUP_SUPERVISOR_CODE = Path(_PROCESS_GROUP_SUPERVISOR).read_text(encoding="utf-8")
 except OSError:
     _PROCESS_GROUP_SUPERVISOR_CODE = ""
+
+
+@functools.cache
+def _host_can_reap() -> bool:
+    """Whether the supervisor's ``--reap-survivors`` can act on this host.
+
+    Probed here, in the gateway, with the supervisor's own check: the child runs
+    on the same host and kernel, so the answer is the same there.
+    """
+    return platform_compat.IS_POSIX and _process_group_supervisor.can_reap()
+
+
+async def spawn_supervised_oneshot(argv: list[str], **kwargs: Any) -> asyncio.subprocess.Process:
+    """Spawn a one-shot ``kiro-cli`` call that cleans up what it leaves behind.
+
+    For fixed-argv calls that return (``--list-models``, ``whoami``, the
+    ``/usage`` scrape). A kiro-cli launcher wrapper can start a credential
+    helper of about 140 threads for such a call and leave it running when the
+    call returns. Here the call runs under the process-group supervisor in
+    ``--reap-survivors`` mode, in its own session: the supervisor stays the
+    group leader for the whole call and then ends what the command left in the
+    group. Pass the already sandbox- and cgroup-wrapped *argv*; the supervisor
+    goes outermost. Keyword arguments go to ``create_subprocess_limited``.
+
+    The supervisor execs its target without a PATH lookup, so a wrapper that is
+    not already absolute is resolved to a trusted system binary first, off the
+    loop since a miss walks all of PATH. Where the supervisor is unavailable
+    (Windows, or its source could not be captured) or the wrapper cannot be
+    resolved, the call runs unsupervised, still in its own session on POSIX
+    (Windows ignores ``start_new_session``). So does a
+    host that cannot reap (no pidfd, e.g. macOS): there the supervisor would only
+    wait for the leftovers instead of ending them, which would hold the call open.
+    """
+    supervised = False
+    if _PROCESS_GROUP_SUPERVISOR_CODE and argv and _host_can_reap():
+        target = argv
+        if not os.path.isabs(target[0]):
+            resolved = await asyncio.to_thread(platform_compat.trusted_system_bin, target[0])
+            target = [resolved, *target[1:]] if resolved else []
+            if not resolved:
+                logger.debug("%s is not a trusted system binary; spawning unsupervised", argv[0])
+        if target:
+            supervised = True
+            argv = [
+                sys.executable,
+                "-I",
+                "-c",
+                _PROCESS_GROUP_SUPERVISOR_CODE,
+                "--reap-survivors",
+                *target,
+            ]
+    if not supervised:
+        _note_unsupervised_once()
+    return await create_subprocess_limited(*argv, start_new_session=True, **kwargs)
+
+
+_unsupervised_noted = False
+
+
+def _note_unsupervised_once() -> None:
+    """Say once per process that one-shot calls run without leftover cleanup.
+
+    Debug-level detail stays per call; this single INFO line is what makes a
+    host that keeps leaking helpers diagnosable from the gateway log.
+    """
+    global _unsupervised_noted
+    if _unsupervised_noted:
+        return
+    _unsupervised_noted = True
+    logger.info(
+        "One-shot kiro-cli calls run without the reaping supervisor on this host "
+        "(no pidfd support, supervisor source unavailable, or wrapper not a trusted "
+        "system binary); helpers they leave behind are not cleaned up"
+    )
+
+
 _AUTH_STAGING_RELATIVE = Path(".kiro") / "crew-auth-staging"
 # Marker the offline E2E harness sets on the gateway it spawns. It grants NO
 # privilege: the packaged fake ACP backend is launched by the ordinary in-place
@@ -293,6 +451,11 @@ _AUTH_FINGERPRINT_CACHE_SECS = 5.0
 # Short: the projection is a handful of small reads against a local file, and a
 # stuck open must not hold up sign-in.
 _AUTH_SQLITE_TIMEOUT_SECS = 5.0
+# Upper bound on the boot-time baseline seed's store read. The seed sits on the
+# gateway startup path ahead of the listeners binding, so a hung store (locked
+# SQLite, stalled network filesystem) must cost boot at most this much; on
+# timeout the seed refuses and the fail-safe unset-baseline sweep remains.
+_SEED_BASELINE_TIMEOUT_SECS = 5.0
 # Process-lifetime pins for explicit operator overrides. The prerequisite
 # service records the canonical path + digest before any agent session starts;
 # ACP spawn consumes the same pin so a later agent write cannot turn a stale
@@ -310,6 +473,7 @@ _PROBE_ENV_KEYS = frozenset(
         # headless) simply don't set them, so this is a no-op there.
         "DBUS_SESSION_BUS_ADDRESS",
         "HOME",
+        "KIRO_NO_AUTO_UPDATE",
         "LANG",
         "LC_ALL",
         "LOCALAPPDATA",
@@ -441,6 +605,11 @@ class PrerequisiteStatus:
     # tier is an explicit choice rather than whichever option the sign-in page
     # happens to make prominent.
     sso_login_command: str = KIRO_CLI_SSO_LOGIN_COMMAND
+    # True when the resolved binary is the desktop app's own bundled copy. The
+    # gate uses it to explain why ``login_command`` is an absolute path into the
+    # app's resources rather than the bare name the user's shell would resolve
+    # (the bundled copy is not on their PATH).
+    bundled_cli: bool = False
     # Whether the installed CLI exposes the ``acp`` subcommand every Kiro Crew
     # session is launched through. Defaults True so nothing regresses when the
     # probe cannot answer (a sandbox refusal, a timeout): those are reported by
@@ -1173,6 +1342,234 @@ def _combine_identity_fingerprints(cli: str, crew_vault: str) -> str:
     if not crew_vault:
         return cli
     return f"{cli}{_CREW_VAULT_FINGERPRINT_SEP}{crew_vault}"
+
+
+def identity_stamp_mismatch(stamp: str, live: str) -> bool:
+    """Whether a child's spawn-time identity PROVABLY differs from the live one.
+
+    ``stamp`` is the combined fingerprint recorded when the child's process
+    spawned (:func:`stamp_spawn_identity`); ``live`` is a fresh read. This is
+    what closes the round trip no read ever observes: seed A -> a child spawns
+    under B -> the store returns to A before any poll or turn gate samples the
+    interim -- the baseline and the latch both compare A to A, but the child's
+    own stamp still says B.
+
+    "Provably" is the loop guard. A retirement triggered by a transient read
+    failure would recycle a healthy child, and a systematically unreadable
+    component would recycle one every turn -- the respawn churn the seeded
+    baseline exists to remove. So a component participates only when it is
+    nonempty on BOTH sides: reads lose components under failure, they do not
+    gain or alter them, so two nonempty values that differ cannot be a blip.
+    An empty ``stamp`` means the spawn-time read failed or the stamping is
+    unwired, and an empty ``live`` means the store cannot be read right now;
+    both fall back to the existing baseline/latch machinery unchanged.
+    """
+
+    if not stamp or not live or stamp == live:
+        return False
+    stamp_cli, _, stamp_vault = stamp.partition(_CREW_VAULT_FINGERPRINT_SEP)
+    live_cli, _, live_vault = live.partition(_CREW_VAULT_FINGERPRINT_SEP)
+    if stamp_cli and live_cli and stamp_cli != live_cli:
+        return True
+    return bool(stamp_vault and live_vault and stamp_vault != live_vault)
+
+
+def spawn_identity_of(holder: Any) -> str:
+    """The spawn-time identity stamp recorded on *holder*, or ``""``.
+
+    A standalone provider carries ``spawn_identity`` itself; a demuxed
+    session's provider rides a shared ``AcpRuntime`` and the stamp lives on
+    that runtime (``_runtime``). Empty means unstamped: the spawn-time read
+    failed, disagreed with its pre-spawn read, or the stamping is unwired.
+    """
+
+    return str(
+        getattr(holder, "spawn_identity", "")
+        or getattr(getattr(holder, "_runtime", None), "spawn_identity", "")
+        or ""
+    )
+
+
+def spawned_under(holder: Any, live: str) -> bool:
+    """Whether *holder*'s child PROVABLY authenticated as the live account.
+
+    The identity sweep's spare test, and the converse of
+    :func:`identity_stamp_mismatch` -- deliberately stricter. A mismatch is
+    proven component-wise, because a read can LOSE a component under failure
+    and two nonempty values that differ cannot be a blip. Sparing a holder
+    from retirement is the opposite bet: a wrong spare keeps a wrong-account
+    child answering turns, so only a nonempty stamp EQUAL to a nonempty live
+    fingerprint, whole, qualifies. An unstamped child is never spared -- it
+    keeps exactly the pre-stamping treatment (retired by the sweep) -- and an
+    unreadable store (empty *live*) spares nothing, so a host whose store
+    cannot be fingerprinted keeps the fail-safe retire-everything sweep.
+    """
+
+    if not live:
+        return False
+    return spawn_identity_of(holder) == live
+
+
+async def pre_spawn_identity(reader: Any) -> str:
+    """Best-effort identity read taken immediately BEFORE a child spawns.
+
+    The first half of the double read that brackets a spawn: call this right
+    before ``provider.start()`` and hand the value to
+    :func:`stamp_spawn_identity` as ``pre_spawn``. The child reads its
+    credential between the two, so two agreeing reads bound what it can have
+    loaded. Never raises; an empty return means the read failed or no reader
+    is wired, and the stamp will be refused (the child keeps the pre-stamping
+    protections).
+    """
+
+    if reader is None:
+        return ""
+    try:
+        return str(await reader() or "")
+    except Exception:
+        logger.warning("Pre-spawn identity read failed; the stamp will be refused", exc_info=True)
+        return ""
+
+
+async def stamp_spawn_identity(reader: Any, provider: Any, *, pre_spawn: str = "") -> None:
+    """Record which identity a just-spawned child loaded, when provable.
+
+    Called right after a kiro-backed provider's process start succeeds, with
+    ``reader`` being :meth:`KiroPrerequisiteService.read_spawn_identity` (or
+    ``None`` on entry points that never wire one -- the CLI, tests -- where
+    this is deliberately inert) and ``pre_spawn`` the value
+    :func:`pre_spawn_identity` returned immediately before ``start()``. The
+    stamp lands on ``provider.spawn_identity`` and is consumed by
+    ``flag_identity_stamp_mismatches`` via :func:`identity_stamp_mismatch`.
+
+    The stamp is recorded only when the pre-spawn and post-spawn reads are
+    both nonempty and EQUAL. The child reads its credential between the two,
+    so agreement is what makes the record trustworthy: a single post-start
+    read can miss a switch that landed before it (the child authenticated as
+    B, the store returned to A, the read stamps A -- labelling a
+    wrong-account child as healthy). Disagreement or a failed read refuses
+    the stamp instead of guessing; both reads flow through the ordinary read
+    path, so an interim account either one observes feeds the latch anyway.
+
+    Never raises and never blocks the spawn on failure: an unstamped child is
+    exactly as protected as every child was before stamping existed (the
+    baseline and interim latch still cover it), so the failure direction is
+    the status quo, not a regression.
+
+    Residual (documented, not closed): a switch AND return that both complete
+    strictly between the two reads, with the child sampling the interim, can
+    still stamp the wrong account. Closing that needs the child to report the
+    identity it actually loaded -- a protocol change, the named follow-up.
+    """
+
+    if reader is None:
+        return
+    if getattr(provider, "spawn_identity", ""):
+        # First stamp wins: a warm-pool provider authenticated at FILL time,
+        # and a later ``start()`` on the claim path is a no-op on an already
+        # running process -- re-stamping there would relabel it with whatever
+        # the store holds at claim time, which is exactly the wrong account
+        # for a provider that spawned during an interim window.
+        return
+    try:
+        stamp = await reader()
+    except Exception:
+        logger.warning("Spawn identity stamp read failed; child left unstamped", exc_info=True)
+        return
+    if not stamp or not pre_spawn:
+        return
+    if stamp != pre_spawn:
+        # An observed switch across the spawn window: which account the child
+        # loaded cannot be proven, so refuse the stamp. The differing read has
+        # already fed the interim latch through the ordinary read path.
+        logger.info(
+            "Identity changed across a spawn window; child left unstamped "
+            "(the interim latch covers the observed switch)"
+        )
+        return
+    try:
+        setattr(provider, "spawn_identity", stamp)
+    except Exception:
+        logger.warning("Provider refused the spawn identity stamp", exc_info=True)
+
+
+#: How long a runtime displaced by the spawn-identity gate must sit parked
+#: before a drain reap may kill it, even when its busy probe answers idle.
+#: The probe reads registered sessions plus open init scopes, and a claim
+#: opens its scope at ``create_session`` entry before the admission gate --
+#: but a handful of bounded awaits (a config read, a document projection)
+#: still precede the scope on the claim path, so a probe landing exactly
+#: there would read a claimed runtime as idle. The grace outlasts that
+#: sub-second window by two orders of magnitude; it only delays teardown of
+#: an already-unclaimable process, never a claim.
+IDENTITY_PARK_GRACE_SECS = 30.0
+
+
+def mark_identity_parked(runtime: Any, now: float) -> None:
+    """Record when the spawn-identity gate parked *runtime* on a drain list.
+
+    Read back by the drain reaps, which refuse to kill a parked runtime
+    before :data:`IDENTITY_PARK_GRACE_SECS` has elapsed (see the constant for
+    why). Best-effort: a runtime that refuses the attribute is reaped on the
+    pre-grace rules, exactly as every parked runtime was before the grace
+    existed. Backend-switch displacement never calls this, so its parks keep
+    their original reap timing.
+    """
+
+    try:
+        setattr(runtime, "_identity_parked_at", float(now))
+    except Exception:
+        logger.debug("runtime refused the identity park mark", exc_info=True)
+
+
+def identity_park_grace_remaining(runtime: Any, now: float) -> float:
+    """Seconds of park grace left for *runtime*; ``0.0`` when reapable.
+
+    Zero for a runtime never marked by :func:`mark_identity_parked` (a
+    backend-switch park, or one that refused the mark), so the grace never
+    delays a reap the spawn-identity gate did not ask for.
+    """
+
+    parked_at = getattr(runtime, "_identity_parked_at", None)
+    if not isinstance(parked_at, (int, float)):
+        return 0.0
+    return max(0.0, IDENTITY_PARK_GRACE_SECS - (float(now) - float(parked_at)))
+
+
+def spawn_pid(child: Any) -> int | None:
+    """Best-effort PID of a just-started provider or runtime.
+
+    The spawn-identity stamp read (:func:`stamp_spawn_identity`) is a real,
+    bounded suspension point between a child's process start and its
+    registration in whichever structure shields it from the periodic orphan
+    sweep (``_starting_pids``, the session map, a runtime registry, the warm
+    pool). On hosts whose PID probe has no age grace, a sweep tick landing in
+    that await would find a tracked PID in no active set and kill the healthy
+    child -- so every stamp site adds this PID to the facade's
+    start-to-registration guard BEFORE awaiting the stamp and discards it
+    once real registration is visible (or on teardown).
+
+    Accepts either shape: a raw ``AcpRuntime`` (its ``pid`` property) or a
+    provider (``client._pid``, falling back to a live ``_proc``). Returns
+    ``None`` when no live PID is extractable -- the caller then simply skips
+    the shield, which is exactly the pre-stamping exposure, never worse.
+    """
+
+    try:
+        pid = getattr(child, "pid", None)
+        if isinstance(pid, int):
+            return pid
+        pid = getattr(getattr(child, "client", None), "_pid", None)
+        if isinstance(pid, int):
+            return pid
+        process = getattr(child, "_proc", None)
+        if process is not None and getattr(process, "returncode", 0) is None:
+            proc_pid = getattr(process, "pid", None)
+            if isinstance(proc_pid, int):
+                return proc_pid
+    except Exception:
+        logger.debug("spawn pid probe failed", exc_info=True)
+    return None
 
 
 def _claim_digest(value: object) -> str:
@@ -2262,6 +2659,24 @@ class KiroPrerequisiteService:
         # on every identity poll, so the diagnostic logs once per service rather
         # than flooding; see current_identity_fingerprint.
         self._relocation_logged = False
+        # Sticky: some fresh read observed a DIFFERENT signed-in account than
+        # the recorded baseline. Forces the retirement sweep at the next turn
+        # gate even after the store switches back (the A->B->A round trip a
+        # bare baseline comparison cannot see), and clears only when a sweep
+        # COMPLETES (note_sessions_reconciled). Latched exclusively by
+        # _maybe_latch_interim_identity, which refuses component-loss
+        # observations so a transient unreadable store can never arm it.
+        self._interim_identity_observed = False
+        # Monotonic count of qualifying interim observations. Every arm-worthy
+        # read bumps it -- including reads that land while the latch is already
+        # armed -- so a sweep can tell observations it covered from ones that
+        # arrived AFTER its own initiating read. note_sessions_reconciled
+        # clears the latch only when no observation postdates the generation
+        # its caller captured at the gate read; a newer observation names an
+        # account that sweep never compared against, and clearing it would
+        # erase the only record that the account existed (a child spawned
+        # under it may be unstamped and otherwise invisible).
+        self._interim_identity_gen = 0
 
     @property
     def initial_setup_complete(self) -> bool:
@@ -2656,7 +3071,7 @@ class KiroPrerequisiteService:
         ):
             return self._identity_cache
 
-        def _read() -> str:
+        def _read() -> tuple[str, str]:
             # Both the relocation guard and the win32 path resolver stat the
             # filesystem, so the whole resolve-and-read runs in this worker
             # thread and stats stay off the event loop.
@@ -2682,19 +3097,91 @@ class KiroPrerequisiteService:
                 cli = identity_fingerprint(
                     kiro_identity_store_path(self._platform, self._home, self._environ)
                 )
-            return _combine_identity_fingerprints(cli, _crew_vault_fingerprint())
+            # The CLI component is returned alongside the combined digest so the
+            # interim-identity latch can tell "a different account" from "the
+            # same account with a component that failed to read" -- the combined
+            # string alone cannot (an absent CLI plus a present vault is truthy).
+            return cli, _combine_identity_fingerprints(cli, _crew_vault_fingerprint())
 
         try:
-            fingerprint = await asyncio.to_thread(_read)
+            cli, fingerprint = await asyncio.to_thread(_read)
         except Exception:
             # An unreadable store reports "no identity", matching
             # identity_fingerprint's own contract, rather than "unchanged" --
             # guessing "unchanged" is what keeps a stale account alive.
             logger.warning("Kiro identity fingerprint could not be read", exc_info=True)
-            fingerprint = _AUTH_FINGERPRINT_ABSENT
+            cli = fingerprint = _AUTH_FINGERPRINT_ABSENT
+        self._maybe_latch_interim_identity(cli, fingerprint)
         self._identity_cache = fingerprint
         self._identity_cache_at = now
         return fingerprint
+
+    def _maybe_latch_interim_identity(self, cli: str, fingerprint: str) -> None:
+        """Latch when a fresh read observes a DIFFERENT account than the baseline.
+
+        The retirement gate compares the live fingerprint to a baseline, which
+        is blind to a round trip: seed A -> switch to B (a child spawns under
+        B) -> switch back to A compares equal, and the B-authenticated child
+        serves the next turn. Any fresh read that lands DURING the interim
+        window -- a status poll (every few seconds per open dashboard tab), a
+        turn gate, a readiness probe -- records the observation here, and
+        :meth:`identity_changed_since_sessions` reports changed until a sweep
+        completes, whatever the store says by then.
+
+        Latching is deliberately refused for every observation that could be a
+        TRANSIENT READ FAILURE rather than a different account -- a sticky flag
+        armed by a blip would force retire-until-complete sweeps on a healthy
+        host, re-creating the perpetual recycle loop the seeded baseline
+        exists to remove:
+
+        - no baseline recorded: nothing to differ from (the unset baseline
+          already reports changed on its own);
+        - the CLI component is absent AND the vault component does not
+          independently prove a change: an unreadable/relocated store or a
+          sign-out, indistinguishable from a blip. Real sign-outs are still
+          caught by the ordinary (non-sticky) baseline comparison. A nonempty
+          vault that appears or differs from the baseline's DOES latch even
+          with the CLI absent -- a vault-only gateway has no CLI component to
+          offer, and a changed vault cannot be a read failure;
+        - the vault component vanished while the CLI component matches the
+          baseline's: an unreadable vault reads as empty, same reasoning.
+
+        A component that APPEARS or CHANGES is never a blip -- reads lose
+        components under failure, they do not gain them -- so those latch.
+        """
+
+        baseline = self._session_identity
+        if baseline is None or fingerprint == baseline:
+            return
+        base_cli, _, base_vault = baseline.partition(_CREW_VAULT_FINGERPRINT_SEP)
+        _, _, vault = fingerprint.partition(_CREW_VAULT_FINGERPRINT_SEP)
+        if not cli:
+            # The CLI component is absent: on its own this is indistinguishable
+            # from a transient store read failure, so it never latches. But the
+            # VAULT component can still prove a real change -- a nonempty vault
+            # that appears or differs from the baseline's cannot be a blip
+            # (reads lose components under failure; they do not gain or alter
+            # them). Without this arm, a vault-only gateway (no CLI store at
+            # all) could never latch, and a vault A->B->A round trip there
+            # would leave B-authenticated children alive.
+            if not (vault and vault != base_vault):
+                return
+        elif cli == base_cli and base_vault and not vault:
+            # Same CLI account, vault component lost: indistinguishable from a
+            # transient vault read failure. The non-sticky baseline comparison
+            # still reports this as changed for as long as it persists.
+            return
+        # Bump the generation on EVERY qualifying observation, not only the
+        # arming one: an observation landing while the latch is already armed
+        # must still postdate a sweep that read the store before it, or the
+        # sweep's reconcile would erase it (see note_sessions_reconciled).
+        self._interim_identity_gen += 1
+        if not self._interim_identity_observed:
+            self._interim_identity_observed = True
+            logger.info(
+                "Interim account observed since the last reconciled baseline; "
+                "the next turn gate will sweep even if the store switches back"
+            )
 
     async def identity_changed_since_probe(self) -> bool:
         """Whether the signed-in account differs from the one the LATCH describes.
@@ -2748,16 +3235,172 @@ class KiroPrerequisiteService:
         live = await self.current_identity_fingerprint(allow_cached=False)
         if self._session_identity is None:
             return (True, live)
+        if self._interim_identity_observed:
+            # Some fresh read since the last complete sweep observed a DIFFERENT
+            # account. Even if the store has since switched back (live equals the
+            # baseline again), children spawned during the interim window hold
+            # that account's credential, so report changed until a sweep
+            # completes. See _maybe_latch_interim_identity.
+            return (True, live)
         return (live != self._session_identity, live)
 
-    def note_sessions_reconciled(self, fingerprint: str) -> None:
+    @property
+    def identity_observation_generation(self) -> int:
+        """Count of qualifying interim-identity observations so far.
+
+        Captured by the turn gate immediately after its
+        :meth:`identity_changed_since_sessions` read and handed back to
+        :meth:`note_sessions_reconciled`, so the reconcile can tell
+        observations its sweep covered from ones that arrived while the sweep
+        ran. An instance-level "generation at last gate read" would race:
+        two overlapping turn gates would overwrite each other's capture, and
+        the later writer's value could mask an observation the earlier
+        sweep never saw.
+        """
+
+        return self._interim_identity_gen
+
+    def note_sessions_reconciled(
+        self, fingerprint: str, *, observations_before: int | None = None
+    ) -> None:
         """Record that running children now match *fingerprint*.
 
         Advanced ONLY by the retirement path, so no other consumer can retire
         this baseline's signal on its behalf.
+
+        *observations_before* is the :attr:`identity_observation_generation`
+        the caller captured right after the gate read that initiated the
+        sweep. A COMPLETE sweep retired or flag-marked every kiro-backed child
+        that predates that read -- but an observation with a NEWER generation
+        names an account the sweep never compared against (a store flap
+        observed by a status poll while the sweep ran, after its permits
+        reopened cold starts). Clearing the latch then would erase the only
+        record that account existed: a child spawned under it inside a
+        bracket-read disagreement is unstamped, invisible to the stamp gate,
+        and live equals the baseline so no later read re-latches. The latch
+        is therefore kept when a newer observation exists, and the next turn
+        gate runs one more sweep that covers it. ``None`` (tests, legacy
+        callers) clears unconditionally -- the production gate always passes
+        the captured generation, pinned by a source scan.
         """
 
         self._session_identity = fingerprint
+        if observations_before is not None and self._interim_identity_gen > observations_before:
+            logger.info(
+                "Interim account observed while the sweep ran; keeping the "
+                "latch so the next turn gate sweeps again"
+            )
+            return
+        # A COMPLETE sweep retired or flag-marked every kiro-backed child, so
+        # nothing predating it survives unmarked -- the interim observation is
+        # resolved. A child spawned under yet another account AFTER the sweep
+        # re-latches on the next fresh read that observes it.
+        self._interim_identity_observed = False
+
+    async def seed_sessions_baseline(self) -> bool:
+        """Adopt the CURRENT store identity as the running-children baseline.
+
+        Called once at gateway startup, BEFORE anything can spawn a kiro-backed
+        child. Every child necessarily postdates this read, so the account it
+        authenticates under is the one recorded here or a later one -- and a
+        later one compares unequal, which is exactly the change
+        :meth:`identity_changed_since_sessions` exists to catch. That makes the
+        once-per-lifetime unset-baseline sweep unnecessary on a host whose store
+        is readable, and removing it matters: on a live gateway that sweep's
+        completion precondition (nothing busy, nothing mid-start, no runtime
+        surviving) is routinely unsatisfiable -- the sweep retires idle sessions,
+        dashboard slots eagerly respawn them, and the in-flight starts keep the
+        next sweep incomplete -- so the baseline never advances and every turn
+        recycles healthy, seconds-old children forever.
+
+        Returns whether a baseline was recorded. Refuses -- keeping the
+        fail-safe unset-baseline behaviour -- when:
+
+        - ``assume_ready`` holds: a test or offline gateway asserts its own
+          readiness and has no store to compare against;
+        - a baseline is already recorded: a seed must never mask a pending
+          change another consumer is still retrying to reconcile;
+        - the store cannot be fingerprinted: seeding "" would make "cannot
+          tell" the accepted steady state, so every later account switch would
+          compare equal to "" and go undetected. Unset instead re-sweeps each
+          turn, bounding how long a child can outlive the account it loaded;
+        - the store read exceeds :data:`_SEED_BASELINE_TIMEOUT_SECS`: this
+          await sits on the gateway boot path ahead of the listeners binding,
+          so a hung store must not stall startup indefinitely.
+
+        Known residual, narrowed twice: the interim-identity latch
+        (:meth:`_maybe_latch_interim_identity`) catches an A->B->A round trip
+        whenever ANY fresh fingerprint read lands during the interim window,
+        and the spawn-identity stamp (:meth:`read_spawn_identity` +
+        ``flag_identity_stamp_mismatches``) catches the child itself even when
+        NO read observed the interim -- the stamp recorded at its spawn still
+        names the interim account. What remains is the sub-second gap inside a
+        single spawn (see :func:`stamp_spawn_identity`); closing it needs the
+        child to report the identity it actually loaded.
+        """
+
+        if self._assume_ready or self._session_identity is not None:
+            return False
+        try:
+            # Bounded: this await sits on the gateway boot path ahead of the
+            # listeners binding, so a hung store (locked SQLite, stalled
+            # network filesystem) must delay startup by at most this deadline,
+            # not indefinitely. On timeout, refuse toward the existing
+            # fail-safe unset-baseline sweep -- boot proceeds unchanged.
+            live = await asyncio.wait_for(
+                self.current_identity_fingerprint(allow_cached=False),
+                timeout=_SEED_BASELINE_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Identity baseline NOT seeded (store read exceeded %.0fs); "
+                "keeping the fail-safe unset-baseline sweep",
+                _SEED_BASELINE_TIMEOUT_SECS,
+            )
+            return False
+        if not live:
+            logger.info(
+                "Identity baseline NOT seeded (store unreadable); keeping the "
+                "fail-safe unset-baseline sweep"
+            )
+            return False
+        self._session_identity = live
+        logger.info("Identity baseline seeded at startup; boot sweep skipped")
+        return True
+
+    async def read_spawn_identity(self) -> str:
+        """Fresh identity fingerprint for stamping a just-spawned child.
+
+        The spawn-time counterpart of the turn gate's live read: the value it
+        returns is recorded on the new provider (``spawn_identity``) so
+        ``flag_identity_stamp_mismatches`` can later prove the child loaded a
+        different account than the store now names -- including across an
+        A->B->A round trip that no poll or turn observed, which neither the
+        baseline nor the interim latch can see.
+
+        Uncached on purpose (a cached value predating the spawn would stamp
+        the wrong account) and bounded like the boot seed: a spawn already
+        takes seconds, but a hung store must not add an unbounded await to
+        every cold start. Failure returns the absent sentinel, which
+        :func:`stamp_spawn_identity` refuses to record -- an unstamped child
+        keeps exactly the pre-stamping protections. The read itself flows
+        through the ordinary path, so an interim account it happens to observe
+        feeds the latch as any other read would.
+        """
+
+        if self._assume_ready:
+            return _AUTH_FINGERPRINT_ABSENT
+        try:
+            return await asyncio.wait_for(
+                self.current_identity_fingerprint(allow_cached=False),
+                timeout=_SEED_BASELINE_TIMEOUT_SECS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Spawn identity read exceeded %.0fs; child left unstamped",
+                _SEED_BASELINE_TIMEOUT_SECS,
+            )
+            return _AUTH_FINGERPRINT_ABSENT
 
     async def verified_ready(self, *, max_age_secs: float) -> bool:
         """Return readiness backed by a probe no older than *max_age_secs*.
@@ -2924,6 +3567,7 @@ class KiroPrerequisiteService:
                         kind,
                         detail,
                     )
+                    login_cmd, sso_cmd, bundled = login_commands_for(first_candidate, self._environ)
                     self._status = PrerequisiteStatus(
                         platform=_platform_label(self._platform),
                         # Present and executable on disk. Verification is what
@@ -2935,6 +3579,9 @@ class KiroPrerequisiteService:
                         ready=False,
                         repair_required=False,
                         initial_setup_complete=self._initial_setup_complete,
+                        login_command=login_cmd,
+                        sso_login_command=sso_cmd,
+                        bundled_cli=bundled,
                         sandbox_unavailable=True,
                         sandbox_failure_kind=kind,
                         sandbox_detail=detail,
@@ -2986,6 +3633,7 @@ class KiroPrerequisiteService:
                             first_candidate,
                             _PROBE_TIMEOUT_SECS,
                         )
+                    login_cmd, sso_cmd, bundled = login_commands_for(first_candidate, self._environ)
                     self._status = PrerequisiteStatus(
                         platform=_platform_label(self._platform),
                         installed=True,
@@ -2995,6 +3643,9 @@ class KiroPrerequisiteService:
                         ready=False,
                         repair_required=False,
                         initial_setup_complete=self._initial_setup_complete,
+                        login_command=login_cmd,
+                        sso_login_command=sso_cmd,
+                        bundled_cli=bundled,
                         probe_timed_out=True,
                     )
                     self._last_probe_at = self._clock()
@@ -3040,6 +3691,7 @@ class KiroPrerequisiteService:
             if whoami.ok:
                 rejected, rejection_detail = await self._probe_spec_acceptance(self._viable_binary)
                 acp_supported = await self._probe_acp_support(self._viable_binary)
+            login_cmd, sso_cmd, bundled = login_commands_for(self._viable_binary, self._environ)
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
                 installed=True,
@@ -3052,6 +3704,9 @@ class KiroPrerequisiteService:
                 ready=whoami.ok and not rejected and acp_supported,
                 repair_required=bool(rejected),
                 initial_setup_complete=self._initial_setup_complete,
+                login_command=login_cmd,
+                sso_login_command=sso_cmd,
+                bundled_cli=bundled,
                 rejected_agent_specs=rejected,
                 agent_spec_rejection_detail=rejection_detail,
                 acp_supported=acp_supported,
@@ -3202,6 +3857,13 @@ class KiroPrerequisiteService:
         error = ""
         if not executable:
             error = "Kiro CLI could not be found to update."
+        elif is_bundled_kiro_cli(executable, self._environ):
+            # The bundled copy lives inside the signed app bundle: writing there
+            # breaks the codesign seal (Gatekeeper then calls the app "damaged"),
+            # and it is pinned to the version the app was built against anyway.
+            # Refused BEFORE the audited spawn so no "invoked" record is written
+            # for a step that never runs.
+            error = BUNDLED_CLI_UPDATE_REFUSAL
         else:
             # The resolved binary is UNVERIFIED (candidates[0] is whatever sits
             # first on PATH; an agent that can plant ~/.local/bin/kiro-cli would

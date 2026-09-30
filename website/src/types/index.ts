@@ -167,7 +167,7 @@ export interface StatusData {
    * AMBIGUOUS by construction: it is what an unconfigured channel and a
    * configured one that never started both look like. Nothing in this payload
    * separates them — each channel's own config endpoint reports `configured`,
-   * which is what Settings > Channels reads.
+   * which is what Settings > Messaging Channels reads.
    */
   channels?: Record<string, { connected: boolean; error: string }>
   /** Governance enforcement health. */
@@ -858,6 +858,22 @@ export interface McpServer {
   /** True when the entry lives in KiroCrew's own mcp.json — the scope the
    *  Edit JSON action reads and writes (consent-disabled rows included). */
   kirocrewManaged?: boolean
+  /** Which config switched the row off, from the backend — never inferred from
+   *  `enabled` + `kirocrewManaged`. `kirocrew`: a disable in Kiro Crew's own
+   *  store, which the Kiro Crew scope badge + Apply lifts (the consent step).
+   *  `shared`: a disable in a config this panel does not write for enable (the
+   *  shared Kiro MCP config the IDE edits, or a provider global), so the row is
+   *  inert here; a row disabled in both reads `shared`. `null` when enabled. */
+  disabledIn?: 'shared' | 'kirocrew' | null
+  /** The file to edit to re-enable a `shared` row, home collapsed to `~`, when
+   *  the backend can name it; `null` when it cannot. */
+  disabledInFile?: string | null
+  /** WHY the row is off, when the switch is not the honest story: `invalid`
+   *  means the config's `disabled` is not a boolean (`"false"`, `1`, `null`) and
+   *  the backend read it fail-closed -- an invalid value never launches a
+   *  server -- so the fix is to repair the value where it sits, not to flip a
+   *  switch. `null` when enabled or when some config really says `true`. */
+  disabledReason?: 'invalid' | null
   /** Consecutive failed probes on record. Absent means none — a healthy server
    *  carries neither this nor `quarantined`. */
   probeFailures?: number
@@ -892,6 +908,9 @@ export interface TodoTask {
   text: string
   /** kiro-cli's todo model is a plain boolean — there is no in-progress state. */
   completed: boolean
+  /** True while a person's click holds this row's state and the agent has not
+   * yet confirmed it in its own list. Absent on rows the agent itself set. */
+  person?: boolean
 }
 
 /**
@@ -951,7 +970,17 @@ export interface McpSessionReport {
 export interface SessionLink {
   channel: string
   label: string
+  /** Redacted display tail of the conversation id — never the id, never a key. */
   target: string
+  /**
+   * Opaque identity of the whole binding (channel, full conversation id, thread),
+   * minted server-side. An unlink names it, and the server refuses a row whose
+   * binding has since been replaced — `target` alone cannot tell a Slack thread
+   * from its same-channel replacement. Optional for the same reason as `paused`:
+   * a cached `slots` payload from before this field shipped has none, and a
+   * row sent without it is refused as stale rather than unlinking anything.
+   */
+  binding?: string
   /**
    * `origin` — the conversation the session started on.
    * `out`    — dashboard replies are mirrored there (one-way, from `!link`).
@@ -964,6 +993,21 @@ export interface SessionLink {
    * `channel` alone does not identify a row; pair it with origin-ness.
    */
   direction: 'origin' | 'out' | 'both'
+  /**
+   * Messages sent in that conversation land in THIS session. The server's
+   * statement of inbound routing, per row, because it is not readable from the
+   * other fields: a Slack thread is `out` (Slack routes replies through its own
+   * thread index, not the mirror's inbound marker) yet a reply there resumes
+   * this session; a `both` mirror routes inbound by that marker; a one-way
+   * `out` mirror only receives replies; the conversation a session was born in
+   * is where its turns come from. What a sever destroys differs between a row
+   * that drives the session and one that does not, so the menu's sub-lines
+   * read this rather than inferring it from `direction` or the channel name —
+   * the inference is wrong for a paused Slack row. Optional for the same
+   * reason as `binding`: a cached `slots` payload from before this field
+   * shipped has none, and such a row reads as not driving until the next push.
+   */
+  drives_session?: boolean
   live: boolean
   /**
    * The user disconnected this channel: turn output stops flowing there, but the
@@ -1044,6 +1088,15 @@ export interface ChatSlot {
    *  the absence of an answer, never a denial. DISPLAY only — the pin is
    *  deliberately kept when withheld, so this must not drive a write. */
   model_withheld?: boolean | null
+  /** Whether this session's turns ask Jev which model tier to run on -- the chat
+   *  picker's `Auto (Jev)` entry (`lib/jevRoute.ts`, `decisions/points/model_route.py`).
+   *
+   *  Shipped on every slot, so "the owner picked a model by hand" is a positive
+   *  value rather than an absent key. Unlike `model_withheld` and `served_model`
+   *  this IS the owner's own choice, so it drives the picker's highlight: a routed
+   *  slot stores `model: 'auto'`, and highlighting the Auto row would name a
+   *  behaviour the session does not have. */
+  jev_route?: boolean
   /** The model id the live session actually resolved to; `''`/absent when not
    *  known. A slot with no pin — or one whose pin was withheld — runs on the
    *  backend's own choice, which the pin cannot name, so this is what lets a
@@ -1076,7 +1129,7 @@ export interface ChatSlot {
   linked_session_key?: string
   /** Prompts held for a later turn on this slot. */
   queue_depth?: number
-  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
+  key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_scope?: string; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; tags_revision?: string; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue'; identity?: string }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse
    * survey shows only on a "user" slot, so an imported Slack thread, a
@@ -1281,15 +1334,35 @@ export interface PullRequestSource {
 
 export interface ChatFolder {
   id: string; name: string; collapsed?: boolean; order: number; parent_id?: string; color?: string; icon?: string; default_agent?: string; project_dir?: string; hidden?: boolean; history_count?: number
+  /** Epoch seconds the folder was created, written by every folder creator since
+   *  the sidebar's `created` sort existed. Absent on a row from before that; such
+   *  a row sorts as older than every stamped one. Read only through
+   *  `folderComparator('created')`, which mirrors the Python reader. */
+  created_at?: number
   /** Tag ids (from the tag vocabulary) copied onto every NEW chat filed into
    *  this folder. Absent = no tags, mirroring the optional `color`. */
   tags?: string[]
+  /** Extra steering directories loaded, in addition to the global and project
+   *  steering, for every chat whose folder is in this folder's subtree.
+   *  ACCUMULATIVE up the parent_id chain (unlike `project_dir`, which is
+   *  nearest-wins). Absent = none, mirroring the optional `tags`. */
+  steering_dirs?: string[]
+  /** Principal that owns the folder: an app's name, `member:<store>` for a
+   *  crew member, absent/empty for the person. Folder steering from an
+   *  ancestor owned by ANOTHER principal is never delivered to this folder's
+   *  chats, so the inherited list filters on it. */
+  owner_app?: string
   /** Channel namespace when this folder was created by per-channel session filing (e.g. 'discord'). */
   channel?: string
 }
 
+export type AgentTagPolicy = 'none' | 'add-only' | 'add-remove'
+
 export interface ChatTag {
   id: string; name: string; color: string; order: number; status?: boolean
+  agent?: AgentTagPolicy
+  agent_provenanced?: boolean
+  agent_store_degraded?: boolean
 }
 
 export type TagColumnMode = 'any' | 'all' | 'none'
@@ -1316,7 +1389,7 @@ export interface ChatMessage {
   /** Structured metadata for role-specific data (e.g. tool_input for permission messages). */
   meta?: Record<string, unknown>
   /** Regenerated variants of an assistant message (most recent last). */
-  variants?: { content: string; ts?: string }[]
+  variants?: { content: string; ts?: string; blocked_links?: unknown; redactions?: unknown }[]
   /** Which variant index is currently active. */
   variant_idx?: number
   /** Counter for consecutive identical tool message deduplication. */
@@ -1368,7 +1441,7 @@ export interface SubagentActivity {
   childSession?: string
   status: 'pending' | 'running' | 'tool' | 'done' | 'error' | 'stopped'
   streaming: string; lastTool: string
-  startedAt: number; elapsed: number; error?: string
+  startedAt: number; elapsed: number; credits?: number; error?: string
   /** True when `startedAt` was ASSUMED rather than observed, which is the case
    *  for an entry minted by `upsertSlotSub` from an incremental frame: that frame
    *  carries no start time, so the entry records its arrival instant. The agent
@@ -1400,12 +1473,25 @@ export interface SubagentActivity {
   result?: string
 }
 
+/** Where `clampToolOutput` (wire.ts in store/chat) removed the middle of a tool
+ *  payload: the stored string is `head + '\n' + tail`, `at` is the offset of
+ *  the tail (right after that newline) and `count` is how many characters were
+ *  dropped between the two. Renderers put the localized marker there at view
+ *  time, so the store never holds a rendered string and the marker follows a
+ *  later language switch. */
+export interface ToolPayloadCut {
+  at: number
+  count: number
+}
+
 export interface ToolActivity {
   type: string
   text: string          // tool name (or approval / activity label)
   purpose?: string      // tool purpose
   input?: string        // tool input (commands, file content, etc.)
   output?: string       // tool output (stdout, results, etc.)
+  input_cut?: ToolPayloadCut   // set only when `input` was clamped
+  output_cut?: ToolPayloadCut  // set only when `output` was clamped
   ts: number
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call
@@ -1457,6 +1543,9 @@ export interface NotificationChannel {
 }
 
 export interface PendingApproval {
+  origin?: 'native' | 'coordinator'
+  request_mid?: string
+  tool_purpose?: string
   tool: string
   tool_input: string
   tool_kind: string

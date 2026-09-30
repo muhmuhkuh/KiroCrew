@@ -16,6 +16,7 @@ Property-based tests (Hypothesis) and unit tests for:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -48,6 +49,29 @@ def agent_root(tmp_path, monkeypatch):
     """Point subagent persistence at a temp directory."""
     monkeypatch.setattr("kiro_crew.subagent_persistence._SUBAGENTS_DIR", tmp_path)
     return tmp_path
+
+
+@contextlib.asynccontextmanager
+async def _owning(manager):
+    """Close the durable task-queue store a ``SubagentManager`` opens at construction.
+
+    ``SubagentManager.__init__`` opens ``tasks.db`` under the test's data home --
+    three descriptors (the database, its WAL, its shared-memory index) plus a
+    writer thread -- and a gateway holds its one manager for the process
+    lifetime, so nothing on the manager's surface closes them again. Left open
+    they survive the test: +3 descriptors per constructed manager, and the
+    hypothesis-driven startup sweep below constructs one per example. Closing
+    waits for the off-loop open first; a close BEFORE the attach would let the
+    late-arriving store reopen the very handles this releases.
+    """
+    try:
+        yield manager
+    finally:
+        await asyncio.wait_for(manager.wait_taskq_ready(), 5)
+        manager._shutting_down = True
+        store = manager._taskq
+        if store is not None:
+            store.close()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -373,10 +397,11 @@ class TestSubagentManagerCleanupIntegration:
 
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("cleanup test", parent_session_key="dashboard:default")
-            assert info is not None
-            await manager._tasks[info.id]
+        async with _owning(manager):
+            with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+                info = manager.spawn("cleanup test", parent_session_key="dashboard:default")
+                assert info is not None
+                await manager._tasks[info.id]
 
         # Retain-by-default: release is called WITHOUT cleanup — session
         # files are spawn_continue's resume material; the tombstone pruner
@@ -422,10 +447,11 @@ class TestSubagentManagerCleanupIntegration:
 
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("error test", parent_session_key="dashboard:default")
-            assert info is not None
-            await manager._tasks[info.id]
+        async with _owning(manager):
+            with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+                info = manager.spawn("error test", parent_session_key="dashboard:default")
+                assert info is not None
+                await manager._tasks[info.id]
 
         # Even on error, release retains session files (retain-by-default).
         sessions.release.assert_called()
@@ -471,10 +497,11 @@ class TestSubagentManagerCleanupIntegration:
         on_done = AsyncMock()
         manager = SubagentManager(sessions=sessions, ctx_builder=ctx, on_done=on_done)
 
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("cleanup fail test", parent_session_key="dashboard:default")
-            assert info is not None
-            await manager._tasks[info.id]
+        async with _owning(manager):
+            with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+                info = manager.spawn("cleanup fail test", parent_session_key="dashboard:default")
+                assert info is not None
+                await manager._tasks[info.id]
 
         # Completion should still succeed (on_done called) despite release raising
         on_done.assert_awaited_once()
@@ -653,11 +680,12 @@ class TestStartupSweep:
         sessions = MagicMock()
         manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
 
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=False),
-            patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
-        ):
-            await manager._reconcile_orphans()
+        async with _owning(manager):
+            with (
+                patch.object(manager, "_is_pid_alive", return_value=False),
+                patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
+            ):
+                await manager._reconcile_orphans()
 
         # Retain-by-default: session files are NOT deleted at reconcile time.
         mock_cleanup.assert_not_called()
@@ -689,11 +717,12 @@ class TestStartupSweep:
         sessions = MagicMock()
         manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
 
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=False),
-            patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
-        ):
-            await manager._reconcile_orphans()
+        async with _owning(manager):
+            with (
+                patch.object(manager, "_is_pid_alive", return_value=False),
+                patch("kiro_crew.subagent._cleanup_session_files_sync") as mock_cleanup,
+            ):
+                await manager._reconcile_orphans()
 
         mock_cleanup.assert_not_called()
         assert (_adir("fail-orphan") / "tombstone.json").exists()
@@ -843,3 +872,30 @@ class TestCompanionRuntimeGuard:
         assert ok is True
         assert companion_pid in active, "companion runtime PID must be sweep-protected"
         assert bg_pid in active, "bg runtime PID must be sweep-protected"
+
+
+class TestTheSuiteNeverRunsTheBootSandboxSweep:
+    """``test/conftest.py`` pins the session module's boot sandbox sweep to a no-op.
+
+    ``SessionManager.get_or_create`` arms the cleanup loop, whose boot reclaim
+    submits ``kiro_crew.session.cleanup_stale_sandbox_profiles`` -- the real
+    ``/proc`` pin scan over the operator's data home -- to the shared
+    ``mc-maint`` executor, and ``close_all()`` cannot stop an executor thread.
+    The tenth hygiene pass measured 138 real sweeps from ``test_session.py``
+    alone, one of which logged into an unrelated test's ``caplog`` seconds
+    after its own test had torn down. ``test/conftest.py::_no_boot_sandbox_sweep``
+    is what stops that, by importing the session module itself rather than
+    asking ``sys.modules`` whether someone else already did; this test is the
+    only thing that notices if the pin goes away or stops reaching the name the
+    session module actually calls.
+    """
+
+    def test_the_session_modules_binding_is_the_no_op_not_the_sandbox_sweep(self) -> None:
+        import kiro_crew.sandbox as sandbox_mod
+        import kiro_crew.session as session_mod
+
+        assert (
+            session_mod.cleanup_stale_sandbox_profiles
+            is not sandbox_mod.cleanup_stale_sandbox_profiles
+        ), "test/conftest.py does not pin kiro_crew.session.cleanup_stale_sandbox_profiles"
+        assert session_mod.cleanup_stale_sandbox_profiles(data_home=Path("/nonexistent")) == 0

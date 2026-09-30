@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import itertools
+import json
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,7 +23,9 @@ from kiro_crew.dashboard.state import (
     _ChatSlot,
     build_refusal_recovery_prompt,
     parse_cls_meta,
+    row_mid,
 )
+from kiro_crew.dashboard.turn_dispatch import format_approval_no_budget_card
 from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE, ScriptHookResult, ToolHookResult
 from kiro_crew.providers.base import (
@@ -30,6 +35,7 @@ from kiro_crew.providers.base import (
     EVENT_THINKING_CHUNK,
     LLMEvent,
 )
+from kiro_crew.validation import MAX_TOOL_NAME_LEN
 
 # ── Helpers ──
 
@@ -208,7 +214,12 @@ _ANSWER_POLL_SECS = 0.01
 
 
 async def _answer_approval(
-    owner: object, request_id: str, outcome: str, *, timeout: float = _ANSWER_WAIT_SECS
+    owner: object,
+    request_id: str,
+    outcome: str,
+    *,
+    timeout: float = _ANSWER_WAIT_SECS,
+    before_answer: Callable[[], None] | None = None,
 ) -> None:
     """Resolve *owner*'s approval future for *request_id* once the turn registers it.
 
@@ -224,7 +235,12 @@ async def _answer_approval(
         fut = owner._approval_futures.get(request_id)  # type: ignore[attr-defined]
         if fut is not None:
             if not fut.done():
-                fut.set_result(outcome)
+                try:
+                    if before_answer is not None:
+                        before_answer()
+                finally:
+                    # A failed observation must not leave the runner parked.
+                    fut.set_result(outcome)
             return
         assert loop.time() < deadline, (
             f"approval future {request_id!r} was never registered within "
@@ -266,6 +282,90 @@ async def _drain(task: asyncio.Task) -> None:
 
 class TestApprovalModes:
     """Verify that normal/trust/yolo modes route permission requests correctly."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["approved", "rejected_once"])
+    async def test_old_completion_preserves_replacement_request(self, tmp_path, outcome):
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+        replacement = asyncio.get_running_loop().create_future()
+        observed = {}
+
+        def replace():
+            old_row = next(m for m in slot.messages if m.get("role") == "permission")
+            assert slot.approval_instance("req-1") == row_mid(old_row)
+            row = slot.append("permission", "Replacement", json.dumps({"request_id": "req-1"}))
+            slot.register_approval("req-1", replacement, row)
+            observed["row"] = row
+            state.broadcast_ws.reset_mock()
+
+        answer = asyncio.create_task(
+            _answer_approval(slot, "req-1", outcome, timeout=5, before_answer=replace)
+        )
+        try:
+            with _patch_stats():
+                await asyncio.wait_for(_run_chat(state, slot, "hello"), 15)
+            await asyncio.wait_for(answer, 5)
+            assert slot._approval_futures["req-1"] is replacement
+            assert slot.approval_instance("req-1") == row_mid(observed["row"])
+            assert "resolved" not in parse_cls_meta(observed["row"]["cls"])
+            assert not replacement.done()
+            assert not any(
+                call.args[0] == "approval_resolved" for call in state.broadcast_ws.call_args_list
+            )
+        finally:
+            await _drain(answer)
+            replacement.cancel()
+            slot.unregister_approval("req-1", replacement)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "purpose", ["Inspect the isolated workspace", "", "Inspect token ghp_" + "a" * 36]
+    )
+    async def test_pending_permission_persists_its_own_redacted_purpose(self, tmp_path, purpose):
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        slot.messages.append(
+            {
+                "role": "tool",
+                "content": "Previous tool",
+                "cls": json.dumps({"tool_purpose": "Unrelated purpose"}),
+            }
+        )
+        event = _permission_event()
+        event.tool_purpose = purpose
+        _set_stream(client, [event, _complete_event()])
+        observed = {}
+
+        async def _inspect_and_approve():
+            await _answer_approval(
+                slot,
+                "req-1",
+                "approved",
+                before_answer=lambda: observed.update(slot.to_dict()["pending_approval_info"]),
+            )
+
+        approver = asyncio.create_task(_inspect_and_approve())
+        try:
+            with _patch_stats():
+                await _run_chat(state, slot, "hello")
+            await approver
+        finally:
+            await _drain(approver)
+        permission = next(m for m in slot.messages if m.get("role") == "permission")
+        metadata = parse_cls_meta(permission["cls"])
+        assert observed["request_id"] == "req-1"
+        if purpose:
+            expected = chat_runner._redact_tool_field(purpose, limit=chat_runner._MAX_TOOL_PURPOSE)
+            assert metadata["tool_purpose"] == expected
+            assert observed["tool_purpose"] == expected
+            if "ghp_" in purpose:
+                assert "ghp_" not in expected
+        else:
+            assert not metadata.get("tool_purpose")
+            assert not observed.get("tool_purpose")
+        assert observed.get("tool_purpose") != "Unrelated purpose"
 
     @pytest.mark.asyncio
     async def test_normal_mode_prompts_interactively(self, tmp_path):
@@ -1112,7 +1212,16 @@ class TestBatchCascadeAttribution:
         # flag is down, so only a source guard can hold that pairing).
         state, client = _make_state(tmp_path, context_builder=_context_builder())
         slot = _make_slot()
-        state.approval_timeout_for = MagicMock(return_value=0.05)
+        # Only the FIRST prompt is meant to expire. The revised call must be
+        # answered by the approver below, which polls for its future; a 50 ms
+        # window on that second prompt races the poll on a slow runner (the
+        # runner declines tool_b as unanswered before the approver sees it),
+        # and a declined tool_b is the very outcome this test says never
+        # happens. So the shrunken bound applies to one prompt; the next gets
+        # a window the approver cannot miss.
+        state.approval_timeout_for = MagicMock(
+            side_effect=itertools.chain([0.05], itertools.repeat(_ANSWER_WAIT_SECS))
+        )
         timed_out = _permission_event(title="tool_a")
         timed_out.request_id = "req-1"
         timed_out.tool_call_id = "tc-1"
@@ -2518,6 +2627,419 @@ class TestDenyRowTitleRedaction:
         # Each deny shape is rendered in exactly one place — its helper.
         assert source.count('f"🚫 {title} (invalid: {error})"') == 1
         assert source.count('f"🚫 {title} (hook error)"') == 1
+
+
+# ── Long read titles carrying a canonical identity ──
+
+
+class TestLongTitleWithCanonicalIdentity:
+    """A ``read`` whose title embeds long image paths must not be refused as a bad name.
+
+    kiro-cli titles a ``read`` with ``image_paths`` by its operation content, so the
+    title grows with the user's filenames while the tool's identity travels beside
+    it as ``AcpEvent.tool_name`` (``_meta.kiro.toolName``). The length cap in
+    ``_validate_tool_name`` protects the case where the title is the ONLY identity;
+    with the canonical name present the title is content, like a shell command
+    line, and the call must proceed.
+    """
+
+    _TITLE = "View image " + " ".join(
+        f"/mnt/Sign in with Apple - screenshot {i:02d} of the consent sheet.png" for i in range(6)
+    )
+
+    def _read_event(self, *, tool_name: str) -> LLMEvent:
+        assert len(self._TITLE) > MAX_TOOL_NAME_LEN
+        return LLMEvent(
+            kind=EVENT_PERMISSION_REQUEST,
+            title=self._TITLE,
+            tool_kind="read",
+            request_id="req-1",
+            tool_input="",
+            tool_name=tool_name,
+        )
+
+    @pytest.mark.asyncio
+    async def test_auto_approve_proceeds_with_canonical_name(self, tmp_path):
+        state, client = _make_state(
+            tmp_path, context_builder=_context_builder(ToolHookResult.auto_approve())
+        )
+        slot = _make_slot()
+        _set_stream(client, [self._read_event(tool_name="fs_read"), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.approve_tool.assert_called_once_with("req-1")
+        client.reject_tool.assert_not_called()
+        rows = [m.get("content", "") for m in slot.messages]
+        assert not any("(invalid:" in row for row in rows), rows
+        # The scripted PreToolUse gate still ran, keyed on the sanitised title.
+        pre = [
+            c
+            for c in state._hook_store.fire.call_args_list
+            if c.args and c.args[0] == HOOK_EVENT_PRE_TOOL_USE
+        ]
+        assert pre, state._hook_store.fire.call_args_list
+        assert pre[0].kwargs["tool_name"] == self._TITLE
+
+    @pytest.mark.asyncio
+    async def test_auto_approve_without_identity_keeps_the_loud_refusal(self, tmp_path):
+        """A backend publishing no ``_meta`` identity is refused exactly as before."""
+        state, client = _make_state(
+            tmp_path, context_builder=_context_builder(ToolHookResult.auto_approve())
+        )
+        slot = _make_slot()
+        _set_stream(client, [self._read_event(tool_name=""), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.approve_tool.assert_not_called()
+        rows = [m.get("content", "") for m in slot.messages]
+        assert any("(invalid:" in row and "exceeds max length" in row for row in rows), rows
+
+
+class TestHostPreDeclinedRowIsBornResolved:
+    """What the permission row's one frame carries when the host declines it.
+
+    The dashboard synthesizes its "needs my action" sound from this row's
+    ``chat_message`` frame (``shouldChimeOnPermissionRow``), gated on the
+    ``resolved`` the frame itself carries; the ``finally``'s in-place
+    ``_mark_permission_resolved`` reaches the client only as an
+    ``approval_resolved`` frame, which retires the card but cannot un-play a
+    sound. So a decline the runner can know before the row exists -- a turn
+    with no budget left to wait, no I/O needed -- is written into the row
+    before the append and its frame arrives ``resolved``. The other host
+    decline, a linked Slack thread the prompt could not be posted to, is known
+    only after the post; the row is published BEFORE the post on purpose
+    (withholding it would hide the card, the chime and the Board's pending
+    state for the post's whole duration on every linked prompt), so a post
+    that fails retires the row through ``approval_resolved`` the moment the
+    decline is recorded, and the arrival chime is the accepted residual.
+
+    The runner tests read the frame at EMISSION: the later mark mutates the very
+    dict ``slot.messages`` keeps, so the transcript's final state cannot tell
+    a row appended resolved from one resolved a tick later.
+    """
+
+    @staticmethod
+    def _record(slot: _ChatSlot, state: DashboardState) -> list[tuple]:
+        """Timeline of broadcast rows (role, cls at emission), slots pushes
+        (whether an approval future was still pending when the push ran) and
+        ``broadcast_ws`` frames (kind, payload)."""
+        timeline: list[tuple] = []
+        slot._on_message = lambda _key, msg: timeline.append(
+            ("row", msg["role"], msg.get("cls", ""))
+        )
+        state.push_slots_update.side_effect = lambda: timeline.append(
+            ("push", any(not f.done() for f in slot._approval_futures.values()))
+        )
+        state.broadcast_ws.side_effect = lambda kind, payload=None, *_a, **_k: timeline.append(
+            ("ws", kind, payload)
+        )
+        return timeline
+
+    @staticmethod
+    def _permission_frames(timeline: list[tuple]) -> list[dict]:
+        return [json.loads(t[2]) for t in timeline if t[:2] == ("row", "permission")]
+
+    @pytest.mark.asyncio
+    async def test_no_budget_row_is_emitted_resolved_and_the_board_unblocks(self, tmp_path):
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        timeline = self._record(slot, state)
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        # No turn budget left is the no-budget branch (the per-slot bound is a
+        # positive constant, so only the remaining-budget bound can zero the
+        # window): the host declines without waiting, so the row's one
+        # delivery is for a prompt already decided.
+        with (
+            _patch_stats(),
+            patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0),
+        ):
+            await _run_chat(state, slot, "hello")
+
+        (frame,) = self._permission_frames(timeline)
+        assert frame["request_id"] == "req-1"
+        assert frame["resolved"] == "rejected", (
+            "the no-budget prompt's frame left the gateway pending: the client "
+            "chimes for a prompt the host declined in the same tick"
+        )
+        client.reject_tool.assert_awaited_once_with("req-1")
+        # The row needed no in-place mark, but the future it registered is
+        # gone only in the ``finally`` -- the Board must still learn
+        # pending_approval=false before the turn moves on to the denied row.
+        row_at = next(i for i, t in enumerate(timeline) if t[:2] == ("row", "permission"))
+        denied_at = next(
+            i for i, t in enumerate(timeline) if i > row_at and t[:2] == ("row", "tool")
+        )
+        assert ("push", False) in timeline[row_at:denied_at], (
+            "no slots push cleared pending_approval between the born-resolved "
+            "row and the denied tool row -- the Board keeps the session Blocked"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["delivery-returns-none", "delivery-raises"])
+    async def test_slack_linked_row_is_published_before_the_post_and_retired_when_it_fails(
+        self, tmp_path, failure
+    ):
+        from kiro_crew.dashboard.chat_handlers import _get_pattern_from_pending
+
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        # A linked slot whose thread the prompt cannot reach. The user-echo
+        # mirror resolves its own link through the sessions registry; an empty
+        # link keeps that leg out of the way of the approval mirror under test.
+        state.slack_client = AsyncMock()
+        state.sessions.get_slack_link = MagicMock(return_value=("", ""))
+        slot = _make_slot()
+        slot._slack_linked = True
+        slot._slack_channel = "C1"
+        slot._slack_thread_ts = "1700000000.000100"
+        timeline = self._record(slot, state)
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        # A SLOW post double. What the dashboard has while the post is still in
+        # flight decides the user's experience on every linked prompt: the row's
+        # frame and the Board's pending state must already be out (a post that
+        # takes its whole timeout to fail must not hide the card that long), and
+        # the Slack card's durable-Trust proof must be readable off that same
+        # row (``_linked_trust_grantable``).
+        seen_at_post: dict[str, object] = {}
+
+        async def _mirror(_slack, _chan, _ts, request_id, *_a, **_k):
+            await asyncio.sleep(0.01)
+            seen_at_post["proof"] = _get_pattern_from_pending(
+                slot, str(request_id), "trust_grantable"
+            )
+            seen_at_post["frames"] = len(self._permission_frames(timeline))
+            seen_at_post["pending_pushed"] = ("push", True) in timeline
+            if failure == "delivery-raises":
+                raise RuntimeError("slack down")
+            return None
+
+        mirror = AsyncMock(side_effect=_mirror)
+        with _patch_stats(), patch.object(chat_runner, "post_linked_approval", mirror):
+            await _run_chat(state, slot, "hello")
+
+        mirror.assert_awaited_once()
+        assert seen_at_post == {"proof": "1", "frames": 1, "pending_pushed": True}, (
+            "while the Slack post was in flight the dashboard must already hold the "
+            "row (one frame out), the Board its pending state, and the mirror its "
+            "Trust proof"
+        )
+        (frame,) = self._permission_frames(timeline)
+        assert frame["request_id"] == "req-1"
+        # The accepted residual: the frame went out before the delivery outcome
+        # existed, so it is pending (and the arrival chime stands). What the
+        # failure owes is the retirement, and it owes it at once.
+        assert "resolved" not in frame
+        retire_at = next(
+            i
+            for i, t in enumerate(timeline)
+            if t[:2] == ("ws", "approval_resolved") and t[2].get("id") == "req-1"
+        )
+        assert timeline[retire_at][2] == {"id": "req-1", "approved": False, "slot": slot.key}
+        denied_at = next(i for i, t in enumerate(timeline) if t[:2] == ("row", "tool"))
+        assert retire_at < denied_at, (
+            "the failed post did not retire the card before the turn moved on to "
+            "the denied tool row"
+        )
+        (stored,) = [m for m in slot.messages if m.get("role") == "permission"]
+        assert json.loads(stored["cls"])["resolved"] == "rejected"
+        client.reject_tool.assert_awaited_once_with("req-1")
+        if failure == "delivery-returns-none":
+            # Nobody had answered, so this decline is the runner's own and the
+            # user is told so.
+            assert any(
+                m.get("role") == "assistant" and "auto-declined" in str(m.get("content"))
+                for m in slot.messages
+            ), "the undelivered prompt was declined without telling the user"
+        # Nothing was posted, so nothing is cleaned up on the Slack side.
+        state.slack_client.delete_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_answer_given_during_the_slack_post_survives_a_window_that_ran_out(
+        self, tmp_path
+    ):
+        """A decision already made must not be overruled by the no-budget decline.
+
+        The row is out and chiming before the Slack post; a user can answer it
+        while the post is still in flight. The wait's window is computed only
+        after the post, from the budget left THEN -- so a post slow enough to
+        exhaust the budget reaches the no-budget branch with a prompt the
+        dashboard already shows (and the resolver already records) as
+        approved. The wait consumes an answer that has already arrived before
+        it consults the window, the way the delivery-failure arms guard their
+        own auto-reject with ``if not fut.done()``; the model is told approved,
+        never rejected.
+        """
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state.slack_client = AsyncMock()
+        state.sessions.get_slack_link = MagicMock(return_value=("", ""))
+        slot = _make_slot()
+        slot._slack_linked = True
+        slot._slack_channel = "C1"
+        slot._slack_thread_ts = "1700000000.000100"
+        timeline = self._record(slot, state)
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        posted = {"done": False}
+
+        async def _slow_post_answered_meanwhile(_slack, _chan, _ts, request_id, *_a, **_k):
+            # The dashboard answers while the post is in flight.
+            await _answer_approval(slot, str(request_id), "approved")
+            posted["done"] = True
+            return "1700000000.000200"
+
+        def _budget() -> float:
+            # Budget at the append (the row goes out pending); none left once
+            # the post has returned and the wait computes its window.
+            return 0.0 if posted["done"] else 70.0
+
+        with (
+            _patch_stats(),
+            patch.object(chat_runner, "post_linked_approval", _slow_post_answered_meanwhile),
+            patch.object(chat_runner, "tool_approval_timeout_secs", side_effect=_budget),
+        ):
+            await _run_chat(state, slot, "hello")
+
+        (frame,) = self._permission_frames(timeline)
+        assert "resolved" not in frame, "the row had budget when it went out"
+        client.approve_tool.assert_awaited_once_with("req-1")
+        client.reject_tool.assert_not_awaited()
+        no_budget_card = format_approval_no_budget_card()
+        assert not any(
+            m.get("role") == "error" and m.get("content") == no_budget_card for m in slot.messages
+        ), "the no-budget card was rendered for a prompt the user had already approved"
+        retire = [t for t in timeline if t[:2] == ("ws", "approval_resolved")]
+        assert retire == [
+            ("ws", "approval_resolved", {"id": "req-1", "approved": True, "slot": slot.key})
+        ]
+        (stored,) = [m for m in slot.messages if m.get("role") == "permission"]
+        assert json.loads(stored["cls"])["resolved"] == "approved"
+        # The posted Slack card is cleaned up now that the decision is in.
+        state.slack_client.delete_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_delivery_failure_after_an_answer_keeps_the_answer_and_says_nothing(
+        self, tmp_path
+    ):
+        """A prompt answered during the post is not reported as auto-declined.
+
+        The row is out and chiming before the Slack post, so the dashboard can
+        answer it while the post is still in flight; if that post then fails,
+        the delivery-failure arm finds a future already done. Its auto-reject
+        is guarded by ``if not fut.done()`` and the transcript notice that says
+        the prompt was auto-declined sits under the same guard: the user who
+        approved is told nothing false, the model is told approved, and the
+        undelivered-prompt decline cause is not recorded.
+        """
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state.slack_client = AsyncMock()
+        state.sessions.get_slack_link = MagicMock(return_value=("", ""))
+        slot = _make_slot()
+        slot._slack_linked = True
+        slot._slack_channel = "C1"
+        slot._slack_thread_ts = "1700000000.000100"
+        timeline = self._record(slot, state)
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        async def _answered_then_undeliverable(_slack, _chan, _ts, request_id, *_a, **_k):
+            # The dashboard answers while the post is in flight; the post then
+            # reports that nothing reached the thread.
+            await _answer_approval(slot, str(request_id), "approved")
+            return None
+
+        with (
+            _patch_stats(),
+            patch.object(chat_runner, "post_linked_approval", _answered_then_undeliverable),
+        ):
+            await _run_chat(state, slot, "hello")
+
+        notices = [
+            m
+            for m in slot.messages
+            if m.get("role") == "assistant" and "auto-declined" in str(m.get("content"))
+        ]
+        assert notices == [], (
+            "the delivery-failure arm told the user their prompt was auto-declined "
+            "after the dashboard had already approved it"
+        )
+        client.approve_tool.assert_awaited_once_with("req-1")
+        client.reject_tool.assert_not_awaited()
+        retire = [t for t in timeline if t[:2] == ("ws", "approval_resolved")]
+        assert retire == [
+            ("ws", "approval_resolved", {"id": "req-1", "approved": True, "slot": slot.key})
+        ]
+        (stored,) = [m for m in slot.messages if m.get("role") == "permission"]
+        assert json.loads(stored["cls"])["resolved"] == "approved"
+        # Nothing was posted, so nothing is cleaned up on the Slack side.
+        state.slack_client.delete_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_slack_linked_no_budget_row_is_not_mirrored_and_its_future_is_settled(
+        self, tmp_path
+    ):
+        """A pre-declined row settles its future without a cancellable await.
+
+        The Slack post is the one await between the future's registration and
+        the ``try``/``finally`` that pops it, and its ``except Exception`` does
+        not see the ``CancelledError`` a turn ceiling raises inside it. A prompt
+        pre-declined for lack of budget that still went through the post could
+        therefore leave a future nothing resolves -- the Board keeps the
+        session Blocked and Continue answers 409 until a reload or a slot
+        switch rejects it -- for a card the ``finally`` deletes the moment the
+        post returns. So a row pre-declined at its append is not mirrored at
+        all: the decline is recorded and the future popped exactly as on the
+        interactive path, with no await left on the way there.
+        """
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        state.slack_client = AsyncMock()
+        state.sessions.get_slack_link = MagicMock(return_value=("", ""))
+        slot = _make_slot()
+        slot._slack_linked = True
+        slot._slack_channel = "C1"
+        slot._slack_thread_ts = "1700000000.000100"
+        timeline = self._record(slot, state)
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        # The turn ceiling landing inside the post. The runner's outer handler
+        # absorbs the cancellation, so whatever the approval block left behind
+        # is what the slot keeps.
+        async def _ceiling_cancels_the_post(*_a, **_k):
+            raise asyncio.CancelledError()
+
+        mirror = AsyncMock(side_effect=_ceiling_cancels_the_post)
+        with (
+            _patch_stats(),
+            patch.object(chat_runner, "post_linked_approval", mirror),
+            patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0),
+        ):
+            await _run_chat(state, slot, "hello")
+
+        assert slot._approval_futures == {}, (
+            "the pre-declined prompt's future is still registered: the Board keeps "
+            "the session Blocked and Continue answers 409 until something else "
+            "rejects it"
+        )
+        mirror.assert_not_awaited()
+        (frame,) = self._permission_frames(timeline)
+        assert frame["resolved"] == "rejected"
+        client.reject_tool.assert_awaited_once_with("req-1")
+        no_budget_card = format_approval_no_budget_card()
+        assert any(
+            m.get("role") == "error" and m.get("content") == no_budget_card for m in slot.messages
+        ), "the no-budget decline was not recorded for the pre-declined prompt"
+        # The slots push that clears pending_approval lands before the denied
+        # tool row, exactly as for an unlinked slot; nothing was posted, so
+        # there is nothing to clean up on the Slack side.
+        row_at = next(i for i, t in enumerate(timeline) if t[:2] == ("row", "permission"))
+        denied_at = next(
+            i for i, t in enumerate(timeline) if i > row_at and t[:2] == ("row", "tool")
+        )
+        assert ("push", False) in timeline[row_at:denied_at]
+        state.slack_client.delete_message.assert_not_awaited()
 
 
 class TestApprovalAnswerersDoNotRaceTheStream:

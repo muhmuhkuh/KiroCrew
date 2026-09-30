@@ -250,10 +250,11 @@ jobs:
               # The external_id is now attempt-scoped (<lane>-pr-<PR>-<run>-<attempt>),
               # so match the PR dimension by prefix and let sort_by(.started_at)|last
               # pick the newest attempt regardless of suffix. Trailing hyphen keeps
-              # -pr-9 from matching -pr-99.
+              # -pr-9 from matching -pr-99. filter=all: the default (latest) returns one
+              # check-run per name, which leaves sort_by nothing to choose between.
               enc="$(jq -rn --arg name "$check_name" '$name | @uri')"
               details_url="$(gh api --method GET \
-                "repos/$REPO/commits/$HEAD/check-runs?check_name=$enc&per_page=100" \
+                "repos/$REPO/commits/$HEAD/check-runs?check_name=$enc&per_page=100&filter=all" \
                 --jq "[.check_runs[]
                        | select(.external_id != null)
                        | select(.external_id | startswith(\"$lane-pr-$PR-\"))]
@@ -304,7 +305,7 @@ jobs:
 
           #                workflow             label      fork check-run name / external-id lane / fork workflow
           if [ "$TARGET" = "fable" ] || [ "$TARGET" = "all" ]; then
-            rerun_reviewer "claude-review.yml" "Fable 5" "Opus 4.8 Review" "opus" "fork-opus-review.yml"
+            rerun_reviewer "claude-review.yml" "Fable 5" "Opus 5 Review" "opus" "fork-opus-review.yml"
           fi
           if [ "$TARGET" = "gpt" ] || [ "$TARGET" = "all" ]; then
             rerun_reviewer "codex-review.yml" "GPT 5.6" "GPT 5.6 Review" "gpt" "fork-gpt-review.yml"

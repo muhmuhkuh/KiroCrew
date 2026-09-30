@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
 from test_connections_mint import _FS_ATTRS, _FS_NAMES, _called_names
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew import security
 from kiro_crew.agent_files import AGENT_FILENAME
-from kiro_crew.connections import tool_aliases, warm
+from kiro_crew.connections import mint, tool_aliases, warm
 from kiro_crew.connections.mint import _mints
 from kiro_crew.connections.registry import Provider
 
@@ -228,28 +229,45 @@ def _provider(slug: str, url: str = "") -> Provider:
 _WARM_FS_NAMES = _FS_NAMES | {"list_servers", "grant_present", "oauth_url_contains_credential"}
 
 
+def _warm_engine_trees() -> list[tuple[str, ast.Module]]:
+    """The facade plus every module of its private ``warm_runtime`` package.
+
+    One call graph, because a helper the facade re-exports is still called from the facade's
+    coroutines, and a coroutine that moved into an owner still owes the same invariant. Reading
+    the facade alone would silently drop both.
+    """
+    from kiro_crew.connections import warm_runtime
+
+    owners = sorted(Path(warm_runtime.__file__).parent.glob("*.py"))
+    assert len(owners) > 1, "warm_runtime moved; this guard is reading the wrong tree"
+    return [
+        (path.name, ast.parse(path.read_text(encoding="utf-8")))
+        for path in [Path(warm.__file__), *owners]
+    ]
+
+
 def test_no_coroutine_in_the_warm_module_touches_the_filesystem_directly():
-    tree = ast.parse(inspect.getsource(warm))
-    sync: dict[str, Any] = {}
-    coros: dict[str, Any] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            sync[node.name] = node
-        elif isinstance(node, ast.AsyncFunctionDef):
-            coros[node.name] = node
+    sync: dict[str, list[Any]] = {}
+    coros: list[tuple[str, Any]] = []
+    for label, tree in _warm_engine_trees():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                sync.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.AsyncFunctionDef):
+                coros.append((f"{label}:{node.name}", node))
     assert sync and coros, "module shape changed; this guard is reading the wrong tree"
 
     touches = {
-        name: bool(_called_names(node) & (_FS_ATTRS | _WARM_FS_NAMES))
-        for name, node in sync.items()
+        name: any(_called_names(node) & (_FS_ATTRS | _WARM_FS_NAMES) for node in nodes)
+        for name, nodes in sync.items()
     }
     changed = True
     while changed:
         changed = False
-        for name, node in sync.items():
+        for name, nodes in sync.items():
             if touches[name]:
                 continue
-            if any(touches.get(callee) for callee in _called_names(node)):
+            if any(touches.get(callee) for node in nodes for callee in _called_names(node)):
                 touches[name] = changed = True
     fs_helpers = {name for name, hit in touches.items() if hit}
     # The known set, so a helper silently losing its filesystem work -- and with it
@@ -289,7 +307,7 @@ def test_no_coroutine_in_the_warm_module_touches_the_filesystem_directly():
 
     offenders = {
         f"{coro} -> {callee}"
-        for coro, node in coros.items()
+        for coro, node in coros
         for callee in _called_names(node) & (fs_helpers | _FS_ATTRS | _WARM_FS_NAMES)
     }
     assert not offenders, (
@@ -1057,6 +1075,24 @@ def test_a_dangling_symlink_at_the_spec_path_reads_as_foreign(_agents_dir: Path)
     assert warm._warm_spec_is_foreign(planted) is True
 
 
+def test_a_junction_at_the_spec_path_reads_as_foreign(_agents_dir: Path):
+    """A directory JUNCTION is the only directory link an unprivileged Windows writer can
+    plant, and it answers ``is_symlink()`` False (and ``exists()`` False when its target is
+    absent), so an ``is_symlink() or exists()`` guard read a junction at a warm-spec name as
+    a free path -- the writer replaced it and the sweep unlinked it, destroying an occupant
+    this module does not own. make_dir_link plants a junction on Windows and a directory
+    symlink on POSIX, so the occupied verdict is pinned on every shard."""
+    outside = _agents_dir / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("not ours", encoding="utf-8")
+    planted = _agents_dir / "kirocrew-mint-warm-notion.json"
+    make_dir_link(planted, outside)
+
+    assert warm._warm_spec_is_foreign(planted) is True
+    # The refusal never followed the link: its target is untouched.
+    assert (outside / "keep.txt").read_text(encoding="utf-8") == "not ours"
+
+
 def test_every_spec_a_warm_plan_writes_carries_the_ownership_sentinel(_agents_dir: Path):
     """Whole-plan coverage: the base spec and the all-providers spec alike."""
     warm._write_warm_mint_specs(warm._warm_spec_plan([]), _agents_dir)
@@ -1183,7 +1219,9 @@ def test_a_sensitive_symlink_at_the_spec_path_never_reaches_the_plan(
         encoding="utf-8",
     )
     (_agents_dir / AGENT_FILENAME).symlink_to(target)
-    monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+    monkeypatch.setattr(
+        agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+    )
 
     plan = warm._warm_spec_plan([_provider("acme")])
 
@@ -1246,7 +1284,9 @@ def test_a_sensitive_symlink_at_a_warm_spec_path_is_never_judged_ours(
     target.write_text(_ours_shaped_spec_text(stem), encoding="utf-8")
     link = _agents_dir / f"{stem}.json"
     link.symlink_to(target)
-    monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+    monkeypatch.setattr(
+        agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+    )
 
     assert warm._warm_spec_is_foreign(link) is True
 
@@ -1561,6 +1601,51 @@ async def test_a_url_carrying_a_credential_is_refused_rather_than_stored(_stub_a
     )
     assert await warm._absorb_warm_requests(bearing, claims) == []
     assert "linear" not in _mints, "the claim is released so the card asks for a fresh mint"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_premint_stays_slug_only_and_hands_naming_to_the_cold_mint(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, _stub_activation
+):
+    """The warm gate is one half of a two-step surface. It must NOT name the endpoint
+    itself -- the warning and the audit line are logger sinks, and URL-derived text there
+    is what the credential-disclosure scanners flag -- but the URL it refuses must be one
+    the cold mint CAN name, or releasing the claim would send the card to a fresh mint that
+    ends just as opaquely. Both halves are pinned here: the release leaves no row (so the
+    card's poll reads ``idle`` and asks for a cold mint), the warm-side text carries the
+    slug and nothing from the URL, and the display contract the cold mint applies to the
+    same URL yields the copy-ready endpoint."""
+    # The operator-extension corpus: rejected for a long opaque state at an
+    # endpoint outside the allowlist, clean once the endpoint is added -- the
+    # one shape whose cold-mint card must name the endpoint.
+    _, url, (host, path) = OPERATOR_EXTENSION_OAUTH_URLS[0]
+    audited: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        warm, "_log_warm_event", lambda op, res, outcome="ok": audited.append((op, res, outcome))
+    )
+    provider = _provider("linear")
+    claims = await _claim("linear")
+
+    with caplog.at_level(logging.WARNING, logger=warm.logger.name):
+        absorbed = await warm._absorb_warm_requests(
+            _result([provider], [{"serverName": "linear", "oauthUrl": url}]), claims
+        )
+
+    assert absorbed == []
+    assert "linear" not in _mints
+    assert mint.pending_mint_for("linear") is None
+    # Slug-only on every warm-side channel.
+    assert audited == [("connections_warm_mint_url", "provider:linear", "refused")]
+    assert "linear" in caplog.text
+    for never in (host, path, "a1B2c3D4", url):
+        assert never not in caplog.text
+        assert never not in json.dumps(audited)
+    # The hand-off is coherent: the cold mint the card now starts re-hits this URL,
+    # and its card view names exactly this endpoint (host+path, nothing from the query)
+    # -- because this is a rejection the allowlist entry would clear.
+    assert security.oauth_url_contains_credential(url)
+    assert security.oauth_rejection_is_endpoint_exemptible(url)
+    assert security.sanitized_oauth_endpoint_display(url) == f"{host}{path}"
 
 
 @pytest.mark.asyncio

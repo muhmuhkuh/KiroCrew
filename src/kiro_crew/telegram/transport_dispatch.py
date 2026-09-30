@@ -29,21 +29,24 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
+from kiro_crew import runtime_death
 from kiro_crew.acp.client import AcpError
-from kiro_crew.agent_discovery import list_agents
+from kiro_crew.agent_discovery import AgentInfo, list_agents
 from kiro_crew.config import live
 from kiro_crew.config.loader import ACTIVATION_MENTION, ACTIVATION_OFF
 from kiro_crew.config.sections import _clamp_pct
+from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import mint_row_mid
 from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.memory_stores import UnknownMemoryStore
-from kiro_crew.messaging import auto_title, privacy_mode
+from kiro_crew.messaging import auto_title, privacy_mode, turn_ceiling
 from kiro_crew.messaging.attachments import IngestLimits, append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import (
@@ -64,10 +67,15 @@ from kiro_crew.messaging.dispatch import (
     admit_inbound_callback,
     build_auto_approve,
     build_directive_consumer,
+    charge_turn_failure,
     consume_reinjection,
     delivery_is_muted,
     driver_turn_landed,
+    open_turn_crew_log,
+    predecessor_sid,
     rearm_reinjection,
+    requested_model_sid,
+    slot_workspace,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
@@ -75,16 +83,27 @@ from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import (
     CHAT_TYPE_DIRECT,
     CHAT_TYPE_FORUM,
+    DM_SCOPE_UNIFIED,
     ChannelLink,
     bind_origin_mirror,
     build_dm_session_key,
+    channel_namespace_of,
+    parse_session_key,
     rebind_conversation_location,
     release_conversation_location,
     seed_generation,
 )
+from kiro_crew.messaging.queue_drain import (
+    drain_until_quiet,
+    entry_channel,
+    owner_token,
+    register_drain,
+    tag_entry,
+)
 from kiro_crew.messaging.renderer import (
     SilentRenderer,
     display_safe,
+    new_approval_nonce,
     session_provenance_tag,
 )
 from kiro_crew.messaging.session_resume import (
@@ -94,7 +113,9 @@ from kiro_crew.messaging.session_resume import (
     refused_resume_is_restricted,
 )
 from kiro_crew.messaging.session_trust import add_trusted_session, is_session_trusted
+from kiro_crew.messaging.spawn_approval_delivery import unpressed_wait_answer
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.messaging.upload_gate import (
     session_blocks_reads,
     session_is_restricted,
@@ -116,8 +137,9 @@ from kiro_crew.telegram.commands import (
     parse_dashboard_argument,
     parse_mid_turn_override,
 )
+from kiro_crew.telegram.renderer import TelegramApprovalDecider
+from kiro_crew.telegram.renderer import TelegramApprovalDecider as _APPROVAL_REGISTRY
 from kiro_crew.telegram.renderer import (
-    TelegramApprovalDecider,
     TelegramRenderer,
     md_to_telegram_html_safe,
 )
@@ -148,6 +170,7 @@ from kiro_crew.messaging.queue_receipt import STEER_ACK_EMOJI as _STEER_ACK_EMOJ
 from kiro_crew.messaging.queue_receipt import (
     ReceiptQueue,
     ReceiptSurface,
+    receipt_address_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -212,6 +235,147 @@ _DETACH_EXEMPT_COMMANDS = frozenset(
 # losing the second album entirely. Mirrors discord/transport_dispatch.py.
 _MAX_COLLAPSED_ATTACHMENTS = IngestLimits().max_attachments
 
+#: Prefix the queued origin's fields take on a queue entry, so they can never
+#: collide with the entry's other payload (``attachments``, ``privacy_request``).
+_ORIGIN_PREFIX = "telegram_"
+
+#: This channel's name in the shared queue-drain contract
+#: (``messaging/queue_drain.py``). ONE constant, used both to tag the entries this
+#: dispatcher produces and to register its drain, because a tag that does not match the
+#: registration cannot be woken for its own entries. The neutral key those entries carry
+#: it under is defined in that module, not here: a per-module copy of the string fails
+#: silently, making this channel's entries unowned to every drain.
+_CHANNEL = "telegram"
+
+#: Origin fields that are NOT part of "who sent this, and where does the reply go",
+#: so they are excluded from :attr:`_QueuedOrigin.sender_key`. Only ``username``
+#: qualifies: it is a MUTABLE label for the sender ``user_id`` already pins, and a
+#: handle changed between two messages would make one person's own burst compare
+#: unequal and stop the collapse the drain exists for.
+#:
+#: The exclusion is a DENY list, so a field added to :class:`_QueuedOrigin` later
+#: joins the key by default. That direction is deliberate: a missing WHO field lets
+#: two people's messages collapse into one turn under one identity, while a surplus
+#: field only costs a collapse, and answering the wrong person is the worse failure.
+_NOT_A_SENDER = frozenset({"username"})
+
+
+class _QueuedOrigin(NamedTuple):
+    """Who sent one queued message and where its reply goes.
+
+    Recorded per QUEUED MESSAGE when it arrives, and NOT inherited from the envelope
+    that opened the finished turn: under ``messaging.dm_scope = "unified"`` every
+    allow-listed person's direct chat collapses into one session key
+    (``build_dm_session_key`` reduces the bucket to ``unified:{agent}``, dropping
+    both channel and user), so one queue holds messages from several people. A
+    drained turn that ran under the opener's envelope would post one person's answer
+    into another person's chat, and would name the opener as the author of text they
+    did not write everywhere the turn is attributed -- its audit caller, its
+    persisted transcript row, and its principal-scoped context all resolve from this
+    envelope.
+
+    These are exactly the fields the replayed ``TelegramInboundMessage`` carries, so
+    ``handle_message`` re-derives the route, the session key and the reply address
+    from the QUEUED message's own envelope rather than from the opener's. No
+    per-message id is recorded, because the drain constructs a fresh message rather
+    than copying the opener's: a drained turn is a reply to a burst, not to any one
+    message. That is why the collapse trap -- grouping on a per-message identifier,
+    which makes one person's burst compare unequal -- is avoided structurally here
+    rather than by exclusion.
+    """
+
+    user_id: str
+    chat_id: str
+    thread_id: str
+    chat_type: str
+    username: str
+
+    @property
+    def sender_key(self) -> tuple[str, ...]:
+        """Who sent this and where the reply goes, with the mutable handle dropped.
+
+        Two entries may be collapsed into one turn exactly when these match, because
+        one turn gets one envelope. Derived from ``_fields`` minus
+        :data:`_NOT_A_SENDER` rather than listed by hand, so a new field cannot be
+        silently left out of the comparison that keeps two people's messages apart.
+        """
+        return tuple(getattr(self, name) for name in self._fields if name not in _NOT_A_SENDER)
+
+
+def _inbound_origin(msg: InboundMessage) -> _QueuedOrigin:
+    """This message's own origin, for recording on its queue entry.
+
+    ``thread_id`` / ``chat_type`` / ``username`` are read through ``getattr`` for the
+    same reason every other consumer does: the neutral :class:`InboundMessage` stays
+    channel-agnostic and only ``TelegramInboundMessage`` declares them.
+    """
+    return _QueuedOrigin(
+        user_id=str(msg.user_id),
+        chat_id=str(msg.conversation_id),
+        thread_id=str(getattr(msg, "thread_id", None) or ""),
+        chat_type=str(getattr(msg, "chat_type", "private")),
+        username=str(getattr(msg, "username", "")),
+    )
+
+
+def _entry_owner(origin: _QueuedOrigin) -> str:
+    """The neutral token naming the principal *origin* came from.
+
+    Built from ``sender_key``, the same value that decides whether two queued messages
+    may share one turn, so "whose entry is this" and "may these collapse together" can
+    never answer differently. ``/stop`` compares it to drop one person's queued messages
+    and leave everybody else's.
+    """
+    return owner_token(_CHANNEL, origin.sender_key)
+
+
+def _origin_kwargs(origin: _QueuedOrigin) -> dict[str, str]:
+    """An origin as prefixed queue-entry keyword arguments, plus the neutral channel.
+
+    The channel rides with them because a drain must be able to tell an entry it owns
+    from one another transport recorded BEFORE it reads any channel-specific field,
+    and because the value names which peer drain to wake for a foreign entry. The owner
+    rides with them for the mirror reason on the clear side: ``/stop`` must tell one
+    person's entries from another's across every transport on the queue, and the
+    prefixed fields below are unreadable to it on a foreign entry.
+    """
+    recorded = {f"{_ORIGIN_PREFIX}{name}": value for name, value in origin._asdict().items()}
+    return tag_entry(recorded, _CHANNEL, _entry_owner(origin))
+
+
+def _queued_origin(kwargs: dict) -> _QueuedOrigin | None:
+    """The origin recorded on a queue entry, or None if ANOTHER channel recorded it.
+
+    One queue can hold entries from more than one transport. Every DM dispatcher is
+    constructed with the orchestrator's single ``SessionManager``
+    (``telegram/gateway.py``, ``discord/gateway.py``, ``teams/transport_dispatch.py``),
+    and under ``messaging.dm_scope = "unified"`` ``build_dm_session_key`` reduces a
+    direct chat's bucket to ``unified:{agent}`` -- dropping the CHANNEL as well as the
+    user -- so a Telegram DM and a Discord DM to the same agent resolve to the same
+    session key, and therefore the same queue.
+
+    Such an entry is not this dispatcher's to replay: it carries no field this channel
+    can address, and answering it here would post one transport's reply into another
+    transport's conversation. So None means DEFER, never raise and never guess. The
+    drain re-enqueues it untouched and wakes the channel that owns it. Raising here
+    instead would be worse than the bug this module prevents: the entry is already
+    dequeued when this runs, so an exception would discard every message dequeued in
+    that iteration, and the remainder is re-enqueued only after the loop.
+
+    Ownership is decided on the NEUTRAL channel field, not on the presence of a
+    prefixed one, so an entry that names this channel but is missing a field raises a
+    ``KeyError`` naming it. That case is a producer bug in THIS module -- both
+    producers are here, ``_enqueue_with_receipt`` and the drain's own re-enqueue --
+    and defaulting to empty strings would address the reply to an empty chat id,
+    which is a silent misdelivery.
+    """
+    if entry_channel(kwargs) != _CHANNEL:
+        return None
+    return _QueuedOrigin(
+        *(str(kwargs[f"{_ORIGIN_PREFIX}{name}"] or "") for name in _QueuedOrigin._fields)
+    )
+
+
 _HELP_TEXT = build_help_text()
 
 
@@ -266,6 +430,37 @@ _MODEL_PICKER_MAX = 50
 #: are this account's own models and this machine's own agent specs, not
 #: catalogues, so one bound fits both.
 _PICKER_LIMIT = 24
+
+#: An agent kept out of the channel ``/agent`` picker BY DEFAULT: the picker
+#: offers the agents a person driving from Telegram actually chooses between,
+#: not Kiro Crew's own machinery. Two disjoint signals, both authoritative on
+#: their own field rather than on the display name:
+#:
+#: * ``kirocrew_owned`` — the Kiro Crew-generated internal agents (the chat
+#:   agent, the background/heartbeat/conductor/worker/knowledge specs). This is
+#:   the ``name in OWNED_KIRO_AGENT_FILES`` flag ``list_agents`` already sets, so
+#:   a user's OWN hand-authored ``kirocrew-custom.json`` — which merely shares
+#:   the ``kirocrew`` name prefix and is not owned — is NOT hidden. The prefix
+#:   would over-match it; the ownership flag is exactly the set to hide.
+#: * an app-installed agent, whose spec is materialised under the
+#:   ``<app>--<agent>.json`` link filename (see ``apps.bridges``/``apps.execution``).
+#:   These belong to an installed app, not to the person picking an agent, so
+#:   they are hidden alongside the internals. The double-dash is a filename
+#:   convention Kiro Crew writes, not a name a user types, so matching the
+#:   FILENAME (not the possibly-bare declared name) is what identifies them.
+_APP_AGENT_LINK_SEP = "--"
+
+
+def _agent_is_internal(info: AgentInfo) -> bool:
+    """Whether *info* is a system/internal agent hidden from the channel picker.
+
+    See :data:`_APP_AGENT_LINK_SEP`. Purely a function of the roster row, so the
+    picker and any test agree on one definition.
+    """
+    if info.kirocrew_owned or info.source == "kirocrew":
+        return True
+    return _APP_AGENT_LINK_SEP in info.filename
+
 
 #: ``/title`` ceiling. The dashboard sidebar row truncates well before this; the
 #: cap is here so a persisted transcript never carries an unbounded title.
@@ -409,6 +604,13 @@ class TelegramDispatcher:
         # over-permissive.
         self.bot_id: int = 0
         self._conv = ConversationState(seed_fn=self._seed_gen)
+        # Published so a peer channel sharing this queue can wake this drain. Under
+        # ``dm_scope = "unified"`` a Telegram DM and a Discord DM to the same agent
+        # resolve to ONE session key and therefore one queue, and a drain can only
+        # answer the entries its own channel recorded -- so the channel that sets a
+        # foreign entry aside has to hand it back to its owner. See
+        # ``messaging/queue_drain.py``.
+        register_drain(_CHANNEL, self._drain_queue)
         # Set by maybe_start_telegram after construction (same construction-cycle
         # reason as ``client``); the config applier pushes reloaded authorization
         # fields at it.
@@ -715,7 +917,9 @@ class TelegramDispatcher:
             await self._reply(chat_id, _HELP_TEXT, thread=reply_thread)
             return
         if cmd == "stop":
-            await self._handle_stop(route, chat_id, session_key=resumed_key)
+            await self._handle_stop(
+                route, chat_id, origin=_inbound_origin(msg), session_key=resumed_key
+            )
             return
         if cmd == "model":
             await self._handle_model(
@@ -757,17 +961,22 @@ class TelegramDispatcher:
                 return
             rest = parse_command_argument(text)
             if not rest:
-                applied = await privacy_mode.apply_mode(
-                    cmd,
-                    # Rotation FIRST: a bare modifier returns before the turn path
-                    # would have rotated, so keying on the un-rotated generation
-                    # protects a session the next message abandons.
-                    resumed_key or self._rotated_session_key(route),
-                    source="telegram",
-                    caller=str(user_id),
-                    sessions=self.sessions,
-                    notify=lambda note: self._notify(chat_id, note, thread=reply_thread),
-                )
+                try:
+                    applied = await privacy_mode.apply_mode(
+                        cmd,
+                        # Rotation FIRST: a bare modifier returns before the turn path
+                        # would have rotated, so keying on the un-rotated generation
+                        # protects a session the next message abandons.
+                        resumed_key or self._rotated_session_key(route),
+                        source="telegram",
+                        caller=str(user_id),
+                        sessions=self.sessions,
+                        notify=lambda note: self._notify(chat_id, note, thread=reply_thread),
+                    )
+                except privacy_mode.PrivacyModeRefused:
+                    # Audited and announced by apply_mode: the conversation was not
+                    # made private and nothing runs.
+                    return
                 if not applied:
                     # Idempotent, so apply_mode said nothing. Say something anyway:
                     # silence reads as the command having failed.
@@ -907,14 +1116,20 @@ class TelegramDispatcher:
             return
         privacy_mode.hydrate(self.sessions, session_key)
         if privacy_request:
-            await privacy_mode.apply_mode(
-                privacy_request,
-                session_key,
-                source="telegram",
-                caller=str(user_id),
-                sessions=self.sessions,
-                notify=lambda note: self._notify(chat_id, note, thread=reply_thread),
-            )
+            try:
+                await privacy_mode.apply_mode(
+                    privacy_request,
+                    session_key,
+                    source="telegram",
+                    caller=str(user_id),
+                    sessions=self.sessions,
+                    notify=lambda note: self._notify(chat_id, note, thread=reply_thread),
+                )
+            except privacy_mode.PrivacyModeRefused:
+                # Audited and announced by apply_mode. The message is NOT run:
+                # running it with the mode dropped is the leak the modifier
+                # exists to prevent.
+                return
         channel_id = f"telegram:{user_id}"
         agent = self._resolve_agent(route)
         if resumed_key is not None:
@@ -967,6 +1182,13 @@ class TelegramDispatcher:
         # on _acquired so we never release a semaphore we didn't hold. Mirrors
         # slack/transport_dispatch.py.
         _acquired = False
+        # The provider THIS turn acquired, for the failure handler's attribution
+        # question. Bound before the try so every handler can read it -- an
+        # attribution flag read on a path its assignment cannot reach is an
+        # UnboundLocalError inside an except arm, not a guard. Stays None when
+        # get_or_create never returned, and an unattributable death charges as
+        # before.
+        _turn_provider: object | None = None
         failure_reason: str | None = None
         attachment_temp_paths: list[str] = []
         # Post-compaction re-injection bookkeeping for the finally: whether this
@@ -998,6 +1220,44 @@ class TelegramDispatcher:
                 model=(None if resumed_key is not None else self._model_pref.get(route) or None),
             )
             _acquired = True
+            # Hold the provider this turn obtained, for the failure handler's
+            # attribution question. Captured HERE rather than looked up when a
+            # failure is handled: the recovery paths replace a dead session, so a
+            # lookup at failure time answers for the replacement and the question
+            # silently becomes "was the NEW runtime shared".
+            _turn_provider = provider
+            if resumed_key is None or channel_namespace_of(session_key):
+                # The session's crew log, opened the moment the allocation lands
+                # and before ANY further await: the work ledger appends every write
+                # to the acting session's log and rolls back one it cannot record,
+                # so a DM admitted as a conductor needs its log to exist before its
+                # first ledger call -- and a turn that bails between the allocation
+                # and a later opener (a failed attachment fetch, a renderer error)
+                # would leave a live session whose log is first created on the NEXT
+                # turn, by then a warm reuse, so the previous edge would never be
+                # written. The predecessor is the allocation boundary's own capture,
+                # taken inside its critical section and consumed here after the
+                # claim -- no read of the mapping around the call, which a
+                # concurrent turn's allocate-and-recycle could stale while this turn
+                # waited inside the allocation. Every CHANNEL session this dispatcher
+                # runs is opened here, including a same-DM native history picked
+                # through ``/sessions`` (``resumed_key`` naming a channel key): no
+                # dashboard runner ever handles its turns, so this is its only
+                # opener. Only a resumed DASHBOARD session is left alone -- its
+                # opener is the dashboard's, which alone holds its lineage. The
+                # workspace is read off the dashboard slot this conversation is
+                # surfaced under, the source a tab on it states the same fact from,
+                # so the two writers of this log agree. Never raises, never suspends.
+                open_turn_crew_log(
+                    provider,
+                    session_key=session_key,
+                    agent=agent,
+                    resumed=resumed,
+                    ctx_builder=self.ctx_builder,
+                    previous_sid=predecessor_sid(self.sessions, session_key),
+                    model_requested=requested_model_sid(self.sessions, session_key),
+                    workspace=slot_workspace(self.dashboard_state, session_key),
+                )
             # Extraction's approved root is the provider's OWN resolved cwd, so a
             # path lexically outside it is refused before any metadata probe.
             # Read defensively: an absent cwd must mean "no uploads", never a dead
@@ -1013,7 +1273,19 @@ class TelegramDispatcher:
                 await self.sessions.set_channel(session_key, channel_id)
             if resumed_key is None:
                 # A resumed dashboard session already owns its surface and binding.
-                # Reassert only Telegram's native conversation mirror.
+                # Reassert only Telegram's native conversation mirror -- and record
+                # that conversation as the session's ORIGIN, the in-memory fact the
+                # dashboard reads for unattended output about the session and for
+                # session control's owner-DM check (a DM whose mirror IS its own
+                # conversation is one audience; a mirror aimed anywhere else is not,
+                # and only the recorded origin can tell the two apart). Discord's
+                # dispatcher writes both on the same turn for the same reasons.
+                # The same key-based unified guard ``bind_origin_mirror`` applies:
+                # a ``unified:{agent}`` bucket collapses every user's DMs into one
+                # session, so it has no single origin to record.
+                setter = getattr(self.sessions, "set_origin_link", None)
+                if setter is not None and channel_namespace_of(session_key) != DM_SCOPE_UNIFIED:
+                    setter(session_key, self._origin_mirror_link(route, chat_id))
                 self._bind_origin_mirror(session_key, route, chat_id)
             # ── Attachment ingestion (mirrors Discord) ──
             if msg.attachments:
@@ -1108,13 +1380,20 @@ class TelegramDispatcher:
                 ),
                 audit_session_key=session_key,
                 audit_agent=agent or "kirocrew",
-                closing_gate=lambda: self.sessions.begin_turn(session_key),
+                closing_gate=turn_ceiling.gate(
+                    session_key, lambda: self.sessions.begin_turn(session_key)
+                ),
             )
             accumulated = await driver.run(full_message)
 
             # ── Post-turn bookkeeping (each guarded so a failure here can't
             # fall through to the except and re-record the successful turn). ──
             self.sessions.record_success(session_key)
+            # Beside the counter it stands in for: a landed turn clears the
+            # shared-death streak exactly as it clears the consecutive-failure
+            # count, so the streak stays a consecutive run rather than a lifetime
+            # total whose bound is permanently tripped.
+            runtime_death.clear_shared_deaths(session_key)
             # The prompt (with any re-injected context) reached the model and
             # the turn completed, so the finally must NOT restore the flag --
             # unless the user cancelled it, which discards that prompt.
@@ -1131,42 +1410,30 @@ class TelegramDispatcher:
                 await self._speak_reply(
                     route, chat_id, accumulated, int(thread) if thread else None
                 )
-            # Auto-title, fire-and-forget. Without it a conversation's name is
-            # frozen at the first forty characters of the first message forever —
-            # the deterministic fallback ``_persist_turn`` writes — and the only
-            # correction is a manual /title. Claim-and-spawn, never awaited: the
-            # answer has already been delivered, so the user waits on nothing.
+            # Decided BEFORE the persist below, and used by BOTH it and the
+            # auto-title dispatch, so the two cannot disagree. That write mints
+            # this conversation's deterministic fallback name, and auto-title's
+            # guard refuses a record that already carries a name -- so a fallback
+            # written here would be the conversation's name for good, with the
+            # claim retained and no later exchange retrying. The suppression is
+            # passed explicitly rather than inferred from claim timing, because the
+            # claim is taken AFTER this write: the pin below reads a record this
+            # turn has already persisted.
             #
-            # Requires ``accumulated``: a turn that produced no text has nothing to
-            # name, and titling it would spend a background turn to be told SKIP.
-            # Skipped for a restricted session, which persists nothing to title.
-            # Isolated like every other bookkeeping step here, so failing even to
-            # SPAWN the task never re-records this successful turn as a failure.
-            try:
-                if (
-                    resumed_key is None
-                    and accumulated
-                    and not privacy_mode.is_restricted(session_key)
-                    and auto_title.try_claim(session_key)
-                ):
-                    _title_task = asyncio.create_task(
-                        auto_title.maybe_auto_title(
-                            self.sessions,
-                            self.conv_log,
-                            session_key,
-                            text,
-                            accumulated,
-                            source="telegram",
-                        )
-                    )
-                    self._title_tasks.add(_title_task)
-                    _title_task.add_done_callback(self._title_tasks.discard)
-            except Exception:
-                logger.warning(
-                    "Telegram: auto-title dispatch failed session=%s",
-                    session_key,
-                    exc_info=True,
-                )
+            # ``accumulated`` is required: a turn that produced no text has
+            # nothing to name, and titling it would spend a background turn to be
+            # told SKIP. A restricted session persists nothing to title, and a
+            # resumed session is not this dispatcher's to name.
+            _will_auto_title = bool(
+                resumed_key is None
+                and accumulated
+                and not privacy_mode.is_restricted(session_key)
+                # Cheap synchronous peek: ``try_claim`` below tests this very
+                # membership, so without it the pin's thread hop would be paid
+                # and then thrown away on every later message of every
+                # already-named conversation.
+                and not auto_title.is_titled(session_key)
+            )
             try:
                 # Circular import: the dashboard package imports the channel
                 # transports on its boot path, so this edge only exists at call
@@ -1198,10 +1465,62 @@ class TelegramDispatcher:
                         is_new_own_session,
                         agent=agent,
                         mirror_mids=mirror_mids,
+                        auto_title_pending=_will_auto_title,
                     )
             except Exception:
                 logger.warning(
                     "Telegram: persist_turn failed session=%s", session_key, exc_info=True
+                )
+            # Auto-title, fire-and-forget. Without it a conversation's name is
+            # frozen at the first forty characters of the first message forever —
+            # the deterministic fallback ``_persist_turn`` writes — and the only
+            # correction is a manual /title. Claim-and-spawn, never awaited: the
+            # answer has already been delivered, so the user waits on nothing.
+            #
+            # Placed AFTER the persist above, because the record the pin reads is
+            # the one ``_persist_turn`` mints: pinning ahead of it would read
+            # ABSENT on a conversation's first exchange, which the guard refuses,
+            # so a new thread would lose its generated name and pay a second
+            # background turn for it on the next exchange. Both Slack dispatchers
+            # are ordered the same way -- they persist their turn before they pin
+            # -- so an ABSENT pin means the record is genuinely gone rather than
+            # not yet written. It stays OUTSIDE the ``dashboard_restricted``
+            # branch above so titling keeps the conditions it has here and gains
+            # none from that gate.
+            #
+            # Isolated like every other bookkeeping step here, so failing even to
+            # SPAWN the task never re-records this successful turn as a failure.
+            try:
+                if _will_auto_title:
+                    # Pin BEFORE claiming, and both before scheduling. The pin read
+                    # suspends on a thread, so claiming first would hold the claim
+                    # across that await with nothing scheduled yet to release it,
+                    # and a cancellation there would strand it -- the claim is
+                    # process-wide, so this key could not be named again until the
+                    # gateway restarts. The pin still precedes ``create_task``,
+                    # which is what closes the scheduling-tick window: read inside
+                    # the task, one tick is enough for a delete plus a re-message
+                    # on this thread to pin the replacement.
+                    _title_pin = await auto_title.pin_record(self.conv_log, session_key)
+                    if auto_title.try_claim(session_key):
+                        _title_task = asyncio.create_task(
+                            auto_title.maybe_auto_title(
+                                self.sessions,
+                                self.conv_log,
+                                session_key,
+                                text,
+                                accumulated,
+                                pin=_title_pin,
+                                source="telegram",
+                            )
+                        )
+                        self._title_tasks.add(_title_task)
+                        _title_task.add_done_callback(self._title_tasks.discard)
+            except Exception:
+                logger.warning(
+                    "Telegram: auto-title dispatch failed session=%s",
+                    session_key,
+                    exc_info=True,
                 )
             if is_new_own_session:
                 try:
@@ -1233,6 +1552,23 @@ class TelegramDispatcher:
                 )
             except Exception:
                 logger.debug("Telegram: success audit failed", exc_info=True)
+        except TurnCeilingExceeded as exc:
+            # At the conversation's turn ceiling, so no turn opened. Unlike the
+            # shutdown branch below this is NOT spooled -- the spool replays a
+            # message our restart dropped, and this one was refused on purpose --
+            # and it is not charged to the circuit breaker. The notice is
+            # rendered so the placeholder finalizes as the pause message rather
+            # than a perma-"thinking".
+            #
+            # Through ``out_renderer``, the same one the driver streams to, NOT
+            # the concrete one: a muted conversation substitutes ``SilentRenderer``
+            # because the dashboard disconnected it, and posting there would put a
+            # message into a chat that is supposed to hear nothing -- once per
+            # inbound message, since the latch does not clear on its own.
+            logger.warning(
+                "Telegram turn ceiling reached for %s -- conversation paused", session_key
+            )
+            await turn_ceiling.render_refusal(out_renderer, exc)
         except SessionClosingError:
             # Shutdown began between the claim and the dispatch, so no turn ever
             # opened. Caught ahead of the generic handler so a restart is not
@@ -1283,9 +1619,33 @@ class TelegramDispatcher:
             # generic retry text; everything else stays generic (None).
             failure_reason = _user_safe_failure_reason(exc)
             if _acquired:
-                await self.sessions.record_failure(session_key)
+                # A dying runtime reaches this generic handler as one more
+                # exception, so without the attribution question every tenant of
+                # one process charges its own breaker for a single process event.
+                # ``_turn_provider`` is the one THIS turn acquired, never a lookup
+                # made while handling the failure.
+                await charge_turn_failure(
+                    self.sessions,
+                    session_key,
+                    exc=exc,
+                    provider=_turn_provider,
+                    channel_type="telegram",
+                )
                 Stats().inc_message_failed()
         finally:
+            # An approval window the driver never awaited -- the prompt went out
+            # and the turn then ended before the decider -- has no wait of its own
+            # to close it, so it would outlive this turn with its nonce still
+            # armed and authorizing a press.
+            #
+            # ``_APPROVAL_REGISTRY`` is ``TelegramApprovalDecider`` under a second
+            # name. Reservations are class state, so the sweep has to reach the
+            # class holding them, and the construction name above is a seam
+            # callers and tests substitute to observe the decider a turn builds.
+            # Sweeping through that name aims at the substitute: it raises on a
+            # plain function, and on a stand-in class it clears an empty registry
+            # and leaves the real window armed past the end of its turn.
+            _APPROVAL_REGISTRY.discard_session(session_key)
             # A turn that consumed the post-compaction flag but never landed
             # discarded the prompt carrying the re-injected context; put the
             # flag back so the next turn re-injects it.
@@ -1321,14 +1681,13 @@ class TelegramDispatcher:
         # Now that the turn is released, run anything that queued during it
         # (queue_mode == "queue"). ``drain`` is False for drained turns so the
         # loop stays iterative at one level (no recursion); ``limit`` bounds it.
+        #
+        # Deliberately handed NOTHING about this turn but its session key: the
+        # replay envelope comes from each queued entry's own recorded origin, and
+        # under ``dm_scope = "unified"`` the person who opened this turn is not
+        # necessarily the person who queued during it.
         if drain:
-            await self._drain_queue(
-                session_key,
-                user_id,
-                chat_id,
-                chat_type=getattr(msg, "chat_type", "private"),
-                thread=thread,
-            )
+            await self._drain_queue(session_key)
 
     @asynccontextmanager
     async def _routing_turn(self, route_id: str) -> "AsyncIterator[list[int]]":
@@ -1362,12 +1721,14 @@ class TelegramDispatcher:
         *privacy_request* is a modifier the caller stripped off *text*, and the two
         branches owe it different things because they run the request under different
         keys. A STEERED message folds into the turn already running on
-        ``session_key``, so the mark belongs on that key now, before the steer, or
-        the running turn's transcript is written before anything marks it. A QUEUED
-        message runs later under whatever key the drained turn resolves, so the
-        request rides ALONG with it and is applied there. Applying it here for a
-        queued message would mark a key the drain may have rotated past, which is the
-        failure the deferred apply exists to avoid.
+        ``session_key``, so the mode is RESERVED on that key before the steer -- row
+        on disk, mark and header (``privacy_mode.reserve``) -- or the running turn's
+        transcript would be written before anything marks it; a refusal means no
+        steer. A landed steer commits the reservation; a steer that did not land
+        releases it (the message then takes the queue path, where the request is
+        applied under the drained key), so a turn the user never asked to protect is
+        not left restricted. A QUEUED message runs later under whatever key the
+        drained turn resolves, so the request rides ALONG with it and is applied there.
         """
         assert self.client is not None
         chat_id = int(msg.conversation_id)
@@ -1394,26 +1755,72 @@ class TelegramDispatcher:
             # message is re-run or queued instead of lost.
             has_active = getattr(provider, "has_active_turn", None)
             live = has_active is None or bool(has_active())
-            steered = bool(
-                live
-                and getattr(provider, "supports_steer", False)
-                and steer is not None
-                and await steer(text)
+            can_steer = (
+                live and bool(getattr(provider, "supports_steer", False)) and steer is not None
             )
-            if steered:
-                if privacy_request:
-                    # The turn this folded into is running on THIS key, and it writes
-                    # its transcript when it finishes. Marked after the steer landed,
-                    # so a refused steer does not leave the session restricted for a
-                    # message that fell through to the queue path instead.
-                    await privacy_mode.apply_mode(
+            reservation: privacy_mode.Reservation | None = None
+            # ONE producer for everything this path tells the user about the
+            # mode: the refusal (at once), the confirmation (by commit, only once
+            # the steer has put the message in the turn) or the failure notice.
+            announce = lambda note: self._notify(chat_id, note, thread=thread)  # noqa: E731
+            if privacy_request and can_steer:
+                # RESERVE before the steer. A steer cannot be taken back once it
+                # lands, and the turn it folds into runs on THIS key and writes
+                # its transcript when it finishes -- so the row, the mark and the
+                # header must exist before the message is in that turn, not after
+                # (a persist that failed after the steer would leave the turn run
+                # with no durable record; two modifiers racing for the last row
+                # would both steer). reserve publishes only once the row is on
+                # disk -- a row that cannot be taken or written is a refusal,
+                # already audited and announced: no steer, nothing runs -- and
+                # hands back what a failed steer must release. It does NOT confirm
+                # the mode: the steer may still decline or fail, and a "mode ON"
+                # for a message that then ran elsewhere or not at all is false.
+                try:
+                    reservation = await privacy_mode.reserve(
                         privacy_request,
                         session_key,
                         source="telegram",
                         caller=caller,
                         sessions=self.sessions,
-                        notify=lambda note: self._notify(chat_id, note, thread=thread),
+                        notify=announce,
                     )
+                except privacy_mode.PrivacyModeRefused:
+                    return
+            try:
+                steered = bool(can_steer and steer is not None and await steer(text))
+            except asyncio.CancelledError:
+                # Cancelled mid-steer: the outcome is unknown -- the steer's
+                # bytes may already be with the backend -- so the mode STANDS
+                # (fail-closed: taking it back would strip the protection from
+                # a message that may be recorded). Committed silently; the
+                # cancellation goes through.
+                if reservation is not None:
+                    with suppress(Exception):
+                        await privacy_mode.commit(reservation, unconfirmed=True)
+                raise
+            except BaseException:
+                # The steer RAISED after the message may have reached the
+                # backend (the write lands before the awaited flush that
+                # fails), so nobody knows whether it is in the turn. Keep the
+                # mode -- row, mark and header exactly as a landed steer leaves
+                # them -- and tell the user the mode is on but the message
+                # itself is unconfirmed; then let the failure propagate as
+                # before. Only an explicit decline (``steer`` returning False)
+                # releases: that message provably runs elsewhere. The notice
+                # is best-effort, as in the arm above: ``commit`` records the
+                # mode BEFORE it sends, so a sender that raises has changed
+                # nothing else, and letting it through here would replace the
+                # steer's own exception with the notice's.
+                if reservation is not None:
+                    with suppress(Exception):
+                        await privacy_mode.commit(reservation, unconfirmed=True)
+                raise
+            if steered:
+                if reservation is not None:
+                    # The message is in the turn: the mode is the conversation's
+                    # for good, and THIS is when the user is told so.
+                    await privacy_mode.commit(reservation)
                 # Record the user's OWN words on the running turn's renderer so
                 # it can render an inline "↪️ steered: <text>" chip (never the
                 # redacted backend echo). Best-effort: no active renderer -> skip.
@@ -1433,6 +1840,17 @@ class TelegramDispatcher:
                     except Exception:
                         logger.debug("telegram: steer ack reaction failed", exc_info=True)
                 return
+            if reservation is not None:
+                # The steer did not land (the provider declined it): the message
+                # falls through to the queue path below and runs at the drain,
+                # where ``privacy_request`` is applied under the drained key. The
+                # reservation is RELEASED -- marking this key for a message that
+                # never ran here would restrict a turn the user never asked to
+                # protect -- unless another modifier on this thread is riding it
+                # or has landed, which release checks before loosening anything.
+                await privacy_mode.release(
+                    reservation, sessions=self.sessions, source="telegram", caller=caller
+                )
         # queue mode (or /queue override, or steer unavailable). Enqueue + receipt
         # happen atomically under ``self._queue.lock`` (see ``_enqueue_with_receipt``)
         # so the end-of-turn drain -- which takes the same lock to dequeue + flip
@@ -1447,23 +1865,25 @@ class TelegramDispatcher:
             thread=thread,
             attachments=list(msg.attachments) if msg.attachments else None,
             privacy_request=privacy_request,
+            # The sender and their chat ride with the entry too, because the drain
+            # replays it and the reply reaches whoever the replayed envelope names.
+            # Under ``dm_scope = "unified"`` two allow-listed people share ONE
+            # session key and therefore one queue, so without this a message queued
+            # by one of them during the other's turn is answered into the other's
+            # chat and attributed to them. Built from ``msg`` rather than from this
+            # method's ``chat_id`` / ``thread``: ``thread`` here is the REPLY thread
+            # the route resolved to, while the replay needs the message's own
+            # ``thread_id`` so ``handle_message`` re-derives that route itself.
+            origin=_inbound_origin(msg),
         ):
             # Not queued, so re-run it now. The ORIGINAL msg, whose text still
             # carries the modifier, so command parsing re-derives the request rather
             # than this path having to re-thread it.
             await self.handle_message(msg)
 
-    async def _drain_queue(
-        self,
-        session_key: str,
-        user_id: int,
-        chat_id: int,
-        *,
-        chat_type: str = "private",
-        thread: str | None = None,
-    ) -> None:
-        """Collapse every message queued during the just-finished turn into ONE
-        combined turn (order preserved, blank-line joined) and answer them
+    async def _drain_queue(self, session_key: str) -> None:
+        """Collapse every message ONE SENDER queued during the just-finished turn
+        into ONE combined turn (order preserved, blank-line joined) and answer them
         together, rather than replaying each as a separate turn.
 
         The dequeue + receipt flip run together under ``self._queue.lock`` so a
@@ -1472,28 +1892,86 @@ class TelegramDispatcher:
         runs OUTSIDE the lock -- messages that arrive during it open a fresh
         receipt and drain after the next turn. Only the queued text is replayed
         (matching what ``enqueue`` persists for DM channels: text only).
+
+        One combined turn gets ONE envelope, so it may only combine messages that
+        SHARE one -- same sender, same chat, same Topic. That is
+        :attr:`_QueuedOrigin.sender_key`, and it is taken from the FIRST entry this
+        iteration collapses, never from the turn that opened the queue: under
+        ``dm_scope = "unified"`` one session key, and therefore one queue, is shared
+        by every allow-listed person, so a queue holding two of them is reachable on
+        the live path. Anything from a different sender or place defers itself and
+        everything behind it, so FIFO stays exact and the outer loop drains it next
+        as its own turn under its own envelope.
+
+        Which is why this method is given the session key and nothing else: the
+        opener's identity is not an input it could accidentally fall back to.
+
+        An entry ANOTHER transport recorded shares this queue under the same scope and
+        cannot be answered here at all. It is set aside, and because it has already
+        been accepted and receipted, its owner's drain is woken once this pump is done
+        -- outside ``self._queue.lock``, since that drain takes its own lock and runs a
+        whole turn. See ``messaging/queue_drain.py`` for why the cascade terminates.
         """
         # Iterate rather than recurse: one burst can span multiple
         # attachment-capped turns, and a message deferred by the cap must drain
         # in THIS pump rather than waiting for unrelated future user input.
         # Mirrors the Discord drain.
+        #
+        # Channels whose entries this pump set aside, so they can be woken after it.
+        # The sequence -- pump, then wake outside the queue lock but INSIDE this
+        # channel's active marker, then pump again for any wake a peer could not
+        # deliver back here -- lives in the shared module, because all four drains
+        # need exactly it and getting the order wrong has no local symptom.
+        await drain_until_quiet(
+            channel=_CHANNEL,
+            session_key=session_key,
+            pump=lambda foreign: self._pump_queue(session_key, foreign),
+        )
+
+    async def _pump_queue(self, session_key: str, foreign_channels: set[str]) -> None:
+        """The collapse-and-answer loop itself. See :meth:`_drain_queue`.
+
+        Split out so the wake has one exit point to run after: the loop returns from
+        several places, and a wake that some of them skipped is the defect it exists
+        to close.
+        """
         while True:
             texts: list[str] = []
             all_attachments: list[Any] = []
             remainder: list[tuple[str, str, dict]] = []
             privacy_requests: list[str] = []
             defer_rest = False
+            # The origin this iteration answers, taken from the FIRST entry it
+            # collapses. None until that entry is read.
+            origin: _QueuedOrigin | None = None
             async with self._queue.lock:
                 # Drain the ENTIRE queue under the lock, then split: the first
-                # _MAX_COLLAPSE messages collapse into this turn; the rest are
-                # re-enqueued IN ORIGINAL ORDER (the queue is now empty, so
-                # re-adding preserves FIFO) to drain after the next turn. This
-                # bounds the combined prompt without dropping or reordering surplus.
+                # _MAX_COLLAPSE messages FROM ONE SENDER collapse into this turn;
+                # the rest are re-enqueued IN ORIGINAL ORDER (the queue is now
+                # empty, so re-adding preserves FIFO) to drain after the next turn.
+                # This bounds the combined prompt without dropping or reordering
+                # surplus.
                 while True:
                     item = self.sessions.dequeue(session_key)
                     if item is None:
                         break
                     item_attachments = list(item[2].get("attachments") or [])
+                    item_origin = _queued_origin(item[2])
+                    if item_origin is None:
+                        # ANOTHER transport recorded this entry, so it is not this
+                        # dispatcher's to answer -- it holds no address this channel
+                        # can reach. Set aside for its own channel's drain WITHOUT
+                        # ``defer_rest``: order matters within one sender's messages,
+                        # which ``sender_key`` already keeps exact, while blocking
+                        # this channel's own queue behind a foreign entry would
+                        # strand it whenever that transport sends nothing further.
+                        # Remember WHOSE it is: the entry was already accepted and
+                        # receipted, so its owner is woken once this pump is done.
+                        remainder.append(item)
+                        foreign_channels.add(entry_channel(item[2]))
+                        continue
+                    if origin is None:
+                        origin = item_origin
                     # Never collapse past the shared ingestion cap: the extra files
                     # would be dropped inside ingest_attachments with the user given
                     # no indication, so defer instead. Mirrors the Discord drain.
@@ -1503,7 +1981,17 @@ class TelegramDispatcher:
                         and len(all_attachments) + len(item_attachments)
                         > _MAX_COLLAPSED_ATTACHMENTS
                     )
-                    if not defer_rest and len(texts) < _MAX_COLLAPSE and not exceeds_attachment_cap:
+                    fits = (
+                        not defer_rest
+                        and len(texts) < _MAX_COLLAPSE
+                        and not exceeds_attachment_cap
+                        # sender_key, NOT the whole origin: the origin also carries
+                        # the sender's @handle, which they can change between two
+                        # messages, so comparing all of it would make one person's
+                        # own burst compare unequal and drain as N turns.
+                        and item_origin.sender_key == origin.sender_key
+                    )
+                    if fits:
                         texts.append(item[1])
                         all_attachments.extend(item_attachments)
                         requested = item[2].get("privacy_request") or ""
@@ -1514,30 +2002,57 @@ class TelegramDispatcher:
                         # behind it, so queue order stays exact.
                         defer_rest = True
                         remainder.append(item)
+                # How many of the set-aside entries belong to the sender this turn
+                # answers. NOT ``len(remainder)``: that also counts entries from a
+                # DIFFERENT sender and entries another TRANSPORT recorded, each of
+                # which drains in its own turn in its own chat. Showing those to this
+                # sender would promise them a follow-up for messages they never sent
+                # -- and when their own burst fit in one turn, a "+N deferred" where
+                # their true count is zero.
+                own_deferred = 0
                 for _ts, rtext, rkw in remainder:
+                    r_origin = _queued_origin(rkw)
+                    if (
+                        origin is not None
+                        and r_origin is not None
+                        and r_origin.sender_key == origin.sender_key
+                    ):
+                        own_deferred += 1
                     self.sessions.enqueue(
                         session_key,
                         str(time.time()),
                         rtext,
                         force=True,
-                        attachments=list(rkw.get("attachments") or []),
-                        # Re-enqueued verbatim, modifier included: a deferred message
-                        # drains in a LATER iteration of this pump, and dropping the
-                        # request here would unprotect exactly the messages the
-                        # collapse cap pushed back.
-                        privacy_request=rkw.get("privacy_request") or "",
+                        # Re-enqueued VERBATIM: its attachments, its privacy modifier
+                        # (a deferred message drains in a LATER iteration of this pump,
+                        # and dropping the request here would unprotect exactly the
+                        # messages the collapse cap pushed back), and its origin -- an
+                        # entry deferred because it came from SOMEONE ELSE would
+                        # otherwise inherit the next first entry's identity, the bug
+                        # one iteration later. Passing the payload through rather than
+                        # rebuilding it is also what lets an entry another transport
+                        # recorded survive this drain intact.
+                        **rkw,
                     )
-                if texts:
-                    await self._receipt_flip_locked(session_key, chat_id, texts, len(remainder))
-            if not texts:
+                if texts and origin is not None:
+                    await self._receipt_flip_locked(
+                        session_key,
+                        int(origin.chat_id),
+                        texts,
+                        own_deferred,
+                        owner=_entry_owner(origin),
+                    )
+            if not texts or origin is None:
                 return
             if remainder:
                 logger.debug(
-                    "telegram: drain deferred %d message(s) for %s to respect the "
-                    "collapse cap (%d) / attachment cap (%d); they drain in the "
-                    "next iteration of this pump, in order",
+                    "telegram: drain set aside %d message(s) for %s, %d of them this "
+                    "sender's own (collapse cap %d / attachment cap %d); the rest "
+                    "belong to another sender or another transport. All drain in "
+                    "order, this sender's in the next iteration of this pump",
                     len(remainder),
                     session_key,
+                    own_deferred,
                     _MAX_COLLAPSE,
                     _MAX_COLLAPSED_ATTACHMENTS,
                 )
@@ -1545,14 +2060,19 @@ class TelegramDispatcher:
             await self.handle_message(
                 TelegramInboundMessage(
                     channel_type="telegram",
-                    user_id=str(user_id),
-                    conversation_id=str(chat_id),
+                    # Every addressing and attribution field comes from the queued
+                    # entry's own origin, so the turn runs in the sender's chat under
+                    # the sender's identity even when someone else opened the queue.
+                    user_id=origin.user_id,
+                    conversation_id=origin.chat_id,
                     text=combined,
-                    # Carry the turn's ORIGINAL route so the drained turn resolves to
-                    # the SAME forum session key -- a plain DM-shaped InboundMessage
-                    # would drain a queued forum message under the DM key instead.
-                    thread_id=thread,
-                    chat_type=chat_type,
+                    # Carry the QUEUED message's ORIGINAL route so the drained turn
+                    # resolves to the SAME forum session key -- a plain DM-shaped
+                    # InboundMessage would drain a queued forum message under the DM
+                    # key instead.
+                    thread_id=origin.thread_id or None,
+                    chat_type=origin.chat_type,
+                    username=origin.username,
                     attachments=all_attachments,
                 ),
                 drain=False,
@@ -1564,7 +2084,9 @@ class TelegramDispatcher:
                 # queued, so it travels as state rather than as text. The STRICTEST of
                 # the collapsed messages wins, because they answer as one turn under
                 # one key -- honouring only the first would let a later `/incognito`
-                # in the same burst be silently downgraded to whatever led it.
+                # in the same burst be silently downgraded to whatever led it. Now
+                # scoped to ONE sender's messages, so one person's modifier can no
+                # longer restrict a turn answering someone else.
                 privacy_request=privacy_mode.strictest(privacy_requests),
             )
 
@@ -1584,12 +2106,18 @@ class TelegramDispatcher:
 
         class _Surface:
             label = "telegram"
+            # ``chat_id`` alone, deliberately: a forum route's ``comp`` is
+            # ``"{chat_id}:{thread}"``, so ``_session_key`` already gives each Topic its
+            # own entry and no two Topics ever share a bubble for this key to keep
+            # apart. ``thread`` routes a send, which the bubble's own retained surface
+            # already carries.
+            address_key = receipt_address_key("telegram", chat_id)
 
             async def send_receipt(self, body: str) -> Any | None:
                 return await reply(chat_id, body, thread=thread)
 
-            async def edit_receipt(self, msg_id: Any, body: str) -> None:
-                await client.edit_message(chat_id, msg_id, body)
+            async def edit_receipt(self, msg_id: Any, body: str) -> bool:
+                return await client.edit_message(chat_id, msg_id, body)
 
         return _Surface()
 
@@ -1602,6 +2130,7 @@ class TelegramDispatcher:
         thread: int | None = None,
         attachments: list[Any] | None = None,
         privacy_request: str = "",
+        origin: _QueuedOrigin,
     ) -> bool:
         """Atomically enqueue a mid-turn message and create/grow its collapsing
         "⏳ Queued (N): …" receipt, under ``self._queue.lock``.
@@ -1613,6 +2142,12 @@ class TelegramDispatcher:
         orphan a bubble. Returns True if queued; False if the turn finished in
         the window (``enqueue`` is a no-op once the semaphore is free), so the
         caller runs the message as a fresh turn instead.
+
+        *origin* is REQUIRED and keyword-only: it is who sent THIS message and where
+        its reply goes, and the drain replays the entry under it. A default would be
+        a way to enqueue an unattributed message, which under
+        ``dm_scope = "unified"`` the drain could only answer under someone else's
+        identity.
         """
         assert self.client is not None
         async with self._queue.lock:
@@ -1627,15 +2162,22 @@ class TelegramDispatcher:
                 # modifier was already stripped from, so a request left behind here
                 # is one no later parse can recover.
                 privacy_request=privacy_request,
+                **_origin_kwargs(origin),
             ):
                 return False
             await self._queue.create_or_grow_locked(
-                session_key, self._receipt_surface(chat_id, thread), text
+                session_key, self._receipt_surface(chat_id, thread), text, _entry_owner(origin)
             )
             return True
 
     async def _receipt_flip_locked(
-        self, session_key: str, chat_id: int, answered: list[str], deferred: int = 0
+        self,
+        session_key: str,
+        chat_id: int,
+        answered: list[str],
+        deferred: int = 0,
+        *,
+        owner: str,
     ) -> None:
         """Flip the receipt to a durable "▶️ Now answering" record and drop the
         live entry so the next mid-turn burst opens a fresh receipt. Caller MUST
@@ -1645,10 +2187,26 @@ class TelegramDispatcher:
         ``_MAX_COLLAPSE``); the count reflects it -- not the full queued list --
         so a >cap burst doesn't overstate what this turn answers. ``deferred``
         (>0 only past the cap) is noted so the remainder isn't silently implied.
+
+        ``owner`` is WHOSE messages those are, which the flip needs because one bubble
+        can list several principals': a GROUP chat gives every member one chat address
+        and one session key, so a drain answering one member must leave the others'
+        lines -- and the entry that is their only handle -- alone. REQUIRED and
+        keyword-only, the same way the registry transition it forwards to spells it:
+        this wrapper has exactly one caller and that caller always can name the
+        principal, so an omission is a type error rather than a silent return to
+        retiring the whole bubble.
+
+        ``chat_id`` is the chat the receipt BUBBLE lives in, which the drain takes
+        from the queued entry's own origin rather than from the turn that opened the
+        queue -- ``create_or_grow_locked`` posted that bubble into the chat of
+        whoever queued first. The ``None`` thread is correct and not an omission:
+        ``flip_answering_locked`` only ever EDITS, and ``edit_message`` addresses a
+        message by its id, which already identifies it within its Topic.
         """
         assert self.client is not None
         await self._queue.flip_answering_locked(
-            session_key, self._receipt_surface(chat_id, None), answered, deferred
+            session_key, self._receipt_surface(chat_id, None), answered, deferred, owner=owner
         )
 
     async def _handle_dashboard(
@@ -1823,9 +2381,10 @@ class TelegramDispatcher:
         route: tuple[str, str],
         chat_id: int,
         *,
+        origin: _QueuedOrigin,
         session_key: str | None = None,
     ) -> None:
-        """Hard cancel: abort the in-flight turn and clear everything.
+        """Hard cancel: abort the in-flight turn and clear THIS caller's queued messages.
 
         The cooperative-cancel contract, the lock ordering across
         ``clear_queue`` + the receipt finalize, and both replies live in
@@ -1834,6 +2393,11 @@ class TelegramDispatcher:
         because ``editMessageText`` is not threaded -- the message id already
         identifies the message within its Topic -- while the reply itself must
         land back in the originating Topic.
+
+        *origin* is this caller's own, recorded the same way their queued entries were,
+        so the clear matches their entries and no one else's: under
+        ``dm_scope = "unified"`` this queue also holds other people's messages, and on
+        another transport too.
         """
         assert self.client is not None
         reply = await stop_running_turn(
@@ -1841,6 +2405,7 @@ class TelegramDispatcher:
             session_key or self._session_key(route),
             queue=self._queue,
             surface=self._receipt_surface(chat_id, None),
+            owner=_entry_owner(origin),
         )
         await self._reply(chat_id, reply, thread=self._route_thread(route))
 
@@ -2314,12 +2879,20 @@ class TelegramDispatcher:
 
     @staticmethod
     def _installed_agent_names() -> list[str]:
-        """Every installed agent spec's name, user-level scope.
+        """Selectable agent names for the picker, user-level scope, sorted.
+
+        System and internal agents are excluded (:func:`_agent_is_internal`):
+        the picker offers the agents a person chooses between, so Kiro Crew's own
+        machinery and app-installed agents do not occupy its slots and crowd out
+        the user's own agents. The classification is on the roster row's fields,
+        not the display name, so a user's own ``kirocrew``-prefixed agent stays.
 
         ``list_agents`` caches on a directory signature but still reads and
         parses each JSON on a miss, so callers run it off the loop.
         """
-        return sorted({info.name for info in list_agents() if info.name})
+        return sorted(
+            {info.name for info in list_agents() if info.name and not _agent_is_internal(info)}
+        )
 
     def _agent_choices(self, names: list[str]) -> tuple[tuple[str, str], ...]:
         """``(agent_id, label)`` rows to offer, "" first for the configured default.
@@ -2328,6 +2901,12 @@ class TelegramDispatcher:
         can actually load — a static catalogue would offer an agent whose spec is
         absent and fail at the next session start, which is exactly the failure
         mode the ``/model`` picker avoids by listing only advertised ids.
+
+        Only SELECTABLE rows are returned, and this is the exact set stored in
+        the picker's resolution table: cut to :data:`_PICKER_LIMIT` so the count
+        fits Telegram's keyboard. The count hidden by that cut is surfaced by the
+        caller as a separate, non-selectable keyboard row — it must not live here,
+        or a press would resolve its index back to an agent.
         """
         configured = self._configured_agent()
         rows: list[tuple[str, str]] = [("", f"Default ({configured})")]
@@ -2363,6 +2942,14 @@ class TelegramDispatcher:
             [{"text": f"{'• ' if aid == current else ''}{label}", "callback_data": f"g:{index}"}]
             for index, (aid, label) in enumerate(choices)
         ]
+        # Make truncation VISIBLE instead of silent (the reported harm). More
+        # selectable agents than fit are cut in ``_agent_choices``; this trailing
+        # row names how many were dropped. Its ``callback_data`` matches no picker
+        # prefix, so a press is inert — the callback is already acked, and it is
+        # deliberately NOT a ``g:`` index that would resolve back to an agent.
+        hidden = len(names) - _PICKER_LIMIT
+        if hidden > 0:
+            keyboard.append([{"text": f"… and {hidden} more not shown", "callback_data": "noop"}])
         message_id = await self._reply(
             chat_id, header, thread=thread, reply_markup={"inline_keyboard": keyboard}
         )
@@ -2874,6 +3461,273 @@ class TelegramDispatcher:
                 origin_tag=origin_tag,
             )
 
+    # ── Spawn-approval channel delivery ─────────────────────────────────────
+
+    async def deliver_spawn_approval(
+        self, request_id: str, description: str, parent_session_key: str
+    ) -> bool | None:
+        """Post a spawn-approval prompt to the ORIGINATING Telegram conversation.
+
+        Registered into the channel-neutral
+        :mod:`~kiro_crew.messaging.spawn_approval_delivery` seam so the single
+        host spawn gate can reach the same Approve/Deny/Trust keyboard the
+        main-agent tool ladder already uses here. Returns the user's decision
+        (``True``/``False``), or ``None`` to tell the gate "not surfaced here,
+        fall through to Slack/dashboard" — for a key this dispatcher cannot turn
+        back into a chat (``unified`` dm_scope drops the peer, a non-``telegram``
+        key, an unparseable one), when the client is not up, when the
+        destination's authorization has since been withdrawn, or when the post
+        fails. The operator's ``channels`` governance ceiling is read TWICE for
+        one prompt, and both reads belong to the seam: before it invokes any hook,
+        so a denied channel is never prompted at all, and again through
+        ``unpressed_wait_answer`` when a wait elapses unpressed, because a deny
+        can land inside that wait. This method owns neither reading; it asks for
+        the second one.
+
+        The wait is the SAME deny-by-default one a tool prompt uses
+        (:class:`TelegramApprovalDecider`, ``APPROVAL_TIMEOUT_S``): the press
+        resolves through the ``on_callback`` ``a:`` branch exactly as a tool
+        approval does, so Trust still runs ``add_trusted_session`` and a spawn id
+        (``spawn:<agent_id>``) cannot collide with an opaque tool id in the
+        registry keyed by ``session_key:request_id``.
+
+        The prompt is armed under ``parent_session_key`` VERBATIM (its ``:genN``
+        suffix included), but a press recomputes the key from the LIVE
+        conversation (``_callback_session_key``). A generation rotation between the
+        spawn and the press — ``/new``, an idle reset, a daily rotation — bumps the
+        generation, so the recomputed key does not match the armed one, the press
+        resolves nothing, and the prompt deny-by-defaults at the timeout (the user
+        sees "already expired"). This mirrors how a mid-run tool prompt behaves
+        across a rotation, and it stays a DENY: a rotation is the conversation
+        moving on, not a withdrawal of the right to answer. An elapsed wait is a
+        fall-through in one case only, when AUTHORIZATION ended during it -- the
+        prompt was surfaced, so otherwise ``False`` is a real decision and the gate
+        refuses the spawn on it. Two authorities can end authorization mid-wait and
+        both are re-read when the wait elapses: this conversation's own
+        authorization, which ``on_callback`` checks first for every press with no
+        exemption (``_spawn_prompt_destination_permitted``, the same pair consulted
+        before posting), and the operator's ``channels`` ceiling, whose reading
+        belongs to the seam (``unpressed_wait_answer``) for every channel.
+        """
+        client = self.client
+        if client is None:
+            return None
+        target = self._spawn_chat_target(parent_session_key)
+        if target is None:
+            # A key this channel does not own or cannot address (unified DM
+            # bucket, non-telegram key, malformed). Let the gate fall through.
+            return None
+        chat_id, thread_id, session_key = target
+
+        rid = str(request_id)
+        nonce = new_approval_nonce()
+        key = TelegramApprovalDecider.key(session_key, rid)
+        # The wait below runs in this gate's OWN task, not in the turn that asked
+        # for the spawn: that turn returns as soon as the spawn is admitted, so its
+        # end-of-turn sweep can land while this coroutine is still in the send.
+        # Claiming the window here keeps the sweep off a prompt the operator is
+        # looking at; every exit path below releases the claim.
+        TelegramApprovalDecider.arm(key, nonce, detached=True)
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "✅ Approve", "callback_data": f"a:{rid}:{nonce}:1"},
+                    {"text": "🚫 Deny", "callback_data": f"a:{rid}:{nonce}:0"},
+                ],
+                [
+                    {
+                        "text": "🤝 Trust this conversation",
+                        "callback_data": f"a:{rid}:{nonce}:t",
+                    }
+                ],
+            ]
+        }
+        # ``description`` is the gate's own ``spawn_run(<task-preview>)`` string,
+        # already credential/exfil-redacted in admission.py before it reaches
+        # here; escape it for the HTML body it lands in.
+        detail = " ".join((description or "spawn_run").split())
+        body = f"🔐 Approve sub-agent spawn?\n<pre>{html.escape(detail)}</pre>"
+        if not self._spawn_prompt_destination_permitted(chat_id, thread_id):
+            # Authorization for this destination was withdrawn between the turn that
+            # asked for the spawn and this delivery. Retire the armed nonce and fall
+            # through, so the spawn is still answerable on Slack/dashboard.
+            TelegramApprovalDecider.retire(key)
+            logger.info(
+                "Telegram: not posting the spawn-approval prompt for %s; the "
+                "originating conversation is no longer authorized",
+                rid,
+            )
+            return None
+        try:
+            posted = await client.send_message(
+                chat_id,
+                body,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+                message_thread_id=thread_id,
+            )
+        except asyncio.CancelledError:
+            # The only suspension point between the arm and the wait, so a cancel
+            # here is the one exit that would otherwise leave the window claimed
+            # with no wait coming to release it. Close it, then let the cancel run.
+            TelegramApprovalDecider.retire(key)
+            raise
+        except Exception:
+            # Could not surface it: retire the armed nonce and fall through so the
+            # spawn can still be answered on Slack/dashboard rather than deny by a
+            # timeout nobody could see.
+            TelegramApprovalDecider.retire(key)
+            logger.warning(
+                "Telegram: failed to post spawn-approval prompt for %s", rid, exc_info=True
+            )
+            return None
+        if not posted:
+            # This client reports a failed send by RETURNING no message id rather
+            # than by raising (a revoked token, a deleted forum Topic, a chat it
+            # cannot write to, a 5xx past its own retries), so the ``except`` above
+            # does not cover it. Same conclusion: nothing is on screen, so fall
+            # through instead of waiting out the whole decision window on a prompt
+            # nobody can press and handing that silence back as a denial.
+            TelegramApprovalDecider.retire(key)
+            logger.warning(
+                "Telegram: the spawn-approval prompt for %s was not accepted by the "
+                "chat; falling through",
+                rid,
+            )
+            return None
+
+        decider = TelegramApprovalDecider(session_key=session_key)
+        event = SimpleNamespace(request_id=rid)
+        approved = bool(await decider(event))
+        if not approved and decider.last_deny_cause == DENY_CAUSE_APPROVAL_TIMEOUT:
+            # Nobody pressed. An elapsed wait is a deny-by-default except when
+            # AUTHORIZATION ended during it; reporting ``False`` then would refuse
+            # the spawn in the operator's name. A generation rotation is not in
+            # that set: it moves the conversation on rather than withdrawing the
+            # right to answer, and stays a deny like a mid-run tool prompt. Two
+            # authorities can end authorization, and both are asked:
+            #
+            # * this conversation's own authorization, which ``on_callback`` checks
+            #   FIRST for every press with no exemption: the peer roster gates
+            #   every press, and a Topic passes the shared ``forum_gate_outcome``
+            #   as well. A peer dropped from the roster, or a Topic dropped from
+            #   the allow-list, therefore silences even a reject.
+            #   ``_spawn_prompt_destination_permitted`` is the same pair this
+            #   method already consults before posting, read here as "could a
+            #   press still have been honored";
+            # * the operator's ``channels`` ceiling, which the seam owns for every
+            #   channel (``unpressed_wait_answer``).
+            #
+            # A press — approve, trust, or the explicit reject the channels drop
+            # exempts — is the operator's own decision and is returned verbatim
+            # below, so a real refusal never becomes a fall-through.
+            if not self._spawn_prompt_destination_permitted(chat_id, thread_id):
+                logger.info(
+                    "Telegram: the spawn-approval prompt for %s went unanswered and "
+                    "its conversation is not authorized, so no press could have "
+                    "resolved it; falling through to the Slack/dashboard path",
+                    rid,
+                )
+                return None
+            return await unpressed_wait_answer("telegram", rid)
+        return approved
+
+    def _spawn_prompt_destination_permitted(self, chat_id: int, thread_id: int | None) -> bool:
+        """May a spawn-approval prompt be posted into this chat RIGHT NOW? Fails closed.
+
+        The gate can hold a spawn for as long as its approval takes, so the
+        authorization that admitted the originating turn is not evidence about this
+        instant: an operator can drop the peer from ``telegram.allowed_user_ids``, or
+        a Topic from the forum allow-list, while the prompt is still being prepared.
+        The prompt carries a task preview, so it is a send that must be re-decided
+        against the LIVE roster rather than the one the turn started under.
+
+        Called SYNCHRONOUSLY with no suspension point between it and the send it
+        gates — an await in between would reopen the window it closes.
+
+        Two authorities, both consulted, neither sufficient alone:
+
+        * the dispatcher's own live gates, which are exactly the ones a PRESS is
+          judged by in ``on_callback``: the peer roster gates EVERY press, and a
+          Topic passes the shared ``forum_gate_outcome`` predicate as well. A DM's
+          chat id IS the peer's user id, so ``_authorized`` answers it directly; a
+          Topic names no single peer, so the roster is asked whether it admits
+          anybody. Either way a prompt is never posted where its own button could
+          not be honored;
+        * ``transport.may_send_to``, the transport's revocation-at-egress decision,
+          when a transport is wired. Absent (no transport, as in a unit harness) the
+          dispatcher's gates above stand alone; a raise is read as a denial.
+        """
+        if thread_id is None:
+            # Private chat: its id IS the peer's user id, so the roster answers.
+            if not self._authorized(chat_id):
+                return False
+        else:
+            # A Topic press passes BOTH gates, the roster first and then the
+            # shared forum predicate. The roster is keyed by the PRESSING peer,
+            # and a Topic route names none of them -- any authorized peer in it
+            # may press -- so what the roster can answer here is whether it
+            # admits anybody at all. An empty roster denies every press, reject
+            # included, leaving a prompt in this Topic answerable by nobody.
+            if not self._allowed:
+                return False
+            forum_cfg = self._live_cfg().telegram
+            if (
+                forum_gate_outcome(
+                    "supergroup",
+                    chat_id,
+                    thread_id,
+                    allow_forum=bool(forum_cfg.allow_forum),
+                    allowed_forum_chat_ids=forum_cfg.allowed_forum_chat_ids,
+                )
+                is not None
+            ):
+                return False
+        gate = getattr(self.transport, "may_send_to", None)
+        if gate is None:
+            return True
+        try:
+            return bool(gate(str(chat_id), str(thread_id) if thread_id is not None else None))
+        except Exception:
+            logger.warning(
+                "Telegram: may_send_to raised for the spawn-approval destination; "
+                "treating it as revoked",
+                exc_info=True,
+            )
+            return False
+
+    def _spawn_chat_target(self, parent_session_key: str) -> tuple[int, int | None, str] | None:
+        """``(chat_id, thread_id, session_key)`` for a Telegram spawn parent, else None.
+
+        Reconstructs the conversation from the parent session key's grammar
+        (``telegram:{agent}:{chat_type}:{scope…}``): a direct DM's scope is the
+        peer's user id, and a Telegram private chat's id EQUALS that user id; a
+        forum route's scope is ``{chat_id}:{thread}``. A ``unified`` DM bucket
+        (``unified:{agent}``) parses as a non-telegram surface and returns None —
+        it names no single conversation to post into, which is the same reason the
+        origin mirror declines it. ``session_key`` is returned so the caller arms
+        the decider under the exact key ``on_callback`` recomputes for a press in
+        that chat.
+        """
+        parsed = parse_session_key(parent_session_key)
+        if parsed is None or parsed.surface != "telegram":
+            return None
+        try:
+            if parsed.chat_type == CHAT_TYPE_FORUM and len(parsed.scope) >= 2:
+                chat_id = int(parsed.scope[0])
+                thread_id: int | None = int(parsed.scope[1])
+            elif parsed.chat_type == CHAT_TYPE_DIRECT and len(parsed.scope) == 1:
+                chat_id = int(parsed.scope[0])
+                thread_id = None
+            else:
+                return None
+        except (TypeError, ValueError):
+            return None
+        # The key was minted with a generation suffix; the press recomputes the
+        # same key from the live conversation, so key the decider by the exact
+        # value the gate handed us.
+        return chat_id, thread_id, parent_session_key
+
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _callback_session_key(
@@ -3233,8 +4087,18 @@ class TelegramDispatcher:
         is_new: bool,
         agent: str | None = None,
         mirror_mids: tuple[str, str] | None = None,
+        auto_title_pending: bool = False,
     ) -> None:
         """Persist one atomic turn, deduplicating rows already projected live.
+
+        ``auto_title_pending`` says a generated name is on its way for this
+        conversation, so the deterministic fallback below is skipped: auto-title's
+        guard refuses a record that already carries a name, so writing one here
+        would make the first forty characters of the first message the permanent
+        name and retain the claim, leaving nothing to retry. The caller decides it
+        once and uses the same value for its own dispatch, so the two cannot
+        disagree. It defaults to False, so a caller that does not dispatch
+        auto-title writes the fallback unconditionally.
 
         ``privacy_mode.is_restricted`` is this channel's OWN privacy gate and is
         checked here, at the only writer, so it covers the turn, the drained queue
@@ -3285,7 +4149,7 @@ class TelegramDispatcher:
                         agent=agent,
                         mid=mint_row_mid(),
                     )
-            if is_new and not auto_title.is_titled(session_key):
+            if is_new and not auto_title_pending and not auto_title.is_titled(session_key):
                 title = (user_text or "").strip().replace("\n", " ")[:40] or "Telegram"
                 self.conv_log.set_title(session_key, title)
 

@@ -630,15 +630,24 @@ def test_dry_run_full_exits_zero_and_prints_plan(gate, capsys) -> None:
     assert "frontend (full)" in err
 
 
-def test_dry_run_against_the_real_repo_never_plans_a_full_suite(gate, capsys) -> None:
-    """Whatever this checkout's diff looks like, the default plan is related-only.
+def test_dry_run_against_the_real_repo_never_plans_a_full_suite(gate, monkeypatch, capsys) -> None:
+    """Whatever the diff looks like, the default plan run END TO END is related-only.
 
-    The diff is the developer's, not the test's: a clean checkout has no changes
-    against the merge-base and the gate says so instead of selecting anything, a
-    dirty one gets a related-only plan. Both are the invariant holding, so the
-    assertion accepts either wording; only a ``(full)`` surface label -- the
-    ``--full`` plan's own marker -- would break it.
+    The selection is real: ``related_targets`` scans this checkout's actual test
+    tree for the changed files, which is what the stubbed-``_related`` tests
+    above never exercise. The DIFF is pinned, though, not read from the
+    developer's working tree. ``changed_files`` reports every untracked path, so
+    a checkout carrying a large evidence tree (a sweep's ``hygiene/tmp`` with
+    tens of thousands of files) hands the reference matcher an alternation of
+    that size and the scan runs for minutes -- the test then measured the
+    developer's clutter, not the gate. One file per surface is the realistic
+    dirty tree; only a ``(full)`` surface label -- the ``--full`` plan's own
+    marker -- would break the invariant.
     """
+    monkeypatch.setattr(
+        gate, "changed_files",
+        lambda base: ["src/kiro_crew/gateway.py", "website/src/App.tsx"],
+    )
     rc = gate.main(["--dry-run"])
     err = capsys.readouterr().err
     assert rc in (0, 2), err
@@ -647,3 +656,21 @@ def test_dry_run_against_the_real_repo_never_plans_a_full_suite(gate, capsys) ->
         # Every rc==0 plan names CI as the full suite's owner, in one of two
         # spellings depending on whether there was anything related to select.
         assert "full suite deferred to CI" in err or "the full suite runs in CI" in err, err
+
+
+def test_the_reference_scan_reads_each_test_file_once_and_drops_it(gate) -> None:
+    """The selector streams the test tree; it must not memoise what it read.
+
+    ``related_targets`` reads every collectable test file once per call to match
+    it against the diff's tokens. An earlier revision wrapped that read in
+    ``functools.lru_cache(maxsize=None)``, so the whole tree -- ~3,200 files,
+    ~100 MB of ``str`` -- stayed resident for the life of whichever process had
+    imported the selector: the gate itself, or the pytest worker running the
+    end-to-end dry run above (+190 MiB high-water, outliving the test). The
+    re-read it saved is 0.4 s. Pinned by shape: the read seam is a plain function.
+    """
+    selector = importlib.import_module("run_scoped_tests")
+    assert not hasattr(selector._read_text, "cache_info"), (
+        "run_scoped_tests._read_text is memoised again; the reference scan must "
+        "read each file once and drop it, not retain the test tree's text"
+    )

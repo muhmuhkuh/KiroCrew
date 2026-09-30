@@ -12,6 +12,7 @@ app-specific fields.
 from __future__ import annotations
 
 import json
+import os
 import posixpath
 import re
 import sys
@@ -2694,6 +2695,106 @@ class AppManifest:
             # so rewriting it on a signed app redirects that dispatch while every visible
             # character of the row, and the signature, stay exactly as published.
             body["contributes"] = self.contributes.to_dict()
+        setup_d = self.setup.to_dict()
+        if setup_d:
+            # `onInstall`/`onUpdate`/`onUninstall`/`onEnable`/`onDisable` are shell
+            # text `run_lifecycle_script` hands to `/bin/bash -c`. The string IS the
+            # program -- no file in the package has to exist for it to run -- so a
+            # manifest-only rewrite of a published app buys execution outright. Same
+            # reason `crons` is covered one clause up: vetting bounds the SYNTAX of
+            # what runs, only the signature authenticates PUBLISHER INTENT.
+            # Included only when non-empty so manifests signed before setup was
+            # covered keep producing the identical payload.
+            body["setup"] = setup_d
+        if self.mcpServers:
+            # Each entry's `command`/`args`/`env` is written into the agent config
+            # kiro-cli reads and SPAWNS (`bridges._register_mcp_servers`). Like
+            # `setup`, the executed argv lives in the manifest itself, so this is the
+            # one part of a signed app whose program an attacker could swap with the
+            # signature still verifying.
+            # Included only when non-empty so manifests signed before mcpServers was
+            # covered keep producing the identical payload.
+            body["mcpServers"] = dict(self.mcpServers)
+        backend_d = self.backend.to_dict()
+        if backend_d:
+            # `hooks.*` names a module:callable `module_loader.load_app_module`
+            # imports INTO THE GATEWAY PROCESS, and `entryPoint` + `type` select the
+            # file and interpreter `_start_app_backend_body` spawns. These are
+            # selectors rather than literal argv, so repointing one at a module that
+            # already sits in an otherwise untouched package is enough -- and a
+            # manifest-only tamper is precisely what the signature is the sole
+            # detector for.
+            # The whole canonical dict, not the executed keys alone: cherry-picking
+            # leaves `port`/`healthCheck`/`routes` as residue an attacker may still
+            # move, and one guard is smaller than four.
+            # Included only when non-empty so manifests signed before backend was
+            # covered keep producing the identical payload.
+            body["backend"] = backend_d
+        ui_d = self.ui.to_dict()
+        if ui_d:
+            # `entry` and every `pages[].entryPoint` name an ESM module the dashboard
+            # builds `/apps/<name>/ui/<path>` from and dynamic-`import()`s in its OWN
+            # origin (`website/src/components/AppHost.tsx`) -- the same surface
+            # `contributes.panelTabs[].entry` is covered for one clause up. Outside the
+            # payload, the derivative is signed and the original is not.
+            # The whole canonical dict, not the two executed keys alone: a
+            # `pages[].route` decides which URL serves that bundle, and a page's
+            # `label`/`icon` plus `sidebar` are the whole of what the reader sees
+            # before clicking it -- so cherry-picking the entry paths leaves the
+            # routing and the presentation of an attacker-chosen bundle as residue.
+            # Included only when non-empty so manifests signed before ui was covered
+            # keep producing the identical payload.
+            body["ui"] = ui_d
+        if self.agents:
+            # Each path names a JSON agent spec `bridges._register_agents` writes into
+            # the user's agents dir, carrying its own `tools`/`allowedTools`/`model`/
+            # `prompt`. APPENDING one entry is enough to get an attacker-authored agent
+            # materialized, and the same guard covers that: the payload is recomputed
+            # from the manifest as received, so a package that GAINS an `agents` key
+            # gains it in the signed bytes too and the signature stops matching.
+            # Included only when non-empty so manifests signed before agents was
+            # covered keep producing the identical payload. List order preserved.
+            body["agents"] = list(self.agents)
+        if self.skills:
+            # `bridges._register_skills` symlinks each directory into the skills root,
+            # both namespaced and flat, so a repointed entry puts attacker-authored
+            # skill instructions where an agent reads them as its own.
+            # Included only when non-empty so manifests signed before skills was
+            # covered keep producing the identical payload. List order preserved.
+            body["skills"] = list(self.skills)
+        if self.sops:
+            # Same shape as `skills` one clause up: the file's text becomes procedure an
+            # agent follows, and only the signature authenticates whose text it is.
+            # Included only when non-empty so manifests signed before sops was covered
+            # keep producing the identical payload. List order preserved.
+            body["sops"] = list(self.sops)
+        dependencies_d = self.dependencies.to_dict()
+        if dependencies_d:
+            # `capabilities.mcp` is an id `dependencies.resolve_dependencies` hands to
+            # `CapabilityManager.install_mcp` AT INSTALL TIME, so a swapped id installs
+            # an attacker's MCP server -- whose command an agent then spawns -- under
+            # the publisher's signature.
+            # The whole canonical dict, not `capabilities` alone: `managedBy` is the
+            # switch deciding whether the gateway installs the capability at all, and
+            # `commands`/`optionalCommands` name host executables the install chain
+            # probes and reports as missing.
+            # Included only when non-empty so manifests signed before dependencies was
+            # covered keep producing the identical payload.
+            body["dependencies"] = dependencies_d
+        platform_d = self.platform.to_dict()
+        if platform_d:
+            # `clientInstall.shell` is a one-liner the App Store hands the reader to
+            # PASTE INTO A TERMINAL -- `install_from_registry` returns the whole `clientInstall`
+            # dict with `needsClientInstall: True`, under a signature-verified publisher badge.
+            # No file in the package has to exist for it to run, which is the property
+            # that put `setup` in the payload.
+            # The whole canonical dict, not `clientInstall` alone: `installMode:
+            # "client"` is what makes that block reach the reader at all, so signing the
+            # one-liner without the switch that surfaces it is the cherry-pick this
+            # method avoids everywhere else.
+            # Included only when non-empty so manifests signed before platform was
+            # covered keep producing the identical payload.
+            body["platform"] = platform_d
         return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     # -----------------------------------------------------------------
@@ -2872,3 +2973,210 @@ class AppManifest:
         if not isinstance(data, dict):
             raise ValueError(f"app.json must be a JSON object, got {type(data).__name__}")
         return cls.from_dict(data)
+
+
+# ---------------------------------------------------------------------------
+# What the runtime provisions out of process
+# ---------------------------------------------------------------------------
+#
+# The app runtime installs an app's root ``requirements.txt`` with
+# ``pip install --target`` into the app's own deps directory, a tree that
+# reaches processes spawned on the app's behalf and never the gateway's own
+# import path. Exactly two paths do it, and each decides from the typed
+# manifest plus the app root. The predicates below ARE that decision, imported
+# by both provisioners (``backend.py`` at the spawn of a backend entry point,
+# ``bridges.py`` at the registration of a stdio ``mcpServers`` entry) and by
+# the install-time desktop gate that mirrors them, so the three sites cannot
+# drift: ``test_apps_provisioning_predicate.py`` pins each site to these names.
+
+#: A ``backend.entryPoint`` ending in one of these is a script FILE even when
+#: it contains dots (``run.server.py``); anything else dotted is a module path.
+SCRIPT_ENTRY_POINT_SUFFIXES: tuple[str, ...] = (".py", ".js", ".ts", ".mjs", ".cjs", ".sh")
+
+#: Suffixes the backend spawn launches with ``node`` (``backend.type: "node"``
+#: chooses the same branch by declaration).
+NODE_ENTRY_POINT_SUFFIXES: tuple[str, ...] = (".js", ".mjs", ".cjs")
+
+#: The suffix the backend spawn launches as a shell script (``backend.type:
+#: "exec"`` chooses the same branch by declaration, and so does an extensionless
+#: executable whose first line is a shebang naming no ``python``).
+SHELL_ENTRY_POINT_SUFFIX = ".sh"
+
+
+def spawn_launches_entry_point_as_python(manifest: AppManifest, app_root: Path) -> bool:
+    """True when the backend spawn would run ``backend.entryPoint`` as a PYTHON child.
+
+    The one file-style shape the provisioned deps tree REACHES. ``backend.py``
+    pip-installs the root ``requirements.txt`` at the spawn of any file-style
+    entry, but hands the tree to a Python child only -- through the ``deps_boot``
+    shim when the child runs the gateway interpreter, through the shim under an
+    ABI-matched shebang, or on ``PYTHONPATH`` for an ABI-matched interpreter (the
+    transport block after the launch is built) -- and a node or shell child gets
+    none of the three: its dependencies land beside it, unreachable. Mirrors the
+    spawn's own dispatch (``_start_app_backend_body``, ``_is_shell_entry``): an
+    explicit ``backend.type`` of ``node`` or ``exec``, a node suffix, or ``.sh``
+    is not Python; an extensionless EXECUTABLE whose first line is a shebang
+    naming no ``python`` is a shell launcher; everything else -- ``.py``, a dotted
+    file name such as ``server.main``, an extensionless script the spawn feeds
+    to the interpreter -- is Python. Asked of the tree the spawn will resolve
+    the name under, like :func:`file_entry_point_refusal`; an extensionless
+    entry that is not there yet is judged by name alone.
+    """
+    entry_point = manifest.backend.entryPoint
+    if manifest.backend.type in ("node", "exec"):
+        return False
+    if entry_point.endswith(NODE_ENTRY_POINT_SUFFIXES) or entry_point.endswith(
+        SHELL_ENTRY_POINT_SUFFIX
+    ):
+        return False
+    if "." in entry_point.rsplit("/", 1)[-1]:
+        return True
+    entry = app_root / entry_point
+    try:
+        if not os.access(entry, os.X_OK):
+            return True
+        with open(entry, "rb") as fh:
+            first_line = fh.readline(256)
+    except OSError:
+        return True
+    return not (first_line.startswith(b"#!") and b"python" not in first_line)
+
+
+def is_module_style_entry_point(entry_point: str, app_root: Path) -> bool:
+    """True when ``backend.entryPoint`` names a dotted Python module, not a file.
+
+    The backend spawn runs such an entry with ``python -m`` from the trusted
+    package (a built-in app living inside the Kiro Crew package itself), never
+    from the writable app directory, so nothing found in that directory -- a
+    ``requirements.txt`` included -- is provisioned for it. Four conditions
+    together decide the shape: no path separator, no script suffix, at least
+    one dot, and no file of that literal name under *app_root* (a file named
+    ``server.main`` is a file). An empty entry point is not module-style.
+    """
+    return (
+        "/" not in entry_point
+        and not entry_point.endswith(SCRIPT_ENTRY_POINT_SUFFIXES)
+        and "." in entry_point
+        and not (app_root / entry_point).exists()
+    )
+
+
+def has_stdio_mcp_server(manifest: AppManifest) -> bool:
+    """True when the manifest declares a stdio ``mcpServers`` entry: one without ``url``.
+
+    A ``url`` server is remote and spawns nothing on the app's behalf. A stdio
+    server is a process the gateway launches, and its Python imports resolve
+    from the app's provisioned deps tree, which is why its presence is what
+    makes ``bridges.py`` provision at registration.
+    """
+    return any(
+        isinstance(cfg, dict) and not cfg.get("url") for cfg in manifest.mcpServers.values()
+    )
+
+
+def file_entry_point_refusal(entry_point: str, app_root: Path) -> str:
+    """Why the backend spawn would refuse *entry_point* as a FILE-style entry,
+    or ``""`` when it would spawn it.
+
+    The spawn's own precondition (``backend.py::_start_app_backend_body``),
+    spelled once: the entry must be a regular file under *app_root* whose
+    resolution stays inside the root. Returns the spawn's reason -- ``"not
+    found"``, ``"escapes app root"``, ``"path resolution failed"`` -- so the
+    spawn can log it and :func:`runtime_provisions_requirements` can treat any
+    reason as "the backend provisioner never runs for this entry".
+    """
+    entry = app_root / entry_point
+    if not entry.is_file():
+        return "not found"
+    try:
+        if not entry.resolve().is_relative_to(app_root.resolve()):
+            return "escapes app root"
+    except (OSError, ValueError, RuntimeError):
+        # RuntimeError: a symlink loop under Python 3.12 (ELOOP from 3.13 on).
+        return "path resolution failed"
+    return ""
+
+
+def runtime_provisions_requirements(manifest: AppManifest, app_root: Path) -> bool:
+    """True when the runtime installs the app's root ``requirements.txt`` out of
+    process FOR A PROCESS THAT RECEIVES IT.
+
+    Composed from the same predicates the two provisioners call, plus the one
+    fact the provisioners do not decide by -- which child the installed tree
+    reaches:
+
+    - ``backend.py`` provisions at the spawn of any FILE-style ``backend.entryPoint``
+      -- the spawn runs only for an entry that IS a regular file inside the app
+      root (:func:`file_entry_point_refusal`); a declared file the spawn refuses
+      is returned before provisioning -- but hands the tree to a PYTHON child
+      only (:func:`spawn_launches_entry_point_as_python`): a shell or node entry is
+      spawned with the deps installed beside it and no way to import them, so it
+      counts here as no consumer. Never for a module-style entry, which executes
+      trusted package code;
+    - ``bridges.py`` provisions at the registration of a stdio ``mcpServers``
+      entry for an app whose entry point is absent or file-style -- the same
+      module-style exclusion, and no existence requirement of its own: the
+      stdio server is the consumer it provisions for, and the one that can still
+      make this true beside a shell or node entry.
+
+    So a module-style entry point is never provisioned, whatever else the
+    manifest declares; a ``.py`` entry point that would spawn always is; a
+    non-Python file entry, or a declared file the spawn would refuse, leaves only
+    a stdio server to make it true; without an entry point, a stdio server is.
+    Says nothing about ``backend.hooks``: a hook is imported into the gateway
+    process, which the deps tree never reaches, so a gate that waives an
+    install-time refusal on this predicate must exclude hooks itself.
+    """
+    entry_point = manifest.backend.entryPoint
+    if entry_point:
+        if is_module_style_entry_point(entry_point, app_root):
+            return False
+        if spawn_launches_entry_point_as_python(
+            manifest, app_root
+        ) and not file_entry_point_refusal(entry_point, app_root):
+            return True
+    return has_stdio_mcp_server(manifest)
+
+
+#: Read cap for an app's ``requirements.txt``: the provisioner buffers it in the
+#: GATEWAY's memory, so an oversized, app-controlled file must exhaust a bounded
+#: buffer, not the gateway. 1 MiB is orders of magnitude beyond any real
+#: requirements.txt. Owned here so the one acceptance rule below can apply the
+#: same cap the provisioner's bounded read enforces.
+REQUIREMENTS_TXT_MAX_BYTES = 1024 * 1024
+
+
+def requirements_in_tree(app_root: Path, req_file: Path) -> tuple[Path, Path] | None:
+    """The strictly-resolved ``(app_root, requirements.txt)`` pair when *req_file*
+    is one the runtime will read, else ``None``.
+
+    The provisioner's own acceptance rule for the file, spelled once: the entry
+    must strictly resolve (a dangling link is ``None``) to a regular file (a
+    directory is ``None``) inside the strictly-resolved app root (a link that
+    escapes it is ``None``), no larger than :data:`REQUIREMENTS_TXT_MAX_BYTES`
+    (an oversized file is ``None``; the provisioner's bounded read refuses it).
+    ``requirements.txt -> requirements/prod.txt`` is legitimate layout and
+    resolves.
+
+    Three callers, one rule. ``backend_runtime/provisioning.py``'s provisioning read and its
+    activation gate use it as the fast refusal before their descriptor-pinned,
+    every-component-no-follow open of the returned target -- that open, and the
+    bounded read through it, are the security boundary; this is not, and it
+    stays where it is. ``registry_pipeline/install.py``'s install-time desktop gate uses it to
+    predict what those two will do, so it never waives a file the provisioner
+    would refuse. ``None`` on any resolution error, so no caller catches here.
+    """
+    try:
+        root_resolved = app_root.resolve(strict=True)
+        target = req_file.resolve(strict=True)
+        if not target.is_file() or not target.is_relative_to(root_resolved):
+            return None
+        if target.stat().st_size > REQUIREMENTS_TXT_MAX_BYTES:
+            return None
+    except (OSError, RuntimeError):
+        # RuntimeError: a symlink loop, which Path.resolve raises as such before
+        # Python 3.13 (ELOOP, an OSError, from then on). Either way "not a file
+        # the runtime will read", never an exception for a caller to turn into a
+        # 500.
+        return None
+    return root_resolved, target

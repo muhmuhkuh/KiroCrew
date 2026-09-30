@@ -38,7 +38,7 @@ Rooted at `MD_NOTEBOOK_HOME`, defaulting to `~/.kiro/crew/workspace/md-notebook/
 | --- | --- |
 | `vaults.json` | Vault descriptors. No secrets, but `localPath` is what sync runs git against, so it is in `_SENSITIVE_HOME_DIRS`. Published through the staging directory + `os.replace`. |
 | `pat` | GitHub token, chmod 0600, never echoed back to the UI (only a boolean is). Also listed in `_SENSITIVE_HOME_DIRS`, so agent file tools cannot read it through the shared gate — 0600 alone does not isolate another process running as the same user. Cleared by writing an EMPTY file, never by `unlink`: the empty file is the reader's absent-equivalent, and removing the inode would delete the sandbox mask's mount target. |
-| `settings.json` | The `autoSync` authorization bit and the `lastSync` stamp. Published through the staging directory with `fsync`, so a rename from an unflushed page cache cannot discard an acknowledged toggle. |
+| `settings.json` | The `autoSync` authorization bit, `autoSyncMins` cadence, and `lastSync` stamps. Published through the staging directory with `fsync`, so a rename from an unflushed page cache cannot discard an acknowledged toggle. |
 | `../../md-notebook-staging/` | Write-staging directory for the three state files above, at the crew data home ROOT. Every state writer opens its temp HERE and renames onto the target, so no temp carrying PAT bytes ever lands at a name the sandbox masks do not cover. Masked as a whole directory. It is top-level rather than a child of this directory because a mask covers the leaf and not its ancestors: under the agent-writable `workspace/md-notebook` it could be renamed out from under its own mask. Same filesystem, so the publish rename stays atomic. |
 | `vaults/<id>/` | Vaults this app cloned itself. Attached vaults stay where the user has them. |
 
@@ -96,8 +96,9 @@ Two properties keep the mask meaningful now that the backend can create these fi
   between check and open would redirect the whole descent and the sweep would unlink inside
   a tree the agent chose. A root whose descent fails is skipped, not escalated to a spawn
   refusal — skipping removes the hazard, while refusing would break every spawn on a host
-  that merely symlinks its legacy home. Regular files only, sparing
-  another spawn's in-flight ceiling temp) and refuses the spawn if one cannot be removed.
+  that merely symlinks its legacy home. It removes regular files only, exempts
+  another spawn's `_CEILING_TEMP_PREFIX` in-flight temp, and refuses the spawn if an
+  eligible orphan cannot be removed.
   Unlike materialisation this runs on BOTH launch paths, Linux and macOS: a Seatbelt deny
   covers the named leaves, never an arbitrary `*.tmp` sibling, so an orphan would otherwise
   stay readable on macOS forever. A removal is logged as a security event — the token in
@@ -149,6 +150,7 @@ UI calls. All vault-scoped routes accept `?vault=<id>` and fall back to the firs
 | --- | --- |
 | `/health`, `/api/health` | `{ok, features[]}` — the capability probe |
 | `/api/vaults` | `{vaults[], hasPat, hasGhAuth}` |
+| `/api/settings` | `{settings: {autoSync, autoSyncMins, lastSync}}` — the backend-owned sync schedule |
 | `/api/notes` | `{notes[]}` with title, `modifiedAt`, `createdAt`, `syncStatus` |
 | `/api/note?path=` | `{path, content, mtime, meta, backlinks[]}` |
 | `/api/search?q=` | `{results[]}`; an empty query returns nothing, not everything |
@@ -162,6 +164,7 @@ UI calls. All vault-scoped routes accept `?vault=<id>` and fall back to the firs
 | `POST /api/vaults/attach` | Adopt an existing checkout, with or without a git remote (no remote → a `localOnly` vault); 409 if already attached; 403 if the folder resolves into a protected location OR contains one (e.g. the home directory — sync's `git add -A` from such a root would stage `~/.ssh`/`~/.aws` wholesale; checked list-based via `security.path_contains_sensitive`, no tree walk) |
 | `DELETE /api/vaults` | Forget the descriptor. FILES ARE NEVER DELETED. |
 | `PUT /api/vaults/knowledge` | Persist the knowledge flag and source id |
+| `PUT /api/settings` | Persist the complete auto-sync choice and interval |
 | `PUT /api/pat` | Store or clear the token |
 | `PUT /api/note` | Save, guarded by `baseMtime` |
 | `DELETE /api/note?path=` | Move a note into the vault's local `.trash` (never unlinked) |
@@ -170,16 +173,20 @@ UI calls. All vault-scoped routes accept `?vault=<id>` and fall back to the firs
 | `POST /api/note/move` | Move or rename; 409 rather than overwrite |
 | `POST /api/sync` | Commit, fetch, merge, push |
 | `POST /api/commit` | Commit to LOCAL history only — the periodic autosave. Never pushes, so it skips the remote-identity checks (`require_writable` and the trusted-gitdir check still apply) |
+| `POST /api/trash/open` | Reveal the selected vault's `.trash`; 501 when no file manager is supported |
 | `POST /api/pick-folder` | Native folder chooser; 501 when unsupported |
 
 ### Capability probe
 
 Both health routes return a `features` list: `createdAt`, `attach`, `changes`,
 `saveGuard`, `forget`, `pat`, `newNote`, `move`, `duplicate`, `trash`, `localOnly`,
-`autoCommit`, `trashOpen`, `knowledge`, `pickFolder`.
-The gateway keeps an app's backend alive across UI reloads, so a process running older code than
-the page would otherwise surface as confusing "no route" errors; the UI compares this list
-and names the missing capabilities instead. `trash` is listed even though it adds no route,
+`autoCommit`, `trashOpen`, `knowledge`, `pickFolder`, `settings`, `autoSyncLoop`.
+The gateway keeps an app's backend alive across UI reloads, so a process running older
+code than the page can otherwise surface as confusing "no route" errors. The UI compares
+only its `REQUIRED_FEATURES` subset and names missing entries. `settings` and
+`autoSyncLoop` are advertised by the backend but are not yet in that subset, so their
+absence does not currently trigger the stale-backend banner. `trash` is listed even though
+it adds no route,
 because the delete dialog's copy *promises* the note is recoverable — an older backend would
 hard-unlink while the UI said otherwise, so the capability has to be detectable.
 
@@ -268,8 +275,13 @@ The word "save" means three different things here, and only the last needs a but
    write), and it is silent by design: a tick with nothing pending makes no commit, touches
    no listing, and a failure raises no banner over the user's writing — an explicit sync
    reports errors normally.
-3. **The remote (push).** The Sync button, the sync shortcut, and auto-sync
-   (`LS.autoSync`, **default OFF**). This is the only layer that leaves the machine.
+3. **The remote (push).** The Sync button, the sync shortcut, and backend auto-sync
+   (`settings.json`'s `autoSync`, **default OFF**). `GET`/`PUT /api/settings` owns the
+   choice and its interval (10 minutes by default, clamped to 1–1440). `syncer.py`
+   re-reads that file every 20 seconds, keeps running with no Notes tab open, and
+   re-checks the opt-in before each writable vault. The unattended path stages only
+   markdown changes and keeps the same trusted-remote and trusted-gitdir checks as a
+   manual Sync. This is the only layer that leaves the machine.
 
 The row's `pending` badge belongs to layer 3, not layer 1: it is `git status`
 reporting the file differs from the last commit, so it appears AFTER the disk write
@@ -324,15 +336,17 @@ Git runs as the real `git` binary via `asyncio.create_subprocess_exec`, never a 
   ONLY thing keeping the trash — including a PRE-EXISTING Obsidian one in a freshly attached
   vault — out of history, since no git ignore rule is written for it. A scope-wide `add -A`
   would sweep it up and push notes the user deleted elsewhere.
-  `notes_only` (autosave) narrows the same list further, to `.md` only.
-* **Only the autosave truncates at `MAX_STAGED_PATHS` (500); an explicit Sync refuses.** The cap
-  exists so a first sweep over a large vault cannot build an argv past the OS limit, and for the
-  autosave the remainder is a delay rather than a loss — it pushes nothing, and the next tick
-  picks the rest up. A user-initiated Sync cannot truncate, because `status()` reports a rename
-  as **two** entries (old path deleted, new path added) and the slice sorts by path: a cutoff
-  falling between them would push the deletion half alone, so the note reads as deleted in every
-  other clone while the UI reported success. Sync therefore raises with the changed-file count
-  and tells the user the autosave is draining them.
+  `notes_only` (the local autosave and backend auto-sync) narrows the same list
+  further, to `.md` only. The autosave stops after the commit; backend auto-sync
+  continues through fetch, merge and push. A manual Sync keeps the full changed-path
+  list because the user chose that moment.
+* **Unattended notes-only runs truncate at `MAX_STAGED_PATHS` (500); an explicit Sync
+  refuses.** The cap keeps a large first sweep from building an argv past the OS limit.
+  The local autosave commits one batch without pushing; backend auto-sync currently commits
+  and pushes one batch, and the next cycle picks up the remainder. A user-initiated Sync
+  cannot truncate, because `status()` reports a rename as **two** entries (old path deleted,
+  new path added) and the sorted cutoff can fall between them. It therefore raises with the
+  changed-file count instead of reporting a partial manual sync as complete.
 * **Sync** commits pending work, fetches, and merges. On conflict the merge is ABORTED so
   the working tree keeps local content, and the result lists each conflicted path with both
   the local and remote versions. Nothing is overwritten.
@@ -364,13 +378,23 @@ CLI login (cached 300s, never written to disk).
 
 * Note paths resolve through `safe_join`, which rejects anything landing outside the vault
   root after symlink resolution (400).
-* **`.trash` is refused when it is a symlink at all** (`trash_dir_path`), not only when it
+* **`.trash` is refused when it is a symlink at all** (`reject_linked_trash`), not only when it
   escapes the vault. A clone can carry `.trash -> public`, whose target is *contained*, so the
   escape check passes — then `mkdir(exist_ok=True)` follows the link and the note lands at
   `public/One.md`, a path `status()` does not filter (it filters the `.trash/` prefix), so the
   next sync pushes the deleted note. `is_symlink()` (`lstat`) is the only test that sees this;
-  `exists()` and `is_dir()` both follow. Both the delete route and the reveal route go through
-  the same resolver.
+  `exists()` and `is_dir()` both follow. The delete route runs `reject_linked_trash` inside the
+  vault write lock, in the same worker thread as the move, so a refused delete never even
+  creates `.trash`; the reveal route resolves the trash directory through `trash_dir_path`.
+* **No note write follows an in-vault symlinked folder, even one a sync's merge swaps in
+  mid-request** (400 `folder_is_symlink`). Create, save, move and duplicate walk every
+  destination folder component with `lstat` (`reject_linked_folder_component`) and then resolve
+  the destination directory — both steps under a per-vault `vault_write_lock`, in the same
+  worker thread as the write, so a `git merge` that replaces a real directory with a symlink
+  into `.git` (or another tracked folder) cannot land between the check and the write, and the
+  write can never aim at a link target resolved before the lock. All three `git_ops.sync`
+  callers hold the same lock for their whole run, so a sync's tree-rewriting merge and a note
+  write never overlap.
 * **Containment is not sufficient, so every caller-supplied path also passes
   `require_note_path()`** (`require_folder_path()` for the new-note `folder`): each component
   must be undotted and the file must end in `.md`. A vault holds far more than notes, and
@@ -478,6 +502,14 @@ Delete is the one destructive row action, and it is staged rather than immediate
 `test/test_md_notebook.py` drives the aiohttp app through a signed test client, so the
 proxy-HMAC middleware is exercised on every call rather than bypassed. Coverage includes
 the save guard, path traversal, unique note naming, duplicate-note naming and containment,
-move-without-overwrite, external-change
-detection, self-write suppression, token file permissions, the knowledge flag round-trip,
-and a real sync against git fixtures including the conflict path.
+move-without-overwrite, external-change detection, self-write suppression, token file
+permissions, the knowledge flag round-trip, and a real sync against git fixtures including
+the conflict path. `test/test_md_notebook_git_ops.py` pins Git subprocess lifecycle,
+`test/test_sandbox_md_notebook_carveout.py` pins the state-file carve-out and orphan sweep,
+and `src/kiro_crew/apps/builtins/md_notebook/tests/test_md_notebook_windows.py` covers the
+native Windows branches. All are collected because `setup.cfg` includes both `test` and
+`src/kiro_crew/apps/builtins` in `testpaths`.
+
+Frontend coverage lives in `website/src/test/Frontend5MdNotebook.cov80.test.tsx`,
+`MdNotebookApiCoverage.test.tsx`, `MdNotebookPage.coverage.test.tsx`, and
+`MdNotebookPageCoverage.test.tsx`.

@@ -21,6 +21,7 @@ vi.mock('framer-motion', async (importOriginal) => {
 vi.mock('../api/client', async importOriginal => ({
   ...await importOriginal<typeof import('../api/client')>(),
   api: {
+    monitorForSlot: vi.fn(),
     monitorCreate: vi.fn(),
     monitorUpdate: vi.fn(),
     monitorStop: vi.fn(),
@@ -95,6 +96,13 @@ describe('SessionAutomationPopover', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     framerMocks.reducedMotion = false
+    /* The bounded view reads the live runtime ceiling off the per-slot monitor
+       read. Default it to the contract's absolute maximum so the existing
+       bound assertions keep describing the contract; the ceiling tests below
+       override it per case. */
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: 2_592_000,
+    })
   })
 
   afterEach(() => {
@@ -443,7 +451,7 @@ describe('SessionAutomationPopover', () => {
 
   it.each([
     ['Probe cadence in seconds', '86401', 'Enter a whole number from 15 to 86,400.'],
-    ['Maximum runtime in seconds', '604801', 'Enter a whole number from 1 to 604,800.'],
+    ['Maximum runtime in seconds', '604801', 'Enter a whole number from 1 to 604,800 (7 days).'],
     ['Maximum agent turns', '9', 'Enter a whole number from 1 to 8.'],
     ['Maximum tokens', '1000001', 'Enter a whole number from 1 to 1,000,000.'],
     ['Maximum provider errors', '21', 'Enter a whole number from 1 to 20.'],
@@ -457,6 +465,153 @@ describe('SessionAutomationPopover', () => {
 
     expect(await screen.findByText(message)).toBeInTheDocument()
     expect(api.monitorCreate).not.toHaveBeenCalled()
+  })
+
+  it('bounds the runtime input by the live operator ceiling, not the contract maximum', async () => {
+    /* A default install's server enforces `monitoring.max_runtime_secs`
+       (seven days) while contract.json advertises the 30-day absolute maximum.
+       Validating against the contract alone lets a value through that can only
+       fail after submit as an HTTP 400; the popover must refuse it inline. */
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: 604_800,
+    })
+    renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', '604800'))
+    expect(api.monitorForSlot).toHaveBeenCalledWith('chat-1')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.change(runtime, { target: { value: '604801' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    expect(await screen.findByText('Enter a whole number from 1 to 604,800 (7 days).')).toBeInTheDocument()
+    expect(api.monitorCreate).not.toHaveBeenCalled()
+  })
+
+  it('accepts a runtime the raised operator ceiling permits', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: 2_592_000,
+    })
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, monitor: {} })
+    renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', '2592000'))
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.change(runtime, { target: { value: '2592000' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    await waitFor(() => expect(api.monitorCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ max_runtime_secs: 2_592_000 }),
+    ))
+  })
+
+  it.each([
+    [2_592_000, '2592001', 'Enter a whole number from 1 to 2,592,000 (30 days).'],
+    [5_400, '5401', 'Enter a whole number from 1 to 5,400 (90 minutes).'],
+    [90, '91', 'Enter a whole number from 1 to 90 (90 seconds).'],
+  ])('glosses the runtime ceiling %s with the largest unit that divides it exactly', async (ceiling, value, message) => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: ceiling,
+    })
+    renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', String(ceiling)))
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.change(runtime, { target: { value } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    expect(api.monitorCreate).not.toHaveBeenCalled()
+  })
+
+  it('uses the shipped runtime ceiling while the live ceiling read is pending', () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockReturnValue(new Promise(() => {}))
+    renderPopover(null)
+
+    expect(screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' }))
+      .toHaveAttribute('max', '604800')
+  })
+
+  it('keeps the shipped runtime ceiling and renders the read failure', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('offline'))
+    renderPopover(null)
+
+    const notice = await screen.findByTestId('monitor-read-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice).toHaveTextContent(
+      "Couldn't load this session's monitor state. Retry loading before starting a monitor.",
+    )
+    expect(screen.queryByRole('button', { name: /ask.*agent/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry loading' })).toBeEnabled()
+    expect(screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' }))
+      .toHaveAttribute('max', '604800')
+  })
+
+  it('does not stack the ceiling read failure under a rejected request', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('offline'))
+    vi.mocked(api.monitorCreate).mockRejectedValueOnce(new Error('offline'))
+    renderPopover(null)
+    expect(await screen.findByTestId('monitor-read-error')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/acme/widgets/pull/42' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    await waitFor(() => {
+      const alerts = screen.getAllByRole('alert')
+      expect(alerts).toHaveLength(1)
+      expect(alerts[0]).toHaveTextContent('The monitor request failed. Try again.')
+    })
+    expect(screen.queryByTestId('monitor-read-error')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Retry loading' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Start monitor' })).toBeEnabled()
+  })
+
+  it('renders one notice when the snapshot and the ceiling read fail together and retries both', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue({ enabled: true, monitor: null, max_runtime_ceiling_secs: 604_800 })
+    const readSnapshot = vi.fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue(null)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    function SnapshotEditor() {
+      const snapshot = useQuery({ queryKey: ['session-automation', 'chat-1'], queryFn: readSnapshot })
+      return <SessionAutomationPopover
+        slotKey="chat-1" automation={null} open onOpenChange={() => {}} onChange={() => {}}
+        creationReady={snapshot.isSuccess && !snapshot.isFetching} snapshotFailed={snapshot.isError}
+      />
+    }
+    const view = render(<QueryClientProvider client={client}><SnapshotEditor /></QueryClientProvider>)
+    enterBoundedView()
+
+    await waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(api.monitorForSlot).toHaveBeenCalledTimes(1))
+    const retry = await screen.findByRole('button', { name: 'Retry loading' })
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'Retry loading' })).toHaveLength(1)
+
+    fireEvent.click(retry)
+    await waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(api.monitorForSlot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(screen.queryByRole('button', { name: 'Retry loading' })).toBeNull()
+    view.unmount()
+    client.clear()
+  })
+
+  it('does not read the runtime ceiling for the goal-loop view', () => {
+    renderPopover(activeLegacyLoop)
+    expect(api.monitorForSlot).not.toHaveBeenCalled()
   })
 
   it('exposes exact input bounds and rejects oversized wake instructions inline', async () => {
@@ -1046,5 +1201,122 @@ describe('SessionAutomationPopover', () => {
 
     expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Watch a pull request instead' })).not.toBeInTheDocument()
+  })
+
+  /* THE JUDGE LINE, mounted the way the dashboard mounts it.
+     The row below is `GET /api/autonudge` output in the wire's own spelling, and it
+     is parsed by the real normalizer rather than written as a record, because the
+     three hops between the endpoint and the line each name their fields: the
+     publisher's keys, this record's, and the adapter's. A test that hands the
+     popover a loop object directly agrees with the reader about every name and
+     still passes while a middle hop carries none of them -- and a dropped judge is
+     silent on screen, because "this loop has no judge" is the honest reading for
+     most loops and renders nothing. So the assertion has to start at the wire. */
+  const judgeLoopRow = (judge: Record<string, unknown>) => ({
+    id: 'legacy-judge', slot_key: 'chat-1', message: 'Keep checking.',
+    idle_secs: 300, max_cycles: 24, cycle_count: 2, active: true,
+    last_fire_ts: 1_800_000_000, next_due_ts: 1_900_000_000, stopped_reason: '',
+    ...judge,
+  })
+
+  it('renders the judge line from a GET row, criterion and verdict both', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 'a reviewer asks for changes', quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 2, at: 1_800_000_500 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('Judge: wake when a reviewer asks for changes')
+    expect(line).toHaveTextContent('quiet')
+    expect(line).toHaveTextContent('2 items')
+  })
+
+  it('renders the judge line with no verdict yet when the judge has not answered', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: '', quiet_when: 'the build is still running', targets: [] },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    // The LABEL as well as the criterion. A quiet-only brief under the wake label
+    // states the inverse of what the owner armed, and an assertion on the criterion
+    // alone passes either way, because the criterion travels either way.
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('Judge: stay quiet while the build is still running')
+    expect(line).not.toHaveTextContent('wake when')
+    expect(line).toHaveTextContent('no verdict yet')
+  })
+
+  it('renders a verdict with no timestamp without a dangling separator', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 'a reviewer asks for changes', quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 2, at: 0 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('2 items')
+    expect(line.textContent?.trimEnd().endsWith('·')).toBe(false)
+  })
+
+  it('carries a criterion at the arming bound in full, styled as its sibling rows', () => {
+    // The arming surface refuses anything past MAX_JUDGE_CRITERION_CHARS (500), so a
+    // criterion this long is the widest the render can ever be handed. It is shown
+    // whole rather than clipped: the owner reads back exactly the prose they armed,
+    // and the row carries its siblings' type contract so a long brief grows the
+    // popover the way every other wrapping row in it does.
+    const criterion = 'w'.repeat(500)
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: criterion, quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 1, at: 1_800_000_500 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line.textContent).toContain(criterion)
+    expect(line).toHaveTextContent('quiet')
+    expect(line.className).toContain('text-[11px]')
+    // This criterion is 500 characters with NO space in it, which is the input that
+    // makes the difference between wrapping and overflowing: without a break rule the
+    // row runs off the popover horizontally instead of growing it. A rendered capture
+    // of this exact case is attached to the pull request.
+    expect(line.className).toContain('break-words')
+  })
+
+  it('draws no judge line for a loop whose row carries a cleared brief', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({ judge: {} }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
+    expect(screen.queryByTestId('judge-line')).not.toBeInTheDocument()
+  })
+
+  it('keeps a malformed judge inert rather than throwing inside the render', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 42, quiet_when: null, targets: ['ok', 7] },
+      judge_last_verdict: { outcome: {}, evidence_items: -1, at: 'now' },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
+    expect(screen.queryByTestId('judge-line')).not.toBeInTheDocument()
+  })
+
+  it('falls back to the shipped ceiling when a refetch fails after a raised ceiling', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        enabled: true, monitor: null, max_runtime_ceiling_secs: 2_592_000,
+      })
+      .mockRejectedValueOnce(new Error('offline'))
+    const { client } = renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', '2592000'))
+
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['monitor-runtime-ceiling', 'chat-1'] })
+    })
+
+    expect(await screen.findByTestId('monitor-read-error')).toHaveAttribute('role', 'alert')
+    expect(runtime).toHaveAttribute('max', '604800')
   })
 })

@@ -448,6 +448,26 @@ async def run_git(
         # into an unbounded wait for a surviving helper's EOF.
         await platform_compat.kill_and_reap(proc)
         raise GitError(f"git {args[0]} timed out after {timeout}s") from None
+    except asyncio.CancelledError:
+        # Shutdown cancels the background syncer mid-``sync`` (see
+        # ``syncer.stop_syncer``), and this child is deliberately session-
+        # detached, so a bare re-raise would leave a ``git merge`` still
+        # rewriting the working tree AFTER ``vault_write_lock`` releases —
+        # restarted note writers would then overlap an orphaned merge and
+        # corrupt the tree/index. Kill and reap the whole isolated tree BEFORE
+        # propagating. The reap runs as a shielded task and is awaited to
+        # completion even if this frame is cancelled again mid-cleanup, so a
+        # second cancellation cannot re-orphan the child; then the original
+        # cancellation is propagated.
+        reap = asyncio.ensure_future(platform_compat.kill_and_reap(proc))
+        while not reap.done():
+            try:
+                await asyncio.shield(reap)
+            except asyncio.CancelledError:
+                # Re-cancelled while reaping — keep waiting for the reap itself,
+                # which is bounded by its own timeout, rather than abandoning it.
+                continue
+        raise
     stdout = out.decode("utf-8", errors)
     stderr = err.decode("utf-8", "replace")
     if check and proc.returncode != 0:
@@ -563,7 +583,13 @@ async def clone_vault(
         validate_remote_url(url),
         dir_,
     ]
-    await run_git(args, pat=pat, timeout=GIT_NETWORK_TIMEOUT_SEC)
+    # The one git call in this module with no repository to run inside yet, so it
+    # is pinned to the clone's parent instead of inheriting the gateway's cwd:
+    # ``dir_`` is absolute and git creates the leaf itself, so the parent is the
+    # only directory the command needs to exist.
+    parent = os.path.dirname(os.path.abspath(dir_))
+    await asyncio.to_thread(os.makedirs, parent, exist_ok=True)
+    await run_git(args, cwd=parent, pat=pat, timeout=GIT_NETWORK_TIMEOUT_SEC)
     vault: dict[str, Any] = {
         "id": vault_id,
         "name": name or repo_name(url),

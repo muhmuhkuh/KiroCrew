@@ -21,9 +21,7 @@ import hashlib
 import json
 import logging
 import os
-import shutil
 import socket
-import tempfile
 import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -32,7 +30,6 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from dashboard_owner_helpers import as_owner
-from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew.browser_cli import launcher
 
@@ -762,18 +759,18 @@ class TestReveal:
         assert "does not expose" in messages[1]
 
     @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets only")
-    def test_sends_one_reveal_line_to_the_running_dashboard(self, request: pytest.FixtureRequest):
-        # An AF_UNIX sun_path is capped at ~104 bytes, so the socket must live
-        # under a SHORT base. short_tmp_base() pins that to /tmp on POSIX
-        # regardless of TMPDIR: the conftest's redirected tempfile base (and
-        # pytest's own tmp_path) can themselves be long enough to overflow
-        # sun_path when the run's TMPDIR is deep, which makes bind() fail.
-        root = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "pw-", dir=short_tmp_base()))
-        # Strict cleanup, registered the moment the directory exists: a socket
-        # file left behind would be a real leak, not one to ignore.
-        request.addfinalizer(lambda: shutil.rmtree(root))
-        (root / "dashboard").mkdir(parents=True)
-        sock_path = str(root / "dashboard" / "app.sock")
+    def test_sends_one_reveal_line_to_the_running_dashboard(
+        self, short_sock_dir: Path, request: pytest.FixtureRequest
+    ):
+        # An AF_UNIX sun_path is capped at ~104 bytes, and that cap is on the
+        # STRING handed to bind()/connect(). Production hands ``_reveal`` an
+        # ABSOLUTE root -- the gateway's socket root under the data home -- so
+        # the test does the same, from the suite's run-owned short root
+        # (``short_sock_dir``), rather than pinning the CWD and connecting to a
+        # cwd-relative ``./dashboard/app.sock`` that no production caller ever
+        # spells. Nothing is written outside the run's own roots.
+        (short_sock_dir / "dashboard").mkdir(parents=True)
+        sock_path = os.path.join(str(short_sock_dir), "dashboard", "app.sock")
         received: list[bytes] = []
         serve_error: list[BaseException] = []
         ready = threading.Event()
@@ -801,7 +798,12 @@ class TestReveal:
         # Joined unconditionally: a failed reveal must not leave the listener blocked in accept().
         request.addfinalizer(lambda: thread.join(6))
         assert ready.wait(5), f"listener never became ready: {serve_error}"
-        assert REAL_REVEAL("panel-0a1b2c-1234abcd", {launcher.SOCKETS_ENV: str(root)}) is True
+        # The listener's endpoint landed under the run's short root, not a host root.
+        assert Path(sock_path).is_socket()
+        assert (
+            REAL_REVEAL("panel-0a1b2c-1234abcd", {launcher.SOCKETS_ENV: str(short_sock_dir)})
+            is True
+        )
         thread.join(5)
         assert json.loads(received[0].decode().strip()) == {"sessionName": "panel-0a1b2c-1234abcd"}
 

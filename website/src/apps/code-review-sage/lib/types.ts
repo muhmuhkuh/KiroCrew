@@ -238,22 +238,24 @@ export interface UserReposResponse {
 }
 
 export interface RepoPr {
- url: string;
- number: number;
- title: string;
- head_sha: string;
- author?: string;
- updated_at?: string;
- draft?: boolean;
- change_id: string;
- reviewed: boolean;
- reviewed_stale: boolean;
- reviewed_at?: string;
- /** GitHub label names, in GitHub's order. Optional here and not on the wire:
-  *  the backend always sends a list, but a response cached by an older build
-  *  (`lib/persist.ts` keeps a 24h snapshot) predates the field, so a reader
-  *  must tolerate its absence. */
- labels?: string[];
+  url: string
+  number: number
+  title: string
+  head_sha: string
+  author?: string
+  updated_at?: string
+  draft?: boolean
+  change_id: string
+  reviewed: boolean
+  reviewed_stale: boolean
+  reviewed_at?: string
+  /** GitHub label names, in GitHub's order. Optional here and not on the wire:
+   *  the backend always sends a list, but a response cached by an older build
+   *  (`lib/persist.ts` keeps a 24h snapshot) predates the field, so a reader
+   *  must tolerate its absence. */
+  labels?: string[]
+  /** `owner/name`; set only on review-queue rows, which span repos. */
+  repo?: string
 }
 
 /** The minimum needed to open a PR in the detail pane.
@@ -272,6 +274,13 @@ export interface PrRef {
  draft?: boolean;
  reviewed?: boolean;
  reviewed_stale?: boolean;
+}
+
+/** The "awaiting my review" queue: `RepoPr` rows spanning many repos. */
+export interface ReviewQueueResponse {
+  prs: RepoPr[]
+  truncated?: boolean
+  setup_required?: boolean
 }
 
 export interface RepoPrsResponse {
@@ -353,8 +362,8 @@ export interface LearningsResponse {
 
 export type MainView = "reviews" | "learning" | "settings";
 /** Which list the middle column shows: the active repo's PRs, or the threads. */
-export type ListTab = "pulls" | "reviews";
-export type RailSection = "repos" | "reviews" | "learning" | "settings";
+export type ListTab = 'pulls' | 'reviews' | 'queue'
+export type RailSection = 'repos' | 'reviews' | 'learning' | 'settings'
 
 // --- Follow-up sessions ------------------------------------------------------
 

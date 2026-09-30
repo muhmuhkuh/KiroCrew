@@ -239,8 +239,8 @@ class CodexHarness(MembershipHarness):
 
         codex-acp takes no argv of its own: any invocation enters stdio-server mode
         and blocks on stdin. So there is no ``--agent`` (the adapter reads no
-        ``~/.kiro/agents/<name>.json``; the session's whole MCP surface arrives in
-        the ``session/new`` array instead) and no ``--model`` (the model is chosen
+        ``~/.kiro/agents/<name>.json``; everything Crew mounts on the session
+        arrives in the ``session/new`` array instead) and no ``--model`` (the model is chosen
         per session over ``session/set_config_option``, so pinning one at process
         start would apply it to every session on this process).
 
@@ -327,6 +327,10 @@ class CodexHarness(MembershipHarness):
         from kiro_crew.config import loader as loader_mod
 
         loader_mod.strip_kiro_cli_api_key(env)
+        # codex-acp otherwise drops session entries whose names occur in global
+        # config. That keeps an unbound global dashboard server in place of the
+        # gateway's verified mount, on both session/new and session/load.
+        env["DISABLE_MCP_CONFIG_FILTERING"] = "true"
 
     @property
     def verifies_agent_activation(self) -> bool:
@@ -356,6 +360,7 @@ class CodexHarness(MembershipHarness):
         work_dir: str | Path | None,
         mcp_gateway_overlay: Any = None,
         member_dispatch: bool = False,
+        crew_panel: bool = False,
         session_key: str = "",
     ) -> SessionExtras:
         """Empty. codex has no custom-agent channel to register anything on.

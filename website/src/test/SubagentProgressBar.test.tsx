@@ -360,3 +360,48 @@ describe('SubagentProgressBar — collapse toggle', () => {
     expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
   })
 })
+
+describe('SubagentProgressBar — why the queued agents wait', () => {
+  it('renders the deferral sentence as visible text, not only in the tooltip', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1, reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }))
+    renderBar(store)
+    const line = screen.getByTestId('subagent-wait-reason')
+    expect(line.textContent).toContain('free up memory to continue')
+    expect(line.className).toContain('text-warn')
+    expect(screen.getByTestId('subagent-queued-count').getAttribute('title')).toBe(line.textContent)
+  })
+
+  it('renders no extra line for a bare count (older gateway) or the capacity wait', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 2 }))
+    renderBar(store)
+    expect(screen.queryByTestId('subagent-wait-reason')).toBeNull()
+    expect(screen.getByTestId('subagent-queued-count').getAttribute('title'))
+      .toBe('Waiting to start — queued behind the concurrency limit')
+  })
+})
+
+describe('SubagentProgressBar — expand renders no empty body', () => {
+  beforeEach(() => { vi.clearAllMocks(); try { localStorage.clear() } catch { /* not available in this env */ } })
+
+  it('renders no rows body when the chip is mounted only on a queued count', () => {
+    // The second bug in the report: expanding the chip while running===0 (only a
+    // queued tally) added vertical whitespace with nothing in it, because the
+    // rows body carried its px-3 pb-2 padding around an empty list. There must be
+    // no such body — the header (count + Stop all) stands alone.
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1 }))
+    renderBar(store)
+    // Header is present…
+    expect(screen.getByTestId('subagent-queued-count')).toBeInTheDocument()
+    // …but no row exists and no empty padded body is rendered.
+    expect(screen.queryAllByTestId('subagent-row')).toHaveLength(0)
+    expect(screen.queryByTestId('subagent-overflow-row')).toBeNull()
+  })
+
+  it('still renders the rows body when there is a running agent to show', () => {
+    renderBar(makeStore(['a1']))
+    expect(screen.getAllByTestId('subagent-row')).toHaveLength(1)
+  })
+})

@@ -369,6 +369,7 @@ class HarnessAdapter(abc.ABC):
         work_dir: str | Path | None,
         mcp_gateway_overlay: Any = None,
         member_dispatch: bool = False,
+        crew_panel: bool = False,
         session_key: str = "",
     ) -> SessionExtras:
         """Per-session payload for this host, for both session start paths.
@@ -379,6 +380,16 @@ class HarnessAdapter(abc.ABC):
         shadow the keyed one. Empty extras is the normal answer for a host that
         took its agent at spawn time.
         """
+
+    def record_session_projection(self, handle: Any, custom_agents: Any, active_agent: str) -> None:
+        """Record on a new or resumed session's *handle* what its agent batch grants.
+
+        For a host whose PreToolUse hooks Crew runs at the permission request, so
+        the turn loop can tell when that batch auto-approves a call a hook covers.
+        A host that took its agent at spawn time registers no batch and records
+        nothing, which is this default: its handle keeps the declared defaults.
+        """
+        return None
 
     @abc.abstractmethod
     def session_mcp_servers(
@@ -405,6 +416,19 @@ class HarnessAdapter(abc.ABC):
         unchanged, which is what keeps its wire byte-identical.
         """
 
+    def activation_refusal(self, agent: str, resp: dict[str, Any]) -> str | None:
+        """Why *agent* must NOT be activated on the session *resp* just opened, or ``None``.
+
+        Read after ``session/new`` / ``session/load`` and before ``set_mode``,
+        on every host, as a seam rather than a backend test (harness-parity
+        H13): the shared runtime asks, and a host that took its agent at spawn
+        time has nothing on the wire to judge, so this base answer is ``None``
+        and the Kiro path gains no branch. A wire-registered host overrides it
+        to read what the engine did with the definition it was sent. The string
+        returned is the user-facing refusal, ready to raise as-is.
+        """
+        return None
+
     # ── Seam 4: inbound requests the host answers ──
 
     @property
@@ -423,6 +447,16 @@ class HarnessAdapter(abc.ABC):
         Raise ``HostAuthCallbackError`` (or any exception the runtime maps to a
         JSON-RPC error) rather than returning a partial result: a host left
         hanging on a callback is worse than one told its credential expired.
+        """
+
+    @property
+    @abc.abstractmethod
+    def opens_external_urls(self) -> bool:
+        """This host sends ``_kiro/openExternalUrl`` for an MCP sign-in.
+
+        When true the reader loop answers that request and hands the URL to the
+        session whose sign-in the runtime started, as an ordinary OAuth request
+        frame. When false the request is answered -32601 and no sign-in starts.
         """
 
     # ── Seam 5: notification aliases ──

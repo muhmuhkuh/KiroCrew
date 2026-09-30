@@ -38,6 +38,7 @@ const {
   openPetWindow,
   closePetWindow,
   petWindowCount,
+  rearmBlankedCompanionWindows,
   setOverlayLogger,
   setOverlayTarget,
   registerOverlayIpc,
@@ -50,7 +51,7 @@ const APP_NAME = "crew-companion";
 const TICK_MS = 5_000
 
 let backendUrl = "";
-let fetchLocalToken = null;
+let mintLocalToken = null;
 let log = () => {};
 let timer = null;
 let reconciling = false;
@@ -88,7 +89,7 @@ let cachedToken = "";
 async function tokenForProbe(forceMint) {
   if (!forceMint && cachedToken) return cachedToken;
   try {
-    cachedToken = (fetchLocalToken && (await fetchLocalToken())) || "";
+    cachedToken = (mintLocalToken && (await mintLocalToken())) || "";
   } catch {
     cachedToken = "";
   }
@@ -214,11 +215,11 @@ function showsForeignOrigin(wc) {
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   if (!backendUrl) return true; // a web page with no backend to compare against
-  try {
-    return url.origin !== new URL(backendUrl).origin;
-  } catch {
-    return true;
-  }
+  // Same rule as the routing check above, and the same rule the mint dials by, so
+  // a window this app opened at the minted origin is never read as foreign while
+  // the configured URL still spells the host `localhost`. A v6 spelling is NOT
+  // covered: that is a different listener.
+  return url.origin !== new URL(backendUrl).origin;
 }
 
 /**
@@ -289,7 +290,7 @@ async function reconcileOnce() {
   if (reconciling) return;
   reconciling = true;
   try {
-    let token = await tokenForProbe(false);
+    const token = await tokenForProbe(false);
     if (!token) {
       // No credential means we cannot ask, which is unknown — not disabled.
       return;
@@ -305,12 +306,12 @@ async function reconcileOnce() {
       // is left as unknown rather than retried in a loop, so a genuinely broken
       // credential path cannot turn this poll back into a mint-per-tick.
       cachedToken = "";
-      token = await tokenForProbe(true);
-      if (!token) return;
-      setOverlayTarget(backendUrl, token);
-      setPanelTarget(backendUrl, token);
-      setGalleryTarget(backendUrl, token);
-      state = await probeEnabled(token);
+      const reminted = await tokenForProbe(true);
+      if (!reminted) return;
+      setOverlayTarget(backendUrl, reminted);
+      setPanelTarget(backendUrl, reminted);
+      setGalleryTarget(backendUrl, reminted);
+      state = await probeEnabled(reminted);
       if (state === "unauthorized") {
         cachedToken = "";
         return;
@@ -336,6 +337,17 @@ async function reconcileOnce() {
       openPetWindow();
       log("crew-companion: enabled — overlays opened");
     }
+    // A display overlay or hidden notification owner latched on an error document
+    // is reloaded here and nowhere else: this tick's probe was just answered with
+    // the credential set above, so the reload carries one the gateway accepts,
+    // and a reload per 5s tick is the whole retry budget. "unknown" returned
+    // before this line on purpose — a gateway that cannot answer the probe cannot
+    // serve the page either. Freshly opened windows are still loading and have
+    // nothing latched, so this is a no-op right after openPetWindow.
+    const rearmed = rearmBlankedCompanionWindows();
+    if (rearmed > 0) {
+      log(`crew-companion: re-armed ${rearmed} window(s) hidden on an error document`);
+    }
   } finally {
     reconciling = false;
   }
@@ -344,12 +356,14 @@ async function reconcileOnce() {
 /**
  * Start following the app's enabled state.
  *
- * @param {{backendUrl: string, fetchLocalToken: () => Promise<string>, glog: (m: string) => void,
+ * @param {{backendUrl: string,
+ *   mintLocalToken: () => Promise<string>,
+ *   glog: (m: string) => void,
  *   getDashboardWindow?: () => (object | null)}} deps
  */
 function initCrewCompanion(deps) {
   backendUrl = (deps && deps.backendUrl) || "";
-  fetchLocalToken = deps && deps.fetchLocalToken;
+  mintLocalToken = deps && deps.mintLocalToken;
   log = (deps && deps.glog) || (() => {});
   getDashboardWindow = (deps && deps.getDashboardWindow) || null;
   setOverlayLogger(log);
@@ -439,7 +453,7 @@ function shutdownCrewCompanion() {
   }
   // Drop the reused credential with the poll that reused it, so a later
   // initCrewCompanion starts from a fresh mint instead of a token that may have
-  // been minted against a gateway that is no longer the one we will talk to.
+  // been minted against a gateway other than the one we will talk to.
   cachedToken = "";
   stopHitboxPoll();
   closePetWindow();

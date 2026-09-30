@@ -15,8 +15,9 @@ stopped request.
 
 `voice_reply.resolve_system_tts()` returns `(engine, binary)` for the host:
 `say` on macOS, `sapi` (Windows PowerShell 5.1 driving `System.Speech`) on
-Windows, `espeak-ng` on everything else when it is installed. Resolution goes
-through `platform_compat.trusted_system_bin`, not `PATH`, so a shim in an
+Windows, and `espeak-ng` on other platforms, with the legacy `espeak` binary
+accepted as a fallback under the same engine identity. Resolution goes through
+`platform_compat.trusted_system_bin`, not `PATH`, so a shim in an
 agent-writable directory cannot be handed LLM text. Linux is the one platform
 where the answer can be `None` — a stock Ubuntu Desktop ships the espeak-ng
 library and data but not the CLI — and that is reported as unavailable rather
@@ -135,17 +136,19 @@ Telegram and dashboard paths. Three rules:
 | Voice endpoints | `dashboard.chat_voice.api_voice_config()`, `api_voice_synthesize()`, `api_voice_cancel()`, `api_voice_voices()`, and `api_voice_system_voices()` | Read and persist configuration, synthesize and interrupt dashboard speech, and return the Polly and built-in-engine catalogues. |
 | Provider implementation | `voice_reply.synthesize_speech()`, `streaming_piper_reply()`, `streaming_voice_reply()`, and `stitch_mp3s()` | Redacts text, selects a provider, streams local PCM, and joins completed Polly chunks. |
 | Resident local voice | `piper_runtime.PiperRuntime`, `piper_worker.serve()` | Owns one sandboxed Piper model and serial framed requests, with cancellation, idle, model-change, and shutdown cleanup. |
-| Streaming playback | `website/src/hooks/useWebSocket.ts`, `website/src/lib/voicePlayback.ts` | Detects speech boundaries, coalesces pending requests, schedules PCM on one audio clock, and handles interruption. |
+| Streaming playback | `website/src/hooks/websocket/voicePlayback.ts`, `website/src/lib/voicePlayback.ts` | Detects speech boundaries, coalesces pending requests, schedules PCM on one audio clock, and handles interruption. `website/src/hooks/useWebSocket.ts` composes it and routes the `voice_*` frames and the stream and turn boundaries to it. |
 | Playback failures | `website/src/components/VoicePlaybackNotice.tsx` | Displays localized playback or provider failures and retains their machine code in the error report. |
 | Settings | `website/src/pages/settings/VoicePanel.tsx` | Updates auto-speak, provider, and the selected provider's settings; fetches each provider's voice catalogue only while that provider is selected. |
 | Slack reply | `slack.handler.handle_message()` and `_safe_voice_reply()` | Starts a background provider-aware voice reply when thread, global, or voice-input settings allow it. |
 
 ## Dashboard auto-speak
 
-`useWebSocket` buffers `chat_chunk` text and, after it updates the Redux
-streaming message, scans the active slot for completed sentence boundaries. It
-submits only text beyond `voiceProgressRef.spokenLen` through
-`enqueueVoiceSynthesis()`. The progress record is keyed by slot and message
+The socket's chat-stream buffer (`website/src/hooks/websocket/streamBuffers.ts`)
+batches `chat_chunk` text and, after it updates the Redux streaming message,
+hands the active slot to the playback owner
+(`website/src/hooks/websocket/voicePlayback.ts`), which scans it for completed
+sentence boundaries. It submits only text beyond `voiceProgressRef.spokenLen`
+through `enqueueVoiceSynthesis()`. The progress record is keyed by slot and message
 identity: this prevents an old segment or a background slot from replaying text
 or resetting the active response.
 
@@ -334,7 +337,8 @@ before any audio has started. `useVoiceInput` also dispatches it when an actual
 batch or streaming recording starts, before microphone acquisition, so the
 recognizer does not capture ongoing synthesized speech. Hover prewarming does
 not interrupt playback. Clicking Read aloud while audio plays stops it.
-`useWebSocket` maps the event to `stopVoice()`, which stops scheduled PCM sources,
+The playback owner (`website/src/hooks/websocket/voicePlayback.ts`) maps the
+event to `stopVoice()`, which stops scheduled PCM sources,
 pauses an active media element, revokes queued blob URLs, invalidates pending
 decodes and synthesis requests, and sets `voiceMutedRef`.
 
@@ -412,13 +416,15 @@ spawning the AWS CLI. It returns no audio when consent is absent, which lets its
 callers retain their text response rather than spending through an unattended
 path.
 
-`_synthesize_polly()`, `_synthesize_piper()`, and `streaming_piper_reply()` run their commands through
-`wrap_argv_async(..., _prepare=wrap_argv)` and catch
-`SandboxUnavailableError` separately from provider failures. They log the
-sandbox error kind and its own message, then **re-raise**. The distinction is
-load-bearing because only the sandbox layer can distinguish a missing backend
-from transient pressure or an existing outer sandbox, and therefore provides the
-applicable remedy.
+`_synthesize_polly()` and `streaming_piper_reply()` run their commands through
+`wrap_argv_async(..., _prepare=wrap_argv)`. `_synthesize_piper()` instead delegates
+to `_run_tts_subprocess()`, which uses `sandboxed_spawn_argv_async()` and the
+credential-scrubbed child environment. Those chokepoints catch
+`SandboxUnavailableError` separately from provider failures, log the sandbox
+error kind and its own message, then **re-raise**. The distinction is load-bearing
+because only the sandbox layer can distinguish a missing backend from transient
+pressure or an existing outer sandbox, and therefore provides the applicable
+remedy.
 
 Re-raising rather than returning `None` is what lets that remedy reach a person.
 A refusal collapsed into the generic "no audio" result is indistinguishable from

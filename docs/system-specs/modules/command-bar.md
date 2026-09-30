@@ -26,16 +26,24 @@ write that flips `enabled`), is what delivers the launcher to them; see app-kit-
 What makes the app worth existing is a single invariant: **the first page issues no network
 request.** The palette it replaces ran an unindexed scan over the sessions corpus on every
 keystroke, so fast typing could stall unrelated streaming. Command Bar's root carries only
-locally-known rows — commands, app destinations, system settings — and every corpus search is a
-view the reader ENTERS, so the expensive work is explicit and chosen.
+locally-known rows — sessions awaiting a user decision, commands, app destinations, and system
+settings — and every corpus search is a view the reader ENTERS, so the expensive work is explicit
+and chosen.
 
-Three such views exist: session search, artifact search, and folder search. The artifacts view
+Four such views exist: session search, artifact search, folder search, and crewmate search —
+the last of them behind the `PREVIEW_CREW` flag, because it is an INGRESS to `/members` and
+that page is registered with the same flag. Every other door to it applies the gate, and this
+app ships `defaultEnabled: true`, so a launcher row that skipped it would advertise a page the
+operator has not opted into, on a default install. All three rows the feature adds are gated —
+the view row, the query-carrying fallback row, and the empty-state row — because each is
+independently reachable, and both memos that build them take the flag as a dependency so
+turning the preview on reaches the bar without a reload. The artifacts view
 asks `GET /api/artifacts?q=<query>` and nothing else — no `content=1`, no `snippet=1` — so the
 server matches NAMES only (`name_contains` in `api_artifacts_list`) and never opens a stored
 body. Searching what is INSIDE an artifact is a later change, and it is a change to that one
 request.
 
-The folders view is the cheapest of the three, and its shape follows from that. Its corpus is
+The folders view is the cheapest of the four, and its shape follows from that. Its corpus is
 the folder tree the sidebar already holds under `['chat-folders']`, so a keystroke costs a local
 filter rather than a request: it has no minimum query length, where the two views above each
 hold their first characters back, and no row cap, because the count is the reader's own filing
@@ -53,18 +61,87 @@ the `usePaletteActions` route change are wired in `CommandBarOverlay`, which is 
 holding this app's seams. It still renders the host's `Result` row contract, because forking the
 row shape would fork the Enter matrix with it.
 
+The crewmates view (`apps/command-bar/matesProvider.ts`) reaches the reader's own crew: typing
+filters the roster by fuzzy name and Enter lands on that mate's pinned DM thread
+(`/members?member=<name>`, encoded — a crew may be called `Review & QA`). It is a VIEW rather
+than a root group, and the roster's size is the reason it looks like it should be the other way
+round. The deciding fact is that the corpus is a FETCH: `GET /api/agents/catalog`, which
+`useAgents` calls on mount and which no WebSocket push seeds into the cache. A root group would
+therefore either issue that request on every open of the bar — the one invariant this app
+exists for — or subscribe to a cache nothing fills and render an empty Crewmates group on a cold
+install, which reads as the feature being absent. Like the folders view it has no minimum query
+length and no row cap: once the catalog resolves, a keystroke is a local filter over the
+reader's own crew.
+
+Two fields of a row come from different places, and only one of them is cached. Identity,
+label, role and avatar are the catalog's; whether the mate is WORKING is read from the live slot
+frames the root's attention group already uses (`mode === 'member'` and
+`running || subagents_running`), keyed on `slot.agent`, which a member slot is born with pinned
+to its crew's exact name. That running set is part of the view's query KEY, not merely a
+dependency of the engine: rebuilding the engine does not re-run a resolved query, so without it
+a mate that had finished would keep its busy dot for the rest of the stale window. The same key
+carries `placeholderData`, which is the cost of that decision paid back — this is the only view
+whose key moves on an event the reader did not cause, and without held-over rows a member slot
+finishing anywhere in the dashboard blanks the list and the selection clamp pulls the reader's
+keyboard selection back to row 0 mid-typing. The indicator itself is the dot, colour, pulse AND
+WORD the bar already shows for a running session (`recentsProvider`'s own key): "agent is busy"
+is one state, the sessions view is one keystroke away, and two words for it left a reader unable
+to tell whether they meant the same thing. Only members are listed — the catalog also answers
+with installed templates, and a template has no DM thread, so a row for one would navigate to a
+page that cannot open it. The built-in `default` assistant is excluded for the same reason
+in a second shape: it arrives tagged as a member, and the Crewmates page treats a roster
+holding only `default` as EMPTY — it draws the empty-roster hero, never opens a thread for
+it, and skips it when choosing which crewmate to open. It is also what a fresh install has
+instead of a crew, so listing it would make the first thing a new reader sees in this view
+a row that cannot be opened, in place of the empty state that tells them where to make one.
+
+Matching is on NAMES only, over two fields: the displayed label and the immutable `name` a
+display label hides, the latter penalised so the word on screen always outranks the one behind
+it. When the IDENTITY is what matched, it takes the row's second line, highlighted, in place of
+the role — otherwise the row cannot explain itself, and typing `qa` surfaced a row titled
+"reviewer" with no highlight anywhere that read as a wrong result. That is the answer
+`foldersProvider` already gives when an ancestry path is why a folder surfaced, with one
+difference that matters: the identity is GLOSSED ("also called qa-bot"), because a bare second
+name under a different title reads as a possible second crewmate, where `kirocrew › oss`
+self-evidently reads as a path. The highlight offsets are recomputed against the glossed
+string, since the gloss shifts every position. The description is rendered on every other row
+and deliberately never matched — that would make this a content search over prose, and the row
+could not honestly highlight it.
+
+The view's EMPTY state is a row, not a centred sentence. Naming the Crewmates page without a
+way to reach it was the dead end — a reader reported that "nothing looks like a link", so the
+one thing they came to do had no affordance. As a row it carries both halves the way the
+no-match row does (what is true, and what Enter does about it) and the keyboard reaches it
+without leaving the list. It is gated on the roster having actually answered, so a cold fetch
+draws the skeleton rather than briefly claiming the reader has no crew.
+
+Adding this view cost the `commands` group its shared cap. Six builtin rows (New Session, Toggle
+Theme, and one corpus entry each for sessions, artifacts, folders and crewmates) exactly filled
+`PER_GROUP_LIMIT`, which silently evicted every app-CONTRIBUTED command from the idle page: the
+app installed fine, its manifest was accepted, its row was simply absent. The sixth builtin only
+revealed the defect, which is a cap counting the product's own rows against an app's.
+
+So the cap counts CONTRIBUTIONS only, marked by `RootRow.contributed` and set at the single
+place a row enters this group from a manifest. A builtin cannot evict an app's row, because
+adding one does not change the count — there is no builtin count at which app rows start
+disappearing, rather than a boundary moved further out. What that leaves uncapped is the
+product's own list, deliberately: it grows only by a change in this repository, where the page
+it lands on is reviewed and a row too many is somebody's decision instead of an invisible
+eviction.
+
 ## Responsibilities
 
 1. **Claim the slot** — declare `ui.overlays` in the manifest and take over the `quick-search`
    host slot while enabled, without the shell ever naming an app
-2. **Root index** — build the command / app / settings rows from local data only, rank them,
-   and cap each group
+2. **Root index** — build the attention / command / app / settings rows from local data only,
+   rank them, and cap each group
 3. **Ranking** — fuzzy match against the live query plus a frecency boost, so habit surfaces
    without out-ranking a clearly better string match
-4. **Scopes** — enter a sub-surface (today: session search, artifact name search, and folder
-   search) as a navigation state, with its own engine loaded on entry
-5. **Fallback** — when the root cannot answer, offer the rows that carry the query into the
-   sessions view and the artifacts view rather than reporting "no results"
+4. **Scopes** — enter a sub-surface (today: session search, artifact name search, folder search,
+   and crewmate search) as a navigation state, with its own engine loaded on entry
+5. **Fallback** — for any non-empty root query, offer Ask plus rows that carry the query into
+   the sessions, artifacts, folders, and crewmates views; when no root row matches, also offer
+   the app page that can disable Command Bar
 
 ## The overlay seam
 
@@ -102,28 +179,63 @@ that.
 
 `website/src/apps/command-bar/rootIndex.ts` owns the row model.
 
-- `ROOT_GROUPS = ['commands', 'apps', 'settings']`, rendered in that order. `rankRootRows`
-  ends with a sort on `groupOrder`, so groups are always contiguous blocks under their own
-  header — they never interleave by score.
+- `ROOT_GROUPS = ['attention', 'recent', 'commands', 'apps', 'settings']`, rendered in that
+  order while the query is EMPTY. `attention` is normally absent and contains only live sessions
+  whose status is a pill — an approval or answer the user owes, not merely running or unread
+  work. On an empty query `rankRootRows` ends with a sort on `groupOrder`, so groups are
+  contiguous blocks under their own header. A NON-EMPTY query skips that regroup and comes back
+  in score order across every group, because the reader has said what they want and the best
+  match is the answer; group order is the decision about what the launcher OPENS on, and
+  applying it to a query too made the group the first sort key, so a command matching only
+  through its subtitle outranked the app being spelled out. Groups therefore interleave under a
+  query, and the section headers are suppressed there — a header per group change would print
+  the same word twice over rows it does not describe. Each row names its own kind in its
+  right-hand column instead, and the two groups with no kind word (`attention` carries a status
+  pill, `recent` its group name) keep one for that reason.
+- `recent` follows `attention`: at most `RECENT_SESSION_ROWS = 3` live sessions the reader was
+  last in, so "get me back to what I was doing" is a row to press rather than a search to run.
+  It is built by the overlay from the same live slot store `attention` reads, so it costs the
+  root no request. The rows are the slots left after two exclusions — any slot already lifted
+  into `attention` (it is on screen above, carrying more), and any empty untitled new-chat slot
+  (that is what New Session is for) — ordered newest-first by `slotRecency` (the later of
+  `last_activity_ts` and `last_ts`, with `created` as a fallback), then sliced to the cap. A
+  recent row renders a dot status when the session is running and never a pill (a pill means the
+  session owes the user something, and every such session has already been lifted into
+  `attention`). The full corpus stays one `view` row below, under Search Sessions.
 - A row's `kind` is `view` (enter a surface inside the bar), `navigate` (leave and route),
   `invoke` (run and close), or `prompt` (a contributed command -- collect one argument if it
   declares one, then seed a session).
 - App rows are derived from the installed-app list, so a newly installed app appears as a
   destination with no per-app work.
-- Each row renders its kind as a right-aligned word — Command, App, Setting or View — because
-  the only other per-row signal is the group icon, which reads only to someone who has already
-  learned it. `view` is named separately from its group because it opens a surface instead of
-  acting and closing.
-- `PER_GROUP_LIMIT = 6` caps each group so one group cannot push the others off the page.
-  **Known gap:** rows past the cap are dropped silently. The artifacts view does not share that
-  gap — it renders a `+N more` line under its list, outside the listbox so it cannot become an
-  option that Enter does nothing with — and that line is the shape to copy when this one is closed.
+- Ordinary rows render a right-aligned kind — Command, App, Setting or View. A contributed
+  command prefixes that kind with its app label. While the query is EMPTY an `attention` or
+  `recent` row renders no kind label — `attention` shows its live status pill instead and
+  `recent` its running dot, because the session's state is more useful than a static "Session"
+  label, and the group header above the row already names it. Under a query there is no header
+  (see the group bullet above), so a `recent` row whose session is idle — no pill, no dot, no
+  kind word — would carry no naming at all; it renders its group's own name,
+  `group_recent_sessions`, in that otherwise empty column. An `attention` row needs no such
+  substitution: it reaches that group only because its status is a pill, so the column is never
+  empty. `view` is named separately from its group because it opens a surface instead of acting
+  and closing.
+- `PER_GROUP_LIMIT = 6` caps each group so one group cannot push the others off the page;
+  settings use the tighter `SETTINGS_IDLE_LIMIT = 2` while the query is empty, and `recent` is
+  capped ahead of ranking by the overlay at `RECENT_SESSION_ROWS = 3` rather than by this limit.
+  **Known gap:** rows past a root cap are dropped silently. The artifacts view does not share
+  that gap — it renders a `+N more` line under its list, outside the listbox so it cannot become
+  an option that Enter does nothing with — and that line is the shape to copy when this one is
+  closed.
 - `idleDemote` sorts a row to the end of its group while the query is EMPTY, at a cost sized
   to lose to a single real use. The empty-query order is frecency, so on a cold install every
   score is zero and the alphabet alone decides what the launcher opens on. It is DERIVED, not
   declared: a command that needs an argument cannot act on an empty query, so it has nothing
   to offer a bar that has just opened -- leaving it to the manifest would mean asking every
   app author to volunteer their own row out of the first page, which none would.
+- `recent` opts out of all of that while the query is empty: `rankRootRows` scores its rows 0,
+  declining the frecency boost, and breaks their tie by SOURCE POSITION rather than title, so
+  the newest-first order the overlay already sorted them into stands. Neither frecency, idle
+  demotion nor the alphabet may reshuffle a recency order that is a fact. Once a query is
+  present a recent row ranks on its match like any other row.
 
 ## Ranking and frecency
 
@@ -135,6 +247,30 @@ over a scattered subsequence on a daily one.
 
 The root ranks from the LIVE query, not a debounced copy, so a fast typist never sees rows
 that answer an older prefix.
+
+### Stale rows must not act
+
+Every SCOPED view ranks from the debounced query, because each one reaches the network, so for
+one debounce interval its rows answer the previous query. A keyboard Enter in that window names
+an INDEX, and that index means a different row once the rows move under it — which is how typing
+`onc` and pressing Enter opened `accountant`. So the activation path all four views share does
+nothing until the rows answer what has been typed: a dropped keystroke rather than the wrong
+session, artifact, folder or crewmate.
+
+Three details carry the rule. The comparison is between what the view WOULD ask for the live
+query and what it DID ask, not between the two query strings: sessions and artifacts only search
+above a floor, so below it every query asks for the same listing, and comparing strings would
+freeze Enter on rows that were the correct answer. It binds the KEYBOARD only — a pointer names
+its own target, so the row a reader pressed opens what it says. And it sits above the row-tag
+switch, not inside the results case: a view's SYNTHESIZED rows are built from the same debounced
+query its results are, and two of them do something worse than opening the wrong thing — the
+no-match row wipes the query, and the empty-crewmates row navigates and closes the bar. Both
+live at a zero-result dead end, which is exactly where a reader types another character.
+
+The query matching is not on its own enough for the crewmates view, which holds its previous rows
+across a key change (see the running-set key above). That hold is scoped to the running set: rows
+are never held across a change of the query, because those answer the previous words while the
+debounced query already matches the new ones.
 
 ## Keyboard and focus contract
 
@@ -159,6 +295,30 @@ that answer an older prefix.
 | the artifacts fallback row issues no request while it is merely OFFERED | offering a way into the corpus becomes a scan on every keystroke, which is the cost this app exists to avoid |
 | the artifacts row cap names its remainder, from OUTSIDE the listbox | a silent slice reads as "these are all of them"; a counted row inside the listbox is an option Enter cannot act on |
 | the root ranks from the live query | a debounced read discards a fast-entered query |
+| the crewmates view is entered, never fetched from the root | the catalog `useAgents` calls on mount becomes a request on every open of the bar |
+| the crewmates view lists MEMBERS only | a template row navigates to a page with no thread to open |
+| the crewmates view excludes the built-in `default` | a fresh install's first row is one the Crewmates page opens for nobody, in place of the empty state |
+| all three crewmate rows sit behind `PREVIEW_CREW` | a default install advertises `/members`, which every other door keeps behind that flag |
+| the crewmates read shares `['agents-catalog', 'global']` | two caches of one sessionless response, so the dialog fetches and the bar refetches the same bytes |
+| a crewmate route is encoded | a crew called `Review & QA` truncates the parameter and opens the page on nothing |
+| a crewmate row is keyed on the immutable `name`, not the display label | a renamed crew routes to a member that does not exist, and reads as idle while it is working |
+| the running set is part of the crewmates query key | a resolved query keeps a finished mate's busy dot for the rest of the stale window |
+| that query holds its previous rows across the key change | a slot finishing elsewhere blanks the list and resets the reader's keyboard selection to row 0 |
+| it holds them across the RUNNING SET only, never across the query | rows answering the previous words stay actionable for as long as the new read takes |
+| Enter does nothing in any scoped view until the rows answer the live query | the row selected against an older debounced query opens under the reader's hands |
+| that guard covers a view's SYNTHESIZED rows, not only its results | a stale no-match row discards the query just typed, and a stale empty-roster row navigates away |
+| that guard binds the keyboard, not the pointer | a row the reader can read and press stops responding |
+| the guard compares what the view WOULD ask against what it DID ask | a sub-floor query freezes Enter on a listing that is the correct answer to it |
+| a crewmate row says BUSY in the same word as a session row | two vocabularies for one state, one keystroke apart, that a reader cannot tell apart |
+| an identity match shows the identity it matched | a row surfaces with no highlight anywhere and reads as a wrong result |
+| that identity is GLOSSED, and its highlight recomputed against the gloss | a bare second name reads as a second crewmate, and carried-over offsets mark the gloss's own words |
+| those offsets are shifted by the template's INTERPOLATION SITE | a mate named `cal` glosses to "also called cal" and the highlight marks the `cal` inside "called" |
+| the empty crewmates state is an Enter-able row | the view names the Crewmates page with no way to reach it, and nothing looks like a link |
+| that row waits for the roster to answer | a cold fetch briefly claims the reader has no crew |
+| a failed crewmate read renders an ErrorNotice | the retry row carries no text by design, so the failure is unexplained and indistinguishable from a crew-less install |
+| the `commands` cap counts CONTRIBUTED rows only | a builtin added here evicts an app-contributed row with nothing on screen saying so |
+| that cap still bounds one app's contributions | an app with twenty commands turns the first page into its index |
+| the product's own command list is uncapped | a builtin silently dropped from a page this repository reviews |
 | `aria-modal` and the focus trap travel together | a dialog that traps nothing while claiming modality |
 | the `apps` query is a pure cache consumer (`enabled: false`) | a second identical fetch per open |
 | every `['apps']` reader goes through the one api call | a divergent shape silently poisons the shared cache |
@@ -333,10 +493,16 @@ stays where this repository counts it. Assembling the name at runtime to keep th
 scanner from seeing it was tried first and is worse: it opens a third suppression
 channel nothing counts.
 
-The leaf name is clamped to the 100 characters the server stores, because a manifest
-title may be 120. Without the clamp the create is silently shortened, the next run's
-lookup for the full title misses, and every run makes another folder — the one failure
-mode here that compounds rather than staying cosmetic. When two rows currently offered
+Both folders are resolved through the shared `ensureChatFolder` helper
+(`website/src/utils/ensureChatFolder.ts`), which matches by name under an exact parent and
+asks the server only for names it will store unchanged. A leaf name is cut to fit the 100
+code points the server keeps, because a manifest title may be 120: an over-long title
+keeps its first 65 code points and ends in ` (<32-hex fingerprint of the whole title>)` —
+the first 128 bits of its SHA-256, so two different titles cannot be made to share one.
+Without the cut the create is silently shortened, the next run's lookup for the full
+title misses, and every run makes another folder — the one failure mode here that
+compounds rather than staying cosmetic; and the fingerprint keeps two different long
+titles that agree on their first 100 code points in two leaves. When two rows currently offered
 carry the SAME title, a discriminator is appended to both — the contributing app's label
 between two apps, and the row's own id when the collision is inside ONE app, where the
 label separates nothing. A leaf keyed on the title alone would interleave two commands
@@ -369,5 +535,6 @@ being installed, not on this app's name, and it lists the other default-off buil
   guarantee and somewhere to put "more results" — a contract to design against a response shape
   that does not exist yet, not a parameter to add.
 - **Quicklinks.** A group with no writer was removed rather than shipped empty.
-- **A default-on launcher.** Flipping the default and deleting the legacy palette is a separate
-  change, after the remaining corpora become apps with their own scopes.
+- **Removing the legacy palette.** Command Bar is default-on, but disabling it deliberately
+  restores the legacy palette and a rejected lazy chunk falls back there. Deleting that fallback
+  is a separate change, after the remaining corpora become launcher scopes.

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         ImportSource,
         InboundToken,
         McpScope,
+        MemoryRoots,
         SessionPrincipal,
         WorkloadIdentity,
     )
@@ -455,7 +456,8 @@ class DefaultExternalAccessPolicy:
 class DefaultAppRegistryPolicy:
     """Today's public trusted-host set + clone-sandbox-mode decision.
 
-    Delegates to ``apps/registry.py._PUBLIC_GIT_HOSTS`` — the public-forge set
+    Delegates to ``_PUBLIC_GIT_HOSTS`` (``apps/registry_pipeline/git_targets.py``, read
+    through the ``apps.registry`` facade) — the public-forge set
     (github / gitlab / bitbucket / sr.ht / codeberg), with NO internal host
     trusted.  A clone from any host outside that set runs ``strict`` sandbox
     mode.  The Amazon companion's ``AmazonAppRegistryPolicy`` overrides
@@ -499,17 +501,17 @@ class DefaultAppsLoader:
 
 
 class DefaultPackageManager:
-    """Public brew/curl/pip install strategy (delegated to cli_doctor logic).
+    """Public brew/winget/pip install strategy (the inline hints in doctor_checks/features.py).
 
     RESERVED slot (see ``context.RESERVED_SLOTS['package_manager']``): no core
-    call site routes installs through this seam — ``cli_doctor.py`` keeps its
-    inline per-tool logic.  Use ``CapabilityManager`` for registry-backed
+    call site routes installs through this seam — ``doctor_checks/features.py``
+    keeps its inline per-tool hints.  Use ``CapabilityManager`` for registry-backed
     installs of MCP servers / skills / agent packages.
     """
 
     def install_plan(self, tool: str) -> List[str]:
         # The public edition has no managed installer; callers fall back to
-        # their existing inline brew/curl/pip logic when the plan is empty.
+        # their existing inline brew/winget/pip hints when the plan is empty.
         return []
 
     def which(self, tool: str) -> Optional[str]:
@@ -578,6 +580,25 @@ class DefaultTelemetryProvider:
                 signals=frozenset({"metrics"}),
             ),
         )
+
+
+class DefaultMemoryFilesProvider:
+    """Local-disk memory files — today's behaviour, unchanged.
+
+    Every store gets a :class:`~kiro_crew.memory_files.LocalMemoryFiles`, which is
+    the gate/reader/writer code lifted out of ``MemoryStore`` without alteration,
+    so the public edition reads and writes memory with the same syscalls in the
+    same order as before this seam existed.
+
+    The import is deferred: ``memory_files`` pulls in ``hooks``, ``pinned_fs`` and
+    ``memory_startup``, and this module is imported at boot by every edition
+    including ones that never touch memory.
+    """
+
+    def files_for(self, roots: "MemoryRoots") -> Any:
+        from kiro_crew.memory_files import LocalMemoryFiles
+
+        return LocalMemoryFiles(roots)
 
 
 class DefaultKnowledgeProvider:
@@ -790,7 +811,28 @@ class DefaultRemoteProvisionerProvider:
                 # be the file confirming itself. ``provision`` resolves the recipient from
                 # the spec and compares, and it refuses an empty value.
                 confirmed_recipient=confirmed_recipient,
-            )
+                # The operator's own trust-boundary claim, read from the block they
+                # wrote. It is the only field here that loosens a posture, and it is
+                # read rather than asked for at launch because the statement it makes --
+                # these are the operator's own crews, and they bear the risk of what
+                # those crews read -- is a property of the lane, not of one launch.
+                # Absent means not claimed, so a lane that says nothing keeps the
+                # container's sandboxed-only refusal.
+                internal_only=config.internal_only,
+            ),
+            # What bounds the task's cost. Passed rather than left to default, which is
+            # the whole point: the engine defaults to six hours, and until this argument
+            # existed that default was reachable only by editing Python -- so a task the
+            # RFC itself says may run for hours was stopped by its owner's next launch
+            # with no operator-reachable way to ask for longer.
+            #
+            # ``config`` is complete here (``_fargate_config`` yields only complete
+            # blocks), and ``is_complete`` already called this same method, so the numbers
+            # are ones ``TaskBounds`` accepts and this cannot raise. A block that omits
+            # the key produces exactly the engine's own defaults, so the lane's
+            # behaviour is unchanged for every operator who does not set it. The
+            # population cap has no key at all and always stays the engine's.
+            bounds=config.task_bounds(),
         )
 
     @staticmethod

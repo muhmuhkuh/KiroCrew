@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
-import AssistantMessage, { fmtTurnElapsed, fmtCredits, fmtTurnModel } from '../pages/chat/AssistantMessage'
+import AssistantMessage, { fmtTurnElapsed, fmtTurnModel } from '../pages/chat/AssistantMessage'
+import { fmtCredits } from '../i18n/format'
 import { parseOptions } from '../app-sdk/protocol'
 // Imported from the defining module, not the `protocol` barrel, which deliberately
 // does not re-export a g-flagged regex. Only `.source` is read below — a string
@@ -9,7 +10,9 @@ import { OPTION_MARKER_PATTERN_SOURCE } from '../app-sdk/protocol/optionMarker'
 
 // Mock MarkdownRenderer to avoid complex markdown parsing in tests
 vi.mock('../components/MarkdownRenderer', () => ({
-  default: ({ content }: { content: string }) => <div data-testid="md">{content}</div>,
+  default: ({ content, blockedLinks }: { content: string; blockedLinks?: unknown }) => (
+    <div data-testid="md" data-blocked-links={JSON.stringify(blockedLinks ?? null)}>{content}</div>
+  ),
 }))
 // Mock useSmoothStream to passthrough — its rAF loop conflicts with vi.useFakeTimers()
 vi.mock('../hooks/useSmoothStream', () => ({
@@ -243,6 +246,21 @@ describe('AssistantMessage', () => {
     fireEvent.click(screen.getByTitle('Previous version'))
     expect(screen.getByText('1/2')).toBeInTheDocument()
     expect(screen.getByTestId('md')).toHaveTextContent('version one text')
+  })
+
+  it('local variant browsing takes each variant\'s blocked-link records with its text', () => {
+    // A record describes one text: showing variant one beside the row's records
+    // would open a panel naming a link that text never held.
+    const rowRecords = [{ domain: 'row.example.com' }]
+    const v1Records = [{ domain: 'one.example.com' }]
+    const variants = [
+      { content: 'version one text', blocked_links: v1Records },
+      { content: 'version two text' },
+    ]
+    render(<AssistantMessage content="version two text" isStreaming={false} variants={variants} variantIdx={1} blockedLinks={rowRecords} />)
+    expect(screen.getByTestId('md').dataset.blockedLinks).toBe(JSON.stringify(rowRecords))
+    fireEvent.click(screen.getByTitle('Previous version'))
+    expect(screen.getByTestId('md').dataset.blockedLinks).toBe(JSON.stringify(v1Records))
   })
 
   it('calls onSwitchVariant for last message but uses local state for older messages', () => {

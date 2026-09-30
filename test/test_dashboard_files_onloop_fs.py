@@ -259,7 +259,10 @@ def _app() -> web.Application:
 
 def _req(path: str, query: str = "", method: str = "GET") -> web.Request:
     req = make_mocked_request(method, f"{path}?{query}" if query else path, app=_app())
-    req["user"] = "test-user"
+    # The owner: the file readers are owner-gated, and these tests are about
+    # the probe, not the gate.
+    req["user"] = "local-app"
+    req["app"] = ""
     return req
 
 
@@ -270,7 +273,10 @@ def _body(resp: web.Response) -> Any:
 async def _grep_req(query: str, root: Path | str) -> web.Response:
     """One ``POST /api/file-grep`` with the body the handler reads."""
     req = make_mocked_request("POST", "/api/file-grep", app=_app())
-    req["user"] = "test-user"
+    # The owner: the file readers are owner-gated, and these tests are about
+    # the probe, not the gate.
+    req["user"] = "local-app"
+    req["app"] = ""
     with mock.patch.object(
         f, "read_bounded_json", mock.AsyncMock(return_value=({"q": query, "root": str(root)}, None))
     ):
@@ -500,7 +506,10 @@ class TestFileWrite:
     async def test_validation_runs_off_the_event_loop(self, a_file: Path, spy: _ThreadSpy):
         spy.watch(a_file)
         req = make_mocked_request("POST", "/api/file-write", app=_app())
-        req["user"] = "test-user"
+        # The owner: /api/file-write is owner-gated, and this test is about the
+        # probe, not the gate.
+        req["user"] = "local-app"
+        req["app"] = ""
         with mock.patch.object(
             f,
             "read_bounded_json",
@@ -696,6 +705,17 @@ class TestBrowseAndReveal:
 
         assert resp.status == 400
         assert _body(resp)["error"] == "Not a directory"
+        # The UI keys per-cause copy on `code`: a permanent path refusal must
+        # not degrade to the recoverable arm that offers a Refresh.
+        assert _body(resp)["code"] == "not_a_directory"
+
+    @pytest.mark.asyncio
+    async def test_browse_files_non_directory_root_carries_the_same_code(self, a_file: Path):
+        resp = await f.api_browse_files(_req("/api/browse-files", f"path={a_file}"))
+
+        assert resp.status == 400
+        assert _body(resp)["error"] == "Not a directory"
+        assert _body(resp)["code"] == "not_a_directory"
 
     @pytest.mark.asyncio
     async def test_an_unnamed_root_still_falls_back_to_home(
@@ -942,7 +962,9 @@ class TestBoundedProbePool:
 
         async def post(handler, body: dict) -> web.Response:
             req = make_mocked_request("POST", "/api/x", app=_app())
-            req["user"] = "test-user"
+            # The owner, so the owner-gated file_write reaches its probe.
+            req["user"] = "local-app"
+            req["app"] = ""
             with mock.patch.object(
                 f, "read_bounded_json", mock.AsyncMock(return_value=(body, None))
             ):

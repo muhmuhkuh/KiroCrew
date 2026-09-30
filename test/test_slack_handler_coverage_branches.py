@@ -33,6 +33,13 @@ from kiro_crew.slack import handler as h
 # ──────────────────────────────────────────────────────────────────────
 
 
+#: These tests exercise the SLACK side (thread renaming), not the record
+#: pin, so they pass the value production supplies when there is nothing to
+#: pin. ``maybe_auto_title`` requires it, which is what stops a call site
+#: from reading the record inside the task and reopening the window.
+_PRESENT_PIN = auto_title.RecordPin(auto_title.RECORD_PRESENT, "")
+
+
 class FlakySlack(MockSlackClient):
     """MockSlackClient whose named methods raise instead of recording.
 
@@ -55,18 +62,15 @@ class FlakySlack(MockSlackClient):
             raise RuntimeError("slack remove_reaction unavailable")
         await super().remove_reaction(channel, ts, emoji, raise_on_error)
 
-    async def post_message(self, channel, text, thread_ts=None, unfurl_links=None,
-                           unfurl_media=None):
+    async def post_message(self, channel, text, thread_ts=None):
         if "post_message" in self.fail:
             raise RuntimeError("slack post_message unavailable")
-        return await super().post_message(channel, text, thread_ts, unfurl_links, unfurl_media)
+        return await super().post_message(channel, text, thread_ts)
 
-    async def post_blocks(self, channel, blocks, text, thread_ts=None, unfurl_links=None,
-                          unfurl_media=None):
+    async def post_blocks(self, channel, blocks, text, thread_ts=None):
         if "post_blocks" in self.fail:
             raise RuntimeError("slack post_blocks unavailable")
-        return await super().post_blocks(channel, blocks, text, thread_ts, unfurl_links,
-                                         unfurl_media)
+        return await super().post_blocks(channel, blocks, text, thread_ts)
 
 
 def _raising_sel(*, method: str) -> MagicMock:
@@ -345,7 +349,7 @@ class TestResolveAgentName:
     def test_project_spec_wins_over_user_level_agents(self, monkeypatch, tmp_path):
         spec = tmp_path / "reviewer.agent-spec.json"
         spec.write_text("{}", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [spec])
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [spec])
         monkeypatch.setattr(h, "project_agent_name", lambda p: "project-reviewer")
         assert h._resolve_agent_name("reviewer", str(tmp_path)) == "project-reviewer"
 
@@ -353,19 +357,20 @@ class TestResolveAgentName:
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "helper.json").write_text('{"name": "helper"}', encoding="utf-8", newline="\n")
-        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [])
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [])
         monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
         # The hardened reader vets the RESOLVED target in the same step as the
         # read, so the refusal is injected at its gate, not at a path check
-        # here.
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda _p: True)
+        # here. That gate is is_sensitive_canonical_path; is_sensitive_path in
+        # agent_discovery gates only the project dir and the cache key.
+        monkeypatch.setattr(agent_discovery, "is_sensitive_canonical_path", lambda _p: True)
         assert h._resolve_agent_name("helper") is None
 
     def test_unparseable_spec_falls_back_to_the_file_stem(self, monkeypatch, tmp_path):
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "helper.json").write_text("{not json", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [])
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [])
         monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
         assert h._resolve_agent_name("helper") == "helper"
 
@@ -561,7 +566,7 @@ class TestAutoTitle:
         slack = FlakySlack()
         h._titled_threads["slack:t1"] = "manual"
         await h._maybe_auto_title_slack(
-            slack, title_sessions, "C1", "slack:t1", None, "hello", "hi there"
+            slack, title_sessions, "C1", "slack:t1", None, "hello", "hi there", pin=_PRESENT_PIN,
         )
         assert not [a for a in slack.actions if a[0] == "set_thread_title"]
 
@@ -571,7 +576,7 @@ class TestAutoTitle:
         log = MagicMock()
         log.set_title = MagicMock(side_effect=RuntimeError("log locked"))
         await h._maybe_auto_title_slack(
-            slack, title_sessions, "C1", "slack:t1", log, "hello", "hi there"
+            slack, title_sessions, "C1", "slack:t1", log, "hello", "hi there", pin=_PRESENT_PIN,
         )
         titled = [a for a in slack.actions if a[0] == "set_thread_title"]
         assert titled and titled[0][1]["title"] == "Deploy the gateway"
@@ -584,7 +589,7 @@ class TestAutoTitle:
         title_sessions.get_or_create = AsyncMock(return_value=(_TitleClient("SKIP"), None, None))
         h._titled_threads["slack:t1"] = "auto"
         await h._maybe_auto_title_slack(
-            slack, title_sessions, "C1", "slack:t1", None, "hello", "hi"
+            slack, title_sessions, "C1", "slack:t1", None, "hello", "hi", pin=_PRESENT_PIN,
         )
         assert "slack:t1" not in h._titled_threads
         assert not [a for a in slack.actions if a[0] == "set_thread_title"]

@@ -467,6 +467,42 @@ describe('CommandBarOverlay rows', () => {
     await waitFor(() => expect(sessionSearch.mock.calls.length).toBeGreaterThan(before))
   })
 
+  it('refuses a STALE Enter, so a fast typist never opens the wrong session', async () => {
+    // Every scoped view ranks from the DEBOUNCED query, so for one debounce interval
+    // after a keystroke its rows answer the previous query, and an Enter in that window
+    // acts on the row selected against it. Reported in the crewmates view; the guard is
+    // on the activation path all four views share, so each one pins it.
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    const hit = (title: string, onActivate: () => void) => ({
+      id: `sessions:${title}`,
+      providerId: 'sessions',
+      title,
+      icon: null,
+      score: 1,
+      indices: [],
+      onActivate,
+    })
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    // No debounce tick: the row on screen still answers `alpha`.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(openAlpha).not.toHaveBeenCalled()
+    // Once the rows catch up, the same Enter opens what was typed.
+    await waitFor(() => {
+      expect(screen.queryByText('Beta review')).not.toBeNull()
+      expect(screen.queryByText('Alpha planning')).toBeNull()
+    })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(openBeta).toHaveBeenCalled()
+  })
+
   it('leaves the sessions failure a row, with none of the artifacts scope notice', async () => {
     // Guard on a deliberate boundary. The artifacts scope renders its failure through
     // ErrorNotice above the list, and it would have been easy to reach that surface for
@@ -610,16 +646,92 @@ describe('CommandBarOverlay rows', () => {
   it('shows no attention section when nothing is waiting on the user', () => {
     // A section that is always present is a section the user learns to skip; the whole
     // value of this one is that its presence means something. A RUNNING session is not
-    // waiting on anyone, so it must not be lifted here either.
+    // waiting on anyone, so it must not be lifted here either — it belongs to the
+    // recent group below, which is a switch list and makes no claim on the reader.
     storeState.dashboard.slots = [
       { key: 'slot-c', title: 'Refactor the parser', running: true, messages: 9 },
       { key: 'slot-d', title: 'Idle thread', messages: 3 },
     ]
     mount()
     expect(screen.queryByText('Needs You')).toBeNull()
-    expect(screen.queryByText('Refactor the parser')).toBeNull()
-    // The commands are back at the top where they were.
-    expect(screen.getAllByRole('option')[0].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    expect(screen.queryByText('Approve')).toBeNull()
+    expect(screen.queryByText('Answer')).toBeNull()
+    expect(rowByText('Refactor the parser')).toBeTruthy()
+  })
+
+  it('offers the sessions the reader was last in, newest first, above the commands', () => {
+    // The most common reason this surface is opened: get me back to what I was doing.
+    // It used to mean entering the sessions view and typing a name from memory, so the
+    // answer the store already held cost two steps and a recall.
+    storeState.dashboard.slots = [
+      { key: 'slot-old', title: 'Last week thread', messages: 3, last_activity_ts: 1_000 },
+      { key: 'slot-new', title: 'This morning thread', messages: 5, last_activity_ts: 3_000 },
+      { key: 'slot-mid', title: 'Yesterday thread', messages: 2, last_activity_ts: 2_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(screen.getByText('Recent sessions')).toBeTruthy()
+    // Order is the claim — recency, not the alphabet and not the frecency store.
+    expect(rows[0].textContent).toContain('This morning thread')
+    expect(rows[1].textContent).toContain('Yesterday thread')
+    expect(rows[2].textContent).toContain('Last week thread')
+    // Ahead of the commands, which keep their own block underneath.
+    expect(rows[3].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    // A session row carries no static kind word; its column is for live state.
+    expect(rows[0].textContent).not.toContain('Command')
+    // Activating one switches to it, the same way every other surface opens a session.
+    fireEvent.mouseDown(rows[0])
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'switchSlot',
+      key: 'slot-new',
+      announceOnMissing: true,
+    })
+  })
+
+  it('caps the recent group at three, leaving the rest to the sessions view', () => {
+    // The group's value is that it needs no reading. A fourth row buys a little more
+    // coverage and spends that property, and the whole corpus is one row below.
+    storeState.dashboard.slots = Array.from({ length: 7 }, (_, i) => ({
+      key: `slot-${i}`,
+      title: `Thread ${i}`,
+      messages: 2,
+      last_activity_ts: 1_000 - i,
+    }))
+    mount()
+    const titles = screen.getAllByRole('option').map(r => r.textContent ?? '')
+    expect(titles.filter(t => /Thread \d/.test(t))).toHaveLength(3)
+    expect(titles[0]).toContain('Thread 0')
+    expect(screen.queryByText('Thread 3')).toBeNull()
+    expect(rowByText('Search Sessions')).toBeTruthy()
+  })
+
+  it('keeps a session out of the recent group when it is already in the one above', () => {
+    // A session waiting on the reader is on screen with its pill. A second, quieter
+    // copy of it three rows down adds nothing and makes the page look longer than the
+    // number of sessions it is actually about.
+    storeState.dashboard.slots = [
+      { key: 'slot-a', title: 'Deploy the pricing service', pending_approval: true, messages: 4, last_activity_ts: 3_000 },
+      { key: 'slot-b', title: 'Idle thread', messages: 2, last_activity_ts: 1_000 },
+    ]
+    mount()
+    expect(screen.getAllByText('Deploy the pricing service')).toHaveLength(1)
+    expect(rowByText('Idle thread')).toBeTruthy()
+  })
+
+  it('leaves an empty untitled session out of the recent group', () => {
+    // Switching into a blank chat is what New Session is for, and one blank row is
+    // indistinguishable from another — so they would fill the group with rows that
+    // cannot be told apart.
+    storeState.dashboard.slots = [
+      { key: 'slot-blank', title: 'New Session…', messages: 0, last_activity_ts: 9_000 },
+      { key: 'slot-real', title: 'Real thread', messages: 4, last_activity_ts: 1_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(rows[0].textContent).toContain('Real thread')
+    // The New Session COMMAND is still there; what is absent is a session row for the
+    // blank slot, which would be a second row reading the same way.
+    expect(screen.getAllByText(/New Session/)).toHaveLength(1)
   })
 
   it('always gives the typed text a way to reach an agent', async () => {
@@ -1603,5 +1715,135 @@ describe('CommandBarOverlay contributed commands', () => {
     await Promise.resolve()
     expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.anything() })
     expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
+  })
+})
+
+/**
+ * What the root list looks like once the reader has typed.
+ *
+ * Group order is the idle page's filing order — the product decision about what a
+ * launcher OPENS on. A query is a different question, so these pin the two halves:
+ * a typed query is one list ranked by match, and the section headers that name the
+ * blocks go with the blocks.
+ */
+describe('CommandBarOverlay root ordering under a query', () => {
+  beforeEach(() => {
+    dispatch.mockReset()
+    navigate.mockReset()
+    sessionSearch.mockReset()
+    sessionSearch.mockResolvedValue([])
+    recentsSearch.mockReset()
+    recentsSearch.mockResolvedValue([])
+    enterInsertOrNewSession.mockReset()
+    newSessionWithToken.mockReset()
+    storeState.dashboard = { slots: [], unreadSlots: [] }
+    storeState.chat = { slotStatusDetail: {}, activeSlot: null }
+    window.localStorage.clear()
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  /** The app the reader is typing toward, as the apps API returns it. */
+  const DEV_FLEET = {
+    name: 'dev-fleet',
+    displayName: 'Dev Fleet',
+    enabled: true,
+    origin: 'registry',
+    manifest: { ui: { pages: [{ label: 'Dev Fleet', route: '/apps/dev-fleet' }] } },
+  }
+
+  /** A DIFFERENT app, contributing the command that used to outrank it. */
+  const PR_BULK_OPS = {
+    name: 'pr-bulk-ops',
+    displayName: 'PR Bulk Ops',
+    enabled: true,
+    origin: 'registry',
+    manifest: {
+      contributes: {
+        commands: [
+          {
+            id: 'approve-merge-all',
+            title: 'Approve and merge all PRs',
+            subtitle:
+              'Merge every ready pull request behind a link, approving first where allowed',
+            prompt: 'Approve and merge every ready pull request.',
+          },
+        ],
+      },
+    },
+  }
+
+  function mountWith(apps: unknown[]) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(['apps'], apps)
+    render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={vi.fn()} />
+      </QueryClientProvider>,
+    )
+  }
+
+  /** The section headers the list is rendering, top to bottom. */
+  const renderedHeaders = () =>
+    Array.from(document.querySelectorAll('div.uppercase.tracking-wide.text-muted')).map(
+      el => el.textContent ?? '',
+    )
+
+  const rowIndex = (re: RegExp) =>
+    screen.getAllByRole('option').findIndex(el => re.test(el.textContent ?? ''))
+
+  it('puts the app the reader is spelling out above a command that only matched its subtitle', () => {
+    // The reported bug. `dev fle` scores the Dev Fleet app 216 and this contributed
+    // command 60 — the command's own title does not match at all, only its subtitle —
+    // and the command was still shown first, because `commands` files before `apps`.
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dev fle' } })
+    const app = rowIndex(/Dev Fleet/)
+    const command = rowIndex(/Approve and merge all PRs/)
+    // Both rows are on screen: the command still matches, it just ranks below.
+    expect(app).toBeGreaterThanOrEqual(0)
+    expect(command).toBeGreaterThan(app)
+  })
+
+  it('names a recent session in its own column once the headers are gone', () => {
+    // The headers are what named a recent row, and `kindLabel` deliberately returns
+    // nothing for one (its column belongs to live state). An IDLE session has no live
+    // state either, so under a query the row would be a glyph and a title while every
+    // row beside it still showed its word. The group's own name stands in there.
+    storeState.dashboard = {
+      slots: [{ key: 'chat-7', title: 'Fleet notes', messages: 4, running: false }],
+      unreadSlots: [],
+    }
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    // Idle page: the header above the row says it, so the column stays empty.
+    const idleRow = screen.getAllByRole('option').find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(idleRow).toBeTruthy()
+    expect(renderedHeaders()).toContain('Recent sessions')
+    expect(idleRow?.textContent).not.toContain('Recent sessions')
+    // Under a query the header is gone and the row carries the name instead.
+    fireEvent.change(input, { target: { value: 'fleet' } })
+    expect(renderedHeaders()).toEqual([])
+    const queriedRow = screen
+      .getAllByRole('option')
+      .find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(queriedRow).toBeTruthy()
+    expect(queriedRow?.textContent).toContain('Recent sessions')
+  })
+
+  it('drops the group headers while a query ranks the list, and restores them when it clears', () => {
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    expect(renderedHeaders()).toContain('Commands')
+    fireEvent.change(input, { target: { value: 'dev fle' } })
+    // One ranked list: a group can now appear, be left and appear again, so a header
+    // per transition would print the same word twice over rows it does not describe.
+    expect(renderedHeaders()).toEqual([])
+    // The headers belong to the idle page, so clearing the query brings them back.
+    fireEvent.change(input, { target: { value: '' } })
+    expect(renderedHeaders()).toContain('Commands')
   })
 })

@@ -1,6 +1,6 @@
 # `kirocrew pod` — isolated worktree test instances
 
-Spin up a **throwaway, full-stack KiroCrew gateway** for any feature worktree —
+Spin up a **throwaway, full-stack Kiro Crew gateway** for any feature worktree —
 its own port, its own `KIROCREW_HOME` (own DB / sessions / memory), no Slack
 tunnel, `--no-crons` (unless you pass `--crons`), resource-capped, and reclaimed
 by `pod down`. Test a branch's
@@ -25,18 +25,20 @@ a child pod.
 
 ```bash
 kirocrew pod install              # lay down the systemd --user template unit (Linux only; a no-op elsewhere)
-kirocrew pod provision <wt>       # build the worktree's venv + SPA dist (the on-ramp)
+kirocrew pod provision <wt> [--venv-only]  # build the venv and, unless opted out, the SPA dist
 kirocrew pod up   <wt> [--json]   # bring up an isolated pod → {base_url, token, port}
 kirocrew pod up   <wt> --provision# provision (if needed) then bring it up
 kirocrew pod up   <wt> --approval reads  # boot its gateway in an approval mode
 kirocrew pod up   <wt> --crons          # boot its gateway with the cron scheduler on
 kirocrew pod up   <wt> --no-embeddings  # boot without the embedding model (keyword-search fallback)
+kirocrew pod up   <wt> --wait-secs N    # override the 90s health-wait budget
 kirocrew pod up   <wt> --seed minimal  # pre-populate its HOME from a named scenario
 kirocrew pod scenarios [--json]        # list named scenarios and their descriptions
 kirocrew pod api  <wt> GET sessions    # authenticated request → fixed-key JSON
-kirocrew pod ls                   # what's running (≈ kubectl get pods) + orphaned HOMEs (with age)
-kirocrew pod prune [--all] [--dry-run]  # bulk-reclaim orphaned HOMEs (default: older than 3d; --all for every age)
-kirocrew pod status <wt>          # up/down + health
+kirocrew pod exec <wt> -- status        # run a kirocrew command in the pod environment
+kirocrew pod ls [--json]          # what's running (≈ kubectl get pods) + orphaned HOMEs (with age)
+kirocrew pod prune [--older-than 3d] [--all] [--dry-run] [--json]  # bulk-reclaim orphaned HOMEs
+kirocrew pod status <wt> [--json] # up/down + health
 kirocrew pod token  <wt> [--ttl]  # (re)mint a dashboard token for a running pod
 kirocrew pod url    <wt>          # print its base_url
 kirocrew pod logs   <wt> [-n N]   # tail its journal
@@ -46,13 +48,13 @@ kirocrew pod down   <wt>          # evict → delete its HOME, verified (zero re
 `<wt>` is a friendly worktree name. It is resolved to a checkout **git-natively**:
 `kirocrew pod up <name>` matches a linked worktree by its directory basename, its
 branch (`<name>` or `feat/<name>`), or an exact path — run it from inside any
-KiroCrew checkout (or set `KIROCREW_POD_REPO`). The resolved path is pinned so the
+Kiro Crew checkout (or set `KIROCREW_POD_REPO`). The resolved path is pinned so the
 pod's gateway boots without re-consulting git.
 
 ## The on-ramp (provisioning)
 
 A worktree must be *built* before it can be podded — an editable
-`.venv/bin/kirocrew` and a built SPA bundle (`src/kiro_crew/static/dist`). These
+`.venv/bin/kirocrew` (`.venv\Scripts\kirocrew.exe` on Windows) and a built SPA bundle (`src/kiro_crew/static/dist`). These
 are intrinsic to "a worktree that can run a gateway at all"; pod just surfaces
 and collapses them, honoring their very different costs:
 
@@ -60,6 +62,12 @@ and collapses them, honoring their very different costs:
 |---|---|---|
 | **venv** | ~1 min, idempotent | `pod up` **auto-builds** it on demand |
 | **dist** | minutes (Vite SPA build) | only on **explicit consent** |
+
+The venv is built with Python 3.12, found as `python3.12` in the usual POSIX
+locations and then on `PATH`. A python.org install on Windows ships `python.exe`
+and never a `python3.12.exe`, so there the `py` launcher is asked next
+(`py -3.12`): it is the platform's own index of installed interpreters, and it
+picks the right one on a host that has several.
 
 So plain `pod up <wt>` builds the cheap venv for you but **fails loud** if the
 dist is missing — pointing you at the slow build — while `pod up <wt> --provision`
@@ -216,14 +224,29 @@ response text and transport failures never include the authenticated URL.
 - **Payload** — the booted pod *is* the worktree's `.venv/bin/kirocrew gateway`. If
   the worktree's gateway can't start (bad import, broken config, unbuilt dist), the
   pod can't come up — **and that is correct**. `pod up` detects the crash fast,
-  prints the gateway's own journal, stops the half-started unit, and tells you this
-  is the worktree build failing — not the pod tool.
+  prints the gateway's own journal, and tells you this is the worktree build failing
+  — not the pod tool. It stops a unit it started itself, so a crash-looping gateway
+  is not left respawning; it reclaims the isolated home only when it created that
+  home too, and a pod it did not start is left alone for `pod down` to retire. If a
+  stop itself fails the message says so rather than claiming the pod was handled.
+
+Inside this package the control plane is `kiro_crew.pod.runtime`, the one namespace
+the verbs, Dev Fleet and the tests use. It holds the core — names, the per-pod env
+file, worktree resolution, the `systemd --user` adapter and platform dispatch, the
+lifecycle locks, seed sanitization and the pod environment — and re-exports six
+owners that build on it: `runtime_ports`, `runtime_attestation`, `runtime_client`,
+`runtime_home`, `runtime_lifecycle` and `runtime_boot`. A patch of a function or
+constant as `kiro_crew.pod.runtime.<name>` reaches the module that reads it; a
+module the runtime imports is patched by attribute (`runtime.time.sleep`), and
+rebinding it there is refused. What each owner
+holds is mapped in the Dev Fleet spec's
+[Pod runtime ownership](../../../docs/system-specs/modules/dev-fleet.md#pod-runtime-ownership).
 
 ## Mechanism (Linux `systemd --user`)
 
 `kirocrew pod install` writes a template unit `kirocrew-pod@.service` whose
 `ExecStart` re-enters `kirocrew pod _run <wt>` (boot logic lives in
-`kiro_crew.pod.runtime.boot`). Before each start, `pod up` writes a per-instance
+`kiro_crew.pod.runtime_boot.boot`, reached as `kiro_crew.pod.runtime.boot`). Before each start, `pod up` writes a per-instance
 drop-in that replaces the template's `ExecStart` with the resolved checkout's
 own `.venv/bin/kirocrew`; it refuses to fall back to a global install that may
 not understand the requested seed. `pod down` removes that drop-in and reloads
@@ -237,7 +260,7 @@ recreated the directory by reopening their audit log in append mode — and it a
 fired on the stop half of a `Restart=`, bringing the pod back on a home stripped
 of its sessions and config. So `kirocrew pod down` owns reclamation on every
 platform: it stops the service, waits for the unit's cgroup to drain, deletes the
-HOME through `runtime.cleanup_home` (which re-validates the name and refuses
+HOME through `runtime.cleanup_home` (defined in `runtime_home`; it re-validates the name and refuses
 `..`/absolute/empty, since teardown safety must not rely on systemd `%i`
 semantics), then VERIFIES the directory is gone and fails loudly if it is not.
 The trade is that a pod which goes away without a `down` — a crash, a raw
@@ -313,7 +336,7 @@ host may ship no `lsof` at all, and an unprivileged caller — which is how `pod
 runs — cannot see a socket held by a gateway the user's service manager started. `pod up` names the conflict and points at `PORT=` rather than blaming the
 worktree build, and pinning a colliding pod's own `PORT=` remains the manual way out.
 
-## Configuration (`PodConfig`, all `KIROCREW_POD_*`-overridable)
+## Configuration (`PodConfig` plus CLI and service-manager overrides)
 
 | env | default | meaning |
 |---|---|---|
@@ -321,10 +344,13 @@ worktree build, and pinning a colliding pod's own `PORT=` remains the manual way
 | `KIROCREW_POD_WORKTREES_ROOT` | (unset) | optional `name→path` fallback root (hermetic planes) |
 | `KIROCREW_POD_ROOT` | `~/.kirocrew-pods` | isolated pod HOMEs (reclaimed by `pod down`) |
 | `KIROCREW_POD_ENV_DIR` | `~/.kiro/crew/pods` | per-pod `CHECKOUT=`/`PORT=`/`SEED=` files |
+| `KIROCREW_POD_ARTIFACTS_DIR` | `<pod root>/.e2e-artifacts` | pod run logs and screenshots |
 | `KIROCREW_POD_BASE_PORT` | `7810` | port derivation base |
 | `KIROCREW_POD_LIVE_PORT` | `5476` | the port a pod must never bind |
-| `KIROCREW_POD_UNIT_PREFIX` | `kirocrew-pod` | systemd unit prefix |
-| `KIROCREW_POD_BIN` | (auto) | the `kirocrew` binary the unit boots |
+| `KIROCREW_POD_UNIT_PREFIX` | `kirocrew-pod` | service-manager unit/task prefix |
+| `KIROCREW_POD_PATH` | generated standard executable path | `PATH` handed to the booted gateway |
+| `KIROCREW_POD_HEALTH_SECS` | `90` | `pod up` health-wait budget; `--wait-secs` wins and the result is clamped to 5–3600 seconds |
+| `KIROCREW_POD_BIN` | (auto) | binary baked into the Linux template unit; `pod up` replaces it with the worktree binary through a per-instance drop-in |
 | `KIROCREW_POD_KIRO_BIN` | (unset) | agent backend pinned into the service definition as `KIROCREW_KIRO_BIN` |
 
 Overriding the prefix + roots + base port yields a fully **hermetic pod plane**
@@ -347,7 +373,7 @@ pod resolves the host's real `kiro-cli` exactly as before.
   the shared `~/.kiro/crew` data and refuses the live port.
 - Every pod's `config.json` forces `enabled=false` on the tunnel and on every
   channel that carries a config-level enable (`runtime.SEED_DISABLED_SECTIONS`),
-  and the booted env scrubs `SLACK_*`, `WECOM_*`, `MICROSOFT_APP_*` and non-AWS
+  and the booted env scrubs `SLACK_*`, `WECOM_*`, `MICROSOFT_APP_*`, `FEISHU_*` and non-AWS
   `*_TOKEN`, so a pod can never grab a live messaging identity — not even a
   seeded one, which is the point: `--seed ~/.kiro/crew` clones the real config.
   Pod HOME is `0700`; `config.json` is `0600`.
@@ -627,11 +653,19 @@ so pods used to fail with a bare `Failed to connect to bus: No medium found`.
 
 `runtime._systemctl_env()` backfills both when the socket
 (`$XDG_RUNTIME_DIR/bus`, else `/run/user/<uid>/bus`) actually exists; an
-explicitly-set value always wins. When the socket is genuinely absent — no login
-session and `Linger=no` — `require_systemd()` refuses with the fix
-(`loginctl enable-linger <user>`) instead of letting systemctl emit a message
-that names neither cause nor remedy. `kirocrew doctor` reports the same three
-states (present / absent / present-but-no-linger).
+explicitly-set value always wins. When the socket is genuinely absent the refusal
+depends on whether this host can have a per-user manager at all. With a manager
+unit installed — the template `user@.service`, or a hand-installed
+`user@<uid>.service` — the cause is a missing login session and `Linger=no`, so
+`require_systemd()` names the fix (`loginctl enable-linger <user>`). With no
+manager unit anywhere on systemd's load path, that remedy cannot work: there is
+no unit for linger to start, which is the case on Enterprise Linux 7 derivatives
+(RHEL 7, CentOS 7, Amazon Linux 2). `require_systemd()` then names the platform
+limit and points at `./dev-backend.sh` instead. `kirocrew doctor` checks for the
+manager unit BEFORE probing bus reachability, because a stray session
+`dbus-daemon` can create a socket on a host that has no manager behind it. With a
+manager unit present, doctor retains the shared probe's reachable / no-session /
+sandboxed-away / unclassified-failure diagnostics, and warns when linger is off.
 
 An explicitly-set `DBUS_SESSION_BUS_ADDRESS` stays trusted as an availability
 hint, because a stale address is never proof that no backend exists and that

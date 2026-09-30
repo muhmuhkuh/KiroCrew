@@ -747,7 +747,11 @@ def main() -> None:
         )
 
     package_dir = Path(__file__).resolve().parent
-    gate = package_dir / "config" / "pi-tool-gate.ts"
+    gate = (
+        Path(os.environ.get("KIROCREW_PI_GATE_EXTENSION", ""))
+        if os.environ.get("KIROCREW_PI_GATE_EXTENSION")
+        else package_dir / "config" / "pi-tool-gate.ts"
+    )
     prompt_path = Path(os.environ.get("KIROCREW_PI_PROMPT", ""))
     mcp_config = Path(os.environ.get("KIROCREW_PI_MCP_CONFIG", ""))
     mcp_adapter = Path(os.environ.get("KIROCREW_PI_MCP_ADAPTER", ""))
@@ -771,8 +775,7 @@ def main() -> None:
         "--no-prompt-templates",
         "--no-context-files",
         "--no-themes",
-        "--extension",
-        str(gate),
+        *([] if str(gate) in args else ["--extension", str(gate)]),
         "--extension",
         str(mcp_adapter),
         "--extension",

@@ -52,6 +52,8 @@ import reducer, {
   selectSlotPendingApproval,
   selectComposerBusy,
   confirmOptimisticSend,
+  markSendUnconfirmed,
+  selectTrailingSendUnconfirmed,
 } from '../store/chatSlice'
 import './mockApiClient'
 
@@ -348,18 +350,22 @@ describe('chatSlice reducers', () => {
     })
   })
 
-  it('setSlotStatusDetail updates kind, text, and ts', () => {
+  it('setSlotStatusDetail updates kind and ts, and keeps a server status label', () => {
     const now = Date.now()
-    const state = reducer(initial, setSlotStatusDetail({ slot: 'test-slot', kind: 'thinking', text: 'Thinking…', ts: now }))
+    const state = reducer(initial, setSlotStatusDetail({ slot: 'test-slot', kind: 'thinking', ts: now }))
     expect(state.slotStatusDetail['test-slot'].kind).toBe('thinking')
-    expect(state.slotStatusDetail['test-slot'].text).toBe('Thinking…')
+    // A fixed phase stores no copy: the label is resolved from `kind` at render time.
+    expect(state.slotStatusDetail['test-slot']).toEqual({ kind: 'thinking', ts: now })
     expect(state.slotStatusDetail['test-slot'].ts).toBe(now)
     // Tool name optional
-    const state2 = reducer(state, setSlotStatusDetail({ slot: 'test-slot', kind: 'tool', text: 'Tool: read', toolName: 'read', ts: now }))
+    const state2 = reducer(state, setSlotStatusDetail({ slot: 'test-slot', kind: 'tool', purpose: 'Tool: read', toolName: 'read', ts: now }))
     expect(state2.slotStatusDetail['test-slot'].toolName).toBe('read')
     // Idle clears
-    const state3 = reducer(state2, setSlotStatusDetail({ slot: 'test-slot', kind: 'idle', text: 'Ready', ts: now }))
+    const state3 = reducer(state2, setSlotStatusDetail({ slot: 'test-slot', kind: 'idle', ts: now }))
     expect(state3.slotStatusDetail['test-slot'].kind).toBe('idle')
+    // A server-supplied status is the one non-tool phase that carries a label.
+    const state4 = reducer(state3, setSlotStatusDetail({ slot: 'test-slot', kind: 'thinking', label: 'Compacting…', ts: now }))
+    expect(state4.slotStatusDetail['test-slot']).toEqual({ kind: 'thinking', label: 'Compacting…', ts: now })
   })
 
   it('clearMessages resets messages and pagination', () => {
@@ -1390,6 +1396,145 @@ describe('confirmOptimisticSend — the send response retires the pending state'
   })
 })
 
+/* The transport deadline fired with no receipt and no echo: the bubble is still
+ * `optimistic`, and nothing will clear that until a late echo does. The mark is
+ * what the row's pending line is drawn from -- the flag alone also survives a
+ * refused or connection-failed send and a queued receipt, none of which is a
+ * wait -- and it falls with the flag on both confirmation doors. */
+describe('markSendUnconfirmed — the deadline mark on a bubble whose receipt never came', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withSlot = { ...initial, activeSlot: 'slot-1' }
+  const bubble = (sendId: string, content = 'did this arrive?') =>
+    appendMessage({ role: 'user', content, cls: '', ts: '2026-09-28T10:00:00.000Z', meta: { sendId } })
+
+  it('marks the matching optimistic bubble and keeps its flag and sendId', () => {
+    let state = reducer(withSlot, bubble('s-late'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-late' }))
+    expect(state.messages[0].meta).toMatchObject({ optimistic: true, sendId: 's-late', deliveryUnconfirmed: true })
+  })
+
+  it('marks only the matching send, leaving a sibling bubble unmarked', () => {
+    let state = reducer(withSlot, bubble('s-a', 'first'))
+    state = reducer(state, bubble('s-b', 'second'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-b' }))
+    expect(state.messages[0].meta?.deliveryUnconfirmed).toBeUndefined()
+    expect(state.messages[1].meta?.deliveryUnconfirmed).toBe(true)
+  })
+
+  it('leaves a row an echo or receipt already confirmed alone', () => {
+    let state = reducer(withSlot, bubble('s-confirmed'))
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-confirmed', mid: 'm-1' }))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-confirmed' }))
+    expect(state.messages[0].meta?.deliveryUnconfirmed).toBeUndefined()
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('is a no-op for an unknown sendId', () => {
+    let state = reducer(withSlot, bubble('s-mine'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-someone-else' }))
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].meta?.deliveryUnconfirmed).toBeUndefined()
+  })
+
+  it('marks a background slot bubble in slotMessages (the user switched sessions inside the deadline)', () => {
+    let state = reducer(withSlot, appendSlotMessage({
+      slot: 'pane-9',
+      message: { role: 'user', content: 'pane send', cls: '', ts: '2026-09-28T10:00:00.000Z', meta: { sendId: 's-pane' } } as ChatMessage,
+    }))
+    state = reducer(state, markSendUnconfirmed({ slot: 'pane-9', sendId: 's-pane' }))
+    expect(state.slotMessages['pane-9'][0].meta?.deliveryUnconfirmed).toBe(true)
+  })
+
+  it('falls with the flag when the receipt arrives after all', () => {
+    let state = reducer(withSlot, bubble('s-late-receipt'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-late-receipt' }))
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-late-receipt', mid: 'm-2' }))
+    expect(state.messages[0].meta?.deliveryUnconfirmed).toBeUndefined()
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    expect(state.messages[0].meta?.mid).toBe('m-2')
+  })
+
+  it('falls with the flag when a correlated echo lands', () => {
+    let state = reducer(withSlot, bubble('s-late-echo'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-late-echo' }))
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'did this arrive?', cls: '', ts: '2026-09-28T10:00:05.000Z',
+      meta: { sendId: 's-late-echo', mid: 'm-3' },
+    }))
+    expect(state.messages).toHaveLength(1)
+    expect(state.messages[0].meta?.deliveryUnconfirmed).toBeUndefined()
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+    expect(state.messages[0].meta?.mid).toBe('m-3')
+  })
+})
+
+/* The footer's running indicator reads this: while the newest send is still
+ * unconfirmed the transcript already says "pending" on the bubble and in the
+ * WARN notice under it, so "Thinking…" beneath both would claim the agent is
+ * working on a message nothing proves it received. The two confirmation doors
+ * (`confirmOptimisticSend`, the correlated echo) clear the mark, and the
+ * selector follows the mark, never `optimistic` alone. */
+describe('selectTrailingSendUnconfirmed — the newest send is a bubble whose receipt never came', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const withSlot = { ...initial, activeSlot: 'slot-1' }
+  const wrap = (chat: typeof initial) => ({ chat }) as unknown as RootState
+  const bubble = (sendId: string, content = 'did this arrive?') =>
+    appendMessage({ role: 'user', content, cls: '', ts: '2026-09-28T10:00:00.000Z', meta: { sendId } })
+  /** The WARN row the `response-late` arm posts directly under the bubble. */
+  const notice = () => appendMessage({ role: 'notice', content: '\u26A0\uFE0F Delivery not confirmed', cls: '' })
+
+  it('is true while the trailing user row carries the deadline mark, looking past the notice under it', () => {
+    let state = reducer(withSlot, bubble('s-late'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-late' }))
+    state = reducer(state, notice())
+    expect(selectTrailingSendUnconfirmed(wrap(state))).toBe(true)
+  })
+
+  it('is false once the receipt confirms the send after all', () => {
+    let state = reducer(withSlot, bubble('s-late-receipt'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-late-receipt' }))
+    state = reducer(state, notice())
+    expect(selectTrailingSendUnconfirmed(wrap(state))).toBe(true)
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-late-receipt', mid: 'm-2' }))
+    expect(selectTrailingSendUnconfirmed(wrap(state))).toBe(false)
+  })
+
+  it('is false once a correlated echo clears the mark', () => {
+    let state = reducer(withSlot, bubble('s-late-echo'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-late-echo' }))
+    state = reducer(state, notice())
+    state = reducer(state, sseChatMessage({
+      slot: 'slot-1', role: 'user', content: 'did this arrive?', cls: '', ts: '2026-09-28T10:00:05.000Z',
+      meta: { sendId: 's-late-echo', mid: 'm-3' },
+    }))
+    expect(selectTrailingSendUnconfirmed(wrap(state))).toBe(false)
+  })
+
+  it('is false for a confirmed send that was never marked', () => {
+    let state = reducer(withSlot, bubble('s-ok'))
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-ok', mid: 'm-1' }))
+    expect(selectTrailingSendUnconfirmed(wrap(state))).toBe(false)
+  })
+
+  it('is false for an optimistic bubble the deadline has not reached (the flag alone does not decide)', () => {
+    const state = reducer(withSlot, bubble('s-in-flight'))
+    expect(state.messages[0].meta?.optimistic).toBe(true)
+    expect(selectTrailingSendUnconfirmed(wrap(state))).toBe(false)
+  })
+
+  it('is false when an assistant row trails the marked bubble: the agent is visibly working', () => {
+    let state = reducer(withSlot, bubble('s-late'))
+    state = reducer(state, markSendUnconfirmed({ slot: 'slot-1', sendId: 's-late' }))
+    state = reducer(state, notice())
+    state = reducer(state, appendMessage({ role: 'assistant', content: 'on it', cls: '', ts: '2026-09-28T10:00:09.000Z' }))
+    expect(selectTrailingSendUnconfirmed(wrap(state))).toBe(false)
+  })
+
+  it('is false on an empty transcript', () => {
+    expect(selectTrailingSendUnconfirmed(wrap(withSlot))).toBe(false)
+  })
+})
+
 describe('sseChatMessage — _segment handling', () => {
   const initial = reducer(undefined, { type: '@@INIT' })
   const withSlot = { ...initial, activeSlot: 'slot-1' }
@@ -1697,14 +1842,15 @@ describe('activity viewer reducers', () => {
     expect(state.toolLog).toHaveLength(0)
   })
 
-  it('sseToolResult stores an output at the ceiling verbatim', () => {
+  it('sseToolResult stores an output at the ceiling verbatim, with no seam', () => {
     let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '' }))
     const exact = 'a'.repeat(TOOL_OUTPUT_MAX_CHARS)
     state = reducer(state, sseToolResult({ slot: 'slot-1', output: exact }))
     expect(state.toolLog[0].output).toBe(exact)
+    expect(state.toolLog[0].output_cut).toBeUndefined()
   })
 
-  it('sseToolResult clamps an oversize output to head + marker + tail', () => {
+  it('sseToolResult clamps an oversize output to head + tail and records the seam', () => {
     let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '' }))
     const head = 'H'.repeat(60_000)
     const middle = 'M'.repeat(500_000)
@@ -1714,18 +1860,32 @@ describe('activity viewer reducers', () => {
     // Bounded, and by a wide margin: the middle is gone.
     expect(out.length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
     expect(out).not.toContain('M')
-    // Head first, tail last, marker between.
+    // Head first, tail last, one newline between.
     expect(out.startsWith('H')).toBe(true)
     expect(out.endsWith('T')).toBe(true)
-    expect(out).toContain('truncated')
+    // The store holds NO rendered marker: that is a locale string and belongs
+    // to the renderer. The seam is structural.
+    expect(out).not.toContain('truncated')
+    expect(state.toolLog[0].output_cut).toEqual({ at: 48_001, count: 620_000 - 48_000 - 12_000 })
+    expect(out[state.toolLog[0].output_cut!.at - 1]).toBe('\n')
   })
 
   it('sseToolResult clamps the background slot log the same way', () => {
     let state = reducer(withSlot, sseToolActivity({ slot: 'slot-2', tool: 'sh', kind: 'execute', purpose: '', input_preview: '' }))
     state = reducer(state, sseToolResult({ slot: 'slot-2', output: 'Z'.repeat(TOOL_OUTPUT_MAX_CHARS * 4) }))
-    const out = state.slotActivity['slot-2'].toolLog[0].output ?? ''
-    expect(out.length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
-    expect(out).toContain('truncated')
+    const entry = state.slotActivity['slot-2'].toolLog[0]
+    expect((entry.output ?? '').length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
+    expect(entry.output_cut).toEqual({ at: 48_001, count: TOOL_OUTPUT_MAX_CHARS * 4 - 60_000 })
+  })
+
+  it('a later result at or under the ceiling clears a stale seam', () => {
+    let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '', tool_call_id: 'tc-re' }))
+    state = reducer(state, sseToolResult({ slot: 'slot-1', output: 'Z'.repeat(TOOL_OUTPUT_MAX_CHARS * 2), tool_call_id: 'tc-re' }))
+    expect(state.toolLog[0].output_cut).toBeDefined()
+    state = reducer(state, sseToolResult({ slot: 'slot-1', output: 'short', tool_call_id: 'tc-re' }))
+    expect(state.toolLog[0].output).toBe('short')
+    // A leftover offset would make the renderer split the new text.
+    expect(state.toolLog[0].output_cut).toBeUndefined()
   })
 
   it('clampToolOutput snaps both cuts to line breaks and counts the elided characters', () => {
@@ -1734,56 +1894,59 @@ describe('activity viewer reducers', () => {
     const rows = Array.from({ length: 6_000 }, (_, i) => `line ${String(i + 1).padStart(5, '0')} passed`)
     const raw = rows.join('\n')
     expect(raw.length).toBeGreaterThan(TOOL_OUTPUT_MAX_CHARS)
-    const out = clampToolOutput(raw)
-    const lines = out.split('\n')
-    const marker = lines.findIndex(l => l.includes('truncated'))
-    expect(marker).toBeGreaterThan(0)
-    // Every line on either side of the marker is a whole source row: no
-    // mid-line fragment right above or right below it.
-    expect(lines[marker - 1]).toMatch(/^line \d{5} passed$/)
-    expect(lines[marker + 1]).toMatch(/^line \d{5} passed$/)
-    expect(lines[0]).toBe(rows[0])
-    expect(lines[lines.length - 1]).toBe(rows[rows.length - 1])
-    expect(out.length).toBeLessThanOrEqual(TOOL_OUTPUT_MAX_CHARS)
-    // The marker states exactly how much sits between head and tail.
-    const head = lines.slice(0, marker).join('\n')
-    const tail = lines.slice(marker + 1).join('\n')
+    const { text, cut } = clampToolOutput(raw)
+    expect(cut).not.toBeNull()
+    const head = text.slice(0, cut!.at - 1)
+    const tail = text.slice(cut!.at)
+    // The seam sits on its own newline, and every line on either side of it is
+    // a whole source row: no mid-line fragment right above or right below.
+    expect(text[cut!.at - 1]).toBe('\n')
+    expect(head.split('\n').at(-1)).toMatch(/^line \d{5} passed$/)
+    expect(tail.split('\n')[0]).toMatch(/^line \d{5} passed$/)
+    expect(text.split('\n')[0]).toBe(rows[0])
+    expect(text.split('\n').at(-1)).toBe(rows[rows.length - 1])
+    expect(text.length).toBeLessThanOrEqual(TOOL_OUTPUT_MAX_CHARS)
+    // Head and tail are verbatim slices, and the count is exactly what sits
+    // between them.
     expect(raw.startsWith(head)).toBe(true)
     expect(raw.endsWith(tail)).toBe(true)
-    const elided = raw.length - head.length - tail.length
-    expect(lines[marker]).toBe(`…(${elided} characters truncated — full output on reload)`)
+    expect(cut!.count).toBe(raw.length - head.length - tail.length)
+    expect(text).toBe(head + '\n' + tail)
   })
 
   it('clampToolOutput keeps the raw offsets when a slice has no line break', () => {
     const raw = 'H'.repeat(60_000) + 'T'.repeat(60_000)
-    const out = clampToolOutput(raw)
-    expect(out.startsWith('H'.repeat(48_000) + '\n')).toBe(true)
-    expect(out.endsWith('\n' + 'T'.repeat(12_000))).toBe(true)
-    expect(out).toContain('(60000 characters truncated')
+    const { text, cut } = clampToolOutput(raw)
+    expect(text).toBe('H'.repeat(48_000) + '\n' + 'T'.repeat(12_000))
+    expect(cut).toEqual({ at: 48_001, count: 60_000 })
     // A single trailing newline must not empty the tail.
     const oneLine = 'x'.repeat(100_000) + '\n'
-    expect(clampToolOutput(oneLine).endsWith('\n' + 'x'.repeat(11_999) + '\n')).toBe(true)
+    expect(clampToolOutput(oneLine).text.endsWith('\n' + 'x'.repeat(11_999) + '\n')).toBe(true)
   })
 
   it('clampToolOutput limits line snapping to the window around each raw cut', () => {
     const farBeforeHead = 'H'.repeat(200) + '\n' + 'x'.repeat(119_799)
     const headOut = clampToolOutput(farBeforeHead)
-    expect(headOut.slice(0, 48_000)).toBe(farBeforeHead.slice(0, 48_000))
-    expect(headOut[48_000]).toBe('\n')
-    expect(headOut).toContain('(60000 characters truncated')
+    expect(headOut.text.slice(0, 48_000)).toBe(farBeforeHead.slice(0, 48_000))
+    expect(headOut.text[48_000]).toBe('\n')
+    expect(headOut.cut).toEqual({ at: 48_001, count: 60_000 })
 
     const farAfterTail = 'x'.repeat(113_000) + '\n' + 'T'.repeat(6_999)
     const tailOut = clampToolOutput(farAfterTail)
-    expect(tailOut.endsWith('\n' + farAfterTail.slice(108_000))).toBe(true)
-    expect(tailOut).toContain('(60000 characters truncated')
+    expect(tailOut.text.endsWith('\n' + farAfterTail.slice(108_000))).toBe(true)
+    expect(tailOut.cut?.count).toBe(60_000)
+  })
+
+  it('clampToolOutput returns the input untouched under the ceiling', () => {
+    expect(clampToolOutput('short')).toEqual({ text: 'short', cut: null })
+    const exact = 'a'.repeat(TOOL_OUTPUT_MAX_CHARS)
+    expect(clampToolOutput(exact)).toEqual({ text: exact, cut: null })
   })
 
   it('clampToolOutput materializes the exact clamped text through Array#join', () => {
     const raw = 'H'.repeat(60_000) + 'T'.repeat(60_000)
-    const expected = raw.slice(0, 48_000)
-      + '\n…(60000 characters truncated — full output on reload)\n'
-      + raw.slice(108_000)
-    expect(clampToolOutput(raw)).toBe(expected)
+    const expected = raw.slice(0, 48_000) + '\n' + raw.slice(108_000)
+    expect(clampToolOutput(raw).text).toBe(expected)
     expect(clampToolOutput.toString()).toMatch(/\.join\((['"])\1\)/)
   })
 
@@ -1791,12 +1954,22 @@ describe('activity viewer reducers', () => {
     const big = 'I'.repeat(TOOL_OUTPUT_MAX_CHARS * 4)
     let state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: big, tool_call_id: 'tc-in' }))
     expect(state.toolLog[0].input?.length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
-    expect(state.toolLog[0].input).toContain('truncated')
+    expect(state.toolLog[0].input).not.toContain('truncated')
+    expect(state.toolLog[0].input_cut).toEqual({ at: 48_001, count: TOOL_OUTPUT_MAX_CHARS * 4 - 60_000 })
     state = reducer(state, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: 'J'.repeat(TOOL_OUTPUT_MAX_CHARS * 4), tool_call_id: 'tc-in', is_update: true }))
     expect(state.toolLog).toHaveLength(1)
     expect(state.toolLog[0].input?.length).toBeLessThan(TOOL_OUTPUT_MAX_CHARS + 64)
     expect(state.toolLog[0].input?.startsWith('J')).toBe(true)
-    expect(state.toolLog[0].input).toContain('truncated')
+    expect(state.toolLog[0].input_cut).toEqual({ at: 48_001, count: TOOL_OUTPUT_MAX_CHARS * 4 - 60_000 })
+    // An update that brings the input back under the ceiling drops the seam.
+    state = reducer(state, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: '{"command":"ls"}', tool_call_id: 'tc-in', is_update: true }))
+    expect(state.toolLog[0].input).toBe('{"command":"ls"}')
+    expect(state.toolLog[0].input_cut).toBeUndefined()
+  })
+
+  it('an unclamped push carries no input_cut key at all', () => {
+    const state = reducer(withSlot, sseToolActivity({ slot: 'slot-1', tool: 'sh', kind: 'execute', purpose: '', input_preview: 'ls' }))
+    expect('input_cut' in state.toolLog[0]).toBe(false)
   })
 
   it('streamed answer chunks are not duplicated into the tool log', () => {
@@ -2272,7 +2445,7 @@ describe('slotHistory — session navigation stack', () => {
       loadingOlder: true,
       lastChunkSeq: 99,
       _wsChunkedDuringFetch: true,
-      slotStatusDetail: { x: { kind: 'tool', text: 'hi', ts: 1 } },
+      slotStatusDetail: { x: { kind: 'tool', purpose: 'hi', ts: 1 } },
       voicePlaying: true,
       voiceAudio: 'base64data',
     }
@@ -3058,6 +3231,71 @@ describe('creatingSlot — New Chat pending flag', () => {
     expect(state.creatingSlot).toBe(true)
     state = reducer(state, rejected)
     expect(state.creatingSlot).toBe(false)
+  })
+})
+
+describe('create activation tracking — which create activated which slot', () => {
+  const initial = reducer(undefined, { type: '@@INIT' })
+  const pending = (requestId: string, arg?: { activate?: boolean }) => ({ type: 'chat/createSlot/pending', meta: { arg, requestId, requestStatus: 'pending' as const } })
+  const fulfilled = (requestId: string, origin: string | null, key: string, activate = true) => ({
+    type: 'chat/createSlot/fulfilled',
+    meta: { arg: undefined, requestId, requestStatus: 'fulfilled' as const, originActiveSlot: origin, activate },
+    payload: { key },
+  })
+  const rejected = (requestId: string) => ({ type: 'chat/createSlot/rejected', meta: { arg: undefined, requestId, requestStatus: 'rejected' as const }, error: {} })
+
+  it('records the activated slot with the requestId of the create that activated it', () => {
+    let state = reducer({ ...initial, activeSlot: 'A' }, pending('r1'))
+    expect(state.foregroundCreateId).toBe('r1')
+    state = reducer(state, fulfilled('r1', 'A', 'new-slot'))
+    expect(state.activeSlot).toBe('new-slot')
+    expect(state.lastCreatedActivation).toEqual({ slot: 'new-slot', requestId: 'r1' })
+    expect(state.foregroundCreateId).toBeNull()
+  })
+
+  it('records no activation when the user switched away during the create', () => {
+    const state = reducer(reducer({ ...initial, activeSlot: 'B' }, pending('r1')), fulfilled('r1', 'A', 'new-slot'))
+    expect(state.activeSlot).toBe('B')
+    expect(state.lastCreatedActivation).toBeNull()
+  })
+
+  it('a background create neither arms a foreground create nor records an activation', () => {
+    let state = reducer({ ...initial, activeSlot: 'A' }, pending('bg', { activate: false }))
+    expect(state.foregroundCreateId).toBeNull()
+    state = reducer(state, fulfilled('bg', 'A', 'bg-slot', false))
+    expect(state.activeSlot).toBe('A')
+    expect(state.lastCreatedActivation).toBeNull()
+  })
+
+  it('a background create resolving does not clear a foreground create still in flight', () => {
+    let state = reducer({ ...initial, activeSlot: 'A' }, pending('bg', { activate: false }))
+    state = reducer(state, pending('fg'))
+    state = reducer(state, fulfilled('bg', 'A', 'bg-slot', false))
+    expect(state.foregroundCreateId).toBe('fg')
+    state = reducer(state, fulfilled('fg', 'A', 'fg-slot'))
+    expect(state.lastCreatedActivation).toEqual({ slot: 'fg-slot', requestId: 'fg' })
+  })
+
+  it('a second foreground create takes over the pending id, and the first one activating carries its own id', () => {
+    let state = reducer({ ...initial, activeSlot: 'A' }, pending('r1'))
+    state = reducer(state, pending('r2'))
+    expect(state.foregroundCreateId).toBe('r2')
+    state = reducer(state, fulfilled('r1', 'A', 'slot-1'))
+    expect(state.lastCreatedActivation).toEqual({ slot: 'slot-1', requestId: 'r1' })
+    expect(state.foregroundCreateId).toBe('r2')
+  })
+
+  it('a rejected create clears its own pending id only', () => {
+    let state = reducer({ ...initial, activeSlot: 'A' }, pending('r1'))
+    state = reducer(state, rejected('r1'))
+    expect(state.foregroundCreateId).toBeNull()
+    state = reducer(reducer(state, pending('r2')), rejected('r1'))
+    expect(state.foregroundCreateId).toBe('r2')
+  })
+
+  it('the next foreground create clears the previous activation', () => {
+    const state = reducer({ ...initial, activeSlot: 'A', lastCreatedActivation: { slot: 'old', requestId: 'r0' } }, pending('r1'))
+    expect(state.lastCreatedActivation).toBeNull()
   })
 })
 

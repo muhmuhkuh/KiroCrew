@@ -7,10 +7,12 @@ narrowing, and mtime hot-reload.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -946,15 +948,35 @@ def test_under_lock_restat_commits_fingerprint_of_published_snapshot(profiles_di
     assert calls["n"] == 0, "a converged store must not reload again on the next access"
 
 
+class _ChmodStat:
+    """What a ``chmod`` leaves behind: ``st_ctime_ns`` moved, nothing else did.
+
+    Every other field is the real ``os.stat_result``'s, so ``is_file()`` / mode /
+    size / mtime readers see the unchanged inode; only the fingerprint's ctime
+    term observes the metadata write.
+    """
+
+    def __init__(self, real: os.stat_result, shift_ns: int) -> None:
+        self._real = real
+        self.st_ctime_ns = real.st_ctime_ns + shift_ns
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
 def test_unreadable_profile_recovers_on_ctime_change(profiles_dir, monkeypatch):
     # A chmod that FIXES perms on an unreadable profile changes ctime but NOT
-    # mtime/size — so the fingerprint must
-    # include ctime, else the unreadable fallback stays cached forever and the
-    # profile's restrictions remain bypassed. Simulate: file readable → unreadable
-    # (fallback) → readable again with ONLY ctime bumped → must re-read.
-    import os
-    from pathlib import Path
-
+    # mtime/size — so the fingerprint must include ctime, else the unreadable
+    # fallback (deny-all) stays cached forever and the profile never recovers its
+    # real permissions. Sequence: file readable → unreadable (deny-all fallback)
+    # → readable again with ONLY ctime moved → must re-read.
+    #
+    # The ctime move is CONSTRUCTED through the seam the fingerprint reads
+    # (``Path.stat`` on the profile) rather than performed by a real ``chmod``:
+    # the kernel stamps ctime from a coarse clock, so a chmod issued within the
+    # same tick as the preceding ``utime`` leaves ``st_ctime_ns`` unchanged, and a
+    # test that waited for the filesystem to move it was measuring timestamp
+    # granularity (and skipping most runs), not the store.
     path = profiles_dir / "cron.json"
     path.write_text(
         json.dumps(
@@ -966,37 +988,54 @@ def test_unreadable_profile_recovers_on_ctime_change(profiles_dir, monkeypatch):
         )
     )
     gp.reset_store()
-    assert gp.resolve_active_scope("cron:j:r") is not None  # last-known-good
+    prof = gp.resolve_active_scope("cron:j:r")
+    assert prof is not None and resolve(None, prof, "tools", "read").permitted
 
     real_read_text = Path.read_text
-    state = {"fail": True}
+    real_stat = Path.stat
+    state = {"fail": True, "ctime_shift_ns": 0}
+    reads = {"ok": 0}
     target = str(path)
 
-    def _patched(self, *a, **k):
-        if str(self) == target and state["fail"]:
-            raise OSError("EACCES")
+    def _patched_read_text(self, *a, **k):
+        if str(self) == target:
+            if state["fail"]:
+                raise OSError(errno.EACCES, "EACCES")
+            reads["ok"] += 1
         return real_read_text(self, *a, **k)
 
-    monkeypatch.setattr(Path, "read_text", _patched)
-    # Make it unreadable and bump mtime so the store reloads and hits the failure.
+    def _patched_stat(self, *a, **k):
+        st = real_stat(self, *a, **k)
+        if str(self) == target and state["ctime_shift_ns"]:
+            return _ChmodStat(st, state["ctime_shift_ns"])
+        return st
+
+    monkeypatch.setattr(Path, "read_text", _patched_read_text)
+    monkeypatch.setattr(Path, "stat", _patched_stat)
+
+    # Make it unreadable, with an EXPLICIT mtime bump so the fingerprint moves and
+    # the reload hits the failure. The bind is preserved but the permissions fail
+    # CLOSED: the fallback denies what the real profile allowed.
     st = path.stat()
-    os.utime(path, (st.st_atime, st.st_mtime + 5))
-    # Preserved (last-known-good) while unreadable — still resolves.
-    assert gp.resolve_active_scope("cron:j:r") is not None
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    unreadable = gp.resolve_active_scope("cron:j:r")
+    assert unreadable is not None, "the bind must survive an unreadable profile"
+    assert not resolve(None, unreadable, "tools", "read").permitted
 
-    # Now perms are "fixed": readable again, but ONLY ctime changes (a chmod does
-    # not touch mtime/size). Force a ctime bump by leaving mtime/size identical and
-    # relying on the fingerprint including st_ctime_ns. On most FSes any metadata
-    # write bumps ctime; simulate by re-writing identical bytes then restoring mtime.
+    # Perms are "fixed" (the read now succeeds) but NOTHING in the fingerprint has
+    # moved yet: the deny-all fallback is served from cache and the file is not
+    # re-read. This is the negative control that gives the ctime step below its
+    # discriminating power.
     state["fail"] = False
-    before_ct = path.stat().st_ctime_ns
-    os.chmod(path, 0o644)  # a real chmod — bumps ctime, not mtime/size
-    # If the platform's chmod didn't move ctime (rare), skip rather than false-fail.
-    if path.stat().st_ctime_ns == before_ct:
-        import pytest as _pytest
+    cached = gp.resolve_active_scope("cron:j:r")
+    assert reads["ok"] == 0, "an unchanged fingerprint must not trigger a re-read"
+    assert cached is not None and not resolve(None, cached, "tools", "read").permitted
 
-        _pytest.skip("platform chmod did not change st_ctime_ns")
+    # The chmod: ctime moves, mtime/size do not. The fingerprint's ctime term is
+    # the only thing that can bust the cache here.
+    state["ctime_shift_ns"] = 1
     prof = gp.resolve_active_scope("cron:j:r")
+    assert reads["ok"] >= 1, "a ctime-only change must force a re-read"
     assert prof is not None and prof.name == "cron"
     assert resolve(None, prof, "tools", "read").permitted
 
@@ -1365,6 +1404,112 @@ def test_no_profiles_dir_is_safe(tmp_path, monkeypatch):
         gp.reset_store()
 
 
+def test_the_cold_load_barrier_never_blocks_the_event_loop(profiles_dir, monkeypatch):
+    """A loop-thread caller must not wait on a cold load another thread owns.
+
+    This path is pinned as never blocking on the event loop: the synchronous
+    tool-approval gate runs there, so waiting on another thread's filesystem I/O
+    stalls every other task on that loop. The barrier is confined to callers holding
+    their own thread, and a loop caller keeps the unresolved fail-closed answer.
+    """
+    import asyncio
+    import time
+
+    (profiles_dir / "host.json").write_text(
+        json.dumps(
+            {
+                "name": "host",
+                "bind": {"type": "surface", "id": "host"},
+                "channels": {"members": {"mode": "allow", "allow": ["slack"]}},
+            }
+        )
+    )
+    gp.reset_store()
+    try:
+        store = gp._STORE
+        assert not store._snap.loaded, "precondition: the store must be cold"
+        assert store._lock.acquire(blocking=False), "precondition: own the reload lock"
+        try:
+
+            async def _resolve_on_the_loop():
+                started = time.monotonic()
+                prof = gp.resolve_active_scope(gp.HOST_SESSION_KEY)
+                return time.monotonic() - started, prof
+
+            elapsed, prof = asyncio.run(_resolve_on_the_loop())
+        finally:
+            store._lock.release()
+
+        assert elapsed < gp._COLD_LOAD_WAIT_S / 2, (
+            f"a loop-thread caller waited {elapsed:.2f}s for a cold load another "
+            f"thread owned; the barrier must be confined to off-loop callers"
+        )
+        assert prof is not None and prof.name.startswith(
+            "_deny_all_unloaded"
+        ), f"a loop caller keeps the unresolved fail-closed answer; got {prof}"
+    finally:
+        gp.reset_store()
+
+
+def test_a_concurrent_cold_load_does_not_deny_the_loser(profiles_dir, monkeypatch):
+    """Two first-touch callers must both resolve: the store serialises its cold load.
+
+    A loser refused outright here -- denied by nothing but the presence of its
+    sibling -- silently drops a real delivery on the first note after a restart. The
+    store owns that window, so the loser waits for the owner's load and reads its
+    result instead of being turned away.
+    """
+    import threading
+    import time
+
+    (profiles_dir / "host.json").write_text(
+        json.dumps(
+            {
+                "name": "host",
+                "bind": {"type": "surface", "id": "host"},
+                "channels": {"members": {"mode": "allow", "allow": ["slack"]}},
+            }
+        )
+    )
+    gp.reset_store()
+    try:
+        store = gp._STORE
+        assert not store._snap.loaded, "precondition: the store must be cold"
+        real_reload = store._reload
+        owns_the_load = threading.Event()
+
+        def _slow_reload(directory):
+            owns_the_load.set()
+            time.sleep(0.3)
+            return real_reload(directory)
+
+        monkeypatch.setattr(store, "_reload", _slow_reload)
+        got: "dict[str, object]" = {}
+
+        def _resolve(tag):
+            got[tag] = gp.resolve_active_scope(gp.HOST_SESSION_KEY)
+
+        winner = threading.Thread(target=_resolve, args=("winner",), daemon=True)
+        winner.start()
+        assert owns_the_load.wait(5.0), "precondition: one thread must own the cold load"
+        loser = threading.Thread(target=_resolve, args=("loser",), daemon=True)
+        loser.start()
+        winner.join(15)
+        loser.join(15)
+
+        assert set(got) == {"winner", "loser"}, f"both callers must answer; got {set(got)}"
+        for tag, prof in got.items():
+            assert prof is not None, f"{tag} resolved to policy-only"
+            assert not prof.name.startswith(
+                "_deny_all_unloaded"
+            ), f"{tag} was denied for the cold load a sibling owned: {prof.name}"
+        assert (
+            got["winner"].name == got["loser"].name == "host"
+        ), f"both must read the same loaded snapshot; got {got}"
+    finally:
+        gp.reset_store()
+
+
 def test_resolution_is_checked_before_bind_lookups(profiles_dir, monkeypatch):
     # Resolution must be confirmed BEFORE any bind
     # lookup, not after. Checking afterwards is a check-AFTER-use: the lookup can
@@ -1387,6 +1532,9 @@ def test_resolution_is_checked_before_bind_lookups(profiles_dir, monkeypatch):
     assert not store._snap.loaded
 
     # Hold the reload lock: the caller is an unprimed contender that cannot load.
+    # The holder never publishes, so this exercises the barrier's TIMEOUT floor;
+    # shorten the wait because the assertions below are about ordering, not duration.
+    monkeypatch.setattr(gp, "_COLD_LOAD_WAIT_S", 0.01)
     assert store._lock.acquire(blocking=False)
     try:
         looked_up: "list[object]" = []

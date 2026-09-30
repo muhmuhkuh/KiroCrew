@@ -18,11 +18,17 @@ import type { RootState } from '../store'
 
 // --- Stub child components ---
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
-vi.mock('../components/ChatInput', () => ({
-  default: ({ value }: { value: string }) => (
-    <textarea aria-label="test chat input" value={value} readOnly />
-  ),
-}))
+vi.mock('../components/ChatInput', async () => {
+  // The page hands the text over through the Composer root's draft store, not
+  // a `value` prop, so the stand-in reads it the way the real ChatInput does.
+  const { useComposerDraftText } = await import('../chat-core/composer/Composer')
+  return {
+    default: function ChatInputStub({ value }: { value?: string }) {
+      const draft = useComposerDraftText()
+      return <textarea aria-label="test chat input" value={draft ?? value ?? ''} readOnly />
+    },
+  }
+})
 vi.mock('../components/PendingQuestionCard', () => ({
   default: ({ onFallbackSend }: { onFallbackSend: (text: string) => void }) => (
     <button aria-label="send stale question fallback" onClick={() => onFallbackSend('Public only')}>
@@ -47,7 +53,6 @@ vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, 
 vi.mock('../pages/chat/ChatSettings', () => ({ loadChatConfig: () => ({ contentWidth: 'compact' }), CONTENT_WIDTH: { compact: { messages: '900px', input: '916px' }, comfortable: { messages: '84%', input: '85%' }, full: { messages: '92%', input: '93%' } } }))
 
 // --- Stub hooks ---
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
 vi.mock('../hooks/useFilteredDropdown', () => ({ useFilteredDropdown: () => ({ filtered: [], query: '', setQuery: vi.fn(), selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn() }) }))

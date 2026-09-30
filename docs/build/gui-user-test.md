@@ -21,14 +21,14 @@ while the code holding credentials is not. `pr-readiness.yml` does not read this
 
 | Path | Role |
 |---|---|
-| `.github/workflows/gui-user-test.yml` | Triggers, boot, run, artifact, PR comment, nightly issue, lane status. |
-| `scripts/gui-user-test/boot.sh` | Xvfb -> `seed_home.py` -> `python -m kiro_crew gateway --test-mode --approval yolo --no-crons` on the packaged fake ACP backend -> Chromium at the dashboard URL. Writes `target.env` (origin + one-time token, mode 0600) and `pids`. Also stages the sample notes folder at a fixed path (see "Seeds" below). |
-| `scripts/gui-user-test/seed_home.py` | Copies a fixture into `$KIROCREW_HOME` through `kiro_crew.seed` and adds `config.agents.<slug>` for each `--member` so the Crew Members page has a roster. |
-| `scripts/gui-user-test/teardown.sh` | Kills the three process groups and removes the scratch home, the browser profile and the sample notes folder. |
+| `.github/workflows/gui-user-test.yml` | Triggers, boot, run, artifact, run summary, nightly issue, lane status. |
+| `scripts/gui-user-test/boot.sh` | Xvfb -> `seed_home.py` -> `python -m kiro_crew gateway --test-mode --approval yolo --no-crons` on the packaged fake ACP backend -> Chromium at the dashboard URL. Writes `target.env` (origin + one-time token, mode 0600) and `pids`. Also stages the sample notes folder and the sample project at a fixed path (see "Seeds" below). |
+| `scripts/gui-user-test/seed_home.py` | Copies a fixture into `$KIROCREW_HOME` through `kiro_crew.seed` adds `config.agents.<slug>` for each `--member` so the Crew Members page has a roster, and with `--project` gives the pinned starter session (`dashboard_starter.jsonl`) the staged sample project. |
+| `scripts/gui-user-test/teardown.sh` | Kills the three process groups and removes the scratch home, the browser profile and the staged sample folders. |
 | `test/gui_user/harness.py` | The screenshot -> Bedrock Messages API -> action loop with the step, time and budget gates. |
 | `test/gui_user/x11.py` | Screenshots (Pillow `ImageGrab`) and input (`xdotool`); coordinate scaling, key aliases and argv building are pure and unit-tested. |
 | `test/gui_user/scenarios.py` + `scenarios/*.yaml` | The scenario DSL (including the `FEATURES` registry) and the shipped scenarios. |
-| `test/gui_user/report.py` | Renders `summary.json` into `verdict.md`, the PR comment and the nightly issue, all grouped by feature; renders `features.md` from the scenario directory. |
+| `test/gui_user/report.py` | Renders `summary.json` into `verdict.md`, the run summary and the nightly issue, all grouped by feature; renders `features.md` from the scenario directory. |
 | [`test/gui_user/FEATURES.md`](../../test/gui_user/FEATURES.md) + `features.json` | The scenario backlog: every user-visible feature as one record (feature slug, user story, start URL, seed, runnable tier, priority). `features.json` is the source of truth; `FEATURES.md` is rendered from it by `features_catalog.py` (`--write` / `--check`), which also validates every record and refuses cross-slug duplicates. |
 | `test/gui_user/friction.py` | The new-user friction channel: the `report_friction` tool schema, entry validation, the cross-night ledger, the "New-user friction" section and the nightly `ux(<feature>)` issues. |
 
@@ -51,7 +51,11 @@ need no display and never call Bedrock.
    harness holds a session's first prompt behind that readiness barrier), reads
    the `KIROCREW_READY:{port, token}` line, opens Chromium
    (`--no-sandbox --test-type`, full-screen window, omnibox kept) at
-   `http://127.0.0.1:<port>/?token=...`, focuses the window.
+   `http://127.0.0.1:<port>/?token=...`, waits for its window and focuses it. The
+   window wait is bounded by the browser process rather than a stopwatch: a browser
+   that exits fails the boot at once, one still starting gets up to 120 s, because
+   Chromium's cold start on the hosted runner image has ranged from under 2 s to
+   over 30 s between nights with nothing else different.
 3. `harness.py` navigates to each scenario's `start_url` through the omnibox (the
    token has become the `mc_token` cookie by then), takes a screenshot, and loops:
    the model returns one action, the harness executes it, waits about a second, and
@@ -85,7 +89,10 @@ image block inside `tool_result`. Both shapes drive the same `x11.perform`, so t
 logs and the scenarios are identical either way. `--tool-mode native|custom` pins one.
 
 The model id is a workflow parameter (`inputs.model`, default
-`us.anthropic.claude-sonnet-4-6`), never a default in code.
+`us.anthropic.claude-opus-5`), never a default in code. The workflow also passes
+`--price-in 15 --price-out 75` (Opus list prices per million tokens) so the run's
+cost figure and the budget gate count real dollars; the harness's own defaults are
+Sonnet prices, for a `-f model=` override to a Sonnet-class model.
 
 ## Adding a scenario
 
@@ -93,7 +100,7 @@ Create `test/gui_user/scenarios/<name>.yaml`; the file stem must equal `name`:
 
 ```yaml
 name: settings-theme-toggle
-tier: smoke                 # smoke = runs on PRs and nightly; nightly = nightly only
+tier: smoke                 # smoke = on-demand subset + nightly; nightly = nightly-only addition
 feature: settings           # product area -- a key of scenarios.FEATURES (see below)
 user_story: >-              # one sentence a person can read: who wants what, and why
   As a user, I want to switch the dashboard theme in Settings, so that the app
@@ -171,6 +178,16 @@ on demand (below) before merging.
 (default `nova-sky`); a scenario's `preconditions.seed` / `members` document what it
 needs and must agree with that boot, because the target is booted once per run.
 
+Because one seed serves every scenario, a surface that needs content gets it from the
+`rich` fixture itself rather than from a second seed: `rich` ships the three saved
+artifacts of the `artifacts-library` fixture (`release-checklist`, a widget on its
+second version; `pagination-design`, markdown; `queue-badge`, svg) so the Artifacts
+scenario reads a populated library, and the one crew on the Agents tab is the member
+`boot.sh` adds. Surfaces the seed cannot populate deterministically are read in their
+empty state instead -- the MCP Servers table (no `mcp.json` in the seeded home or the
+isolated agent home) -- or through content the gateway itself installs at boot, such as
+the packaged built-in skills the Skills tab lists.
+
 The home is a `mktemp` directory, so no scenario can spell its path. Where a flow needs
 the tester to TYPE a path -- the Knowledge "Add Source > Local Folder" form, whose
 native picker is macOS-only -- `boot.sh` stages the three markdown files under
@@ -189,6 +206,23 @@ exactly three items -- the count that scenario asserts, and
 `test_scenarios_and_report.py` pins the note count and word length to it, so a note
 added without moving the scenario fails a unit test rather than a paid nightly run.
 
+The same owned root holds a second staged tree, `sample-project` (a `README.md` beside
+a `docs/` folder with copies of the three notes), and `boot.sh` runs `seed_home.py`
+AFTER staging it with `--project <that path>`: the seed writes the path into the
+metadata line of the pinned starter transcript (`dashboard_starter.jsonl`), the same `project` key a
+live slot persists, so the chat's Files view lists a real tree for that one session.
+The fixture cannot carry a project itself (the path exists only on the machine the seed
+runs on), and the other seeded chats stay project-less on purpose, so
+`chat-files-side-panel-browse` opens that session by name first. `teardown.sh` removes
+the whole root, sample project included.
+
+One boot also means one roster: every scenario meets the members `GUI_MEMBERS` seeded
+plus whatever an earlier scenario created, so a flow that exists only for an EMPTY
+roster -- the "Meet CrewMates" first-run chapter, offered while `config.agents` holds
+nothing beyond `default` -- cannot be reached in this lane and has no scenario. Giving
+it one needs a second gateway boot per run (a scenario-level reseed), which is
+per-scenario isolation work for the tracking issue, not a YAML change.
+
 That one boot also serves a failed scenario's retry: the harness runs attempt 2 against
 the same live gateway, with nothing re-seeded in between. A scenario must therefore
 hold on a target its own first attempt already touched -- more bubbles in the same
@@ -196,7 +230,14 @@ thread, a toggle already flipped. One that changes persisted state (creates some
 switches a store) and then expects the pre-change state cannot be retried: its second
 attempt meets a precondition that no longer holds and cannot reach a verdict. Write the
 steps and expectations so both attempts read the same, or keep the mutation out of the
-scenario.
+scenario. The same boot also serves every LATER scenario in the run, through one browser
+profile, so a per-device switch (Developer Mode, Show Timestamps, a feature preview)
+that a scenario flips is still flipped when the next scenario starts. A scenario that
+flips one either puts it back before it ends or leaves a state nothing later depends on
+(the members scenarios leave the Crew Members preview on), and it words each switch step
+as the position to leave the switch in ("make sure it is ON -- click it once if it is
+off") rather than as a click, so a retry that starts from a half-finished attempt
+converges instead of inverting it.
 
 ### New-user friction: what confused the tester, beside the verdict
 
@@ -291,8 +332,9 @@ logged, or fail with none.
   leave the summary. Closing an issue is a human call; the lane never reopens one.
 - **Cost.** The persona adds about 450 input tokens to every model call and each
   `report_friction` call is one extra round trip (~7k input, ~150 output tokens);
-  two to four per scenario in practice. Roughly +$0.10 per scenario, about +$1 a
-  night on the twelve-scenario tier, inside the $10 ceiling. If the ceiling is ever
+  two to four per scenario in practice. Roughly +$0.10 per scenario, or about
+  +$2.70 if all 27 current scenarios run, inside the $10 ceiling. If the ceiling
+  is ever
   the problem, set `persona: none` on the low-priority scenarios first rather than
   dropping the channel.
 
@@ -305,8 +347,9 @@ logged, or fail with none.
   `configure-aws-credentials` -- verify branch changes through the nightly after merge
   or through a lane-scoped role that trusts the branch.
 - **On a PR**: not yet -- see the note at the top and phase 2 of the tracking issue.
-- **Nightly**: `20 9 * * *` UTC on `main`, full tier. A non-PASS night opens or
-  updates the single open issue labelled `gui-test-report`.
+- **Nightly**: `20 9 * * *` UTC on `main`, full tier (currently 32 smoke plus
+  8 nightly-only scenarios). A non-PASS night opens or updates the single open
+  issue labelled `gui-test-report`.
 
 ### Locally
 
@@ -324,7 +367,7 @@ export GUI_OUT="$(mktemp -d)"
 bash scripts/gui-user-test/boot.sh                       # Xvfb :99, gateway, Chromium
 . "$GUI_OUT/target.env"
 python test/gui_user/harness.py --out "$GUI_OUT/results" --base-url "$GUI_BASE_URL" \
-  --model us.anthropic.claude-sonnet-4-6 --tier smoke --budget-usd 2
+  --model us.anthropic.claude-opus-5 --tier smoke --budget-usd 10 --price-in 15 --price-out 75
 bash scripts/gui-user-test/teardown.sh
 ```
 
@@ -339,15 +382,19 @@ owning server is not a virtual one.
 - A 1280x800 screenshot is about 1 365 input tokens (width x height / 750). With three
   screenshots kept, a step costs roughly 6-8k input and ~150 output tokens; a
   10-step scenario on a Sonnet-class model is about $0.25-0.40 and two to four
-  minutes. Budget the nightly tier (every shipped scenario, one retry each in the
-  worst case) at about $0.50 per scenario and the smoke tier at about $0.35. The run
-  stops at `--budget-usd` (dispatch default $5 -- at about $0.35 per smoke scenario
-  with one retry apiece the default has to clear the whole smoke tier; nightly $8)
-  and marks the remaining
-  scenarios `SKIPPED`; the job's 90-minute timeout is the backstop for a hung target,
-  not the budget. Keep the nightly bill under $10: when a new batch would push past
-  it, move the lowest-value scenarios to a cheaper cadence (a `weekly` tier is a
-  schema + workflow change) rather than raising the budget.
+  minutes; on Opus (the default) about five times that. Budget the nightly tier
+  (every shipped scenario, one retry each in the worst case) at about $1 per
+  scenario on Opus and the smoke tier at about $0.80. The run stops at
+  `--budget-usd` (default $60 everywhere: the `budget_usd` dispatch input, the
+  nightly schedule's fixed value, and the harness's own fallback when the flag is
+  omitted -- the 40-scenario nightly tier on Opus spends about $45 with retries;
+  the earlier $5 / $8 / $20 / $40 caps all tripped mid-run and skipped the tail
+  of the tier) and
+  marks the remaining scenarios `SKIPPED`; the job's 90-minute timeout is the
+  backstop for a hung target, not the budget. Keep the nightly bill well under the
+  $20 cap: when a new batch would push a night toward it, move the lowest-value
+  scenarios to a cheaper cadence (a `weekly` tier is a schema + workflow change)
+  rather than raising the budget again.
 - Pixel tests are stochastic. One retry absorbs a mis-click; a scenario that flips
   night to night is a scenario problem (vague step, timing) before it is a product
   problem. Read `steps.jsonl` and the numbered screenshots: they show exactly where

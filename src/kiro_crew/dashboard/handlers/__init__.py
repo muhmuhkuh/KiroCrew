@@ -103,6 +103,12 @@ from kiro_crew.dashboard.handlers.appearances import (  # noqa: E402, F401
     api_appearances_petdex_fetch,
 )
 
+# ── Browser view same-origin relay (handlers/browser_view_relay.py) ──
+from kiro_crew.dashboard.handlers.browser_view_relay import (  # noqa: E402, F401
+    api_browser_view_relay,
+    close_relay_client,
+)
+
 # ── Connections OAuth relay (handlers/connections.py) ──
 from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_cancel,
@@ -233,6 +239,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_apply,
     api_mcp_gateway_enable,
     api_mcp_gateway_metrics,
+    api_mcp_gateway_server_launch,
     api_mcp_gateway_servers,
     api_mcp_gateway_set_stub,
     api_mcp_gateway_status,
@@ -251,13 +258,12 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_toggle_all,
     api_mcp_toggle_tool,
 )
-from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
-    api_mcp_apps_call,
-)
 
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
+    api_member_briefing,
+    api_member_projections,
     api_member_rules_get,
     api_member_rules_put,
     api_member_thread,
@@ -376,6 +382,12 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_wecom_config_get,
     api_wecom_config_save,
 )
+
+# ── Rendered slides for the file panel (handlers/office_slides.py) ──
+from kiro_crew.dashboard.handlers.office_slides import (  # noqa: E402, F401
+    api_file_office_slide,
+    api_file_office_slides,
+)
 from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     MAX_PROMPT_BYTES,
     _extract_sop_description,
@@ -448,6 +460,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_sessions_search,
     api_sessions_summarize,
     api_sessions_usage,
+    api_sessions_usage_refresh,
 )
 
 # ── Side conversation (extracted to handlers/side.py) ──
@@ -510,6 +523,23 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
     api_taskrunner_update_plan,
     api_taskrunner_update_task,
 )
+
+# ── Crewmate teams (handlers/teams.py) ──
+from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
+    api_teams_create,
+    api_teams_delete,
+    api_teams_list,
+    api_teams_update,
+)
+
+# ── MCP Apps message/call endpoints (handlers/mcp_apps.py) ──
+# DELIBERATELY NOT IMPORTED HERE. MCP Apps are feature-gated behind
+# ``mcp_gateway.apps_enabled``, and the module imports the gateway backend at
+# module scope — an eager import here would put the entire optional gateway
+# subsystem on the dashboard boot path, which ``no-new-work-on-gateway-boot-path``
+# clause 5 forbids ("gate the import, not just the handler"). ``server._deferred``
+# binds the two routes at boot and imports this module on the first request,
+# exactly as the work_ledger and session-control routes do.
 
 
 # ── Durable task queue + capacity view (handlers/tasks.py) ──
@@ -603,6 +633,7 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     api_update_channel,
     api_update_check,
     api_update_disarm,
+    api_update_revalidate,
     api_update_simulate,
     get_update_info,
     install_log_ring_handler,
@@ -931,8 +962,7 @@ def _build_prompt_base() -> list[dict[str, Any]]:
 
 
 # Paid-AWS-service consent — the operator's confirmation surface for Amazon
-# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant
-# alongside the ``kirocrew aws-consent`` CLI.
+# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant.
 from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
     api_aws_consent_delete,
     api_aws_consent_get,
@@ -972,6 +1002,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_shutdown,
     api_stt_config,
     api_stt_ffmpeg_download,
+    api_stt_polish,
     api_stt_prepare,
     api_stt_prewarm,
     api_stt_status,
@@ -983,6 +1014,13 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     index,
     logo,
     pwa_file,
+)
+
+# Credential-redaction switch — owner-gated, and the ONLY writer of
+# ``credential_redaction.json`` (see ``security.redaction_switch``).
+from kiro_crew.dashboard.handlers.credential_redaction import (  # noqa: E402, F401
+    api_credential_redaction_get,
+    api_credential_redaction_put,
 )
 
 # Decision seam — the operator's switch for sending conversation state to Jev

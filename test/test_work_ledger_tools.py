@@ -65,6 +65,13 @@ def _open_route(monkeypatch):
     monkeypatch.setattr(routes, "_recognize_session", _recognized)
     monkeypatch.setattr(routes, "_is_restricted_session", lambda *a: False)
     monkeypatch.setattr(routes, "_reaches_a_channel", lambda request, sk: False)
+    # The routes record every write into the caller's crew log and refuse when
+    # they cannot: a ``MagicMock`` state resolves no unit, so the gate is opened
+    # here and the append is swallowed. ``test_work_ledger_projection.py`` drives
+    # the gate and the recorded entries themselves.
+    monkeypatch.setattr(routes.crew_log_emit, "enabled", lambda: True)
+    monkeypatch.setattr(routes, "unit_for_session_key", lambda sessions, key: f"unit:{key}")
+    monkeypatch.setattr(routes.crew_log_emit, "on_work_recorded", lambda unit, data: True)
 
 
 class _Slot:
@@ -387,7 +394,10 @@ async def test_every_store_code_maps_to_the_status_the_rfc_tabulates():
         "already_bound": 409,
         "item_closed": 409,
         "item_cap_exceeded": 409,
+        "item_store_full": 409,
         "depth_exceeded": 409,
+        "crew_log_incomplete": 409,
+        "cache_dirty": 409,
         "field_too_long": 400,
         "invalid_action": 400,
         "invalid_status": 400,
@@ -452,6 +462,36 @@ async def test_item_cap_exceeded_is_409():
     )
     assert status == 409
     assert body["code"] == wl.CODE_ITEM_CAP_EXCEEDED
+
+
+@pytest.mark.asyncio
+async def test_item_store_full_is_409(monkeypatch):
+    """A board full of closed records refuses the next create as a 409 conflict.
+
+    The code is the store's own, ``item_store_full``: the open cap is not what bit,
+    since nothing on the board is open.
+    """
+    monkeypatch.setattr(wl, "MAX_STORED_ITEMS_PER_CONDUCTOR", 2)
+    items = await two_by_two()
+    status, _ = await _record(
+        CONDUCTOR_A, {"action": "close", "item_id": items["item_a"], "state": "accepted"}
+    )
+    assert status == 200
+    status, body = await _record(
+        CONDUCTOR_A,
+        {"action": "create", "title": "second", "acceptance": {"kind": "human_approval"}},
+    )
+    assert status == 200
+    status, _ = await _record(
+        CONDUCTOR_A, {"action": "close", "item_id": body["item"]["item_id"], "state": "accepted"}
+    )
+    assert status == 200
+    status, body = await _record(
+        CONDUCTOR_A,
+        {"action": "create", "title": "one too many", "acceptance": {"kind": "human_approval"}},
+    )
+    assert status == 409
+    assert body["code"] == wl.CODE_ITEM_STORE_FULL
 
 
 @pytest.mark.asyncio

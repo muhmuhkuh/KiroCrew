@@ -95,6 +95,63 @@ describe('rankRootRows', () => {
     expect(rankRootRows(near, 'search s', usage, now)[0].id).toBe('used')
   })
 
+  it('ranks a query by score across groups, so the best match is not held under its group', () => {
+    // The bug this pins: group order is the IDLE page's filing order, and applying it
+    // to a query result too makes the group the first sort key. Typing `dev fle` put
+    // a contributed command that matched only through its subtitle above the app the
+    // reader was spelling out, because `commands` files before `apps`.
+    const rows = [
+      row({
+        id: 'approve',
+        title: 'Approve and merge all PRs',
+        subtitle: 'Merge every ready pull request behind a link, approving first where allowed',
+        group: 'commands',
+      }),
+      row({ id: 'fleet', title: 'Dev Fleet', group: 'apps' }),
+    ]
+    const ranked = rankRootRows(rows, 'dev fle', {}, 0)
+    // Both rows match — the command only via its subtitle — and the app scores higher.
+    expect(ranked.map(r => r.id)).toEqual(['fleet', 'approve'])
+    const [app, command] = ranked
+    expect(app.score).toBeGreaterThan(command.score)
+    expect(command.matchField).toBe('subtitle')
+  })
+
+  it('still files the SAME rows into group blocks on an empty query', () => {
+    // The other half of the split, and the guard on it. Frecency is what makes the
+    // regroup load-bearing here: the app is used daily so it OUTSCORES the command,
+    // and score order alone would open the launcher on it. What a launcher opens on
+    // is the product decision the block order carries, so the idle page keeps it.
+    const now = 10 * DAY
+    const rows = [
+      row({
+        id: 'approve',
+        title: 'Approve and merge all PRs',
+        subtitle: 'Merge every ready pull request behind a link, approving first where allowed',
+        group: 'commands',
+      }),
+      row({ id: 'fleet', title: 'Dev Fleet', group: 'apps' }),
+    ]
+    const usage: UsageMap = { fleet: { count: 9, last: now } }
+    const idle = rankRootRows(rows, '', usage, now)
+    expect(idle.map(r => r.id)).toEqual(['approve', 'fleet'])
+    // Not a tie broken by group: the app genuinely scores higher and is still second.
+    expect(idle[1].score).toBeGreaterThan(idle[0].score)
+  })
+
+  it('lets frecency lift a row over an earlier group once a query ranks them', () => {
+    // Habit and group order used to be unable to disagree under a query: the regroup
+    // ran last, so a boost could only move a row inside its own block. A used app row
+    // now outranks a cold command row on the strength of the boost alone.
+    const now = 10 * DAY
+    const rows = [
+      row({ id: 'cmd', title: 'Deploy notes', group: 'commands' }),
+      row({ id: 'app', title: 'Deploy notes', group: 'apps' }),
+    ]
+    const usage: UsageMap = { app: { count: 6, last: now } }
+    expect(rankRootRows(rows, 'deploy', usage, now).map(r => r.id)).toEqual(['app', 'cmd'])
+  })
+
   it('caps each group so one group cannot crowd out the others', () => {
     const many: RootRow[] = []
     for (let i = 0; i < 20; i++) many.push(row({ id: `app${i}`, title: `App ${i}`, group: 'apps' }))
@@ -102,6 +159,73 @@ describe('rankRootRows', () => {
     const out = rankRootRows(many, 'app', {}, 0)
     expect(out.filter(r => r.group === 'apps')).toHaveLength(6)
     expect(out.some(r => r.id === 'cmd')).toBe(true)
+  })
+
+  it('leaves the commands group room for contributed rows beyond its builtins', () => {
+    // The group holds the product's own builtins AND whatever an installed app
+    // declares. Under one shared cap the six builtins fill it, and an app's row is
+    // dropped with nothing on screen saying so — the app installed fine, its
+    // manifest was accepted, its row is simply absent. This is the regression adding
+    // the crewmates row produced, and the reason the group has a cap of its own.
+    const builtins = [
+      'New Session',
+      'Toggle Theme',
+      'Search Sessions',
+      'Search Artifacts',
+      'Search Folders',
+      'Search Crewmates',
+    ].map((title, i) => row({ id: `builtin${i}`, title, group: 'commands' }))
+    // Demoted, the way `CommandBarOverlay` marks an argument-taking contribution: it
+    // sorts last on an empty query, which is exactly where a tight cap removes it.
+    const contributed = [
+      row({ id: 'app-cmd-a', title: 'Approve all PRs', group: 'commands', idleDemote: true, contributed: true }),
+      row({ id: 'app-cmd-b', title: 'Merge all PRs', group: 'commands', idleDemote: true, contributed: true }),
+    ]
+    const ids = rankRootRows([...builtins, ...contributed], '', {}, 0).map(r => r.id)
+    for (const b of builtins) expect(ids).toContain(b.id)
+    expect(ids).toContain('app-cmd-a')
+    expect(ids).toContain('app-cmd-b')
+  })
+
+  it('keeps every contributed row no matter how many builtins the product adds', () => {
+    // The boundary itself, stated as a rule rather than as a number: a builtin is not
+    // counted, so there is no builtin count at which an app's row starts being dropped.
+    // A cap that counted both populations made "we added a row" and "your app lost a
+    // row" the same event, and an earlier fix for it -- a wider cap of 8 -- only moved
+    // that boundary from six builtins to eight.
+    const builtins = Array.from({ length: 30 }, (_, i) =>
+      row({ id: `builtin${i}`, title: `Builtin ${i}`, group: 'commands' }),
+    )
+    const contributed = row({
+      id: 'app-cmd',
+      title: 'Approve all PRs',
+      group: 'commands',
+      idleDemote: true,
+      contributed: true,
+    })
+    const ids = rankRootRows([...builtins, contributed], '', {}, 0).map(r => r.id)
+    expect(ids).toContain('app-cmd')
+  })
+
+  it('still caps CONTRIBUTED command rows, so one app cannot become an index', () => {
+    // The cap is not removed, it is pointed at the population it was written for: a
+    // page nobody has typed into stays short, and the rest of an app's twenty rows are
+    // one keystroke away, because a typed query ranks every row on its match.
+    const many = Array.from({ length: 20 }, (_, i) =>
+      row({ id: `cmd${i}`, title: `Command ${i}`, group: 'commands', contributed: true }),
+    )
+    expect(rankRootRows(many, '', {}, 0)).toHaveLength(6)
+  })
+
+  it('leaves the product\'s own command list uncapped, which is where it is reviewable', () => {
+    // The deliberate consequence of not counting builtins, pinned so it is a decision
+    // rather than a discovery. A builtin list long enough to fill the first page is a
+    // change in this repository, where the page it lands on is reviewed; an app's rows
+    // arrive from a manifest nobody here reads, which is why only those are capped.
+    const many = Array.from({ length: 12 }, (_, i) =>
+      row({ id: `builtin${i}`, title: `Builtin ${i}`, group: 'commands' }),
+    )
+    expect(rankRootRows(many, '', {}, 0)).toHaveLength(12)
   })
 
   it('returns group blocks in launcher order, not in score order', () => {
@@ -162,6 +286,59 @@ describe('rankRootRows', () => {
     // that decision: with no group to file them under, a future caller cannot push
     // folder rows into the root without first reopening the question.
     expect(ROOT_GROUPS).not.toContain('folders')
+  })
+
+  it('leads with the sessions that need the reader, then the ones they were last in', () => {
+    // Group order is the product decision, and `recent` sits between the two things
+    // it is not: a session waiting on the reader outranks one they merely left, and
+    // both outrank a command they would otherwise have to go looking for.
+    const rows = [
+      row({ id: 'c', title: 'Alpha command', group: 'commands' }),
+      row({ id: 'r', title: 'Zulu session', group: 'recent' }),
+      row({ id: 'a', title: 'Mike session', group: 'attention' }),
+    ]
+    expect(rankRootRows(rows, '', {}, 0).map(r => r.group)).toEqual([
+      'attention',
+      'recent',
+      'commands',
+    ])
+  })
+
+  it('keeps an idle-ordered group in its own order, against the alphabet', () => {
+    // "The last three sessions" is only true in the order the caller supplied. Every
+    // score ties on an empty query, so the alphabetical tiebreak would otherwise
+    // reorder them into a list that is no longer about recency at all. An
+    // idle-ordered group is exempt from it and keeps the order it was supplied in.
+    const rows = [
+      row({ id: 'first', title: 'Zulu', group: 'recent' }),
+      row({ id: 'second', title: 'Alpha', group: 'recent' }),
+      row({ id: 'third', title: 'Mike', group: 'recent' }),
+    ]
+    expect(rankRootRows(rows, '', {}, 0).map(r => r.id)).toEqual(['first', 'second', 'third'])
+  })
+
+  it('keeps an idle-ordered group in its own order, against frecency too', () => {
+    // The stronger half. A session opened from the bar eight times last week earns a
+    // boost that would lift it over the one the reader just left — which is the one
+    // fact this group exists to report, so the boost has to be declined here.
+    const now = 10 * DAY
+    const rows = [
+      row({ id: 'just-left', title: 'Just left', group: 'recent' }),
+      row({ id: 'habitual', title: 'Habitual', group: 'recent' }),
+    ]
+    const usage: UsageMap = { habitual: { count: 8, last: now } }
+    expect(rankRootRows(rows, '', usage, now).map(r => r.id)).toEqual(['just-left', 'habitual'])
+  })
+
+  it('ranks an idle-ordered row on its match once a query narrows the list', () => {
+    // Idle only: typing a session's name must find it, and at that point the row is
+    // an ordinary candidate. A row whose title cannot match is dropped like any
+    // other, so idle order is not a way to stay on screen.
+    const rows = [
+      row({ id: 'alpha', title: 'Alpha', group: 'recent' }),
+      row({ id: 'beta', title: 'Beta', group: 'recent' }),
+    ]
+    expect(rankRootRows(rows, 'bet', {}, 0).map(r => r.id)).toEqual(['beta'])
   })
 })
 
