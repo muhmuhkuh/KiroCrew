@@ -120,6 +120,13 @@ Nothing on disk is rewritten. The stored pin stays as the user picked it and is
 simply not read by a harness that cannot claim it, so switching back restores it
 with no migration and no second field.
 
+A local dashboard chat may override its nullable `acp_backend` independently of
+the global setting; `null` inherits and `""` selects Kiro. Persisted `model_backend`
+records the namespace used for that slot's pin. When the effective backend changes,
+chat allocation discards the stale pin and starts on `auto` rather than applying an
+id selected in another harness. The chat composer obtains model options from
+`GET /api/models?backend=…`, and its cache/degraded state is backend-keyed.
+
 Both resolvers scope EVERY tier and let an out-of-scope tier defer to the next, so
 an out-of-scope pin reads exactly like an unset one:
 

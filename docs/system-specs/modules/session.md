@@ -3091,3 +3091,12 @@ pops by object identity — if a racing cold-start already replaced the
 entry, only the old session object is shut down; the fresh replacement
 and its session_map entry survive (the old provider is still reaped so
 its process never leaks).
+
+## Per-chat backend selection
+
+Slash-command detection resolves provider and effective chat backend from the
+same configuration snapshot, without a second unguarded configuration read.
+
+A local ordinary dashboard slot, including Autopilot (`mode="orchestrator"`), may persist a nullable `acp_backend`: `null` inherits `agent.acp_backend`; `""` explicitly selects Kiro. The route validates against the live selectable-backend registry and refuses managed slots, running/queued turns, eager starts, stage execution, active provider turns, and attached subagents. It serializes switching with slot and session locks, resets the idle session when its effective backend differs, and preserves the transcript.
+
+`model_backend` records the model namespace last used. When the inherited or explicit backend changes, the next allocation drops the old model pin to `auto`; backend-specific model lists and degraded caches are keyed by backend. Explicit chat overrides bypass the global warm pool, and session-map provider labels prevent a resume id from another harness being reused. The composer exposes the registry's selectable backends only for supported local slots.

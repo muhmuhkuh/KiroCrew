@@ -1512,6 +1512,9 @@ class SessionAllocationService:
             # Native launch documents are captured before session creation.
             # An already launched generic pool cannot supply that receipt.
             pool_decision = "bypass_member_context"
+        elif extra_factory_kwargs.get("acp_backend_override") is not None:
+            # Pool entries belong to the global factory, not a chat override.
+            pool_decision = "bypass_backend"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
         elif extra_env:

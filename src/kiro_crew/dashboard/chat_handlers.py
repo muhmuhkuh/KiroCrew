@@ -71,6 +71,7 @@ from kiro_crew.dashboard.chat_persistence import (
     save_slot_off_loop,
 )
 from kiro_crew.dashboard.chat_runner import (
+    _clear_fallback_sticky_state,
     _context_usage_payload,
     _run_chat,
     _start_next_queued_turn,
@@ -6795,6 +6796,94 @@ def _slot_replaced_while_queued(
         error="slot was replaced while the request queued on the switch locks",
     )
     return True
+
+
+async def api_chat_slot_backend(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/backend — nullable, chat-local harness override."""
+    from kiro_crew.agent_sdk.backends import selectable_backends
+    from kiro_crew.dashboard.chat_backend import backend_selection_supported
+
+    state: DashboardState = request.app["state"]
+    slot = state._slots.get(request.match_info["slot"])
+    if slot is None:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    denied = _deny_cross_app_slot_access(request, slot, slot.key, "slot_backend")
+    if denied is not None:
+        return denied
+    body, error = await read_bounded_json(request)
+    if error is not None:
+        return error
+    assert body is not None
+    backend = body.get("acp_backend")
+    if "acp_backend" not in body or (
+        backend is not None
+        and (not isinstance(backend, str) or backend not in selectable_backends())
+    ):
+        return web.json_response(
+            {"error": "invalid backend", "code": "invalid_backend"}, status=400
+        )
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    async with contextlib.AsyncExitStack() as stack:
+        await stack.enter_async_context(slot._lock)
+        if not backend_selection_supported(slot):
+            return web.json_response(
+                {
+                    "error": "backend selection is unavailable for managed chats",
+                    "code": "backend_managed",
+                },
+                status=409,
+            )
+        key = effective_session_key(slot)
+        await stack.enter_async_context(_slot_switch_session_lock(key))
+        await stack.enter_async_context(slot._model_pick_lock)
+        target = cfg.agent.acp_backend if backend is None else backend
+        if target not in selectable_backends():
+            return web.json_response(
+                {"error": "backend is not selectable", "code": "backend_not_selectable"},
+                status=400,
+            )
+        provider = state.sessions.get_provider(key)
+        resident_backend = getattr(getattr(provider, "client", None), "backend", None)
+        previous = cfg.agent.acp_backend if slot.acp_backend is None else slot.acp_backend
+        changed = (
+            target != previous
+            or (slot.model_backend is not None and slot.model_backend != target)
+            or (isinstance(resident_backend, str) and resident_backend != target)
+        )
+        if slot.acp_backend == backend and not changed:
+            return web.json_response({"ok": True, "acp_backend": backend, "model": slot.model})
+        eager = slot._eager_spawn_task
+        if (
+            slot.running
+            or slot._queue
+            or slot._in_stage_execution
+            or (eager is not None and not eager.done())
+            or (provider is not None and provider.has_active_turn())
+        ):
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
+        attached = await _subagents_attached_response(state, slot, key, "slot_backend")
+        if attached is not None:
+            return attached
+        if changed:
+            reset = await _reset_slot_session(state, slot, key, skip_if_busy=True)
+            if not reset and state.sessions.get_provider(key) is not None:
+                return web.json_response(
+                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                )
+            slot.model = "auto"
+            slot._model_pick_gen += 1
+            slot.forget_session_model_state()
+            slot.reasoning_effort = ""
+            _clear_fallback_sticky_state(slot, provider)
+            _broadcast_context_reset(state, slot.key, None)
+        slot.acp_backend = backend
+        slot.model_backend = target
+        slot._dirty = True
+        await save_slot_off_loop(state, slot, force=True, best_effort=False)
+        state.push_slots_update()
+    return web.json_response({"ok": True, "acp_backend": backend, "model": slot.model})
 
 
 async def api_chat_slot_agent(request: web.Request) -> web.Response:

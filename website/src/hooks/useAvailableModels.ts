@@ -43,14 +43,15 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.
  */
-type AvailableModelsOptions = { enabled?: boolean }
+type AvailableModelsOptions = { enabled?: boolean; backend?: string }
 
-export function useAvailableModelsQuery({ enabled }: AvailableModelsOptions = {}) {
+export function useAvailableModelsQuery({ enabled, backend }: AvailableModelsOptions = {}) {
   const provider = useProvider()
-  const isDegraded = useModelsDegraded(provider.id)
+  const healthKey = backend === undefined ? provider.id : `${provider.id}:${backend}`
+  const isDegraded = useModelsDegraded(healthKey)
   const query = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => withAutoFirst(await provider.fetchAvailableModels()),
+    queryKey: ['available-models', healthKey],
+    queryFn: async () => withAutoFirst(await provider.fetchAvailableModels(backend)),
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })

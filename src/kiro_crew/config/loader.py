@@ -5504,6 +5504,7 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            acp_backend_override: str | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5551,6 +5552,12 @@ class KiroCrewConfig:
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
             )
+            if acp_backend_override is not None:
+                from kiro_crew.agent_sdk.backends import selectable_backends
+
+                if acp_backend_override not in selectable_backends():
+                    raise ValueError("backend is not selectable")
+                _backend = acp_backend_override
             is_pi = _backend == ACP_BACKEND_PI
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
@@ -5580,8 +5587,11 @@ class KiroCrewConfig:
             # Pi owns model selection when no concrete pin survives scope, but
             # still needs its native effort override keyed by the auto sentinel.
             _eff_model = m or (DEFAULT_MODEL if is_pi else "")
-            if _eff_model and _eff and is_valid_effort(_eff) and (
-                is_pi or model_supports_effort(_eff_model)
+            if (
+                _eff_model
+                and _eff
+                and is_valid_effort(_eff)
+                and (is_pi or model_supports_effort(_eff_model))
             ):
                 _eff_per_model[_eff_model] = _eff
             elif _eff and is_valid_effort(_eff):

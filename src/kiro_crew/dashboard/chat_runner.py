@@ -94,6 +94,7 @@ from kiro_crew.context_management import (
 )
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.dashboard import directive_queue
+from kiro_crew.dashboard.chat_backend import chat_session_selection, effective_chat_backend
 from kiro_crew.dashboard.chat_delivery import (
     STEER_STATE_CONSUMED,
     STEER_STATE_REQUEUED,
@@ -5922,6 +5923,7 @@ async def _eager_spawn(
                     default_model=default_model,
                     allow_resume=allow_resume,
                     _bound=_bound,
+                    loaded_cfg=loaded_cfg,
                 )
             finally:
                 # Every exit that is not a registration -- refused, another
@@ -5952,6 +5954,7 @@ async def _spawn_admitted_prefetch(
     default_model: str,
     allow_resume: bool,
     _bound: tuple,
+    loaded_cfg: KiroCrewConfig | None,
 ) -> None:
     """The admitted half of ``_eager_spawn``: handshake, guards, registration.
 
@@ -5965,22 +5968,27 @@ async def _spawn_admitted_prefetch(
         # which case the speculative session/load runs here and the
         # resumed=True observation is armed for the real turn. See
         # get_or_create's docstring.
-        _requested_model = slot.model or agent_model or default_model or ""
-        _, is_new, resumed = await sessions.get_or_create(
-            session_key,
-            agent=kiro_agent or slot.agent or None,
-            # Canonical crew identity — the resolver's alias, which
-            # covers the default crew on an empty slot; plumbed to the
-            # session so per-agent watchdog windows never depend on a
-            # cross-namespace name match. "" is authoritative: no
-            # alias applied, so no override applies.
-            crew_agent=crew_alias,
-            model=_requested_model or None,
-            cwd=slot.project or None,
-            speculative=True,
-            speculative_resume=allow_resume,
-            reasoning_effort_override=slot.reasoning_effort or None,
-        )
+        async with slot._lock:
+            selection = chat_session_selection(
+                slot, loaded_cfg, agent_model or default_model or None
+            )
+            _requested_model = str(selection.pop("model", "") or "")
+            _, is_new, resumed = await sessions.get_or_create(
+                session_key,
+                agent=kiro_agent or slot.agent or None,
+                # Canonical crew identity — the resolver's alias, which
+                # covers the default crew on an empty slot; plumbed to the
+                # session so per-agent watchdog windows never depend on a
+                # cross-namespace name match. "" is authoritative: no
+                # alias applied, so no override applies.
+                crew_agent=crew_alias,
+                model=_requested_model or None,
+                cwd=slot.project or None,
+                speculative=True,
+                speculative_resume=allow_resume,
+                reasoning_effort_override=slot.reasoning_effort or None,
+                **selection,
+            )
     except SpeculativeResumeRefused:
         # Two sources: the entry gate (resumable key, resume not
         # opted in — fresh eager spawn leaves it to the first turn)
@@ -8786,7 +8794,8 @@ async def _run_chat(
 
     # ── Slash commands: detect early, before session acquisition ──
     first_word = message.split()[0] if message.strip() else ""
-    _agent_config = KiroCrewConfig.load().agent
+    _config = KiroCrewConfig.load()
+    _agent_config = _config.agent
     _is_cc_provider = is_claude_code(_agent_config.provider)
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
@@ -8794,7 +8803,7 @@ async def _run_chat(
     is_slash = is_harness_slash_command(
         first_word,
         cc_provider=_is_cc_provider,
-        pi_backend=_agent_config.acp_backend == ACP_BACKEND_PI,
+        pi_backend=effective_chat_backend(slot, _config) == ACP_BACKEND_PI,
     )
 
     # Block dangerous/local-only commands before acquiring a session
@@ -9003,7 +9012,7 @@ async def _run_chat(
             # Claude Code compacts natively in-prompt (cc_managed).
             _compact_unsupported = None
         else:
-            _cfg_backend = getattr(KiroCrewConfig.load().agent, "acp_backend", "")
+            _cfg_backend = effective_chat_backend(slot, KiroCrewConfig.load())
             _compact_unsupported = (
                 _cfg_backend
                 if isinstance(_cfg_backend, str) and _cfg_backend not in ACP_BACKENDS_COMPACT
@@ -9345,22 +9354,27 @@ async def _run_chat(
         # local because two consumers must not diverge: the provider call below,
         # which decides whether to send it, and the crew log's `session/opened`,
         # which records the choice.
-        _requested_model = slot.model or agent_model or default_model or ""
-        client, is_new, resumed = await state.sessions.get_or_create(
-            session_key,
-            agent=kiro_agent or slot.agent or None,
-            # Same canonical crew identity as the eager-spawn path — the two
-            # must agree or an eager session and its real first turn would
-            # carry different watchdog windows.
-            crew_agent=crew_alias,
-            model=_requested_model or None,
-            cwd=slot.project or None,
-            # The persisted channel stays separate from the dashboard-owned key
-            # so provider startup can distinguish a linked dispatcher from a
-            # direct dashboard turn.
-            channel_id=_provider_channel_id or None,
-            reasoning_effort_override=slot.reasoning_effort or None,
-        )
+        async with slot._lock:
+            selection = chat_session_selection(
+                slot, loaded_cfg, agent_model or default_model or None
+            )
+            _requested_model = str(selection.pop("model", "") or "")
+            client, is_new, resumed = await state.sessions.get_or_create(
+                session_key,
+                agent=kiro_agent or slot.agent or None,
+                # Same canonical crew identity as the eager-spawn path — the two
+                # must agree or an eager session and its real first turn would
+                # carry different watchdog windows.
+                crew_agent=crew_alias,
+                model=_requested_model or None,
+                cwd=slot.project or None,
+                # The persisted channel stays separate from the dashboard-owned key
+                # so provider startup can distinguish a linked dispatcher from a
+                # direct dashboard turn.
+                channel_id=_provider_channel_id or None,
+                reasoning_effort_override=slot.reasoning_effort or None,
+                **selection,
+            )
         if is_new and not resumed:
             # This call allocated the live session, so its own selection is the
             # provenance -- overwriting whatever a previous session left behind.

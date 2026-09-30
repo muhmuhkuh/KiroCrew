@@ -11,6 +11,11 @@
     "unknown": "Unbekannt",
     "empty": "Versuche eine andere Suche, Kategorie oder Quelle."
   },
+  "chatBackend": {
+    "label": "Backend",
+    "inherit": "Globalen Standard verwenden",
+    "managed": "Backend wird vom Besitzer dieses Chats verwaltet"
+  },
   "crewCapabilityEditing": {
     "sourceFailed": "Die gespeicherte Konfiguration konnte nicht geprüft werden. Laden Sie vom Server neu, um es erneut zu versuchen.",
     "keep": "Verborgener Wert bleibt erhalten. Zum Ersetzen tippen.",
@@ -303,7 +308,7 @@
         "staygreen": "STAYGREEN"
       },
       "manifest": {
-        "description": "Misst ein GitHub-Repository, bevor es daran etwas ändert. Entwirft eine kalibrierte Leistungsmetrik (das Maß), weist anhand eines bekannten Gewinns nach, dass die Metrik vertrauenswürdig ist, und führt dann Verbessern-oder-Verwerfen-Zyklen aus: Jede Kandidatenkorrektur entsteht in einem isolierten Worktree, wird gegen eine Bearbeitungs-Allowlist und die Tests des Repositorys geprüft und nur behalten, wenn der gemessene Gewinn das Rauschband übersteigt. Was übrig bleibt, wird als GitHub-Pull-Request im Entwurfsstatus angelegt, den du selbst prüfst und veröffentlichst.",
+        "description": "Misst ein GitHub- oder GitLab-Repository, bevor es daran etwas ändert. Entwirft eine kalibrierte Leistungsmetrik (das Maß), weist anhand eines bekannten Gewinns nach, dass die Metrik vertrauenswürdig ist, und führt dann Verbessern-oder-Verwerfen-Zyklen aus: Jede Kandidatenkorrektur entsteht in einem isolierten Worktree, wird gegen eine Bearbeitungs-Allowlist und die Tests des Repositorys geprüft und nur behalten, wenn der gemessene Gewinn das Rauschband übersteigt. Was übrig bleibt, wird als GitHub-Pull-Request / GitLab-Merge-Request im Entwurfsstatus angelegt, den du selbst prüfst und veröffentlichst.",
         "display_name": "Auto-Improvement",
         "highlight_1": "Weist zuerst die eigene Metrik nach — ein Lauf startet nicht mit einem unzuverlässigen Maß",
         "highlight_2": "Jeder Kandidat wird A/B gemessen, bei Fehlerkorrekturen RED/GREEN, niemals nur „sieht richtig aus“",
@@ -1079,13 +1084,13 @@
         }
       },
       "manifest": {
-        "description": "Prüft Pull Requests auf GitHub in der Tiefe und sagt dir, welche Änderungen wirklich deine Aufmerksamkeit verdienen. Jede geänderte Datei wird in einer eigenen, isolierten Agentensitzung überprüft, nach ihrer möglichen Wirkungsbreite gewichtet und zu einem priorisierten Fokusbericht zusammengefasst. Ergebnisse werden als Entwurf einer Überprüfung auf GitHub vorbereitet, der unveröffentlicht bleibt, bis du ihn einreichst, und der Prüfer lernt fortlaufend die echten Standards deines Repositorys aus ausgelieferten Korrekturen und früheren Review-Kommentaren.",
+        "description": "Prüft Pull Requests auf GitHub und Merge Requests auf GitLab in der Tiefe und sagt dir, welche Änderungen wirklich deine Aufmerksamkeit verdienen. Jede geänderte Datei wird in einer eigenen, isolierten Agentensitzung überprüft, nach ihrer möglichen Wirkungsbreite gewichtet und zu einem priorisierten Fokusbericht zusammengefasst. Ergebnisse werden als Entwurf einer Review (ausstehende GitHub-Review / GitLab-Entwurf) vorbereitet, der unveröffentlicht bleibt, bis du ihn einreichst; der Prüfer lernt fortlaufend die echten Standards deines Repositorys aus ausgelieferten Korrekturen und früheren Review-Kommentaren.",
         "display_name": "Code Review Sage",
         "highlight_1": "Der Fokusbericht sortiert Änderungen nach Wirkungsbreite, damit die riskanten Dateien zuerst gelesen werden",
         "highlight_2": "Eine isolierte Agentensitzung pro Änderung, damit Ergebnisse nie zwischen Dateien verschwimmen",
         "highlight_3": "Reviews werden in der App gelesen – es wird nichts an deinen Pull Request gepostet, sofern du es nicht anforderst",
         "highlight_4": "Lernt pro Repository aus ausgelieferten Korrekturen, Review-Kommentaren und Design-Diskussionen",
-        "highlight_5": "Überprüft Pull Requests auf GitHub; benötigt eine authentifizierte `gh` CLI auf dem Gateway-Host",
+        "highlight_5": "Überprüft Pull Requests auf GitHub und Merge Requests auf GitLab; benötigt eine authentifizierte `gh`- und/oder `glab`-CLI auf dem Gateway-Host",
         "page_label": "Code Review Sage",
         "use_case_1": "Prüfe einen oder mehrere GitHub-Pull-Requests nach Risiko, untersuche gezielte Ergebnisse und bereite nur veröffentlichungswürdige Kommentare vor.",
         "configuration_1": "Installiere und authentifiziere die gh-CLI auf dem Gateway-Host, füge ein Repository hinzu und wähle dann in den Einstellungen Review-Modell, Reasoning-Aufwand und Parallelität."
@@ -1988,7 +1993,8 @@
           "no_repo_members_found_among_these_issues": "Keine Repo-Mitglieder unter diesen Issues gefunden",
           "open": "Offen",
           "requested_by_me": "Von mir angefragt",
-          "sort": "Sortieren"
+          "sort": "Sortieren",
+          "status": "Status"
         },
         "investigateButton": {
           "could_not_check_for_an_existing_investigation_re": "Prüfung auf eine bestehende Untersuchung nicht möglich — neuer Versuch beim Aktualisieren",
@@ -2423,7 +2429,7 @@
         }
       },
       "manifest": {
-        "description": "Ein Triage-Assistent für Issues, der sich erinnert. Durchsuche, filtere und triagiere GitHub-Issues, GitLab-Issues und Azure DevOps Work Items mit KI-vorgeschlagenen Labels und Untersuchungsnotizen pro Element — die Ergebnisse liegen in einem lokalen Register, damit nichts zweimal untersucht wird.",
+        "description": "Ein Triage-Assistent für Issues, der sich erinnert. Durchsuche, filtere und triagiere Issues von GitHub, GitLab, Azure DevOps und Jira mit KI-vorgeschlagenen Labels und Untersuchungsnotizen pro Element — die Ergebnisse liegen in einem lokalen Register, damit nichts zweimal untersucht wird.",
         "display_name": "Issue Radar",
         "highlight_1": "KI-Zusammenfassungen und Label-Vorschläge für Issues und Pull Requests, jeweils mit Begründung",
         "highlight_2": "Untersuchungsnotizen pro Issue in einem lokalen Register, damit nichts zweimal untersucht wird",
@@ -2433,7 +2439,7 @@
         "highlight_6": "Jeder Schreibvorgang braucht Triage- oder Push-Zugriff auf das Repository; eine nur lesende Verbindung bleibt bei Vorschlägen",
         "highlight_7": "Zeigt Repositorys, zu denen du kürzlich beigetragen hast, sodass das Verbinden ein Klick ist",
         "highlight_8": "Speichert Issues, Labels und Mitglieder lokal im Cache, auf Anforderung aktualisiert",
-        "highlight_9": "Funktioniert mit GitHub, GitLab und Azure DevOps; benötigt auf dem Gateway-Host eine authentifizierte CLI für den verbundenen Anbieter (`gh`, `glab` oder `az`) — für die Installation ist keine bestimmte CLI erforderlich",
+        "highlight_9": "Funktioniert mit GitHub, GitLab, Azure DevOps und Jira; benötigt auf dem Host eine authentifizierte CLI des verbundenen Anbieters oder Gateway-Zugangsdaten (`gh`, `glab`, `az` oder JIRA_EMAIL + JIRA_API_TOKEN) — für die Installation ist keine bestimmte CLI erforderlich",
         "page_label": "Issue Radar",
         "use_case_1": "Triagiere Issues und Pull Requests verschiedener verbundener Anbieter und bewahre dabei Zusammenfassungen, Label-Vorschläge und den Untersuchungsverlauf auf.",
         "configuration_1": "Verbinde ein Repository und authentifiziere dessen Anbieter-CLI auf dem Gateway-Host: gh für GitHub, glab für GitLab oder az mit der Azure DevOps-Erweiterung unter macOS, Linux oder WSL."

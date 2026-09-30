@@ -11,6 +11,11 @@
     "unknown": "Desconocida",
     "empty": "Prueba otra búsqueda, categoría o fuente."
   },
+  "chatBackend": {
+    "label": "Backend",
+    "inherit": "Usar valor global",
+    "managed": "Backend gestionado por el propietario de este chat"
+  },
   "crewCapabilityEditing": {
     "sourceFailed": "No se pudo validar la configuración guardada. Recarga desde el servidor para reintentar.",
     "keep": "Valor oculto conservado. Escribe para reemplazarlo.",
@@ -307,7 +312,7 @@
         "staygreen": "STAYGREEN"
       },
       "manifest": {
-        "description": "Mide un repositorio de GitHub antes de cambiarlo. Diseña una métrica de rendimiento calibrada (la regla), demuestra que la métrica es fiable frente a una mejora conocida y luego ejecuta ciclos de conservar o revertir: cada corrección candidata se escribe en un worktree aislado, se filtra con una lista de permitidos de edición y las pruebas del propio repositorio, y solo se conserva cuando la mejora medida supera la banda de ruido. Las supervivientes se redactan como pull requests de GitHub en borrador que tú revisas y publicas.",
+        "description": "Mide un repositorio de GitHub o GitLab antes de cambiarlo. Diseña una métrica de rendimiento calibrada (la regla), demuestra que la métrica es fiable frente a una mejora conocida y luego ejecuta ciclos de conservar o revertir: cada corrección candidata se escribe en un worktree aislado, se filtra con una lista de permitidos de edición y las pruebas del propio repositorio, y solo se conserva cuando la mejora medida supera la banda de ruido. Las supervivientes se redactan como pull requests de GitHub / merge requests de GitLab en borrador que tú revisas y publicas.",
         "display_name": "Auto-Improvement",
         "highlight_1": "Primero demuestra su propia métrica: una ejecución se niega a empezar con una regla poco fiable",
         "highlight_2": "Cada candidato se mide en A/B, o RED/GREEN para correcciones de errores, nunca solo “parece correcto”",
@@ -1109,13 +1114,13 @@
         }
       },
       "manifest": {
-        "description": "Revisa a fondo las pull requests de GitHub y te dice qué cambios merecen de verdad tu atención. Cada archivo modificado se revisa en su propia sesión de agente aislada, ponderada por el alcance del impacto que tiene, y todo se resume en un informe de enfoque priorizado. Los hallazgos se preparan como una revisión de GitHub en borrador que no se publica hasta que tú la envías, y el revisor sigue aprendiendo los estándares reales de tu repositorio a partir de correcciones ya integradas y comentarios de revisiones anteriores.",
+        "description": "Revisa a fondo las pull requests de GitHub y las merge requests de GitLab, y te dice qué cambios merecen de verdad tu atención. Cada archivo modificado se revisa en su propia sesión de agente aislada, ponderada por el alcance del impacto que tiene, y todo se resume en un informe de enfoque priorizado. Los hallazgos se preparan como una revisión en borrador (revisión pendiente de GitHub / borrador de GitLab) que no se publica hasta que tú la envías, y el revisor sigue aprendiendo los estándares reales de tu repositorio a partir de correcciones ya integradas y comentarios de revisiones anteriores.",
         "display_name": "Code Review Sage",
         "highlight_1": "El informe de enfoque ordena los cambios por alcance del impacto, así los archivos riesgosos se leen primero",
         "highlight_2": "Una sesión de agente aislada por cambio, así los hallazgos nunca se filtran entre archivos",
         "highlight_3": "Las revisiones se leen en la aplicación: no se publica nada en tu pull request a menos que lo pidas",
         "highlight_4": "Aprende por repositorio a partir de correcciones ya integradas, comentarios de revisión y discusiones de diseño",
-        "highlight_5": "Revisa pull requests de GitHub; necesita una CLI `gh` autenticada en el host del gateway",
+        "highlight_5": "Revisa pull requests de GitHub y merge requests de GitLab; necesita una CLI `gh` o `glab` autenticada en el host del gateway",
         "page_label": "Code Review Sage",
         "use_case_1": "Revisa una o varias pull requests de GitHub según su riesgo, inspecciona hallazgos concretos y prepara solo los comentarios que merezca la pena publicar.",
         "configuration_1": "Instala y autentica la CLI gh en el host del gateway, añade un repositorio y elige en Ajustes el modelo de revisión, el nivel de razonamiento y la concurrencia."
@@ -1955,7 +1960,8 @@
           "no_repo_members_found_among_these_issues": "No se encontraron miembros del repositorio entre estas incidencias",
           "open": "Abiertas",
           "requested_by_me": "Solicitadas por mí",
-          "sort": "Ordenar"
+          "sort": "Ordenar",
+          "status": "Estado"
         },
         "investigateButton": {
           "could_not_check_for_an_existing_investigation_re": "No se pudo comprobar si ya existe una investigación — se reintentará al actualizar",
@@ -2403,7 +2409,7 @@
         }
       },
       "manifest": {
-        "description": "Un asistente de triaje de incidencias con memoria. Explora, filtra y clasifica incidencias de GitHub, incidencias de GitLab y elementos de trabajo de Azure DevOps con etiquetas sugeridas por IA y notas de investigación por elemento — con los hallazgos guardados en un registro local para que nada se investigue dos veces.",
+        "description": "Un asistente de triaje de incidencias con memoria. Explora, filtra y clasifica incidencias de GitHub, GitLab, Azure DevOps y Jira con etiquetas sugeridas por IA y notas de investigación por elemento — con los hallazgos guardados en un registro local para que nada se investigue dos veces.",
         "display_name": "Issue Radar",
         "highlight_1": "Resúmenes con IA y etiquetas sugeridas para incidencias y pull requests, cada una con su razonamiento",
         "highlight_2": "Notas de investigación por incidencia guardadas en un registro local para que nada se investigue dos veces",
@@ -2413,7 +2419,7 @@
         "highlight_6": "Cada escritura necesita acceso de triaje o de push en el repositorio; una conexión de solo lectura se limita a sugerir",
         "highlight_7": "Muestra los repositorios en los que has contribuido hace poco, así conectar uno es un clic",
         "highlight_8": "Guarda en caché las incidencias, las etiquetas y los miembros de forma local, y los actualiza cuando lo pides",
-        "highlight_9": "Funciona con GitHub, GitLab y Azure DevOps; necesita una CLI autenticada del proveedor que conectes (`gh`, `glab` o `az`) en el host del gateway — no hace falta la CLI de ningún proveedor concreto para instalarlo",
+        "highlight_9": "Funciona con GitHub, GitLab, Azure DevOps y Jira; necesita la CLI autenticada del proveedor o credenciales del gateway (`gh`, `glab`, `az` o JIRA_EMAIL + JIRA_API_TOKEN) en el host — no hace falta una CLI concreta para instalarlo",
         "page_label": "Issue Radar",
         "use_case_1": "Clasifica issues y pull requests de proveedores conectados mientras conservas resúmenes, etiquetas sugeridas y el historial de investigación.",
         "configuration_1": "Conecta un repositorio y autentica la CLI de su proveedor en el host del gateway: gh para GitHub, glab para GitLab o az con la extensión de Azure DevOps en macOS, Linux o WSL."

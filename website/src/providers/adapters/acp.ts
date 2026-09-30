@@ -66,10 +66,11 @@ interface CachedModels {
  *  expired (older than the TTL), or unusable. Fully guarded: SSR (no
  *  localStorage), disabled storage, quota, and corrupt JSON all degrade to null
  *  so the caller falls through to auto-only. */
-function readCachedModels(): ModelInfo[] | null {
+function readCachedModels(backend?: string): ModelInfo[] | null {
   try {
     if (typeof localStorage === 'undefined') return null
-    const raw = localStorage.getItem(MODELS_CACHE_KEY)
+    const key = backend === undefined ? MODELS_CACHE_KEY : `${MODELS_CACHE_KEY}:${backend}`
+    const raw = localStorage.getItem(key)
     if (!raw) return null
     const parsed = JSON.parse(raw) as CachedModels
     if (!parsed || typeof parsed.ts !== 'number' || !Array.isArray(parsed.models)) return null
@@ -115,11 +116,12 @@ export function clearCachedModels(): void {
 
 /** Persist a live model list with a timestamp. Best-effort — storage errors
  *  (quota, disabled, SSR) are swallowed so caching never breaks the picker. */
-function writeCachedModels(models: ModelInfo[]): void {
+function writeCachedModels(models: ModelInfo[], backend?: string): void {
   try {
     if (typeof localStorage === 'undefined') return
     const payload: CachedModels = { ts: Date.now(), models }
-    localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(payload))
+    const key = backend === undefined ? MODELS_CACHE_KEY : `${MODELS_CACHE_KEY}:${backend}`
+    localStorage.setItem(key, JSON.stringify(payload))
   } catch {
     /* quota exceeded / storage disabled — non-fatal */
   }
@@ -370,14 +372,15 @@ export class AcpAdapter implements ProviderAdapter {
     return { ok: false as const, error: 'plugin update is not supported' }
   }
 
-  async fetchAvailableModels(): Promise<ModelInfo[]> {
+  async fetchAvailableModels(backend?: string): Promise<ModelInfo[]> {
+    const healthKey = backend === undefined ? this.id : `${this.id}:${backend}`
     try {
-      const models = await api.models()
+      const models = await api.models(backend)
       if (!Array.isArray(models) || models.length === 0) {
         // Empty/non-array success: NOT a live list — keep polling, serve the
         // last-good live list if we have one, else auto-only.
-        markModelsDegraded(this.id, true)
-        return readCachedModels() ?? this._defaultModels()
+        markModelsDegraded(healthKey, true)
+        return readCachedModels(backend) ?? this._defaultModels()
       }
       const result = models.map((m: RawModel) => {
         // Prefer the backend's resolved window over the bundled snapshot: the
@@ -394,15 +397,15 @@ export class AcpAdapter implements ProviderAdapter {
           rateMultiplier: rowMultiplier(m),
         }
       })
-      writeCachedModels(result) // remember this good live list for next hiccup
-      markModelsDegraded(this.id, false) // live success → self-heal can stop polling
+      writeCachedModels(result, backend) // remember this good live list for next hiccup
+      markModelsDegraded(healthKey, false) // live success → self-heal can stop polling
       return result
     } catch {
       // Transient backend failure (503 / network): NOT live — keep polling.
       // Serve the last-good live list if we have one, else auto-only. Never
       // surface canonical registry keys — the ACP CLI rejects them (-32603).
-      markModelsDegraded(this.id, true)
-      return readCachedModels() ?? this._defaultModels()
+      markModelsDegraded(healthKey, true)
+      return readCachedModels(backend) ?? this._defaultModels()
     }
   }
 

@@ -1022,6 +1022,8 @@ export interface RemoteCrewCapabilities {
 }
 
 export interface ChatSlot {
+ acp_backend?: string | null;
+ backend_selection_supported?: boolean;
   /** Which namespace `agent` was chosen in: a configured member, a shared
    *  provider template, or "" when the choice was made by name alone or came
    *  back from history. Display provenance for the picker's selected row; the

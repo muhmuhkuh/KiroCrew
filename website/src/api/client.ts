@@ -3475,7 +3475,7 @@ export const api = {
       body: form,
     }).then(j) as Promise<{ ok?: boolean; staged?: boolean; token?: string; error?: string }>
   },
-  models: () => fetch('/api/models').then(j),
+  models: (backend?: string) => fetch('/api/models' + (backend === undefined ? '' : '?backend=' + encodeURIComponent(backend))).then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,
   // Bounded HERE, not per initiator: react-query dedupes on the key, so the
@@ -3487,6 +3487,10 @@ export const api = {
    *  keeps its legacy name-first resolution; stated, a same-name template and
    *  member are told apart and an unresolvable choice is refused (409) rather
    *  than answered by the default agent. */
+  chatSlotBackend: (slot: string, acp_backend: string | null) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/backend', { acp_backend }).then(j) as Promise<{
+      ok: boolean; acp_backend: string | null; model: string;
+    }>,
   chatSlotAgent: (slot: string, agent: string, kind?: 'member' | 'template') =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', {
       agent,

@@ -29,7 +29,6 @@ src/kiro_crew/apps/builtins/auto_research/handlers.py
 src/kiro_crew/apps/builtins/auto_research/subquestion_queue.py
 src/kiro_crew/apps/builtins/auto_research/workflow_template.py
 src/kiro_crew/apps/builtins/code_review_sage/__init__.py
-src/kiro_crew/apps/builtins/code_review_sage/backend/routes.py
 src/kiro_crew/apps/builtins/code_review_sage/sage_lib/adapters.py
 src/kiro_crew/apps/builtins/code_review_sage/sage_lib/blast_radius.py
 src/kiro_crew/apps/builtins/code_review_sage/sage_lib/discovery.py
@@ -39,7 +38,6 @@ src/kiro_crew/apps/builtins/code_review_sage/sage_lib/pipeline.py
 src/kiro_crew/apps/builtins/code_review_sage/sage_lib/report.py
 src/kiro_crew/apps/builtins/code_review_sage/sage_lib/results.py
 src/kiro_crew/apps/builtins/code_review_sage/sage_lib/review_driver.py
-src/kiro_crew/apps/builtins/code_review_sage/sage_lib/review_pool.py
 src/kiro_crew/apps/builtins/code_review_sage/sage_lib/store.py
 src/kiro_crew/apps/builtins/code_review_sage/tests/fixtures.py
 src/kiro_crew/apps/builtins/code_review_sage/tests/test_activity_progress.py
@@ -87,7 +85,6 @@ src/kiro_crew/apps/builtins/issue_radar/backend/gitlab_client.py
 src/kiro_crew/apps/builtins/issue_radar/backend/provider.py
 src/kiro_crew/apps/builtins/issue_radar/backend/store.py
 src/kiro_crew/apps/builtins/issue_radar/backend/watch.py
-src/kiro_crew/apps/builtins/issue_radar/tests/test_gitlab.py
 src/kiro_crew/apps/builtins/issue_radar/tests/test_investigation.py
 src/kiro_crew/apps/builtins/issue_radar/tests/test_issue_detail.py
 src/kiro_crew/apps/builtins/issue_radar/tests/test_issues_first_page.py
@@ -326,7 +323,6 @@ test/test_api_file_diff.py
 test/test_api_hook_test_stop_payload.py
 test/test_api_input_validation.py
 test/test_api_kiro_hooks.py
-test/test_api_models_retry.py
 test/test_api_shutdown.py
 test/test_app_backend.py
 test/test_app_backend_stale_reap.py

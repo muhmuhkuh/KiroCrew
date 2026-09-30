@@ -206,6 +206,7 @@ class _Slot:
         self.key = "t"
         self.agent = "kirocrew"
         self.model = None
+        self.acp_backend = None
         self._queue = []
         self._stop_generation = 0
         self._stopping = False
