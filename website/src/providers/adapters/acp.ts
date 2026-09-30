@@ -133,6 +133,7 @@ interface RawDailyHistory {
   sessions: number
   messages: number
   tool_calls: number
+  credits?: number
 }
 
 /** Raw provider-hook entry from /api/kiro-hooks. */
@@ -260,10 +261,12 @@ export class AcpAdapter implements ProviderAdapter {
 
   /** KiroCrew's configured default reasoning effort (Settings → Chat). '' means
    *  no default, i.e. the model picks its own. A per-slot override outranks it,
-   *  matching ConfigLoader._acp()'s `reasoning_effort_override or default`. */
-  async resolveDefaultEffort(): Promise<string> {
+   *  matching ConfigLoader._acp()'s `reasoning_effort_override or default`.
+   *  `readConfig` supplies the gateway config body from the caller's shared
+   *  `['kirocrewConfig']` query, avoiding a second GET at boot. */
+  async resolveDefaultEffort(readConfig: () => Promise<unknown>): Promise<string> {
     try {
-      const c = (await api.kirocrewConfig()) as KirocrewAgentConfig
+      const c = (await readConfig()) as KirocrewAgentConfig
       return c?.agent?.reasoning_effort || ''
     } catch {
       return ''
@@ -304,6 +307,7 @@ export class AcpAdapter implements ProviderAdapter {
           sessions: d.sessions,
           messages: d.messages,
           toolCalls: d.tool_calls,
+          credits: typeof d.credits === 'number' && Number.isFinite(d.credits) ? d.credits : undefined,
         })),
       },
       billing: b.plan ? {

@@ -1,11 +1,11 @@
 ---
 title: App SDK durable jobs and view state
-status: in-progress
+status: partial
 revision: v1
 author: Kiro Crew
 created: 2026-09-06
-last-audited: 2026-09-06
-audited-at: 424efa423
+last-audited: 2026-09-22
+audited-at: 80bd0a81f
 doc-pr:
 implementation-prs: [8403]
 tracking-issues: []
@@ -14,13 +14,10 @@ superseded-by: []
 ---
 # RFC: App SDK durable jobs and view state
 
-This RFC covers two surfaces on different tracks. The view-state record and the
-host-owned cache retention it depends on are an accepted decision, implemented in
-PR #8403 (`useAppViewState` in `website/src/app-sdk/viewState.ts`, with AWS Control
-as its first consumer); until that PR lands, neither `useAppViewState` nor the
-retention default is on the base branch. The durable-job surface stays proposed:
-`useAppJob` appears nowhere in `src/kiro_crew` or `website/src`, and the
-run-lifecycle question it shares a boundary with is argued in
+Status: partial. Gateway-side `JobSDK` is wired into `AppContext`, and
+`useAppViewState` plus its AWS Control consumer are on main. A frontend
+`useAppJob` contract is still absent, so the durable-job surface is incomplete.
+The run-lifecycle boundary is also discussed in
 [`rfc-durable-run-coordinator.md`](rfc-durable-run-coordinator.md).
 
 ## Current SDK boundary
@@ -50,12 +47,12 @@ work.
 returns its terminal record (`src/kiro_crew/apps/builtins/aws_control/backend/routes.py`,
 `_handle_backup_run`). The runner records completed backup metadata through
 `_record_run`, and `last_runs` reads that per-account terminal ledger
-(`backend/backup.py`, `_record_run` and `last_runs`). The status endpoint
+(`backend/backup_parts/ledger.py`, `_record_run` and `last_runs`). The status endpoint
 returns that ledger as `runs` (`backend/routes.py`, `_handle_backup_status`).
 There is no backup job identifier or persisted in-flight registry in this path.
 
 A worker thread cannot be killed by cancelling the awaiting coroutine, and
-`_STOP` only prevents an upload reached after app teardown (`backend/backup.py`,
+`_STOP` only prevents an upload reached after app teardown (`backend/backup_parts/uploads.py`,
 `_STOP` and `_authorize_upload`). A client disconnect therefore does not create
 a cancelable or reattachable backup job.
 
@@ -123,7 +120,7 @@ registration path.
 Together the two produce a record that contradicts the work it describes. At
 gateway startup `_reap_stale_app_backends` terminates a backend left by a prior
 gateway generation only when the pid's identity positively matches the recorded
-one; when identity cannot be confirmed the pid is left alone (`backend.py`,
+one; when identity cannot be confirmed the pid is left alone (`backend_runtime/stale_reap.py`,
 `_reap_stale_app_backends`). A backend spared by that check keeps executing, and
 the new gateway's reconciliation marks its runs `INTERRUPTED`, recording that the
 gateway restarted while the run was executing and that no runner is registered for

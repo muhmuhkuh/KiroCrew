@@ -66,13 +66,20 @@ class SlotRegistry:
 
     @staticmethod
     def creator_slot_count(owner: Any, creator_key: str) -> int:
-        """Count published slots attributed to one non-empty creator key."""
+        """Count published slots charged to one non-empty caller key under the
+        per-caller slot cap: the slots it CREATED (``_created_by``) and the slots
+        it REVIVED from history (``_revived_by``, which a revive stamps while
+        preserving the target's own creator). A slot that is both counts once.
+        """
         if not creator_key:
             return 0
         # Construction reservations carry no creator attribution, so charging
         # them here would assign one caller another caller's in-flight slot.
         return sum(
-            1 for slot in owner._slots.values() if getattr(slot, "_created_by", "") == creator_key
+            1
+            for slot in owner._slots.values()
+            if getattr(slot, "_created_by", "") == creator_key
+            or getattr(slot, "_revived_by", "") == creator_key
         )
 
     @staticmethod
@@ -95,7 +102,7 @@ class SlotRegistry:
         # may mutate the registry.  Snapshotting prevents a read-only scan from
         # failing with ``RuntimeError: dictionary changed size``.
         return frozenset(
-            effective_session_key(slot) for slot in list(owner._slots.values()) if slot.running
+            effective_session_key(slot) for slot in list(owner._slots.values()) if slot.turn_running
         )
 
     @staticmethod

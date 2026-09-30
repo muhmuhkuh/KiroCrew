@@ -1,5 +1,5 @@
-import { Loader2 } from 'lucide-react'
-import { useState, useMemo } from 'react'
+import { Loader2, Eye, Type, SquareTerminal, Palette, PanelLeft } from 'lucide-react'
+import { useState, useMemo, useEffect, useRef } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { useZoomCtx } from '../../hooks/ZoomProvider'
 import type { FontFamily } from '../../hooks/useZoom'
@@ -7,8 +7,9 @@ import { useTheme } from '../../hooks/useTheme'
 import type { ColorTheme } from '../../hooks/useTheme'
 import { useUIMode } from '../../hooks/useUIMode'
 import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, SettingsButtonGroup, SettingsInput, SettingsCombobox, SettingsToggle } from '../../components/settings'
+import { SettingsSubNav, type SubNavItem } from '../../components/SettingsSubNav'
 import SimpleSelect from '../../components/SimpleSelect'
-import { Input } from '../../components/ui'
+import { Btn, Input } from '../../components/ui'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
 import Modal from '../../components/Modal'
 import { useAppSelector, useAppDispatch } from '../../store'
@@ -31,12 +32,15 @@ import {
 } from '../../hooks/useTerminalFont'
 import { FONT_FAMILY_OPTIONS, OPENDYSLEXIC_MONO_FAMILY_NAME } from '../../utils/fontFamilyOptions'
 import { useFontOptions } from '../../hooks/useFontOptions'
-import { isFontInstalled, monospaceFontStack } from '../../utils/fontDetect'
+import { isFontInstalled, monospaceFontStack, proportionalFontStack } from '../../utils/fontDetect'
 
 import { i18nT } from '../../i18n/t'
 import { ThemeDroppedRulesNotice } from './ThemeDroppedRulesNotice'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useImeGuard } from '../../hooks/useImeGuard'
+import { useBranding } from '../../hooks/useBranding'
+import { useLiquidGlass } from '../../hooks/useLiquidGlass'
+import { TranslucentPanelsPreview } from './TranslucentPanelsPreview'
 /**
  * Lightweight inline spinner (no modal / progress bar — matches the "status,
  * not ceremony" preference). Colors come from theme CSS vars via Tailwind
@@ -70,36 +74,39 @@ function StatusIndicator({ label }: { label: string }) {
   )
 }
 
-/**
- * True when a failed credit-meter save was the owner gate refusing, not a
- * transient failure.
- *
- * Enabling this field is owner-only (handlers/core.py refuses with 403 and the
- * standard `owner_only` code). The generic line ends "you can try again", which
- * for a non-owner is a loop: the retry can never succeed. Duck-typed on
- * `status` and the body rather than `instanceof ApiError`, the same way
- * `isNotFoundError` is, so a suite that mocks `api/client` still reaches this
- * branch.
- */
-function isOwnerOnlyRefusal(err: unknown): boolean {
-  const e = err as { status?: unknown; body?: unknown } | null
-  return (
-    typeof e === 'object' &&
-    e !== null &&
-    e.status === 403 &&
-    String(e.body ?? '').includes('owner_only')
-  )
-}
-
-export function DisplayPanel() {
+export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
   const ime = useImeGuard()
-  const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed } = useLanguage()
-  const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily } = useZoomCtx()
+  const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed, catalogFailed: langCatalogFailed } = useLanguage()
+  const { zoom, zoomSupported, zoomIn, zoomOut, reset, family, setFontFamily, customFontFamily, setCustomFontFamily, customFontLigatures, setCustomFontLigatures } = useZoomCtx()
   // Shortcut label for the zoom hint/description: ⌘ on macOS, Ctrl elsewhere.
   const modKey = /mac/i.test(navigator.platform) ? '⌘' : 'Ctrl'
-  const { preference, setTheme, colorTheme, setColorTheme, allThemes, loadCustomThemes, themeSwitching, overridesDropReport } = useTheme()
+  const {
+    preference,
+    setTheme,
+    colorTheme,
+    setColorTheme,
+    allThemes,
+    customThemesUpdatedAt,
+    loadCustomThemes,
+    themeSwitching,
+    overridesDropReport,
+    installedThemeLoadFailed,
+    customThemesLoadError,
+    customThemesLoaded,
+  } = useTheme()
+  // The load-error notice is shown only for a pack that is actually unstyled.
+  // `installedThemeLoadFailed` is derived in the provider from the selection,
+  // the catalog and the detail map, so a failed reload whose last good detail
+  // is still in the map (render-cache seed or carry-forward) is false: the
+  // theme stays on screen and no notice contradicts it. The copy names the way
+  // out that exists for this pack: an installed pack can be reinstalled, an
+  // editor-created one can only be edited or swapped.
+  const showThemeLoadError = installedThemeLoadFailed
+  const isInstalledTheme = allThemes.find((t) => t.value === colorTheme)?.installed === true
   const { uiMode, setUIMode } = useUIMode()
   const editor = useThemeEditor()
+  const { liquidGlass, setLiquidGlass } = useLiquidGlass()
+  const { botName } = useBranding()
   const termFont = useTerminalFont()
   // Probed families become picker rows previewed in their own family, so the
   // Powerline sample answers "will my prompt theme render" before the choice is
@@ -157,6 +164,41 @@ export function DisplayPanel() {
           ? i18nT('pages.settings.displayPanel.terminal_font_detect_none')
           : undefined
 
+  // ── Custom font picker ──
+  // Shown only when the Font Family option below is "Custom". It names any
+  // installed family, which useZoom applies to --font-body app-wide (the custom
+  // family flows to chat, titles and folders by inheritance). Same component and
+  // two-layer detection as the terminal picker, but 'all' mode (this is prose,
+  // so proportional families are offered too) with previews in a proportional
+  // stack. Empty string = nothing typed yet; useZoom then falls back to the Sans
+  // stack, so Custom never renders as the browser default serif.
+  const {
+    families: customFontFamilies,
+    accessSupported: customFontAccessSupported,
+    lastResult: customFontDetectResult,
+    enumerate: enumerateCustomFonts,
+  } = useFontOptions('all')
+  const customFontPreview = (fam: string) => ({ previewFontFamily: proportionalFontStack(fam) })
+  const customFontOptions = useMemo(
+    () => customFontFamilies.map(fam => ({ value: fam, label: fam, ...customFontPreview(fam) })),
+    [customFontFamilies],
+  )
+  const customFontDetectStatus = customFontDetectResult === 'checking'
+    ? i18nT('pages.settings.displayPanel.custom_font_detect_checking')
+    : customFontDetectResult === 'added'
+      ? i18nT('pages.settings.displayPanel.custom_font_detect_added')
+      : customFontDetectResult === 'none'
+          ? i18nT('pages.settings.displayPanel.custom_font_detect_none')
+          : undefined
+  // A denied Local Font Access permission is an error, not a plain status line:
+  // it is surfaced through ErrorNotice (errors-use-error-notice) rather than the
+  // combobox's actionStatus slot, which styles its text as recede-into-the-
+  // background metadata. The typed free-text path still works, so this is a
+  // notice, not a blocker.
+  const customFontDetectError = customFontDetectResult === 'denied'
+    ? i18nT('pages.settings.displayPanel.custom_font_detect_denied')
+    : null
+
   const dispatch = useAppDispatch()
   const { paletteColors: colors, colorMode, paletteName, intensity, boost } = useSessionPalette()
   const defaultColor = useAppSelector(s => s.dashboard.sessionDefaultColor) as DefaultColorSetting
@@ -167,7 +209,6 @@ export function DisplayPanel() {
   type KirocrewCfg = {
     dashboard?: {
       recent_tint_count?: number
-      usage_text_scrape_enabled?: boolean
       terminal?: { shell?: string; completion?: { enabled?: boolean } }
     }
   }
@@ -278,59 +319,50 @@ export function DisplayPanel() {
     onSupersede: () => setCompletionError(null),
   }))
 
-  // ── Billed credit-meter fallback (server-side; dashboard.usage_text_scrape_enabled) ──
-  // Copies the terminal-completion toggle directly above: same ['kirocrewConfig']
-  // query, same `api.patchConfig` write, same per-path overlay, same
-  // onFailure/onSupersede error line. Before this the key was declared in the
-  // schema but missing from the PATCH allowlist, so no control could have saved
-  // it at all (see handlers/core.py `_EDITABLE_CONFIG`).
-  //
-  // `=== true` is not a UI default, it MIRRORS the backend's own coercion:
-  // config/loader.py stores this field as `_safe_bool(..., False)` and
-  // config/sections.py:357 defines `_safe_bool` as "return value only when it
-  // is a real bool, else default". So a hand-edited `"true"` string is read as
-  // OFF by the gate, and must render OFF here too — the same reasoning the
-  // completion toggle above applies with its `!== false` (its default is on,
-  // ours is off). A config that has never carried the key renders OFF, so
-  // installing this control changes nothing until the user flips it.
-  //
-  // No restart prompt, which the issue asked about: the reader calls
-  // `KiroCrewConfig.load()` per check and the config cache is keyed on
-  // `_config_fingerprint()` (st_mtime_ns + st_size + st_mode), whose docstring
-  // says any edit busts it — so the next refresh interval already sees the new
-  // value. A banner promising a restart would be a false instruction.
-  //
-  // Locked for the round-trip (`scrapeMut.isPending`), like the shell field
-  // below and unlike the completion toggle above. The overlay's token guard
-  // already keeps the DISPLAYED value and the cache write coherent, but it
-  // cannot order two PATCHes in flight: rapid on-off clicks are ordinary, and
-  // if they land out of order the server keeps `true` after the user's final
-  // `false`. For this key that is not a cosmetic revert, it is billed refreshes
-  // the user switched off, so the second click is made unrepresentable instead.
-  const serverScrape = mcQ.data?.dashboard?.usage_text_scrape_enabled === true
-  const shownScrape = overlay.shown('dashboard.usage_text_scrape_enabled', serverScrape)
-  const [scrapeError, setScrapeError] = useState<string | null>(null)
-  const scrapeMut = useMutation(overlay.mutationOpts<boolean>({
-    queryKey: ['kirocrewConfig'],
-    mutationFn: (value: boolean) => api.patchConfig('dashboard.usage_text_scrape_enabled', value),
-    path: () => 'dashboard.usage_text_scrape_enabled',
-    displayValue: v => v,
-    applyToCache: (cached, value) =>
-      setConfigPathValue(cached as KirocrewCfg, 'dashboard.usage_text_scrape_enabled', value),
-    onFailure: err =>
-      setScrapeError(
-        isOwnerOnlyRefusal(err)
-          ? i18nT('pages.settings.displayPanel.credit_usage_scrape_owner_only')
-          : i18nT('pages.settings.displayPanel.credit_usage_scrape_save_failed'),
-      ),
-    onSupersede: () => setScrapeError(null),
-  }))
-
   // ── Install theme (Level 0) from a local folder or a GitHub repo ──
   const [installType, setInstallType] = useState<'github' | 'local'>('github')
   const [installValue, setInstallValue] = useState('')
   const [installBusy, setInstallBusy] = useState(false)
   const [installError, setInstallError] = useState<string | null>(null)
+  // An install landed but the follow-up catalog refresh failed, so the new pack
+  // is not listed yet and was not selected. That failure is rendered at once
+  // under the picker (it must not wait for the invalidated refetch to SETTLE in
+  // error, which may take a retry); the user picks the pack from the list once
+  // it is current. No deferred auto-select: a selection made minutes later by a
+  // background refetch, possibly with the user gone, is a theme swap nobody
+  // asked for. The notice is withdrawn the next time the list changes.
+  const [installRefreshFailed, setInstallRefreshFailed] = useState(false)
+  // The slug that install left unlisted, so a USER-INITIATED Retry that
+  // succeeds can finish the install by selecting it -- the notice's own
+  // instruction, kept. Never read by an effect: a background refetch landing
+  // minutes later must not restyle the dashboard unprompted.
+  const installedUnlistedSlugRef = useRef<string | null>(null)
+  // `customThemesUpdatedAt` moves whenever a catalog fetch LANDS. Neither
+  // `allThemes` (rebuilt every render) nor `customThemes` (structurally shared:
+  // a deep-equal listing, e.g. a reinstall of an already-listed pack, keeps its
+  // reference) can serve as that signal.
+  const catalogSeenRef = useRef(customThemesUpdatedAt)
+  useEffect(() => {
+    if (catalogSeenRef.current !== customThemesUpdatedAt) {
+      catalogSeenRef.current = customThemesUpdatedAt
+      setInstallRefreshFailed(false)
+      installedUnlistedSlugRef.current = null
+    }
+  }, [customThemesUpdatedAt])
+  // Retry of the catalog list from its notice: busy while the fetch runs so a
+  // failed retry is visibly a retry that ran, not a click that did nothing.
+  const [catalogRetrying, setCatalogRetrying] = useState(false)
+  const retryCatalog = async () => {
+    setCatalogRetrying(true)
+    try {
+      if (await loadCustomThemes()) {
+        setInstallRefreshFailed(false)
+        const slug = installedUnlistedSlugRef.current
+        installedUnlistedSlugRef.current = null
+        if (slug) setColorTheme(`custom-${slug}` as ColorTheme)
+      }
+    } finally { setCatalogRetrying(false) }
+  }
   // Phase for the install status indicator: fetching (api.installTheme in
   // flight) → applying (auto-selecting the freshly installed theme).
   const [installPhase, setInstallPhase] = useState<'fetching' | 'applying' | null>(null)
@@ -340,6 +372,10 @@ export function DisplayPanel() {
     if (!v || installBusy) return
     setInstallBusy(true)
     setInstallError(null)
+    // A new attempt owns the notices: the previous attempt's stale-list state
+    // is replaced by this one's outcome.
+    setInstallRefreshFailed(false)
+    installedUnlistedSlugRef.current = null
     setInstallPhase('fetching')
     try {
       const source =
@@ -352,8 +388,23 @@ export function DisplayPanel() {
         return
       }
       setInstallPhase('applying')
-      await loadCustomThemes()
-      if (res.slug) setColorTheme(`custom-${res.slug}` as ColorTheme)
+      // Select only once the catalog carries the new pack: selecting a slug the
+      // catalog lacks is read by self-repair as dangling and reset. On a failed
+      // refresh the pack is installed but not yet listed; the failure is the
+      // catalog query's to report (`customThemesLoadError` -> the
+      // `installed_themes_refresh_failed` notice under the picker), and the
+      // user picks the pack from the list once it is current.
+      const refreshed = await loadCustomThemes()
+      if (refreshed && res.slug) {
+        setColorTheme(`custom-${res.slug}` as ColorTheme)
+      } else if (!refreshed) {
+        // The install landed but the list refresh did not: the picker's notice
+        // says so at once (it keys on this state, not only on a SETTLED catalog
+        // error, which the invalidated refetch may take a retry to reach) and
+        // carries the Retry.
+        setInstallRefreshFailed(true)
+        installedUnlistedSlugRef.current = res.slug ?? null
+      }
       setInstallValue('')
     } catch (e) {
       setInstallError(e instanceof Error ? e.message : i18nT('pages.settings.displayPanel.install_failed'))
@@ -363,8 +414,42 @@ export function DisplayPanel() {
     }
   }
 
+  // The shell field (terminal pane) and the recency-tint stepper (sidebar pane)
+  // are both disabled while this query is not successful. The notice rides the
+  // SubNav banner slot so a failed read explains the greyed control on whichever
+  // pane the rail opens, instead of sitting in one unmounted case.
+  const configBanner = mcQ.isError ? (
+    // No hand-off: this is a config READ failure carrying its own Retry, and
+    // showing it discards nothing — the `shellDraft` and `installValue` drafts
+    // on the panes below stay put, so an ErrorNotice hand-off would only risk
+    // navigating those unsaved values away.
+    <ErrorNotice
+      className="mb-2 animate-rise"
+      message={i18nT('pages.settings.displayPanel.config_load_failed')}
+    />
+  ) : null
+
+  const railItems: SubNavItem[] = [
+    { key: 'view', label: i18nT('pages.settings.displayPanel.view'), icon: <Eye size={16} /> },
+    { key: 'zoom', label: i18nT('pages.settings.displayPanel.zoom_font'), icon: <Type size={16} /> },
+    { key: 'terminal', label: i18nT('pages.settings.displayPanel.terminal'), icon: <SquareTerminal size={16} /> },
+    { key: 'theme', label: i18nT('pages.settings.displayPanel.theme'), icon: <Palette size={16} /> },
+    { key: 'sidebar', label: i18nT('pages.settings.displayPanel.sidebar_colors'), icon: <PanelLeft size={16} /> },
+  ]
+
   return (
-    <>
+    <SettingsSubNav
+      items={railItems}
+      basePath={basePath}
+      railWidth={220}
+      listLabel={i18nT('settings.tabs.display.label')}
+      banner={configBanner}
+    >
+      {active => {
+        switch (active) {
+
+        case 'view':
+          return (
       <SettingsSection title={i18nT('pages.settings.displayPanel.view')}>
         <SettingsCard>
           {/* Options are built from SUPPORTED_LANGUAGES, so shipping a new
@@ -389,52 +474,59 @@ export function DisplayPanel() {
             ]}
             onChange={setLanguage}
           />
-          {/* A failed write means the choice is browser-local only, and the next
-              load will silently revert it to the server's value. Say so rather
-              than letting the user discover it on reload. No hand-off: the
-              `shellDraft` and `installValue` fields further down this panel are
-              unsaved local state, and the navigation unmounts the panel. */}
-          <ErrorNotice
-            variant="inline"
-            message={langSyncFailed ? i18nT('settings.display.language.sync_failed') : null}
-          />
+          {/* A catalog failure leaves the previous language active even though
+              the picker preserves the user's choice. Keep that mismatch visible
+              until a later switch succeeds. Persistence can fail independently,
+              so each active failure keeps its own notice. Neither offers a
+              hand-off: navigating away would discard `shellDraft` or
+              `installValue` further down this panel when either contains
+              unsaved input. */}
+          {langCatalogFailed && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('settings.display.language.catalog_failed')}
+            />
+          )}
+          {langSyncFailed && (
+            <ErrorNotice
+              variant="inline"
+              message={i18nT('settings.display.language.sync_failed')}
+            />
+          )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.interface')} description={i18nT('pages.settings.displayPanel.chat_bubbles_or_cli_style_line_by_line_output')} value={uiMode}
             options={[
               { value: 'chat', label: 'Chat' },
               { value: 'cli', label: 'CLI' },
             ]}
             onChange={v => setUIMode(v as 'chat' | 'cli')} />
-          {/* The credit pill's data source. It sits on Display because the pill
-              is dashboard chrome and the issue asked for it here; the closest
-              boolean of the same family (link_previews, also opt-in and also
-              off for a non-display reason) lives on the Chat tab, so this is
-              the reporter's placement rather than that sibling's.
-
-              `description` is a bare i18nT() call, not an element: the settings
-              extractor reads it only as a string literal or a t() call
-              (scripts/settingsExtract.ts `extractStringProp`), so wrapping it
-              would drop this row's description from the command-palette
-              registry with no type error. The sentence reuses the cost
-              disclosure the account modal already ships in every locale
-              (components.kiroAccountModal.credit_usage_scrape_disabled). */}
+          {/* The translucent panels (the Liquid Glass primitive: the message
+              box, the chips, the Settings search capsule, the list search
+              fields, the notification panes) are opt-in. Off (the default)
+              they are solid cards -- the same rules the app applies under the
+              OS's own reduced-transparency setting, so the two paths cannot
+              look different. On, they render as frosted glass over whatever
+              scrolls under them. Browser-local, like the font family: it is
+              about how this screen renders, so it sits with the other
+              how-the-UI-draws choices (interface style) rather than with the
+              theme catalog. The preview under the row is the real Glass
+              primitive over a skeleton transcript, so it follows the switch
+              live and shows what the setting changes before the user leaves
+              Settings. */}
           <SettingsToggle
-            label={i18nT('pages.settings.displayPanel.credit_usage_scrape')}
-            description={i18nT('pages.settings.displayPanel.credit_usage_scrape_desc')}
-            checked={shownScrape}
-            onChange={v => scrapeMut.mutate(v)}
-            disabled={scrapeMut.isPending || !mcQ.isSuccess}
-            configKey="dashboard.usage_text_scrape_enabled"
+            label={i18nT('pages.settings.displayPanel.translucent_panels')}
+            description={i18nT('pages.settings.displayPanel.translucent_panels_desc')}
+            checked={liquidGlass}
+            onChange={setLiquidGlass}
           />
-          {/* A rejected write rolls the switch back, which is honest but silent
-              about why. No hand-off: `shellDraft` and `installValue` elsewhere
-              on this panel are unsaved local state the navigation would
-              discard — same rule as the language notice above. */}
-          <ErrorNotice message={scrapeError} variant="inline" />
+          <TranslucentPanelsPreview placeholder={i18nT('components.chatInput.message_placeholder', { bot: botName })} />
         </SettingsCard>
       </SettingsSection>
+          )
 
+        case 'zoom':
+          return (
       <SettingsSection title={i18nT('pages.settings.displayPanel.zoom_font')}>
-        <SettingsCard index={1}>
+        <SettingsCard>
           {zoomSupported ? (
             <SettingsStepper label={i18nT('pages.settings.displayPanel.zoom_level')} description={i18nT('pages.settings.displayPanel.native_window_zoom_tip', { mod: modKey })} value={zoom} suffix="%" onIncrement={zoomIn} onDecrement={zoomOut} onReset={reset} />
           ) : (
@@ -454,11 +546,60 @@ export function DisplayPanel() {
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.font_family')} description={i18nT('pages.settings.displayPanel.ui_font_family_for_the_dashboard_code_font_follo')} value={family}
             options={FONT_FAMILY_OPTIONS.map(o => ({ value: o.value, label: o.labelKey ? i18nT(o.labelKey) : o.label! }))}
             onChange={v => setFontFamily(v as FontFamily)} />
+          {/* Only when "Custom" is picked above: choose ANY installed family for
+              --font-body app-wide (chat, titles and folders inherit it). Same
+              browser-side detection as the terminal picker; a Nerd Font renders
+              its glyphs and index.css turns on ligatures while Custom is active.
+              Empty = nothing chosen yet, and useZoom falls back to the Sans stack. */}
+          {family === 'custom' && (
+            <>
+            <SettingsCombobox
+              label={i18nT('pages.settings.displayPanel.custom_font_family')}
+              description={i18nT('pages.settings.displayPanel.custom_font_family_desc')}
+              value={customFontFamily}
+              options={customFontOptions}
+              onChange={setCustomFontFamily}
+              triggerFallback={customFontFamily || i18nT('pages.settings.displayPanel.custom_font_choose')}
+              searchPlaceholder={i18nT('pages.settings.displayPanel.custom_font_search')}
+              customValueOption={typed => (isFontInstalled(typed)
+                ? {
+                  label: i18nT('pages.settings.displayPanel.custom_font_use_typed', { value: typed }),
+                  ...customFontPreview(typed),
+                }
+                : {
+                  label: i18nT('pages.settings.displayPanel.custom_font_use_typed', { value: typed }),
+                  sublabel: i18nT('pages.settings.displayPanel.custom_font_not_detected'),
+                })}
+              action={customFontAccessSupported
+                ? { label: i18nT('pages.settings.displayPanel.custom_font_detect'), onSelect: enumerateCustomFonts }
+                : undefined}
+              actionStatus={customFontDetectStatus}
+            />
+            {/* A denied Local Font Access permission surfaces here, not as a
+                muted status line. askAgent ON: the Custom font value persists
+                live on change and the typed free-text path stays available, so
+                there is no unsaved draft to lose — the hand-off may navigate to
+                chat freely. */}
+            <ErrorNotice message={customFontDetectError} variant="inline" askAgent />
+            {/* Ligatures are the reason many pick a coding font here, so default
+                on — but a programming font's =>/!= ligatures are divisive, so this
+                turns them off without leaving Custom. Only shown in Custom mode. */}
+            <SettingsToggle
+              label={i18nT('pages.settings.displayPanel.custom_font_ligatures')}
+              description={i18nT('pages.settings.displayPanel.custom_font_ligatures_desc')}
+              checked={customFontLigatures}
+              onChange={setCustomFontLigatures}
+            />
+            </>
+          )}
         </SettingsCard>
       </SettingsSection>
+          )
 
+        case 'terminal':
+          return (
       <SettingsSection title={i18nT('pages.settings.displayPanel.terminal')}>
-        <SettingsCard index={2}>
+        <SettingsCard>
           {/* Detected families, not free text alone: the fonts that matter are the
               ones installed on the machine RENDERING the terminal, which is the
               browser's machine — xterm rasterizes client-side while the pty lives on
@@ -543,20 +684,15 @@ export function DisplayPanel() {
               are unsaved local state, and the hand-off's navigation unmounts
               the whole panel with them. Same rule as the language notice. */}
           <ErrorNotice message={completionError} variant="inline" />
-          {/* The shell field and the recency-tint stepper are both disabled
-              while this query is not successful. A failed read used to leave
-              them greyed out with no reason on screen. No hand-off: the theme
-              `installValue` field on this panel is unaffected by the query and
-              may hold a half-typed source the navigation would discard. */}
-          <ErrorNotice
-            variant="inline"
-            message={mcQ.isError ? i18nT('pages.settings.displayPanel.config_load_failed') : null}
-          />
         </SettingsCard>
       </SettingsSection>
+          )
 
+        case 'theme':
+          return (
+      <>
       <SettingsSection title={i18nT('pages.settings.displayPanel.theme')}>
-        <SettingsCard index={3}>
+        <SettingsCard>
           <div className="flex items-center gap-2">
             <div className="flex-1 min-w-0">
               <SettingsSelect label={i18nT('pages.settings.displayPanel.theme')} description={i18nT('pages.settings.displayPanel.select_a_theme_for_the_dashboard')} value={colorTheme}
@@ -565,12 +701,66 @@ export function DisplayPanel() {
             </div>
             {themeSwitching && <StatusIndicator label={i18nT('pages.settings.displayPanel.applying')} />}
           </div>
+          {/* The installed-theme catalog failed to load (gateway still booting,
+              tunnel error): without this the picker just lacks the installed
+              rows and the selected theme renders unstyled with no reason on
+              screen. The provider keeps retrying; this reports the wait.
+              No hand-off: `installValue` (the GitHub URL / local path below) may
+              be half-typed, and the hand-off's navigation would discard it. */}
+          {(customThemesLoadError || installRefreshFailed) && (
+            <div className="flex items-center gap-3">
+              <ErrorNotice
+                variant="inline"
+                message={i18nT(
+                  installRefreshFailed
+                    ? 'pages.settings.displayPanel.installed_themes_refresh_failed_after_install'
+                    : customThemesLoaded
+                      ? 'pages.settings.displayPanel.installed_themes_refresh_failed'
+                      : 'pages.settings.displayPanel.installed_themes_load_failed',
+                )}
+              />
+              {/* A settled refetch failure does not retry on its own (the boot
+                  loop does, hence no button while nothing has loaded), so the
+                  notice carries the retry rather than being a dead end. */}
+              {(customThemesLoaded || installRefreshFailed) && (
+                <Btn
+                  type="button"
+                  disabled={catalogRetrying}
+                  aria-busy={catalogRetrying || undefined}
+                  onClick={() => { void retryCatalog() }}
+                >
+                  {i18nT(catalogRetrying
+                    ? 'pages.settings.displayPanel.retrying_theme_list'
+                    : 'pages.settings.displayPanel.retry_theme_list')}
+                </Btn>
+              )}
+            </div>
+          )}
           {/* Surface scoper-dropped overrides.css rules for the ACTIVE
               theme. The slug guard is belt-and-braces for the switch race — the
               provider clears the report on theme change, but a stale report must
               never be attributed to the wrong pack. */}
           {overridesDropReport && colorTheme === `custom-${overridesDropReport.slug}` && (
             <ThemeDroppedRulesNotice report={overridesDropReport} />
+          )}
+          {/* The active custom theme's detail fetch failed AND no last good
+              detail is in the map, so its variables and branding are not on
+              screen: say so and name the way out instead of leaving the picker
+              showing a theme that is not applied. `installedThemeLoadFailed` is
+              derived by the provider (listed pack, detail absent from the map),
+              so a failed reload with the render-cache seed still applied keeps
+              the screen themed and gets no notice. Two copies: an installed pack
+              can be reinstalled; an editor-created pack has no install source,
+              so it is told to edit or pick another. The flag is the provider's
+              trigger only; the rejection is never shown. No hand-off:
+              the `shellDraft` and `installValue` fields further down this panel
+              are unsaved local state, and the navigation unmounts the panel. */}
+          {showThemeLoadError && (
+            <ErrorNotice
+              message={isInstalledTheme
+                ? i18nT('pages.settings.displayPanel.installed_theme_could_not_be_loaded')
+                : i18nT('pages.settings.displayPanel.custom_theme_could_not_be_loaded')}
+            />
           )}
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.mode')} description={i18nT('pages.settings.displayPanel.light_or_dark_appearance_for_the_dashboard')} value={preference}
             options={[
@@ -664,10 +854,13 @@ export function DisplayPanel() {
       >
         <ThemeEditorPanel editor={editor} />
       </Modal>
+      </>
+          )
 
-      {/* Sidebar Colors */}
+        case 'sidebar':
+          return (
       <SettingsSection title={i18nT('pages.settings.displayPanel.sidebar_colors')}>
-        <SettingsCard index={4}>
+        <SettingsCard>
           <SettingsButtonGroup
             label={i18nT('pages.settings.displayPanel.palette')}
             description={i18nT('pages.settings.displayPanel.choose_a_color_palette_for_your_sidebar_sessions')}
@@ -716,6 +909,12 @@ export function DisplayPanel() {
           </div>
         </SettingsCard>
       </SettingsSection>
-    </>
+          )
+
+        default:
+          return null
+        }
+      }}
+    </SettingsSubNav>
   )
 }

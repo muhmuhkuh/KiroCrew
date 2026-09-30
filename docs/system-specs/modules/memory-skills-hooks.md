@@ -85,7 +85,10 @@ an edited or shortened prefix refuses acknowledgement. Receipts are not pruned.
 - `memory_stores.py` resolves configured store paths and explicit member creation.
   `members.py` owns persisted member IDs and manual member documents.
 - `memory_schema.py` defines the authoritative member tables. `vector_memory.py`
-  owns exclusive creation, strict open, learned reads/writes, FTS and vectors;
+  owns exclusive creation, strict open and the store's one connection and lock.
+  Learned reads/writes, FTS and vectors run on that connection, split between the
+  store and the `vector_memory_runtime/` modules it delegates to (see
+  [Store composition](#store-composition-vector_memorypy-and-vector_memory_runtime));
   `memory_record_metadata.py` maintains revisions, proposals and provenance.
 - `memory.py` is the facade for manual documents and learned history. V2 learned
   operations delegate to its admitted SQLite handle; V1 keeps its file layout.
@@ -123,14 +126,20 @@ V2 has no automatic history retention limit.
 
 V1 has six distinct storage layers, each with its own store and write path. V2
 unifies learned layers in SQLite. Fresh V1 context includes complete stable
-preferences, a short activity index and applicable lessons; daily history,
-project notebooks and old-task facts/episodes stay behind explicit
-`memory_recall`. Warm follow-ups retain native conversation history without
-repeating startup injection. V2 session context reads essential anchors and
-query-free scoped lessons; its semantic and episodic fragments require an
-explicit `memory_recall` operation. The nesting below is source-of-truth
-ordering (a later layer can override an earlier one), not a storage hierarchy
-and not everything sent on each turn:
+preferences, a short activity index and applicable lessons as protected
+context; with `memory.inject_activity` on (the default) the first turn also
+carries project notebooks, daily history (14 full days, then decayed summaries
+and counts to day 180), task facts and past episodes as one budgeted
+`[Memory activity]` background block
+(`get_activity_context`), and it embeds the request once to rank those facts
+and episodes (two embed calls on the same text, one shared inference). With the
+switch off that material stays behind explicit `memory_recall`, and anything
+the block omits or the budget drops is reached the same way. Warm follow-ups
+retain native conversation history without repeating startup injection. V2
+session context reads essential anchors and query-free scoped lessons; its
+semantic and episodic fragments require an explicit `memory_recall` operation.
+The nesting below is source-of-truth ordering (a later layer can override an
+earlier one), not a storage hierarchy and not everything sent on each turn:
 
 ```
 Memory storage layers (not a model-input or token budget)
@@ -204,7 +213,7 @@ from every backup while a restore writes a copy nothing reads. A NAMED store's i
 does live beside its own markdown, which is what makes the index per-store and puts
 it behind the `memory_stores/` fence. The snapshot `memory` component and
 `portability`'s export both carry the whole `memory_stores/` tree (see
-[Named stores ride the backup paths](#named-stores-ride-the-backup-paths)), so a
+[Named stores and backup paths](#named-stores-and-backup-paths)), so a
 named store's index rides beside its markdown; `scripts/sync-to-remote.sh` still
 names only the root paths.
 
@@ -267,6 +276,24 @@ larger than 8 MiB is refused without truncating or deleting it; editable-history
 GET and PUT retain the existing `store_unavailable` (503) error response.
 Ordinary V2 message context does not scan learned history.
 
+Whether a group is in scope is the intersection of the caller-passed
+`context_groups` (subagent narrowing) with the operator's config toggles —
+`memory.inject_memory` / `memory.inject_lessons`, with
+`memory.persistence_enabled` as the global switch — computed inside
+`build_session_context()` so every surface (dashboard, channels, cron,
+heartbeat, task runner, eval, subagents) obeys the config without passing
+anything. `memory.inject_activity` is finer than a group: inside the memory
+group it decides whether the budgeted `[Memory activity]` block (projects,
+daily history (14 full days, then decayed summaries and counts to day 180),
+task facts and relevant episodes) is appended after the protected
+preferences and activity index. The member-essentials builder and the post-compaction re-injection in
+`build_message()` route through the same intersection, because each restores a
+block the session-start build gates: reading the caller scope alone there would
+hand back withheld memory for the rest of the session. The `[CONTEXT SCOPE]`
+withheld-groups block stays keyed to the caller-passed value only: "your parent
+withheld" describes per-spawn narrowing, not the operator's standing config
+choice.
+
 `MemoryStore.get_context()` retains `history_cap=25_000` as its default for
 programmatic readers. V1 `ContextBuilder` calls it with the scaled history cap
 when building fresh session context. V2 reads preference/project anchors without
@@ -303,6 +330,13 @@ pre-extraction record revision in that transaction. Embeddings are deferred for
 maintenance and cannot hold the write lock during provider inference. Before a
 retry calls a provider, a committed receipt recovers a lost transcript progress
 acknowledgement and leaves later appended messages pending.
+
+Display-only rows (`history_projection.DISPLAY_ONLY_ROLES`, the `notice` role)
+never reach a consolidation or skill-detection prompt: they are drawn for the
+person reading the transcript, and the Slack thread-parent notice carries
+untrusted text. They stay in the snapshot, and a span holding nothing else
+costs no model call: a history pass marks it consolidated, while a
+skill-detection pass leaves the offset alone.
 
 The following file-oriented flow and independent writes describe V1.
 
@@ -351,12 +385,33 @@ material by replacing a manual member document.
 
 Both versions freeze a deep copy of the extraction transcript and revalidate
 its generation, original message prefix and new user turns after the model
-returns, before any memory write. Edited/deleted source messages or a new user
-turn refuse that pass and leave it pending without charging a different span's
-retry budget. Appended assistant acknowledgments can remain pending while the
-unchanged original span is committed. This source check and each record's
-revision check protect against stale background extraction; they are separate
-checks, not a cross-file transcript/database transaction.
+returns, before any memory write. Every transcript-derived durable publication
+then enters `ConversationLog.publication_hold` for that one write: the member V2
+atomic consolidation transaction, and each V1 history, semantic, preference,
+project, lesson and episodic write. The hold runs on the existing worker and spans
+neither extraction nor embedding inference nor an event-loop await. Edited/deleted
+source messages or a new user turn refuse that pass and leave it pending without
+charging a different span's retry budget. Appended assistant acknowledgments can
+remain pending while the unchanged original span is committed. The
+persistence switch is checked at the start of the run and before its first
+publication. If it turns off before any output commits, the run is refused and
+no transcript span is marked consolidated. Once one output commits, the run
+finishes its remaining outputs and marks the span normally so a retry cannot
+repeat a partial consolidation. The same latch governs a later hold the seam
+refuses: before the first commit a restricted line (`TranscriptWithheld`) or a
+lock the hold cannot take (`TranscriptBusy`) refuses the run with nothing
+marked; after it, the run stops publishing at that output -- a restricted line
+must not be learned from and a busy lock cannot be vouched for -- logs at
+warning which stage was refused and why, and still marks the span consolidated.
+The outputs after the first are best-effort memory, while leaving the span
+pending re-runs it on the next idle sweep and `append_history`, which carries no
+receipt, appends the same history entry twice; a transcript restricted mid-run
+is refused by the derivation seam on every later run, so marking it loses
+nothing. The run-level latch counts only a publication
+whose writer reports success, or a no-result writer that completes without raising.
+This source check and each record's revision
+check protect against stale background extraction; they are separate checks,
+not a cross-file transcript/database transaction.
 
 The prefs path does NOT advance the persisted `last_consolidated` marker — only the history path does. This ensures history consolidation always covers all messages, even if prefs consolidation fired earlier.
 
@@ -364,10 +419,55 @@ Idle detection: `_last_activity[key]` updated on every `maybe_consolidate()` cal
 
 **Both paths write to the session's captured store.** `_consolidate` captures the
 canonical execution context before its first await and refuses incognito or
-temporary sessions before reading their transcripts. V2 uses that context's exact
+temporary sessions before reading their transcripts. A channel thread's
+`!temporary` / `!incognito` mode lives in two durable records for two readers:
+the session map's flag (`SessionMap.set_flag`, keyed by the live `slack:<ts>`
+key) is what the channel's inbound gate hydrates from per message, and the
+transcript header's `memory_mode` is what every memory reader refuses on -- this
+pass's pre-snapshot check, the derivation seam (`TranscriptWithheld`) and the
+publication hold around each durable write, above. `privacy_mode._commit_mode`
+writes both, the row first and then the header, tighten-only against the
+header's mode read NORMALIZED (`history.transcript_privacy_mode`: the shared
+predicate's `lower()` and set, returning the mode, so a header spelled
+`Temporary` is the stricter mode it is rather than an unknown string an
+incognito stamp would overwrite; upserted, so a thread flagged before its first
+turn gets a metadata-only header that `ConversationLog.append` then keeps), so a
+transcript read never depends on the session map. A privacy flag keeps its map
+entry alive through `SessionMap.prune` and the per-read repair, both of which
+run under the map lock on the event loop and read no transcript, and through
+every other path: no step removes a privacy-flagged row, whatever the header
+says, because the gate hydrates from the map alone and a removed row leaves it
+reading the thread as persistent after the next restart. The header of a row
+flagged before the stamp existed is ensured by `SessionMap.stamp_privacy_headers`,
+which the session pool's `start_pool` runs right after `prune` (awaited in place
+by a blocking start; inside the already-scheduled task by a non-blocking one, so
+a live-config apply or a background-session restart never waits on it): every
+flagged row is named under the map lock (a snapshot of candidates, no file
+touched), then each row is re-read and stamped under that session's
+durable-write lock (`privacy_mode._serialized`, the lock the modifier's commit
+and a reservation's release hold across their own row-and-header sequences): a
+row the re-read finds unflagged is skipped, and a row still flagged has its
+existing transcript's header probed on a worker thread and the mode copied in
+where it is missing or weaker (tighten-only, never creating a transcript).
+Serialized because the snapshot goes stale under live traffic: a reservation
+released after the snapshot restores the header and clears the row, and a stamp
+from the snapshot alone re-wrote the released mode into that header over a row
+that was gone -- which nothing loosens again (the sweep only tightens, from
+rows; a later release of the same mode reads the stale stamp as its own
+`header_before`), so the thread's consolidation stayed refused for good. A flag
+tightened during the probe is re-stamped by the next pass, and a header that
+already records the mode costs no write (`needs_tightening`). The rows are
+capped at `SessionMap.PRIVACY_ROW_CAP` (the trackers' `PRIVACY_LRU_MAX`), held
+by refusing a NEW flag fail-closed -- the modifier tells the user the message
+was not processed and does not run it -- never by evicting a retained row.
+Retiring those rows needs the inbound gate to read the header, a separate
+change. This pre-snapshot refusal is the memory-mode choke point every entry
+point inherits (idle sweep, `maybe_consolidate`, expiry sweep, dashboard
+trigger, CLI); the dashboard trigger adds its own target-side 403 in front of it
+(see the route table below). V2 uses that context's exact
 member store and commits learned records, history and the retry receipt in one
 SQLite transaction. V1 retains `context.store_of_session(log, key)` and its
-Markdown and lesson fallback behavior. See [The write path](#the-write-path).
+Markdown and lesson fallback behavior. See [Memory across surfaces and channels](#memory-across-surfaces-and-channels).
 
 Neither path owns a timer. The prefs path is checked inline on every
 `maybe_consolidate()`; the history path is driven entirely by the heartbeat
@@ -414,7 +514,71 @@ decoded JSON values, or episode text and decoded tags. `%` and `_` are literal
 characters, not SQL wildcards. Query filtering does not change retrieval ranking,
 store provenance, or the existing V1 list behavior when `q` is absent.
 
-Structured memory system backed by SQLite + FAISS + in-process embeddings (vendored llama-cpp-python). Embeddings are ALWAYS-ON: `_coerce_embedding_provider` (config/loader.py) coerces EVERY `embedding_provider` value — including legacy `"ollama"` and `"none"` — to `"llama_cpp"`, so there is no config knob to disable them. While the model is still downloading or absent, memory degrades gracefully to keyword/FTS search and the lazy-rebind machinery in `vector_memory._try_embed` picks embeddings up when the model lands — no restart. Per-store overrides (`MemoryStoreConfig.embedding_provider`, enum `["", "llama_cpp"]`) can only inherit or restate the default — per-store disable is not supported, and the value reaches nothing: `context._build_store_vectors` configures a named store's `VectorMemoryStore` from top-level `cfg.memory`, and the embedder beneath it is the process-wide `get_shared_embedder()` singleton, so two stores cannot run two backends without two resident models and two incomparable vector spaces.
+Structured memory system backed by SQLite + FAISS + in-process embeddings (vendored llama-cpp-python). Embeddings are ALWAYS-ON: `_coerce_embedding_provider` (config/loader.py) coerces EVERY `embedding_provider` value — including legacy `"ollama"` and `"none"` — to `"llama_cpp"`, so there is no config knob to disable them. While the model is still downloading or absent, memory degrades gracefully to keyword/FTS search and the lazy-rebind machinery in `VectorMemoryStore._try_embed` (`vector_memory_runtime/embedding.py`) picks embeddings up when the model lands — no restart. Per-store overrides (`MemoryStoreConfig.embedding_provider`, enum `["", "llama_cpp"]`) can only inherit or restate the default — per-store disable is not supported, and the value reaches nothing: `context._build_store_vectors` configures a named store's `VectorMemoryStore` from top-level `cfg.memory`, and the embedder beneath it is the process-wide `get_shared_embedder()` singleton, so two stores cannot run two backends without two resident models and two incomparable vector spaces.
+
+### Store composition (`vector_memory.py` and `vector_memory_runtime/`)
+
+`VectorMemoryStore` is the one owner of a store's SQLite connection and its
+`_db_lock`. The class keeps:
+
+- the store lifecycle (`init`, `close`, `reconfigure`, lineage binding, owner-only
+  file lockdown) and the member-database operations;
+- the history files and their FTS index (`append_history`, `read_history_entries`,
+  `read_editable_history`, `replace_today_history`, `search_memory`,
+  `rebuild_memory_index`, `consolidation_receipt`);
+- record revisions and the eligibility filter (`_record_mutation`,
+  `with_record_metadata`, `_eligible_rows`);
+- the facet and event-log readers (`count_by_facet`, `list_by_facets`,
+  `get_events`), event rotation (`rotate_events`), the `_log_event` and
+  `memory_meta` helpers and the read counters;
+- the episodic list, cap, delete and restore paths, the per-row embed calls
+  (`embed_episodic`, `embed_lesson`), `get_semantic`, the statistics readers
+  (`memory_stats`, `get_rejection_stats`), the embedding-space guards and the
+  invalidation of both resident scoring sets;
+- the write paths whose source the read-only guards pin to `vector_memory.py`:
+  `_write_semantic` with its consolidation branches, `write_episodic` and
+  `write_episodic_outcome`, `write_lesson`, `apply_consolidation`, `import_memory`,
+  and the writer loops of `migrate_from_markdown`, `promote_episodic_patterns` and
+  `seed_item_if_absent`.
+
+The other rules live in
+the modules of `kiro_crew.vector_memory_runtime`. Each store method keeps its name
+and signature and delegates to the function that owns the rule (`set_semantic` to
+`semantic.write_value`, for example):
+
+| Module | Owns |
+|---|---|
+| `semantic` | Key and value validation and the reject audit, insert-if-absent, delete and review-proposal writes, facet stamping, the publication tail a committed `_write_semantic` runs (V1 audit event, write-time vector, supersession trigger), the V1 and V2 fact and preference readers, and the resident `_SemanticScoringSet` the V1 fact reader ranks from |
+| `episodic_search` | The episodic search ladder (V2 population scan, FAISS, stored-vector cosine over the resident `_EpisodicScoringSet`, keyword fallback), the relevance gate and decay, the debounced `last_accessed_at` touch and the episodic context block |
+| `faiss_index` | Building, persisting (stamped in `memory_meta`) and verifying the optional FAISS index |
+| `retirement` | Supersession retirement on both algorithms and the retired-episode listing |
+| `lessons` | The lesson value codec, `write_lesson`'s exact-rule pass, scope partition and tier rule, `delete_lesson`'s scope selection, and the lesson readers, ranking and tiered rendering |
+| `embedding` | Embedding inference (`_try_embed`), its provenance types and the stored-vector scorers |
+| `embedding_repair` | The recorded vector space, `reconcile_embedding_space` and the three NULL-vector sweeps |
+| `recall` | `recall`, its single-inference retry, and the bounded evidence payload |
+| `migration` | Legacy `lessons.jsonl` parsing, Markdown parsing through the `MemoryFiles` the store resolves, and the episode clustering promotion uses |
+| `text_scoring` | Stemming, the row-token memo, keyword and hybrid scores, MMR and the list-search predicate |
+
+A runtime function that works on a store takes it as its first argument. Every
+statement it runs, its commits and its `memory_meta` and `memory_events` writes
+included, goes through `store.db` under `store._db_lock` or `store._vector_commit`.
+None opens a connection or keeps store state; the only module-level state is the
+per-thread stemmer and the text-keyed stem memos in `text_scoring`. A runtime
+function reaches other store behaviour through the store (`store._try_embed(...)`,
+never the function that implements it), so a class-level patch of a method reaches
+every caller. It reads the facade's patch seams (`np`, `faiss`, `_HAS_NUMPY`,
+`_HAS_FAISS`, `datetime`, `time`, `sqlite3`, `_now_iso`, `_contains_injection`,
+`bulk_pace_delay` and the patched bounds) through `kiro_crew.vector_memory` at
+call time. Any other moved name belongs to its runtime module, and a patch of it
+goes there. `vector_memory.py` imports every runtime module when it loads and still
+binds every name it defined or imported from another `kiro_crew` module, and the
+runtime modules log on the `kiro_crew.vector_memory` logger.
+`test/test_vector_memory_composition_contract.py` pins that surface, the seams, the
+import and logger rules and the through-the-store call rule, and re-applies the
+source guards that scan
+`vector_memory.py` by name — the lineage relation and kind-guard checks, the
+facet-in-view check, the redaction-sink and md5 checks — to every runtime module,
+each with a planted violation proving the re-applied check can fail.
 
 ### Live reconfiguration (`VectorMemoryStore.reconfigure`)
 
@@ -469,9 +633,10 @@ a column the `WHERE` clause excluded), while a concurrent FAISS `add` during a
 `search` can corrupt the C++ index outright. `self._db_lock` (a reentrant
 `threading.RLock`, so a locked method may call another locked method)
 serializes every statement on that connection. The structural regression guard
-recognizes explicit lock scopes and `_vector_commit`, checks the latter's actual
-`ExitStack.enter_context(_db_lock)` acquisition, and fails if that acquisition
-is removed. Its negative fixtures retain checks before acquisition, after scope
+scans `vector_memory.py` and every `vector_memory_runtime` module (where the store
+is the `store` parameter), recognizes explicit lock scopes and `_vector_commit`,
+checks the latter's actual `ExitStack.enter_context(_db_lock)` acquisition, and
+fails if that acquisition is removed. Its negative fixtures retain checks before acquisition, after scope
 exit, on failed admission and in deferred nested functions. Generation rechecks
 must be lexically inside a lock-owning scope, not merely later in source order.
 The critical sections that matter most:
@@ -495,7 +660,8 @@ The critical sections that matter most:
 
 An async caller offloads every operation that can reach `_db_lock`, including
 `close()`, so contention never stalls the event loop. The source gate derives
-the ordinary method set from the store call graph and separately tracks
+the ordinary method set from the store call graph, following each delegate into
+the runtime function that implements it, pins that set, and separately tracks
 constructor-bound receivers for the generic lifecycle names `init` and `close`.
 
 **The lock is never held across an embedding call.** An embed on a loaded model
@@ -503,9 +669,9 @@ is serialized behind the embedder's own lock and costs tens of ms per short
 text; holding a process-wide store lock across that would serialize every reader
 behind it and defeat the point of offloading the write to a worker thread in the
 first place. So each write embeds FIRST, then takes the lock for local work
-only. Two consequences the code handles explicitly: `_write_semantic` calls
-`_retire_stale_episodic` AFTER releasing the lock (that helper embeds, then
-re-takes the lock itself), and `write_episodic` samples `_space_generation`
+only. Two consequences the code handles explicitly: `_write_semantic`'s
+publication tail calls `_retire_stale_episodic` AFTER releasing the lock (that
+helper embeds, then re-takes the lock itself), and `write_episodic` samples `_space_generation`
 before the embed, carries it into the locked region, and re-checks it there,
 because an embedding-model swap can land in the gap and a vector from the
 previous space must be persisted as NULL rather than committed (the post-swap
@@ -590,8 +756,8 @@ discriminating lessons with `key LIKE 'lesson.%'` exactly as it does on v1, so `
 never becomes a second, divergent notion of what a lesson is.
 
 **`semantic_memory` and `episodic_memories` survive as READ-ONLY VIEWS presenting v1's
-exact columns in v1's exact order.** The 36 read statements naming them in
-`vector_memory.py` are therefore unchanged, and `SELECT *` still hands `sqlite3.Row`
+exact columns in v1's exact order.** The read statements naming them in the
+engine (`vector_memory.py` and `vector_memory_runtime/`) are therefore unchanged, and `SELECT *` still hands `sqlite3.Row`
 the columns the engine expects. Splitting by `kind` is also what keeps the vector scorers
 partitioned by RELATION: episodic blobs are L2-normalized at write and semantic and
 lesson blobs are not, and three of the four places that score a stored blob take a bare
@@ -612,7 +778,7 @@ instead of uploading — permanently, since the trigger is part of the schema.
 Writes therefore name the physical table: `semantic_relation(lineage)` /
 `episodic_relation(lineage)` resolve it and
 `semantic_guard` / `episodic_guard` supply the trailing `AND kind …` clause that keeps a
-semantic write off an episode sharing the table; both render EMPTY on v1, so the 15
+semantic write off an episode sharing the table; both render EMPTY on v1, so the
 interpolated write statements are byte-identical to the literals they replace. The four
 that differ in their COLUMN LIST — semantic insert, semantic upsert, and the two episodic
 inserts — carry two spellings plus a param builder in `memory_schema`, side by side so a
@@ -687,9 +853,10 @@ indexes.
 
 **The SQL lives in `memory_schema`, not in the engine, and that placement is load-bearing
 twice over.** It names `memory_items`, a relation only the crew lineage has, so the same
-literal inside `vector_memory.py` would be a statement that raises on every v1 file — which
-is exactly what `test_memory_lineage_drift`'s "every relation the module names exists in
-both lineages" refuses. And it keeps the one place a facet NAME is spliced into SQL beside
+literal inside the engine would be a statement that raises on every v1 file — which is
+exactly what `test_memory_lineage_drift`'s "every relation the module names exists in both
+lineages" refuses for `vector_memory.py`, and the composition contract refuses for the
+`vector_memory_runtime` modules. And it keeps the one place a facet NAME is spliced into SQL beside
 the dataclass those names come from.
 
 **Names come from an allowlist derived from the dataclass; values are bound.**
@@ -825,21 +992,23 @@ SQLite table `semantic_memory` — structured key-value store with:
 - **Allowed keys**: `_BUILTIN_PREFIXES` is `pref.*`, `project.*`, `user.*`, `lesson.*` (+ user-configurable `extra_prefixes`). The first three are the fact prefixes the consolidation prompt offers the LLM; `lesson.*` is the lessons tier writing into the same table.
 - **Key format**: `^[a-z][a-z0-9_.]*[a-z0-9]$`, max 100 chars; value JSON max 4,096 bytes. The lower bound is a decoded one: a value that is null, empty, or only whitespace is refused as `VALUE_EMPTY`, so no row can hold a value that reads as absent.
 - **Confidence gating**: writes whose source is not `user_explicit` require confidence ≥ `_DEFAULT_CONFIDENCE_THRESHOLD` (0.8); `user_explicit` bypasses the threshold
-- **V1 conflict resolution**: `user_explicit` replaces an existing value; an automated source cannot replace an active user-explicit fact, unless the stored value is itself degenerate (null, empty, or only whitespace) — that row holds nothing for precedence to protect, and only an automated writer would ever repair it, so such a write is allowed and logged. Otherwise higher confidence wins, or the newer value wins when the confidence difference is less than 0.1. Tombstones can be recreated. V1 consolidation retains direct stale-key deletion and its semantic prompt, while extracted lessons keep their automatic consolidation source. An LLM confidence claim is not user evidence. Reaffirmation still refreshes confidence/source and reaches the original embedding and retirement paths. Owner edits retain shared revision checks. A rejected write logs a best-effort `conflict_skip` event; an unavailable event log does not prevent a V1 data write.
-- **Injection detection**: the `_INJECTION_PATTERNS` regex set (14 patterns, `vector_memory_constants.py`) is scanned on every value write
-- **Write-time embedding**: `_write_semantic()` embeds `"<key> <value_json>"` after the upsert (outside `_db_lock`, at `PRIORITY_BULK` — nothing blocks on it and the tail is reached from consolidation/import loops; same space-generation contract as `write_lesson`) and persists the struct-packed, un-normalized vector into the row's `embedding` column. The upsert's conflict clause keeps the stored vector when the value is unchanged (a re-affirmation — the tail then skips the redundant embed) and clears it when the value changed, so a row never ranks by a vector for text it no longer holds. `lesson.*` keys are excluded (`write_lesson` owns their vector — raw rule text). `set_semantic_if_absent()` (bulk import) defers embedding to the backfill sweep, like `write_episodic(defer_embedding=True)`. Rows missed while the model was absent — plus rows cleared by `reconcile_embedding_space()` — are repaired by `_backfill_semantic_kv_embeddings()` inside `backfill_missing_embeddings()`.
+- **V1 conflict resolution**: `user_explicit` replaces an existing value; an automated source cannot replace an active user-explicit fact, unless the stored value is itself degenerate (null, empty, or only whitespace) — that row holds nothing for precedence to protect, and only an automated writer would ever repair it, so such a write is allowed and logged. Otherwise higher confidence wins, or the newer value wins when the confidence difference is less than 0.1. A tombstone (deleted row) is not recreated by an automated source: the write is routed to the review queue as a conflict proposal and the row stays hidden; only a `user_explicit` write revives it. V1 consolidation retains direct stale-key deletion and its semantic prompt, while extracted lessons keep their automatic consolidation source. An LLM confidence claim is not user evidence. Reaffirmation still refreshes confidence/source and reaches the original embedding and retirement paths. Owner edits retain shared revision checks. A rejected write logs a best-effort `conflict_skip` event; an unavailable event log does not prevent a V1 data write.
+- **Injection detection**: the `_INJECTION_PATTERNS` regex set (`vector_memory_constants.py`) is scanned on every value write
+- **Write-time embedding**: `_write_semantic()`'s publication tail embeds `"<key> <value_json>"` after the upsert (outside `_db_lock`, at `PRIORITY_BULK` — nothing blocks on it and the tail is reached from consolidation/import loops; same space-generation contract as `write_lesson`) and persists the struct-packed, un-normalized vector into the row's `embedding` column. The upsert's conflict clause keeps the stored vector when the value is unchanged (a re-affirmation — the tail then skips the redundant embed) and clears it when the value changed, so a row never ranks by a vector for text it no longer holds. `lesson.*` keys are excluded (`write_lesson` owns their vector — raw rule text). `set_semantic_if_absent()` (bulk import) defers embedding to the backfill sweep, like `write_episodic(defer_embedding=True)`. Rows missed while the model was absent — plus rows cleared by `reconcile_embedding_space()` — are repaired by `_backfill_semantic_kv_embeddings()` inside `backfill_missing_embeddings()`.
 - **Audit trail**: `memory_events` table logs every create/update/delete with old+new values, bounded at `_MAX_EVENTS = 10_000`. The dashboard events API recursively redacts credentials and unsafe URLs on response for Global V1, named V1 and private V2. Stored events and their identities remain unchanged.
 
-Retrieval formats `key: value` pairs in a `[Semantic Memory]` block and excludes `lesson.*` keys. With a query it uses `_SEMANTIC_VECTOR_WEIGHT` 0.6 × vector_score + `_SEMANTIC_KEYWORD_WEIGHT` 0.4 × keyword_score; `_stored_similarity_scorer` embeds the query once and reads stored vectors. When the query vector is available, a row without a vector contributes zero on that term; without embeddings, retrieval uses keyword scoring. Explicit identity terms supplement keys and values. V1 startup reads only eligible `pref.*` rows through `get_preferences_context`, with the DATA-only wrapper and no query embedding. Other semantic facts are retrieved explicitly through `memory_recall` or the activity-enabled Python reader. V2 also leaves fragment retrieval to `memory_recall`, which has its own total response cap.
+Retrieval formats `key: value` pairs in a `[Semantic Memory]` block and excludes `lesson.*` keys. With a query it uses `_SEMANTIC_VECTOR_WEIGHT` 0.6 × vector_score + `_SEMANTIC_KEYWORD_WEIGHT` 0.4 × keyword_score; `_stored_similarity_scorer` embeds the query once and reads stored vectors. When the query vector is available, a row without a vector contributes zero on that term; without embeddings, retrieval uses keyword scoring. Explicit identity terms supplement keys and values. V1 startup reads eligible `pref.*` rows through `get_preferences_context`, with the DATA-only wrapper and no query embedding, as protected context; with `memory.inject_activity` on, the other semantic facts arrive query-ranked in the budgeted `[Memory activity]` block through `get_semantic_context(facts_only=True)`, which embeds the request. With the switch off they are retrieved explicitly through `memory_recall` or the activity-enabled Python reader. V2 also leaves fragment retrieval to `memory_recall`, which has its own total response cap.
 
 The keyword half's ROW side — the regex scan, set build, and Snowball expansion over a row's key and value — depends only on that row's own text, so it is memoized by `_row_stem_tokens`, bounded at `_ROW_STEM_CACHE_SIZE` entries. The memo is keyed on the TEXT rather than on a row key or rowid: an updated value hashes to a different entry, so no write path has an invalidation step to forget and a stale token set can never be served for text the row no longer holds. Only the row side goes through it — query text has one distinct value per user message, so memoizing it would evict the bounded row population the memo exists to keep. This is a separate memo from the per-word `_stem_one` cache (`_STEM_CACHE_SIZE`), which the row memo populates on a miss.
 
 **A scan wider than the cache bypasses the memo, by design.** Both row-side callers (`get_semantic_context` and `_rank_lessons`) ask `_row_stem_tokens_for_scan()` for the form to use, passing the number of entries the pass will touch — two per row for the semantic scan, one per lesson — and get `_row_stem_tokens_uncached` when that exceeds `_ROW_STEM_CACHE_SIZE`. A repeated full-table scan is LRU's worst case: past the bound every lookup evicts the entry the next one needs, so the hit rate is not degraded but exactly zero, and the memo costs the wrapper plus the retained frozensets while returning nothing. Nothing caps `semantic_memory` — only `_MAX_SEMANTIC_PER_CONSOLIDATION` per run, and `promote`/`import`/`migrate` bulk-write — so a store crosses that width on its own, which is why the width is checked per scan rather than assumed. Note also that the bound is in ENTRIES and therefore does not bound bytes: an entry retains its text plus a frozenset of words and stems, so a filled cache spans roughly 9 MiB for ordinary values to ~296 MiB for `_MAX_VALUE_BYTES` values of short words, held for the process's life. Size the constant against that ceiling.
 
+For repeated query-aware context builds, `_SemanticScoringSet` holds exactly the active non-lesson columns used for ranking and rendering (`key`, `value_json`, `updated_at`, `embedding`) rather than scanning `semantic_memory` each time. Its `(in-process generation, PRAGMA data_version)` token refreshes after this store's semantic upserts, deletes, embedding writes/backfills, and embedding-space reconciliation, or after another process commits to the same database. Each local writer advances the generation before it releases `_db_lock`, so a reader cannot observe a committed semantic change while still accepting the prior resident set. The snapshot is capped at `_SEMANTIC_SCORING_MAX_BYTES` (64 MiB); an oversized store or SQLite without `data_version` keeps the established per-call scan, preserving freshness without unbounded gateway-process retention.
+
 ### Episodic Memory
 
 SQLite table `episodic_memories` — conversation fragments with optional embeddings:
-- **Write**: text validation (10-2000 chars), **prompt-injection screening** (`_contains_injection`, same pattern set as the semantic-KV path), tag sanitization, importance clamping (0-1), FAISS dedup (cosine > `_DEFAULT_DEDUP_THRESHOLD` = 0.88, configurable via `memory.episodic_dedup_threshold` — the production stores (`slack/gateway.py`, `cli_server.py`, the dashboard's standalone fallback in `dashboard/handlers/memory.py`) pass it as `dedup_threshold`; deferred writers skip this check entirely so they have no threshold to honour, and `eval/bench/ingest.py` sweeps its own value). The dedup scan **skips tombstoned ("ghost") matches**: tombstone paths (merge, dashboard delete, cap eviction, stale retirement) set `is_deleted=1` but leave the vector in `_faiss_index`/`_faiss_id_map`, so a high-similarity hit may map to a deleted row. `_get_episodic()` filters `is_deleted=0` and returns `None` for those; the write loop `continue`s past a `None` match (mirroring `search_episodic`'s `if not mem or mem["is_deleted"]: continue`) instead of treating it as a conflict — otherwise a new memory matching a deleted one was silently rejected (data loss).
+- **Write**: text validation (10-2000 chars), **prompt-injection screening** (`_contains_injection`, same pattern set as the semantic-KV path), tag sanitization, importance clamping (0-1), FAISS dedup (cosine > `_DEFAULT_DEDUP_THRESHOLD` = 0.88, configurable via `memory.episodic_dedup_threshold` — every store built from the install's config passes the loaded config to the constructor as `config=`, which applies it through `reconfigure(cfg)` before the store subscribes to the live watcher (so a reload landing during construction is not overwritten by the older snapshot), and the new subscription is then replayed (`ConfigWatch.replay`, only for a store built with `config=`; so a reload dispatched between the caller's load and the registration reaches the store; see the config spec), setting it together with `memory.episodic_max_count` and the other retrieval settings: `slack/gateway.py`, `cli_server.py`, `cli_commands.py` (lesson, carve and import/migrate stores), the dashboard's standalone fallback in `dashboard/handlers/memory.py`, the ops-mission-control ledger indexer (`routes.py`) and lesson recall (`dispatch.py`), and named stores via `context._build_store_vectors`. A deferred write skips this similarity check, so the threshold is inert on a deferred-only store, but the cap is not. `onboarding_import.py` (a foreign `data_home`), `eval/` harnesses and the read-only injection audit keep constructor defaults at construction (no config applied, no replay; like every store they still follow later live `memory.*` reloads through the subscription); `test_every_construction_site_is_plumbed_or_exempted` fails on a new construction site that is in neither list). The dedup scan **skips tombstoned ("ghost") matches**: tombstone paths (merge, dashboard delete, cap eviction, stale retirement) set `is_deleted=1` but leave the vector in `_faiss_index`/`_faiss_id_map`, so a high-similarity hit may map to a deleted row. `_get_episodic()` filters `is_deleted=0` and returns `None` for those; the write loop `continue`s past a `None` match (mirroring `search_episodic`'s `if not mem or mem["is_deleted"]: continue`) instead of treating it as a conflict — otherwise a new memory matching a deleted one was silently rejected (data loss).
 - **Injection screening (XPIA defense-in-depth)**: episodic text is derived from conversation transcripts, so a poisoned turn could persist steering instructions that get re-injected into future contexts. `write_episodic()` runs `_contains_injection()` (before the embed call) and, on match, drops the entry and emits an auditable `injection_blocked` event with `memory_type='episodic'`. The stored audit snippet is scrubbed with `redact_exfiltration_urls()` + `redact_credentials()` first as defense in depth; `/api/memory/events` also redacts all returned events. This mirrors the semantic-KV screen at `validate_semantic()`. **Residual (accepted risk)**: this is a best-effort regex screen: a determined owner can still steer their own long-term memory with phrasing that evades the patterns; long-term memory poisoning is an accepted residual. The screen raises the bar against accidental/opportunistic XPIA persistence, not against a motivated self-owner.
 - **Search**: FAISS vector similarity with decay scoring: `cosine_sim × (0.7 + 0.3×importance) × exp(-rate×days_old)`, then MMR diversity reranking (Jaccard-based, `_MMR_LAMBDA` = 0.6). The decay rate is `_DEFAULT_DECAY_RATE` = 0.03/day, configurable per tag via `memory.decay_rates` (`_decay_rate_for`): keys are tags (case-insensitive, matching `_matches_tags`), the reserved `default` key replaces the built-in fallback, a multi-tag row uses the SLOWEST matching rate (smallest = maximum retention, so a broad tag can never age out a long-retention one), values are clamped to [0, 10] and non-numeric entries are dropped with a warning by `_sanitize_decay_rates`, which runs on every config apply as well as at construction, so a hand-edited rate is clamped and a garbage entry dropped identically either way. Both vector rungs (FAISS and the stdlib fallback) resolve the rate through the same helper; the keyword rung does no decay scoring at all.
 - **MMR reranking**: Maximal Marginal Relevance balances relevance with diversity. Greedy iterative selection penalizes candidates similar to already-selected results. Prevents redundant episodic fragments from consuming the context budget. Configurable via `mmr=False` parameter to disable. The candidate pool is deliberately NOT truncated toward `limit` (that tail pick is the point of MMR); the only bound is the recall-safe `_MMR_MAX_POOL` = 1000 ceiling for pathological inputs.
@@ -847,9 +1016,9 @@ SQLite table `episodic_memories` — conversation fragments with optional embedd
 - **Fallback ladder**: FAISS (needs faiss + numpy) → `_sqlite_vector_search`, cosine over the stored blobs → FTS5/LIKE keyword search (OR logic on text + tags) when there is no query embedding at all. The middle rung matters: faiss is an optional accelerator, not a declared dependency, so a stock install still gets vector recall from the stored vectors. Inside that rung the per-row dot product itself has two rungs, guarded by `_HAS_NUMPY` exactly as `_stored_similarity_scorer` is: the query vector is converted once outside the row loop, then numpy does the products where it is installed and `struct.unpack` + `sum` does them where it is not. The numpy resident and per-call rungs dot in float32, matching the stored dtype. The FAISS path verifies each candidate against its current SQLite vector and recomputes cosine with Python arithmetic and norm division; these paths share the admission policy but do not promise bit-identical floating-point results.
 - **Resident scoring set (the middle rung, with numpy)**: scoring reads only the embedding, `tags`, `importance`, `created_at` and the text LENGTH, and none of that changes between two searches with no write in between — so `_EpisodicScoringSet` holds those columns as numpy arrays and the search resolves row BODIES (`text`, `conversation_id`, `last_accessed_at`) for the ranked pool only, through the same `_get_episodic_batch` the FAISS path uses. Decay is a vectorized expression over the cached arrays, not a per-row Python dict build. Filtering still runs across the FULL population before `limit` — `tag_filter` and the relevance gate are masks over the cached arrays, never a top-k window, because a tag matching few rows would otherwise miss the pool entirely and return nothing where it returns hits today. The pool handed to MMR stays `_MMR_MAX_POOL`-bounded rather than `limit`, since the rerank reads each candidate's text.
 - **Scoring-set invalidation**: the validity token is `(in-process generation, PRAGMA data_version)`. `_invalidate_episodic_scoring()` bumps the generation and is called by **every** writer that changes which rows are scored or what they score as — `write_episodic`, `delete_episodic`, `_delete_episodic_row`, `_enforce_episodic_cap`, `_retire_stale_episodic`, `reconcile_embedding_space`, and `backfill_missing_embeddings`. Two of those are traps a naive append-only cache falls into: the backfill rebuilds the FAISS index only `if _HAS_FAISS`, which is False on exactly the install this rung serves, and a body lookup can never repair it (it drops ids that vanished but cannot surface ids that appeared, so recall degrades with no error); and `PRAGMA data_version` is the only in-band signal that a SECOND PROCESS committed to the same file, and both the scoring cache and FAISS search check it. Persisted FAISS loading additionally verifies database and index-file digests. `_touch_last_accessed` is deliberately NOT a writer here — `last_accessed_at` is never scored and is re-read per search with the bodies. A ratchet test (`test_every_episodic_writer_invalidates_the_scoring_set`) fails on a new `episodic_memories` writer that skips the hook. The set is bounded by `_EPISODIC_SCORING_MAX_BYTES` (64 MiB, ~10 MiB for 2,600 rows at dim 1024) and is disabled outright on an sqlite with no `data_version` pragma; either way the rung falls back to reading the population per call.
-- **V1 cap**: `_DEFAULT_EPISODIC_MAX` = 10,000 active entries, overridden by `memory.episodic_max_count`. For V1, `_enforce_episodic_cap()` tombstones `ORDER BY importance ASC, created_at ASC` (lowest-importance oldest first) on write once the count reaches the cap. The gateway passes the configured value as `episodic_max` when it builds the store, and `reconfigure` re-pushes it, so raising the cap stops evicting on the next write and lowering it trims on the next one — the key was parsed and dropped before, which silently pinned every install to the built-in 10,000. V2 bypasses capacity eviction and retains the stored episodes.
+- **V1 cap**: `_DEFAULT_EPISODIC_MAX` = 10,000 active entries, overridden by `memory.episodic_max_count`. For V1, `_enforce_episodic_cap()` tombstones `ORDER BY importance ASC, created_at ASC` (lowest-importance oldest first) on write once the count reaches the cap. Every config-built store listed under **Write** gets the configured value through that `config=` argument, the loader floors it at 1 (a cap of 0 refuses every merge-only write even on an empty store; for a normal write 0 and 1 behave the same, keeping only the new row), and the live reload calls the same `reconfigure` again, so raising the cap stops evicting on the next write and lowering it trims on the next one — the key was parsed and dropped before, which silently pinned every install to the built-in 10,000. A merge-only (`preserve_existing`) write is refused rather than evicting when the store is full. `write_episodic` returns a bare `bool`; `write_episodic_outcome` (which it wraps) returns an `EpisodicWriteOutcome` (`WRITTEN`/`REFUSED`/`AT_CAPACITY`; `REFUSED` covers duplicates, similarity conflicts and unacceptable text, and is cursored as final; only the text refusals are final in fact, since a duplicate or similarity refusal can change once the colliding row is tombstoned, and the indexer accepts losing that later retry) whose capacity verdict is taken inside the transaction that refused the row, so a caller that cursors refused rows tells a capacity refusal from a duplicate without a second count that a concurrent `reconfigure` or eviction could change. The ops-mission-control ledger indexer uses it to leave capacity-refused entries pending for the next import. V2 bypasses capacity eviction and retains the stored episodes.
 
-Episodic context retains `_DEFAULT_EPISODIC_LIMIT` = 8 results for explicit readers. Neither fresh nor warm V1/V2 session construction automatically queries episodic fragments. Agent retrieval uses `memory_recall`, whose response includes only rows fitting the tool's total cap, including wrappers. Explicit Python callers may still request episodic context through `MemoryStore.get_context(include_activity=True, query=...)`.
+Episodic context retains `_DEFAULT_EPISODIC_LIMIT` = 8 results for explicit readers. Fresh V1 session construction carries a query-ranked episodic slice inside the budgeted `[Memory activity]` block (`MemoryStore.get_activity_context`, capped at `_EPISODIC_INJECT_CAP`) while `memory.inject_activity` is on; warm turns and V2 construction do not query episodic fragments. Agent retrieval uses `memory_recall`, whose response includes only rows fitting the tool's total cap, including wrappers. Explicit Python callers may still request episodic context through `MemoryStore.get_context(include_activity=True, query=...)`.
 
 ### Read-volume counters (`_ReadCounters`, `read_counters()`)
 
@@ -864,7 +1033,7 @@ Six monotonic per-store-instance integer totals recording how much the store REA
 | `episodic_rows_read` | rows materialized by whole-population **episodic retrieval** scans |
 | `episodic_full_scans` | how many such episodic scans ran |
 
-The marked scan sites (`_fetch_all_locked(..., scan=...)`, plus one direct `record()` inside `_build_episodic_scoring_set`'s own locked block) are exactly the whole-population reads #8971 names: the V1 and V2 semantic candidate helpers used by `get_semantic_context`, `get_lessons()` unbounded (what the `_stored_similarity_scorer` callers score over), `_sqlite_vector_search`'s per-call read, the resident scoring-set build, and the V2 episodic candidate scan. A bounded read — V1 `get_semantic_context` with no query, `get_lessons(limit=N)`, any keyed lookup — contributes to the all-tables totals only, so a rising `*_full_scans` always means a population was re-read. On the episodic side both rungs land on the same counter, so `episodic_full_scans` rising with WRITES rather than with searches is what the resident set (#8956) looks like from outside; the semantic surface has no such set yet, which is #8971.
+The marked scan sites (`_fetch_all_locked(..., scan=...)`, plus one direct `record()` inside `_build_episodic_scoring_set`'s own locked block) are exactly the whole-population reads #8971 names: the V1 and V2 semantic candidate helpers used by `get_semantic_context`, `get_lessons()` unbounded (what the `_stored_similarity_scorer` callers score over), `_sqlite_vector_search`'s per-call read, the resident scoring-set build, and the V2 episodic candidate scan. A bounded read — V1 `get_semantic_context` with no query, `get_lessons(limit=N)`, any keyed lookup — contributes to the all-tables totals only, so a rising `*_full_scans` always means a population was re-read. On the episodic side both rungs land on the same counter, so `episodic_full_scans` rising with WRITES rather than with searches is what the resident set (#8956) looks like from outside; the semantic surface carries the same resident set (`_SemanticScoringSet`, above), so `semantic_full_scans` likewise rises with a semantic write rather than with a repeated query — an oversized store or a library without `data_version` is the exception that keeps a per-call scan.
 
 Semantics that matter to a caller: per instance and per process (two processes over one file report their own reads independently, never a shared total), never persisted, never reset, and no timing metric is recorded or derived. Every increment happens under `_db_lock`, so `read_counters()` — which takes the same lock — returns an untorn snapshot and no count is lost to a concurrent reader. Two identical `GET /api/memory/observability?q=…` calls with no write in between, compared field by field, are the intended probe.
 
@@ -1126,6 +1295,15 @@ it was handed receives the same values. `member-memory.json` and the old
 `memory_meta` rows are left in place. One store's failure is logged and never
 blocks start or another store.
 
+The store migration never touches session records. A member chat written on
+0.7.0.5 carries `{agent, memory_store}` and no `execution_context`, and is
+backfilled at first read instead: `execution_context.read_session_execution`
+derives the carrier from the repaired store's `owner_member_id` when that owner
+is unique and the record's `agent` names it, and persists it with a
+compare-and-set (see [session](session.md), *Agent selection provenance*). A
+record the store migration left unattributed stays refused, with the remedy in
+the message.
+
 V2 labels owner changes as Edit and retained older experiences as Replaced
 experiences. Recall explains which context the member would receive; the record
 list remains available for browsing and editing. Included rules have a summary
@@ -1145,13 +1323,19 @@ identities, and reports imported/skipped outcomes with reasons and provenance.
 No row is selected automatically. This is selective copying, not V1 migration.
 
 V1 fresh-session context keeps complete preferences and eligible project-scoped
-lessons. Project notebooks, decayed daily history and other semantic/episodic
-facts are on demand through the store-bound `memory_recall` route; startup does
-not invoke the three query-embedding paths. Warm follow-ups do not repeat startup
-memory injection. The prompt-build embedding deadline remains a compatibility
-guard for other contributors, not evidence that default memory performs inference.
-The synchronous `ContextBuilder.build_message` call remains off the event loop
-in the bounded `mc-embed` pool.
+lessons as protected context. With `memory.inject_activity` on (the default) the
+first turn also carries project notebooks, daily history (the last 14 days in
+full, days 15–60 as one-entry summaries, older days through 180 as counts — the
+same decayed read `get_context` uses), task facts and past episodes in the
+budgeted `[Memory activity]` block
+(`get_activity_context`); the facts and episodes are ranked against the request,
+so a fresh first turn embeds the request once — two embed calls on the same text
+through the shared embedder, one inference. With the switch off, that material
+is on demand through the store-bound `memory_recall` route and startup performs
+no query embedding. Warm follow-ups do not repeat startup memory injection. The
+prompt-build embedding deadline bounds that first-turn inference, and the
+synchronous `ContextBuilder.build_message` call remains off the event loop in
+the bounded `mc-embed` pool.
 V2 context includes essential preference/project anchors and query-free,
 project-scoped lessons. V2 prompt construction performs no embedding search or
 episodic/semantic retrieval. Its runtime tells the agent to call `memory_recall`
@@ -1159,9 +1343,9 @@ for a changed topic or prior decision and to
 use `learn_add` for corrections. The agent prompts (`config/prompt.md`,
 `config/prompt-orchestrator.md`) give both versions the same order for a question
 about the past: the injected block and lessons, then `memory_recall`, then
-`search_chat_history` for verbatim transcript text. Both versions retrieve facts
-and episodes explicitly instead of relying on activity ranked against a first
-message. Retrieval is reference material and does not
+`search_chat_history` for verbatim transcript text. Anything the V1 activity
+block omits, and every V2 fact or episode, is retrieved explicitly rather than
+inferred from the first message. Retrieval is reference material and does not
 override the current user's instruction. Forgetting removes a row from future
 long-term recall; it does not erase text already in an active conversation.
 Backup and staged restoration cover the entire member memory bundle, as
@@ -1221,7 +1405,23 @@ complete snapshot is submitted only when the conversation needs it.
 bound custom-template persona on fresh, warm, resumed, post-compaction and
 minimal turns, including delegated and cron turns with no DM member argument.
 An execution-template override supplies task instructions; it does not replace
-the memory owner's persona. The generic product prompt retains its existing
+the memory owner's persona. The member OPERATING protocol and working briefing
+are the one exception, and they follow the selection rather than the store: an
+execution whose record carries the owner's `member_id` and store with
+`selection_kind == "template"` — the shape `session_create(agent=…)` and
+`spawn_run(agent=…)` mint for a member caller naming a template — is the owner's
+delegate, and its member section is identity and permanent rules only. The desk
+protocol, whose second item hands substantial work to a separate session, and the
+briefing that protocol maintains are withheld with no placeholder, so a delegate
+picked to do the work is not told to hand it on again. A member selected by name
+receives the whole section, and so does the `session_create` child of a member whose
+record carries no persisted `member_id`: that member is named by `selection_kind
+== "member"` and `selection_name` alone, and no record field can carry "this
+member, under that template", so that arm keeps its selection and changes only the
+template, because a record that does not name the member would lose its rules along
+with its persona. The spawn gate's `spawn_run(agent=…)` child of such a member is a
+plain template run on the parent's store — `ExecutionContext.with_template` flips
+the namespace for every record — and receives no member section at all. The generic product prompt retains its existing
 provider/session-start path, including when a member's fork inherits it. The
 loader recognizes the exact current `file://` URI selected by `_prompt_path()`,
 not a template name or file basename. Package installs outside the user home,
@@ -1234,7 +1434,24 @@ unbounded archival memory.
 
 Admitted project essentials are the active project's root `AGENTS.md` and
 `SOUL.md`, default/`always` documents under `.kiro/steering`, and Markdown file
-resources explicitly declared by the template. Native `manual`, `auto` and
+resources explicitly declared by the template. The global `~/.kiro/steering`
+always documents, the root `AGENTS.md` and undeclared `.kiro/steering`
+documents are kiro-cli default resources: when kiro-cli serves the session and
+`chat.disableInheritingDefaultResources` opts the workspace out, the snapshot
+omits them and keeps the prompt, the declared resources and `SOUL.md`, which is
+Crew's own file rather than a kiro-cli default. The verdict is computed once
+per normal turn, where the harness is known, and handed to the snapshot and the
+folder-steering dedup; no consumer reads the setting itself, and on any other
+harness the member keeps inheriting because a kiro-cli setting changes nothing
+there. A profile validation pass does not read the setting and instead measures
+the inheriting envelope, which is the largest envelope any harness can build.
+The preference comes from the skill projection's decision (see
+[ACP client](acp-client.md)), so Crew's overlay on that key never reads as an
+opt-out; settings that cannot be read keep inheritance. A non-member kiro-cli
+chat follows the same decision: in an opted-out workspace a folder that
+declares the project's or the global `.kiro/steering` root carries those
+always documents itself, at session start and after a compaction, instead of
+skipping them as already delivered. Native `manual`, `auto` and
 `fileMatch` steering retain their trigger semantics. A custom template's
 declared prompt may be inline or a file source. Missing optional root files
 are allowed; an unreadable declared source or malformed/shadowed template
@@ -1841,7 +2058,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
 - The underlying `Llama` object is NOT thread-safe — inference on a loaded model is serialized behind a lock (tens of ms per short text)
 - `get_shared_embedder()` — process-wide singleton (~700MB RSS when loaded), shared by vector memory AND the knowledge library; `close()` unloads the model to free RSS
-- **Bounded llama.cpp scratch memory**: the accepted context and logical batch remain 2,048 tokens, while the physical decode micro-batch (`n_ubatch`) is 512. llama.cpp splits a long input across those physical batches before applying last-token pooling, so the complete context still contributes to one vector. Against the shipped Qwen model, a maximum 6,000-character input produced byte-identical 1,024-dimensional vectors at 512 and 2,048 (`cosine=1.0`, max absolute difference `0.0`); 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` as a memory shortcut: either would reduce the semantic input the model can accept.
+- **Metadata-sized llama.cpp context and bounded scratch memory**: before constructing the native context, a custom GGUF reads `general.architecture`, `<architecture>.attention.causal` and `<architecture>.context_length` from its KV header. The file's `pooling_type` key is not read: every model, custom encoders included, is loaded with last-token pooling passed explicitly, the pooling every earlier release produced, so this metadata never changes stored vectors (honouring a declared `pooling_type` is tracked separately). Measured with the vendored runtime on two BERT-family f16 GGUFs (`all-MiniLM-L6-v2`, trained for mean pooling, and `bge-small-en-v1.5`, trained for cls pooling): under last-token pooling two paraphrase pairs scored cosine 0.745 and 0.791 against 0.112 for an unrelated pair (MiniLM) and 0.765 and 0.787 against 0.382 (bge), the same ordering mean pooling gave (0.638 and 0.612 against 0.005; 0.752 and 0.793 against 0.328), and over twelve sentences from six paraphrase pairs each sentence's nearest neighbour was its paraphrase 12/12 times under both poolings on both models. A model is non-causal when its GGUF declares `<architecture>.attention.causal = false` (the boolean llama.cpp reads into `hparams.causal_attn` for every architecture, `llama-embed` included; absent, the runtime defaults to causal) or when its architecture is one the vendored llama.cpp runs without a KV cache (`_ENCODER_ARCHITECTURES`, a verbatim mirror of the `res = nullptr` cases of `llama_model::create_memory` plus `t5encoder`). That mirror is checked mechanically: `test/test_encoder_architecture_mirror.py` opens every vendored `libllama` binary and requires each listed name as a NUL-terminated string, so a runtime bump that removes or renames a cache-less architecture fails the test unless the name is the suffix of another listed name (`bert` inside `modern-bert`: GNU ld tail-merges such strings, so only the terminating NUL can be required and the longer name still satisfies the check); an architecture the bump adds is invisible to it, so the bump procedure in `_vendor/README.md` re-reads the `res = nullptr` cases by hand and confirms suffix names there. The accepted context and logical batch remain 2,048 tokens for every decoder model, which also retains a physical decode micro-batch (`n_ubatch`) of 512; non-causal models use one physical micro-batch the size of their whole context because llama.cpp aborts when their token count exceeds `n_ubatch` — cache-less architectures in `encode()` (`encoder requires n_ubatch >= n_tokens`) and declared-non-causal cached models in `decode()` (`non-causal attention requires n_ubatch >= n_tokens`). The 512 micro-batch is kept for custom decoders on measurement, and it is the only reason the cache-less architecture set exists (giving every custom file `n_ubatch = n_batch` would need no list): with the vendored runtime, four compute threads and a 2,048/2,048 window, the shipped Qwen3-Embedding-0.6B Q8_0 file standing in for a custom decoder, one 5,000-character embedding (936 tokens) took the process's peak resident memory (Linux `VmHWM`) from 1,826 MiB at `n_ubatch` 512 to 2,098 MiB at 2,048, 272 MiB more (two runs each, within 0.5 MiB), and an input filling the whole 2,048-token batch took it from 2,493 MiB to 3,502 MiB, 1,009 MiB more; constructing the context alone showed no difference (0.2 MiB) because the reserved compute arena is not resident until the first graph runs. The same comparison on the `gpt2` Q8_0 file cost 37 MiB at 2,048/2,048 (655 tokens) and 98 MiB between `n_ubatch` 512 and 1,024 at its clamped 1,024 window (935 tokens). That cost, paid by every process holding a custom decoder embedder, outweighs maintaining the mirrored list, which the binary pin and the bump procedure keep honest. For every custom GGUF the context and logical batch are additionally clamped to the trained position count the file declares in `<architecture>.context_length` (llama.cpp's `n_ctx_train`): a model with learned absolute positions — encoder families, but causal `gpt2` and `starcoder` as well — indexes a position table of that many rows, and a token past it aborts the process in ggml's `get_rows` (`GGML_ASSERT(i01 >= 0 && i01 < ne01)`) whatever the model's causality, so `n_ctx` and `n_batch` are set to `min(2048, context_length)` (2,048 when the key is absent), a non-causal model's `n_ubatch` equals that count and a decoder's stays 512 bounded by it, and a longer input is truncated to its first `n_batch` tokens by the vendored binding's `create_embedding()` → `embed(truncate=True)` path, a default `test_vendored_embed_truncates_to_the_logical_batch_by_default` pins. The truncation is stated as one WARNING when the model loads, naming the file and the count, never per embed call; a GGUF whose KV header cannot be read is loaded with the decoder sizes after one WARNING naming the file. Because the header is read before the native constructor opens the same path again, the loader stamps the file (device, inode, size, mtime, ctime) before the header read and re-checks the stamp once the constructor returns: a file replaced in between is closed unpublished after one WARNING and the load is retried after the failure cooldown, so a context sized from a previous header never serves. Measured with the vendored runtime on a 5,000-character input: `bge-small-en-v1.5` (`bert`, `context_length` 512, 895 tokens) aborted with that assertion at a 2,048/2,048/2,048 sizing and returns a 384-dimensional vector at 512/512/512; `gpt2` Q8_0 (causal, `context_length` 1,024) aborted with the same assertion at 2,048/2,048/512 and returns a 768-dimensional vector at 1,024/1,024/512; `nomic-embed-text-v1.5` Q2_K (`nomic-bert`, `context_length` 2,048) keeps 2,048/2,048/2,048 and its 768-dimensional vector. The shipped Qwen model declares 32,768 positions, so it keeps 2,048/2,048/512 and produces byte-identical vectors: a 6,000-character input gave the same 1,024-dimensional vectors at a 512 and a 2,048 micro-batch (`cosine=1.0`, max absolute difference `0.0`) while 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` below the policy-selected window as a memory shortcut: either would reduce the semantic input the model can accept.
 - Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Before loading the bundled Linux x86_64 runtime, `_load_llama_class()` intersects the `flags` reported for every visible processor in `/proc/cpuinfo` and requires the baseline compiled into the shipped upstream wheel (AVX, AVX2, BMI2, F16C, FMA, SSE3, SSSE3). A missing or unreadable feature list refuses the native runtime before it can raise an uncatchable SIGILL; memory stays available through keyword search. The gate does not apply to an operator-set `LLAMA_CPP_LIB_PATH`, because that directory may contain a lower-baseline build. Unsupported platforms, incompatible bundled CPUs, and import failures all degrade to keyword-only memory search. See `_vendor/README.md`
 - **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel — which the desktop bundle inherits, since it pip-installs the project into its bundled interpreter), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
 - **The artifact verifier needs only the Python standard library.** `scripts/verify_vendored_payload.py` reads `_LIBS_DIR_NAME` and `_REQUIRED_VENDORED_LIBS` from the source with `ast.parse` and `ast.literal_eval`. It never imports the embedding runtime or its config dependencies. Both constants must stay literal top-level assignments; a missing or computed declaration fails the gate. Tests run the real script with `python -I -S`, checking complete archives and missing members in the wheel, sdist, or both.
@@ -1850,10 +2067,16 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 **Embedding backend abstraction** (`EmbeddingBackend` ABC): the public swap seam for future runtimes (Ollama again, remote endpoints, ONNX) and user-defined models. Surface: `model_id`, `dim`, `is_ready()`, `embed()`, `embed_batch()`, `close()`. Consumers (vector memory, knowledge library) depend only on this interface; everything llama.cpp-specific lives in `LlamaCppEmbedder`. Swap flow: `register_embedding_backend(factory)` + `reset_shared_embedder()` replaces the singleton (pass `None` to restore the default). A backend with a different `model_id`/`dim` produces incomparable vectors — the knowledge library's `embed_signature` is derived from `embedding_space_signature` and so folds BOTH in, meaning a swap (including a width change at a constant model id) automatically triggers the sig-gated knowledge re-embed; vector memory re-embeds via `migrate`.
 
 **Shared embedding budget.** Native inference has one shared worker and model.
-The normal interactive default is four native threads; background bulk work
-defaults to one. Explicit normal and bulk thread settings are honored within
-the available CPU count and the existing configuration range of 1–256; a bulk
-value of 0 inherits the ordinary thread setting. At most eight pending native
+The normal interactive default is four native threads, capped at one core below
+the count of CPUs the process may run on, which a CPU-set restriction
+(`--cpuset-cpus`, `taskset`) narrows below the host's core count, and never below
+one thread, so the event loop keeps a core
+wherever there is one to spare; background bulk work defaults to one. A normal-thread value equal to that four-thread default reads as
+the default policy rather than as operator intent, because a whole-document config
+save materializes it. Any other explicit normal or bulk thread setting is honored
+within the CPUs the process may run on, inside the existing configuration range
+of 1–256; a bulk value
+of 0 inherits the ordinary thread setting. At most eight pending native
 jobs are retained, with
 two slots reserved for interactive queries; overflow returns `None`, leaving
 unembedded writes eligible for ordinary backfill. Native batch calls contain
@@ -2138,11 +2361,11 @@ alignment requires readiness.
 - On failure: status resets to `idle` with error message, frontend shows error + Retry button
 - Prevents concurrent setup attempts (409 if already in progress)
 - `can_retry` flag in status response for frontend retry button
-- `GET /api/memory/embedding-status` — `enabled` is always `true`; `provider` reports the legacy `"ollama"` token (the shipped frontend hard-checks `provider === "ollama"` — kept until the frontend companion change lands); `setup_step` maps the manager's steps to the legacy vocabulary the shipped polling loop terminates on (`ready`→`done`, `failed`→`error`, `downloading`/`verifying`/`waiting_retry`→`downloading`); the raw step and attempt are additionally exposed as `download_step` + `download_attempt` for newer frontends; `server_healthy` requires a present or loaded model and no custom-model validation error; `setup_warning` exposes inherited legacy-vector identity until explicit model apply; `model_id` + `model_dim` disclose the embedding model producing vectors (read live from the shared embedder — e.g. `qwen3-embedding:0.6b` / `1024`) so the Memory tab can show which model runs locally
+- `GET /api/memory/embedding-status` — `enabled` is always `true`; `provider` reports the legacy `"ollama"` token for older frontend compatibility; `setup_step` maps the manager's steps to the legacy vocabulary the shipped polling loop terminates on (`ready`→`done`, `failed`→`error`, `downloading`/`verifying`/`waiting_retry`→`downloading`); the raw step and attempt are additionally exposed as `download_step` + `download_attempt` for newer frontends; `server_healthy` requires a present or loaded model and no custom-model validation error; `setup_warning` exposes inherited legacy-vector identity until explicit model apply; `model_id` + `model_dim` disclose the embedding model producing vectors (read live from the shared embedder — e.g. `qwen3-embedding:0.6b` / `1024`) so the Memory tab can show which model runs locally
 - `POST /api/memory/embedding-model` — changes the local embedding model at runtime. Two modes, and note which one is the default: `{"path": "...", "validate_only": true}` validates only (returns `size_bytes` without touching the live backend), while **omitting `validate_only` performs the swap** — there is no `apply` flag, so a caller that sends only `path` applies the model. An empty `path` reverts to the bundled model. Refuses with 403 on a restricted session (SEL-audited), 409 while a re-embed is already running (single-flight), and 409 `env_override_active` when `KIROCREW_EMBED_MODEL_PATH` is set, because the env var wins at load and persisting a config path under it would store a path/dim pair the process never uses
 - **Apply ordering**: build the gated candidate, install it while retiring the outgoing model, advance the store generation, wait for readiness (600s bound), persist the verified model configuration, retarget and reconcile stores, verify every recorded signature, activate, then backfill. Configuration-write failure preserves stored vectors. Alignment failure conditionally restores the prior model settings before resetting the candidate and restoring widths; rollback failure leaves the candidate gated with an actionable error. Unrelated configuration fields are not rolled back.
 - `GET /api/memory/embedding-status` additionally returns a `reembed` snapshot (`step`: `idle`/`applying`/`running`/`done`/`failed`, plus `done`/`total`/`error`) so the dashboard can render background re-embed progress; the card polls only while that step is busy
-- `POST /api/memory/disable-embeddings` — **gone**: embeddings are always-on. Kept as a graceful HTTP 410 stub (not a 404) because the shipped frontend still renders a Disable button; remove together with the frontend button
+- `POST /api/memory/disable-embeddings` — **gone**: embeddings are always-on. Kept as a graceful HTTP 410 compatibility stub (not a 404) for older clients; the current frontend does not call it
 
 ### Model Security & Policy
 
@@ -2173,7 +2396,9 @@ When vector memory is active, lessons are stored as semantic entries:
   carrying `repo_scope` folds the scope into the hash, so the same rule scoped to two
   repositories is two rows and an unscoped row keeps its historical key byte-for-byte.
 - Value: a mapping `{"rule": ..., "category": ..., "negative": ...}` — the NOT-clause
-  — plus `"repo_scope": ...` when the lesson is restricted to one repository. The key
+  — plus `"repo_scope": ...` when the lesson is restricted to one repository. A
+  `"applies"` key is present only when the writer named a tier (`"always"` or
+  `"on_topic"`); absent means unstated and is the byte-identical legacy shape. The key
   is absent for a global lesson, so no migration was needed. A `repo_scope` that is
   present but not a usable string is withheld from injection rather than read as
   global, and is refused at every write surface.
@@ -2238,11 +2463,11 @@ before reading transcript bodies, opening learned memory or billing a model.
 | GET | `/api/memory/embedding-status` | Embedding health + download progress. `enabled` always true; `setup_step` in legacy vocabulary (done/error/idle/downloading); raw `download_step` (idle/downloading/verifying/waiting_retry/ready/failed) + `download_attempt` + `bytes_downloaded`/`bytes_total`; `model_id` + `model_dim` disclose the embedding model + vector dimension; `reembed` reports background re-embed progress (`step` idle/applying/running/done/failed + `done`/`total`/`error`) |
 | POST | `/api/memory/enable-embeddings` | Non-blocking: kicks/adopts the background model download and returns `{"ok": true, "status": "downloading"}` when the model is absent; wires embeddings + updates config when present. The persisted `memory.embedding_dim` is the width of the **live** backend (`get_shared_embedder().dim`), never a literal — a width that cannot be read, or is not positive, is a 500 `embedding_dim_unreadable` that persists nothing, because `_load_model` refuses a model whose `n_embd` disagrees with the stored width and a wrong value leaves that model unloadable on every later restart |
 | POST | `/api/memory/embedding-model` | Change the embedding model. `{"path", "validate_only": true}` validates only; **omitting `validate_only` applies** (no `apply` flag exists). Empty path reverts to bundled. 403 restricted session, 409 while re-embedding, 409 `env_override_active` under `KIROCREW_EMBED_MODEL_PATH` |
-| POST | `/api/memory/disable-embeddings` | HTTP 410 stub — embeddings are always-on; kept only until the frontend removes its Disable button |
+| POST | `/api/memory/disable-embeddings` | HTTP 410 compatibility stub for older clients — embeddings are always-on; the current frontend does not call it |
 | POST | `/api/memory/migrate` | Migrate markdown → structured memory (gated) |
 | POST | `/api/memory/import` | Import from JSON export (gated) |
 | POST | `/api/memory/promote` | Promote repeated episodic patterns to semantic facts, tombstoning the rows folded in (gated) |
-| POST | `/api/memory/consolidate` | Trigger consolidation for one session (restricted-mode check only) |
+| POST | `/api/memory/consolidate` | Trigger consolidation for one session. Gated on the caller like every write, and additionally on the TARGET: the body's `key` is resolved through `resolve_session_memory_mode` (live slot first, then the persisted execution record and transcript header) and a temporary or incognito target is 403 `restricted_target_session` (the body carries the target's `mode` as a field, which the Memory tab's tally names) before the running claim or any other work. A channel transcript reaches the route as its filename stem (`slack_<ts>`), so the stem is first unfolded to the thread's live key through the session map (`channel_key_for_stem`) and the thread's flag is read there. When that live resolution does not refuse, the route reads the transcript header under `key` exactly as `_consolidate` does (`get_metadata`, the mode normalized), so a stem the map cannot unfold, or an entry the map no longer holds, is refused from its header here instead of answering 200 for a pass the consolidator refuses. A key no record calls restricted proceeds |
 | GET | `/api/memory/context-preview?q=` | Preview injected semantic + episodic context |
 | GET | `/api/memory/observability?q=` | `stats` + `rejections` + `context_preview`, plus `reads` — the read-volume counters (see above). `reads` is resolved LAST, so it INCLUDES the reads this request itself performed; that is what lets a caller issue the same `q` twice and compare the two objects |
 | GET | `/api/memory/recall?q=` | V2 task recall with evidence. Explicit `store` requires the dashboard owner; the authenticated MCP path uses the owning session's canonical execution context and requires memory reads to be allowed. Invalid or unavailable member memory returns an explicit error |
@@ -2461,7 +2686,7 @@ the unconditional gate is the stronger check layered in front of it.
 
 ### CLI
 
-`kirocrew memory {list,search,show,stats,audit,export,migrate,import,carve}` — manage memory from the command line:
+The canonical command and flag inventory is in the [CLI spec](cli.md#member-memory-commands); this section records the memory-side behavior behind those commands:
 - `carve --store <name>` — filter or count one store's rows by their carve facets; see [Who reads a facet](#who-reads-a-facet). Dispatched before the shared vector store is opened, because it opens the store NAMED on the command line rather than the default one
 - `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
 - `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking. `search_episodic` text-searches whenever `query_embedding` is None and does not auto-embed, so the vector section embeds the query in-process, blocking once on the model load (`_SEARCH_MODEL_LOAD_TIMEOUT_SECS`, 120 s) — a one-shot read cannot lean on the gateway's boot re-embed sweep the way a WRITE can. It degrades to keyword matching, naming the reason on **stderr** (stdout shape is unchanged), when the model is not downloaded (a one-shot CLI never kicks the download), when the store's vectors were produced by a different model, or when the model fails to load; and when the semantic pass returns nothing it retries the keyword leg once before reporting "No episodic memories found.", because the vector legs score only rows with a non-NULL embedding and deferred/imported/re-embed-pending rows are keyword-searchable only until the gateway's sweep reaches them
@@ -2578,7 +2803,8 @@ the `memories` category. A **foreign memory row the source types as a
 `directive`** is also an instruction, not a fact, so it lands in the same lesson
 tier (`_add_db_directive`) under the same identity guard and ceiling rather than
 being dropped. Import contributes at most 50 lessons
-(`_MAX_IMPORTED_LESSONS`) because `LessonStore` prunes oldest-first at 200; an
+(`_MAX_IMPORTED_LESSONS`) because `LessonStore` prunes at 200 (by tier, findings
+first, then unstated rows, then authored rules — each oldest-first); an
 unbounded import would silently evict the user's own accumulated corrections. What is excluded
 is the persona *role*: a foreign persona document never becomes Kiro Crew's
 persona (that surface is theme-pack persona, gated by
@@ -2626,7 +2852,7 @@ concurrent native write from being duplicated.
 
 User-taught corrections ("always do X", "never do Y"). Single write path through `vector_memory.write_lesson()`:
 
-1. **Vector memory** (primary): stored as `lesson.<md5hash>` semantic entries with `confidence=1.0, source=user_explicit`. The value is a mapping `{"rule", "category", "negative"}`, plus `"repo_scope"` when the lesson is restricted to one repository — the NOT-clause is a separate field; legacy in-band `"rule — NOT: negative"` rows stay readable without migration. Injected via `get_lessons_context()` — separate from `[Semantic Memory]` block. A scoped lesson is gated by `project_scope.project_scope_satisfied` against the session's active project BEFORE the shown/omitted counts are computed, using the same rule as a skill's `repo_scope`.
+1. **Vector memory** (primary): stored as `lesson.<md5hash>` semantic entries with `confidence=1.0, source=user_explicit`. The value is a mapping `{"rule", "category", "negative"}`, plus `"repo_scope"` when the lesson is restricted to one repository — the NOT-clause is a separate field; legacy in-band `"rule — NOT: negative"` rows stay readable without migration. Injected via `get_lessons_context()` — separate from `[Semantic Memory]` block. A scoped lesson is gated by `project_scope.project_scope_satisfied` against the session's active project BEFORE the shown/omitted counts are computed, using the same rule as a skill's `repo_scope`. A row whose stored `value_json` does not decode is skipped with one warning naming its key (never its value), so one bad row cannot fail every context build.
 2. **V1 JSONL fallback** (`~/.kiro/crew/lessons.jsonl`): only used when vector memory is not initialized. Read-only migration source once vector memory is active.
 
 **V1 priority**: vector lessons override JSONL. V2 never constructs a JSONL lesson store or falls back to one; an empty SQLite lesson table is a valid empty result. The fallback is keyed on whether the
@@ -2773,7 +2999,15 @@ remain durable.
 
 **V1 migration**: `migrate_from_markdown()` reads `lessons.jsonl` and writes each entry as `lesson.*` semantic key with `source=migration, confidence=0.9`. User-explicit lessons (confidence 1.0) can't be overwritten by migration. V2 refuses this importer.
 
-Categories: `tool`, `preference`, `knowledge`. Injected as a `[Learned corrections]` block. V1 background context retains every eligible, project-scoped lesson without query ranking or ordinary-budget truncation while the complete protected context remains below its model-safe ceiling; V2 keeps its essential-delivery and scope gates. The ceiling is `max(3 * 33,000, floor(model_window_tokens * 4.0 * 0.125))` characters. Crossing it trims only complete lesson entries, preserving preferences and safety rules; a preferences file that alone exceeds the ceiling is the one exception, kept from its head with an in-prompt notice naming the omitted character count and the file to read. Vector lessons keep the lexical relevance order already computed for the request; JSONL fallback has no relevance score and keeps newest entries first. The prompt reports the exact omitted lesson count and points to `memory_recall`. Content below the ceiling is byte-identical. Explicit lesson readers can use hybrid relevance and fill the caller's character budget, reporting shown and omitted counts. The JSONL store retains `_MAX_LESSONS_TOTAL = 200` and prunes oldest-first beyond that. The listing surface is bounded too — `GET /api/lessons` returns one `limit`/`offset` window and carries `total` and `truncated` so `learn_list` can say `Showing N of M`; `VectorMemoryStore.get_lessons(limit, offset)` honours the offset only on the bounded read, and the unbounded read the scorers use ignores it. Contract: [learn-cron-dashboard](learn-cron-dashboard.md).
+Categories: `tool`, `preference`, `knowledge`. Startup injects lessons as TWO blocks with TWO separate, window-INDEPENDENT budgets, split on an authored `applies` field rather than on anything a reader could infer. `applies: "always"` is a standing rule and renders in `[Learned corrections]` under the `lessons` budget (22.6% of the 33,000 base); `applies: "on_topic"` is a past finding and renders in `[Learned experience]` under the separate, smaller `lesson_experience` budget (5%). The startup rule tier is bounded by a window-INDEPENDENT allowance, `caps.lessons_startup` (`_LESSONS_STARTUP_CAP` = 37,000 characters), passed as the four startup renderers' `directive_budget`. That allowance is `min`'d only against the model-safe ceiling each store hands its directive tier — the vector store's `hard_cap` and the JSONL store's `cap`, which the JSONL renderers pass that same ceiling into (about 500,000 characters at the 1M reference window, and smaller on a smaller model) — so 37,000 binds the rule block on both paths whenever the ceiling exceeds it. (The two stores name that outer bound differently: `get_lessons_context`'s `hard_cap` and `get_context`'s `cap` are the same role, the ceiling the authored tier is taken smaller than, not the ordinary `caps.lessons` budget.) The allowance is deliberately NOT a share of the 33,000 base: standing rules are not discretionary background, and pinning the base to its smallest-window value (`#11996`) had shrunk the derived `lessons` cap about fivefold, so binding the authored tier to it dropped nearly every standing rule from startup. 37,000 restores the allowance a 1M-window session shipped with before that base change (165,000 × 0.226 = 37,290); it does not scale with the model window. The write surfaces that state it today are the `learn_add` MCP tool (whose schema carries the enum and whose description tells the model to decide from what the user said, not from wording), `POST /api/lessons`, the CLI reaching that route, and history consolidation, whose extraction prompt carries the same instruction per extracted item (both read it from `LESSON_APPLIES_INSTRUCTION` in `lesson_validation.py`, so they cannot drift apart) and which forwards the normalized tier on all three of its write paths: `_save_lessons` to `write_lesson(applies=...)` and to `Lesson(applies=...)`, and the member-store path `VectorMemoryStore.apply_consolidation`, which builds the lesson value itself. The task runner's own lesson extraction (`source="task_runner"`) and the CLI's direct `write_lesson` still state none; those rows stay unstated. Consolidation is the highest-volume lesson writer, so it is exactly the surface that must state a tier or the budget split protects nothing. Its value is untrusted model output: an omitted or blank tier lands the row unstated (the supported choice), and a misspelled one is logged at warning and the row is still written UNSTATED rather than dropped -- a real correction should not be lost over a one-word slip, and unstated is the direction whose mistake costs least. A row with NO `applies` value — every lesson written before the field existed, and any unrecognized stored value — reads as **unstated** and is served in the rule block, because demoting a real standing rule is the costlier mistake. Within the rule block, authored `always` rows are ordered AHEAD of unstated rows: ranked together on recency or relevance, a crowd of untagged rows displaces exactly the rules the user was most explicit about. The two budgets are separate rather than one shared allowance so a user with many findings cannot crowd out their own rules and vice versa; they are not added into a larger total, and a wider model window does not enlarge either one. The model-safe protected ceiling, `max(3 * 33,000, floor(model_window_tokens * 4.0 * 0.125))` characters, still bounds the two blocks TOGETHER, with one deliberate exception: a block's MANDATORY frame — its label plus the omission notice — is rendered even when the remaining ceiling is too small to hold it, so the two blocks can exceed the ceiling by those frames. That is the same trade as the preferences exception below: a silently absent block is indistinguishable from "this user has no rules", and the frame is a bounded constant while the entries it announces are not. The rule block is served first so a finding yields to a rule rather than the two sharing a shortfall. V2 keeps its essential-delivery and scope gates. **A findings tier is WITHHELD when the request matches none of it.** Ordering alone left a bare greeting spending the entire findings allowance on the newest rows, which are unrelated to the request by construction; `on_topic` means "worth having when the task touches it", so a request that touches none of them gets none of them. The test covers every token each store's own ranking sorts with: `any_request_overlap` (unstemmed) for JSONL, and `VectorMemoryStore._any_lesson_overlap` (surface plus stem, which covers every token `rank_lessons` matches: the hybrid branch uses the same set and the no-vector branch one stem per word) for the vector store. Admission must not suppress a match its own ranking found; the vector store stems, so it matches strictly more and must not borrow the unstemmed answer. This costs no recall that filler provided: newest-first never rescued a near-miss either, since it surfaces the newest rows rather than the closest. It applies to findings ONLY — a standing rule, and an untagged row served as one, arrives whatever the message is about. Two boundaries: a request is needed for the test to mean anything, so a caller that supplies NO `query_text` keeps the previous behaviour and stays byte-identical, and a tier with no findings at all renders nothing rather than an empty block. `render_withheld_tier` renders the frame with a notice naming the withheld total, stating that this is not a budget limit, and pointing at `memory_recall`/`learn_list` — a silently absent block reads as "this user has no findings", which is the reading that stops anyone from going to look, and the notice is also what lets the NEXT turn act on findings the greeting turn did not carry. Measured on a 10,000-finding store: a greeting's findings tier costs 298 characters with 0 findings injected instead of filling the 1,650-character allowance, while a matching request still receives 6.
+
+**Startup selection is not re-run per turn, and the withheld notice is what carries the gap.** A session that opens with a greeting and then states its real task on the next turn keeps the greeting turn's lesson selection: the warm path does not reselect. That predates the budgets, and no per-turn retrieval trigger is added here — one would need its own trigger condition, its own budget, and its own coverage across resume, fork and compaction, which is a second mechanism rather than a bound on this one. What the budgets change is that the gap is now VISIBLE where it was not: the greeting turn renders the withheld notice naming the total and the tool, so the follow-up turn is looking at an explicit pointer instead of at filler that silently displaced the finding it needed. Closing it properly is deliberately left to a change that owns the retrieval trigger.
+
+Crossing a budget trims only complete lesson entries, never a partial rule, and an entry too large for the room that remains is SKIPPED rather than ending the selection: the kept set is then a superset of what stopping would give, since an oversized entry is dropped either way and continuing can only add later entries that do fit, never displacing one already accepted. Stopping wasted room a shorter, more relevant entry could have used — five in-budget rows rendered 1,408 of 1,650 characters while omitting a later 76-character line with 242 characters free. Preferences and safety rules are never sliced to make space; a preferences file that alone exceeds the ceiling is the one exception, kept from its head with an in-prompt notice naming the omitted character count and the file to read. Vector lessons keep the lexical relevance order already computed for the request. With no query vector — every startup render, and a recall whose embed is unavailable — `rank_lessons` scores a row by rarity-weighted overlap: each stemmed token it shares with the request weighs `log((N + 1) / (df + 0.5))`, where `N` is the number of rows being ranked and `df` the number of them carrying the token, and the sum is divided by the square root of the row's token count. The capped overlap count the hybrid score uses as its keyword half is not used there: it reaches 1.0 at ten shared tokens, so on a long first message it would tie nearly every rule at the top and the stable sort would hand back newest-first (#14243). Each request word contributes only its stem, so an exact inflection does not count twice. A distinctive term counts for far more than a common one; a token carried by nearly every row weighs close to nothing (about `0.5 / N`), and the length factor discounts incidental overlap in a long row. Every weight is positive, so any overlap still outranks none and a zero-overlap request keeps the stored order. Document frequency is counted only for the request's tokens, over the row token sets `_row_stem_tokens_for_scan` already memoises, so no row is stemmed again. `_keyword_score` and `_hybrid_score` are unchanged, and a query that has a vector still ranks by the hybrid score. The JSONL fallback orders EVERY tier the same way (`order_by_request_relevance`, length>=3 word tokens, no stemming and no embedding), and orders them PER TIER so authored rules keep their precedence over untagged rows: newest-first alone drops a row the task is actually about while newer irrelevant ones fit, measured on a 199-lesson store for the findings tier and on a 100-row all-untagged store for the RULE tier — every pre-field row lands in the rule tier, so leaving that tier unordered lost an exact-topic match the vector store kept, since the vector path ranks its whole eligible set before partitioning. Ordering is NOT admission: it decides only which rows survive a truncation that is going to happen anyway, so no row is dropped for being irrelevant that the budget would otherwise have kept. The residual is real and is why the omission notice exists — inside an OVERFLOWING rule tier a standing rule unrelated to this message sorts last and can be the omitted one, which the notice names and points at `learn_list` for; ordering cannot both favour the current task and ignore it. An empty query, or no overlap anywhere, leaves the stored order untouched and renders byte-identically. Both tiers' findings header reads "relevant ones first", which is what each renders: the sort runs before the block is built and deliberately lets an OLDER relevant finding outrank newer irrelevant ones, so a header reading "newest first" would describe the pre-sort order and be false for exactly the crowded store the budget exists to serve. The sort is stable, so equal-overlap rows still read newest-first underneath. **An overflow is always reported and never silent**: each block's notice names its own shown/omitted counts, names the budget it hit, states that the limit is a budget rather than a judgement that the rules stopped applying, and points at `learn_list` (rules) or `memory_recall` (findings). A budget too small for even one entry still renders the labelled block with that notice, because an empty block is indistinguishable from "this user has no rules". Startup spends no embedding inference on either tier. Content below both budgets is byte-identical to the previous behaviour, and a caller that names no budget (every reader predating them) is unchanged: for it the rule block keeps the two-stage contract — COMPLETE below the model-safe ceiling whatever `caps.lessons` says, which is the pinned retain-every-eligible-in-scope-rule invariant, and only an overflow, where that invariant is already unmet, trims to the ordinary lessons budget (`min(caps.lessons, ceiling)`, and the ceiling alone when no lessons budget is named). Naming a tier budget is what asks for a window-independent bound instead, so the two mechanisms never both decide one block, and the rule tier's overflow notice names `learn_list` and `memory_recall` because both reach the omitted rules. Explicit lesson readers can use hybrid relevance and fill the caller's character budget, reporting shown and omitted counts. The JSONL store retains `_MAX_LESSONS_TOTAL = 200`, and prunes **by tier**: findings first, then unstated rows, then authored rules, each oldest-first within its class. A tier-blind `[-200:]` deleted the user's oldest authored rules from disk as cheap findings accumulated, which is strictly worse than a prompt omission — an omission is announced and readable through `learn_list`, a pruned row is gone. Authored rules are evicted only when they alone exceed the cap. A submission the prune itself removes is reported as `refused`, never `inserted`: at the cap a new `on_topic` row is the first eviction candidate, and reporting success for a row that is not in the file is a silent false success the caller cannot recover from. That refusal carries its OWN reason, `store_at_capacity`, and not the content refusal's `volatile_session_fact`: the JSONL store answers both of its refusals with the same bare `refused` string, so `POST /api/lessons` re-derives the cause by re-running the volatile-text predicate — exact rather than a guess, since those are the store's only two refusal paths, and the same re-derivation the listing surface already performs for its withheld marker. Telling a user whose store is full to reword a rule is advice that cannot succeed, so `learn_add` renders a distinct message naming the row cap and `learn_remove` as the action that frees a row. Only the JSONL store raises it; the vector store has no row cap and names its own reasons. The vector store's dedup scan carries the matching guard on the other side: its three delete branches decide on text alone, so an `on_topic` write may retire ONLY another `on_topic` row (the reverse is allowed, since promoting guidance to a standing rule is the direction the user is asking for). Unstated rows are protected too, not just `always` ones: an unstated row is served AS a standing rule at injection, and on an install whose lessons predate the field every row is unstated, so a guard keyed on `always` alone would protect nothing on exactly the stores holding the user's real corrections. Read side and write side classify a row the same way. The `POST /api/lessons` route's model-judged contradiction sweep is a SECOND deletion path ending in `delete_semantic`, and it carries a STRICTER guard than the dedup scan: it retires a candidate ONLY when that candidate is itself a finding (`_candidate_applies(candidate) == on_topic`), regardless of the submission's tier. This is deliberately narrower than `tier_permissions`, and the two paths differ because their authority differs. The dedup scan decides on deterministic text (substring and embedding similarity), so it may honour the asymmetric rule and let a standing submission retire a finding. The sweep decides on a single-word LLM verdict, which is a guess, not authority to remove a standing rule the user filed — so the sweep protects EVERY standing and unstated candidate, even from a standing submission. That closes the reported case where a standing (`always`) submission retired a standing rule the model called contradictory. The filter reads the CANDIDATE's persisted tier via `_candidate_applies`, never the submission's tier (`result.applies`): the submission's tier is deliberately not consulted, because a model verdict is not authority to delete a standing rule whatever tier the submission carries. Keying on the submission (its old form, `if result.applies == on_topic`) fired only for a finding submission, so a standing or unstated submission skipped the guard and the sweep could retire a contradictory standing rule, with no recovery, since the sweep's self-heals-next-time note covers a MISSED sweep rather than a wrong deletion. `find_contradiction_candidates` therefore carries each candidate's authored tier on the row it returns: the filter can only apply the guard to a tier it can read, and `_candidate_applies` fails safe to unstated (the protected side) for a row it cannot classify — so a candidate without a stated tier is protected rather than deletable, and a store predating the field, whose every row is unstated, retires nothing on a model verdict at all. It carries each candidate's stored `value_json` too, and the sweep hands it back as `expect_value_json` so its delete is a COMPARE-AND-DELETE. Without it the tier filter is defeatable by timing rather than by tier: the candidates are a write-time snapshot, the delete runs after a per-candidate LLM verdict, and `_lesson_key` keys on rule text plus scope alone — so re-tiering that rule in between (a delete plus a re-add, the documented way to change a tier) puts a DIFFERENT row under the same key, and an unconditional delete tombstones the replacement, including when the replacement is the `always` row the filter exists to protect. A body that changed is reported as kept, not as an error: the row this decided to retire is gone, and a contradiction against whatever replaced it is re-nominated by the next write touching the topic. This is the same guard the inline dedup pass already applies to its own deferred supersedes. The guard gates deletion only, so an `on_topic` rule already contained in an `always` rule is still declined as `substring_covered`. The DECLINE carries the MIRROR of the same rule, because tiering is what makes "already covered" conditional: a submission is covered only while the covering row arrives at least as often as the submission would, and a covering `on_topic` row arrives only when the request is about it. So a STANDING submission (`always`, or unstated) contained in an `on_topic` row is NOT declined — declining it would drop the rule from every unrelated turn while reporting `substring_covered` for a row that does not cover it there, and a re-submit is declined identically so nothing recovers it. In that one direction the submission is stored instead, which can leave a standing rule beside the longer finding containing it; that duplicate is the price of not silently refusing to create the rule. `migrate_from_markdown` carries the authored tier across for the same reason the adjacent lines carry `repo_scope`, and in the same direction: an omitted `applies` reads as unstated, which every read path serves AS a standing rule, so dropping it would promote a row the user filed as a past finding into one injected in every session. It normalizes READ-safely (`authored_lesson_applies`, not the write path's raising form) because that loop reads `lessons.jsonl` directly, so a hand-edited or future-schema value migrates the row as unstated rather than aborting the migration. The listing surface is bounded too — `GET /api/lessons` returns one `limit`/`offset` window and carries `total` and `truncated` so `learn_list` can say `Showing N of M`; `VectorMemoryStore.get_lessons(limit, offset)` honours the offset only on the bounded read, and the unbounded read the scorers use ignores it. That route also reports each row's tier, and `learn_list` marks a finding as `(applies: on_topic)` beside the rule: every overflow notice sends the reader to these surfaces, so a row filed as a finding has to be legible there or a rule the model misfiled stops arriving with nothing to show why, and re-tiering (a delete plus a re-add) cannot even be diagnosed. Only `on_topic` is marked and only an AUTHORED tier is reported — a standing rule and an unstated row are both injected every session, so marking one and not the other would name a difference the injection path does not make. Contract: [learn-cron-dashboard](learn-cron-dashboard.md).
+
+**`applies` is AUTHORED, never derived, and that is the whole reason it is stored.** No property of a stored row separates "a rule the user wants enforced in every session" from "something we worked out once". `source` does not: the consolidator can extract a real safety correction, and a human can type a note about last week's outage. `category` does not: its three values describe subject matter. Keyword shape does not: "always" appears in both classes and reliably in neither. A reader that guessed from any of those would re-decide the user's intent on every turn, and would fail silently in the direction that costs most. So `normalize_lesson_applies` accepts only the two literals, RAISES on a misspelling at the write path (there is no safe clamp — one choice injects a note into every session, the other demotes a standing rule, and both are silent), and treats an omitted value as the supported choice to leave the row unstated. The read path never raises: a hand-edited or future-schema value reads as unstated so one bad row cannot abort prompt assembly for every other lesson. The field is additive and absent when unset in BOTH stores -- the vector writer omits the key, and the JSONL writer drops a `None` through `_serializable` rather than emitting `"applies": null`, which would rewrite every legacy line on the next save and make the two stores disagree about what absence means -- so an unstated row is byte-identical to what the writer produced before the field existed; on the enrich path it is WRITE-ONCE like `category` and `repo_scope`, so enrichment cannot silently demote a rule and re-tiering is a delete + re-add.
+
+**The compatibility limit is real and is not papered over.** A store whose lessons all predate `applies` gets its reduction from the budget alone, not from classification: every row is unstated, so they all compete for the rule budget and the overflow notice is what tells the user which ones did not fit. Classification only starts helping as new lessons are written with a stated value. "Retain an unbounded number of unstated rules" and "a small fixed startup budget" cannot both hold; this is the side that was chosen, and the notice is the mechanism that keeps the trade visible instead of silent. No existing row is rewritten, reclassified or deleted by this change.
 
 Vector scoring builds one scorer per query (`_stored_similarity_scorer`) so the query vector and its norm are derived once instead of once per lesson — the same hoisting `_sqlite_vector_search` does for episodic rows. There is a numpy path and a stdlib fallback, because numpy is guarded by `_HAS_NUMPY`; both produce the same ranking. Stored lesson vectors are un-normalized (unlike episodic vectors, which are L2-normalized for FAISS inner-product scoring), so both norms are divided out per row rather than assuming unit length. A row whose vector has a different dimensionality than the query — a row written under a previous embedding model — is incomparable and scores 0.0, matching `_sqlite_vector_search` and `HybridRetriever._cosine_similarity`, rather than being truncated against the query's leading elements.
 
@@ -2799,8 +3033,8 @@ lesson beat a contradicting preference in the same prompt.
 | Two semantic writes to one key in V2 | Owner correction or verified transcript correction with matching revision replaces the fact; other changed automated assertions remain reviewable proposals | `vector_memory._write_semantic()` |
 | Duplicate lessons in V1 | Substring dedup (contained-in-stored declines; contains-a-stored-one deletes it, longer wins, regardless of source), then topic-overlap dedup (shared keywords cover at least 50% of the LARGER keyword set; newer replaces older regardless of source), then embedding dedup (cosine > 0.85; newer replaces older unless a stored near-duplicate outranks the write: `user_explicit` over a lower-authority source, or strictly higher stored confidence). A non-mutating authority pre-pass decides semantic-match refusals before the scan; it mirrors the earlier substring/topic branches, which remain source-blind. Every branch's deletions are deferred and execute only after the semantic write commits, so a call that stores nothing deletes nothing: a `deduped` verdict from any branch and a `refused` from the semantic write each preserve every live lesson row and report empty `superseded` (a lazy embedding backfill for a row the call read may still have flushed, which changes a vector and no lesson). `delete_semantic` takes an optional `expect_value_json`, carrying the comparison inside its own UPDATE, so a queued row is tombstoned only while its stored body is still the version the scan read and one a competing writer changed is skipped -- the same compare-and-write contract the lazy embedding backfill applies, atomic against another process, and what covers the write's own key once `set_semantic` has committed under it. A drain that stops partway (raised error, killed process) keeps the submission and leaves the rows it had not reached: the residue is a duplicate, never a lost lesson, and the next write matching those rows retires them. Every completed deletion is named in `LessonWriteResult.superseded` | `vector_memory.write_lesson()` |
 | Distinct lessons in V2 | Different rule text coexists without substring, topic or embedding deduplication. Exact-rule enrichment remains; key-targeted corrections use the owner/revision machinery | `vector_memory.write_lesson()` |
-| Contradicting episodic fragments | No explicit resolution: time decay plus MMR surfaces the newer/more relevant fragment | `vector_memory.search_episodic()` |
-| A semantic value is superseded | `_retire_stale_episodic()` tombstones episodic rows that quote the old value | `vector_memory._write_semantic()` step 9 |
+| Contradicting episodic fragments | No explicit resolution: time decay plus MMR surfaces the newer/more relevant fragment | `VectorMemoryStore.search_episodic()` (`vector_memory_runtime/episodic_search.py`) |
+| A semantic value is superseded | `_retire_stale_episodic()` tombstones episodic rows that quote the old value | the publication tail of `vector_memory._write_semantic()` (`vector_memory_runtime/semantic.py`), after the write commits |
 
 ### Memory across surfaces and channels
 
@@ -2871,6 +3105,46 @@ Debug catalog logs separate snapshot loading, directory scanning, metadata
 assembly and index persistence. This reduces cold latency without promising a
 constant-time scan of an arbitrary filesystem.
 
+**Loader composition (`skills.py` and `skill_runtime/`).** `SkillsLoader` keeps
+its state, its locks and every member it had. Each delegated method keeps its name
+and signature and calls the function that owns the rule in `kiro_crew.skill_runtime`:
+
+| Module | Owns |
+|---|---|
+| `catalog` | The three `_iter` tiers, the `skill-catalog-refresh` worker and its generation and epoch fences, admission of stored snapshot rows, root enumeration in precedence order (`_iter_uncached`), disabled-app filtering by owning app (`_owning_app`), expansion of an agent's `skill://` mapping (`_scoped_entries`) and enumerated-name lookup |
+| `listing` | `list_skills` rows, the `owned` hint and delivery counts, and the byte-identical duplicate filter |
+| `delivery` | `get_context` (bounded directory, required bodies, legacy reader, project bodies) and its ranking, `split_triggered` and `trigger_hint` |
+| `search` | `search_skills` and its body matching, exact reads while a first walk runs, and `$skillname` resolution |
+| `read_credit` | Direct-read attribution (`resolve_tool_read_keys`, `credit_skill_reads`), ledger alias folding and `_record_use` |
+| `authoring` | `create_skill`, `update_skill`, `set_pinned` and `set_inject_on_trigger` |
+| `auto_skills` | Generated-skill create, refine and similarity, the lifecycle (archive, restore, eviction), the slug allocator and staging, and queue dismissal and pruning |
+| `versions` | Live auto-skill versions, `.versions/` snapshots and their pruning, and the frontmatter rewrite an update approval writes |
+
+`skills.py` keeps what repository guards pin to it by path: the enumerated-read
+choke point and its readers (`_read_enumerated_skill_bytes`, `_cached_frontmatter`,
+`load_skill`), the `repo_scope` gate sites (`get_always_skills`,
+`get_triggered_skills` with its `trigger_score` call, `scoped_skills`,
+`read_scoped_skill`), `delete_skill` and `_candidate_has_symlink` (the link-screen
+baseline), every redactor call site (the pending list, detail read, verdict,
+preview and approval that `security_posture` registers as this file's redaction
+sink, and the consent-picker `catalog_project_skills`), the tree walk
+`_iter_skill_files` (the resolved-path gate's call sites are counted per file), and
+the packaged-skill sync with its provenance, currency and cron-source checks.
+Trust enforcement and its audit stay beside the choke point they feed. A function a
+loader member delegates to carries that member's name, which keeps the link-screen
+gate's name-keyed resolver set unchanged. A method delegate passes the loader
+first; the function works on the loader's state under the loader's locks, reaches
+other loader behaviour through `loader.<method>()` so a class-level patch reaches
+every caller, reads the facade's constants and every name the facade imports from
+another `kiro_crew` module through `kiro_crew.skills` at call time, and logs on the
+`kiro_crew.skills` logger. A patch of one of those names on the facade therefore
+still reaches the moved code. A helper that moved is patched on its owner module,
+and a sibling owner calls it as an attribute of that module
+(`_listing._dedupe_identical_skills(...)`), never through a by-name import, so the
+patch reaches every caller. `skills.py` imports every runtime module when it loads and re-exports every
+module-level name that moved. `test/test_skills_composition_contract.py` pins that
+surface, the seams and these placement rules.
+
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
 **Retired generated skill cleanup.** `skills.remove_retired_conductor_skill()`
@@ -2883,6 +3157,12 @@ opens keep the final-name and size checks while the
 ancestor and unlink identity checks degrade to by-name checks. Setup and gateway
 startup both invoke it; startup runs it on every boot so a package upgrade needs
 no separate setup command.
+
+Agent skill-path discovery also scans nested AIM package snapshots under the
+per-package snapshot tree. A valid object version manifest with `currentEventId`
+selects that snapshot. Malformed JSON or a non-object manifest has no selected
+event and follows the existing fallback of scanning nested snapshots; it does not
+abort agent configuration.
 
 **Project skills (`<project>/.kiro/skills`) — a different source from the one above.**
 `$KIROCREW_PROJECT_DIR/skills/` is a *sync* source: its contents are copied into
@@ -3193,7 +3473,18 @@ The explicit unbudgeted catalog renderer remains available to non-startup caller
 Native Kiro 2.21.2 progressively loads bodies but places every mapped skill's
 metadata into startup context. Native CLI launch views omit those skill resources
 and suppress implicit native skill inheritance; Crew supplies the bounded directory.
-The authored agent spec remains the mapping authority. See
+The authored agent spec remains the mapping authority. On a shared runtime a view
+stands on the `kirocrew-core` per-session element that gives `skill_search` this
+session's identity, so the projection asks the same predicate the mount asks over
+the spec entry as authored at preparation, refusing a view whose spec withholds
+the element; the global and project MCP settings are read once per session start
+by the mount alone, which hands its verdict on with the array, and the runtime
+refuses that one session on it -- stub or no stub in its array -- naming the file
+and the restriction while the spawn and the other agents' sessions stand. The
+direct client mounts the declaration natively with the identity on its process
+environment, so its view keeps a spec restriction on other tools
+([native skill startup views](acp-client.md#native-skill-startup-views)).
+See
 [context management](../../architecture/context-management.md#4-default-agent-vs-other-agents)
 for native view and inherited steering behavior.
 
@@ -3441,7 +3732,7 @@ so provider timeouts, the 1 MiB response cap, the SSRF denylist, and
 
 | Tool | Endpoint | Returns |
 |------|----------|---------|
-| `skill_discover(query, limit=10≤50, provider?)` | `GET /api/skills/-/discover` | Candidate list — id, name, description, provider, author, install count, and an `installed` flag resolved against the local catalog. Each entry carries a ready-to-paste `skill_fetch(...)` call so the `owner/repo/skill` id survives verbatim. Publisher-controlled fields are clamped per-entry and labelled untrusted in the **header**. |
+| `skill_discover(query, limit=10≤50, provider?)` | `GET /api/skills/-/discover` | Candidate list — id, name, description, provider, author, install count, and an `installed` flag resolved against the local catalog. Each entry carries a ready-to-paste `skill_fetch(...)` call so the `owner/repo/skill` id survives verbatim. Publisher-controlled fields are clamped per-entry and labelled untrusted in the **header**. The endpoint also returns one `provider_outcomes` row (`ok`, `timeout`, or `error`) per attempted provider, so the tool reports a total failure as an error and labels partial results incomplete rather than claiming a complete zero-match search. |
 | `skill_fetch(id, provider="skillsh")` | `GET /api/skills/-/discover/preview` | The skill's instruction file, usable immediately with **no install step**, capped at `_SKILL_FETCH_MAX_CHARS` (32 KiB) for the context budget, prefixed with an untrusted-content warning. |
 
 Both paths are on `server._MIXED_INTERNAL_API_PATHS` (the Skills page calls the
@@ -3665,6 +3956,16 @@ exclude). To keep it off the per-message filesystem/config hot path:
   explicitly injected config honours that config rather than resolving a cap the
   injected document never carried (the absent-key default is 0, which would
   suppress every skill);
+- that cap is read BEFORE the scan, and a cap of 0 (the shipped default) skips
+  the scan entirely: the message is not tokenized, no visible-skill walk,
+  frontmatter read, `repo_scope` fence check or trigger score runs, and no
+  `skill_trigger` audit row is written -- a `!` veto at cap 0 excludes nothing
+  that could have been injected, so it is not a permission DENY. The matcher's
+  own per-message cost at cap 0 is the one snapshot read. `select` is still
+  called at cap 0, but the selection point owns its own zero-cap refusal and
+  answers `None` there (see [decisions.md](decisions.md)), which keeps the empty
+  match and writes no row. Only a `select` that returns a pick or `[]` at cap 0
+  is injected and audited as a selection;
 - `extra_paths` is re-resolved by `reconfigure(cfg)` on a config write, running
   the SAME screening as construction — expanduser, resolve, `is_sensitive_path`
   reject, existence check — and failing closed per entry, so a root added by hand
@@ -3710,7 +4011,7 @@ its author can make. Absent or malformed, the field means inject.
 
 The `false` value carries no new privilege surface: it can only reduce what a
 skill delivers, and foreign-imported skills are refused for declaring `triggers`
-at all (`onboarding_import.py`), so an import cannot reach either path.
+at all (`_skill_package` in `onboarding_scan.py`), so an import cannot reach either path.
 
 **Disabled-app skill gating.** When an app is disabled (`_disabled_app_names()`),
 its bundled skills are withheld across all user-facing surfaces: trigger matching
@@ -4131,24 +4432,35 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The mutating verbs (POST, PUT, DELETE) are owner-only and SEL-audited — app tokens and non-owner subjects get a 403 before any write — and the same owner gate fronts pending approve/dismiss/dismiss-all, pin, and inject-on-trigger, so every mutating skill endpoint in `prompts.py` refuses non-owner callers (the discover-module install endpoint carries its own internal-secret refusal instead; see learn-cron-dashboard.md's Skills CRUD entry). The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The mutating verbs (POST, PUT, DELETE) are owner-only and SEL-audited — app tokens and non-owner subjects get a 403 before any write — and the same owner gate fronts pending approve/dismiss/dismiss-all, pin, and inject-on-trigger, so every mutating skill endpoint in `prompts.py` refuses non-owner callers (the discover-module install endpoint carries its own internal-secret refusal instead; see learn-cron-dashboard.md's Skills CRUD entry). The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. POST also bounds the sanitized name's length against `MAX_PROMPT_NAME_BYTES` and answers 400 with `code: name_too_long` before any write, measured on the whole name so that one bound covers a component past the filesystem cap, a joined path past `PATH_MAX`, and a nesting depth that would make `create_skill`'s `mkdir(parents=True)` recurse per level (#10913). Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **Skill browse containment** (`_resolve_skill_root`, `read_skill_file` in `handlers/_shared.py`): the tree (`/api/skills/{name}/-/tree`) and file (`/api/skills/{name}/-/file`) endpoints serve any directory the resolver returns, so the resolver is the containment boundary. A candidate's *parent* must resolve at or under its own root (that is what rejects a symlinked intermediate directory), and so must the RESOLVED candidate itself — with two exceptions, both in `_leaf_is_contained`: `LEAF_SYMLINK_PREFIX` = `kiro-user/`, where an edition may install `~/.kiro/skills/<name>` as a link into its own tree; and a leaf whose resolved target is a directory an app DECLARES as a skill, because `apps.bridges._register_skills` symlinks each declared skill into the kirocrew skills root (flat AND `skills/<app>/` namespaced) with the target in the app's own tree — without that the browse side would be stricter than the loader and list skills in `GET /api/skills` that 404 when opened. The admissible set is the manifest's own `skills` entries, read through `bridges._registration_source` (the immutable package copy for a shipped builtin), NOT the app's root: an app tree also holds that app's data, tokens and rendered configs, and a link planted at `<root>/x -> <app>/data` must not serve them. The `package/` branch returns before that shared block, so it applies the same containment itself against the resolved `_edition_package_roots()` set — an edition packager can plant an escaping link in its own root like any other, and `package/` carries no allowance. Checking the parent alone for every prefix was a whole-filesystem read primitive: `<project>/.kiro/skills/x -> /etc` resolved to `/etc` and the endpoints enumerated up to `SKILL_TREE_MAX_ENTRIES` names and returned up to `SKILL_FILE_MAX_BYTES` per file from it, and `is_sensitive_path` is no backstop there (it is a `$HOME`-anchored credential denylist, not a containment check). A deliberate cross-checkout leaf link (`<project>/.kiro/skills/x -> ~/dotfiles/skills/x`) is indistinguishable from the exfiltration shape and is refused with it; the sanctioned way to browse a skill tree that lives elsewhere is `skills.extra_paths`, which makes that location a root of its own. `enumerate_skill_catalog`/`_collect_skills_under` carry the same per-prefix policy, because a key enumeration offers must be one the resolver accepts. File bytes then come from `hooks.safe_read_file_bytes_nolink(within_root=…)`, so containment holds on the opened descriptor rather than on a path resolved earlier: re-opening by name left a check-to-use window (an ancestor swapped for a symlink after the check) and no hardlink guard — `resolve()` does not follow a hardlink, so a link to a file outside the root passed the path check and was served. The root is passed as `within_root_is_canonical=True`, because it is already resolved: re-`realpath`ing it at read time would let the skill directory replaced by a link redefine the root it is being contained to. `list_skill_tree` walks by name, so a root replaced after admission is enumerated as whatever its name then denotes — filenames only, and the same exposure the rest of the by-name filesystem surface carries; holding the root across a traversal needs the walk itself to be descriptor-relative, which is a separate change. Every descriptor-level refusal answers one message (`access denied`, 403) rather than naming which guard fired. Refusals are already SEL-audited by the endpoints (`api_skill_tree` / `api_skill_file` outcomes), and the read is NOT trust-gated by design — reading a `SKILL.md` is how an operator decides whether to grant project-skill trust (#4777).
 
+**Pending-review endpoints** (`dashboard/routes/skills.py` → `handlers/prompts.py`): GET `/api/skills/-/pending` (list), GET `/api/skills/-/pending/{slug}` (detail), POST `/api/skills/-/pending/{slug}/approve`, POST `/api/skills/-/pending/{slug}/dismiss`, POST `/api/skills/-/pending/-/dismiss-all`. Approve routes on the candidate's `kind` to `approve_pending_skill_checked` / `approve_pending_update_checked`, which raise `PendingApprovalRefused(reason)` instead of returning `None` (the unsuffixed `approve_pending_skill` / `approve_pending_update` wrappers still return `None` on refusal, but no production caller reads that contract any more — only tests do, and their deletion is tracked in #11089), and the handler maps the reason to a coded refusal so the Skills tab can say WHY the click did nothing. The routing itself is guarded at the CONSUMPTION point, not only in the handler: a raising detail read drops `kind` to `None` and the handler defaults to the new-skill path, so `approve_pending_skill_checked` re-reads the candidate's `.meta.json` itself and refuses `kind == "update"` with `kind_mismatch` (a 409 through the generic coded fallback) — promoting an update fresh would create `auto/<candidate-slug>` while its live target stays unchanged, and `not_found` would trigger the dashboard's approved-or-dismissed-elsewhere recovery copy for a candidate that is still pending:
+
+| Status | `code` | `PendingApprovalRefused.reason` | Meaning to a client |
+|--------|--------|--------------------------------|---------------------|
+| 404 | `pending_skill_not_found` | `not_found` | There is genuinely no candidate at that slug — an unsafe slug, or no `SKILL.md`. The row is gone; refetch the list. |
+| 404 | `pending_skill_unreadable` | — | The candidate IS still staged, but the pinned detail read refuses its tree as not plain: a link at ANY top-level name (including one nothing reads, since approve refuses a stray entry outright), a link swapped in while the read was running, a present `.meta.json` unreadable through the pin, a `scripts/` tree the pinned walk declines, or a tree over the read's budget (more than `_PENDING_SCRIPT_MAX_ENTRIES` entries at the root or across `scripts/`, or a file over `MAX_SCRIPT_BYTES` — the verdict walk's own constants, so the two agree on what is readable). A SEPARATE code because `list_pending_skills` applies none of those refusals, so the row REMAINS: answering `not_found` here would tell the user the candidate was approved or dismissed elsewhere while it sits in front of them, and point them away from the one action that does apply. The panel renders `pages.overview.skillsTab.detail_unreadable` for it. Unparseable `.meta.json` CONTENT is not a refusal at all: metadata comes back empty and the candidate stays reviewable. The staged/absent split is decided by a by-name probe that runs only AFTER the pinned read refused, so losing its race changes the message and can never grant a read. |
+| 409 | `live_skill_exists` | `live_exists` | A live `auto/<slug>` already holds the name (new-candidate path only). |
+| 422 | `script_validation_failed` | `script_validation_failed` | Body adds `report`: the `validate_scripts` `{filename: [finding, ...]}` map, redaction-scrubbed by `_redact_validation_report` (every filename and finding string through `redact_exfiltration_urls` + `redact_credentials`, redacted BEFORE shortening so a cut cannot leave a credential fragment the scrubber no longer recognises) and BOUNDED at retention: at most `_PENDING_SCRIPT_MAX_ENTRIES` filename entries, `_VALIDATION_REPORT_MAX_FINDINGS` findings each, `_VALIDATION_REPORT_MAX_STRING_CHARS` characters per string. Anything dropped — including entries whose redacted names collide — is counted once under a `<truncated>` key, so a shortened report never reads as a complete one. Raised on the raw scripts, or on the re-validation after in-place redaction. |
+| 409 | `pending_approval_refused` | any other | Body adds `reason`: `target_missing` or `stale_base` (update candidates), `invalid_layout`, `redaction_failed`, or `promotion_failed`. |
+
+Success is 200 `{"approved": "<auto/name>"}`; a malformed slug is still an uncoded 400 `invalid slug`, and a non-refusal exception an uncoded 500 `internal error`. Before this contract every refusal collapsed into one uncoded 409 (`not found, a live skill already exists, or script validation failed`). **Dismiss has no 409**: 200 `{"dismissed": slug}`, uncoded 400 `invalid slug`, 404 `pending_skill_not_found` (the same code as approve's not-found, so the dashboard's refetch-and-explain recovery keys on one code), uncoded 500. **Dismiss-all** has no 409 either: it REQUIRES a JSON object body with a non-empty `slugs` string array — 400 `invalid_body`, `invalid_slugs` or `slugs_required` otherwise — and answers 200 `{"dismissed_count": n}` or 500 `internal_error`. The detail 404 (`not found`, uncoded) also covers a candidate `get_pending_skill` refuses to read because it contains a symlink. The `script_validation` verdict the list and detail payloads may carry, and the SEL outcomes of a refused approval, are specified under Auto Skill Creation → Pending review contract.
+
 **LLM tool mechanisms:**
-- MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
-  - `kirocrew-cron`: cron scheduling
-  - `kirocrew-core`: spawn, learn, task tools
+- MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**. The complete managed-server inventory, emission gates and per-agent opt-in sets are canonical in [MCP architecture](../../architecture/mcp.md#managed-servers).
 - Skills are for on-demand knowledge only (not for CLI command wrappers — use MCP tools instead)
 
 ## MCP Discovery (`mcp_discovery.py`)
 
-Auto-sync at startup + on-demand discovery from dashboard. Default servers: `kirocrew-cron`, `kirocrew-core`.
+Auto-sync runs at startup and on demand from the dashboard. The authoritative managed-server inventory and its always-on, gated and opt-in rules are in [MCP architecture](../../architecture/mcp.md#managed-servers).
 
 **Server sources** (merged by `list_servers()`):
 1. `agents/defaults.json` → `mcpServers` (default: none beyond the managed servers)
 2. `~/.kiro/agents/kirocrew.json` → `mcpServers` (installed config, merged)
 3. `~/.kiro/settings/mcp.json` and `~/.kiro/crew/mcp.json` (scanned at startup and on-demand)
+4. Edition-contributed provider-global scopes from `extra_mcp_scopes()` (the public edition contributes none)
 
 **Startup behavior**: gateway calls `_init_mcp_discovery()` which runs `discover_servers_to_sync()` + `sync_to_agent_config()` to auto-add new servers from mcp.json, then logs all configured servers. Discovery/sync failures are caught independently so `list_servers()` always runs. Additionally, `server.py` fires `_bg_mcp_probe()` as a background task at startup to populate the probe cache.
 
@@ -4165,7 +4477,7 @@ Auto-sync at startup + on-demand discovery from dashboard. Default servers: `kir
 - On Windows the keys are `normcase`+`normpath` folded (paths are case-insensitive and accept either separator), and a trailing `PATHEXT` suffix is stripped from the **rooted side only** — `shutil.which("npx")` returns `...\npx.CMD`, which would otherwise read as divergent from `npx` on every cycle and re-sync + reset every session at each startup. Stripping both sides would wrongly collapse distinct executables (`foo.bat` vs `foo.cmd`).
 - A leading separator with no drive letter (`/usr/bin/srv`) counts as rooted on Windows even though `ntpath.isabs` rejects it, so an `mcp.json` authored on macOS/Linux is read identically on every host.
 
-**Probing**: spawns each MCP server, sends JSON-RPC `initialize` + `tools/list` handshake, reports status + tool names. **Both calls must succeed for `ok`** — an initialize that answers and a tools/list that does not is a server no session can get a tool out of, so it reports as an error rather than certifying an unusable server. Each result carries `probedAt` (wall-clock) and `probeMode` (`handshake`, or `declared` for a managed server served from its in-process declaration) so the UI can say when and how the status was established. 30-second timeout, 1MB stdout buffer (an MCP server's responses exceed the default 64KB). Cleanup via `finally` block (no zombie processes). Results cached in `handlers.py` with 10-min TTL; GET `/api/mcp/probe` returns cached results non-blocking, POST `/api/mcp/probe` forces a fresh probe and updates cache.
+**Probing**: external servers are spawned and must complete both JSON-RPC `initialize` and `tools/list`; managed servers may instead use their in-process declaration. An initialize that answers without a successful tool list is an error, not a usable server. Each result carries `probedAt` (wall-clock) and `probeMode` (`handshake` or `declared`) so the UI can say when and how the status was established. The handshake timeout defaults to 15 seconds and is configurable through `dashboard.mcp_probe_timeout_secs` from 5 to 120 seconds. The stdout buffer is 1 MiB (responses can exceed the default 64 KiB), and subprocess cleanup runs in `finally`. Results are cached in `handlers.py` for 10 minutes; GET `/api/mcp/probe` returns cached results non-blocking, while POST `/api/mcp/probe` forces a fresh probe and updates the cache.
 
 **MCP temp**: the probe and runtime apply one rule through `sandbox.classify_declared_temp_env`. The probe, `gatewayd._spawn`, and `spawn_backend` run that rule off the event loop before honouring a spec-declared `TMPDIR`/`TMP`/`TEMP` (matched case-insensitively). A cleared declaration is re-emitted under canonical uppercase keys with ambient siblings dropped. A refused declaration is dropped as a whole, the managed temp takes over, and one WARNING names each refused key, its path and the cause. `sealed` means the path lies inside `<data home>/run`; the classifier checks the original `realpath`, the lexical spelling, and `(st_dev, st_ino)` identity against the sealed parent. `unclassifiable` means the canonical form cannot be established, or the declaration is relative. Relative values are refused because the daemon would classify them against its cwd while the backend child resolves them against `work_dir`, so one classification cannot describe both paths. A classifier exception refuses every declared key under `check-failed` and names the exception. If managed allocation fails after a refusal, no refused temp value reaches the child. On `win32`, `classify_declared_temp_path` returns `None` without resolving the path because Kiro Crew has no native Windows sandbox backend and nothing seals `run/` there. The probe's managed directory lives under `<data home>/run/mcp-tmp/probe-<id>/tmp`, is carved out of the sandbox seal, and is exported on all three canonical keys. This rule prevents the known sealed-parent conflict. It does not certify that every arbitrarily declared temp directory exists or is writable.
 
@@ -4207,7 +4519,7 @@ data-home file, Kiro global settings, bundled/project/installed agent config,
 managed servers, and edition-contributed server/scope files. An exact or
 alias-equivalent foreign name is rejected, so a disabled import cannot shadow
 an enabled global or installed server. Existing server definitions win on
-collision, and KiroCrew-managed servers (including `kirocrew-core` and
+collision, and Kiro Crew-managed servers (including `kirocrew-core` and
 `kirocrew-cron`) are protected from replacement, deletion, or shadowing by an
 imported definition. Malformed effective-source JSON or non-object
 `mcpServers` values contribute no names and cannot abort an import. Repeated
@@ -4231,11 +4543,13 @@ session ends → HistoryConsolidator (3h idle path)
             → LLM consolidation prompt gains new_skill / refined_skill keys
             → result piped through redact_credentials + redact_exfiltration_urls
             → SkillsLoader.find_similar() dedup check
-            → SkillsLoader.create_auto_skill() writes SKILL.md under auto/<slug>/
+            → default or script-bearing path: stage_skill_candidate() writes auto/.pending/<slug>/
+            → owner approval promotes the candidate to auto/<slug>/
+            → approval_required=false: prose-only candidates may publish directly
             → SEL audit event emitted
 ```
 
-No new timer, no new background task — piggybacks on the existing idle-fired `HistoryConsolidator._consolidate()` path. The auxiliary LLM already runs on the background kiro-cli session every 3 hours of idle per session; the auto-skill keys are appended to the same JSON the LLM already returns.
+No new timer, no new background task — piggybacks on the existing idle-fired `HistoryConsolidator._consolidate()` path. The auxiliary LLM already runs on the background kiro-cli session every 3 hours of idle per session; the auto-skill keys are appended to the same JSON the LLM already returns. Before every final stage, create, or refine write, the consolidator enters `ConversationLog.publication_hold`, which revalidates the chained transcript privacy lines and retains their locks for only that final filesystem write. A restricted or unreadable line discards the candidate. The hold never spans skill extraction, metadata dedupe, or merge model calls, so privacy validation and publication are atomic without blocking transcript writers for model latency.
 
 ### Eligibility gate (`_count_tool_call_messages`, `_session_touched_sensitive`)
 
@@ -4254,6 +4568,37 @@ Prompt keys are only appended when ALL hold:
 Auto-generated skills live under `~/.kiro/crew/skills/auto/<slug>/SKILL.md`. Slug validated against `^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`. The `auto/` prefix:
 - Makes provenance visible without parsing frontmatter (`list_auto_skills()`)
 - Prevents accidental overwrite of hand-authored skills via the refine path (`update_auto_skill()` explicitly refuses names outside `auto/`)
+
+### One slug space, one allocator
+
+The live tree `auto/<slug>` and the pending queue `auto/.pending/<slug>` are two halves of ONE name space, because a queued NEW candidate's promotion destination IS `auto/<slug>`. A claim that consults only its own half can take a name the other half depends on, and the losing side goes silently: `approve_pending_skill` refuses a candidate whose live name is occupied (`live_exists`) for as long as that directory stands, TTL pruning then deletes it unreviewed, and consolidation advances its message offset whatever one candidate's outcome, so nothing is retried from the same sessions.
+
+**The invariant: the three AUTO-SKILL allocators test availability with `_auto_slug_available` while holding `_auto_slug_claim_lock`.** They are `create_auto_skill` (live publish), `stage_skill_candidate` (queue a candidate), and `restore_auto_skill` (move an archived skill back live). A new allocator in this pipeline MUST route through the same pair rather than checking a directory itself.
+
+Two writers reach `auto/` WITHOUT that coordination, and both are known gaps rather than covered cases:
+
+- The `crystallize` builtin skill stages `auto/.pending/<slug>` with raw file tools instead of calling `stage_skill_candidate`, so it can write a pending directory after a live claim already stands. Approval then refuses that candidate for `live_exists` and TTL pruning deletes it unarchived. Closing this means giving crystallize a host path that calls `stage_skill_candidate`, not adding another direct-write guard.
+- `create_skill` accepts any name, including an `auto/`-prefixed one, from the dashboard prompt and discover handlers (`READONLY_SKILL_KEY_PREFIXES` does not exclude `auto/`), so a hand-created `auto/<slug>` can strand a queued candidate through the same `live_exists` refusal. Closing this means refusing or routing `auto/`-prefixed names at those call sites.
+
+`_auto_slug_available(slug, claim=...)` answers for the claim actually being made, because the halves are not symmetric:
+
+| `claim` | Free when |
+|---|---|
+| `live` | `auto/<slug>` absent AND no pending NEW candidate under that slug |
+| `pending-new` | `auto/.pending/<slug>` absent AND `auto/<slug>` unoccupied (a queued candidate whose live name is taken is unapprovable) |
+| `pending-update` | `auto/.pending/<slug>` absent; the live tree does not constrain it |
+
+An UPDATE candidate is queued under `<target-slug>-update` and `approve_pending_update` promotes it over the live `target` in its metadata, never consulting `auto/<candidate-slug>`, so it reserves nothing in the live tree. The `live` test reads the queued candidate's `kind` to tell the two apart and FAILS CLOSED: metadata that is missing, unreadable, or silent about `kind` keeps the slug reserved. Staging therefore holds the lock until `.meta.json` is committed, since `kind` is the field a concurrent publish reads.
+
+`_auto_slug_claim_lock` is an advisory exclusive lock on `skills/.auto-slug-claim.lock` — a dot-prefixed plain file at the skills root, skipped by discovery, placed outside `auto/` so taking it does not create the auto namespace as a side effect of a refused claim. It yields whether the lock was ACQUIRED, and an unacquired lock is a REFUSAL: opening the file can fail on a read-only home, and the acquire can lose within its seconds-long ceiling. Each namespace's claim is additionally an atomic `mkdir(exist_ok=False)`, so a claim lost to a concurrent writer refuses instead of overwriting, but `mkdir` alone cannot make the cross-namespace pair safe because the two paths create different directories.
+
+**Both claim paths return `None` rather than raising or half-succeeding.** `stage_skill_candidate` returns `None` when nothing is queued: an invalid slug, an oversized procedure, an unacquired lock, or no free name across `<slug>` and siblings `<slug>-2..-50`. A `None` means the candidate is NOT on disk and the caller MUST take its rejection branch, because a name returned from a path that wrote nothing is recorded as a staged candidate that does not exist, and the offset advance makes that loss permanent and invisible. `create_auto_skill` and `restore_auto_skill` likewise answer `None` on refusal, which their callers audit as a rejection.
+
+**One of those refusals is transient, and only that one is retried.** An invalid slug, an oversized procedure and an exhausted sibling walk are properties of the CANDIDATE: refused once, refused forever. An unacquired claim lock is a property of the MOMENT. A caller reading a bare `None` cannot tell them apart, so a claim path also fills in a `ClaimRefusal` when one is supplied, setting `retryable` for the lock case alone.
+
+Skill detection is what acts on it. It records a `(rotation_generation, message_count)` marker per session BEFORE staging runs and skips a pass whose pair is unchanged, so a stall would otherwise cost the candidate until a further message changed the count or a gateway restart cleared the marker — a session that goes quiet right after the stall loses it. On a `retryable` refusal the pass RETRACTS its own marker, so the next consolidation re-judges the same unchanged session and reaches the claim with the lock free.
+
+**The shared consolidation offset is deliberately left advanced.** History, semantic and lesson extraction all consume it, so rewinding it to re-attempt one skill candidate would re-summarize an already-consolidated tail into duplicate entries — which is why skill detection reads the last `_SKILL_DETECTION_WINDOW` messages of the whole session and was decoupled from that offset in the first place. The marker is the only state the retry rewinds.
 
 ### Provenance (`AutoSkillProvenance`)
 
@@ -4282,6 +4627,16 @@ reuse_count: 0                          # omitted when zero
 4. **Similarity dedup** — `find_similar()` rejects near-duplicates above `skills.auto_similarity_threshold` (default 0.85) Jaccard overlap on description words.
 5. **Namespace lock** — `update_auto_skill()` refuses to touch any skill whose name doesn't start with `auto/`, preventing the refine path from ever clobbering hand-authored skills.
 6. **SEL audit** — every create/refine/dedup-rejection emits `tool_name=auto_skill_create` or `auto_skill_refine` to the security event log with session key + skill name metadata.
+
+### Pending review contract (`list_pending_skills`, `get_pending_skill`, `_pending_scripts_verdict`, `approve_pending_*_checked`)
+
+The HTTP statuses and `code` values of the pending endpoints are tabulated under Skills → Dashboard endpoints above; this section fixes what the payloads MEAN.
+
+**`script_validation` is a poll-time PREDICTION, not the verdict on the click.** Every entry of GET `/api/skills/-/pending` and the GET `/api/skills/-/pending/{slug}` detail MAY carry `script_validation: {"ok": bool, "report": {filename: [finding, ...]}}`, computed per candidate by `_pending_scripts_verdict` on every dashboard poll, `report` scrubbed and bounded by `_redact_validation_report` like the approve refusal's (same entry, finding and string caps, same `<truncated>` accounting — `_PENDING_SCRIPT_MAX_ENTRIES` is the ONE named budget the verdict walk and the report both spend, so the two cannot drift apart). It exists so the card can badge a candidate approve is going to refuse WITHOUT the user expanding the row. It fails closed on everything approve refuses: the top-level layout precheck (`_candidate_layout_findings_at`, reading the same `_ALLOWED_CANDIDATE_TOP` set as approve's `_candidate_layout_ok` — a symlinked or non-regular `SKILL.md` / `.meta.json`, a stray top-level entry, more than 16 top-level names) is reported under the `<candidate>` key; a `scripts` entry that is not a real directory, a symlink under it, a script over `MAX_SCRIPT_BYTES` (flagged from its size, its bytes never read), an unreadable or non-UTF-8 script, an entry swapped between stat and open, and an unexpected walk error (`verdict unavailable: unexpected walk error`) are all findings. Small decodable scripts get the real `validate_scripts` run twice — raw, then on in-memory redacted copies — mirroring approve's two-stage check; nothing on disk is touched. The candidate root is resolved exactly ONCE per verdict: a single `pinned_fs.open_dir_pinned` call pins it, the layout scan reads through that retained descriptor, and `scripts` is opened relative to it (`dir_fd`) with an inode identity check against the layout scan's stat — so a candidate root swapped between steps, whether for a symlink or for a different real directory renamed over it, cannot redirect any part of the verdict; everything below `scripts` is likewise stat-ed, opened and read descriptor-relative.
+
+**When the field is OMITTED.** The field is ABSENT, not `ok: false`, whenever `_pending_scripts_verdict` returns `None` — the honest answer is "no verdict". Three paths do that: (1) a platform without descriptor-relative opens (`pinned_fs.supports_pinned_walk()` false), for EVERY candidate, before any by-name layout scan — a link/junction check followed by a by-name scan races with replacement of the candidate root, so even a layout REFUSAL can expose the target's filenames; (2) a platform with pinned opens but without descriptor-relative tree walks (`pinned_fs.supports_pinned_tree_walk()` false), for a candidate whose pinned layout precheck is clean and that has a real `scripts/` directory; (3) a walk-budget breach — more than `_PENDING_SCRIPT_MAX_ENTRIES` entries (files and directories together), a tree deeper than 8 levels, or more than `_PENDING_SCRIPT_MAX_ENTRIES` × `MAX_SCRIPT_BYTES` aggregate bytes — because the walk stops there while approve's `_collect_scripts` is unbudgeted, so `ok: false` would promise a refusal that never comes. **On Windows the pre-click "fails validation" badge disappears entirely, because no trustworthy verdict can be computed without descriptor-relative opens.** **One verdict, two surfaces.** `approve_pending_skill_checked` / `approve_pending_update_checked` CONSULT the same `_pending_scripts_verdict` the badge serves, immediately after their layout guard: a computable `ok: false` verdict refuses the click with `script_validation_failed` carrying that verdict's own scrubbed report, so the badge and the click cannot disagree on any candidate the badge judged — the badge's word is a refusal by construction, not by parallel re-derivation. When the verdict is `None` (either omission platform, or a budget breach), the click path's own machinery — the layout guard, `validate_scripts` on the collected files, redaction and re-validation — decides alone, exactly as before; it also re-runs in full after a passing consult, because the files on disk at click time are what go live. A client MUST treat a missing `script_validation` as unknown — render no badge, let the 422 `report` speak — and never as an all-clear.
+
+**SEL outcome of a refused approval.** `api_skill_pending_approve` writes one `log_tool_invocation` (`agent="api"`, `source="dashboard"`, `tool_kind="skill"`) per request: `ok` with `{slug, name}` on promotion; `not_found` with `{slug, reason: "not_found"}` when the candidate does not exist; `rejected` with `{slug, reason}` for every other `PendingApprovalRefused` (`live_exists`, `kind_mismatch`, `script_validation_failed`, `target_missing`, `stale_base`, `invalid_layout`, `redaction_failed`, `promotion_failed`) and for a malformed slug (`reason: "invalid_slug"`); `error` for an unexpected exception. Previously every refusal was logged as `not_found`, so the audit trail could not tell a missing candidate from a rejected script. Refusals are audited at the handler only; the `*_checked` promotions emit their existing success-side audit.
 
 ### Refinement (`skills.auto_refine_on_deviation`)
 
@@ -4315,7 +4670,7 @@ No new command. Users interact via the existing skill management surface:
 - Off by default (opt-in). Enable: `kirocrew config set skills.auto_create_from_sessions true` (or dashboard Settings → Skills); auto-approve prose-only: `kirocrew config set skills.approval_required false`
 - Review pending candidates: dashboard Skills → Pending review, or `GET /api/skills/-/pending`
 - List auto skills: filter `kirocrew` skill listings to those under `auto/`, or use `SkillsLoader.list_auto_skills()` in code
-- Remove unwanted auto skill: `rm -rf ~/.kiro/crew/skills/auto/<slug>` (or dashboard skill delete when UI lands)
+- Remove unwanted auto skill: use the dashboard Skills delete action
 - Audit trail: `kirocrew security events -n 20 | grep auto_skill`
 
 ## Hooks (`hooks.py`)
@@ -4432,6 +4787,237 @@ sibling `emit_internal_read_audit(read_id)` — same audit + fail-closed contrac
 `_AUDIT_ONLY_READ_IDS` registry. Adding an allowlist entry is a security-review event; the bytes
 never reach an LLM/agent surface.
 
+### `SessionLaneChanged` — board-lane transitions (`_fire_session_lane_changed`)
+
+**Status: this section specifies a PENDING implementation, not the tree as it
+stands.** `SessionLaneChanged` is not a live hook event yet: it is absent from
+`HOOK_EVENTS`, from `ALLOWED_HOOK_EVENTS` and from `_VALID_HOOK_EVENTS`, and none
+of the symbols named below exist in `src/`. The three sets are not the same size:
+`HOOK_EVENTS` and `_VALID_HOOK_EVENTS` carry the five turn-lifecycle events, while
+`ALLOWED_HOOK_EVENTS` carries eleven — the five plus the six Kiro Agent triggers
+in `hooks.HOOK_EVENTS_KAS_ONLY`, which are registrable but fired by nothing. Read
+every present-tense sentence here as the contract the implementation must meet.
+Until it lands, `handlers/hooks.py` and the Hooks page behave as the rest of this
+module already describes.
+
+The implementation is PR #7669, and this section stands or falls with it: it is
+owned by that PR, is asserted against the code by a spec-pinning test that ships
+there, and **must be deleted if #7669 is withdrawn** rather than left describing
+code that never arrived. The RFC amendment in
+`docs/request-for-change/rfc-session-tag-change-event.md` records which writers
+emit and which remain silent; that document, not this section, is where the
+firing coverage is stated.
+
+Fires when a chat session's **status** tags change through a session-level tag
+transition, so an automation can react to a board lane transition as it happens
+rather than on a timer.
+
+**What it buys, stated exactly: latency, not the removal of reconciliation.**
+Reaction is no longer bounded by a poll interval, and the delta is computed once
+here instead of by every consumer. It does NOT retire the polling loop for a
+subscriber that needs certainty: the RFC states the v1 delivery bar this event
+ships under, and it does not promise every arrival, so such a subscriber still
+re-reads the board. A subscriber that can
+tolerate a missed transition can drop its timer; one doing irreversible work
+cannot, and gains only latency.
+
+**What counts as a status tag, stated once.** `_is_status_tag` is
+`bool(isinstance(tag, dict) and tag.get("status"))` — plain truthiness — and every reader asks
+it: the drop path's mutual-exclusion strip, the delete path, the auto-tagger, and this event's
+dispatch filter. One rule rather than two, and deliberately the rule the board ALREADY uses:
+the tag manager's lightning toggle reads `!!t.status`, and `GET /api/chat/tags` serves the
+field as stored. So any value Python calls truthy is a lane, including a hand-edited
+`"status": "false"` (a non-empty string), and only an absent field, `false`, `0` or `""` is
+not. A stricter predicate would read better in isolation and would RECLASSIFY such a tag from
+a lane to an ordinary one — silently un-stripping it on the drop path, where the board still
+draws it as a column — so the narrowing is left to whatever change owns board behaviour. This
+one adds an event.
+
+**Why the name is LANE-scoped, not tag-general.** The event name is the one part of
+this surface that can never be corrected: once a hook subscribes, renaming is a
+breaking change for that hook, and unlike a payload key there is no additive way to
+migrate it. The firing contract is status-tags-only, so a tag-general name would
+promise more than the event delivers — and it would make the obvious future
+widening (fire on ALL tag changes) a BREAKING change rather than an additive one:
+every no-matcher subscriber would silently begin receiving auto-tag noise from
+`maybe_auto_tag`, which writes non-status tags routinely. Under a lane-scoped name
+that widening is a NEW event (`SessionTagsChanged`, still unused) beside this one,
+and existing subscribers are untouched. The name was deliberately narrowed before
+merge for exactly that reason; widening the contract later must add an event rather
+than redefine this one.
+
+**This section is the event's compatibility surface.** The payload keys and the matcher token grammar are what a registered hook binds to, so changing either
+breaks existing hooks — they are documented here rather than left to be inferred
+from the first subscriber.
+
+**It ships with ZERO registered subscribers, and that is the cheapest moment it
+will ever have.** The event name, the four payload keys and the token grammar are a
+one-way door: every one of them becomes a compatibility obligation the instant a
+hook binds to it, and today nothing does, so the surface is still free to change.
+That is inherent to adding any hook event rather than a defect of this one — but it
+is the reason the contract is written down BEFORE a subscriber exists rather than
+after, and the reason the name was narrowed pre-merge. Reviewers judging this
+surface should treat now as the last point at which a correction is free; the
+status-only scoping is what keeps the expected future widening additive.
+
+**Payload (stdin JSON).** All three keys are stamped unconditionally, so a hook that
+always reads one never `KeyError`s on an addition-only or removal-only change:
+
+| key | meaning |
+|-----------|--------------------------------------------------|
+| `slot` | the session key whose tags changed |
+| `added` | **status** tag ids added by this transition |
+| `removed` | **status** tag ids removed by this transition |
+
+`added` and `removed` are **status-only**, not the raw set difference. A single tag
+edit can bundle a lane change with a plain-label change, and emitting the whole
+delta would put `added:<label>` in the matcher context — letting a hook match a
+non-status tag, which contradicts the status-only firing contract above. There is no
+`tags` key: a subscriber needing the session's full current state re-reads the live
+store, because dispatch is off the request path and the board can move again first.
+
+Filtering the delta cannot make it empty. The fire gate compares the status-only
+sets, so a dispatch happens only when they differ — the symmetric difference then
+holds at least one id. This is load-bearing rather than incidental: `fire` consults
+a matcher only when the context is non-empty, so an empty delta would skip matcher
+filtering and run EVERY hook registered for the event, the opposite of the intent.
+
+The **delta** is the point: with `tags` alone every consumer would have to persist
+its own prior snapshot to answer "was Done just added?", which moves the diffing
+into every subscriber instead of doing it once here.
+
+**Matcher grammar** (built by the module-private `_session_lane_matcher_context`,
+which lives beside `HOOK_EVENT_SESSION_LANE_CHANGED` because the GRAMMAR is the
+event's contract, not the writer's; the builder has no caller outside `hooks.py`,
+since the fire derives the context itself). Tokens are **direction-tagged** and carry the tag **id only**:
+
+```
+added:<id>;  removed:<id>;
+```
+
+Direction is in the grammar because the motivating case is "a session **entered**
+Done"; an untagged context cannot express it, since an `<id>` matcher would fire on
+leaving the lane too.
+
+**A bare lane id matches NOTHING.** The default matcher mode is `glob` and
+matching is **whole-string** `fnmatch`, so a selector must carry wildcards:
+
+| intent            | `glob` selector   | `contains` selector |
+|-------------------|-------------------|---------------------|
+| entered a lane    | `*added:<id>;*`   | `added:<id>;`       |
+| left a lane       | `*removed:<id>;*` | `removed:<id>;`     |
+| any movement      | `*:<id>;*`        | `:<id>;`            |
+
+**Both bounds of the id are load-bearing, not decoration.** Matching is `fnmatch`
+against the whole context, so a selector must pin the id at each end or it matches a
+DIFFERENT lane and the hook that runs belongs to someone else — for a close-out hook,
+an irreversible action on the wrong session.
+
+- The trailing `;` stops a selector for a short id also matching every longer id it
+  **prefixes**: without it `*added:abc*` fires on `added:abcdef;`.
+- The leading `:` stops it matching an id it is a **suffix** of: `*abc;*` fires on
+  `added:xabc;`, because that token ends with the same `abc;`. The direction-tagged
+  rows get this bound for free from `added:`/`removed:`, which is why only the
+  direction-free row has to spell the `:` out.
+
+Neither bound is forgeable: `:` and `;` are both outside the id allowlist
+(`_TOKEN_ALLOWED = re.compile(r"\A[a-z0-9_.-]+\Z")`), so no id can contain either. Two
+generated ids are the same length `uuid4().hex[:12]` and can neither prefix nor suffix each
+other, but `tags.json` is
+hand-editable and legacy artifacts exist — the same path the token validator guards.
+
+**Why the validator is an allowlist and not a separator screen.** `:` and `;` are
+rejected inside an id so it cannot forge its own bounds, but refusing only the
+separators still admits glob metacharacters, and the grammar is consumed by `fnmatch`:
+an id of `*` would make the selector written for it match EVERY lane change and run
+that tag's hook on sessions it was never registered for. Enumerating the safe
+characters refuses that whole class instead of the separators that happened to be
+foreseen. `.` IS admitted, because it is none of those things — `fnmatch` treats it as a
+literal, so a hand-named `in.review` reaches the grammar rather than vanishing from every
+matcher context. The allowlist is lower-case only, because `_context_matches` folds case and
+an upper-case id would otherwise admit two spellings of one token; an id the validator
+refuses is skipped with a logged warning rather than silently dropped.
+
+**Why ids and not display names.** Emitting `added:<name>` alongside the id read
+better — an author could write `*added:In_Review*` for a lane shown as "In Review" —
+but it put a user-controlled string into a structural grammar and cost more than it
+bought. Whitespace divides tokens and `:` divides a direction from its value, so a
+name had to be escaped or one lane could forge another lane's token; a collapsing
+sanitizer turned out to be many-to-one (`In Review`, `In:Review` and a literal
+`In_Review` all became `In_Review`), which fires a destructive close-out hook for
+the **wrong** lane, so the escape had to be injective; and the resulting spelling
+(`*added:In_20Review*`) would have been frozen contract from the first subscriber
+onward. Ids already select a lane, contain no separator to escape, and are stable
+across renames, so a matcher keeps working when a lane is relabelled.
+
+The sequencing is settled by the asymmetry: adding name tokens later is **additive**,
+removing them later is **breaking**, and this event ships with zero subscribers — so
+leaving that grammar unfrozen costs nothing today. A subscriber wanting the
+human-readable label reads `added`/`removed` from the payload and resolves the
+ids it finds there; the follow-up event-picker UI can resolve a name to an id when
+composing the matcher.
+
+An id is **validated, not escaped**: ids are `uuid4().hex[:12]`, but `tags.json` is
+persisted state a human can edit, so an id carrying whitespace or `:` is skipped
+rather than tokenized. That degrades matching for that one tag instead of splitting
+into two tokens or forging the opposite direction.
+
+**Contract limits, all deliberate:**
+
+- **Status tags only.** `chat_auto_tag.maybe_auto_tag` writes non-status tags
+  routinely and never writes status ones, so firing on every tag would make the
+  event chatty for the board-lane case that motivates it while adding nothing.
+- **Informational — a hook cannot veto.** Exit code 2 blocks a `PreToolUse` call;
+  this event ignores it. By the time it fires the write is applied and the drag has
+  happened, so a veto would make the board unusable when a hook breaks rather than
+  preventing anything. A refused or rolled-back write never fires it.
+- **Only ids are tokenized, and an id must match the single `_TOKEN_ALLOWED` allowlist stated above, so nothing user-controlled reaches the grammar.**
+  Whitespace separates tokens and `:` separates a direction from its value, so a tag
+  NAME reaching a token raw could forge either: a lane named `removed:done` would
+  emit `added:removed:done` and fire a `*removed:done*` cleanup hook on a session
+  that just ENTERED a lane, and `done x` would split and forge a match for a
+  different lane called `done`. Escaping names was tried and dropped as a
+  subtraction: the escape had to be *injective* (collapsing separator runs to `_`
+  made `In Review`, `In:Review` and a literal `In_Review` share one token, firing a
+  destructive hook for the wrong lane), and its spelling would then be frozen
+  contract. Dropping name tokens removes that surface instead of guarding it — see
+  the matcher-grammar section above for the sequencing argument. Ids are
+  `uuid4().hex[:12]` and carry no separator, but are **validated** anyway because
+  `tags.json` is persisted state: a malformed id is skipped, never rewritten.
+- **Three event allowlists diverge intentionally.** The event is in
+  `hooks.HOOK_EVENTS` (dispatchable) and `validation.ALLOWED_HOOK_EVENTS`
+  (registrable through the hook create/update API), and deliberately **absent**
+  from `agent._VALID_HOOK_EVENTS` — kiro-cli rejects a generated agent config
+  naming an event it does not know, refusing to load that agent at all. A test
+  pins all three memberships together with this rationale, so the divergence
+  cannot be "fixed" by syncing them. The Kiro Agent triggers sit one step further
+  out again: registrable, absent from `_VALID_HOOK_EVENTS` for the same reason,
+  and not dispatchable either.
+
+**The SEL rows this event adds, stated so an auditor can find them and a host can
+budget them.** A lane-dispatch decision writes ONE `log_api_access` row under
+`operation="hooks.session_lane_changed"`, on either outcome, so the count does not
+depend on whether the dispatch was permitted. The rate is per DECISION, not per
+session and not per tag: deleting a status tag strips it from every session holding
+it and still records one row for that whole batch. The floor is zero and zero is the
+default shipping state — the row is written only once an enabled `SessionLaneChanged`
+hook is registered, so a host with no subscriber adds none. No volume figure is
+stated here on purpose: nothing in the implementation measures one, so any
+rows-per-day number would be an estimate rather than a contract.
+
+**Known deferral (partially mitigated here).** Resolving the `capabilities.script_hooks`
+gate walks `profiles/` synchronously, so any `async` caller resolving it inline stalls the
+event loop for that walk — a `no-blocking-call-on-event-loop` violation reachable from lane
+dispatch. Both `async` call sites in `hooks.py` therefore await ONE seam,
+`_script_hooks_capability_denied_async`, which hops to a thread. Unconditional, not keyed on
+the event: scoping it to `SessionLaneChanged` was tried and withdrawn, because it put an
+equality branch in shared dispatch that every future event would grow while leaving the
+other events stalling anyway. Centralised in one wrapper rather than a hop at each call
+site, because it remains a CALLER-side workaround: the cause-level remedy is non-blocking
+resolution, or a cached fingerprint, in the owning module — and when that lands there is one
+seam to delete instead of a hop per caller. Synchronous callers outside this module still
+resolve inline and still stall.
+
 ### User kiro-cli Hooks (`agent.kiro_hooks` in `config.json`)
 
 User-defined kiro-cli hooks that persist across `kirocrew update`. Follows the
@@ -4442,7 +5028,81 @@ User-defined kiro-cli hooks that persist across `kirocrew update`. Follows the
 {"agent": {"kiro_hooks": {"preToolUse": [{"matcher": "*", "command": "/path/to/hook.sh"}]}}}
 ```
 
-Merge rules (implemented in `_merge_kiro_hooks()` in `agent.py`):
+**Two accepted shapes.** The object above, and the array of hook documents a
+kiro-agent profile carries:
+
+```json
+{"agent": {"kiro_hooks": [
+  {"name": "guard", "trigger": "PreToolUse", "matcher": "*",
+   "action": {"type": "command", "command": "/path/to/hook.sh"}}
+]}}
+```
+
+Each shape has exactly one reader. `normalize_spec_hooks()` in `agent_materialization/kiro_hooks.py` reads
+the array and returns the internal list of hook documents, and
+`hook_documents_to_object_form()` derives the object form handed to kiro-cli. The
+object form is read only by `_merge_kiro_hooks()`, which owns its validation and
+its audit, so its serialized bytes and its error path are unchanged by the array
+form's arrival — re-deriving it from documents would move both. Anything that is
+not an array, an object included, is warned about and SEL-audited by
+`normalize_spec_hooks()`, and the one caller sends an object straight to the
+merge instead of here. So a value that is neither shape is audited rather than
+dropped in silence. The standalone hook-file wrapper
+`{"version": "v1", "hooks": [...]}` is a file format, not a spec value: it is an
+object, so the merge sees `version`/`hooks` as unknown event keys and rejects it.
+
+Array-form rules (implemented in `normalize_spec_hooks()`):
+- `trigger` accepts the whole alias table from the trigger alias table in `kiro-team/kiro-agent` (blob `2d4a3127e32e5e81e68d5c2ea406a6a5728f6d78`, `trigger-names.ts` under its hooks package) — twelve canonical triggers with their PascalCase identity rows, the IDE's
+  legacy camelCase spellings, the CLI aliases and one Open Plugins legacy alias —
+  keyed case-insensitively, which is one deliberate leniency over kiro-agent's
+  own case-sensitive lookup. That blob is the version to re-read when adding a
+  name
+- `action` is `{"type": "command", "command": ...}` or
+  `{"type": "agent", "prompt": ...}`; the type must be a string and the payload a
+  non-empty string within `_MAX_HOOK_PAYLOAD_LEN`
+- `name` and `description` are bounded by `_MAX_HOOK_NAME_LEN` and
+  `_MAX_HOOK_DESCRIPTION_LEN`, `timeout` must be a positive integer, `enabled` and
+  `confirm` must be booleans, and `matcher` follows the object form's rules
+- at most `_MAX_SPEC_HOOK_DOCUMENTS` documents are read from one field
+- a rejected document is warned about and SEL-audited; the documents beside it
+  still load
+- documents are then projected onto the object form and merged by
+  `_merge_kiro_hooks()`, so both shapes meet the same command, matcher, dedup and
+  cap rules
+
+Left out of the kiro-cli emission, kept in the stored spec — and left out for
+that TRIGGER only, since autoimport still discovers a script in the hooks
+directory on its own unless a suppressed document names it: an `action` of type
+`agent`, the seven triggers kiro-cli has no event name for (`SessionEnd`, `PreTaskExec`,
+`PostTaskExec`, `PostFileCreate`, `PostFileSave`, `PostFileDelete`, `Manual`), and
+the per-hook `name`, `description` and `timeout`. `enabled: false` and
+`confirm: true` are NOT in that class: each grants less execution than the object
+form can express, so either one keeps the hook out of the kiro-cli spec entirely,
+with a log line and a SEL audit naming which. `hook_documents_suppressed_commands()`
+maps the resolved command of every entry carrying those two fields to the CAUSE the
+audit line reports — read from the RAW array, before validation, so a document that
+says `enabled: false` and is then rejected for an unrelated field still keeps its
+script out of the scan. One filter serves both causes, so the cause travels with the
+command rather than being assumed: a confirmation-gated hook is not recorded as one
+the author disabled, and `enabled: false` outranks `confirm: true` on one document
+and across two naming the same command. Bypassing the validator means carrying its
+bounds: the same `_MAX_SPEC_HOOK_DOCUMENTS` slice, so a document the log calls
+ignored cannot still delete a script, and `_MAX_HOOK_PAYLOAD_LEN` on the retained
+command. On Windows, a UNC or device-shaped command outside the shares
+`unc_probe_allowed()` admits is refused before THIS resolution, because
+`Path.resolve()` on one is an outbound SMB authentication; the shape is judged on the
+authored string and on its user-expanded form. `_validate_hook_command()` does not
+ask: the object form has always resolved its command there and autoimport hands it a
+path already resolved, so a refusal there would prevent no probe while un-installing
+every hook on a host whose hooks directory lives on a share. Each script left out of
+the scan is SEL-audited, because an off-document that validation rejected never
+reaches the emission path's own audit — and
+`_apply_user_kiro_hooks()` subtracts them from what autoimport discovered before
+the single merge pass — otherwise a document naming a script under
+`~/.kiro/hooks` is dropped here and rediscovered there, landing on autoimport's
+default event rather than the one the document named.
+
+Merge rules (implemented in `_merge_kiro_hooks()` in `agent_materialization/kiro_hooks.py`):
 - Bundled hooks from `config/defaults.json` are always present and always first
 - User hooks are appended per event type after bundled hooks
 - Deduped by `(command, matcher)` tuple — same hook won't fire twice
@@ -4559,22 +5219,28 @@ their reported benchmark gains are not Kiro Crew measurements.
 ## Context Builder (`context.py`)
 
 Assembles all sources into prompts:
-- New session: `_CRITICAL_RULES` (runtime-conditional diff blocks + OPTIONS buttons) + agent prompt + static preference/project anchors + memory tool guidance + skills + scoped lessons + conversation history (last 20 messages, thread history at TOP with explicit framing)
-- Every message: channel history, hook transforms, triggered skills, context rules, OPTIONS hint (interactive sessions only). Memory search is an explicit MCP operation; building a message never generates a query embedding.
+- New session: `_CRITICAL_RULES` (runtime-conditional diff blocks + OPTIONS buttons) + agent prompt + static preference/project anchors + activity index + budgeted `[Memory activity]` block (projects, daily history (14 full days, then decayed summaries and counts to day 180), task facts, relevant episodes; `memory.inject_activity`, default on) + memory tool guidance + skills + scoped lessons + conversation history (last 20 messages, thread history at TOP with explicit framing)
+- Every message: channel history, hook transforms, triggered skills, context rules, OPTIONS hint (interactive sessions only). Memory search is an explicit MCP operation; a fresh first turn with `memory.inject_activity` on embeds the request once to rank the activity block's facts and episodes (two embed calls on the same text, one shared inference), and a warm follow-up generates no query embedding.
 - Runtime identity is turn-aware rather than key-only. Channel and dashboard dispatchers pass trusted `runtime_source` metadata to `build_message()`. New sessions use it for `[RUNTIME]`; follow-up turns refresh `[RUNTIME]` outside the one-time session context. This is required because a stable `dashboard:*` session can be resumed from Discord and `messaging.dm_scope="unified"` intentionally removes the originating channel from the session key. When trusted metadata is absent, namespaced keys (`discord:*`, `telegram:*`, `wecom:*`, `weixin:*`, `webex:*`, `teams:*`, `slack:*`) are recognized directly; bare unknown keys keep the legacy Slack fallback.
 - Thread history is injected only at session start (via `build_session_context`). Within the same ACP session, kiro-cli manages conversation history natively — duplicate injection wastes context window and accelerates compaction.
 - `_CRITICAL_RULES` injected by DEFAULT for every agent (built-in `kirocrew` and custom alike) — it is the dashboard/Slack assistant's own output contract (runtime-conditional diff blocks — tool-made edits render as structured diff cards on the dashboard, so ```diff blocks are required only for non-tool edits or non-dashboard runtimes — `[OPTIONS:]` footer, absolute-path rule with a URL exclusion — a backticked URL renders as a click-to-copy chip rather than a link, so URLs must use markdown link syntax instead), so diff rendering and OPTIONS buttons work universally. A **custom** agent can OPT OUT by setting `includeCrewContext: false` in its materialized `~/.kiro/agents/<...>.json`: a custom app agent ships its own system prompt and output contract, so injecting this on top both conflicts with it and, on a safety-tuned model, reads as an identity override the model refuses as prompt injection. The flag is read through the same sensitive-path-gated scan as the agent prompt (matched by declared `name` or filename stem) and memoized by agent name; an absent/non-boolean flag, an unreadable/missing spec, and the built-in `kirocrew` agent all default to injecting (only an explicit boolean `false` on a custom agent suppresses it). The same opt-out also suppresses the dashboard tool nudges (`ask_question` / `suggest_followup`) that `build_message` adds on dashboard sessions, but NOT the provider-agnostic `[OPTIONS:]` reminder. The `[OPTIONS:]`/diff tags still RENDER for any agent that emits them (the dashboard parses them regardless); the gate only stops the host from MANDATING them where an agent has declared it does not want them.
 - Switchable context groups (see below) let a spawning parent drop whole sections for one sub-agent.
-- Cap: `_CONTEXT_BUDGET_BASE` is a fixed 33,000-character Crew background admission allowance, reused from the former smallest-window tier. Model window size and `skills.lazy_load` cannot enlarge it. Admission reserves complete explicit preferences, rules, pinned instructions, date/runtime identity and steering, then admits optional source blocks whole. A separate model-safe ceiling bounds the protected lesson contribution at `max(3 * _CONTEXT_BUDGET_BASE, floor(model_window_tokens * 4.0 * 0.125))` characters for the complete protected set. Below it, protected bytes are unchanged. Above it, complete lessons are omitted in relevance order for vectors or newest-first for JSONL; preferences and safety rules remain whole, the prompt reports the omitted count, and a warning is emitted. Preferences are never trimmed to make room for anything else, but they cannot cross the ceiling themselves: an agent-grown preferences file larger than the ceiling is kept from its head, and the prompt carries a `[Context budget: omitted N chars of preferences ...]` notice naming the file to read, so the overflow is visible in-prompt rather than only in a log line. The 33,000-character allowance remains independent and is not falsely reported as a full-input ceiling. Agent contract, outer replay, following-interaction blocks and the current request are measured separately. The request is never budget-truncated.
+- Cap: `_CONTEXT_BUDGET_BASE` is a fixed 33,000-character Crew background admission allowance, reused from the former smallest-window tier. Model window size and `skills.lazy_load` cannot enlarge it. Admission reserves complete explicit preferences, rules, pinned instructions, date/runtime identity and steering, then admits optional source blocks whole. A separate model-safe ceiling bounds the protected lesson contribution at `max(3 * _CONTEXT_BUDGET_BASE, floor(model_window_tokens * 4.0 * 0.125))` characters for the complete protected set. Below it, protected bytes are unchanged. Above it, admission falls back to the ordinary lessons budget (`caps.lessons`, still bounded by the ceiling) and complete lessons are omitted in relevance order for vectors or newest-first for JSONL; preferences and safety rules remain whole, the prompt reports the omitted count, and a warning is emitted. Preferences are never trimmed to make room for anything else, but they cannot cross the ceiling themselves: an agent-grown preferences file larger than the ceiling is kept from its head, and the prompt carries a `[Context budget: omitted N chars of preferences ...]` notice naming the file to read, so the overflow is visible in-prompt rather than only in a log line. The 33,000-character allowance remains independent and is not falsely reported as a full-input ceiling. Agent contract, outer replay, following-interaction blocks and the current request are measured separately. The request is never budget-truncated.
 
 Startup V1 context retains complete preference documents and eligible `pref.*`
 records. A required activity index (at most 1,800 characters) lists project
 headings/first entries and the last three days' headings or first lines. Each
 source has a share, so project overflow cannot hide recent task names. The
 existing bounded `Recent Session Context` source snippets remain injected:
-those snippets need not exist in vector memory. Index and recalled content are
-reference data, not instructions. Larger notebook bodies and non-preference
-facts/episodes require explicit `memory_recall`.
+those snippets need not exist in vector memory. With `memory.inject_activity`
+on (the default) the notebook bodies, daily history (14 full days, then decayed
+summaries and counts to day 180), task facts and episodes relevant to the
+request follow as one budgeted `[Memory activity]`
+background block (`get_activity_context`) that the admission loop admits or
+drops whole. Index, block and recalled content are reference data, not
+instructions. With the switch off, and for anything the block omits or the
+budget drops, larger notebook bodies and non-preference facts/episodes require
+explicit `memory_recall`.
 
 Recall uses the authenticated session's bound store and workspace, never a
 request-supplied path or another active slot. The V1 notebook query reuses
@@ -4604,7 +5270,7 @@ the model will call the tool. Notebook/history writes maintain the index;
 out-of-band edits still need the existing rebuild. No store binding, privacy
 mode, or private essential-delivery gate changes.
 
-Startup lessons retain every eligible, in-scope rule completely while protected context is below the model-safe ceiling, without a background embedding call. Neither vector `source=consolidation`/`promotion` nor the tool/knowledge category proves optionality: consolidation extracts explicit always/never user corrections through the same path. JSONL likewise has no reliable explicit/inferred provenance. When the ceiling forces omission, only complete lesson entries are removed and the prompt directs explicit recovery through `memory_recall`; wording, lexical mismatch and PR numbers never justify dropping a rule below that ceiling.
+Startup lessons retain every eligible, in-scope rule completely while protected context is below the model-safe ceiling, without a background embedding call. Neither vector `source=consolidation`/`promotion` nor the tool/knowledge category proves optionality: consolidation extracts explicit always/never user corrections through the same path. JSONL likewise has no reliable explicit/inferred provenance. When the ceiling forces omission, only complete lesson entries are removed and the prompt directs explicit recovery through `memory_recall`; wording, lexical mismatch and PR numbers never justify dropping a rule below that ceiling. Above the ceiling, where the retain-everything invariant cannot be met because the full set already exceeds it, admission falls back to the ordinary lessons budget (`caps.lessons`, still bounded by the ceiling) rather than filling to the ceiling with ranked rules; the surviving subset is the one relevant to the request and the omission notice still directs the model to `memory_recall`. This overflow choice is not a statement about what to keep below the ceiling, where the block stays complete.
 
 Explicit recall deduplicates only identical selected evidence with the same stable record ID, independently within facts and episodes. Different IDs, revisions or provenance remain separate. The projection does not mutate input or storage.
 
@@ -4665,7 +5331,7 @@ A spawning parent decides which of three groups its sub-agent inherits, via `inc
 | Group | Sections | Switchable |
 |---|---|---|
 | conduct | `_CRITICAL_RULES`, date, agent/runtime, UI language, workspace identity, bounded skill discovery | no |
-| `memory` | complete preferences, activity index, memory tool guidance, `Recent Session Context` source snippets; V2 essential anchors | yes |
+| `memory` | complete preferences, activity index, budgeted `[Memory activity]` block (projects, daily history (14 full days, then decayed summaries and counts to day 180), task facts, relevant episodes; `memory.inject_activity`), memory tool guidance, `Recent Session Context` source snippets; V2 essential anchors | yes |
 | `lessons` | `[Learned corrections]` (global + workspace), `[USER PROFILE]` | yes |
 | `project` | `[DOCUMENTATION]` pointer, steering resources (CC backend only), `[PROJECT]` directory line | yes |
 

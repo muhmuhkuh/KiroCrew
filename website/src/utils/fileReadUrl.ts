@@ -1,9 +1,10 @@
 import { i18nT } from '../i18n/t'
+import { downloadBlob } from './download'
 
 /** Append resolve=1 for relative paths. The backend resolves such paths
  * against KIROCREW_PROJECT_DIR; absolute and ~-paths pass through unchanged. */
 function withResolve(url: string, filePath: string): string {
-  return isAbsolute(filePath) ? url : url + '&resolve=1'
+  return isAbsolutePath(filePath) ? url : url + '&resolve=1'
 }
 
 /** Is this path already absolute, i.e. NOT to be resolved against the project dir?
@@ -12,9 +13,29 @@ function withResolve(url: string, filePath: string): string {
  * (`C:\x`, `C:/x`) and a UNC path (`\\host\share\x`) are absolute, and marking
  * them `resolve=1` mislabels them. The backend currently passes drive and UNC
  * shapes through its resolver untouched, so the flag is inert today — but the
- * classification is what the caller is asserting, so it should be true. */
-function isAbsolute(filePath: string): boolean {
-  return /^([~/]|[A-Za-z]:[\\/]|\\\\)/.test(filePath)
+ * classification is what the caller is asserting, so it should be true.
+ *
+ * Exported because it is also a SECURITY predicate: `resolve=1` resolves a
+ * relative path against the gateway's CURRENT project directory at request
+ * time, not against whatever project the path was recorded under. A caller
+ * showing a stored path from another context (e.g. the session-doc preview)
+ * must refuse a relative path outright rather than send it with `resolve=1`,
+ * or a project switch turns the read into a same-named file in the newly
+ * active project — silent cross-project disclosure.
+ *
+ * Tilde forms are split, not blanket-accepted: `~` and `~/...` expand
+ * deterministically to the gateway user's OWN home (project-independent, so
+ * absolute in the sense this predicate asserts), but `~name/...` expands only
+ * if `name` is a real account — the backend's `expanduser` leaves an unknown
+ * `~name` UNCHANGED and its resolver then anchors it to the process CWD,
+ * which re-opens the exact cross-project disclosure above. `~name` (and the
+ * POSIX-ambiguous `~\`) are therefore classified NOT absolute: the preview
+ * refuses them, and resolve=1 callers get the backend's project-dir
+ * resolution, which is bounded (it errors on escape) rather than CWD-anchored.
+ * This mirrors the backend materialize allowlist, which trusts only paths
+ * that are absolute AFTER expansion. */
+export function isAbsolutePath(filePath: string): boolean {
+  return /^(?:\/|~(?:$|\/)|[A-Za-z]:[\\/]|\\\\)/.test(filePath)
 }
 
 /** Build the /api/file-read URL, appending resolve=1 for relative paths. */
@@ -70,19 +91,19 @@ export async function downloadFileToDisk(
       return
     }
     const blob = await res.blob()
-    const a = document.createElement('a')
-    const url = URL.createObjectURL(blob)
-    a.href = url
-    a.download = filePath.split('/').pop() || 'download'
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    setTimeout(() => URL.revokeObjectURL(url), 2_000)
+    downloadBlob(blob, downloadFileName(filePath))
   } catch (err) {
     // eslint-disable-next-line no-console -- surface download failures for diagnostics
     console.error('downloadFileToDisk failed', err)
     onError(i18nT('components.markdownPanel.download_failed'))
   }
+}
+
+/** The name a download of `filePath` lands under: its last segment. Shared by
+ *  the fetch above and by the side panel's last-copy download, which hands the
+ *  buffer of a file no longer on disk to `downloadBlob` under the same name. */
+export function downloadFileName(filePath: string): string {
+  return filePath.split('/').pop() || 'download'
 }
 
 /** Build the /api/file-stream URL — Range-capable audio/video serving.
@@ -110,4 +131,29 @@ export function fileStreamUrl(filePath: string): string {
 export function fileOfficePreviewUrl(filePath: string, format?: 'blocks'): string {
   const url = fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-preview')
   return format ? url + '&format=' + format : url
+}
+
+/** Build the /api/file-office-slides URL — the rendered-slides manifest for a
+ * .pptx / .ppt (LibreOffice → PDF → PNG on the gateway host, cached by content).
+ *
+ * Same query shape as the other file endpoints, so it is derived from
+ * fileDownloadUrl like fileOfficePreviewUrl above. The response is either
+ * `{status: 'ready', count, slides}` or `{status: 'unavailable', hint}` when the
+ * host has no LibreOffice; see `api_file_office_slides` in
+ * `src/kiro_crew/dashboard/handlers/office_slides.py`. */
+export function fileOfficeSlidesUrl(filePath: string): string {
+  return fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-slides')
+}
+
+/** Build the /api/file-office-slide URL — one rendered slide (PNG), 1-based.
+ *
+ * `n` and the deck's content `digest` (from the manifest) are appended AFTER
+ * the encoded path (and after `resolve=1` for a relative path), so the path
+ * value is never split by the extra parameters. The digest is what makes the
+ * URL safe to cache: an edited deck has a new digest, hence a new URL, so the
+ * browser can never answer a stale slide for the new file — and the server
+ * refuses a digest that no longer matches the file (409). */
+export function fileOfficeSlideUrl(filePath: string, n: number, digest?: string): string {
+  const base = fileDownloadUrl(filePath).replace('/api/file-download', '/api/file-office-slide') + '&n=' + String(n)
+  return digest ? base + '&digest=' + encodeURIComponent(digest) : base
 }

@@ -1,11 +1,12 @@
 import { useState, useEffect, useRef, memo, type ReactNode } from 'react'
-import { CheckCircle, Handshake, Ban, Wrench, AlertTriangle } from 'lucide-react'
+import { CheckCircle, ChevronRight, Handshake, Ban, Wrench, AlertTriangle } from 'lucide-react'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import { purposeFromToolArgs } from '../../utils/toolPurpose'
 import { deriveToolCallTitle } from '../../utils/toolCallTitle'
 import { ToolInputText } from '../../components/ToolInputText'
 import ErrorNotice from '../../components/ErrorNotice'
 import { ApiError } from '../../api/client'
+import { isTerminalApprovalRefusal } from '../../api/apiError'
 import { useRowDisclosure } from './rowDisclosure'
 
 import { i18nT } from '../../i18n/t'
@@ -191,10 +192,8 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
         setLocalResolved(null)
         setSubmitting(false)
         const refusal = err instanceof ApiError ? err : null
-        const gone = !!refusal && !refusal.authRequired
-          && (refusal.status === 404 || (refusal.status === 400 && refusal.message === 'no pending approval'))
         setFailure({
-          terminal: gone,
+          terminal: isTerminalApprovalRefusal(err),
           message: refusal?.message ?? '',
           attempted: decision,
         })
@@ -218,22 +217,25 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
   return (
     <div className="my-1">
       <button
-        className={`flex items-center gap-2 px-4 py-2 rounded-md text-[13px] leading-5 font-mono text-muted bg-card ring-1 ring-inset forced-colors:border cursor-pointer transition-all w-full text-left ${needsAttention ? 'ring-amber-400 hover:ring-amber-300' : localResolved ? 'ring-ok/60 hover:ring-ok/80' : 'ring-border hover:ring-border-strong'} hover:text-text`}
+        className={`flex items-center gap-2 px-4 py-2 rounded-md text-[13px] leading-5 font-mono text-muted bg-card ring-1 ring-inset forced-colors:border cursor-pointer transition-all w-full text-left ${needsAttention ? 'ring-warn hover:ring-warn/80' : localResolved ? 'ring-ok/60 hover:ring-ok/80' : 'ring-border hover:ring-border-strong'} hover:text-text`}
         onClick={() => { userToggled.current = true; setExpanded(e => !e) }}
         aria-expanded={expanded}
         aria-label={`${expanded ? i18nT('pages.chat.collapsibleToolGroup.collapse') : i18nT('pages.chat.collapsibleToolGroup.expand')} ${labelText}`}
       >
         {needsAttention ? (
           <span className="relative w-2.5 h-2.5 flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.approval_needed')}>
-            <span className="absolute inset-0 rounded-full bg-amber-400 animate-ping opacity-60" />
-            <span className="relative block w-2.5 h-2.5 rounded-full bg-amber-400" />
+            <span className="absolute inset-0 rounded-full bg-warn animate-ping opacity-60" />
+            <span className="relative block w-2.5 h-2.5 rounded-full bg-warn" />
           </span>
         ) : localResolved ? (
           <span className="w-2.5 h-2.5 rounded-full bg-ok flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.resolved')} />
         ) : isRunning ? (
-          <span className="w-2.5 h-2.5 rounded-full bg-green-400 animate-pulse flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.running')} />
+          <span className="w-2.5 h-2.5 rounded-full bg-ok animate-pulse flex-shrink-0" aria-label={i18nT('pages.chat.collapsibleToolGroup.running')} />
         ) : (
-          <span className={`transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`}>▶</span>
+          // Lucide, never a text glyph: AUTOSDE use-lucide-icons / no-emoji-as-icons
+          // are blocking on src/**/*.tsx, and the label carries the name, so the
+          // indicator is decorative.
+          <ChevronRight size={14} aria-hidden="true" className={`flex-shrink-0 transition-transform duration-150 ${expanded ? 'rotate-90' : ''}`} />
         )}
         <span>{labelNode}</span>
       </button>

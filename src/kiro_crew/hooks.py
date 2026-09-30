@@ -23,6 +23,7 @@ import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from dataclasses import replace as dataclasses_replace
 from pathlib import Path
@@ -104,6 +105,9 @@ HOOK_EVENT_PRE_TOOL_USE = "PreToolUse"
 HOOK_EVENT_POST_TOOL_USE = "PostToolUse"
 HOOK_EVENT_STOP = "Stop"
 
+#: The events the gateway itself fires. ``ScriptHookStore.fire`` has a call site
+#: for each one, and ``steering-and-hooks.md`` documents their exit-code
+#: contract. Membership here is what makes an event a *lifecycle* event.
 HOOK_EVENTS = (
     HOOK_EVENT_AGENT_SPAWN,
     HOOK_EVENT_USER_PROMPT_SUBMIT,
@@ -111,6 +115,73 @@ HOOK_EVENTS = (
     HOOK_EVENT_POST_TOOL_USE,
     HOOK_EVENT_STOP,
 )
+
+# Triggers a Kiro Agent session owns that the gateway has no lifecycle call site
+# for. They are authorable and persisted, and NO EVENT FIRES ANY OF THEM: no call
+# site fires one and no other reader consumes this tuple. That is why they are a
+# separate tuple rather than new members of ``HOOK_EVENTS`` -- an event in that
+# tuple carries a promise that something calls ``fire`` for it, and these carry
+# none.
+#
+# "No event fires them" is not "the command cannot run": the dashboard's Test
+# endpoint runs a STORED hook's command on demand and never consults this tuple
+# (``handlers/hooks.py`` ``api_hook_test`` -> ``run_script_hook``), so Test works on
+# one of these exactly as it does on a fired event.
+#
+# They are not equidistant from running, and a reader planning the delivery side
+# needs the difference. A Kiro Agent requests hooks by trigger name over ACP from
+# a fixed set of seven (``acp/kas_wire.py``'s ``ACP_HOOK_TRIGGERS``), and only
+# ``preTaskExecution`` and ``postTaskExecution`` are in it; the file and manual
+# triggers are absent, so a Kiro Agent does not ask for those four at all today.
+#
+# Where the six names come from, since no call site here fires them: each is the
+# PascalCase rendering of a trigger name Kiro's own hook schema carries, so the
+# delivery round maps a documented name rather than inventing one. Kiro documents
+# both spellings of each -- the ``when.type`` name a legacy hook file uses, which
+# is also the ACP spelling for the two above, and the standalone v1 hook-file
+# trigger -- at kiro.dev/docs/ide/whats-new-v1/hooks:
+#
+#   preTaskExecution  -> PreTaskExec        postTaskExecution -> PostTaskExec
+#   fileCreated       -> PostFileCreate     fileEdited        -> PostFileSave
+#   fileDeleted       -> PostFileDelete     userTriggered     -> (none)
+#
+# Two consequences for the delivery round. It has two vocabularies to map, not
+# one, and the names here match the left column. And the manual trigger is the
+# furthest from arriving of the six: it has no v1 equivalent at all, so an
+# existing manual hook stays runnable as a legacy one while a new one cannot be
+# authored in that schema -- the Test button is its whole run path here.
+HOOK_EVENT_PRE_TASK_EXECUTION = "PreTaskExecution"
+HOOK_EVENT_POST_TASK_EXECUTION = "PostTaskExecution"
+HOOK_EVENT_FILE_CREATED = "FileCreated"
+HOOK_EVENT_FILE_EDITED = "FileEdited"
+HOOK_EVENT_FILE_DELETED = "FileDeleted"
+HOOK_EVENT_USER_TRIGGERED = "UserTriggered"
+
+HOOK_EVENTS_KAS_ONLY = (
+    HOOK_EVENT_PRE_TASK_EXECUTION,
+    HOOK_EVENT_POST_TASK_EXECUTION,
+    HOOK_EVENT_FILE_CREATED,
+    HOOK_EVENT_FILE_EDITED,
+    HOOK_EVENT_FILE_DELETED,
+    HOOK_EVENT_USER_TRIGGERED,
+)
+
+#: The subset a Kiro Agent session actually asks its client for. It requests
+#: hooks by trigger name from a fixed set of seven, and only these two of the six
+#: are in it -- so these wait on Kiro Crew answering that request, while the file
+#: and manual triggers are not asked for at all. The dashboard marks the two
+#: groups differently because the distance to running is different, and it reads
+#: the split from here rather than restating it in copy.
+HOOK_EVENTS_AGENT_REQUESTED = (
+    HOOK_EVENT_PRE_TASK_EXECUTION,
+    HOOK_EVENT_POST_TASK_EXECUTION,
+)
+
+#: Every event a hook may be authored against and persisted under. This is the
+#: authoring vocabulary -- the dashboard form's options, the create/update
+#: schemas, and the store's own load and save gates all read this set, so an
+#: event absent from it is refused at authoring time and dropped on reload.
+HOOK_EVENTS_ALL = HOOK_EVENTS + HOOK_EVENTS_KAS_ONLY
 
 
 @dataclass
@@ -135,6 +206,29 @@ class HookResult:
     @staticmethod
     def inject_context(text: str) -> HookResult:
         return HookResult(action=HOOK_INJECT_CONTEXT, text=text)
+
+
+#: Set by :func:`uncounted_gate`; read by ``ToolHookResult._count`` and
+#: ``_audit_governance``.
+_GATE_UNCOUNTED: ContextVar[bool] = ContextVar("kirocrew_gate_uncounted", default=False)
+
+
+@contextmanager
+def uncounted_gate():
+    """Consult the gate without emitting the approval-decision counter.
+
+    For a second consultation of a request whose first one was already counted
+    (the ACP transport's permission floor). The verdict is unaffected. The
+    governance tier writes no ``governance_decision`` audit row either: this
+    consultation carries no caller identity and its caller discards a policy
+    deny, so a row here would record a denial for a call that ran. The
+    consumer's own identity-bearing consultation writes that row.
+    """
+    token = _GATE_UNCOUNTED.set(True)
+    try:
+        yield
+    finally:
+        _GATE_UNCOUNTED.reset(token)
 
 
 @dataclass
@@ -200,7 +294,13 @@ class ToolHookResult:
         ``action`` is one of three module constants and ``security_deny`` a bool,
         so the series is bounded by construction -- no reason string, tool name or
         command reaches the recorder.
+
+        A consultation made inside :func:`uncounted_gate` is not counted: the
+        transport floor re-asks the gate for a request its consumer already
+        counted, and counting both would report one request as two decisions.
         """
+        if _GATE_UNCOUNTED.get():
+            return
         try:
             from kiro_crew.metrics.events import APPROVAL_DECISIONS, emit_counter
 
@@ -571,6 +671,7 @@ def hook_gate_kwargs(event: object, **overrides: Any) -> dict[str, Any]:
         "mcp_server_name": getattr(event, "mcp_server_name", "") or "",
         "mcp_tool_name": getattr(event, "tool_name", "") or "",
         "mcp_identity_trusted": bool(getattr(event, "mcp_identity_trusted", False)),
+        "spawn_target": getattr(event, "spawn_target", "") or "",
     }
     unknown = set(overrides) - set(kwargs)
     if unknown:
@@ -723,6 +824,7 @@ class HookManager:
         mcp_server_name: str = "",
         mcp_tool_name: str = "",
         mcp_identity_trusted: bool = False,
+        spawn_target: str = "",
         resolved_agent: str = "",
         classifier_only: bool = False,
     ) -> ToolHookResult:
@@ -905,7 +1007,16 @@ class HookManager:
         # while a bash command ("cat ~/.aws/credentials") resolves to a
         # non-sensitive path and is NOT matched on its text -- the OS sandbox is
         # what keeps the credential stores and the governance keystone out of the
-        # shell's reach. is_sensitive_bash_command carries the size ceiling, the
+        # shell's reach. A shell tool's recovered COMMAND is therefore not handed
+        # to the path tier: resolving ``cd /x && grep ...`` as a filename never
+        # matched, but it spent a resolver round-trip per call and, under a
+        # resolver stall, refused the command as ``access to sensitive path: cd
+        # /x && grep ...`` -- a refusal naming something that is not a path as a
+        # credential. ``is_shell`` and ``command`` are the client's own
+        # classification and recovery of the tool frame, the same provenance the
+        # shell gates below trust; a shell tool whose command is a bare path is
+        # left to the sandbox, as every command is.
+        # is_sensitive_bash_command carries the size ceiling, the
         # IMDS detector and the environment-credential detector.
         # The always-on gates below are keyed by rule id, so resolve the effective
         # regex set to ids ONCE here and thread it in. ``None`` means all enabled,
@@ -923,11 +1034,23 @@ class HookManager:
         # the encoded form — honouring a pin late is not honouring it.
         ctx = current_context()
         enabled_ids = security.enabled_rule_ids(self._effective_denied(ctx))
+        # The exemption is for the recovered COMMAND of a SANDBOXED shell only.
+        # kiro-cli can classify an execute-kind frame as shell while also
+        # naming an MCP server (``classify_tool_call``: the identity is carried,
+        # the shell verdict stands), and an MCP-served tool runs outside the
+        # agent sandbox that this exemption leans on -- so its targets stay
+        # path-gated. Likewise a shell-kind tool with structured parameters
+        # (``use_aws``) may carry a discrete credential path as an argument, and
+        # in ``standard`` sandbox mode ``~/.aws`` is visible to the shell: the
+        # raw_params tier below is the control there, so only the command text
+        # itself (the normalized title when it IS the command, and ``command``)
+        # is spared the resolver.
+        exempt_command = command if (is_shell and command and not mcp_server_name) else None
         for target in security_targets:
             # Reason-or-None, like the two tiers below: a stall is refused with its
             # own wording (unverifiable, not a match) instead of being reported as
             # a credential hit on whatever the target happened to be.
-            reason = sensitive_path_refusal(target)
+            reason = sensitive_path_refusal(target) if target != exempt_command else None
             if reason:
                 return ToolHookResult.deny(reason)
             # execute_bash (prefixed or bare) — IMDS reach, env-credential leaks,
@@ -1221,6 +1344,7 @@ class HookManager:
             diff_path=diff_path,
             mcp_ref=governance_mcp_ref,
             extra_titles=(mcp_tool_name,) if mcp_tool_name and mcp_tool_name != tool_name else (),
+            spawn_target=spawn_target,
         )
         if gov_reason:
             return ToolHookResult.deny_policy(gov_reason)
@@ -1754,8 +1878,17 @@ def _governance_denial(
     diff_path: str = "",
     mcp_ref: str = "",
     extra_titles: tuple[str, ...] = (),
+    spawn_target: str = "",
 ) -> str | None:
     """Return a denial reason if governance forbids *tool_name*, else None.
+
+    *spawn_target* is the agent a backend-stated sub-agent spawn will start (set
+    only from KAS's own ``_meta.kiro.consent``; see ``AcpEvent.spawn_target``).
+    When set, ``capabilities.spawn`` is judged too -- the gate on, and the target
+    in its ``agents`` scope -- on the SAME ceiling and profile this call resolved,
+    so a spawn costs no second profile resolution and cannot be judged against a
+    different profile snapshot. A spawn policy is not a ``tools`` rule, so the
+    title question alone cannot answer it.
 
     *mcp_ref* is an already-canonical ``@server`` / ``@server/tool`` reference
     for the trusted MCP identity, evaluated in addition to (or instead of) the
@@ -1807,6 +1940,8 @@ def _governance_denial(
             subject = getattr(decision, "item", "") or tool_name or mcp_ref
             _audit_governance(session_key, agent, subject, decision)
             return f"Blocked by governance policy: {decision.reason}"
+        if spawn_target:
+            return _spawn_policy_denial(ceiling, profile, spawn_target, session_key, agent)
         return None
     except PlatformCompositionError:
         raise
@@ -1822,6 +1957,37 @@ def _governance_denial(
         except Exception:
             logger.debug("governance degrade audit unavailable", exc_info=True)
         return None
+
+
+def _spawn_policy_denial(
+    ceiling: Any, profile: Any, target: str, session_key: str, agent: str
+) -> str | None:
+    """The ``capabilities.spawn`` verdict for a spawn of *target*, or None.
+
+    The two questions ``subagent._vet_spawn_governance`` asks -- is spawning on,
+    and is *target* in the ``agents`` scope -- put to a ceiling and profile the
+    caller already resolved. Fails CLOSED, unlike the ``tools`` question around
+    it: this is an authorization for a spawn, and an evaluation error that
+    permitted it would be the bypass the check exists to stop.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError
+    from kiro_crew.platform.governance import resolve
+
+    try:
+        gate = resolve(ceiling, profile, "capabilities.spawn", "")
+        if not gate.permitted:
+            _audit_governance(session_key, agent, target, gate)
+            return f"Blocked by spawn policy: {gate.reason}"
+        scoped = resolve(ceiling, profile, "capabilities.spawn", f"agents:{target}")
+        if not scoped.permitted:
+            _audit_governance(session_key, agent, target, scoped)
+            return f"Blocked by spawn policy: agent {target!r} is not permitted"
+        return None
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        logger.warning("spawn policy could not be evaluated; refusing the spawn", exc_info=True)
+        return "Blocked by spawn policy: it could not be evaluated"
 
 
 def _app_owns_mcp_server(mcp_server_name: str, app: str) -> bool:
@@ -2024,6 +2190,8 @@ def _cu_read_only_auto_approve(tool_name: str) -> bool:
 
 def _audit_governance(session_key: str, agent: str, tool_name: str, decision: object) -> None:
     """Best-effort SEL audit of a governance denial (records scope/rule/layer)."""
+    if _GATE_UNCOUNTED.get():
+        return
     try:
         from kiro_crew.sel import sel
 
@@ -2462,6 +2630,64 @@ def is_unc_shape(raw: str) -> bool:
     return len(raw) >= 2 and raw[0] in "\\/" and raw[1] in "\\/"
 
 
+_unc_data_home_root_cache: tuple[tuple[object, ...], Path | None] | None = None
+
+
+def _unc_data_home_root() -> Path | None:
+    """The data home as a UNC-gate trusted root, memoized per configuration.
+
+    The twin of :func:`_unc_agents_root`, and it exists for the same reason.
+    ``data_home()`` is cheap only on its *default-home* branch: with
+    ``KIROCREW_HOME`` set it calls ``_valid_override_home()`` FIRST, on every
+    call, and that does ``Path(override).expanduser().resolve()`` --
+    filesystem I/O, and on a UNC-shaped override an SMB touch. ``config_dir()``
+    memoizes, but that memo sits BEHIND the predicate, so it never covers this.
+    Measured at this PR's head: three ``protected_ref_spans()`` calls produced
+    three resolves of the override.
+
+    That is the one configuration this gate has to be fast in. A roaming
+    profile is exactly when ``KIROCREW_HOME`` points at a share, so the
+    per-call resolve lands on the host whose latency the gate promises never to
+    depend on -- and :func:`unc_probe_allowed` is reached from
+    ``iter_local_refs``, which ``telegram.renderer._rotate_on_length`` runs
+    INLINE on the event loop against a documented 7-15 us/KB budget.
+
+    Resolves through :func:`peek_data_home`, NOT :func:`data_home`: this module
+    primes the memo at import time, and ``data_home()`` on a first resolution
+    delegates to ``config_dir()`` -- ``mkdir`` plus the recovery-breadcrumb
+    write. The gate only needs to know WHERE the root is (a path-prefix trust
+    check), so importing this module must not create directories or write
+    breadcrumbs -- that maintenance belongs to ``ensure_data_home()`` at process
+    start. ``peek_data_home()`` applies the SAME override predicate, so reader
+    and writer agree on the root, and reads nothing else.
+
+    Memoized on the RAW ``KIROCREW_HOME`` value plus the accessor identity and
+    the resolved-home cache the default branch reads -- so an env change, a
+    monkeypatched accessor or a reset of the resolution cache all invalidate
+    naturally.
+
+    A computation failure memoizes ``None`` (root absent, gate stays total),
+    for the reason :func:`_unc_agents_root` gives: the failure being avoided is
+    a per-call resolve that can block on an SMB timeout, and the degraded state
+    -- UNC attachment paths refused -- is the safe one.
+    """
+    global _unc_data_home_root_cache
+    key: tuple[object, ...] = (
+        os.environ.get("KIROCREW_HOME"),
+        _config_paths.peek_data_home,
+        getattr(_config_paths, "_resolved_home", None),
+    )
+    cached = _unc_data_home_root_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    try:
+        root: Path | None = _config_paths.peek_data_home()
+    except (ValueError, OSError, RuntimeError):
+        root = None
+    _unc_data_home_root_cache = (key, root)
+    return root
+
+
 _unc_agents_root_cache: tuple[tuple[object, ...], Path | None] | None = None
 
 
@@ -2516,6 +2742,11 @@ def _unc_agents_root() -> Path | None:
 # start, off the loop, so the one resolution per configuration lands there.
 # Best-effort: a failure here memoizes root-absent exactly as a lazy miss would.
 _unc_agents_root()
+# Same priming for the data home, for the same reason: the first gate check
+# after start (or after a ``KIROCREW_HOME`` change) would otherwise pay the
+# override resolve on whatever thread asked, which on the inline classifier
+# path is the event loop.
+_unc_data_home_root()
 #: Upper bound on the Windows link chain validate_file_path will walk
 #: hop-by-hop before refusing. Covers both linked ancestors and the leaf.
 #: Mirrors the kernels' own symlink-resolution ceilings (Linux SYMLOOP_MAX
@@ -2573,18 +2804,25 @@ def unc_probe_allowed(raw: str) -> bool:
     write the managed specs there -- see ``kiro_agents_dir()``'s docstring;
     on a roaming profile it sits on the same UNC share as the data home, and
     without it every user-level agent spec read is silently refused).
-    The comparison is purely lexical (``normpath``/``normcase``) and the
-    agents root is memoized per configuration (see ``_unc_agents_root``), so
-    this check never touches the network itself.
+    The comparison is purely lexical (``normpath``/``normcase``) and BOTH
+    resolving roots are memoized per configuration (``_unc_data_home_root``,
+    ``_unc_agents_root``), so this check never touches the network itself.
+
+    The data home is memoized for the same reason as the agents dir, and the
+    omission was load-bearing rather than cosmetic: ``data_home()`` resolves
+    ``KIROCREW_HOME`` on every call when that override is set, which is
+    precisely the roaming-profile configuration in which the override names a
+    share. Calling it per gate check put an SMB round-trip inside a predicate
+    documented as lexical.
     """
     try:
         cand = os.path.normcase(os.path.normpath(raw))
     except (ValueError, OSError):
         return False
-    roots: tuple[Path, ...] = (_config_paths.data_home(), Path(tempfile.gettempdir()))
-    agents_root = _unc_agents_root()
-    if agents_root is not None:
-        roots += (agents_root,)
+    roots: tuple[Path, ...] = (Path(tempfile.gettempdir()),)
+    for extra in (_unc_data_home_root(), _unc_agents_root()):
+        if extra is not None:
+            roots += (extra,)
     for root in roots:
         rootn = os.path.normcase(os.path.normpath(str(root)))
         if not is_unc_shape(rootn):
@@ -3986,6 +4224,17 @@ _AUDIT_ONLY_READ_IDS: dict[str, str] = {
     # Audited on the observation a caller acts on rather than per poll -- the
     # reader holds a short cache -- for the same reason as the mint entry below.
     "kiro_prerequisite.identity_fingerprint": ".local/share/kiro-cli/data.sqlite3",
+    # Same store, read read-only by
+    # ``kiro_crew.apps.builtins.aws_control.backend.backup._export_cli_conversations``
+    # to copy ONLY the terminal conversation allowlist (its chat tables) into
+    # the off-host sessions archive. No token row is read and no credential value
+    # leaves the function -- the export writes a fresh database of the allowlisted
+    # tables alone -- but the file holds live bearer tokens whatever this reader
+    # touches, so opening it owes the same trail as every other reader here.
+    # Audited on every outcome (the store was opened) and fail-closed on success:
+    # a conversation export whose access cannot be recorded is dropped from the
+    # archive rather than shipped unaudited.
+    "aws_control.conversation_export": ".local/share/{kiro-cli,amazon-q}/data.sqlite3",
     # Class 2. kiro-cli's MCP OAuth artifact cache under ``~/.aws/sso/cache``.
     # ``kiro_crew.mcp_grant.grant_present`` STATS the paired
     # ``<sha256(mcp_url)>.token.json`` / ``.registration.json`` artifacts to learn
@@ -4134,15 +4383,19 @@ def validate_hook_fields(
 
     Raises ``ValueError`` (which the dashboard handler maps to HTTP 400) when:
 
-    * ``event`` is not one of ``HOOK_EVENTS``;
+    * ``event`` is not one of ``HOOK_EVENTS_ALL``;
     * ``timeout`` is not an int in ``[1, 300]``;
     * neither ``command`` nor ``skills`` is present (an empty hook);
     * ``skills`` is combined with a ``command`` (the skills would never fire);
     * ``skills`` is paired with an event other than UserPromptSubmit/AgentSpawn
       (the "Load skills:" directive has no consumer there);
+    * ``matcher`` is paired with one of ``HOOK_EVENTS_KAS_ONLY`` -- no event fires
+      those, so no payload exists for a matcher to filter and the field's subject
+      is undefined; storing one now would hand the round that defines the payload
+      a filter written against a different subject than the one it picks;
     * ``matcher_mode`` is ``regex`` with a syntactically invalid ``matcher``.
     """
-    if event not in HOOK_EVENTS:
+    if event not in HOOK_EVENTS_ALL:
         raise ValueError(f"invalid event: {event}")
     if (
         isinstance(timeout, bool)
@@ -4165,6 +4418,11 @@ def validate_hook_fields(
                 f"skills hooks cannot fire on {event} events — "
                 "choose UserPromptSubmit or AgentSpawn"
             )
+    if matcher and event in HOOK_EVENTS_KAS_ONLY:
+        raise ValueError(
+            f"a matcher cannot be set on {event} — no event fires it, so there is "
+            "no payload to filter; leave the matcher empty"
+        )
     if matcher_mode == "regex" and matcher:
         try:
             re.compile(matcher)
@@ -4318,10 +4576,27 @@ class ScriptHook:
         # written so an unknown event is visibly inert rather than silently
         # remapped, matching how `matcher_mode` junk falls through to glob.
         timeout = _normalize_hook_timeout(data.get("timeout", HOOK_TIMEOUT_DEFAULT))
+        event = data.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT)
+        # Drop a matcher stored against an event no event fires, the same way the
+        # timeout above is clamped. ``validate_hook_fields`` refuses that pairing at
+        # the create/update boundary, and a hand-edited file can carry it anyway --
+        # so keeping it would load a hook that cannot be edited or even disabled
+        # without editing the file again, because update re-validates the MERGED
+        # fields and would meet the stored matcher. Normalizing here means the store
+        # never holds the combination and update never sees it. The matcher is the
+        # part with no meaning on these events; the hook itself is kept.
+        if matcher and event in HOOK_EVENTS_KAS_ONLY:
+            logger.warning(
+                "hook %s on %s carried a matcher; dropping it (no event fires this, "
+                "so there is no payload to filter)",
+                data.get("id", "?"),
+                event,
+            )
+            matcher = ""
         return cls(
             id=data.get("id", str(uuid.uuid4())[:8]),
             name=data.get("name", ""),
-            event=data.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT),
+            event=event,
             matcher=matcher,
             matcher_mode=data.get("matcher_mode", "glob"),
             command=data.get("command", ""),
@@ -4527,11 +4802,15 @@ def _audit_governance_hook_decision(
 
 
 async def run_script_hook(
-    hook: ScriptHook, context: str = "", hook_event: dict | None = None
+    hook: ScriptHook,
+    context: str = "",
+    hook_event: dict | None = None,
+    cwd: str | None = None,
 ) -> ScriptHookResult:
     """Execute a script hook's command with timeout.
 
-    Passes hook event as JSON via STDIN (Kiro CLI compatible).
+    Passes hook event as JSON via STDIN (Kiro CLI compatible). ``cwd`` is the
+    directory the command runs in; ``None`` keeps the gateway's own.
     """
     start = time.monotonic()
     # Governance: the ``capabilities.script_hooks`` gate (default OFF) may forbid
@@ -4541,7 +4820,9 @@ async def run_script_hook(
     sk = ""
     if hook_event:
         sk = str(hook_event.get("parent_session_key") or hook_event.get("session_key") or "")
-    gov_denied = _script_hooks_capability_denied(sk)
+    # Offloaded: resolving the governance scope can walk the profile store, which
+    # must not run on the gateway's shared event loop.
+    gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
     if gov_denied:
         hook.last_run = time.time()
         hook.last_status = "blocked"
@@ -4563,6 +4844,7 @@ async def run_script_hook(
         hook_event = {"hook_event_name": hook.event, "cwd": os.getcwd()}
     stdin_data = json.dumps(hook_event).encode()
 
+    proc: Any = None
     try:
         # circular import: sandbox → registry → apps → hooks, so import at call time
         from kiro_crew.sandbox import (
@@ -4622,6 +4904,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
         else:
@@ -4631,6 +4914,7 @@ async def run_script_hook(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=cwd,
                 start_new_session=platform_compat.IS_POSIX,
                 creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
             )
@@ -4663,7 +4947,20 @@ async def run_script_hook(
         stderr_text = _decode_capped(stderr_b, stderr_trunc).strip()
         stdout_safe = redact_via_context(stdout_text) if stdout_text else ""
         stderr_safe_full = redact_via_context(stderr_text) if stderr_text else ""
-        stderr_safe = stderr_safe_full[:500]
+        # An exit-2 deny reason is authored text and reads from the head; any
+        # other failure is a crash whose diagnosis is printed last, so its
+        # last_error excerpt keeps the tail. When the byte cap fired the real
+        # tail was discarded before decoding, so the head is the only honest
+        # excerpt left, and the truncation marker is re-appended so the excerpt
+        # still says it is clipped. Redaction already ran on the full capped
+        # stream above, so neither cut can sever a secret.
+        if exit_code == 2:
+            stderr_safe = stderr_safe_full[:500]
+        elif stderr_trunc:
+            head_len = 500 - len(_HOOK_TRUNCATION_MARKER)
+            stderr_safe = stderr_safe_full[:head_len] + _HOOK_TRUNCATION_MARKER
+        else:
+            stderr_safe = stderr_safe_full[-500:]
         hook.last_run = time.time()
         if exit_code == 2:
             hook.last_status = "blocked"
@@ -4684,6 +4981,15 @@ async def run_script_hook(
             exit_code=exit_code,
             duration_ms=elapsed,
         )
+    except asyncio.CancelledError:
+        # A cancelled caller (a torn-down session, a cancelled turn) must not leave
+        # the hook running: kill its tree, then let the cancellation propagate.
+        if proc is not None and proc.returncode is None:
+            try:
+                await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
+            except Exception:
+                logger.debug("hook tree kill on cancel failed", exc_info=True)
+        raise
     except asyncio.TimeoutError:
         # Kill the whole process tree (shell + grandchildren) to prevent orphans.
         # platform_compat: killpg on POSIX, taskkill /T on Windows (os.killpg /
@@ -4742,7 +5048,7 @@ _HOOKS_FILE = "hooks.json"
 class ScriptHookStore:
     """Persist script hooks to ~/.kiro/crew/hooks.json."""
 
-    def __init__(self, config_dir: Path | None = None):
+    def __init__(self, config_dir: Path | None = None, *, load: bool = True):
         from kiro_crew.config.loader import config_dir as _cfg_dir
 
         self._dir = config_dir or _cfg_dir()
@@ -4759,7 +5065,8 @@ class ScriptHookStore:
         # snapshot taken BEFORE B's change and drops it. Re-entrant because the
         # persist path is called from inside the same held section.
         self._mutex = threading.RLock()
-        self._load()
+        if load:
+            self._load()
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -4769,6 +5076,9 @@ class ScriptHookStore:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load hooks: %s", exc)
             return
+        self._load_data(data)
+
+    def _load_data(self, data: object) -> None:
         # Deserialize each hook independently: a single malformed entry (a
         # non-dict, or a dict `from_dict` cannot coerce) must not take down the
         # whole store and drop every OTHER hook the user has. `from_dict` is
@@ -4792,7 +5102,10 @@ class ScriptHookStore:
             try:
                 if not isinstance(h, dict):
                     raise TypeError("hook entry is not an object")
-                if h.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT) not in HOOK_EVENTS:
+                # The full authoring vocabulary, not the fired subset: a hook
+                # stored against a Kiro Agent trigger must survive a reload,
+                # and the narrower set would quarantine it as unparseable.
+                if h.get("event", HOOK_EVENT_USER_PROMPT_SUBMIT) not in HOOK_EVENTS_ALL:
                     raise ValueError("hook entry has an invalid event")
                 hook = ScriptHook.from_dict(h)
                 # Keep insertion inside the per-entry guard: a hand-edited ID
@@ -4896,6 +5209,17 @@ class ScriptHookStore:
         hook = ScriptHook.from_dict(data)
         if not hook.id:
             hook.id = str(uuid.uuid4())[:8]
+        # A hook on an event no event fires is saved OFF unless the caller said
+        # otherwise. Nothing runs it either way today, so this costs the author
+        # nothing now -- and it is the whole activation contract for later: the
+        # change that starts firing these events inherits hooks that are already
+        # disabled, so it cannot silently run a shell command somebody wrote
+        # months earlier and never reconfirmed. ``fire`` skips a disabled hook;
+        # the Test endpoint does not read ``enabled``, so Test still works, which
+        # is the only way one of these runs at all. An explicit ``enabled: true``
+        # is honoured -- that IS the reconfirmation.
+        if "enabled" not in data and hook.event in HOOK_EVENTS_KAS_ONLY:
+            hook.enabled = False
         # Enforce the SAME invariants `update` does, via the shared validator:
         # checking them only in `update` lets a direct/internal caller of `create`
         # bypass the command+skills invariant, event membership and timeout bounds,
@@ -4904,13 +5228,17 @@ class ScriptHookStore:
         # in, but validate against the ORIGINAL `data` so a caller that passed an
         # out-of-range timeout is told rather than having it silently clamped —
         # matching the API schema's reject-don't-clamp behavior. Raises
-        # ValueError (mapped to HTTP 400 by the dashboard handler).
+        # ValueError (mapped to HTTP 400 by the dashboard handler). The matcher is
+        # read from `data` for the same reason as the timeout: `from_dict` drops one
+        # stored against an event no event fires, which is right for a hand-edited
+        # file and wrong for a caller who asked for it -- a POST carrying a matcher
+        # must be told, not silently saved without the filter it named.
         validate_hook_fields(
             event=hook.event,
             timeout=data.get("timeout", hook.timeout),
             command=hook.command,
             skills=hook.skills,
-            matcher=hook.matcher,
+            matcher=str(data.get("matcher", hook.matcher) or ""),
             matcher_mode=hook.matcher_mode,
         )
         with self._mutex, self._atomic_mutation():
@@ -4923,9 +5251,52 @@ class ScriptHookStore:
             hook = self._hooks.get(hook_id)
             if not hook:
                 return None
+            was_dormant = hook.event in HOOK_EVENTS_KAS_ONLY
             for k in ("name", "event", "matcher", "matcher_mode", "command", "timeout", "enabled"):
                 if k in data:
                     setattr(hook, k, data[k])
+            # The activation contract has to hold on BOTH write paths. `create`
+            # stores a hook on one of the six switched off; without this, an edit
+            # moving an ALREADY-ENABLED hook from a live event onto one of the six
+            # kept it enabled, and the change that starts firing these events would
+            # inherit exactly the pre-authorised command the contract exists to
+            # prevent -- reached by an ordinary edit rather than anything exotic.
+            #
+            # Only on the TRANSITION into the set, and only when the caller did not
+            # name `enabled`. A hook already on one of the six keeps whatever state
+            # it has, so editing the command of one somebody deliberately switched
+            # ON does not silently switch it off again -- the edit form always sends
+            # `event`, so keying on presence rather than on the transition would do
+            # exactly that.
+            if (
+                "event" in data
+                and not was_dormant
+                and hook.event in HOOK_EVENTS_KAS_ONLY
+                and "enabled" not in data
+            ):
+                hook.enabled = False
+            # A move onto one of the six also drops a matcher the caller did not
+            # send. `from_dict` applies the same normalization on load, and its note
+            # says why: `update` validates the MERGED fields, so a stored matcher
+            # meeting the pairing refusal leaves a hook that cannot be edited -- or
+            # even switched off -- without the caller also naming a field it never
+            # touched, and the refusal names that field rather than anything the
+            # request carried. A matcher present IN `data` still refuses, exactly as
+            # `create` refuses one: a caller who asks for a filter these events
+            # cannot use is told, not silently saved without it.
+            if (
+                "event" in data
+                and "matcher" not in data
+                and hook.matcher
+                and hook.event in HOOK_EVENTS_KAS_ONLY
+            ):
+                logger.warning(
+                    "hook %s moved onto %s; dropping its matcher (no event fires "
+                    "this, so there is no payload to filter)",
+                    hook.id,
+                    hook.event,
+                )
+                hook.matcher = ""
             if "skills" in data:
                 skills_raw = data["skills"]
                 hook.skills = (
@@ -4980,10 +5351,32 @@ class ScriptHookStore:
         parent_session_key: str | None = None,
         agent_role: str | None = None,
         hook_continuation_count: int = 0,
+        extra_hooks: Sequence[ScriptHook] = (),
+        extra_hooks_cwd: str | None = None,
+        extra_hooks_tool_names: Sequence[str] | None = None,
+        tool_match_names: Sequence[str] | None = None,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
 
-        For PreToolUse/PostToolUse, matcher filters by tool name.
+        ``extra_hooks`` run after the stored ones, through the same matcher, gate
+        and spawn, and are never persisted: they belong to the caller (an agent
+        spec's own ``hooks`` on a backend that cannot run them, see
+        :mod:`kiro_crew.agent_sdk.spec_hooks`), not to this store. They run in
+        ``extra_hooks_cwd`` -- the session's workspace, where the harness that
+        would otherwise run them runs them -- and their payload's ``cwd`` says so.
+        ``tool_match_names``, when given, are every name the call is known by (its
+        title, its canonical tool name, its ``@server/tool`` form); a tool matcher
+        then matches when it matches any of them. ``tool_name`` stays what the
+        payload says.
+
+        For PreToolUse/PostToolUse, matcher filters by tool name. When
+        ``extra_hooks_tool_names`` is given, an extra hook's tool matcher is
+        compared with those names instead: the tool's identity in the vocabulary
+        the extra hooks were written in, which ``tool_name`` (the call's title)
+        does not carry. It matches when any name does, and an empty sequence
+        leaves only an unscoped (``*``) extra hook matching. The first name is
+        also the ``tool_name`` an extra hook's stdin payload reports, so a script
+        that branches on it reads the same vocabulary its matcher is written in.
         For AgentSpawn/UserPromptSubmit/Stop, all hooks for that event fire.
 
         Optional ``subagent_id``, ``parent_session_key``, and ``agent_role`` are
@@ -5031,13 +5424,29 @@ class ScriptHookStore:
         if agent_role:
             hook_event["agent_role"] = agent_role
 
-        for hook in list(self._hooks.values()):
+        extra_ids = {id(h) for h in extra_hooks}
+        # The extra hooks' own payload: their workspace as ``cwd``, and on a tool
+        # event the tool named in their vocabulary rather than the call's title.
+        extra_event = dict(hook_event)
+        if extra_hooks_cwd:
+            extra_event["cwd"] = extra_hooks_cwd
+        if extra_hooks_tool_names:
+            extra_event["tool_name"] = extra_hooks_tool_names[0]
+        for hook in [*self._hooks.values(), *extra_hooks]:
             if not hook.enabled or hook.event != event:
                 continue
             # Matcher filtering: for tool hooks, match tool name; for others, match context
             if hook.matcher:
                 if event in (HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE):
-                    if not _tool_matches(hook.matcher, tool_name):
+                    if extra_hooks_tool_names is not None and id(hook) in extra_ids:
+                        if hook.matcher != "*" and not any(
+                            _tool_matches(hook.matcher, name) for name in extra_hooks_tool_names
+                        ):
+                            continue
+                    elif not any(
+                        _tool_matches(hook.matcher, name)
+                        for name in (tool_match_names or (tool_name,))
+                    ):
                         continue
                 elif context:
                     # Offload to a thread: regex mode spawns a bounded subprocess
@@ -5063,7 +5472,9 @@ class ScriptHookStore:
                 # gate as command hooks — a disabled capabilities.script_hooks
                 # must not be bypassable by omitting the command field.
                 sk = parent_session_key or ""
-                gov_denied = _script_hooks_capability_denied(sk)
+                # Off the loop, as in run_script_hook: the scope lookup can walk
+                # the governance profile store.
+                gov_denied = await asyncio.to_thread(_script_hooks_capability_denied, sk)
                 if gov_denied:
                     hook.last_run = time.time()
                     hook.last_status = "blocked"
@@ -5107,7 +5518,12 @@ class ScriptHookStore:
                     len(hook.skills),
                 )
                 continue
-            result = await run_script_hook(hook, context, hook_event)
+            if id(hook) in extra_ids and extra_hooks_cwd:
+                result = await run_script_hook(hook, context, extra_event, cwd=extra_hooks_cwd)
+            elif id(hook) in extra_ids:
+                result = await run_script_hook(hook, context, extra_event)
+            else:
+                result = await run_script_hook(hook, context, hook_event)
             results.append(result)
             logger.info(
                 "Hook %s (%s): %s in %dms (exit=%d)",
@@ -5172,6 +5588,40 @@ def get_global_hook_store() -> ScriptHookStore | None:
     return _global_script_hook_store
 
 
+def persisted_hook_store() -> ScriptHookStore:
+    """The registered hook store, or the Hooks page's saved hooks read from disk.
+
+    A process that registers no store (the standalone ``kirocrew run`` task runner)
+    still has the user's saved hooks in ``hooks.json``. A gate that read them as
+    absent would let a covered call past a deny hook, so gates that must enforce
+    them read this instead of :func:`get_global_hook_store`.
+
+    Strict, unlike the store's own fail-soft load: a ``hooks.json`` that cannot be
+    read or parsed, or that holds an entry the store could not load, raises, so a
+    gate fails closed instead of reading a saved deny hook as absent.
+
+    The file is read ONCE, under the same ``hooks.json.lock`` its writers hold, and
+    that one snapshot is both validated and loaded, so an edit landing mid-read
+    cannot pair one version's shape check with another version's hooks. Blocking
+    I/O: an event-loop caller runs it in a worker thread.
+    """
+    store = get_global_hook_store()
+    if store is not None:
+        return store
+    store = ScriptHookStore(load=False)
+    if not store._path.exists():
+        return store
+    with webhooks.locked(store._path):
+        data = json.loads(store._path.read_text(encoding="utf-8"))
+    hooks_data = data.get("hooks", []) if isinstance(data, dict) else None
+    if not isinstance(hooks_data, list):
+        raise ValueError(f"{store._path} does not hold a hooks list")
+    store._load_data(data)
+    if store._unparsed_hook_entries or len(store._hooks) != len(hooks_data):
+        raise ValueError(f"{store._path} holds hooks that could not be loaded")
+    return store
+
+
 async def fire_tool_hooks(
     hook_store: ScriptHookStore | None,
     event_title: str,
@@ -5218,3 +5668,125 @@ async def fire_tool_hooks(
         )
     except Exception:
         logger.debug("PreToolUse hook error", exc_info=True)
+
+
+def pre_tool_match_names(
+    title: str,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+) -> tuple[tuple[str, ...], tuple[str, ...] | None]:
+    """The names a PreToolUse matcher meets for one call: ``(all, spec)``.
+
+    *all* is every name the call is known by, for a Hooks-page hook: its *title*,
+    its canonical *tool_identity* (written by the harness, never the model), the
+    ``@server/tool`` and ``mcp__server__tool`` forms built from the trusted
+    *mcp_server*, and the names the harness's own *harness_tool_id* stands for
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`). *spec* is the
+    same without the title, for a spec hook, whose matcher names tools; ``None``
+    when the harness stated no id, so a spec hook keeps matching the title.
+    """
+    # circular import: spec_hooks imports this module at load time.
+    from kiro_crew.agent_sdk.spec_hooks import spec_hook_tool_names
+
+    harness_names = spec_hook_tool_names(harness_tool_id) or ()
+    trusted = [*harness_names, tool_identity]
+    if mcp_server and tool_identity:
+        trusted += [f"@{mcp_server}/{tool_identity}", f"mcp__{mcp_server}__{tool_identity}"]
+    every = tuple(dict.fromkeys(n for n in [title, *trusted] if n))
+    spec = tuple(dict.fromkeys(n for n in trusted if n)) if harness_names else None
+    return every, spec
+
+
+async def permission_pre_tool_block(
+    hook_store: ScriptHookStore | None,
+    spec_hooks: Sequence[ScriptHook],
+    spec_hooks_cwd: str | None,
+    event_title: str,
+    event_tool_input: str | None = None,
+    *,
+    tool_identity: str = "",
+    mcp_server: str = "",
+    harness_tool_id: str = "",
+    subagent_id: str | None = None,
+    parent_session_key: str | None = None,
+    agent_role: str | None = None,
+) -> str | None:
+    """Run the PreToolUse hooks on a subagent or task-runner permission request.
+
+    For a turn whose backend never receives the agent spec's ``hooks`` (see
+    :func:`kiro_crew.agent_sdk.spec_hooks.turn_spec_hooks`): on that backend the
+    projection turns every call a PreToolUse hook covers into a permission
+    request, so this is where the hooks gate. The Hooks page's hooks and the
+    spec's run together, as on the chat turn loop. Such a turn skips the
+    informational tool-call fire: KAS sends a call's tool-call frame BEFORE its
+    permission request, and every call a PreToolUse hook covers reaches this gate,
+    so firing there too would run each hook twice. Returns why the call is
+    blocked, or ``None``.
+
+    A hook matcher is compared with every name the call is known by: its title
+    (what the chat turn loop matches), its canonical *tool_identity*
+    (``LLMEvent.tool_name``, written by the harness, never the model) and, for an
+    MCP call, the ``@server/tool`` and ``mcp__server__tool`` forms built from the
+    trusted *mcp_server* (``LLMEvent.mcp_server_name``). When the harness stated
+    its own id for the call (*harness_tool_id*, KAS's ``_meta.kiro.toolId``), the
+    names that id stands for join them
+    (:func:`kiro_crew.agent_sdk.spec_hooks.spec_hook_tool_names`), so a ``web_fetch``
+    hook meets KAS's "Fetch URL". A spec hook then matches those names and the
+    trusted identity only, never the title, as on the chat turn loop.
+
+    Blocks by the same rule the chat turn loop applies: exit 2 is a delivered
+    deny, and any other nonzero exit or a fire that raises is a gate with no
+    verdict, which blocks. With no store registered in this process the saved
+    Hooks-page hooks are read from disk (:func:`persisted_hook_store`), and saved
+    hooks that cannot be read block.
+    """
+    if hook_store is None:
+        # No store registered in this process: the saved hooks still apply.
+        try:
+            # Off the loop: it reads and parses the whole saved file.
+            hook_store = await asyncio.to_thread(persisted_hook_store)
+        except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+            logger.warning("saved PreToolUse hooks could not be read; blocking tool", exc_info=True)
+            return f"saved PreToolUse hooks could not be read: {exc}"[:500]
+    tool_name = event_title or ""
+    if tool_name.startswith("Running: "):
+        tool_name = tool_name[9:]
+    match_names, spec_names = pre_tool_match_names(
+        tool_name,
+        tool_identity=tool_identity,
+        mcp_server=mcp_server,
+        harness_tool_id=harness_tool_id,
+    )
+    tool_input = None
+    if event_tool_input:
+        try:
+            tool_input = json.loads(event_tool_input)
+        except Exception:
+            pass
+    try:
+        results = await hook_store.fire(
+            HOOK_EVENT_PRE_TOOL_USE,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            subagent_id=subagent_id,
+            parent_session_key=parent_session_key,
+            agent_role=agent_role,
+            extra_hooks=spec_hooks,
+            extra_hooks_cwd=spec_hooks_cwd,
+            extra_hooks_tool_names=spec_names,
+            tool_match_names=match_names,
+        )
+    except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+        logger.warning("PreToolUse hook fire failed; blocking tool", exc_info=True)
+        return f"PreToolUse hook could not run: {exc}"[:500]
+    for r in results:
+        if r.exit_code == 2:
+            return f"{r.hook_name}: {r.stderr[:200] if r.stderr else 'hook denied'}"
+        if r.exit_code != 0:
+            detail = (
+                r.error[:200] if r.error else (r.stderr[-200:] or f"exited with code {r.exit_code}")
+            )
+            return f"{r.hook_name}: {detail}"
+    return None

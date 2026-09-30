@@ -219,10 +219,17 @@ async def test_run_starts_adaptive_only_after_dashboard_and_taskq_ready(
 
     orch = GatewayOrchestrator.__new__(GatewayOrchestrator)
     orch._background_tasks = set()
+    # The boot work-dir sweep reads this flag before the adaptive controller
+    # starts; True skips it, as the offline E2E gate does.
+    orch._test_mode = True
     orch._no_dashboard = no_dashboard
     orch._json_ready = True
     orch._owner_id = ""
     orch._dashboard_port = 0
+    # ``run`` reads the dashboard state before the memory-backed writers start
+    # (the crewmate-prune barrier); a bare orchestrator has none, as the
+    # ``__init__`` this test skips would have set.
+    orch.dashboard_state = None
     order = []
 
     async def bind_dashboard():

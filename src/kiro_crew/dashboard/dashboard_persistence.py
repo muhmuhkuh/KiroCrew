@@ -17,7 +17,9 @@ from typing import Any
 
 AtomicWriter = Callable[..., None]
 JsonCodecProvider = Callable[[], Any]
-SlotSaver = Callable[[Any, Any], Any]
+# Keyword-accepting: the periodic writer passes ``expected_slot_name`` so the
+# save's in-lock ownership guard can refuse a write whose slot was replaced.
+SlotSaver = Callable[..., Any]
 
 
 def _current_shutdown_event() -> Any:
@@ -87,6 +89,11 @@ class DashboardPersistenceCoordinator:
             # seam while a long-lived loop is already running.
             flush_dirty = self._owner_method(owner, "_flush_dirty_slots", self._flush_dirty_slots)
             await asyncio.get_running_loop().run_in_executor(None, flush_dirty)
+            # circular import: state -> dashboard_persistence -> chat_utils -> state
+            from kiro_crew.dashboard.chat_utils import apply_pending_slot_memory_mode
+
+            for slot in list(owner._slots.values()):
+                apply_pending_slot_memory_mode(owner, slot)
 
     def flush_slot_now(self, owner: Any, slot: Any) -> None:
         """Write one dirty slot and clear only the generation that was saved."""
@@ -94,6 +101,17 @@ class DashboardPersistenceCoordinator:
         # history write.  Do not let this unpinned periodic writer make that
         # provisional value durable while the guarded writer is still waiting.
         if getattr(slot, "_metadata_persist_inflight", 0):
+            return
+        # Nor while the slot's NAME is being retracted. A fenced slot is still
+        # the occupant of its name until the pop, so this 5-second pass still
+        # visits it, and this write carries no ``expected_slot_name`` -- so the
+        # in-lock recreate-won guard is skipped and the retraction's wait, which
+        # only drains REGISTERED guarded writes, cannot see it either. A tick
+        # landing between the fence and the pop would then overwrite whatever
+        # adopts the name next. ``_dirty`` is deliberately left armed: the next
+        # pass writes it if the close is abandoned, and a close that completes
+        # persists the window itself through its own archival save.
+        if getattr(slot, "is_closing", False):
             return
         if not owner.conversation_log or not slot.messages:
             return
@@ -110,7 +128,19 @@ class DashboardPersistenceCoordinator:
         # erasing a new dirty mark set concurrently by the event loop.
         generation = slot._dirty_gen
         try:
-            save_slot_to_history(owner, slot)
+            # The fence read above happens on this executor thread while the
+            # retraction runs on the loop, and the write does not reach the
+            # transcript lock until after the snapshot, routing and retention
+            # stretch -- so the fence is necessary but cannot be sufficient, in
+            # exactly the shape of the defect this ordering exists to close:
+            # event-loop state read from a worker thread decides a commit that is
+            # still ahead. ``expected_slot_name`` closes it at the only place that
+            # can decide, INSIDE the lock with no await before the write: the save
+            # refuses when the map holds a different slot under this name. That
+            # matters here more than elsewhere, because a periodic save is a full
+            # metadata rebuild -- it does not request the ``rows_only`` deferral
+            # that keeps another holder's folder, title and tag.
+            save_slot_to_history(owner, slot, expected_slot_name=slot.key)
         except Exception:
             # A failed write remains owed to the next periodic pass.
             self._logger_provider().warning("Flush failed for slot %s", slot.key, exc_info=True)

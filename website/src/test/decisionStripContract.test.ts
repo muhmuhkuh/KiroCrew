@@ -8,11 +8,11 @@
  * test, and the feature would look like it had never been wired.
  *
  * This suite closes that hole from the side it can reach. It parses the record
- * fixture out of `docs/system-specs/modules/decisions.md` § 8 — the document
- * both halves are written against — and asserts the reader accepts it field for
- * field. A change to the spec without the matching reader change is now a red
- * test here, and a reader change that drops a field the spec still promises is
- * red too.
+ * fixtures out of `docs/system-specs/modules/decisions.md` — § 8 for the skill
+ * selection, § 9 for the model routing, the document both halves are written
+ * against — and asserts the reader accepts each field for field. A change to the
+ * spec without the matching reader change is now a red test here, and a reader
+ * change that drops a field the spec still promises is red too.
  *
  * It reads the spec rather than restating it on purpose: a copy of the fixture
  * in this file would be a second contract, free to drift from the one the
@@ -23,11 +23,22 @@ import { join } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
-import { readDecisionStrip, readSteerRecord } from '../pages/chat/decisionRecord'
+import {
+  readCompactionKeepRecord,
+  readDecisionRecord,
+  readDecisionStrip,
+  readMemoryRecallRecord,
+  readModelRecord,
+  readSteerRecord,
+} from '../pages/chat/decisionRecord'
 
 const SPEC = join(__dirname, '../../../docs/system-specs/modules/decisions.md')
 const SECTION = "## 8. The decision strip's record and feedback"
 const STEER_SECTION = '## 10. Mid-turn handling (`message.steer`)'
+const MODEL_SECTION = '## 11. Model routing (`model.route`)'
+const COMPACTION_SECTION = '## 12. Compaction scoring (`compaction.keep`)'
+
+const MEMORY_SECTION = '## 13. Recalled memories (`memory.recall`)'
 
 /** The first fenced JSON block inside *section*. */
 function specFixtureIn(section: string): Record<string, unknown> {
@@ -225,6 +236,83 @@ describe('the mid-turn handling fixture in the decisions spec', () => {
   })
 })
 
+describe('the recalled-memory fixture in the decisions spec', () => {
+  // Same hazard as the two above, from the same direction: `readMemoryRecallRecord`
+  // fails safe by drawing nothing, which is byte-identical to a turn the seam did
+  // not decide. A field respelled on one side would make the strip vanish rather
+  // than fail.
+  const fixture = specFixtureIn(MEMORY_SECTION)
+
+  it('is accepted by the reader, field for field', () => {
+    expect(readMemoryRecallRecord(fixture)).toEqual({
+      turnId: 'turn-7d1e04',
+      point: 'memory.recall',
+      store: 'default',
+      baselineKeys: ['mem-a', 'mem-b', 'mem-c'],
+      jevKeys: ['mem-a', 'mem-c'],
+      agree: false,
+      p: 0.81,
+      charsSaved: 2100,
+      boundedOmitted: 0,
+      candidates: 3,
+      messageChars: 96,
+      latencyMs: 210,
+      error: null,
+    })
+  })
+
+  it('names every key the reader needs, so a dropped promise is visible here', () => {
+    for (const key of [
+      'turn_id', 'point', 'baseline_keys', 'jev_keys', 'p',
+      'chars_saved', 'candidates', 'message_chars', 'latency_ms', 'error',
+    ]) {
+      expect(Object.keys(fixture), `the spec fixture no longer carries ${key}`).toContain(key)
+    }
+  })
+
+  it('names its two lists for what they hold, which is what keeps the readers apart', () => {
+    // `baseline`/`jev` are what the SKILL reader requires. Spelling them here would
+    // make that reader accept this record and draw memory ids as skill keys, so the
+    // refusal below is a property of the field names rather than a guess.
+    expect(Object.keys(fixture)).not.toContain('baseline')
+    expect(Object.keys(fixture)).not.toContain('jev')
+  })
+
+  it('promises neither `agree` nor `history_chars`, because nothing reads them', () => {
+    // Agreement is recomputed from the two lists. There is no history half: the
+    // candidates ARE the prior conversation this question sends.
+    expect(Object.keys(fixture)).not.toContain('agree')
+    expect(Object.keys(fixture)).not.toContain('history_chars')
+  })
+
+  it('is refused by the other two readers, and refuses their records in turn', () => {
+    // Three records on one field. Each must decline the others rather than render
+    // them: this one read as a skill selection would print two empty skill lists
+    // under a check mark saying the sides agreed.
+    expect(readDecisionStrip(fixture)).toBeNull()
+    expect(readSteerRecord(fixture)).toBeNull()
+    expect(readMemoryRecallRecord(specFixture())).toBeNull()
+    expect(readMemoryRecallRecord(specFixtureIn(STEER_SECTION))).toBeNull()
+  })
+
+  it('carries no memory text, snippet or message — the bound the log section sets', () => {
+    // `point` and `message_chars` are dropped by exact key first: the former's
+    // VALUE is the identifier `memory.recall` and the latter is a LENGTH, so both
+    // would match a broad needle below. The needles stay broad rather than
+    // narrowing, because a narrow one would admit a `message_text` carrying the
+    // conversation — the leak this asserts against.
+    const { point: _id, message_chars: _length, ...rest } = fixture
+    const serialized = JSON.stringify(rest).toLowerCase()
+    for (const forbidden of ['api_key', 'secret', 'prompt', 'message', 'snippet', 'description', 'content', 'text']) {
+      expect(serialized, `the fixture leaks ${forbidden}`).not.toContain(forbidden)
+    }
+    // The teeth: masking is by key, so anything else naming a snippet still fails.
+    expect(JSON.stringify({ ...rest, snippet_text: 'hi' })).toContain('snippet')
+    expect(fixture.point).toBe('memory.recall')
+    expect(typeof fixture.message_chars).toBe('number')
+  })
+})
+
 describe('the feedback vocabulary in the decisions spec', () => {
   const prose = specFeedbackVocabulary()
 
@@ -240,5 +328,134 @@ describe('the feedback vocabulary in the decisions spec', () => {
     // `verdict: null` is the only way a reader takes an answer back; if the spec
     // stops promising it, the second press becomes an undefined request.
     expect(prose.toLowerCase()).toContain('retract')
+  })
+})
+
+describe('the model-routing fixture in the decisions spec', () => {
+  const fixture = specFixtureIn(MODEL_SECTION)
+
+  it('is accepted by the model reader, field for field', () => {
+    expect(readModelRecord(fixture)).toEqual({
+      turnId: 'turn-7b1c40',
+      point: 'model.route',
+      tier: 'complex',
+      modelChosen: 'model-c',
+      baselineModel: 'model-b',
+      p: 0.91,
+      latencyMs: 180,
+      historyChars: 0,
+      truncated: 0,
+      applied: true,
+      modelUsed: 'model-c',
+      error: null,
+    })
+  })
+
+  it('names every key the reader needs, so a dropped promise is visible here', () => {
+    for (const key of [
+      'turn_id', 'point', 'tier', 'model_chosen', 'baseline_model',
+      'p', 'latency_ms', 'history_chars', 'truncated', 'error',
+      // What the turn RAN on, which is not always what was chosen.
+      'applied', 'model_used',
+    ]) {
+      expect(Object.keys(fixture), `the spec fixture no longer carries ${key}`).toContain(key)
+    }
+  })
+
+  it('carries the point, because that is what tells the two records apart', () => {
+    // Dispatched on `point`, never on which fields are present: the whole reason a
+    // model record cannot be rendered as a skill one.
+    expect(fixture.point).toBe('model.route')
+    expect(readDecisionRecord(fixture)).toEqual(readModelRecord(fixture))
+    expect(readDecisionStrip(fixture)).toBeNull()
+  })
+
+  it('needs the tier whole, so a broken producer draws nothing', () => {
+    // The tier IS the answer; a record that cannot name it has no claim to print.
+    expect(readModelRecord({ ...fixture, tier: '' })).toBeNull()
+  })
+
+  it('accepts an empty model, which is the shipped unpinned state', () => {
+    // Every tier of `decisions.model_route` is unpinned until an owner pins one,
+    // because no model id may be a hardcoded default. Refusing the record would
+    // hide the feature on every install that has not been configured yet.
+    expect(readModelRecord({ ...fixture, model_chosen: '' })!.modelChosen).toBe('')
+    expect(readModelRecord({ ...fixture, model_chosen: 42 })!.modelChosen).toBe('')
+  })
+
+  it('carries no message text, description or key — the bound the log section sets', () => {
+    const serialized = JSON.stringify(fixture).toLowerCase()
+    for (const forbidden of ['api_key', 'secret', 'prompt', 'message', 'description', 'content']) {
+      expect(serialized, `the fixture leaks ${forbidden}`).not.toContain(forbidden)
+    }
+  })
+})
+
+describe('the compaction record fixture in the decisions spec', () => {
+  const fixture = specFixtureIn(COMPACTION_SECTION)
+
+  it('is a record, so the fence really held the payload', () => {
+    expect(Object.keys(fixture).length).toBeGreaterThan(10)
+  })
+
+  it('is accepted by the reader, field for field', () => {
+    const read = readCompactionKeepRecord(fixture)
+    expect(read).toMatchObject({
+      turnId: 'cmp-7ab419',
+      point: 'compaction.keep',
+      totalCalls: 61,
+      // DERIVED from the two keep tallies, never read as a field: the line prints
+      // "N of M", so a count that disagreed with the log's own tallies would be
+      // irreconcilable with it.
+      keptCalls: 23,
+    })
+    expect(read?.charsShare).toBeCloseTo(fixture.chars_jev_eligible as number / (fixture.chars_all as number))
+  })
+
+  it('carries the overflow count the line states', () => {
+    // A truncated walk's total is the walk's cap rather than the session's call count,
+    // so the record must be able to SAY how much it missed; a fixture without the field
+    // would let the gateway drop it without a red test.
+    expect(fixture).toHaveProperty('calls_truncated')
+    expect(readCompactionKeepRecord({ ...fixture, calls_truncated: 140 })?.truncatedCalls).toBe(140)
+  })
+
+  it('keeps the numerator inside the denominator', () => {
+    // The invariant that makes the card's percentage a percentage. Held on the fixture
+    // as well as in the point's own tests, because this is the shape the two halves
+    // agreed on.
+    expect(fixture.chars_today_eligible as number).toBeLessThanOrEqual(fixture.chars_jev_eligible as number)
+    expect(fixture.chars_jev_eligible as number).toBeLessThanOrEqual(fixture.chars_all as number)
+  })
+
+  it('names the three tallies the reader sums', () => {
+    // A rename on the gateway side would otherwise hide the line with no red test:
+    // the reader's fail-safe is to draw nothing, which looks like a healthy release
+    // that stamped no record.
+    for (const field of ['total_calls', 'kept_both', 'kept_call', 'dropped']) {
+      expect(fixture).toHaveProperty(field)
+    }
+  })
+
+  it('names both sides of the character comparison', () => {
+    // The eligible arm is what Jev is measured against; without it the record says what
+    // Jev would keep and nothing about what today keeps, which is the whole comparison
+    // this point exists for. Both names carry `_eligible` because both are upper bounds
+    // — the replay applies quotas and a budget the gateway does not re-derive.
+    for (const field of ['chars_all', 'chars_today_eligible', 'chars_jev_eligible']) {
+      expect(fixture).toHaveProperty(field)
+    }
+  })
+
+  it('carries only counts and short identifiers, never conversation content', () => {
+    // The row is a measurement, never a second copy of the conversation. Asserted on
+    // the SHAPE rather than on a word list, because a word list would have to name
+    // every spelling a transcript could contain: every value here is a number, a
+    // boolean, null, or a short identifier, and a list or an object is content.
+    for (const [field, value] of Object.entries(fixture)) {
+      if (value === null || typeof value === 'number' || typeof value === 'boolean') continue
+      expect(typeof value, field).toBe('string')
+      expect((value as string).length, field).toBeLessThanOrEqual(40)
+    }
   })
 })

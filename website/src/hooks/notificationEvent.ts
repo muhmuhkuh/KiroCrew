@@ -1,3 +1,5 @@
+import type { Notification } from '../types'
+
 /** Shared contract between useWebSocket.ts (dispatcher) and useNotificationSound.ts (listener). */
 export const MC_NOTIFICATION_EVENT = 'mc-notification' as const
 export const MC_SOUND_SETTINGS_CHANGED_EVENT = 'mc-notification-sound-changed' as const
@@ -51,4 +53,59 @@ export function shouldChimeOnTurnDone(opts: {
   needsInput?: boolean
 }): boolean {
   return !!opts.slot && !opts.reconnecting && (!!opts.needsInput || !opts.continuing)
+}
+
+/**
+ * Whether a live `permission` row owes the `approval` sound.
+ *
+ * An interactive chat parked on a tool prompt announces it through this row
+ * alone: the chat runner appends the row (delivered once to every dashboard
+ * window as a `chat_message` frame), registers its future and pushes the
+ * slots. No `approval` frame exists for it — that frame belongs to the
+ * coordinator registry (Slack, cron and sub-agent approvals), whose cards are
+ * synthesized on the client and never arrive as a server `permission` row. So
+ * every server row of this role is the runner's, and its one delivery is the
+ * one sound. A row carrying `resolved` is a prompt the runner already knows
+ * nobody will answer: the batch-rejection re-append, or a turn with no budget
+ * left to wait, which it decides before the append so the frame knows its
+ * fate. A decline known only later (a linked Slack thread the prompt could
+ * not be posted to) retires the row through `approval_resolved` instead; that
+ * row's arrival chime is the accepted residual, since holding the row back
+ * would hide the card for the post's whole duration. Reconnect catch-up is
+ * silent, as for every other chime.
+ */
+export function shouldChimeOnPermissionRow(opts: {
+  meta?: { resolved?: unknown } | null
+  reconnecting: boolean
+}): boolean {
+  return !opts.reconnecting && !opts.meta?.resolved
+}
+
+/**
+ * A feed `notification` frame the socket received LIVE — after this tab
+ * mounted, outside a reconnect catch-up replay. The in-app banner
+ * (`components/notifications/NotificationBanner.tsx`) listens for this, not
+ * for the Redux `addNotification` action, because the store also fills from
+ * the boot `fetchNotifications` snapshot and from replays, and a banner for a
+ * note the user already has in the bell would announce history as news.
+ * The dispatcher (useWebSocket) owns the replay half of that rule — it is the
+ * only place that knows the socket is catching up; the listener owns the
+ * silenced/passive/current-view half.
+ */
+export const MC_LIVE_NOTIFICATION_EVENT = 'mc-live-notification' as const
+
+export interface McLiveNotificationDetail {
+  note: Notification
+}
+
+export function dispatchLiveNotification(note: Notification): void {
+  try {
+    const detail: McLiveNotificationDetail = { note }
+    window.dispatchEvent(new CustomEvent(MC_LIVE_NOTIFICATION_EVENT, { detail }))
+  } catch (err) {
+    // Same last-resort surface as dispatchMcNotification: a broken banner
+    // listener must not take the socket handler down with it.
+    // eslint-disable-next-line no-console
+    console.warn('mc-live-notification listener error', err)
+  }
 }

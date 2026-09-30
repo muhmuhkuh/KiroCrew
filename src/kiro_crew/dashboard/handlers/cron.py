@@ -37,19 +37,33 @@ from kiro_crew.cron_script import (
     resolve_script_path,
     validate_secret_env_grant,
 )
+from kiro_crew.dashboard.chat_persistence import _restore_dismissed_source_links
 from kiro_crew.dashboard.cron_inject import (
     chat_folder_exists,
     hydrate_slot_from_history,
     inject_cron_result_to_dashboard,
     move_cron_job_tab,
+    prefetch_cron_dismissed,
 )
-from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.dashboard.handlers._shared import (
+    _owner_denial_response,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.state import DashboardState, SlotOrigin, note_crew_log_class
 from kiro_crew.executors import discovery_executor
 from kiro_crew.history import is_incognito_transcript
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
-from kiro_crew.lesson_validation import contains_volatile_lesson_fact
+from kiro_crew.lesson_validation import (
+    LESSON_APPLIES_ON_TOPIC,
+    LESSON_APPLIES_UNSTATED,
+    LESSON_APPLIES_VALUES,
+    LESSON_REFUSED_AT_CAPACITY,
+)
+from kiro_crew.lesson_validation import authored_lesson_applies as _authored_lesson_applies
+from kiro_crew.lesson_validation import (
+    contains_volatile_lesson_fact,
+)
 from kiro_crew.llm_helpers import run_bg_oneliner
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import is_channel_session_key
@@ -259,7 +273,7 @@ async def _classify_contradiction(state: DashboardState, prompt: str) -> str:
 
 async def _resolve_contradictions(
     state: DashboardState, new_rule: str, candidates: list[dict]
-) -> list[str]:
+) -> list[tuple[str, str | None]]:
     """Use an LLM to identify which candidate lessons contradict the new rule.
 
     Each candidate is classified independently on a fresh ``_bg`` runtime
@@ -267,8 +281,12 @@ async def _resolve_contradictions(
     is swallowed so one bad verdict never aborts the sweep — the lesson is
     already persisted, and a missed verdict self-heals on the next ``learn_add``
     touching the topic.
+
+    Each entry is ``(key, value_json)``: the key alone is not enough to delete
+    safely, because the body under it can be replaced while this loop waits on a
+    verdict. The caller hands the body back as ``expect_value_json``.
     """
-    to_delete: list[str] = []
+    to_delete: list[tuple[str, str | None]] = []
     for candidate in candidates:
         prompt = _CONTRADICTION_PROMPT.format(old_rule=candidate["rule"], new_rule=new_rule)
         try:
@@ -283,8 +301,39 @@ async def _resolve_contradictions(
                 candidate["rule"][:60],
                 candidate["similarity"],
             )
-            to_delete.append(candidate["key"])
+            # ``None`` when the candidate carried no body: an unguarded delete is
+            # the pre-existing behaviour, so a caller shaping its own candidates
+            # keeps working rather than silently never deleting.
+            body = candidate.get("value_json")
+            to_delete.append((candidate["key"], body if isinstance(body, str) else None))
     return to_delete
+
+
+def _candidate_applies(candidate: object) -> str:
+    """The authored tier of a contradiction candidate, or ``unstated``.
+
+    The candidate rows this sweep receives are shaped by
+    ``find_contradiction_candidates``, so the tier may arrive already decoded or
+    still inside ``value_json``. Both are read, and anything unreadable answers
+    ``unstated`` -- the protected side, so a row this cannot classify is never
+    deleted by a finding.
+    """
+    if not isinstance(candidate, dict):
+        return LESSON_APPLIES_UNSTATED
+    direct = candidate.get("applies")
+    if isinstance(direct, str) and direct.strip().lower() in LESSON_APPLIES_VALUES:
+        return direct.strip().lower()
+    raw = candidate.get("value_json")
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            return LESSON_APPLIES_UNSTATED
+        if isinstance(decoded, dict):
+            nested = decoded.get("applies")
+            if isinstance(nested, str) and nested.strip().lower() in LESSON_APPLIES_VALUES:
+                return nested.strip().lower()
+    return LESSON_APPLIES_UNSTATED
 
 
 async def _resolve_and_supersede(
@@ -313,7 +362,7 @@ async def _resolve_and_supersede(
         # the failure — operators need the visibility.
         logger.warning("Background contradiction sweep failed", exc_info=True)
         return
-    for key in contradicted:
+    for key, expect_body in contradicted:
         try:
             # Audit the supersede DECISION *before* the destructive delete: a
             # lesson must never be deleted without a SEL record, so if the audit
@@ -326,9 +375,31 @@ async def _resolve_and_supersede(
                 source="dashboard",
                 resources=key,
             )
+            # COMPARE-AND-DELETE on the body read at write time. The candidates are
+            # a write-time snapshot and this runs after a per-candidate LLM verdict,
+            # so the row under this key can have been replaced in between --
+            # ``_lesson_key`` keys on rule text plus scope alone, and re-tiering a
+            # rule is a delete plus a re-add under that same key. An unconditional
+            # delete here tombstones the replacement, which defeats the tier filter
+            # in ``api_lessons_create``: the replacement can be the `always` row the
+            # filter refuses to let a finding retire. Same guard the inline dedup
+            # pass applies to its own deferred supersedes, for the same reason.
+            #
             # delete_semantic is a sync FAISS op; off-load so this background
             # sweep doesn't block concurrent dashboard/Slack requests on the loop.
-            await asyncio.to_thread(vs.delete_semantic, key, "contradiction_superseded")
+            deleted = await asyncio.to_thread(
+                vs.delete_semantic,
+                key,
+                "contradiction_superseded",
+                expect_value_json=expect_body,
+            )
+            if not deleted:
+                # Not an error: the row changed or went while the verdict was
+                # pending, so what this decided to retire is already gone.
+                # A contradiction against whatever replaced it is re-nominated by
+                # the next write touching the topic.
+                logger.info("Contradicted lesson %s changed while its verdict ran; kept", key)
+                continue
             logger.info("Deleted contradicted lesson: %s", key)
         except Exception:
             # per-key so one bad/already-deleted key doesn't abort the batch (a
@@ -357,7 +428,9 @@ def _schema_field(field_name: str) -> FieldSpec | None:
     return None
 
 
-def _resolve_one_shot_at(body: dict[str, Any]) -> tuple[float | None, web.Response | None]:
+def _resolve_one_shot_at(
+    body: dict[str, Any], tz_name: str = ""
+) -> tuple[float | None, web.Response | None]:
     """Resolve a one-shot fire time from ``at`` / ``delay`` / ``at_time``.
 
     Returns ``(at_ts, None)`` on success — with ``at_ts`` ``None`` when the body
@@ -366,8 +439,9 @@ def _resolve_one_shot_at(body: dict[str, Any]) -> tuple[float | None, web.Respon
 
     Mirrors ``cron_add``'s **parser and precedence**: ``at`` (absolute epoch
     seconds) wins, then ``delay`` (seconds from now), then ``at_time`` (human
-    string, parsed in the CONFIGURED timezone by the shared
-    :func:`parse_time_string`), so a one-shot body means the same instant
+    string, parsed by the shared :func:`parse_time_string` in *tz_name* -- the
+    body's own, already-validated ``timezone`` -- or the CONFIGURED timezone
+    when the body names none), so a one-shot body means the same instant
     whichever door received it. The acceptance sets are NOT identical: the
     resolved-instant ceiling below is stricter than the tool, which bounds only
     its raw fields.
@@ -444,7 +518,7 @@ def _resolve_one_shot_at(body: dict[str, Any]) -> tuple[float | None, web.Respon
                 {"error": str(exc), "code": "invalid_at_time"}, status=400
             )
         if at_time:
-            parsed = parse_time_string(at_time)
+            parsed = parse_time_string(at_time, tz_name)
             if isinstance(parsed, str):
                 # parse_time_string reports failure as an already-prefixed
                 # "Error: ..." string; strip the prefix so the JSON body is not
@@ -605,8 +679,84 @@ def _resolve_chat_folder_id(
     return folder_id, None
 
 
+async def _refuse_foreign_app_job(
+    request: web.Request, state: DashboardState, job_ids: list[str], operation: str
+) -> web.Response | None:
+    """Refuse an APP caller acting on any cron job it does not own.
+
+    ``app == ""`` callers are ruled on by ``require_owner_dashboard_request``
+    already, and an internal-secret caller carries no app claim; both skip
+    this. An app token may reach these routes (``docs/app-kit/api-reference.md``
+    lists them), but only for its OWN jobs: the ones whose host-written
+    ``created_by`` is its ``app:<name>`` stamp. A job without that stamp -- the
+    person's, another app's, or one that does not exist -- is refused with the
+    owner gate's own 403 (``_owner_denial_response``), so a missing id reads the
+    same as a foreign one.
+
+    Both outcomes are SEL-audited under ``app:<name>``, the caller that actually
+    decided the outcome. ``require_owner_dashboard_request`` is not reused for
+    the denial: it records ``request["user"]``, which for an app token is the
+    person the token was minted for, not the app acting.
+
+    Every id is checked before the caller acts on any, so a batch that names one
+    foreign job changes nothing. The lookup is cache-only: ``created_by`` never
+    changes after creation, and a stale miss can only refuse, never allow.
+    """
+    app = request.get("app")
+    # The token middleware publishes the claim as a ``str``; ``None`` (absent)
+    # is the internal-secret transport. Anything else is not an app caller,
+    # matching the ``== ""`` test the owner gate above applies.
+    if not isinstance(app, str) or not app:
+        return None
+    # Function-local for the reason ``api_crons`` gives: importing
+    # ``kiro_crew.apps.cron_sdk`` runs ``kiro_crew.apps.__init__`` and its cycle.
+    from kiro_crew.apps.cron_sdk import app_owner_name
+
+    refused = next(
+        (
+            job_id
+            for job_id in job_ids
+            if app_owner_name(getattr(state.crons.get_job(job_id), "created_by", None)) != app
+        ),
+        None,
+    )
+    # One SEL row per decision, allow and deny alike. A bare enqueue: SEL is
+    # warmed at gateway startup (sel.warm_sel_singleton); guarded because a
+    # FAILED warm leaves construction to retry here.
+    try:
+        _sel().log_api_access(
+            caller=f"app:{app}",
+            operation=operation,
+            outcome="allowed" if refused is None else "denied",
+            source="dashboard",
+            resources=",".join(job_ids) if refused is None else refused,
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for app cron %s failed", operation, exc_info=True)
+    if refused is not None:
+        return _owner_denial_response(request)
+    return None
+
+
 async def api_crons_create(request: web.Request) -> web.Response:
     """POST /api/crons — create a cron job."""
+    # Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    # the class ``is_owner_dashboard_request`` can rule on at all. An app token
+    # carries a non-empty name and stays confined to its manifest's declared
+    # paths by ``_enforce_app_scope`` -- ``POST /api/crons`` is one of those
+    # declarable paths (see ``docs/app-kit/api-reference.md``). No
+    # ``internal_auth`` clause: this route has no ``X-Internal-Secret`` caller,
+    # and a clause naming one would exempt a future caller nobody reviewed.
+    if request.get("app") == "":
+        # Body-scope import, like the sibling gates in this package
+        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+        # reaches back into sibling handler modules, so importing the helper at
+        # module scope from here would close a cycle.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "crons.create")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     # Per-route cap: the body carries the job's full agent message/prompt text,
     # whose field bound (MAX_CRON_MESSAGE chars) can exceed the shared 64 KB
@@ -645,8 +795,12 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # One-shot scheduling, mirroring cron_add's `at` / `delay` / `at_time`.
     # Precedence matches the tool exactly (`at` wins, then `delay`, then
     # `at_time`) so the same request body cannot mean two different instants
-    # depending on which entry point received it.
-    at_ts, at_err = _resolve_one_shot_at(body)
+    # depending on which entry point received it. The timezone is checked first
+    # because it is the zone an `at_time` clock time is read in.
+    if timezone_val and not is_valid_timezone(timezone_val):
+        safe_tz, _ = redact_credentials(redact_exfiltration_urls(timezone_val)[0])
+        return web.json_response({"error": f"invalid timezone: {safe_tz!r}"}, status=400)
+    at_ts, at_err = _resolve_one_shot_at(body, timezone_val)
     if at_err is not None:
         return at_err
     if channel and not CHANNEL_ID_RE.match(channel):
@@ -654,9 +808,6 @@ async def api_crons_create(request: web.Request) -> web.Response:
     if approval_mode and approval_mode not in {"", "auto"}:
         return web.json_response({"error": "invalid approval_mode"}, status=400)
     silent = body.get("silent", False)
-    if timezone_val and not is_valid_timezone(timezone_val):
-        safe_tz, _ = redact_credentials(redact_exfiltration_urls(timezone_val)[0])
-        return web.json_response({"error": f"invalid timezone: {safe_tz!r}"}, status=400)
     strict_schedule = body.get("strict_schedule", False)
     hide_in_chat = body.get("hide_in_chat", False)
     # A job created on a full context pays for memory, lessons, steering, skills
@@ -735,6 +886,16 @@ async def api_crons_create(request: web.Request) -> web.Response:
     }
     if approval_mode:
         add_kwargs["approval_mode"] = approval_mode
+    # An app token's job is stamped as that app's, exactly as ``CronSDK`` stamps
+    # it: without the stamp every later reader (the app's own PATCH/DELETE, the
+    # cron session's scope, the disabled-app fire gate, uninstall cleanup) takes
+    # the job for the person's. Host-written from the verified claim, never the
+    # body, so an app cannot claim another's jobs.
+    app_claim = request.get("app")
+    if isinstance(app_claim, str) and app_claim:
+        from kiro_crew.apps.cron_sdk import owner_tag
+
+        add_kwargs["created_by"] = owner_tag(app_claim)
     # Which schedule this job carries. Resolved to kwargs FIRST, then handed to a
     # single add_job_async call: one call site means the store-failure handling
     # below is written once and cannot drift between the three schedule shapes.
@@ -782,10 +943,17 @@ async def api_crons_create(request: web.Request) -> web.Response:
 
 async def api_cron_delete(request: web.Request) -> web.Response:
     """DELETE /api/crons/{id} — remove a cron job."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.delete")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.delete")
+    if app_denied is not None:
+        return app_denied
     try:
         ok = await state.crons.remove_job_async(job_id, actor="dashboard", source="api_cron_delete")
     except CronStoreBusy:
@@ -813,6 +981,10 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
     purged per successfully-removed job, mirroring the single-delete path, and a
     single ``crons`` refresh is pushed after the batch instead of one per id.
     """
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.batch_delete")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     # Default cap: the body is a bounded list of short job ids.
     body, body_err = await read_bounded_json(request)
@@ -828,6 +1000,9 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
     unique_ids = list(dict.fromkeys(ids))
     if len(unique_ids) > _MAX_BATCH_DELETE:
         return web.json_response({"error": f"too many ids (max {_MAX_BATCH_DELETE})"}, status=400)
+    app_denied = await _refuse_foreign_app_job(request, state, unique_ids, "crons.batch_delete")
+    if app_denied is not None:
+        return app_denied
     deleted: list[str] = []
     failed: list[str] = []
     try:
@@ -870,10 +1045,17 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
 
 async def api_cron_update(request: web.Request) -> web.Response:
     """PATCH /api/crons/{id} — update a cron job (partial)."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.update")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.update")
+    if app_denied is not None:
+        return app_denied
     # Per-route cap: a partial update can carry the job's full agent
     # message/prompt text, whose field bound (MAX_CRON_MESSAGE chars) can
     # exceed the shared 64 KB default in multibyte UTF-8. The helper also owns
@@ -1709,10 +1891,17 @@ async def api_cron_secret_grant(request: web.Request) -> web.Response:
 
 async def api_cron_run(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/run — trigger immediate execution."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.run")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.run")
+    if app_denied is not None:
+        return app_denied
     # Freshness-guaranteed lookup: this endpoint is handed a job id minted by
     # ANOTHER process (`kirocrew cron add`, the MCP cron_add tool), which writes
     # crons.json directly. The cache-only `list_jobs()` would not see that job
@@ -1723,24 +1912,31 @@ async def api_cron_run(request: web.Request) -> web.Response:
     job = await state.crons.get_job_async(job_id)
     if not job:
         return web.json_response({"error": "job not found"}, status=404)
-    # Reject if a run is already in flight. Overwriting _running_tasks[job_id]
-    # would orphan the prior task's handle (it could no longer be
-    # tracked/cancelled/joined) and allow overlapping duplicate runs. The
-    # check-and-set below is atomic: there is no await between the guard and the
-    # assignment, so the single-threaded event loop cannot interleave a second
-    # request into this critical section. (The lookup above awaits, so two
-    # concurrent requests can both reach the guard — but only one can pass it,
-    # because the guard and the assignment are not separated by an await.)
-    if job_id in state.crons._running_tasks or state.crons.is_running(job_id):
+    # Reject if a run is already in flight: a second overlapping run would
+    # orphan the prior task's handle (nothing could track, cancel
+    # or join it). The check-and-claim below is atomic: there is no await between
+    # the guard, run_job's claim and attach_run_task, so the single-threaded
+    # event loop cannot interleave a second request into this critical section.
+    # (The lookup above awaits, so two concurrent requests can both reach the
+    # guard — but only one can pass it, because the guard and the claim are not
+    # separated by an await.)
+    #
+    # A tracked task that has already finished is NOT a run in flight, whatever
+    # the claim says: a run whose task ends without reaching
+    # _run_job_isolated's finally leaves its claim stored with nothing on that
+    # path to release it, and this guard alone would then refuse every manual
+    # run of the job until the reaper sweep meets the finished task (it does
+    # the same release, once a sweep). Drop such leftovers first; the call is
+    # synchronous, so the check-and-claim stays await-free, and a task still
+    # running keeps the 409 below.
+    state.crons.discard_finished_run(job_id)
+    if state.crons.is_running(job_id):
         return web.json_response({"error": "job is already running"}, status=409)
-    task = asyncio.create_task(state.crons.run_job(job_id))  # type: ignore[arg-type]
-    state.crons._running_tasks[job_id] = task  # type: ignore[assignment]
-
-    def _on_done(t: asyncio.Task, _jid: str = job_id) -> None:  # type: ignore[type-arg]
-        if state.crons._running_tasks.get(_jid) is t:
-            state.crons._running_tasks.pop(_jid, None)
-
-    task.add_done_callback(_on_done)
+    # run_job claims the job synchronously while the call is evaluated; the
+    # wrapper task is handed to the claim on the same line so cancel() can
+    # reach a run still parked in its store refresh.
+    task = asyncio.create_task(state.crons.run_job(job_id))
+    state.crons.attach_run_task(job_id, task)
     state.push_refresh("crons")
     safe_name = redact_credentials(redact_exfiltration_urls(job.name)[0])[0]
     return web.json_response({"ok": True, "name": safe_name})
@@ -1783,7 +1979,12 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
         # that produced it is not recoverable from live config -- see
         # inject_cron_result_to_dashboard's ``include_prompt``.
         inject_cron_result_to_dashboard(
-            state, job, job.last_result or "", history=history, include_prompt=False
+            state,
+            job,
+            job.last_result or "",
+            history=history,
+            dismissed=await prefetch_cron_dismissed(state, job.id),
+            include_prompt=False,
         )
     else:
         # Job deleted (one-shot with delete_after_run). Create slot from history or notification.
@@ -1802,6 +2003,34 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
                 # recorder and the derived pin needs no exception for this one.
                 note_crew_log_class(state, slot)
                 hydrate_slot_from_history(slot, history)
+                # Mark dismissed-UNHYDRATED before the off-loop read: the slot is
+                # now bound + dirty with an empty in-memory set, and a periodic
+                # flush during the await would otherwise serialize [] over the
+                # transcript's real dismissals. With the flag False any such flush
+                # carries the on-disk line forward instead. A readable restore
+                # below then hydrates it; an unreadable read leaves it deferred.
+                #
+                # CLEAR the in-memory set here rather than trusting
+                # ``get_or_create_slot`` to have done it: this slot object may be
+                # a REUSED ``cron-{id}`` slot that still carries a PRIOR binding's
+                # dismissal. If that stale key survived and the metadata read came
+                # back UNREADABLE (so the authoritative restore below is skipped),
+                # the deferred union-carry flush would fold the foreign key into
+                # this ``session_key`` transcript and hide its matching chip. An
+                # empty set means the union carries only the transcript's own
+                # on-disk dismissals; the readable restore replaces it wholesale.
+                slot._dismissed_source_links = set()
+                slot.invalidate_source_links()
+                slot._dismissed_hydrated = False
+                if state.conversation_log is not None:
+                    try:
+                        _meta, _readable = await asyncio.to_thread(
+                            state.conversation_log.get_metadata_status, session_key
+                        )
+                    except Exception:
+                        _meta, _readable = {}, False
+                    if _readable:
+                        _restore_dismissed_source_links(slot, _meta.get("dismissed_source_links"))
         else:
             # No session log — fall back to notification body.
             notif = next(
@@ -1823,10 +2052,17 @@ async def api_cron_to_chat(request: web.Request) -> web.Response:
 
 async def api_cron_enable(request: web.Request) -> web.Response:
     """POST /api/crons/{id}/enable — toggle enable/disable."""
+    if request.get("app") == "":
+        owner_denied = await require_owner_dashboard_request(request, "crons.enable")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     if (_e := _invalid_path_id_response(job_id, "job_id")) is not None:
         return _e
+    app_denied = await _refuse_foreign_app_job(request, state, [job_id], "crons.enable")
+    if app_denied is not None:
+        return app_denied
     # Default cap: the body is a single flag. allow_absent keeps the
     # missing-body-means-defaults contract; a body that is PRESENT but
     # malformed is a 400; only an absent body defaults.
@@ -1967,7 +2203,10 @@ def _read_script_source_sync(
         # resolver would crash on it. Refuse, same code as any bad path.
         return None, ("script path refused", "script_path_refused")
     try:
-        file_path, func_name = resolve_script_path(script_spec)
+        # A PERSISTED spec off crons.json, so an app cron's bundle path must
+        # resolve here; the nolink read below stays pinned to crons/, so a
+        # bundle script yields a typed refusal rather than bundle bytes.
+        file_path, func_name = resolve_script_path(script_spec, allow_bundle_roots=True)
     except FileNotFoundError:
         return None, ("script file not found", "script_not_found")
     except Exception:
@@ -2441,6 +2680,30 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             {"error": "Memory writes are not allowed in this session mode."},
             status=403,
         )
+    # Global persistence switch (memory.persistence_enabled).
+    # Enforced on the route rather than in the learn_add MCP handler so every
+    # transport that posts here (MCP tool, dashboard, direct HTTP) is covered
+    # by the one check. Reads and deletions stay available — the right to
+    # forget survives the switch.
+    if not KiroCrewConfig.load().memory.persistence_enabled:
+        _sel().log_api_access(
+            caller=sk,
+            operation="learn_add",
+            outcome="denied",
+            source="dashboard",
+            resources="persistence_disabled",
+            error="Persistent memory is disabled (memory.persistence_enabled).",
+        )
+        return web.json_response(
+            {
+                "error": "Lesson was NOT saved: persistent memory is disabled "
+                "(memory.persistence_enabled is false). Re-enable it with "
+                "`kirocrew config set memory.persistence_enabled true` to save "
+                "lessons again.",
+                "code": "persistence_disabled",
+            },
+            status=403,
+        )
     # Validate body fields against the SAME schema the learn_add MCP tool uses
     # (LEARN_ADD_SCHEMA), so REST and tool paths share one source of truth:
     # rule must be a string (bounded to MAX_SHORT_STRING), category/scope are
@@ -2469,6 +2732,11 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # Both write paths carry it, so the JSONL fallback store gates identically to
     # the vector store rather than injecting a scoped lesson the other withholds.
     repo_scope = cleaned.get("repo_scope") or None
+    # Which startup tier this correction belongs to, as STATED by the caller (the
+    # learn_add tool, the dashboard, the CLI). Absent leaves the row unstated,
+    # which the context builder serves as a standing rule. Both write paths carry
+    # it so the JSONL fallback tiers identically to the vector store.
+    applies = cleaned.get("applies") or None
     # Write to vector store if available, else JSONL
     # THE CALLER'S silo, not the global store. This is the agent's only durable
     # memory-write surface, so writing globally let a crew bound to one silo steer
@@ -2516,6 +2784,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             rule_emb,
             rule_emb_generation,
             repo_scope,
+            applies=applies,
         )
         # Sweep ONLY when the lesson actually landed. The write declines for a value
         # its preflight refuses (reachable because ``negative`` is forwarded here) and
@@ -2543,6 +2812,31 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             candidates = await asyncio.to_thread(
                 vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb, repo_scope
             )
+            # A second deletion route, and it ends in delete_semantic on a one-word
+            # LLM verdict. The invariant is on the CANDIDATE, not on the submission:
+            # a model-guessed contradiction may retire only a finding (on_topic). A
+            # standing (always) candidate is always protected, and an unstated
+            # candidate is protected too -- injection serves it AS a standing rule,
+            # and on a store predating the field every row is unstated.
+            #
+            # So the filter is unconditional and reads the CANDIDATE's persisted tier
+            # via _candidate_applies, which fails safe to unstated (protected). The
+            # submission's tier is deliberately not consulted: a model verdict is not
+            # authority to delete a standing rule the user filed, whichever tier the
+            # submission carries. Gating on the submission (its old form,
+            # `if result.applies == on_topic`) fired only for a finding submission,
+            # so a standing or unstated submission skipped the guard and the sweep
+            # could tombstone a standing candidate the model called contradictory --
+            # with no recovery, since the "self-heals on the next learn_add" note
+            # below covers a MISSED sweep, not a wrong deletion. This is stricter
+            # than write_lesson's deterministic dedup scan, which may let a standing
+            # submission retire a finding, because that scan decides on text while
+            # this one decides on a guess.
+            candidates = [
+                candidate
+                for candidate in candidates
+                if _candidate_applies(candidate) == LESSON_APPLIES_ON_TOPIC
+            ]
             if candidates:
                 # Fire-and-forget via this module's _background_tasks
                 # pattern. The sweep only supersedes OTHER (older) lessons, never
@@ -2558,6 +2852,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             category=category,
             negative=negative,
             repo_scope=repo_scope,
+            applies=applies,
             ts=datetime.now(timezone.utc).isoformat(),
         )
         store = _lesson_jsonl_store(state, _lesson_silo, scope, cleaned.get("workspace"))
@@ -2572,7 +2867,20 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # refusal the fallback owns, and its string outcome matches
         # LessonWriteOutcome on the wire.
         outcome = await asyncio.to_thread(store.save_or_enrich, lesson)
-        reason = "volatile_session_fact" if outcome == "refused" else None
+        # This store has exactly TWO refusal paths -- the volatile-text predicate
+        # and the row cap -- and both answer with the bare ``refused`` string, so
+        # the cause has to be re-derived here. Re-running the predicate is exact
+        # rather than a guess: it is the same pure-text call the store made, and
+        # ``_lesson_withheld`` above re-derives it the same way for its own surface.
+        # Reporting every refusal as ``volatile_session_fact`` told a user at the
+        # row cap to reword a rule whose wording was never the problem.
+        reason = None
+        if outcome == "refused":
+            reason = (
+                "volatile_session_fact"
+                if contains_volatile_lesson_fact(rule, negative)
+                else LESSON_REFUSED_AT_CAPACITY
+            )
         stored = outcome != "refused"
         # A genuine empty, not an unfilled field. ``_insert_or_enrich`` has no dedup
         # rule that supersedes: it matches on exact rule text plus scope and either
@@ -3226,6 +3534,7 @@ async def api_lessons(request: web.Request) -> web.Response:
         repo_scope: object = None,
         *,
         tier: tuple[str, str | None] | None = None,
+        applies: object = None,
     ) -> dict:
         """One sanitization chokepoint for every branch of this endpoint.
 
@@ -3262,6 +3571,16 @@ async def api_lessons(request: web.Request) -> web.Response:
             result["scope"] = tier[0]
             if tier[1] is not None:
                 result["workspace"] = tier[1]
+        # Only an AUTHORED tier is reported. A row nobody tiered is served as a
+        # standing rule, so emitting a value for it would name a distinction the
+        # injection path does not make, and the key's absence is what says "this
+        # row carries no author's answer". This is the surface every overflow
+        # notice sends the reader to, so a row filed as a finding has to be
+        # visible HERE -- without it a rule misfiled as on_topic silently stops
+        # arriving and the listing that is supposed to explain it shows nothing.
+        authored_applies = _authored_lesson_applies(applies)
+        if authored_applies is not None:
+            result["applies"] = authored_applies
         if contains_volatile_lesson_fact(rule, negative):
             result["withheld_reason"] = "volatile_session_fact"
         return result
@@ -3331,7 +3650,17 @@ async def api_lessons(request: web.Request) -> web.Response:
         # nowhere to carry a scope and reads as global, exactly as the
         # store's own ``_lesson_scope`` / ``_lesson_scope_unusable`` read it.
         raw_scope = decoded.get("repo_scope") if isinstance(decoded, dict) else None
-        data.append(_safe_lesson(rule, raw_category, e.get("updated_at", ""), negative, raw_scope))
+        raw_applies = decoded.get("applies") if isinstance(decoded, dict) else None
+        data.append(
+            _safe_lesson(
+                rule,
+                raw_category,
+                e.get("updated_at", ""),
+                negative,
+                raw_scope,
+                applies=raw_applies,
+            )
+        )
     # The population is measured by the rows THIS list renders: everything
     # that decodes (legacy strings and rule-less mappings included, marked
     # withheld), which is what ``has_any_decodable_lesson()`` asks. A page with
@@ -3372,7 +3701,21 @@ async def api_lessons(request: web.Request) -> web.Response:
         # tier where ``offset`` also counts back from the newest row.
         end = max(0, total - offset)
         data = [
-            _safe_lesson(le.rule, le.category, le.ts, le.negative, le.repo_scope, tier=tier)
+            _safe_lesson(
+                le.rule,
+                le.category,
+                le.ts,
+                le.negative,
+                le.repo_scope,
+                tier=tier,
+                # ``getattr``, not ``le.applies``: this branch renders whatever
+                # the JSONL loader produced, and a row from an older file (or a
+                # caller passing a lighter row shape) carries no tier attribute at
+                # all. Absent reads the same as unstated, which is the tier every
+                # row written before the field existed is in -- the same policy
+                # the rule/scope reads above already apply to a malformed row.
+                applies=getattr(le, "applies", None),
+            )
             for le, tier in tiered[max(0, end - limit) : end]
         ]
     return _page_body(data, total)

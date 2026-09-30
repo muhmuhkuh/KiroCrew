@@ -19,9 +19,10 @@ import sys
 import pytest
 
 from kiro_crew.acp import session_handle as sh
+from kiro_crew.acp import skill_projection  # bound before a fixture patches its paths
 from kiro_crew.acp.kas_agents import _KAS_FALLBACK_PROMPT
 from kiro_crew.acp.runtime import AcpRuntime
-from kiro_crew.acp.types import ACP_BACKEND_KAS
+from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
 
 
 @pytest.fixture(autouse=True)
@@ -42,8 +43,19 @@ def _fast_no_report_ceiling(monkeypatch):
 _MODE_STUB = """
 import json, os, sys
 
-BUILTIN = ["vibe", "spec", "plan"]
+# ``review`` stands in for a built-in id the engine keeps for itself that Crew's
+# pre-wire reserved set does not know about (the measured ones are refused
+# before the wire and never reach a stub).
+BUILTIN = ["vibe", "spec", "plan", "review"]
 state = {"modes": list(BUILTIN), "injected": [], "set_mode": None}
+
+def mode_entry(mode_id):
+    # The v3 engine stamps who supplied each definition; a client entry that
+    # collides with a built-in id is discarded and the built-in stays stamped
+    # as its own (measured on kiro-cli 2.23.0).
+    origin = "bundled" if mode_id in BUILTIN else "client"
+    return {"id": mode_id, "name": mode_id,
+            "_meta": {"kiro": {"resource": {"resourceType": "agent", "source": {"origin": origin}}}}}
 RECORD = os.environ["KAS_STUB_RECORD"]
 
 def send(obj):
@@ -65,16 +77,17 @@ for line in sys.stdin:
             "protocolVersion": params.get("protocolVersion"),
             "agentCapabilities": {"loadSession": True},
         }})
-    elif method == "session/new":
+    elif method in ("session/new", "session/load"):
         agents = ((params.get("_meta") or {}).get("kiro") or {}).get("customAgents") or []
         state["injected"] = agents
-        state["modes"] = list(BUILTIN) + [a.get("id") for a in agents if a.get("id")]
+        state["modes"] = list(BUILTIN) + [
+            a.get("id") for a in agents if a.get("id") and a.get("id") not in BUILTIN]
         record()
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "sessionId": "kas-mode-session",
             "modes": {
                 "currentModeId": "vibe",
-                "availableModes": [{"id": m, "name": m} for m in state["modes"]],
+                "availableModes": [mode_entry(m) for m in state["modes"]],
             },
         }})
     elif method == "session/set_mode":
@@ -158,6 +171,90 @@ class TestModeBinding:
         # Activation had to happen, and had to name the injected agent — not a
         # built-in that KAS would have run in its place.
         assert seen["set_mode"] == "kirocrew"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", [ACP_BACKEND_KAS, ACP_BACKEND_KIRO], ids=["kas", "kiro"])
+    async def test_only_a_kas_session_records_its_projected_batch(
+        self, mode_stub, crew_agent, tmp_path, monkeypatch, backend
+    ):
+        """The projection bookkeeping is KAS-only: a kiro-cli handle keeps the defaults."""
+        from kiro_crew.acp import kas_agents
+
+        recorded: list = []
+        real = kas_agents.projected_auto_approved
+
+        def spy(custom_agents, active_agent):
+            recorded.append(active_agent)
+            return real(custom_agents, active_agent)
+
+        # Only the KAS harness records the projection; the kiro one never reads it.
+        monkeypatch.setattr(kas_agents, "projected_auto_approved", spy)
+        if backend == ACP_BACKEND_KIRO:
+            # The kiro spawn's skill-view projection is not what this test is about.
+            monkeypatch.setattr(
+                skill_projection,
+                "prepare_native_skill_projection",
+                lambda work_dir, **_kwargs: skill_projection.NativeSkillProjection(
+                    {"vibe": "vibe"}
+                ),
+            )
+        kas = backend == ACP_BACKEND_KAS
+        # kiro-cli takes its agent at spawn: the stub's own current mode stands in.
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "wsp",
+            agent="kirocrew" if kas else "vibe",
+            sandbox_mode="off",
+            acp_backend=backend,
+        )
+        try:
+            await runtime.spawn()
+            handle = await runtime.create_session(
+                cwd=tmp_path / "wsp", agent="kirocrew" if kas else None
+            )
+        finally:
+            await runtime.kill()
+        if kas:
+            assert recorded == ["kirocrew"]
+            assert handle.kas_projected_agent == "kirocrew"
+            assert isinstance(handle.kas_auto_approved, frozenset)
+        else:
+            assert recorded == []
+            assert handle.kas_auto_approved is None
+            assert handle.kas_projected_agent == ""
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_kas_session_records_its_re_registered_batch(
+        self, mode_stub, crew_agent, tmp_path, monkeypatch
+    ):
+        """session/load re-registers the batch, and the resumed handle records it."""
+        from kiro_crew.acp import kas_agents
+
+        recorded: list = []
+        real = kas_agents.projected_auto_approved
+
+        def spy(custom_agents, active_agent):
+            recorded.append(active_agent)
+            return real(custom_agents, active_agent)
+
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "wsl",
+            agent="kirocrew",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        session_file = tmp_path / "prior.jsonl"
+        session_file.write_text("", encoding="utf-8")
+        try:
+            await runtime.spawn()
+            monkeypatch.setattr(kas_agents, "projected_auto_approved", spy)
+            handle = await runtime.load_session(
+                str(session_file), "kas-mode-session", cwd=tmp_path / "wsl", agent="kirocrew"
+            )
+        finally:
+            await runtime.kill()
+        assert recorded == ["kirocrew"]
+        assert handle.kas_projected_agent == "kirocrew"
+        assert [a["id"] for a in handle.kas_registered_agents] == ["kirocrew"]
 
     @pytest.mark.asyncio
     async def test_runtime_default_agent_is_activated_without_explicit_request(
@@ -277,6 +374,70 @@ class TestModeBinding:
             assert "onto KAS" in str(exc.value)
         finally:
             await runtime.kill()
+
+    @pytest.mark.asyncio
+    async def test_a_reserved_id_is_refused_before_the_wire(self, mode_stub, crew_agent, tmp_path):
+        """``plan`` is one of the ids kiro-cli 2.23.0 keeps for itself; the
+        projection refuses it with the remedy and nothing reaches the host."""
+        (crew_agent / "plan.json").write_text(
+            json.dumps({"name": "plan", "tools": ["fs_read"], "prompt": "You are Plan."}),
+            encoding="utf-8",
+        )
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "ws4",
+            agent="plan",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        try:
+            await runtime.spawn()
+            with pytest.raises(Exception) as exc:
+                await runtime.create_session(cwd=tmp_path / "ws4", agent="plan")
+            # The whole message IS the instruction: no "cannot project ... onto
+            # KAS" prefix in front of it, and the shipped labels in the remedy.
+            assert str(exc.value).startswith("Rename this crewmate's template: “plan” is reserved")
+            assert "onto KAS" not in str(exc.value)
+            assert "Agent Template tab" in str(exc.value)
+        finally:
+            await runtime.kill()
+        assert not mode_stub.exists(), "no session/new reached the host"
+
+    @pytest.mark.asyncio
+    async def test_an_id_the_host_keeps_for_itself_is_refused_not_activated(
+        self, mode_stub, crew_agent, tmp_path
+    ):
+        """Guard (C): the id IS advertised, but stamped as the host's own agent.
+
+        A set_mode would succeed and run the engine's built-in under the
+        crewmate's name -- the silent-substitution shape the pre-wire reserved
+        set cannot cover for a built-in id it has not measured. The wire stamp
+        (``origin: bundled`` instead of ``client``) is what catches it.
+        """
+        (crew_agent / "review.json").write_text(
+            json.dumps({"name": "review", "tools": ["fs_read"], "prompt": "You review."}),
+            encoding="utf-8",
+        )
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "ws5",
+            agent="review",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        try:
+            await runtime.spawn()
+            with pytest.raises(Exception) as exc:
+                await runtime.create_session(cwd=tmp_path / "ws5", agent="review")
+            assert str(exc.value).startswith(
+                "Rename this crewmate's template: “review” is reserved"
+            )
+            assert "Agent Template tab" in str(exc.value)
+            assert "kas-mode-session" not in str(exc.value)
+        finally:
+            await runtime.kill()
+        seen = json.loads(mode_stub.read_text(encoding="utf-8"))
+        assert [a["id"] for a in seen["injected"]] == ["review"]
+        # Never activated: that is the whole point.
+        assert seen["set_mode"] is None
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the stub launcher is a POSIX shell script")

@@ -1,12 +1,12 @@
 """Which crew a Fargate resource belongs to, recovered from its ARN.
 
-A crew's model credential reaches its container through the task definition's
+A crew's model identity reaches its container through the task definition's
 ``secrets[].valueFrom``, fetched by the **execution role** before the container
-starts. Nothing downstream can tell a wrong credential from a right one: the
-container's ``require_api_key`` proves a key was supplied, not that it is this
-crew's key. A document that names another crew's secret ARN therefore produces a
-task that starts, answers, and serves turns under the wrong identity, with no
-error at either end.
+starts. Nothing downstream can tell a wrong identity from a right one: the
+container's ``require_model_identity`` proves an identity was stored in the crew's
+vault, not that it is this crew's. A document that names another crew's secret ARN
+therefore produces a task that starts, answers, and serves turns under the wrong
+identity, with no error at either end.
 
 **IAM is the primary control.** Each crew's execution role is derived per crew
 (:func:`execution_role_arn`), so it can be granted that crew's secret and no
@@ -67,21 +67,21 @@ LOG_GROUP_PREFIX = "/kirocrew/crew/"
 #: never starting or ending with a hyphen. A trailing hyphen would make the
 #: derived role name end in ``--exec``, and a leading one is not a legal start
 #: for the resource names built from it.
-_CREW_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+_CREW_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?\Z")
 
 #: An AWS partition: ``aws``, ``aws-cn``, ``aws-us-gov``.
-_PARTITION_RE = re.compile(r"^aws(?:-[a-z0-9]+)*$")
+_PARTITION_RE = re.compile(r"^aws(?:-[a-z0-9]+)*\Z")
 
 #: A 12-digit account id. Anything shorter or longer is not an account.
-_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+_ACCOUNT_RE = re.compile(r"^[0-9]{12}\Z")
 
 #: A region name as it appears in an ARN.
-_REGION_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+_REGION_RE = re.compile(r"^[a-z0-9-]{1,32}\Z")
 
 #: A crew secret's canonical NAME, with no service suffix. This is the shape a
 #: caller states; the ARN is checked against it rather than searched for a split.
 _SECRET_NAME_RE = re.compile(
-    r"^" + re.escape(SECRET_NAME_PREFIX) + r"(?P<crew>[^/]+)/(?P<key>[A-Za-z0-9_]+)$"
+    r"^" + re.escape(SECRET_NAME_PREFIX) + r"(?P<crew>[^/]+)/(?P<key>[A-Za-z0-9_]+)\Z"
 )
 
 #: The suffix Secrets Manager appends to a secret's name in its complete ARN.
@@ -90,7 +90,7 @@ _SECRET_NAME_RE = re.compile(
 #: recovered. A role ARN is TOTALLY derivable, so :func:`parse_role_arn` can make
 #: the round-trip its own parse; there is no equivalent for this suffix, and a
 #: pattern that strips it must guess where the name ends.
-_SECRET_SUFFIX_RE = re.compile(r"^[A-Za-z0-9]{6}$")
+_SECRET_SUFFIX_RE = re.compile(r"^[A-Za-z0-9]{6}\Z")
 
 #: The SHAPE a crew secret's variable segment plus service suffix has. It refuses
 #: an ARN carrying no suffix at all. Checking the shape is not the same as
@@ -98,7 +98,7 @@ _SECRET_SUFFIX_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 #: secret's complete ARN, and deliberately does not say which part is the
 #: variable. The first is a property of the string; the second needs the split
 #: point, which only a :class:`SecretRef` states.
-_SECRET_TAIL_RE = re.compile(r"^[A-Za-z0-9_]+-[A-Za-z0-9]{6}$")
+_SECRET_TAIL_RE = re.compile(r"^[A-Za-z0-9_]+-[A-Za-z0-9]{6}\Z")
 
 
 @dataclass(frozen=True)
@@ -197,8 +197,19 @@ def _refuse(reason: str) -> NoReturn:
     raise DocumentRefused(reason)
 
 
-def _validated_crew(crew: str, *, source: str) -> str:
-    """The crew name, or refuse. Charset is checked before anything derives it."""
+def validated_crew_name(crew: str, *, source: str = "crew name") -> str:
+    """The crew name, or refuse. Charset is checked before anything derives it.
+
+    Public for the reason :func:`validated_region` is public. A crew name is read
+    in more than one place, and two places that have to agree about a charset is
+    the trap this module names elsewhere: the looser reader is the one a caller
+    reaches, and nothing makes a case added to one appear in the other. The crew
+    bundle builder decides a crew name at the step where an operator is still
+    choosing what the bundle contains, which is before any launch derives a
+    resource from it, so it asks THIS function instead of restating the pattern. A
+    name a bundle accepts is then a name a launch accepts, and the two cannot
+    drift apart.
+    """
     if not _CREW_RE.match(crew):
         _refuse(
             f"{source} names crew {crew!r}, which is not a crew name: 1 to 32 characters, "
@@ -314,7 +325,7 @@ def _crew_in_secret_arn(arn: str, *, source: str) -> CrewBinding:
     return CrewBinding(
         partition=partition,
         account=account,
-        crew=_validated_crew(crew, source=source),
+        crew=validated_crew_name(crew, source=source),
     )
 
 
@@ -350,8 +361,8 @@ def secret_env_name(ref: SecretRef, *, source: str = "secret reference") -> str:
     Read from the name the reference states and the ARN was verified against, so a
     document cannot deliver one secret's value under another secret's variable.
     That mistake is the credential defect in its quietest form: the crew agrees,
-    the reference resolves, and ``require_api_key`` sees a key present, so the
-    task starts and every turn runs on the wrong value.
+    the reference resolves, and ``require_model_identity`` sees an identity in the
+    vault, so the task starts and every turn runs on the wrong value.
 
     Validation is :func:`parse_secret_arn`'s, by calling it rather than by
     repeating its checks. Two functions reading one reference to different

@@ -32,33 +32,29 @@ and ``resolve``, applied to a range read.
 The storage package is imported LAZILY here, on the first call that needs it,
 never at module import. The crew log is an optional subsystem behind
 ``KIROCREW_CREW_LOG``, this module is reachable from the dashboard's boot
-path, and a gateway launched with the flag unset must not pay to load a store it
-will not read -- the same split the emitter keeps, and one a test pins from a
+path, and a gateway launched with the flag set to a falsy value must not pay to
+load a store it will not read -- the same split the emitter keeps, and one a test pins from a
 clean interpreter.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import os
 from collections import OrderedDict
+from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp import web
 
-from kiro_crew.constants import env_flag_enabled
+from kiro_crew.constants import CREW_LOG_ENV, ENV_FALSY, crew_log_enabled, env_file_display
 from kiro_crew.dashboard.handlers._shared import (
     guard_owner_surface_routes,
     require_owner_dashboard_request,
 )
-
-#: The variable that switches the crew log on, spelled here rather than read from
-#: the emitter's ``CREW_LOG_ENV``. This module sits on the gateway's boot path and
-#: importing that module to learn whether it is wanted is the very cost the flag
-#: exists to avoid. A test pins this string against the emitter's own constant, so
-#: the two cannot drift apart unnoticed.
-CREW_LOG_ENV: Final[str] = "KIROCREW_CREW_LOG"
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     from kiro_crew.crew_log.errors import CrewLogError
@@ -89,6 +85,16 @@ def _crew_log_read() -> ModuleType:
 #: The frame a growing crew log pushes. The RFC's name, kept.
 FRAME = "session_projection"
 
+#: The frame that says a SLOT's crew log grew. It carries the slot and nothing
+#: else: slot folds (the conductor work board among them) join several units and
+#: are read through the projection route, so the push only tells an observer
+#: which slot to re-read instead of polling it.
+SLOT_FRAME = "slot_projection"
+
+#: Units whose owning slot is remembered. A unit's header is written once and
+#: never rewritten, so the answer never goes stale; the bound only caps memory.
+MAX_CACHED_SLOT_OWNERS: Final[int] = 512
+
 #: Distinct refs a single page resolves. Each resolution opens the cited unit and
 #: walks to the span, so the work is bounded per request rather than left to
 #: however many citations a page happens to carry; identical refs on one page are
@@ -111,6 +117,14 @@ MAX_CACHED_SESSIONS: Final[int] = 32
 
 def _bad_request(message: str, code: str) -> web.Response:
     return web.json_response({"error": message, "code": code}, status=400)
+
+
+def _owner_served_refusal(name: str) -> web.Response:
+    """The answer for a slot-keyed fold its owner serves: the same as an unregistered name."""
+    return _bad_request(
+        f"projection {name!r} is slot-keyed and is served by its owner, not by this route",
+        "unknown_projection",
+    )
 
 
 def _seq_param(request: web.Request, name: str) -> int | None:
@@ -189,9 +203,15 @@ def _unit_id(request: web.Request, given: str) -> tuple[str, bool]:
     state -- the exact reason ``crew_log/resolve.py`` documents for not touching it.
     And a retired unit belongs to a different session from the one this slot serves:
     presenting its totals here would imply a whole-life figure that needs the lineage
-    pointer (``session/opened.data.previous``) and a fold that follows it, and this
-    module has neither. So the honest move is to say what is addressable, not to
-    guess.
+    pointer (``session/opened.data.previous``) and a fold that follows it. Both now
+    exist -- the pointer on the entry, and ``session_tree.fold_slot_chain``, which
+    walks it newest unit first, bounded, cycle-guarded and held to one slot -- but
+    this function calls neither and deliberately answers the narrower question. A
+    caller that does join them owes the walk's ``ended`` reason as well as its ids:
+    only ``first`` reached the slot's first unit, so every other reason is a total
+    over PART of a life and presenting it as the whole would be the same false
+    implication in a new place. So the honest move here is still to say what is
+    addressable, not to guess.
     """
     if not given:
         return given, False
@@ -287,6 +307,12 @@ async def api_session_crew_log_projection(request: web.Request) -> web.Response:
         projections.require_name(name)
     except CrewLogError as exc:
         return _bad_request(exc.message, "unknown_projection")
+    if name == projections.OWNER_SERVED_SLOT_PROJECTION:
+        # A slot-keyed fold its OWNER serves: the owner orders the slot's units by
+        # what the crew recorded and pins the live unit last, which this route cannot
+        # do, and folding the one unit it addresses would serve a part of the record
+        # as the whole. Refused the way an unregistered name is.
+        return _owner_served_refusal(name)
     unit_id, _ = _unit_id(request, session_id)
     try:
         if name in projections.SLOT_PROJECTION_NAMES:
@@ -358,14 +384,40 @@ async def api_session_crew_log_projections(request: web.Request) -> web.Response
     # reads follow: a client polling by slot key compares this against the id it
     # sent, and answering with the resolved ACP id would break that comparison and
     # put an internal identity on the wire.
-    return web.json_response(
-        {
-            "session_id": session_id,
-            "projections": folded,
-            "resolved": resolved,
-            "writes_drained": drained,
-        }
-    )
+    # Whether the gateway is recording at all. An empty fold cannot say, and the two
+    # cases want different words: a session that has not recorded yet, and a gateway
+    # whose flag switched recording off.
+    recording = crew_log_enabled()
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "projections": folded,
+        "resolved": resolved,
+        "writes_drained": drained,
+        "recording": recording,
+    }
+    if not recording:
+        payload["flag_value"] = value = crew_log_flag_value()
+        # Whether the value is one of the switch-off spellings. The panel words an
+        # unrecognised one as such, so a typo is not read as the app misspelling it.
+        payload["flag_recognised"] = value.lower() in ENV_FALSY
+        # The ``.env`` the gateway reads, so the panel names the file to edit.
+        payload["env_file"] = env_file_display()
+    return web.json_response(payload)
+
+
+#: The longest flag value the fold read quotes back; a longer one is cut.
+_FLAG_VALUE_MAX = 40
+
+
+def crew_log_flag_value() -> str:
+    """The ``KIROCREW_CREW_LOG`` value that switched recording off, as the panel quotes it.
+
+    Only this one variable, and only its printable characters up to
+    :data:`_FLAG_VALUE_MAX`: the read is owner-gated, and the operator set the value
+    themselves, so quoting it lets them see a typo instead of a list of spellings.
+    """
+    value = os.environ.get(CREW_LOG_ENV, "").strip()
+    return "".join(char for char in value if char.isprintable())[:_FLAG_VALUE_MAX]
 
 
 #: How long a fold read waits for the writer to owe nothing before folding anyway.
@@ -506,11 +558,18 @@ def _crew_log_refusal(exc: "CrewLogError") -> web.Response:
 #: cannot drift.
 CREW_LOG_MCP_CALLER: Final[str] = "kirocrew-crew-log"
 
-#: How to switch the crew log on, quoted in the refusal a disabled read earns. An
-#: agent that reads ``crew_log_disabled`` should not have to be told separately.
-CREW_LOG_ENABLE_HINT: Final[str] = (
-    f"set {CREW_LOG_ENV}=1 in ~/.kiro/crew/.env and restart the gateway"
-)
+
+def crew_log_enable_hint() -> str:
+    """How to switch the crew log back on, quoted in the refusal a disabled read earns.
+
+    The log is on by default, so a disabled read means the variable holds a falsy or
+    unrecognised value. An agent that reads ``crew_log_disabled`` should not have to be
+    told separately. The ``.env`` named is the one the gateway reads.
+    """
+    return (
+        f"{CREW_LOG_ENV} is set to 0, false, no, off or an unrecognised value; unset it "
+        f"(or remove it from {env_file_display()}) and restart the gateway"
+    )
 
 
 def _forbidden(reason: str) -> web.Response:
@@ -528,7 +587,7 @@ def _disabled() -> web.Response:
     """
     return web.json_response(
         {
-            "error": f"the crew log is switched off; {CREW_LOG_ENABLE_HINT}",
+            "error": f"the crew log is switched off; {crew_log_enable_hint()}",
             "code": "crew_log_disabled",
         },
         status=422,
@@ -561,6 +620,14 @@ _OUT_OF_SCOPE_REFUSAL: Final[str] = (
     "dispatched, and this request does not fall inside that scope; the owner's own "
     "dashboard session reads any unit"
 )
+#: There is deliberately no second refusal for a lineage scan that came back short.
+#: The distinction is real and worth recording -- an edge the scan never read is not
+#: the same fact as a unit outside the caller's tree -- but a caller-visible one
+#: would be an existence oracle: this door passes the REQUESTED unit as the scan's
+#: ``preferred``, and a named unit's own read fault feeds the scan's flag, so a
+#: guessed id that exists and cannot be read would word the refusal differently from
+#: one that does not exist. The fact goes to the operator's log at the refusal site
+#: instead, which is the half that needed it.
 
 LIST_SCOPE_KEY: Final[str] = "crew_log_list_scope"
 
@@ -1121,6 +1188,33 @@ async def _read_scope_refusal(request: web.Request, session_key: str, unit: str)
     if class_refusal:
         return class_refusal
     if not view.dispatched_by(unit, slot):
+        # A false answer here has two causes and only one of them is about the
+        # request. The scan may have placed every unit it read and this one is simply
+        # not in the caller's tree; or the scan could not read part of the store, in
+        # which case the edge that would have placed it may never have been looked
+        # at. ``dispatched_by`` cannot tell them apart -- it answers False for a
+        # missing node either way -- and the view's ``incomplete`` flag now can.
+        #
+        # The CALLER is told neither: one refusal text for both, because this door
+        # hands its answer to an authenticated caller that may be guessing unit ids,
+        # and the flag is STEERABLE by that guess. The probe passes the requested
+        # unit as ``preferred`` (see ``_probe`` below), the scan admits a named unit
+        # first and folds its own read fault into the scan's bit
+        # (``session_tree._records_with_fault``), so a guessed id that exists AND
+        # cannot be read would flip the wording while an id that does not exist
+        # would not -- an existence oracle on exactly the boundary
+        # ``_OUT_OF_SCOPE_REFUSAL`` exists to keep closed. The incompleteness goes
+        # to the operator instead, where it answers "why can my conductor not read
+        # its own child" without answering "does this unit exist" for anyone else.
+        if view.incomplete:
+            logger.warning(
+                "crew log dispatch scope refused a read while the lineage scan was "
+                "INCOMPLETE: part of the store could not be read on this pass, so "
+                "this unit's place in the caller's tree is unknown rather than known "
+                "to be outside it. unit=%r caller slot=%r",
+                unit,
+                slot,
+            )
         return _OUT_OF_SCOPE_REFUSAL
     # The target test, and only once the unit is known to be in this caller's tree: a
     # caller outside the tree must not be able to tell a refused class from a refused
@@ -1463,15 +1557,55 @@ def _unit_param(request: web.Request) -> str:
     return (request.match_info.get("unit") or "").strip()
 
 
+async def _offload_then_recheck(
+    request: web.Request,
+    operation: str,
+    work: Callable[[], Any],
+    respond: Callable[[Any], web.Response],
+    *,
+    unit: str = "",
+    listing: bool = False,
+) -> web.Response:
+    """Read off the loop, re-check the grant the read suspended, then answer.
+
+    An agent-door read that suspends owes four steps in one order: authorize, build
+    the payload off the loop, re-check the grant, answer. The gate is the route's own
+    first line because what it authorizes differs per route; the other three are the
+    same three calls in the same order everywhere, and they live here so that a route
+    cannot answer out of that order. The route hands over the read and the shaping and
+    never names the payload, so "answered without re-checking" is not a shape a route
+    can write -- which is a stronger guarantee than every route happening to get the
+    order right.
+
+    ``work`` is the read, already bound to its arguments, and runs in a thread.
+    ``respond`` turns the payload into the response and belongs to the ROUTE, because
+    what a payload means differs per route: a page with no log is a 404, a fold is
+    wrapped with the unit it was folded from, a listing is returned as it stands. It
+    is called only once the re-check holds, so a withdrawn grant reaches the caller as
+    the refusal and the route's shaping never runs at all.
+
+    A storage refusal is mapped here rather than per route because all three reads map
+    it the same way: :func:`_crew_log_refusal` keeps the code the caller can act on.
+    """
+    from kiro_crew.crew_log.errors import CrewLogError
+
+    try:
+        payload = await asyncio.to_thread(work)
+    except CrewLogError as exc:
+        return _crew_log_refusal(exc)
+    stale = await _stale_grant_refusal(request, operation, unit=unit, listing=listing)
+    if stale is not None:
+        return stale
+    return respond(payload)
+
+
 async def api_crew_log_sessions(request: web.Request) -> web.Response:
     """GET /api/crew-log/sessions -- one row per session crew log this caller may see."""
     denied = await _authorize_crew_log_read(request, "session_crew_log.list", listing=True)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
-    from kiro_crew.crew_log.errors import CrewLogError
-
     try:
         limit = int(request.query.get("limit") or 50)
         active_within_secs = int(request.query.get("active_within_secs") or 0)
@@ -1503,8 +1637,10 @@ async def api_crew_log_sessions(request: web.Request) -> web.Response:
             return False
         return not _workspace_refusal(caller_workspace, recorded)
 
-    try:
-        payload = await asyncio.to_thread(
+    return await _offload_then_recheck(
+        request,
+        "session_crew_log.list",
+        functools.partial(
             _crew_log_read().list_session_units,
             slot_contains=request.query.get("slot_contains", "") or "",
             active_within_ms=active_within_secs * 1000,
@@ -1513,13 +1649,12 @@ async def api_crew_log_sessions(request: web.Request) -> web.Response:
             scope_unit=scope_unit,
             scope_slot=scope_slot,
             admit_dispatched=_admit,
-        )
-    except CrewLogError as exc:
-        return _crew_log_refusal(exc)
-    stale = await _stale_grant_refusal(request, "session_crew_log.list", listing=True)
-    if stale is not None:
-        return stale
-    return web.json_response(payload)
+        ),
+        # A listing is returned as it stands: each row was admitted as it was
+        # gathered, so there is nothing left to shape.
+        web.json_response,
+        listing=True,
+    )
 
 
 async def api_crew_log_resolve(request: web.Request) -> web.Response:
@@ -1542,7 +1677,7 @@ async def api_crew_log_resolve(request: web.Request) -> web.Response:
     key = asked
     if not key:
         return _bad_request("key is required", "unresolvable_key")
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     unit = target
     if not unit:
@@ -1569,26 +1704,27 @@ async def api_crew_log_unit_page(request: web.Request) -> web.Response:
     denied = await _authorize_crew_log_read(request, "session_crew_log.read", unit=unit)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
-    from kiro_crew.crew_log.errors import CrewLogError
-
     try:
         start, end = _span(request)
     except ValueError as exc:
         return _bad_request(str(exc), "bad_range")
-    try:
-        payload = await asyncio.to_thread(_read_page, unit, start, end)
-    except CrewLogError as exc:
-        return _crew_log_refusal(exc)
-    stale = await _stale_grant_refusal(request, "session_crew_log.read", unit=unit)
-    if stale is not None:
-        return stale
-    if not payload.get("exists"):
-        return web.json_response(
-            {"error": f"no session crew log for {unit!r}", "code": "unknown_unit"}, status=404
-        )
-    return web.json_response(payload)
+
+    def _respond(payload: Any) -> web.Response:
+        if not payload.get("exists"):
+            return web.json_response(
+                {"error": f"no session crew log for {unit!r}", "code": "unknown_unit"}, status=404
+            )
+        return web.json_response(payload)
+
+    return await _offload_then_recheck(
+        request,
+        "session_crew_log.read",
+        functools.partial(_read_page, unit, start, end),
+        _respond,
+        unit=unit,
+    )
 
 
 async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
@@ -1597,7 +1733,7 @@ async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
     denied = await _authorize_crew_log_read(request, "session_crew_log.projection", unit=unit)
     if denied is not None:
         return denied
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return _disabled()
     from kiro_crew.crew_log.errors import CrewLogError
 
@@ -1607,14 +1743,31 @@ async def api_crew_log_unit_projection(request: web.Request) -> web.Response:
         projections.require_name(name)
     except CrewLogError as exc:
         return _bad_request(exc.message, "unknown_projection")
-    try:
-        result = await asyncio.to_thread(projections.read_projection, unit, name)
-    except CrewLogError as exc:
-        return _crew_log_refusal(exc)
-    stale = await _stale_grant_refusal(request, "session_crew_log.projection", unit=unit)
-    if stale is not None:
-        return stale
-    return web.json_response({"session_id": unit, **result.to_dict()})
+    if name == projections.OWNER_SERVED_SLOT_PROJECTION:
+        # Same refusal as the per-session route: this fold is slot-keyed and served
+        # by its owner; a per-unit fold of it would be a part served as the whole.
+        return _owner_served_refusal(name)
+    if name in projections.SLOT_PROJECTION_NAMES:
+        # This route folds ONE unit. A slot-keyed fold joins every unit the slot ran
+        # under (and, for the work board, its bound workers' units), so one unit's
+        # answer would be a partial record that reads as whole. The session route
+        # resolves the slot from the unit's header and serves these names whole.
+        return _bad_request(
+            f"projection {name!r} is keyed by slot, not by session", "slot_projection"
+        )
+
+    def _respond(result: Any) -> web.Response:
+        # The fold is named by the unit it was folded from, which the reader needs
+        # and the fold itself does not carry.
+        return web.json_response({"session_id": unit, **result.to_dict()})
+
+    return await _offload_then_recheck(
+        request,
+        "session_crew_log.projection",
+        functools.partial(projections.read_projection, unit, name),
+        _respond,
+        unit=unit,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1640,6 +1793,7 @@ class CrewLogPublisher:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._dirty: set[str] = set()
         self._bundles: "OrderedDict[str, Any]" = OrderedDict()
+        self._slot_owners: "OrderedDict[str, str]" = OrderedDict()
         self._scheduled = False
         # A flush pass runs to completion before the next one starts. Without
         # this, a growth arriving during a slow fold would schedule a second
@@ -1725,13 +1879,24 @@ class CrewLogPublisher:
             return
         from kiro_crew.crew_log.errors import CrewLogError
 
+        grown: list[str] = []
         for session_id in sessions:
             try:
-                await self._publish(session_id)
+                if await self._publish(session_id):
+                    grown.append(session_id)
             except CrewLogError as exc:
                 logger.debug("crew log fold refused for %s: %s", session_id, exc)
             except Exception:  # pragma: no cover - a push must not kill the loop
                 logger.debug("crew log publish failed for %s", session_id, exc_info=True)
+        # One frame per slot per pass: a slot's units growing together, or a team
+        # whose sessions all grew in one burst, is one re-read, not one each.
+        slots: dict[str, None] = {}
+        for session_id in grown:
+            slot = await self._slot_of(session_id)
+            if slot:
+                slots[slot] = None
+        for slot in slots:
+            self._state.broadcast_ws_owners(SLOT_FRAME, {"slot": slot})
 
     def _watchers(self) -> bool:
         """Whether a dashboard user has a socket open."""
@@ -1743,7 +1908,8 @@ class CrewLogPublisher:
         except Exception:  # pragma: no cover - a probe failure is not a verdict
             return False
 
-    async def _publish(self, session_id: str) -> None:
+    async def _publish(self, session_id: str) -> bool:
+        """Push every projection of *session_id* that moved; whether any did."""
         projections = _crew_log()
         before = self._bundles.get(session_id)
         bundle = await asyncio.to_thread(
@@ -1764,14 +1930,31 @@ class CrewLogPublisher:
         # client holding the retired file's projection with no later growth able to
         # dislodge it. When the origin changes, every projection is new.
         rebuilt = before is None or before.origin != bundle.origin
+        moved = False
         for name, checkpoint in bundle.checkpoints.items():
             previous = before.checkpoints.get(name) if before is not None else None
             if not rebuilt and previous is not None and previous.last_seq == checkpoint.last_seq:
                 continue
             if checkpoint.last_seq == 0:
                 continue
+            moved = True
             value = projections.projection_of(checkpoint)
             self._state.broadcast_ws_owners(FRAME, {"session_id": session_id, **value.to_dict()})
+        return moved
+
+    async def _slot_of(self, session_id: str) -> str:
+        """The slot *session_id*'s unit belongs to, from its immutable header."""
+        cached = self._slot_owners.get(session_id)
+        if cached is not None:
+            self._slot_owners.move_to_end(session_id)
+            return cached
+        slot: str = await asyncio.to_thread(_crew_log().slot_of_session, session_id)
+        # An unprovable owner is not cached: the header may not be written yet.
+        if slot:
+            self._slot_owners[session_id] = slot
+            while len(self._slot_owners) > MAX_CACHED_SLOT_OWNERS:
+                self._slot_owners.popitem(last=False)
+        return slot
 
     # -- lifecycle ---------------------------------------------------------- #
 
@@ -1804,9 +1987,10 @@ _publisher: CrewLogPublisher | None = None
 def install_crew_log_publisher(state: Any) -> CrewLogPublisher | None:
     """Register the crew-log push with the emitter, once per process.
 
-    Returns ``None`` and does nothing when the crew log is switched off. This runs
-    on the gateway's boot path, so a launch without the flag must not pay for a
-    subsystem it will not use: the flag is read from the environment here, before
+    Returns ``None`` and does nothing when the crew log is switched off. The gateway
+    calls this once its listener is serving, so building the publisher never delays
+    the bind, and a launch that switches the flag off does not pay for a subsystem it
+    will not use at all: the flag is read from the environment here, before
     the emitter is imported and before a publisher is built. Importing the emitter
     to ask it whether it is enabled would be the cost itself, which is why the
     variable's name is spelled out below rather than read from that module.
@@ -1819,7 +2003,7 @@ def install_crew_log_publisher(state: Any) -> CrewLogPublisher | None:
     twice.
     """
     global _publisher
-    if not env_flag_enabled(CREW_LOG_ENV):
+    if not crew_log_enabled():
         return None
     loop = asyncio.get_running_loop()
     if _publisher is not None:

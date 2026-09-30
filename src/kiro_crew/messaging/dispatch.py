@@ -10,6 +10,8 @@ This module owns the sequence every non-Slack channel dispatcher runs around
     -> publish_turn_identity
     -> ctx_builder.build_message         (off-loop, embeds block)
     -> TurnDriver.run                    (shared redaction + approval ladder)
+    -> COMPACTION_FAILED: reset; replay once more if the failure was transient
+                                         and nothing was emitted (bounded)
     -> post-turn: record_success, persist, threshold notice, SEL audit
                                          (each guarded independently)
     -> finally: renderer.close() + release (release gated on acquire)
@@ -31,10 +33,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from kiro_crew import runtime_death
 from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
-from kiro_crew.agent_sdk.drivers.acp_vocab import classify_stop_reason
+from kiro_crew.agent_sdk.backends import Routing, routing_for
+from kiro_crew.agent_sdk.drivers.acp_vocab import classify_stop_reason, is_runtime_death
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.history import transcript_stem
 from kiro_crew.hooks import (
     HOOK_REPLY,
     TOOL_AUTO_APPROVE,
@@ -43,6 +48,7 @@ from kiro_crew.hooks import (
     hook_gate_kwargs,
 )
 from kiro_crew.memory_stores import UnknownMemoryStore
+from kiro_crew.messaging import turn_ceiling
 from kiro_crew.messaging.driver import DirectiveConsumer, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import (
@@ -54,10 +60,22 @@ from kiro_crew.messaging.link import (
     DM_SCOPE_UNIFIED,
     ChannelLink,
     bind_origin_mirror,
+    canonical_key,
     channel_namespace_of,
     is_channel_session_key,
+    split_dm_session_key,
 )
-from kiro_crew.messaging.renderer import SilentRenderer
+from kiro_crew.messaging.renderer import (
+    DONE,
+    PROMPT_CHOICE,
+    STEER_CONSUMED,
+    TEXT_CHUNK,
+    TOOL_CALL,
+    OutputEvent,
+    Renderer,
+    SilentRenderer,
+)
+from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.security import (
     redact,
     redact_credentials,
@@ -73,6 +91,74 @@ from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
 
 logger = logging.getLogger(__name__)
+
+#: The agent a ``deny_all_tools`` turn runs on. Its spec declares ``tools: []``
+#: and no MCP servers (``agent._install_guest_agent``), so the backend mounts
+#: nothing for the session: no tool exists to call, whatever the operator's own
+#: agent auto-approves. That is the only enforcement that holds on the stock kiro
+#: backend, where a tool named in ``allowedTools`` raises no permission request
+#: and therefore never reaches the driver's ``deny_all_tools`` branch. A spec of
+#: its own, not the background ``kirocrew-lite``: that helper may grow a tool one
+#: day and its empty prompt reads as "no user to address" on backends that need
+#: one, while this agent talks to a person. The spec pin in
+#: ``test_messaging_dispatch.py::TestToollessAgentSpecIsTheBoundary`` makes any
+#: drift loud.
+TOOLLESS_TURN_AGENT = "kirocrew-guest"
+
+
+#: What a sender whose turn was refused as un-tool-less-able reads. One line, no
+#: internals: silence reads as the agent ignoring the person, and the operator's
+#: side of the story is the SEL row, not this note.
+TOOLLESS_TURN_REFUSAL_NOTE = "This account cannot answer you on its current setup. Ask its owner."
+
+
+def toolless_turns_supported(backend: str) -> bool:
+    """Whether a ``deny_all_tools`` turn can be driven on *backend* at all.
+
+    True only where the agent spec is what the harness mounts
+    (``Routing.AGENT_SPEC``): there ``tools: []`` removes every tool. Read by
+    channel startup to warn an operator whose configuration admits non-operator
+    traffic on a backend that will refuse every such turn.
+    """
+    return routing_for(backend) is Routing.AGENT_SPEC
+
+
+def warn_if_toolless_turns_unservable(
+    channel: str, *, admits_non_operators: bool, backend: str, admission: str
+) -> bool:
+    """Warn once, at a channel's start, when its admitted non-operators will all be refused.
+
+    Shared with every ``deny_all_tools`` adopter because the refusal itself lives
+    on the shared seam (:func:`drive_turn`); a channel supplies only the two facts
+    it alone knows, whether its configuration admits anyone but the operator and
+    how (``admission``, for the message). Returns True when it warned.
+    """
+    if not admits_non_operators or toolless_turns_supported(backend):
+        return False
+    logger.warning(
+        "%s: non-operator senders are admitted (%s) but agent.acp_backend=%r cannot "
+        "run a tool-less turn; every non-operator turn will be refused with a note. "
+        "Use the kiro backend or narrow admission.",
+        channel,
+        admission,
+        backend,
+    )
+    return True
+
+
+class ToollessTurnUnavailable(RuntimeError):
+    """A ``deny_all_tools`` turn cannot be made tool-less on this session.
+
+    Two causes. The session key a channel hands in for such a turn must be one
+    that only tool-less turns ever use; a key shared with the operator's own
+    turns would hand the sender the operator's agent, tools included. And the
+    tool-less agent spec is honoured only by a backend whose routing is
+    ``Routing.AGENT_SPEC`` (the spawn names the agent, so ``tools: []`` is what
+    the harness mounts); a harness that reads no agent spec keeps its own native
+    tools, and a project-preapproved one raises no permission request for the
+    driver to refuse. Raised instead of running the turn either way: refusing
+    costs the sender one reply, running it costs the operator their machine.
+    """
 
 
 async def admit_inbound_callback(
@@ -255,8 +341,23 @@ class ChannelTurn:
     For a turn driven by someone the channel does not trust as its operator. The
     approval mode cannot express it: the PreToolUse hook may answer
     ``auto_approve`` and a session carrying Trust short-circuits, both before the
-    interactive ladder is consulted. Defaults False, so every existing adopter is
-    byte-identical."""
+    interactive ladder is consulted. Nor is a permission request guaranteed to be
+    raised at all: a tool the agent spec lists in ``allowedTools`` runs without
+    one on the kiro backend, so the driver never sees it. The turn is therefore
+    driven on :data:`TOOLLESS_TURN_AGENT`, whose spec mounts no tools and no MCP
+    servers, and the driver's own refusal of any permission request that does
+    arrive is the second line. The session key MUST be one that only such turns
+    use (a per-peer bucket, never the operator's): a session already bound to
+    another agent refuses the turn (:class:`ToollessTurnUnavailable`), and so does
+    a backend whose routing is not ``Routing.AGENT_SPEC``, since only a harness
+    that mounts what the spec names honours ``tools: []``. Defaults False, so
+    every existing adopter is byte-identical."""
+
+    unprompted: bool = False
+    """The turn was not addressed to the agent (a rules-mode group message the
+    model may answer or decline). A refusal of such a turn ends silently: a
+    note nobody asked for is an unsolicited post into the room, and it would
+    start the unprompted cooldown for a turn that never ran. Defaults False."""
 
     bind_provider: Optional[Callable[[Any], None]] = None
     """``(provider) -> None``, called once the session's provider exists.
@@ -346,6 +447,10 @@ class ChannelTurn:
     after callback admission succeeded but before the provider turn opened.
     """
 
+    user_display_name: Optional[str] = None
+    """Human name of the sender, injected as ``[CURRENT USER]`` so the agent
+    knows who it is talking to. ``None`` omits the block (byte-identical to before)."""
+
 
 #: Every spelling a channel accepts for "abort the running turn". The union of
 #: the per-channel command tables (``/stop`` and ``/cancel`` everywhere, plus
@@ -425,6 +530,14 @@ def build_tool_gate(ctx_builder: Any, *, session_key: str, agent: str) -> Callab
     Sensitive-path keystone + governance ceiling + deny-list. Returns ``"deny"``
     (un-overridable), ``"auto_approve"``, or ``""`` (passthrough). Built here so
     no channel package needs to import ``kiro_crew.slack``.
+
+    The gate also carries ``last_deny_reason``: the hook's own reason for the
+    most recent ``"deny"`` and ``""`` otherwise, set on every call. The
+    ``TurnDriver`` reads it after a deny and steers it into the running turn
+    before the reject, so the model learns which rule blocked the call instead
+    of reading kiro-cli's generic "User denied tool execution" -- the same
+    attribute-on-a-callable shape ``ApprovalDecider.last_deny_cause`` uses. A
+    plain callable without the attribute is a deny with no reason, as before.
     """
 
     def _tool_gate(event: Any) -> str:
@@ -434,12 +547,16 @@ def build_tool_gate(ctx_builder: Any, *, session_key: str, agent: str) -> Callab
             agent=agent,
             **hook_gate_kwargs(event),
         )
-        if result.action == TOOL_DENY:
+        denied = result.action == TOOL_DENY
+        reason = str(getattr(result, "reason", "") or "") if denied else ""
+        _tool_gate.last_deny_reason = reason  # type: ignore[attr-defined]
+        if denied:
             return "deny"
         if result.action == TOOL_AUTO_APPROVE:
             return "auto_approve"
         return ""
 
+    _tool_gate.last_deny_reason = ""  # type: ignore[attr-defined]
     return _tool_gate
 
 
@@ -597,6 +714,210 @@ def consume_reinjection(sessions: Any, session_key: str) -> bool:
     return bool(consume(session_key)) if callable(consume) else False
 
 
+def predecessor_sid(sessions: Any, session_key: str) -> str:
+    """The crew log *session_key*'s live session superseded -- read AFTER the allocation.
+
+    The ``previous_sid`` producer for :func:`open_turn_crew_log`. It does not read
+    the slot-to-session mapping at all: it returns what the allocation boundary
+    captured for the key (``SessionManager.allocation_predecessor``), which the
+    boundary reads under its own lock, in the same tick that registers a
+    cold-started session and before that session's id is mapped. No read taken
+    around ``get_or_create`` can stand in for that: a caller reading the mapping
+    before its call can be suspended INSIDE the allocation, waiting for the turn
+    permit, while a concurrent turn on the same key allocates an intermediate
+    session and has it recycled by a failed compaction -- the caller's value then
+    names the store before that intermediate one, its successor cites its
+    grandparent, and the intermediate log falls off the succession chain. Read
+    after the call, the mapping already names the successor itself. The
+    boundary's capture is the only read that is neither too early nor too late,
+    so this is consumed right after ``get_or_create`` returns, while this turn
+    holds the key's permit.
+
+    The emitter does the comparing: a warm claim hands back the value its live
+    session was registered with and the log already exists, so nothing is
+    written; only the creation of a cold successor's log cites its predecessor,
+    and only after the emitter has checked that predecessor's header names the
+    same slot. Best-effort: a store without the reader answers ``""``, which the
+    emitter reads as "nothing to follow".
+    """
+    reader = getattr(sessions, "allocation_predecessor", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(reader(session_key) or "")
+    except Exception:
+        logger.debug("crew log: predecessor unreadable for %s", session_key, exc_info=True)
+        return ""
+
+
+def requested_model_sid(sessions: Any, session_key: str) -> str:
+    """The model *session_key*'s live allocation SELECTED, or ``""`` -- read after the claim.
+
+    The ``model_requested`` half of the requested/served pair the ``session/opened``
+    entry records. The dispatcher's own choice is not the whole story: a call handed
+    ``model=None`` has the allocation resolve an id from config itself, and that
+    resolution is invisible in ``get_or_create``'s return, so only the stamp the
+    allocation left on the session (``SessionManager.allocation_requested_model``,
+    the value the provider was constructed with) can say what was asked for. The
+    dashboard runner records the same stamp; without it a channel session's log
+    would carry the served model alone and lose the selected side of the pair for
+    good, the entry being append-only. Best-effort like :func:`predecessor_sid`: a
+    store without the reader answers ``""``, which the emitter records as "no
+    selection to report".
+    """
+    reader = getattr(sessions, "allocation_requested_model", None)
+    if not callable(reader):
+        return ""
+    try:
+        return str(reader(session_key) or "")
+    except Exception:
+        logger.debug("crew log: requested model unreadable for %s", session_key, exc_info=True)
+        return ""
+
+
+def slot_workspace(dashboard_state: Any, session_key: str) -> str:
+    """The workspace the dashboard states for *session_key*'s conversation, or ``""``.
+
+    The ``workspace`` producer for :func:`open_turn_crew_log`, and the SAME source
+    the dashboard runner's writer reads: ``chat_runner._crew_log_workspace`` states
+    ``slot.workspace`` off the live slot, and a channel conversation's slot is the
+    one the dashboard surfaces it under -- ``channel_slot_name(session_key)``, the
+    channel key folded to the filename charset, which is the ``slot`` field this
+    opener already records (:func:`transcript_stem` spells the same fold). A tab
+    opened on that conversation writes its ``session/opened`` from that slot, into
+    the same crew log this dispatcher writes, and the emitter appends a
+    ``session/class`` line whenever the class it is handed differs from the last
+    one stated -- so if the two writers named different workspaces for one
+    session, every switch between them would record a move that never happened.
+    Reading the slot the other writer reads is what makes the two statements one.
+
+    ``""`` when the conversation has no slot yet -- a channel slot is surfaced
+    after its first persisted turn, so the log's opening entry states no workspace
+    -- or when the gateway state is not attached. An unstated workspace is "not
+    observed": the class fold holds the first workspace STATED and records a later
+    different one as a move, so nothing is guessed here for the slot to contradict.
+    Only a ``str`` counts as a statement, so a state double answering with an
+    object of another shape states nothing rather than its ``repr``.
+    """
+    if dashboard_state is None:
+        return ""
+    try:
+        getter = getattr(dashboard_state, "get_slot", None)
+        slot = getter(transcript_stem(session_key)) if callable(getter) else None
+    except Exception:
+        logger.debug("crew log: slot unreadable for %s", session_key, exc_info=True)
+        return ""
+    workspace = getattr(slot, "workspace", "") if slot is not None else ""
+    return workspace if isinstance(workspace, str) else ""
+
+
+def open_turn_crew_log(
+    provider: Any,
+    *,
+    session_key: str,
+    agent: str,
+    resumed: bool,
+    ctx_builder: Any = None,
+    previous_sid: str = "",
+    model_requested: str = "",
+    workspace: str = "",
+) -> None:
+    """Open the channel session's crew log ahead of its turn, as the dashboard runner does.
+
+    ``crew_log_emit.on_session_opened`` is what CREATES a session's crew log, keyed
+    by its ACP session id; ``chat_runner._run_chat`` calls it on every dashboard turn
+    once the handle exists, and a warm reuse is silent. A channel conversation runs
+    its own copy of the turn loop, and without this call it opens no log at all.
+    That is a hole the work ledger falls into: the ledger is a projection of the
+    crew log, every ``work_ledger_record`` / ``work_report`` write appends one
+    ``work/recorded`` entry to the ACTING session's log, and a write with nowhere
+    to append is rolled back and refused (``crew_log_unrecorded``). An owner DM
+    that session control admits as a conductor therefore reached the ledger and
+    lost every write to it. Opening the log here, before ``TurnDriver.run``, is
+    what makes that admission usable. Free while the emitter is off -- the emitter
+    checks its own flag -- and it never raises, because the turn must not be lost
+    to its own record.
+
+    Only facts the dispatcher can establish are recorded; the emitter reads an
+    absent field as "not observed", never as false. The ACP session id comes off
+    *provider* (no id, no log: a turn that never got a session emits nothing, as
+    on the dashboard). ``slot`` is the key the dashboard surfaces this conversation
+    under -- the channel key folded to the filename charset, which is what
+    ``channel_slot_name`` spells and what ``session_create`` stamps as
+    ``_created_by`` on the workers this session dispatches, so the session tree
+    joins the two. The served model and the cwd are read off the provider, the
+    dashboard's own sources for them, and ``model_requested`` is the allocation's
+    stamp of what was SELECTED (:func:`requested_model_sid`, read after the claim
+    like the predecessor) -- the pair the entry records, since a call handed
+    ``model=None`` has the allocation resolve the id itself and nothing else can
+    say what it chose; ``resumed`` is ``get_or_create``'s answer.
+    The class is stated only when the memory mode is known, from the gateway's
+    live policy for the key (``ctx_builder.live_memory_mode_for_session``, wired by
+    the dashboard state; a builder without it states no class, which readers
+    refuse rather than assume), and it carries ``channel=True`` because a
+    channel-born conversation is published to its channel by definition -- the
+    same reading ``_crew_log_class`` takes off a linked slot. ``workspace`` is
+    stated the way the dashboard writer states it, off the slot the dashboard
+    surfaces this conversation under (:func:`slot_workspace`), because a tab on
+    the conversation writes into this same log and the emitter records a
+    ``session/class`` move whenever two statements of one session's class differ:
+    every member the dashboard states, this opener states from the same source, or
+    the two writers would take turns recording a move that never happened. No
+    ``parent``: a
+    conversation the person opened themselves is nobody's child. ``previous_sid``
+    is the crew log this conversation's live session superseded, as the
+    allocation boundary captured it while registering that session
+    (:func:`predecessor_sid`, consumed by the dispatcher right after
+    ``get_or_create`` returns): the emitter writes the ``previous`` edge only when
+    it creates a log that names a different store, which is what keeps a
+    conversation's history reachable across the cold successor a failed
+    compaction leaves behind.
+
+    For the channel's OWN sessions only. A dashboard session resumed into the chat
+    (``!sessions``) is opened by the dashboard runner, which alone holds its
+    lineage: an opener from here would create that log without its ``parent``.
+    """
+    # Imported here, not at module scope, on purpose: this module is on the
+    # dashboard's boot path (``dashboard.handlers.crew_log`` reaches it through the
+    # handlers package -> ``handlers.taskrunner`` -> ``taskrunner`` ->
+    # ``task_executor``), and the crew log is optional -- a flag-off launch must
+    # not load the storage package.
+    # ``test_crew_log_routes.py::test_this_module_does_not_load_the_storage_package_at_import``
+    # pins that from a clean interpreter and fails when this moves up; it is not a
+    # circular import. ``handlers/crew_log.py`` and
+    # ``work_ledger.rebuild_from_projection`` import the emitter the same way. The
+    # ``top-level-imports`` convention is advisory; this boot-path invariant is
+    # enforced, so the invariant wins.
+    from kiro_crew.crew_log import emit as crew_log_emit
+
+    try:
+        session_id = crew_log_emit.session_id_of(provider)
+        if not session_id:
+            return
+        memory_mode = ""
+        live_mode = getattr(ctx_builder, "live_memory_mode_for_session", None)
+        if callable(live_mode):
+            try:
+                memory_mode = str(live_mode(session_key) or "")
+            except Exception:
+                logger.debug("crew log: memory mode unreadable for %s", session_key, exc_info=True)
+        crew_log_emit.on_session_opened(
+            session_id,
+            agent=agent or "",
+            slot=transcript_stem(session_key),
+            model=str(getattr(provider, "served_model", "") or ""),
+            model_requested=model_requested,
+            cwd=str(getattr(provider, "cwd", "") or ""),
+            resumed=bool(resumed),
+            memory=memory_mode,
+            channel=True,
+            workspace=workspace,
+            previous_sid=previous_sid,
+        )
+    except Exception:
+        logger.debug("crew log: opener skipped for %s", session_key, exc_info=True)
+
+
 def stop_reason_landed(stop_reason: str | None) -> bool:
     """Whether the turn that ended with *stop_reason* landed, for re-injection.
 
@@ -701,6 +1022,367 @@ def hook_auto_reply(ctx_builder: Any, text: str) -> str | None:
     return redact(str(getattr(result, "text", "") or ""))
 
 
+# Retries granted to a turn abandoned after a TRANSIENT compaction failure (a
+# throttled or 5xx'd summarization call). Per drive_turn call, so the budget is
+# the turn's own and a throttle that keeps firing costs a bounded number of
+# cold starts. Same count as the dashboard's _COMPACTION_FAILED_RETRIES and for
+# the same reason: a throttle still firing after two session resets is not
+# clearing inside this turn, and every attempt costs the summarization call
+# again.
+_COMPACTION_FAILED_RETRIES = 2
+
+
+#: Event kinds after which a verbatim replay is unsafe: text or a tool
+#: call has landed (replay could repeat a side effect), a permission prompt was
+#: shown, or a mid-turn steer was folded into the turn (replaying
+#: ``user_text`` would drop the accepted correction).
+_EMITTED_KINDS = frozenset({TEXT_CHUNK, TOOL_CALL, PROMPT_CHOICE, STEER_CONSUMED})
+
+
+class _TransientCompactionRetryGuard(Renderer):
+    """The renderer the driver sees while :func:`drive_turn` may still retry.
+
+    A turn abandoned after a transient compaction failure is replayed INSIDE the
+    same ``drive_turn`` call, into the same renderer: the shared pipeline has no
+    queue of its own to put the message back on (five of the seven channels
+    riding it keep none), and the channel's renderer is one message's output
+    surface that finalizes on its first DONE -- so a completion delivered for
+    the abandoned attempt would close the reply before the replay could write
+    it. This guard therefore holds that one DONE back, and only that one:
+
+    * the completion must be ``STOP_REASON_COMPACTION_FAILED``;
+    * nothing may have been emitted through the guard this turn -- verbatim
+      replay is only safe before any text, tool call or permission prompt has
+      landed, exactly the guard the dashboard's transient siblings use. A
+      consumed mid-turn steer counts too: the backend folded a correction the
+      replayed ``user_text`` does not carry, so re-running the original prompt
+      would silently discard what the user was told was accepted;
+    * the provider must report ``last_compaction_transient`` as ``True`` --
+      compared against ``True``, not read for truthiness, so a provider that
+      never set the attribute (or exposes an auto-created stand-in for it)
+      cannot read as transient by accident;
+    * a retry must still be available.
+
+    Every other event passes straight through, and a held DONE is released
+    (``release_held``) when the pipeline decides not to replay after all.
+
+    Whole events are forwarded through the inner renderer's own ``dispatch``
+    rather than routed to its ``on_*`` handlers from here, so the bookkeeping
+    that method does on the way (``current_tool_name``) lands on the object
+    whose handlers read it. The ``on_*`` delegates below exist because the
+    contract declares them abstract; the driver itself reaches its renderer
+    through ``dispatch`` and ``on_turn_start`` only.
+    """
+
+    def __init__(self, renderer: Any) -> None:
+        # Same defensive read as the SilentRenderer substitution: the turn's
+        # renderer is typed ``Any`` and must not fail to wrap for lacking it.
+        capabilities: Any = getattr(renderer, "capabilities", None)
+        super().__init__(capabilities)
+        self.channel_type = getattr(renderer, "channel_type", "") or ""
+        #: The channel's renderer, which every forwarded event reaches.
+        self.inner = renderer
+        #: The provider of the CURRENT attempt; reassigned by the pipeline after
+        #: each ``get_or_create``, since a reset replaces it.
+        self.provider: Any = None
+        self.emitted = False
+        self.retries_used = 0
+        self._held_done: OutputEvent | None = None
+
+    @property
+    def held(self) -> bool:
+        """Whether the last completion was withheld pending a replay."""
+        return self._held_done is not None
+
+    async def on_turn_start(self) -> None:
+        await self.inner.on_turn_start()
+
+    async def close(self) -> None:
+        await self.inner.close()
+
+    async def on_text_chunk(self, text: str) -> None:
+        self.emitted = True
+        await self.inner.on_text_chunk(text)
+
+    async def on_thinking(self, text: str) -> None:
+        await self.inner.on_thinking(text)
+
+    async def on_tool_call(
+        self, tool_call_id: str, title: str, tool_kind: str = "", tool_purpose: str = ""
+    ) -> None:
+        self.emitted = True
+        await self.inner.on_tool_call(tool_call_id, title, tool_kind, tool_purpose)
+
+    async def on_prompt_choice(
+        self,
+        options: list[dict[str, Any]],
+        request_id: str | int,
+        tool_title: str = "",
+        tool_purpose: str = "",
+        tool_input: str = "",
+    ) -> None:
+        self.emitted = True
+        await self.inner.on_prompt_choice(options, request_id, tool_title, tool_purpose, tool_input)
+
+    async def on_compaction(self, context_usage_pct: float) -> None:
+        await self.inner.on_compaction(context_usage_pct)
+
+    async def on_done(self, stop_reason: str = "") -> None:
+        await self.inner.on_done(stop_reason)
+
+    async def on_steer_consumed(self, summary: str = "") -> None:
+        self.emitted = True
+        await self.inner.on_steer_consumed(summary)
+
+    async def dispatch(self, event: OutputEvent) -> None:
+        if event.kind == DONE and self._should_hold(event):
+            self._held_done = event
+            self.retries_used += 1
+            return
+        if event.kind in _EMITTED_KINDS:
+            self.emitted = True
+        await self.inner.dispatch(event)
+
+    def _should_hold(self, event: OutputEvent) -> bool:
+        return (
+            event.stop_reason == STOP_REASON_COMPACTION_FAILED
+            and not self.emitted
+            and getattr(self.provider, "last_compaction_transient", False) is True
+            and self.retries_used < _COMPACTION_FAILED_RETRIES
+        )
+
+    async def release_held(self) -> None:
+        """Deliver the withheld completion: the replay is not happening."""
+        held, self._held_done = self._held_done, None
+        if held is not None:
+            await self.inner.dispatch(held)
+
+    def drop_held(self) -> None:
+        """Forget the withheld completion: the replay's own DONE supersedes it."""
+        self._held_done = None
+
+
+def session_stop_generation(sessions: Any, session_key: str) -> int:
+    """The session manager's user-Stop count for *session_key*, read defensively.
+
+    ``SessionManager.stop_turn`` and ``note_stop`` bump it before anything is
+    awaited, on every surface that can stop the session. A turn snapshots it
+    when it acquires its session and treats any later change as a user Stop --
+    the same reading the dashboard runner takes. Doubles for ``sessions`` may
+    lack the method or answer with a non-int; both read as 0, so a stand-in
+    predating the counter never turns a missing attribute into a stopped turn.
+    """
+    reader = getattr(sessions, "stop_generation", None)
+    if not callable(reader):
+        return 0
+    try:
+        value = reader(session_key)
+    except Exception:
+        return 0
+    return value if isinstance(value, int) else 0
+
+
+def session_conversation_generation(sessions: Any, session_key: str) -> int:
+    """The highest generation persisted for *session_key*'s conversation bucket.
+
+    ``/new`` on every channel of this pipeline advances the conversation's
+    generation and persists it (``reserve_new_generation`` ->
+    ``SessionManager.reserve_generation``) BEFORE acknowledging, so a key whose
+    bucket has since grown a higher generation is a retired conversation. A turn
+    snapshots this when it acquires its session and treats any later increase
+    as supersession -- the same reading it takes of the Stop counter. Keys
+    without a generation grammar (a Slack thread) and doubles lacking the reader
+    both read as 0, so neither can turn into a false supersession.
+    """
+    parsed = split_dm_session_key(canonical_key(session_key))
+    reader = getattr(sessions, "max_generation", None)
+    if parsed is None or not callable(reader):
+        return 0
+    try:
+        value = reader(parsed[0])
+    except Exception:
+        return 0
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+async def await_replay_gap(sessions: Any, session_key: str) -> None:
+    """Wait out an open replay gap on *session_key* before writing its transcript.
+
+    ``get_or_create`` waits on the gap for every turn that acquires a session,
+    but a hook auto-reply never acquires one: it answers from the context
+    builder's hooks and persists the exchange straight away. Arriving while an
+    older message on the same key sits between its reset and its replay, that
+    persist would land in the transcript AHEAD of the replayed turn -- the
+    reader saw the older message first, the record would say otherwise. So the
+    hook paths wait here, right before their persist, the same way the
+    allocation path waits before its claim. The gap owner's own task passes
+    straight through, and a session stand-in without the method (the focused
+    doubles across the suite) waits for nothing.
+    """
+    waiter = getattr(sessions, "await_replay_gap", None)
+    if callable(waiter):
+        await waiter(session_key)
+
+
+def _set_replay_gap(sessions: Any, session_key: str, *, opened: bool) -> None:
+    """Open or close the manager's replay gap for *session_key*, if it has one.
+
+    While the gap is open a Stop that finds no live session is still recorded,
+    and any OTHER task's ``get_or_create`` for the key waits -- so a newer
+    message arriving between the reset and the replay's reacquire claims the
+    successor after the replay, not ahead of it (``SessionManager.open_replay_gap``).
+    The pipeline opens it before the first reset that precedes a replay and
+    closes it only when the whole turn has settled and its permit is released:
+    a waiter admitted earlier would park on the successor's semaphore, and a
+    further retry's reset would pop that session from under it, stranding the
+    message for good. Probed with ``getattr`` for the same reason as the reader
+    above.
+    """
+    method = getattr(sessions, "open_replay_gap" if opened else "close_replay_gap", None)
+    if callable(method):
+        try:
+            method(session_key)
+        except Exception:
+            logger.debug(
+                "replay gap %s failed for %s",
+                "open" if opened else "close",
+                session_key,
+                exc_info=True,
+            )
+
+
+def _toolless_turn_work_dir(session_key: str) -> Any:
+    """The isolated cwd a ``deny_all_tools`` turn cold-starts in.
+
+    The per-session work directory under the workspace root: created on first
+    use, owned by this session key alone, and never a project checkout, so no
+    ``.kiro/agents`` entry there can shadow the tool-less spec.
+    """
+    from kiro_crew.config.loader import _session_work_dir
+
+    path = _session_work_dir(session_key)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _provider_backend(provider: Any) -> str | None:
+    """The ACP backend id a provider drives, ``None`` when it cannot be read.
+
+    Read through ``provider.client.backend`` with ``getattr`` at both hops, the
+    same mock-safe shape ``session._is_claude_backend`` uses. ``None`` (not
+    ``""``) is the unreadable answer: the empty string IS ``ACP_BACKEND_KIRO``,
+    so collapsing an absent client onto it would route an unknown harness as the
+    one that honours the spec. The caller treats ``None`` as refused.
+    """
+    client = getattr(provider, "client", None)
+    if client is None:
+        return None
+    backend = getattr(client, "backend", None)
+    return backend if isinstance(backend, str) else None
+
+
+def _breaker_threshold(sessions: Any) -> int | None:
+    """The circuit breaker's OWN trip threshold, read from the manager applying it.
+
+    Deliberately not a literal here. The number is handed to the allocation layer
+    through ``AllocationConstants``, so a copy in this module would be a second
+    value to keep in step with the counter the bound below stands in for -- and
+    importing the one definition is not available either, because this module
+    stays off the session package's import graph (see ``SessionClosingError``
+    above). Reading it from the manager is therefore the only way to be sure the
+    substitute bound and the real counter share a limit.
+
+    ``None`` when it cannot be read, and the caller then charges exactly as it
+    does today: an exemption whose bound is unknown is not an exemption.
+    """
+    build = getattr(sessions, "_allocation_deps", None)
+    if not callable(build):
+        return None
+    try:
+        threshold = build().constants.circuit_breaker_threshold
+    except Exception:
+        return None
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold <= 0:
+        return None
+    return threshold
+
+
+async def charge_turn_failure(
+    sessions: Any,
+    session_key: str,
+    *,
+    exc: BaseException,
+    provider: object | None,
+    channel_type: str,
+) -> None:
+    """Charge one failed turn to *session_key*'s breaker, unless a SHARED process died.
+
+    The channel dispatchers catch a failed turn generically, so a dying runtime
+    reaches them as one more exception and every tenant of that process charges
+    its own breaker for it -- the misattribution :mod:`kiro_crew.runtime_death`
+    exists to end, arriving by a path no typed handler covers. One helper rather
+    than one copy per channel: four copies of an attribution rule drift, and the
+    rule is identical because the counter is.
+
+    Only a process death is ever exempt. Every other failure is the turn's own
+    and charges exactly as before -- consulting the death record for an unrelated
+    exception would exempt a real fault whenever some co-tenant's death happened
+    to be recorded against the same provider.
+
+    *provider* must be the one this turn ACQUIRED, never a fresh lookup. The
+    recovery around these handlers replaces a dead session, so a lookup at
+    failure time answers for the replacement and the question silently becomes
+    "was the NEW runtime shared".
+
+    The exemption is bounded, and at the limit it PERFORMS the actuator rather
+    than charging the counter it stood in for. ``record_failure`` trips into this
+    same reset, so a session on a permanently dying shared runtime recovers after
+    the threshold rather than after twice it, and its own failure count is left
+    alone -- it never misbehaved.
+    """
+    threshold = _breaker_threshold(sessions)
+    if (
+        threshold is None
+        or not is_runtime_death(exc)
+        or runtime_death.caused_by_this_session(provider)
+    ):
+        await sessions.record_failure(session_key)
+        return
+    streak = runtime_death.note_shared_death(session_key)
+    if streak < threshold:
+        logger.warning(
+            "%s: %s lost a turn to a SHARED runtime's death (%d running) — "
+            "not counting it toward the circuit breaker",
+            channel_type,
+            session_key,
+            streak,
+        )
+        return
+    logger.warning(
+        "%s: the runtime %s shares has died %d times running — resetting it now, "
+        "the same recovery the breaker performs",
+        channel_type,
+        session_key,
+        streak,
+    )
+    try:
+        await sessions.reset(session_key)
+        # Same transfer rule as the two typed hand-overs: the reset spends the
+        # streak, so it is forgotten here. Left in place it would sit at the
+        # threshold forever and every later shared death would reset again --
+        # the unexempted behaviour, arrived at by keeping the exemption's own
+        # bookkeeping. Cleared only after the reset returns, so a failed reset
+        # keeps the streak and the next death retries the actuator.
+        runtime_death.clear_shared_deaths(session_key)
+    except Exception:
+        logger.warning(
+            "%s: reset of %s after a shared runtime's deaths failed",
+            channel_type,
+            session_key,
+            exc_info=True,
+        )
+
+
 async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> None:
     """Run one authorized inbound message end to end.
 
@@ -711,7 +1393,17 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
     """
     renderer = turn.renderer
     session_key = turn.session_key
+    # A sender the channel does not trust talks to a tool-less agent, not to the
+    # operator's. Decided here, on the shared seam, so no adopter can set the
+    # flag and forget the agent that gives it teeth.
+    session_agent = TOOLLESS_TURN_AGENT if turn.deny_all_tools else turn.agent
     _acquired = False
+    # The provider THIS turn acquired, for the failure handler's attribution
+    # question. Bound before the try so every handler can read it -- an
+    # attribution flag read on a path its assignment cannot reach is an
+    # UnboundLocalError inside an except arm, not a guard. Stays None when
+    # get_or_create never returned, and an unattributable death charges as before.
+    _turn_provider: object | None = None
     # Post-compaction re-injection bookkeeping for the finally: whether this
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     needs_reinjection = False
@@ -758,6 +1450,11 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             # blank answer the same way it does one from the model.
             await renderer.on_done()
             if turn.persist is not None:
+                # After the reply is out (a canned answer should not wait on a
+                # model turn) but BEFORE the record is written: an older message
+                # on this key may be between its reset and its replay, and the
+                # transcript must show that turn first, as the reader did.
+                await await_replay_gap(sessions, session_key)
                 # ``is_new`` is False: no session was created, so there is no
                 # new-session bookkeeping (title, dashboard surfacing) owed. What
                 # is recorded is the redacted text the user actually saw, so the
@@ -772,162 +1469,341 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # always did. Widening the call for everyone would make the new field's
         # cost fall on channels that gain nothing from it.
         extra: dict[str, Any] = {"model": turn.model} if turn.model else {}
-        # A linked member session must validate its own memory before a cold
-        # provider start. The same identity is then used for this turn's prompt.
-        memory_store = await session_store_for_turn(ctx_builder, session_key)
-        provider, is_new, resumed = await sessions.get_or_create(
-            session_key, agent=turn.agent, channel_id=turn.conversation_id, **extra
-        )
-        _acquired = True
-        if is_new:
-            await sessions.set_channel(session_key, turn.conversation_id)
-        # Bind this conversation as the session's origin AND its own mirror, so
-        # unattended notices and dashboard-side turns both reach the user here.
-        # After get_or_create, because a cold-start failure leaves no session to
-        # bind to; on EVERY turn, because the binding is what a restart, an
-        # unlink elsewhere, or a rival claim can take away, and only a
-        # self-healing bind cannot leave a live conversation silently unmirrored.
-        #
-        # Deliberately NOT gated on ``resumed``. Discord skips its bind for a
-        # resumed session, but its flag is a mirror-binding LOOKUP ("this turn is
-        # answering a dashboard-owned session"), whereas ``resumed`` here means
-        # "restored via ACP session/load" — a cold-start recovery of this very
-        # conversation, which is exactly the case a self-healing bind exists for.
-        # Skipping on it would leave every post-restart session unmirrored.
-        #
-        # Guarded as a pair. An unbound conversation is a degraded turn — the
-        # user still gets their answer here, they just lose the dashboard mirror
-        # — whereas a raise on this line drops a turn they are waiting on.
-        # ``bind_origin_mirror`` promises not to raise, but that promise covers
-        # the ownership conflict it names, not a session accessor failing, and
-        # this is the widest call site in the codebase: every channel on the
-        # shared pipeline routes through it.
-        if turn.origin_conversation is not None:
-            # Captured non-None for the closure: the ``is not None`` narrowing does
-            # not reach into the nested function (it could be called after the
-            # attribute changed), and a local binding is what makes it a
-            # ``ChannelLink`` there.
-            location = turn.origin_conversation
-            try:
-                # Offloaded, like ``turn.persist`` above: a FRESH bind (and an
-                # in-channel /link, /unlink, or legacy opt-out migration) has
-                # ``bind_origin_mirror`` write through ``SessionMap``, which
-                # rewrites the whole map synchronously -- blocking I/O that must
-                # not run on the shared gateway loop. The steady state returns
-                # early (a read) and costs the thread hop nothing.
-                def _bind_origin() -> None:
-                    # Both calls skip a ``unified:`` key, and for one reason:
-                    # ``dm_scope="unified"`` collapses every allowed user's DM into
-                    # a single bucket, so "the conversation this session is read in"
-                    # has no single answer. Recording one would point the session's
-                    # origin at whichever human spoke LAST, and a later notice (a
-                    # cron result, a subagent completion) would be delivered into
-                    # that person's chat regardless of whose turn produced it.
-                    # ``bind_origin_mirror`` already declines for exactly this
-                    # (link.py), so the sibling write must not be the hole that
-                    # reopens it.
-                    if channel_namespace_of(session_key) == DM_SCOPE_UNIFIED:
-                        return
-                    sessions.set_origin_link(session_key, location)
-                    bind_origin_mirror(sessions, key=session_key, location=location)
+        if turn.deny_all_tools:
+            # ``crew_agent=""`` is the explicit "no crew" answer
+            # (``config.loader.resolve_crew_identity``): without it a crew
+            # ENROLLED under the tool-less agent's name would be made canonical by
+            # the crew-namespace fallback, and its tooled template would start
+            # under a binding that reads as the tool-less agent. The spec named
+            # here must be the template itself, never a namesake crew.
+            extra["crew_agent"] = ""
+            # And the process must be a COLD start in this session's own work
+            # directory: a warm-pool process was spawned in the operator's project
+            # cwd, where a project-local spec under the same name (tools and all)
+            # shadows the generated one the harness would otherwise load. An
+            # explicit cwd that is not the pool's makes the pool ineligible
+            # (``cwd_blocks_pool``) and the per-session directory carries no
+            # project-local agents of its own.
+            extra["cwd"] = str(await asyncio.to_thread(_toolless_turn_work_dir, session_key))
+        # Bounded by the guard's own countdown: it holds a DONE only while it
+        # still has a retry to grant, so this loop runs at most
+        # ``1 + _COMPACTION_FAILED_RETRIES`` times. The driver renders through the
+        # guard, so a retried attempt streams into the SAME still-open renderer
+        # (nothing was emitted, so there is nothing to duplicate); every other
+        # ``renderer`` use in this function -- the mute substitution above, the
+        # ``on_done``/``close`` below -- keeps the real object.
+        retry_guard = _TransientCompactionRetryGuard(renderer)
+        # The user's Stop count for this key when the turn acquired its session.
+        # Any later change means the user stopped this turn on SOME surface, and a
+        # replay must then stay abandoned: the Stop may have landed while the key
+        # had no live session at all (between the reset and the reacquire), where
+        # nothing else could have cancelled it. ``None`` until the first acquire.
+        stop_gen_at_entry: int | None = None
+        # The conversation's persisted generation at the same moment: a ``/new``
+        # issued since -- again including inside the reset gap -- retires this
+        # key, and a replay would run the retired prompt and post its reply after
+        # the fresh-conversation acknowledgement.
+        conv_gen_at_entry: int | None = None
+        # Whether THIS MESSAGE opened the conversation, from the first acquire.
+        # A replay reacquires after a reset and may read ``is_new=True`` for a
+        # conversation that has existed for hours; that attempt-local value is
+        # right for building the replay's context (the fresh runtime needs the
+        # session-start injection again) and wrong for the post-turn
+        # bookkeeping, which would then re-run the new-conversation work --
+        # title, dashboard surfacing -- over an existing conversation.
+        turn_is_new: bool | None = None
+        replaying = False
+        while True:
+            # A linked member session must validate its own memory before a cold
+            # provider start. The same identity is then used for this turn's prompt.
+            memory_store = await session_store_for_turn(ctx_builder, session_key)
+            provider, is_new, resumed = await sessions.get_or_create(
+                session_key, agent=session_agent, channel_id=turn.conversation_id, **extra
+            )
+            _acquired = True
+            # Hold the provider this attempt obtained, for the failure handler's
+            # attribution question. Captured HERE rather than looked up when a
+            # failure is handled: the recovery paths replace a dead session, so a
+            # lookup at failure time answers for the replacement and the question
+            # silently becomes "was the NEW runtime shared". Re-bound on every
+            # pass of the retry loop, so an attempt is never judged by the runtime
+            # a previous attempt used.
+            _turn_provider = provider
+            if turn.deny_all_tools:
+                # The tool-less agent is a SPEC, and only a backend that mounts
+                # what the spec names honours it. On any other routing the
+                # harness keeps its own native tools, and one a project has
+                # pre-approved runs with no permission request for the driver to
+                # refuse -- so the turn is refused instead. Positive identity:
+                # the routing that holds, never the absence of another harness.
+                backend = _provider_backend(provider)
+                if backend is None or not toolless_turns_supported(backend):
+                    sel().log_api_access(
+                        caller=session_key,
+                        operation="turn_agent",
+                        outcome="denied",
+                        source="messaging",
+                        resources=(
+                            f"deny_all_tools turn on backend={'unknown' if backend is None else backend!r}: "
+                            "the tool-less agent spec is not honoured there"
+                        ),
+                    )
+                    raise ToollessTurnUnavailable(
+                        "deny_all_tools turn refused: this backend does not mount tools "
+                        "from the agent spec, so an untrusted sender's turn cannot be "
+                        "made tool-less on it"
+                    )
+                # ``get_or_create`` ignores ``agent`` for a session that already
+                # exists, so a key shared with a tooled session would silently run
+                # this turn with the operator's tools. Read the binding back and
+                # refuse rather than trust the key's shape.
+                bound = sessions.get_agent(session_key) if hasattr(sessions, "get_agent") else ""
+                if bound and bound != TOOLLESS_TURN_AGENT:
+                    sel().log_api_access(
+                        caller=session_key,
+                        operation="turn_agent",
+                        outcome="denied",
+                        source="messaging",
+                        resources=f"deny_all_tools turn on a session bound to agent={bound!r}",
+                    )
+                    raise ToollessTurnUnavailable(
+                        "deny_all_tools turn refused: its session is bound to an agent "
+                        "with tools; channels must key untrusted turns separately"
+                    )
+            if stop_gen_at_entry is None:
+                stop_gen_at_entry = session_stop_generation(sessions, session_key)
+            if conv_gen_at_entry is None:
+                conv_gen_at_entry = session_conversation_generation(sessions, session_key)
+            if turn_is_new is None:
+                turn_is_new = is_new
+            retry_guard.provider = provider
+            if is_new:
+                await sessions.set_channel(session_key, turn.conversation_id)
+            # Bind this conversation as the session's origin AND its own mirror, so
+            # unattended notices and dashboard-side turns both reach the user here.
+            # After get_or_create, because a cold-start failure leaves no session to
+            # bind to; on EVERY turn, because the binding is what a restart, an
+            # unlink elsewhere, or a rival claim can take away, and only a
+            # self-healing bind cannot leave a live conversation silently unmirrored.
+            #
+            # Deliberately NOT gated on ``resumed``. Discord skips its bind for a
+            # resumed session, but its flag is a mirror-binding LOOKUP ("this turn is
+            # answering a dashboard-owned session"), whereas ``resumed`` here means
+            # "restored via ACP session/load" — a cold-start recovery of this very
+            # conversation, which is exactly the case a self-healing bind exists for.
+            # Skipping on it would leave every post-restart session unmirrored.
+            #
+            # Guarded as a pair. An unbound conversation is a degraded turn — the
+            # user still gets their answer here, they just lose the dashboard mirror
+            # — whereas a raise on this line drops a turn they are waiting on.
+            # ``bind_origin_mirror`` promises not to raise, but that promise covers
+            # the ownership conflict it names, not a session accessor failing, and
+            # this is the widest call site in the codebase: every channel on the
+            # shared pipeline routes through it.
+            if turn.origin_conversation is not None:
+                # Captured non-None for the closure: the ``is not None`` narrowing does
+                # not reach into the nested function (it could be called after the
+                # attribute changed), and a local binding is what makes it a
+                # ``ChannelLink`` there.
+                location = turn.origin_conversation
+                try:
+                    # Offloaded, like ``turn.persist`` above: a FRESH bind (and an
+                    # in-channel /link, /unlink, or legacy opt-out migration) has
+                    # ``bind_origin_mirror`` write through ``SessionMap``, which
+                    # rewrites the whole map synchronously -- blocking I/O that must
+                    # not run on the shared gateway loop. The steady state returns
+                    # early (a read) and costs the thread hop nothing.
+                    def _bind_origin() -> None:
+                        # Both calls skip a ``unified:`` key, and for one reason:
+                        # ``dm_scope="unified"`` collapses every allowed user's DM into
+                        # a single bucket, so "the conversation this session is read in"
+                        # has no single answer. Recording one would point the session's
+                        # origin at whichever human spoke LAST, and a later notice (a
+                        # cron result, a subagent completion) would be delivered into
+                        # that person's chat regardless of whose turn produced it.
+                        # ``bind_origin_mirror`` already declines for exactly this
+                        # (link.py), so the sibling write must not be the hole that
+                        # reopens it.
+                        if channel_namespace_of(session_key) == DM_SCOPE_UNIFIED:
+                            return
+                        sessions.set_origin_link(session_key, location)
+                        bind_origin_mirror(sessions, key=session_key, location=location)
 
-                await asyncio.to_thread(_bind_origin)
-            except Exception:
-                logger.warning(
-                    "%s: origin/mirror bind failed session=%s",
-                    turn.channel_type,
-                    session_key,
-                    exc_info=True,
+                    await asyncio.to_thread(_bind_origin)
+                except Exception:
+                    logger.warning(
+                        "%s: origin/mirror bind failed session=%s",
+                        turn.channel_type,
+                        session_key,
+                        exc_info=True,
+                    )
+            # Hand the live provider to whatever the channel could not resolve before
+            # the session existed. Before the driver runs, so the first turn of a
+            # generation behaves like every later one.
+            if turn.bind_provider is not None:
+                try:
+                    turn.bind_provider(provider)
+                except Exception:
+                    logger.warning(
+                        "%s: bind_provider failed session=%s",
+                        turn.channel_type,
+                        session_key,
+                        exc_info=True,
+                    )
+            # Publish this turn's session identity so managed MCP tools resolve
+            # X-Session-Key; one shared writer lives in messaging.identity.
+            await publish_turn_identity(sessions, session_key)
+            # This conversation's own silo, from the session's RECORDED binding and
+            # never from ``turn.agent``: that field carries a kiro-cli template id, a
+            # namespace disjoint from ``cfg.agents``, so a store derived from it
+            # resolves to ``default`` for exactly the crew that configured otherwise.
+            # Resolved on the shared seam rather than per adopter for the same reason
+            # ``minimal_context`` is: every channel on this pipeline has the same
+            # exposure, and one that forgot would silently read the operator's memory.
+            # The member tier was prepared before provider acquisition; unavailable
+            # private memory refuses the turn instead of substituting global memory.
+            # A compaction drops session-start context. Read-and-clear the one-shot
+            # flag so this turn re-injects that context exactly once. The finally
+            # re-arms it if this turn never lands.
+            needs_reinjection = consume_reinjection(sessions, session_key)
+
+            # Off-loop: build_message embeds the episodic query (blocking urllib).
+            full_message, _ = await run_in_embed_pool(
+                ctx_builder.build_message,
+                turn.user_text,
+                is_new,
+                session_key,
+                channel_id=turn.conversation_id,
+                agent=turn.agent,
+                memory_store=memory_store,
+                resumed=resumed,
+                needs_reinjection=needs_reinjection,
+                minimal_context=turn.minimal_context,
+                runtime_source=turn.channel_type,
+                context_provider=provider,
+                user_display_name=turn.user_display_name,
+            )
+
+            driver = TurnDriver(
+                provider,
+                retry_guard,
+                approval_mode=turn.approval_mode,
+                decider=turn.decider,
+                auto_approve_session=turn.auto_approve_session,
+                deny_all_tools=turn.deny_all_tools,
+                auto_approve_tool=build_auto_approve(ctx_builder),
+                tool_gate=build_tool_gate(ctx_builder, session_key=session_key, agent=turn.agent),
+                directive_consumer=turn.directive_consumer,
+                audit_session_key=session_key,
+                audit_agent=turn.agent or "kirocrew",
+                closing_gate=turn_ceiling.gate(
+                    session_key, lambda: sessions.begin_turn(session_key)
+                ),
+            )
+            if replaying:
+                # Last look before the replay opens a prompt: a Stop issued at any
+                # point since the turn began -- including inside the reset gap --
+                # means the user does not want this message run, and a ``/new``
+                # means the conversation it belonged to is over. Either way the
+                # completion the guard held is delivered instead, so the channel
+                # finalizes the abandoned reply exactly as a permanent failure
+                # would.
+                stopped = session_stop_generation(sessions, session_key) != stop_gen_at_entry
+                superseded = (
+                    session_conversation_generation(sessions, session_key) != conv_gen_at_entry
                 )
-        # Hand the live provider to whatever the channel could not resolve before
-        # the session existed. Before the driver runs, so the first turn of a
-        # generation behaves like every later one.
-        if turn.bind_provider is not None:
-            try:
-                turn.bind_provider(provider)
-            except Exception:
-                logger.warning(
-                    "%s: bind_provider failed session=%s",
-                    turn.channel_type,
-                    session_key,
-                    exc_info=True,
-                )
-        # Publish this turn's session identity so managed MCP tools resolve
-        # X-Session-Key; one shared writer lives in messaging.identity.
-        await publish_turn_identity(sessions, session_key)
-        # This conversation's own silo, from the session's RECORDED binding and
-        # never from ``turn.agent``: that field carries a kiro-cli template id, a
-        # namespace disjoint from ``cfg.agents``, so a store derived from it
-        # resolves to ``default`` for exactly the crew that configured otherwise.
-        # Resolved on the shared seam rather than per adopter for the same reason
-        # ``minimal_context`` is: every channel on this pipeline has the same
-        # exposure, and one that forgot would silently read the operator's memory.
-        # The member tier was prepared before provider acquisition; unavailable
-        # private memory refuses the turn instead of substituting global memory.
-        # A compaction drops session-start context. Read-and-clear the one-shot
-        # flag so this turn re-injects that context exactly once. The finally
-        # re-arms it if this turn never lands.
-        needs_reinjection = consume_reinjection(sessions, session_key)
+                if stopped or superseded:
+                    logger.info(
+                        "%s: session=%s %s before the replay -- dropping it",
+                        turn.channel_type,
+                        session_key,
+                        "was stopped by the user" if stopped else "was superseded by /new",
+                    )
+                    await retry_guard.release_held()
+                    # Leave the turn here, not through the post-turn bookkeeping
+                    # below: nothing ran, so there is no success to record and
+                    # no exchange to persist -- writing the prompt with an empty
+                    # reply would file a turn the user cancelled as a completed
+                    # one. The ``finally`` still closes the renderer, releases
+                    # the permit and closes the gap.
+                    return
+                # The replay's own completion supersedes the one the guard held.
+                retry_guard.drop_held()
+            accumulated = await driver.run(full_message)
 
-        # Off-loop: build_message embeds the episodic query (blocking urllib).
-        full_message, _ = await run_in_embed_pool(
-            ctx_builder.build_message,
-            turn.user_text,
-            is_new,
-            session_key,
-            channel_id=turn.conversation_id,
-            agent=turn.agent,
-            memory_store=memory_store,
-            resumed=resumed,
-            needs_reinjection=needs_reinjection,
-            minimal_context=turn.minimal_context,
-            runtime_source=turn.channel_type,
-            context_provider=provider,
-        )
-
-        driver = TurnDriver(
-            provider,
-            renderer,
-            approval_mode=turn.approval_mode,
-            decider=turn.decider,
-            auto_approve_session=turn.auto_approve_session,
-            deny_all_tools=turn.deny_all_tools,
-            auto_approve_tool=build_auto_approve(ctx_builder),
-            tool_gate=build_tool_gate(ctx_builder, session_key=session_key, agent=turn.agent),
-            directive_consumer=turn.directive_consumer,
-            audit_session_key=session_key,
-            audit_agent=turn.agent or "kirocrew",
-            closing_gate=lambda: sessions.begin_turn(session_key),
-        )
-        accumulated = await driver.run(full_message)
-
-        # Defensive lookup, like every other attribute read on this seam: the
-        # driver is resolved through the module attribute, so a caller (or a
-        # test) may supply a stand-in that predates this field. A missing
-        # reason means "no synthetic completion", never an AttributeError
-        # thrown at a real inbound message after the turn already ran.
-        if getattr(driver, "last_stop_reason", "") == STOP_REASON_COMPACTION_FAILED:
+            # Defensive lookup, like every other attribute read on this seam: the
+            # driver is resolved through the module attribute, so a caller (or a
+            # test) may supply a stand-in that predates this field. A missing
+            # reason means "no synthetic completion", never an AttributeError
+            # thrown at a real inbound message after the turn already ran.
+            if getattr(driver, "last_stop_reason", "") != STOP_REASON_COMPACTION_FAILED:
+                break
             # Synthetic completion: the backend abandoned the turn after a
             # failed auto-compaction and never sent end_turn, so it still
             # counts the prompt as in progress. Reset (mirrors the dashboard
             # runner's needs_session_reset) or this channel's NEXT message
-            # collides with "prompt already in progress". No re-queue: the
-            # compaction notice already reached the user via the renderer.
+            # collides with "prompt already in progress". Whether the abandoned
+            # message is then replayed is the guard's verdict, taken when the
+            # driver delivered the completion: a compaction that overflowed the
+            # window fails again identically, so replaying it only burns the
+            # budget, while a throttled or 5xx'd summarization call has nothing
+            # wrong with it and the very next attempt would clear it.
+            if retry_guard.held:
+                # Opened BEFORE the reset pops the session: from that pop until
+                # the reacquire above, a Stop finds no session and would go
+                # unrecorded -- the window the pre-replay check exists for --
+                # and a newer message for this key would claim the successor
+                # first and run ahead of the replay; the open gap makes it wait.
+                # Held until the ``finally`` below, past the whole retry
+                # sequence: a waiter admitted after the reacquire would park on
+                # the successor's semaphore, which the next retry's reset would
+                # pop from under it.
+                _set_replay_gap(sessions, session_key, opened=True)
+            reset_ok = True
             try:
                 await sessions.reset(session_key)
             except Exception:
+                reset_ok = False
                 logger.warning(
                     "%s: session reset after compaction failure failed session=%s",
                     turn.channel_type,
                     session_key,
                     exc_info=True,
                 )
+            if not retry_guard.held:
+                break
+            if not reset_ok:
+                # The runtime this turn ran on is still counted as busy, so a
+                # replay would collide with "prompt already in progress".
+                # Finalize the renderer with the completion the guard held and
+                # keep the give-up behaviour; the ``finally`` closes the gap.
+                await retry_guard.release_held()
+                break
+            replaying = True
+            logger.info(
+                "%s: transient compaction failure session=%s (attempt %d/%d) -- "
+                "replaying the abandoned message",
+                turn.channel_type,
+                session_key,
+                retry_guard.retries_used,
+                _COMPACTION_FAILED_RETRIES,
+            )
+            # Loop back to a fresh ``get_or_create``: the reset discarded the
+            # session whose turn permit this call holds, so the reacquire below
+            # takes the successor's, which the ``finally`` releases once.
 
         # ── Post-turn bookkeeping. Each step is guarded independently so a
         # failure here cannot fall through to the except and re-record a turn
         # that actually succeeded. ──
         try:
             sessions.record_success(session_key)
+            # Beside the counter it stands in for. The shared-death streak is a
+            # reading of whether this session can get work done at all, so a
+            # landed turn clears it exactly as it clears the consecutive-failure
+            # count -- left uncleared it would be a lifetime total, and the bound
+            # it feeds would stay permanently tripped while reporting the total as
+            # a consecutive run.
+            runtime_death.clear_shared_deaths(session_key)
         except Exception:
             logger.warning(
                 "%s: record_success failed session=%s",
@@ -941,7 +1817,9 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         _turn_landed = driver_turn_landed(driver)
         if turn.persist is not None:
             try:
-                await asyncio.to_thread(turn.persist, turn.user_text, accumulated, is_new)
+                await asyncio.to_thread(
+                    turn.persist, turn.user_text, accumulated, bool(turn_is_new)
+                )
             except Exception:
                 logger.warning(
                     "%s: persist_turn failed session=%s",
@@ -949,7 +1827,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
                     session_key,
                     exc_info=True,
                 )
-        if is_new and turn.after_persist is not None:
+        if turn_is_new and turn.after_persist is not None:
             try:
                 await turn.after_persist()
             except Exception:
@@ -979,6 +1857,24 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             )
         except Exception:
             logger.debug("%s: success audit failed", turn.channel_type, exc_info=True)
+    except TurnCeilingExceeded as exc:
+        # The conversation is at its turn ceiling, so this turn never opened.
+        # Ahead of the shutdown branch below and deliberately unlike it in two
+        # ways. It is NOT spooled: the spool exists so a message our own restart
+        # dropped is answered later, and replaying a message we refused on
+        # purpose would answer it after all. And it does not `record_failure`:
+        # the session did not misbehave, the conversation reached a bound.
+        #
+        # The notice IS the point. A refusal the user cannot see is the same
+        # silence the per-message echo guards already leave, so the text goes
+        # into this channel's own renderer, which also ends the stream: the
+        # `finally` below only tears the renderer down and flushes nothing.
+        logger.warning(
+            "%s: turn ceiling reached for %s -- conversation paused",
+            turn.channel_type,
+            session_key,
+        )
+        await turn_ceiling.render_refusal(renderer, exc)
     except SessionClosingError:
         # The gateway began shutting down between the claim and the dispatch, so
         # this turn never opened. Terminal for the message, but NOT a fault of
@@ -1011,6 +1907,21 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
         # reach for the prompt.
         if not turn.inbound_restricted:
             await spool_refused_turn(channel_type=turn.channel_type, route=turn.inbound_route)
+    except ToollessTurnUnavailable as exc:
+        # Refused before the prompt opened; the sender gets one neutral line so
+        # the silence is not read as being ignored, the SEL row already names why.
+        # Not charged to the circuit breaker: this is a configuration refusal,
+        # not a provider failure, and a group of refused members would otherwise
+        # trip the breaker for the session they never got to use.
+        logger.warning("%s: %s", turn.channel_type, exc)
+        if not turn.unprompted:
+            try:
+                await renderer.on_text_chunk(TOOLLESS_TURN_REFUSAL_NOTE)
+                await renderer.on_done()
+            except Exception:
+                logger.warning(
+                    "%s: could not display tool-less refusal", turn.channel_type, exc_info=True
+                )
     except UnknownMemoryStore as exc:
         logger.warning("%s member memory unavailable: %s", turn.channel_type, exc)
         try:
@@ -1018,10 +1929,20 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             await renderer.on_done()
         except Exception:
             logger.warning("%s: could not display memory refusal", turn.channel_type, exc_info=True)
-    except Exception:
+    except Exception as exc:
         logger.exception("%s transport_dispatch: error handling message", turn.channel_type)
         if _acquired:
-            await sessions.record_failure(session_key)
+            # A dying runtime reaches this generic handler as one more exception,
+            # so without the attribution question every tenant of one process
+            # charges its own breaker for a single process event. The provider
+            # handed over is the one THIS turn acquired, never a fresh lookup.
+            await charge_turn_failure(
+                sessions,
+                session_key,
+                exc=exc,
+                provider=_turn_provider,
+                channel_type=turn.channel_type,
+            )
     finally:
         # A turn that consumed the post-compaction flag but never landed
         # discarded the prompt carrying the re-injected context; put the flag
@@ -1054,3 +1975,8 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             )
         if _acquired:
             sessions.release(session_key)
+        # Closed LAST, after the permit is back: a message that waited behind the
+        # gap then finds an idle successor instead of a semaphore a later reset
+        # could pop from under it. Idempotent, so a turn that never opened one
+        # (or whose reset raised) costs a dictionary lookup.
+        _set_replay_gap(sessions, session_key, opened=False)

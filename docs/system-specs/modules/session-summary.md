@@ -92,6 +92,22 @@ exists to avoid.
 
 Both sidecars are reaped by `delete_session`, which is contractually a permanent
 removal: a deleted session must leave no orphaned model-generated text on disk.
+Their user-facing reads validate the transcript's derivation policy through
+`ConversationLog.derivation_hold` while holding the transcript lock; the intent
+panel's GET, the POST's read-back and the `session_summary` MCP tool's
+`GET /api/session-control/summary` share one helper
+(`chat_summary.read_cached_intent_summary`), so a `.intents`
+file left by the key's earlier persistent life is never served bare to a slot that
+is now restricted. Each writer revalidates through
+`ConversationLog.publication_hold` immediately after the model call and keeps that
+hold through the sidecar write. A lock timeout maps to `TranscriptBusy` and follows
+the existing empty/refused result on both READ and PUBLISH: the publish-time
+privacy verdict could not be obtained, so `_summarize_one` discards the generated
+one-line summary as well as skipping its sidecar write; the intent generator,
+which returns no text to a requester, likewise reports the pass as not published.
+The `TranscriptBusy` and `TranscriptWithheld` refusal arms therefore both return an
+empty summary and differ only in their diagnostic log text. No transcript lock
+spans model latency.
 
 **The write is guarded against resurrecting a delete.** Generation holds no lock
 while the model call is in flight (it can take tens of seconds), so a permanent
@@ -138,7 +154,7 @@ Each intent carries:
 | `origin_turn` | The turn that triggered this intent, or `null` |
 | `initial_intent` | Why the work started |
 | `progress` | A runbook of what is true now, not a history |
-| `next_steps` | `{what, why, expect}` — the summarizer's inferences |
+| `next_steps` | List of `{what, why, expect}` objects — the summarizer's inferences |
 
 **`ranges` is a list, and ranges may overlap.** An intent can go dormant and
 resume days later, and one intent can sit inside another's span (a question asked
@@ -160,8 +176,8 @@ into the single word the panel shows, so both surfaces agree by construction:
 
 `constraints` is session-level, not per-intent: recurring operational facts about
 how this project has to be run (a required build flag, a step that must follow a
-change, a name the user corrected). Capped by `max_constraints`, default 5 — a
-long list stops being read. Durable cross-session preferences belong in
+change, a name the user corrected). The `max_constraints` safety ceiling defaults
+to 50; a long list stops being read. Durable cross-session preferences belong in
 **lessons**, not here; this field is scoped to the session's project.
 
 ## Extraction: what the model actually reads
@@ -179,6 +195,18 @@ long list stops being read. Durable cross-session preferences belong in
 
 Measured against three real sessions, this reads roughly 1% of a transcript's
 bytes.
+
+`render_bounded_input()` then caps the transcript part of the prompt at
+`_MAX_INPUT_CHARS` (40 000); the fixed instructions come on top. A session under it renders unchanged. Over it, the input keeps the turns
+through the first `_KEEP_FIRST_TURNS` (3) user turns while they fit in half the
+budget, then as many of the newest turns as fit. One
+`[... user turns A-B omitted ...]` line stands in for the middle, naming the user
+turn numbers it dropped. Any single turn is cut again to its head and tail, about a
+quarter of the budget, so a very large `assistant_excerpt_chars` is not honoured
+there. A user turn, already capped at 4 000 characters, is kept whole or dropped. The trade is
+deliberate: the opening goals and the current state usually stay in view, and an
+intent that lived only in the dropped middle can fall out of a regenerated
+summary.
 
 ### Mechanically detectable traps live here
 
@@ -216,7 +244,7 @@ indistinguishable from one that is broken.
 | `disabled` | The flag is off — the common case, and it costs nothing |
 | `in_flight` | A pass for this slot is already running. The marker is taken **before the first await**, so two concurrent callers cannot both reach the model call — on-demand generation made that reachable from two clients at once |
 | `running` | A turn is in flight (`slot.running`). Consulted directly rather than inferred from the stop reason, because the marker is cleared at turn start: an empty `_last_stop_reason` means BOTH "idle session restored in a later process" and "streaming right now". **Holds under `force`** |
-| `memory_mode` | Incognito or temporary: no derived artifact from this conversation (mirrors `history.INCOGNITO_MEMORY_MODES` — a temporary transcript is discarded, so a persisted summary would outlive it) |
+| `memory_mode` | Incognito or temporary: no derived artifact from this conversation (mirrors `history.INCOGNITO_MEMORY_MODES` — the transcript is kept for the user's own History, and a summary is exactly the kind of model-produced artifact the mode withholds). Checked on the live slot AND on the on-disk line (`history.transcript_withholds_derivation`, before and after the transcript read, failing closed on an unreadable line), because the rows come from disk and the file can be stricter than the slot that kept it in memory. The panel read applies the same two gates while holding the transcript lock across its `.intents` sidecar read, so a summary cached before a same-key restricted recreation is not served. The sidecar is retained rather than deleted: a later persistent holder may legitimately reuse it if its transcript signature still matches. |
 | `stop_reason:<r>` | The turn did not cleanly end |
 | `too_few_turns` | Below `min_user_turns` |
 | `cadence` | Fewer than `regenerate_after_turns` since the last pass |
@@ -237,7 +265,8 @@ restore), so summarizing the in-memory tail of a long session would regenerate
 from a truncated view and overwrite the sidecar — earlier intents would silently
 vanish from the panel. The generator reads `read_messages_chained()` off the event
 loop; the cheap slot-level gates (disabled, unclean stop) run first so the common
-skip cases cost no disk IO, and `extract_turns` still bounds what the model reads.
+skip cases cost no disk IO, and `extract_turns` plus `render_bounded_input` bound
+what the model reads.
 
 **An unchanged transcript costs nothing.** Before any model call the pass checks
 the sidecar; a valid signature means the stored summary is already exactly right.
@@ -262,8 +291,10 @@ at all until the user reloads. The fallback also dispatches the payload as a
 Notification, adding a `ts`-less entry to the bell feed.
 `test_session_summary_api.py::TestSessionSummaryBroadcast` pins the envelope.
 
-The client closes the same gap on its other edge: `useWebSocket`'s reconnect
-catch-up invalidates `['session-summary']` wholesale, because a summary
+The client closes the same gap on its other edge: the socket's reconnect
+catch-up (`website/src/hooks/websocket/reconnectCatchUp.ts`, through
+`refreshServerStateAfterReconnect` in `website/src/hooks/websocket/serverState.ts`)
+invalidates `['session-summary']` wholesale, because a summary
 regenerated while the socket was down pushed a frame nobody received, and a
 non-polling panel would otherwise keep showing the stale one until the tab
 remounted. `useWebSocket.sessionSummary.test.ts` covers both the live frame and
@@ -284,6 +315,24 @@ more reliably than any phrasing, timestamps separate a daily routine from a fail
 retry, and a user correction is the highest-value signal per character in the file.
 
 ## Endpoint
+
+The Sessions three-dot menu also opens `/session-dashboards`: a read-only
+summary gallery alongside each session's model-authored Dynamic Dashboards.
+A centralized Needs you inbox precedes the gallery, including on phones. Each
+native question or approval has one control there, labeled with its human
+session name and current task context when available; session cards do not
+duplicate those controls. Search filters both sections, but the summary page
+limit never hides pending decisions. The view shares `['session-summary', slot]` with the chat
+panel and its websocket invalidation. Only visible cards read summaries (12
+initially, with explicit Show more); opening, filtering, or refreshing this
+page never calls the generation POST. Disabled, missing, stale, and failed
+summary reads remain distinct. Filtering hides inbox items rather than unmounting
+their unsent answer drafts. Hidden model-authored iframe documents are unloaded;
+the current page mounts at most 12 session cards. This view does not change summary
+generation, privacy, or ownership policy. Automatic HTML status cards are a
+separate opt-in (`dashboard.dynamic_dashboard_cards`), updated from session
+events under their own budget, not by this summary GET or its refresh interval.
+See [automatic session cards](learn-cron-dashboard.md#automatic-session-status-cards).
 
 ```
 GET /api/chat/slots/{slot}/summary
@@ -329,7 +378,11 @@ A forced pass lifts **exactly two** gates — `stop_reason` and `cadence` — be
 those bound spending nobody asked for, and an explicit click already carries the
 consent they stand in for. `disabled`, `in_flight`, `memory_mode`, `running` and
 `too_few_turns` all still hold, and the cache check is not skipped, so a second
-click cannot buy an identical answer.
+click cannot buy an identical answer. The handler answers from a **read-back** of
+the sidecar rather than the pass's return value (a forced pass returns `False` both
+for "produced nothing" and "already current"), and that read-back is the GET's own
+gated read: a pass skipped for `memory_mode` is answered `409 summary_unavailable`,
+never with a `.intents` sidecar the key wrote in an earlier persistent life.
 
 `generate_state` on the GET tells the panel which affordance to offer:
 `ready` / `too_few_turns` / `unavailable`. It is decided server-side so the frontend
@@ -349,7 +402,8 @@ would be accepted and broadcast a summary omitting that turn as *current*. So
 `running` and `_dirty` are re-read immediately before the write. Together the three
 answer one question — is the transcript I summarized still the whole session?
 
-`stale: true` means a summary exists but the transcript has moved on. The storedpayload is still returned: an empty panel reads as "this is broken" while a stale
+`stale: true` means a summary exists but the transcript has moved on. The stored
+payload is still returned: an empty panel reads as "this is broken" while a stale
 one reads as "not regenerated yet", which is the truth. `read_intent_summary()` is
 the non-strict accessor for this; `get_cached_intent_summary()` is the strict one
 the generator uses.

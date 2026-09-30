@@ -90,12 +90,6 @@ class _TaskqBridgeMixin(ManagerComponent):
             return None
         return getattr(self._manager, "_taskq_unavailable", None)
 
-    def taskq_window(self) -> int:
-        from kiro_crew import taskq as _taskq
-
-        store = self.taskq_store()
-        return store.window if store is not None else _taskq.DEFAULT_DISPATCH_WINDOW
-
     def taskq_admit_wait_secs(self) -> float:
         return float(getattr(self._manager, "_taskq_admit_wait_secs", 30.0) or 30.0)
 
@@ -117,6 +111,21 @@ class _TaskqBridgeMixin(ManagerComponent):
         # not yet claimed or windowed) belong to that caller, not to the pump.
         admitting = list(getattr(self._manager, "_admitting_ids", ()) or ())
         return self.taskq_window_ids() + live + admitting
+
+    def taskq_dispatch_excluded_ids(self) -> list[str]:
+        """:meth:`taskq_excluded_ids` plus the rows the pump has popped from the
+        window and not yet claimed (``_dispatching_ids``).
+
+        For the pump's own reads only: the refill that tops the window up and
+        the depth the chip shows. A popped row's durable state is still QUEUED
+        until its claim lands, so without this the refill re-hydrates a row that
+        is being started and the depth counts it as waiting. Cancellation and
+        pending-work reads keep :meth:`taskq_excluded_ids`: a parent's Stop must
+        reach a row in exactly this popped-unclaimed state, or it starts after
+        the stop has reported done.
+        """
+        dispatching = list(getattr(self._manager, "_dispatching_ids", ()) or ())
+        return self.taskq_excluded_ids() + dispatching
 
     def taskq_open(self, cfg: Any, *, home: Any) -> "_taskq.TaskStore | None":
         """Open the store for this manager per ``cfg.agent``.
@@ -339,7 +348,13 @@ class _TaskqBridgeMixin(ManagerComponent):
         # here, so a recovered row faces the gate its caller faced; the value is
         # still recorded in ``scope_ref``, which the schema defines as
         # references rather than grants and which no start path reads.
-        _PROCESS_LOCAL_PARAMS = ("_agent_prevalidated", "approval_mode")
+        #
+        # ``_parent_spawn_policy`` is a read of the parent agent spec at THIS
+        # request's moment, kept in the in-memory queue so its synchronous drain
+        # scans nothing on the loop; the durable pump re-resolves it off-loop
+        # before every re-check, so the row never carries a snapshot that an
+        # edited spec would leave stale across a restart.
+        _PROCESS_LOCAL_PARAMS = ("_agent_prevalidated", "approval_mode", "_parent_spawn_policy")
         durable_params = {k: v for k, v in params.items() if k not in _PROCESS_LOCAL_PARAMS}
         return _taskq.TaskRecord(
             id=agent_id,
@@ -455,6 +470,7 @@ class _TaskqBridgeMixin(ManagerComponent):
         batch_id: str,
         queued: "SubagentInfo",
         refused: "SubagentInfo",
+        wait: "Mapping[str, Any] | None" = None,
     ) -> None:
         """Hand a drained row's defer to the coroutine dispatcher to write.
 
@@ -476,6 +492,7 @@ class _TaskqBridgeMixin(ManagerComponent):
             batch_id=batch_id,
             queued=queued,
             refused=refused,
+            wait=dict(wait or {}),
         )
 
     async def finish_parked_defer(self, info: "SubagentInfo") -> "SubagentInfo":
@@ -529,7 +546,12 @@ class _TaskqBridgeMixin(ManagerComponent):
             _asyncio.get_event_loop().call_later(wait, self._manager._drain_queue)
         except RuntimeError:
             pass
-        self._manager._emit_queue_depth(point.parent_session_key, point.batch_id)
+        # The defer is written: publish the gate's label with the depth. A
+        # refused row (``not ok`` above) publishes nothing, so no label outlives
+        # a row that never waited.
+        self._manager._emit_queue_depth(
+            point.parent_session_key, point.batch_id, wait=dict(point.wait) or None
+        )
         return point.queued
 
     async def taskq_should_window_async(self, agent_id: str) -> bool:
@@ -866,23 +888,32 @@ class _TaskqBridgeMixin(ManagerComponent):
             current or "gone",
         )
 
-    def taskq_overflow(self, parent_session_key: str | None = None) -> int:
+    def taskq_overflow(
+        self, parent_session_key: str | None = None, *, for_dispatch: bool = False
+    ) -> int:
         """Queued rows that live only in the store (outside the in-memory window).
 
         A store that cannot be read answers :data:`UNKNOWN_PENDING`, not 0: no
         store at all is a queue with no rows in it, while a locked or full one is
         a queue whose rows nobody can see, and only the first of those is
         evidence that this parent has nothing waiting.
+
+        *for_dispatch* selects :meth:`taskq_dispatch_excluded_ids`, which also
+        leaves out a row the pump has popped and not yet claimed. Only the depth
+        the chip shows asks for that: a pending-work read (the guard that holds
+        a parent's reset while its children wait) must keep counting such a row,
+        because it is still this parent's accepted work.
         """
         from kiro_crew import taskq as _taskq
 
         store = self.taskq_store()
         if store is None:
             return 0
+        exclude = self.taskq_dispatch_excluded_ids() if for_dispatch else self.taskq_excluded_ids()
         try:
             return store.count_pending(
                 _taskq.KIND_SUBAGENT,
-                exclude_ids=self.taskq_excluded_ids(),
+                exclude_ids=exclude,
                 session_key=parent_session_key,
             )
         except _taskq.TaskStoreUnavailable:
@@ -893,7 +924,9 @@ class _TaskqBridgeMixin(ManagerComponent):
             )
             return UNKNOWN_PENDING
 
-    async def taskq_overflow_async(self, parent_session_key: str | None = None) -> int:
+    async def taskq_overflow_async(
+        self, parent_session_key: str | None = None, *, for_dispatch: bool = False
+    ) -> int:
         """:meth:`taskq_overflow` with its store count on the writer thread.
 
         The exclusion set is in-memory manager state, so it is snapshotted HERE
@@ -906,7 +939,7 @@ class _TaskqBridgeMixin(ManagerComponent):
         store = self.taskq_store()
         if store is None:
             return 0
-        exclude = self.taskq_excluded_ids()
+        exclude = self.taskq_dispatch_excluded_ids() if for_dispatch else self.taskq_excluded_ids()
         try:
             return int(
                 await store.run(
@@ -959,6 +992,68 @@ class _TaskqBridgeMixin(ManagerComponent):
         except _taskq.TaskStoreUnavailable:
             return []
         return [r.id for r in rows]
+
+    def taskq_cancel_boundary_store(
+        self,
+        store: "_taskq.TaskStore",
+        parent_session_key: str,
+        boundary_owner: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Store phase for exact queued cancellation; runs on the writer thread."""
+        from kiro_crew import taskq as _taskq
+
+        cancelled: list[dict[str, Any]] = []
+        try:
+            rows = store.list_pending(
+                _taskq.KIND_SUBAGENT,
+                session_key=parent_session_key,
+            )
+            rows.extend(
+                row
+                for row in store.active_rows()
+                if row.kind == _taskq.KIND_SUBAGENT
+                and row.session_key == parent_session_key
+                and row.state == _taskq.ADMITTED
+            )
+            unstarted = _taskq.CLAIMABLE | frozenset({_taskq.ADMITTED})
+            seen: set[str] = set()
+            for row in rows:
+                if (
+                    row.id in seen
+                    or str(row.params.get("_stage_boundary_owner") or "") != boundary_owner
+                ):
+                    continue
+                seen.add(row.id)
+                previous = store.cancel(
+                    row.id,
+                    reason="user_stop",
+                    only_from=unstarted,
+                    generation=row.generation,
+                )
+                if previous is None:
+                    continue
+                params = dict(row.params)
+                params["_preassigned_id"] = row.id
+                cancelled.append(params)
+        except _taskq.TaskStoreUnavailable as exc:
+            return cancelled, str(exc) or "task store unavailable"
+        return cancelled, ""
+
+    async def taskq_cancel_boundary_async(
+        self,
+        parent_session_key: str,
+        boundary_owner: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Cancel exact queued rows on the store's single writer thread."""
+        store = self.taskq_store()
+        if store is None:
+            return [], ""
+        return await store.run(
+            self.taskq_cancel_boundary_store,
+            store,
+            parent_session_key,
+            boundary_owner,
+        )
 
     def taskq_batch_pending(self, batch_id: str) -> bool:
         """True when a store-only queued row belongs to *batch_id*.
@@ -1043,6 +1138,7 @@ class _TaskqBridgeMixin(ManagerComponent):
             absent, lanes = self._refill_absent(store, children_only)
             room, want = self._refill_make_room(store, absent, lanes)
             rows = self._refill_fetch(store, absent, room, want, children_only)
+            rows = self._reconcile_refill_boundaries_sync(store, rows)
             self._refill_apply(rows)
             wake_at = (
                 self._refill_idle_wake_at(store) if not rows and not self._manager._queue else None
@@ -1066,6 +1162,7 @@ class _TaskqBridgeMixin(ManagerComponent):
             absent, lanes = await store.run(self._refill_absent, store, children_only)
             room, want = self._refill_make_room(store, absent, lanes)
             rows = await store.run(self._refill_fetch, store, absent, room, want, children_only)
+            rows = await self._reconcile_refill_boundaries_async(rows)
             self._refill_apply(rows)
             wake_at = (
                 await store.run(self._refill_idle_wake_at, store)
@@ -1076,6 +1173,90 @@ class _TaskqBridgeMixin(ManagerComponent):
             return len(rows)
         self._refill_schedule_wake(store, wake_at)
         return len(rows)
+
+    @staticmethod
+    def _refill_boundary_scope(rec: "_taskq.TaskRecord") -> tuple[str, str] | None:
+        owner = str(rec.params.get("_stage_boundary_owner") or "")
+        parent = str(rec.session_key or rec.params.get("parent_session_key") or "")
+        return (parent, owner) if parent and owner else None
+
+    def _stale_refill_boundary_scopes(
+        self,
+        rows: list["_taskq.TaskRecord"],
+    ) -> set[tuple[str, str]]:
+        """Exact stage scopes without a live boundary owner.
+
+        The resolver is gateway-wired and reads loop-owned dashboard state, so
+        the async refill calls this only after its store fetch returns. A manager
+        without that resolver keeps legacy/test behavior. Resolver failure is
+        observable but is not treated as boundary absence, so no row is
+        cancelled without a positive stale-owner verdict.
+        """
+        resolver = getattr(self._manager, "_stage_boundary_for_scope", None)
+        if not callable(resolver):
+            return set()
+        stale: set[tuple[str, str]] = set()
+        for rec in rows:
+            scope = self._refill_boundary_scope(rec)
+            if scope is None:
+                continue
+            try:
+                boundary = resolver(*scope)
+            except Exception:
+                _glue_logger.warning(
+                    "taskq: stage-boundary lookup failed during refill for parent=%s owner=%s",
+                    *scope,
+                    exc_info=True,
+                )
+                continue
+            if boundary is None:
+                stale.add(scope)
+        return stale
+
+    def _without_refill_boundary_scopes(
+        self,
+        rows: list["_taskq.TaskRecord"],
+        stale: set[tuple[str, str]],
+    ) -> list["_taskq.TaskRecord"]:
+        if not stale:
+            return rows
+        return [rec for rec in rows if self._refill_boundary_scope(rec) not in stale]
+
+    def _reconcile_refill_boundaries_sync(
+        self,
+        store: "_taskq.TaskStore",
+        rows: list["_taskq.TaskRecord"],
+    ) -> list["_taskq.TaskRecord"]:
+        """Cancel stale stage rows inline for the non-loop refill variant."""
+        stale = self._stale_refill_boundary_scopes(rows)
+        for parent, owner in sorted(stale):
+            if self._manager._hold_boundary_cancellation(parent, owner):
+                continue
+            cancelled, failure = self.taskq_cancel_boundary_store(store, parent, owner)
+            if failure:
+                failure = self._manager._bounded_boundary_cancellation_failure(failure)
+            self._manager._apply_boundary_cancelled_rows(
+                parent,
+                owner,
+                cancelled,
+                settled=not failure,
+            )
+            if failure:
+                self._manager._pending_boundary_cancellations[(parent, owner)] = failure
+                self._manager._schedule_boundary_cancel_retry()
+        return self._without_refill_boundary_scopes(rows, stale)
+
+    async def _reconcile_refill_boundaries_async(
+        self,
+        rows: list["_taskq.TaskRecord"],
+    ) -> list["_taskq.TaskRecord"]:
+        """Cancel stale stage rows through the exact off-loop writer path."""
+        stale = self._stale_refill_boundary_scopes(rows)
+        for parent, owner in sorted(stale):
+            if self._manager._hold_boundary_cancellation(parent, owner):
+                continue
+            await self._manager._settle_boundary_queue(parent, owner)
+        return self._without_refill_boundary_scopes(rows, stale)
 
     def _refill_absent(
         self, store: "_taskq.TaskStore", children_only: bool
@@ -1098,7 +1279,7 @@ class _TaskqBridgeMixin(ManagerComponent):
         }
         pending = store.pending_lanes(
             _taskq.KIND_SUBAGENT,
-            exclude_ids=self.taskq_excluded_ids(),
+            exclude_ids=self.taskq_dispatch_excluded_ids(),
             children_only=children_only,
         )
         return [lane for lane in pending if lane not in present], lanes
@@ -1131,7 +1312,7 @@ class _TaskqBridgeMixin(ManagerComponent):
         """Store read: the absent lanes' heads first, then whatever room is left."""
         from kiro_crew import taskq as _taskq
 
-        exclude = self.taskq_excluded_ids()
+        exclude = self.taskq_dispatch_excluded_ids()
         rows: list[_taskq.TaskRecord] = []
         if absent and room > 0:
             rows.extend(
@@ -1178,8 +1359,11 @@ class _TaskqBridgeMixin(ManagerComponent):
             return
         present = {p.get("_preassigned_id") for p in self._manager._queue}
         for rec in rows:
+            entry = self._window_entry(rec)
+            if self._manager._boundary_cancellation_pending(entry):
+                continue
             if rec.id not in present:
-                self._manager._queue.append(self._window_entry(rec))
+                self._manager._queue.append(entry)
 
     @staticmethod
     def _refill_idle_wake_at(store: "_taskq.TaskStore") -> float | None:

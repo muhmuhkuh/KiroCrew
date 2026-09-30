@@ -1510,11 +1510,25 @@ def pytest_make_collect_report(collector):
         )
 
 
+def _pin_crew_log_off_for_the_process() -> None:
+    """``KIROCREW_CREW_LOG=0`` for the whole run, so a test opts IN to the crew log.
+
+    The gateway records a crew log by default. A test that drives the chat path for
+    some other reason would otherwise write one into its data home, and the logs
+    this suite asserts on would pick up entries from code the test never meant to
+    exercise. Every crew-log test sets the variable itself: ``"1"`` to record,
+    ``"0"`` to assert the off path, and ``monkeypatch.delenv`` to assert the default.
+    """
+    os.environ["KIROCREW_CREW_LOG"] = "0"
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Record the working directory pytest started in, before any test can move it."""
     _refuse_a_real_data_home()
     _pin_telemetry_off_for_the_process()
+    _pin_crew_log_off_for_the_process()
     _prefer_short_tmp_base()
+    _install_short_tmp_root()
     _redirect_hypothesis_database()
     _redirect_bytecode_cache()
     _gate_pytest_asyncio_fixture_scan()
@@ -1699,6 +1713,50 @@ def _join_install_receipt_workers() -> None:
     waiter = getattr(mod, "wait_for_pending_receipt_writes", None)
     if waiter is not None:
         waiter()
+
+
+def _resume_crew_log_eager_fold() -> None:
+    """Lift the eager-fold fence for the test about to run.
+
+    The mirror of :func:`_retire_crew_log_eager_fold`: that one fences the gap between
+    tests, this one hands the worker back to the test itself. Looked up rather than
+    imported, so a run that never touches the crew log pays nothing.
+    """
+    mod = sys.modules.get("kiro_crew.crew_log.eager")
+    resume = getattr(mod, "resume_for_tests", None)
+    if resume is not None:
+        resume()
+
+
+def _retire_crew_log_eager_fold() -> "BaseException | None":
+    """Retire the crew log's append path and its fold worker before this test's pins lift.
+
+    The worker is a process-wide daemon that the PRODUCTION append path starts: an
+    ``emit`` call with the crew log on reaches ``note_commit``, which starts the thread.
+    So any test that appends a work or panel entry has one running, whether or not it
+    knows the module exists -- and the worker resolves ``KIROCREW_HOME`` when it folds,
+    which is the pin that lifts a moment later. Stopping it here rather than in each
+    file's own fixture is the point: the next test file to call ``on_work_recorded``
+    should be safe by default, not by remembering.
+
+    Same place and same reason as :func:`_join_install_receipt_workers` -- the
+    ``tryfirst`` teardown hook runs before any fixture finalization, so the pins still
+    hold. The module is looked up rather than imported, so a run that never touches the
+    crew log pays nothing.
+
+    ``retire_for_tests`` owns the ORDER (drain the writer, then stop the worker, and stop
+    nothing if the writer will not drain) because both halves are its own; this floor owns
+    only WHEN and WHERE TO REPORT. The failure is RETURNED, never raised from here: raising
+    on this side of the hookwrapper's ``yield`` would skip every fixture finalization behind
+    it, which is worse than the leak it reports. The caller raises it after the ``yield``
+    instead, beside :func:`_refuse_a_resolved_real_default_home`, which is the established
+    place for "this test left damage".
+    """
+    mod = sys.modules.get("kiro_crew.crew_log.eager")
+    retire = getattr(mod, "retire_for_tests", None)
+    if retire is None:
+        return None
+    return retire()
 
 
 #: How long the executor join waits before giving up on a wedged job. Long enough for
@@ -1932,6 +1990,12 @@ def pytest_runtest_teardown(item, nextitem):
     """
     _join_install_receipt_workers()
     _join_test_loop_executor(item)
+    # LAST, and the order is load-bearing: everything above cancels tasks, joins executor
+    # jobs and drains the crew-log writer, and the ``finally`` blocks that run as they
+    # unwind APPEND -- which reaches ``note_commit``, and an enqueue after a stop starts a
+    # fresh daemon nothing holds a handle to. Stopping the worker once its producers are
+    # quiescent is what makes the stop final.
+    wedged_eager_fold = _retire_crew_log_eager_fold()
     resolved_real_home = (
         _resolved_real_default_home() if item.stash.get(_HOME_PIN_ARMED, False) else None
     )
@@ -1939,6 +2003,10 @@ def pytest_runtest_teardown(item, nextitem):
     yield
     if resolved_real_home is not None:
         _refuse_a_resolved_real_default_home(resolved_real_home)
+    if wedged_eager_fold is not None:
+        # Reported AFTER the yield for the reason on _retire_crew_log_eager_fold: fixture
+        # finalization has run by here, so failing the test costs nothing but the failure.
+        raise wedged_eager_fold
 
 
 def _restore_session_cwd() -> None:
@@ -2079,8 +2147,8 @@ def _restore_log_record_factory():
     installing over the already-installed wrapper captured it as its own base factory.
 
     **Sharding hides this class, so the floor cannot rely on a full-suite run to find it.**
-    ``ci.yml`` assigns whole files to Linux/Windows shards before import (macOS keeps
-    pytest-split groups), and a leak only damages tests in the SAME process, so PR CI
+    CI assigns whole files to a shard before import on every platform, and a leak only
+    damages tests in the SAME process, so PR CI
     usually cannot observe it at all; the
     release job runs the suite whole and is otherwise the first place it appears -- as
     failures in files unrelated to the cause, long after the diff merged. Restoring here
@@ -2191,6 +2259,54 @@ def _restore_log_queue_listener():
     cli._LOG_QUEUE_LISTENER = before
 
 
+# ── the hooks system's process-wide dispatcher goes back after every test ──
+
+
+@pytest.fixture(autouse=True)
+def _restore_hooks_integration_globals():
+    """Put ``hooks_integration._lifecycle_dispatcher`` / ``_route_registry`` back.
+
+    ``init_hooks_system`` -- which every test that builds the real dashboard app
+    reaches through ``server.py`` -- assigns BOTH module globals and nothing in
+    production ever clears them: a gateway sets them once at boot. In a worker they
+    therefore carry the LAST such test's ``LifecycleDispatcher`` into every later
+    test, together with whatever that test passed as ``cron_service`` -- routinely
+    a ``MagicMock``. The trust-revoke teardown (``teardown_app_runtime`` ->
+    ``on_app_disable`` -> ``_cleanup_app_crons``) reads that global and awaits the
+    stale mock's cron store, gets ``object MagicMock can't be used in 'await'
+    expression``, and reports ``hooks disable failed`` -- so the route answers 409
+    ``teardown_incomplete`` for an app whose teardown had nothing to do.
+
+    Measured on a five-run hygiene sweep: seven to nine of
+    ``test_trusted_apps_api.py``'s revoke tests were red in EVERY round with that
+    body, a different subset each round, and all of them pass alone -- the file
+    is a victim, not the leak. Reproduced by replaying one worker's 1,874 files
+    in order at ``-n0`` with a debug hook on the handler, which named the stale
+    dispatcher and its ``MagicMock`` cron service. Restored rather than blamed,
+    like the log-record factory above: the assignment is production's, the
+    tests that trigger it are exercising real boot code, and any of ~170 files
+    that build the app can be the one that lands before the victim. Reached
+    through ``sys.modules`` so a worker that never imported the module pays
+    nothing and no import is charged to the lazy-import ratchets.
+    """
+    hi = sys.modules.get("kiro_crew.apps.hooks_integration")
+    before = None
+    if hi is not None:
+        before = (
+            getattr(hi, "_lifecycle_dispatcher", None),
+            getattr(hi, "_route_registry", None),
+        )
+    yield
+    hi = sys.modules.get("kiro_crew.apps.hooks_integration")
+    if hi is None:
+        return
+    if before is None:
+        # Imported DURING the test: whatever it set is the test's, and the module
+        # started life with both slots empty.
+        before = (None, None)
+    hi._lifecycle_dispatcher, hi._route_registry = before
+
+
 # ── logger levels go back after every test ──────────────────────────
 
 
@@ -2289,7 +2405,13 @@ _probe_attempted = False
 
 
 def pytest_runtest_setup(item):
-    """Keep ``sandbox._backend`` warm for every test, at one probe per worker.
+    """Keep ``sandbox._backend`` warm for every test, at one probe per worker, and hand
+    the crew log's eager fold worker back to it.
+
+    The teardown floor fences that worker between tests (see
+    :func:`_retire_crew_log_eager_fold`), because a wake arriving in that gap comes from
+    the previous test's writer and folds against a home nobody pinned. A test is the other
+    side of that gap: it is meant to reach the worker, so the fence lifts here.
 
     ``detect_backend()`` reached from a running event loop with a COLD cache
     deliberately refuses to probe -- the probe forks and waits, which must never
@@ -2324,6 +2446,7 @@ def pytest_runtest_setup(item):
     every test in the run. A probe failure is swallowed either way -- a host genuinely
     without a sandbox must still run the tests that do not need one.
     """
+    _resume_crew_log_eager_fold()
     global _probe_verdict, _probe_attempted
     try:
         from kiro_crew import sandbox
@@ -2459,7 +2582,8 @@ def _apply_tracked_gap_list(items, listname: str, platform_label: str) -> None:
 
     ONE mechanism serves all three gap lists. macOS and the self-hosted Linux runner
     reuse it rather than growing a second matcher, so the node-id spelling rule
-    (``_base_nodeid``: no ``[params]``, no ``@group``) and the burn-down semantics --
+    (never ``@group``; ``[params]`` optional, and selective when present -- see the
+    parametrization paragraph below) and the burn-down semantics --
     anything NOT listed still fails the job -- are identical for every list by
     construction.
 
@@ -2603,6 +2727,69 @@ def _create_tmp_root(parent: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(tempfile.mkdtemp(prefix=_tmp_root_prefix_for_run(), dir=parent))
 
 
+#: Env var carrying this run's SHORT temp root, so xdist workers reuse the controller's.
+_SHORT_TMP_ROOT_ENV = "KIROCREW_TEST_SHORT_TMP_ROOT"
+
+#: The temp roots THIS process created, captured at creation. The bytecode-mirror prune
+#: reads this instead of ``tempfile.gettempdir()``, which by session teardown has been
+#: restored to the platform temp root -- a mirror shared with every concurrent run.
+_RUN_TEMP_ROOTS: list[str] = []
+
+#: Set only in the process that CREATED the short root, so a worker never removes it.
+_SHORT_TMP_ROOT_OWNED: str | None = None
+
+
+def _install_short_tmp_root() -> None:
+    """Mint one run-owned SHORT temp root and publish it for the whole run.
+
+    A handful of fixtures cannot use ``tmp_path``: an ``AF_UNIX`` ``sun_path`` caps the
+    bind/connect STRING at 108 bytes on Linux and 104 on macOS, and a path asserted in
+    message metadata must not trip ``redact_credentials()`` (a macOS ``tmp_path`` carries
+    high-entropy directory ids that do). Those fixtures reached for a literal ``/tmp``,
+    which put ~40 anonymous ``/tmp/tmpXXXX`` and ``/tmp/kcsock-XXXX`` directories on the
+    host, owned by nobody: the residue guard's allow-list and the hygiene probe both
+    recognise the ``kc-pytest-<user>-<pid>-`` stem and nothing else, so a stray directory
+    spelled any other way names no run and no test.
+
+    ``tempfile.gettempdir()`` cannot serve here, which is the whole reason this root
+    exists separately: under a long ``TMPDIR`` -- the run's own isolated base, a harness
+    that pins ``TMPDIR`` under the checkout -- ``<base>/kcsock-xxxxxxxx/gw-prewarm.sock``
+    is already past ``sun_path`` before a filename is appended (measured at 122 bytes
+    against the 108-byte cap), and ``test_mcp_gateway_transport``'s ``_SUN_PATH_BUDGET``
+    test goes red. So the root is created under the PLATFORM temp root, where the path is
+    short by construction, and carries the run's own stem so it is attributable.
+
+    Created in ``pytest_configure`` and published through the environment: an xdist worker
+    is a child of the controller, inherits the variable, and therefore shares the one root
+    instead of minting its own. Only the creating process removes it (``_SHORT_TMP_ROOT_OWNED``).
+    """
+    global _SHORT_TMP_ROOT_OWNED
+    if os.environ.get(_SHORT_TMP_ROOT_ENV):
+        return  # an xdist worker (or a nested session): the controller already made it
+    parent = None if os.name == "nt" else "/tmp"
+    if parent is not None and not os.path.isdir(parent):
+        parent = None  # unusual POSIX host; the platform default still satisfies both rules
+    try:
+        root = tempfile.mkdtemp(prefix=f"{_tmp_root_prefix_for_run()}short-", dir=parent)
+    except OSError:
+        return  # no short root available; short_tmp_base() falls back to its old behaviour
+    # No chmod: ``mkdtemp`` already creates the directory 0o700, which is what this root
+    # needs in a world-writable temp dir. Setting it again only invites a permissions
+    # linter to argue about a mode the stdlib picked.
+    os.environ[_SHORT_TMP_ROOT_ENV] = root
+    _SHORT_TMP_ROOT_OWNED = root
+
+
+def _remove_short_tmp_root() -> None:
+    """Remove the short root, but only in the process that created it."""
+    global _SHORT_TMP_ROOT_OWNED
+    root, _SHORT_TMP_ROOT_OWNED = _SHORT_TMP_ROOT_OWNED, None
+    if root:
+        shutil.rmtree(root, ignore_errors=True)
+        if os.environ.get(_SHORT_TMP_ROOT_ENV) == root:
+            del os.environ[_SHORT_TMP_ROOT_ENV]
+
+
 #: Env vars ``tempfile`` consults, so a CHILD process inherits the redirect too.
 #: A test that spawns a helper which writes to its temp dir would otherwise put
 #: that file in the real ``/tmp``, where nothing prunes it.
@@ -2709,6 +2896,43 @@ def _remove_tree(path: pathlib.Path) -> bool:
     return _pc.rmtree_force(path)
 
 
+def _stop_git_discovery_above_the_temp_roots(base, tmp_path_factory) -> None:
+    """Fence git's repository discovery at this run's temp roots.
+
+    A test that builds "a directory that is not a repository" under ``tmp_path`` is
+    asserting a property of the HOST unless something bounds git's upward walk: when the
+    temp root sits inside a checkout -- an operator with ``TMPDIR=./tmp``, a harness that
+    pins its scratch under the worktree -- ``git rev-parse`` climbs out of ``tmp_path`` and
+    answers about the enclosing repository instead. The 2026-09-20 sweep measured 66 tests
+    failing exactly that way across two clusters, and the shape is worse in a LINKED
+    worktree, where the ``.git`` the walk finds is a FILE and a marker-based probe declines
+    before the arm under test ever runs.
+
+    ``GIT_CEILING_DIRECTORIES`` is git's own seam for this and is read by every ``git``
+    child the suite spawns, so one write here covers the production helpers a test cannot
+    reach. Per-site fixtures still exist and are still correct -- they document intent, and
+    they cover the walks this cannot fence (an ``install.sh`` marker search, a nested pytest
+    session's ``rootdir``) -- but this is what keeps the NEXT test from inheriting the
+    checkout by default. Absolute, symlink-resolved paths: git ignores a ceiling entry that
+    is not both.
+    """
+    entries: list[str] = []
+    for candidate in (base, tmp_path_factory.getbasetemp(), os.environ.get(_SHORT_TMP_ROOT_ENV)):
+        if not candidate:
+            continue
+        try:
+            resolved = os.path.realpath(str(candidate))
+        except OSError:  # pragma: no cover - unreadable temp root
+            continue
+        if resolved not in entries:
+            entries.append(resolved)
+    existing = os.environ.get("GIT_CEILING_DIRECTORIES")
+    if existing:
+        entries.append(existing)
+    if entries:
+        os.environ["GIT_CEILING_DIRECTORIES"] = os.pathsep.join(entries)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_tempfile_base(tmp_path_factory):
     """Give the run its own ``tempfile`` base, then report and remove what leaked.
@@ -2782,10 +3006,21 @@ def _isolate_tempfile_base(tmp_path_factory):
     previous_env = {name: os.environ.get(name) for name in _TMP_ENV_VARS}
     parent = pathlib.Path(tempfile.gettempdir())
     base = _create_tmp_root(parent)
+    # Record the root at CREATION. The bytecode-mirror prune runs from
+    # ``pytest_sessionfinish``, which is AFTER this fixture's finalizer has restored
+    # ``tempfile.tempdir``: reading ``tempfile.gettempdir()` there resolves to the platform
+    # temp root, and pruning that mirror would delete every concurrent run's bytecode.
+    _RUN_TEMP_ROOTS.append(str(base))
     _redirect_tempfile_base(base)
+    previous_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+    _stop_git_discovery_above_the_temp_roots(base, tmp_path_factory)
     try:
         yield base
     finally:
+        if previous_ceiling is None:
+            os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+        else:
+            os.environ["GIT_CEILING_DIRECTORIES"] = previous_ceiling
         tempfile.tempdir = previous_tempdir
         for name, value in previous_env.items():
             if value is None:
@@ -4067,6 +4302,47 @@ def _drain_windows_proactor_finalizers() -> None:
     atexit.register(_final_gc_pass)
 
 
+def _prune_bytecode_mirror_of_this_runs_temp_roots(session: pytest.Session) -> None:
+    """Drop the ``sys.pycache_prefix`` mirror trees keyed on THIS run's temp roots.
+
+    :func:`_redirect_bytecode_cache` sends every ``.pyc`` to a per-user cache mirror, and
+    its "the cache persists so warm imports stay warm" argument holds for sources in the
+    CHECKOUT, whose absolute paths are stable. It does not hold for a source under
+    ``tmp_path`` or the run's isolated temp base: those paths are new on every run, so the
+    mirror gains one dead tree per run that nothing ever reads and nothing owns. Measured
+    on one developer host before this guard: 14,816 orphaned ``.pyc`` files, 5.3 GB, across
+    161 dead run roots.
+
+    The suite compiles throwaway sources deliberately (``load_app_module``, a skill script
+    imported by path, a packaging step's precompile), so the answer is not to stop writing
+    bytecode -- it is that the writer must own the retirement of what it wrote. Scoped to
+    the roots this run created, so a concurrent run's mirror is never touched.
+    """
+    prefix = getattr(sys, "pycache_prefix", None)
+    if not prefix:
+        return
+    roots: list[str] = []
+    try:
+        roots.append(str(session.config._tmp_path_factory.getbasetemp()))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - no basetemp was ever materialised
+        pass
+    for candidate in (*_RUN_TEMP_ROOTS, os.environ.get(_SHORT_TMP_ROOT_ENV) or ""):
+        if candidate:
+            roots.append(candidate)
+    for root in roots:
+        try:
+            absolute = os.path.abspath(root)
+        except OSError:  # pragma: no cover - unreadable cwd
+            continue
+        # The mirror path is the prefix plus the source's absolute path with its leading
+        # separator dropped; on Windows the drive colon is replaced the same way CPython
+        # does, so the join is done from the parts rather than by string surgery.
+        drive, tail = os.path.splitdrive(absolute)
+        mirrored = os.path.join(prefix, drive.replace(":", "") + tail.lstrip(os.sep))
+        if os.path.isdir(mirrored):
+            shutil.rmtree(mirrored, ignore_errors=True)
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """Fail the run when the suite left new, non-ignored entries at the root.
 
@@ -4091,6 +4367,9 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         xdist_budget.release_worker_slots()
     except ImportError:  # pragma: no cover - partial checkout
         pass
+
+    _remove_short_tmp_root()
+    _prune_bytecode_mirror_of_this_runs_temp_roots(session)
 
     # ── Windows ProactorEventLoop teardown cleanup (#4764) ─────────────────
     # On Windows + Python 3.12, asyncio.run() creates and closes a

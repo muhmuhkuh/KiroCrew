@@ -15,6 +15,7 @@ from dashboard_owner_helpers import as_owner
 from test_members_dm_thread import _make_members_app
 
 from kiro_crew.agent_discovery import AgentInfo
+from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.context import ContextBuilder
 from kiro_crew.dashboard import chat_handlers, chat_runner
@@ -94,7 +95,7 @@ def _turn_state(tmp_path, monkeypatch):
     state.sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
     state.sessions.consume_replay_suppression = MagicMock(return_value=False)
     state.sessions.record_failure = AsyncMock()
-    monkeypatch.setattr(chat_runner, "_maybe_auto_title", AsyncMock())
+    monkeypatch.setattr(chat_runner, "title_then_refresh", AsyncMock())
     monkeypatch.setattr(chat_runner, "generate_session_summary", AsyncMock())
     monkeypatch.setattr(chat_handlers, "schedule_eager_spawn", lambda *a, **kw: None)
     return state
@@ -741,6 +742,11 @@ async def test_cancelled_prewarm_cannot_overwrite_owner_pick(tmp_path, monkeypat
         # provider work is outside this cancelled-publication assertion.
         monkeypatch.setattr(chat_runner, "_eager_spawn", AsyncMock())
         monkeypatch.setattr(chat_handlers, "schedule_eager_spawn", chat_runner.schedule_eager_spawn)
+        # The real scheduler reads the flag from the config watcher's snapshot,
+        # which the suite leaves unbuilt; adopt one carrying the default.
+        _snapshot_cfg = KiroCrewConfig()
+        _snapshot_cfg.session.eager_spawn = True
+        live.watch().prime(_snapshot_cfg)
         async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
             response = await client.post(
                 "/api/chat/slots/template-chat/agent", json={"agent": later_agent}
@@ -1759,7 +1765,7 @@ def _prewarmed_member_state(tmp_path, monkeypatch, *, sid: str | None):
     state = _make_state(tmp_path)
     state.sessions.reset = AsyncMock(return_value=True)
     monkeypatch.setattr(chat_handlers, "schedule_eager_spawn", lambda *a, **kw: None)
-    monkeypatch.setattr(chat_runner, "_maybe_auto_title", AsyncMock())
+    monkeypatch.setattr(chat_runner, "title_then_refresh", AsyncMock())
     holder = {"sid": sid}
     state.sessions.resumable_sid = MagicMock(side_effect=lambda _key: holder["sid"])
 
@@ -1851,9 +1857,21 @@ async def test_prewarmed_session_is_kept_when_the_chat_is_not_provably_empty(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["incognito", "temporary"])
-async def test_restricted_member_selection_and_turn_never_persist_transcript(
+async def test_restricted_member_session_persists_transcript_but_no_owner_record(
     tmp_path, monkeypatch, mode
 ):
+    """A restricted member chat keeps its transcript and survives a restart.
+
+    The line records the restricted mode and the member's name, and NO memory
+    store: with no execution carrier written for a restricted session, a store
+    name would read back as a legacy owner claim and the restart would refuse
+    the chat as a member record with no identity. Left out, the restart reads
+    the session as unbound and the next turn re-selects the member from
+    ``agent`` under the retained mode -- the same live-only carrier the session
+    ran under before the restart.
+    """
+    from kiro_crew.dashboard.chat_persistence import restore_recent_sessions
+    from kiro_crew.execution_context import _LIVE_EXECUTIONS, _live_key
     from kiro_crew.history import ConversationLog
 
     cfg = KiroCrewConfig.load()
@@ -1861,6 +1879,8 @@ async def test_restricted_member_selection_and_turn_never_persist_transcript(
     member_store = provision_member_memory(cfg, "writer")
     cfg.save()
     state = _turn_state(tmp_path, monkeypatch)
+    # One log for the slot save and the execution reads, as in the gateway.
+    state.conversation_log = ConversationLog()
     slot = state.get_or_create_slot("restricted", agent="default", memory_mode=mode)
     state.sessions.reset = AsyncMock(return_value=True)
     async with TestClient(TestServer(as_owner(_make_app_with_agent_routes(state)))) as client:
@@ -1874,7 +1894,33 @@ async def test_restricted_member_selection_and_turn_never_persist_transcript(
     await asyncio.wait_for(chat_runner._run_chat(state, slot, "restricted body sentinel"), 10)
     await asyncio.wait_for(drain_background_tasks(state), 10)
     state.sessions.get_or_create.assert_awaited_once()
-    assert not state.conversation_log.has_log(key)
-    assert not ConversationLog().has_log(key)
     if mode == "temporary":
         state.context_builder.ensure_store.assert_not_awaited()
+
+    body = state.conversation_log._path(key).read_text(encoding="utf-8")
+    assert "restricted body sentinel" in body
+    meta = state.conversation_log.get_metadata(key)
+    assert meta.get("memory_mode") == mode
+    assert meta.get("agent") == "writer"
+    assert meta.get("agent_kind") == "member"
+    assert "memory_store" not in meta
+    assert "execution_context" not in meta
+
+    # Restart: the live carrier is gone and only the record remains.
+    _LIVE_EXECUTIONS.pop(_live_key(key), None)
+    assert read_session_execution(key) is None
+    restarted = _turn_state(tmp_path, monkeypatch)
+    restarted.conversation_log = ConversationLog()
+    assert restore_recent_sessions(restarted, window_minutes=0) >= 1
+    restored = restarted._slots["restricted"]
+    assert restored.memory_mode == mode
+    assert key in restarted._restricted_keys
+    assert [m["content"] for m in restored.messages][:1] == ["restricted body sentinel"]
+    restarted.sessions.reset = AsyncMock(return_value=True)
+    await asyncio.wait_for(chat_runner._run_chat(restarted, restored, "second sentinel"), 10)
+    await asyncio.wait_for(drain_background_tasks(restarted), 10)
+    rebound = read_session_execution(key)
+    assert rebound is not None
+    assert rebound.memory_mode == mode
+    assert rebound.store.store_id == member_store
+    assert "memory_store" not in restarted.conversation_log.get_metadata(key)

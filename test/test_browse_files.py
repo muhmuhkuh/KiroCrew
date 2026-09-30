@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from conftest import requires_symlinks
 from kiro_crew.dashboard.handlers import api_browse_files
@@ -24,7 +25,7 @@ from kiro_crew.dashboard.handlers.files import _browse_files_sync
 def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/browse-files", api_browse_files)
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture()
@@ -146,6 +147,23 @@ class TestBrowseFiles:
                 assert resp.status == 403
 
     @pytest.mark.asyncio
+    async def test_sensitive_base_path_403_names_its_cause(self, tmp_path, mock_sel):
+        # `access_denied` is the code the shared classifier already reads, so without it a
+        # refusal degraded to the generic retryable copy — the defect on the listing arm.
+        with patch("kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=True):
+            async with TestClient(TestServer(_make_app())) as client:
+                resp = await client.get(f"/api/browse-files?path={tmp_path}")
+                assert (await resp.json())["code"] == "access_denied"
+
+    @pytest.mark.asyncio
+    async def test_invalid_path_400_names_its_cause(self, mock_sel):
+        # The panel keys its notice on `code`, never on the status or the human string, so a
+        # refusal that names no cause renders as a RETRYABLE failure and offers a dead Refresh.
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get("/api/browse-files?path=/nonexistent_xyz_browse_files")
+            assert (await resp.json())["code"] == "not_a_directory"
+
+    @pytest.mark.asyncio
     @requires_symlinks
     async def test_symlink_to_sensitive_path_filtered(self, tmp_path, mock_sel):
         """Symlink in a benign dir pointing at ~/.aws must not leak through.
@@ -238,6 +256,83 @@ class TestBrowseFiles:
                 data = await resp.json()
                 entry = next(e for e in data["files"] if e["name"] == "racey.md")
                 assert entry["mtime"] == 0
+
+    @pytest.mark.asyncio
+    async def test_unreadable_sibling_does_not_collapse_listing(self, tmp_path, mock_sel):
+        """A child raising PermissionError on is_dir() (a TCC-protected dir,
+        a permission-denied entry) is skipped while healthy siblings still
+        list. The sort key stats every child, so an unguarded key empties
+        the whole response instead of dropping one entry."""
+        (tmp_path / "alpha").mkdir()
+        (tmp_path / "readme.md").write_text("hello")
+
+        class _Entry:
+            def __init__(self, name, isdir):
+                self.name = name
+                self.path = str(tmp_path / name)
+                self._isdir = isdir
+
+            def is_dir(self, follow_symlinks: bool = True) -> bool:
+                if self.name == "docker":
+                    raise PermissionError(1, "Operation not permitted")
+                return self._isdir
+
+            def is_file(self, follow_symlinks: bool = True) -> bool:
+                if self.name == "docker":
+                    raise PermissionError(1, "Operation not permitted")
+                return not self._isdir
+
+            def stat(self, follow_symlinks: bool = True):
+                return os.stat(self.path)
+
+        entries = [_Entry("alpha", True), _Entry("docker", True), _Entry("readme.md", False)]
+        with patch(
+            "kiro_crew.dashboard.handlers.files.os.scandir",
+            return_value=entries,
+        ):
+            async with TestClient(TestServer(_make_app())) as client:
+                resp = await client.get(f"/api/browse-files?path={tmp_path}")
+                assert resp.status == 200
+                data = await resp.json()
+                assert {d["name"] for d in data["dirs"]} == {"alpha"}
+                assert {f["name"] for f in data["files"]} == {"readme.md"}
+
+    @pytest.mark.asyncio
+    async def test_unclassifiable_sibling_is_skipped(self, tmp_path, mock_sel):
+        """A child whose is_dir() answers False but is_file() raises is
+        skipped rather than aborting the loop and dropping the healthy
+        file that sorts after it."""
+        (tmp_path / "alpha").mkdir()
+        (tmp_path / "readme.md").write_text("hello")
+
+        class _Entry:
+            def __init__(self, name, isdir):
+                self.name = name
+                self.path = str(tmp_path / name)
+                self._isdir = isdir
+
+            def is_dir(self, follow_symlinks: bool = True) -> bool:
+                return self._isdir
+
+            def is_file(self, follow_symlinks: bool = True) -> bool:
+                if self.name == "aardvark":
+                    raise PermissionError(1, "Operation not permitted")
+                return not self._isdir
+
+            def stat(self, follow_symlinks: bool = True):
+                return os.stat(self.path)
+
+        entries = [_Entry("alpha", True), _Entry("aardvark", False), _Entry("readme.md", False)]
+        with patch(
+            "kiro_crew.dashboard.handlers.files.os.scandir",
+            return_value=entries,
+        ):
+            async with TestClient(TestServer(_make_app())) as client:
+                resp = await client.get(f"/api/browse-files?path={tmp_path}")
+                assert resp.status == 200
+                data = await resp.json()
+                assert {d["name"] for d in data["dirs"]} == {"alpha"}
+                assert {f["name"] for f in data["files"]} == {"readme.md"}
 
     @pytest.mark.asyncio
     async def test_scan_does_not_run_on_the_event_loop(self, tmp_path, mock_sel):

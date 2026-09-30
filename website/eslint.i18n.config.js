@@ -100,6 +100,15 @@ export default [
       // to this module will not be reported. Keep it stylesheet-only; anything a
       // person reads belongs in the component with `i18nT`.
       'src/components/fileChangeChipsCss.ts',
+      // The Liquid Glass surface: SVG path data, an inline SVG displacement-map
+      // document, `url("data:image/svg+xml…")`, `linear-gradient(…)`, `path("…")`
+      // and `color-mix(…)` values, every one built as a string and handed to the
+      // CSS or SVG parser. It renders no copy of its own: `children` is the only
+      // text on screen, and that text belongs to (and is gated at) the caller.
+      //
+      // Stated as a false-negative class, per this file's convention: any copy
+      // added to this module will not be reported. Keep it effect-only.
+      'src/components/ui/liquid-glass.tsx',
       // Synthesizes the `diff --git` / `---` / `+++` headers Pierre needs to
       // identify a file in a bare patch body: git wire format handed to Pierre's
       // parser, never read as words. Extracted from `PullRequestPanel.tsx` so that
@@ -189,6 +198,13 @@ export default [
       // keep both modules parser-facing only.
       'src/lib/widgetSrcdoc.ts',
       'src/lib/mcpAppSrcdoc.ts',
+      // Same parser-only boundary as the srcdoc builders above: this module
+      // sanitizes model markup and injects CSP, a DOCTYPE and theme CSS. None
+      // of its literals are human-facing copy; translating them breaks the
+      // policy or the frame. TaskDashboardFrame.tsx stays fully gated.
+      // False-negative class: copy added here would not be checked. Keep this
+      // exact module parser-only, with all host text in its translated consumer.
+      'src/pages/chat/command-center/dashboardDocument.ts',
       // Per-app scoped CSS, injected as `<style>{APP_CSS}</style>`. Each module is
       // ONE template literal of stylesheet text handed to the CSS parser -- selectors,
       // lengths and `var(--…)` references. None of it is read as words, and the
@@ -682,6 +698,14 @@ export default [
               // the moment a label contains a colon, which several already do
               // ("Missing:", "Preset name:").
               '^cc:[A-Za-z0-9:._-]+$',
+              // An ECS Exec target example used as a form placeholder, e.g.
+              // `ecs:my-cluster_taskid_runtimeid`: a module-level ALL-CAPS constant,
+              // which is where `i18n-strict` looks inside, and the camelCase
+              // pattern cannot reach it because it forbids the colon.
+              //
+              // Anchored on the `ecs:` prefix, no spaces, and no second colon (the
+              // target shape has exactly one), so prose cannot match.
+              '^ecs:[A-Za-z0-9_.-]+$',
               '^[\\w.-]+/[\\w./-]*$',
               // EVERY PATTERN IN THIS FILE IS MATCHED FULL-STRING, so a prefix
               // pattern MUST spell out its own tail. `eslint-plugin-i18next` compiles
@@ -872,7 +896,7 @@ export default [
               // per-channel settings panels. Enumerated and whole-value-anchored,
               // so a sentence merely mentioning a channel is still reported —
               // only the bare name is exempt.
-              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp)$',
+              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp|iMessage|Feishu)$',
               // The code-forge product brands, in the do-not-translate glossary for
               // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
               // "GitLab" in every language, and a localized spelling would name a
@@ -1446,6 +1470,17 @@ export default [
     },
   },
 
+  // HOOK EVENT NAMES ONLY: matched BY VALUE against the backend's event
+  // allowlist, and rendered verbatim on the hook's own row, so a translated one is
+  // rejected on save and disagrees with its row. Extracted so the page keeps its
+  // gate. See the module's own header.
+  {
+    files: ['src/pages/hookEventWireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // SEARCH-KEYWORD SYNONYMS ONLY: a manual overlay of extra query terms merged
   // into the Settings search corpus so a query like "dark mode" finds a setting
   // whose label does not contain those words. Every value is a term matched
@@ -1496,6 +1531,19 @@ export default [
   // tight.
   {
     files: ['src/utils/fontFamilyOptions.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // CUSTOM FONT PICKER CANDIDATES: the sibling of monoFontCandidates.ts for the
+  // "Custom" Font Family option's picker. Same names-only rationale — every
+  // literal is a font family name matched by value against the machine's font
+  // book, so a translated name resolves to nothing. Kept in its own module so the
+  // exemption stays tight; the picker's own copy (label, description, free-text
+  // row) lives in the catalog.
+  {
+    files: ['src/utils/customFontCandidates.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

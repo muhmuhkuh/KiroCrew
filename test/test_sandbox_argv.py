@@ -27,6 +27,8 @@ from kiro_crew.sandbox import (
     _build_seatbelt_profile,
     _resolve_agent_executable,
     _ssh_supports_accept_new,
+    _voice_runtime_parent_paths,
+    _voice_runtime_sandbox_paths,
     detect_backend,
     namespace_argv,
     reset_backend,
@@ -93,12 +95,20 @@ def clean_backend(monkeypatch):
     passthrough from short-circuiting tests on hosts (like Cloud Desktops) where
     the gateway process itself runs sandboxed. Tests that exercise the
     passthrough set the env var explicitly.
+
+    Pins ``_ssh_supports_accept_new`` at the module seam ``_build_launcher_script``
+    reads: the real probe runs the host's ``ssh -V`` from whichever of the ~30
+    launcher-building tests happens to call it first (it is ``lru_cache``d), a
+    host program none of them is about (test-hygiene class 7). ``True`` is what a
+    modern host answers. ``TestSshSupportsAcceptNew`` still exercises the real
+    function through the name it imported, with ``subprocess.run`` patched.
     """
     monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
     monkeypatch.setattr(
         "kiro_crew.sandbox._KIRO_INTERNAL_SETTINGS_PATH",
         "/nonexistent/kirocrew-test/amazon-internal.json",
     )
+    monkeypatch.setattr(sandbox_mod, "_ssh_supports_accept_new", lambda: True)
     # Reset one-shot warning flags
     if hasattr(sandbox_mod.wrap_argv, "_warned"):
         delattr(sandbox_mod.wrap_argv, "_warned")
@@ -1011,6 +1021,34 @@ class TestWritableCarveouts:
         assert script.index("for d in READONLY_DIRS:") < script.index("for d in WRITABLE_DIRS:")
 
     @_POSIX_ONLY
+    @pytest.mark.parametrize("level", ["strict", "standard", "cc"])
+    def test_launcher_seals_before_hiding(self, monkeypatch, tmp_path, level):
+        """The READONLY seal must precede the SENSITIVE_DIRS hide.
+
+        Same kernel property as the carve-out pin above, in the other
+        direction: ``run/voice-runtime`` is hidden and its parent ``run`` is
+        sealed, and a non-recursive self-bind of ``run`` issued AFTER the hide
+        masks it -- the real leaf becomes readable through the new mount.
+        Seal first, then hide ON the sealed parent. The carve-out loop stays
+        last, so the three loops are seal < hide < carve-out. Every tier, since
+        all three emit the same launcher body.
+        """
+        home, probe = self._relocated_home(monkeypatch, tmp_path)
+        script = _build_launcher_script(level, extra_writable_dirs=(str(probe),))
+        seal = script.index("for d in READONLY_DIRS:")
+        hide = script.index("for d in SENSITIVE_DIRS:")
+        carve = script.index("for d in WRITABLE_DIRS:")
+        assert seal < hide < carve
+        # The pair this pin exists for is actually emitted: the leaf is hidden
+        # and its parent is sealed, in the lists the two loops consume.
+        voice_roots = _voice_runtime_sandbox_paths()
+        voice_parents = _voice_runtime_parent_paths()
+        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
+        assert set(hidden) >= set(voice_roots)
+        assert set(readonly) >= set(voice_parents)
+
+    @_POSIX_ONLY
     def test_launcher_carveout_mounts_fail_open(self, monkeypatch, tmp_path):
         """The two carve-out mounts WIDEN access, so they must not route
         through ``_mount_or_die``: a host refusing them keeps the seal
@@ -1622,6 +1660,37 @@ class TestBuildLauncherScript:
             ), f"{level}: launcher references un-importable module(s) {forbidden}"
 
 
+class TestAgentEnvPassthroughContract:
+    """Pin the claude-code-provider env-passthrough contract.
+
+    Inherited ``ANTHROPIC_*`` / ``CLAUDE_CODE_*`` variables must keep flowing
+    to claude-harness children (docs/system-specs/modules/claude-code-provider.md,
+    env-passthrough section); the custom-endpoint guide
+    (docs/guides/custom-llm-backend.md) depends on them reaching the child. If
+    either scrub list grows to cover these namespaces, this fails red — the
+    failure a green-CI hardening pass would otherwise ship silently.
+    """
+
+    _PASSTHROUGH_KEYS = [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+    ]
+
+    def test_anthropic_and_claude_code_env_survive_agent_subprocess_scrub(self):
+        # Both lists are prefix-matched (``startswith`` in ``scrub_env`` and
+        # ``scrub_agent_denied_env``), so assert prefix semantics, not bare
+        # membership — a prefix entry like "ANTHROPIC_" would never equal a key.
+        for key in self._PASSTHROUGH_KEYS:
+            assert not any(key.startswith(p) for p in _SENSITIVE_ENV_PREFIXES), key
+            assert not any(key.startswith(p) for p in sandbox_mod._AGENT_DENIED_ENV_KEYS), key
+        # And the ACP spawn path's own parent-side scrub passes them through.
+        env = {key: "x" for key in self._PASSTHROUGH_KEYS}
+        assert sandbox_mod.scrub_agent_subprocess_env(env) == env
+
+
 @_POSIX_ONLY
 class TestHardlinkScanBudget:
     """Step-7 pre-exec hardlink scan: per-root budgets + loud truncation.
@@ -1645,14 +1714,18 @@ class TestHardlinkScanBudget:
         # filesystem, so it must not enter the match set: when every
         # credential has nlink == 1 the CWD + /tmp walk is skipped and the
         # common healthy-host spawn pays nothing (and emits no truncation
-        # warning). Both collection loops (SENSITIVE_DIRS and
-        # SENSITIVE_FILES) carry the gate.
+        # warning). BOTH collection loops carry the gate: SENSITIVE_DIRS
+        # (depth 1) and SENSITIVE_FILES. The per-app credentials one level below
+        # a mask root reach the child as inodes the PARENT read -- it cannot stat
+        # them itself, because it masks that tree in this same process -- and the
+        # parent applies the same gate before sending one. The count is how this
+        # notices a third loop added without the gate.
         #
         # REGULAR FILES only, and that half is not cosmetic: every directory has
         # nlink >= 2, and SENSITIVE_FILES carries directories on purpose, so a bare
         # nlink test armed the walk on every spawn. Behaviour is covered in
-        # test_sandbox_hardlink_scan.py; this is the source-level pin that both
-        # collection loops still carry the gate.
+        # test_sandbox_hardlink_scan.py; this is the source-level pin that every
+        # collection loop still carries the gate.
         script = _build_launcher_script("strict")
         assert script.count("if stat.S_ISREG(_st.st_mode) and _st.st_nlink > 1:") == 2
 
@@ -2005,6 +2078,39 @@ class TestNamespaceArgv:
         assert result[5] == "acp"
         # Cleanup temp file
         os.unlink(result[3])
+
+    @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
+    def test_established_target_that_cannot_be_restatted_refuses(self, mock_resolve, tmp_path):
+        """A ``_required_targets`` entry whose ``lstat`` now fails must FAIL CLOSED.
+
+        A pre-spawn materialiser reports a target as established (present). If an
+        ``lstat`` of that name then fails while the launcher builds -- renamed aside
+        or its permission revoked, the ordinary racing data-home write this module
+        already assumes -- carrying NO identity would leave ``_carried_occupant``
+        returning ``None`` in the child, the substitution refusal never fires, and a
+        decoy left at the name is sealed while the original stays writable elsewhere.
+        ``namespace_argv`` must raise :class:`SandboxCeilingUnsealable` instead of
+        masking whatever took the name's place.
+        """
+        established_name = str(tmp_path / "phantom-ceiling")
+        real_lstat = os.lstat
+
+        def _lstat_fails_for_target(path, *a, **k):  # noqa: ANN001, ANN202
+            if os.fspath(path) == established_name:
+                raise OSError(2, "vanished")
+            return real_lstat(path, *a, **k)
+
+        def _establish(established=None):  # noqa: ANN001, ANN202
+            if established is not None:
+                established.append(established_name)
+            return []
+
+        with (
+            patch("kiro_crew.sandbox._materialize_sealable_ceilings", side_effect=_establish),
+            patch("kiro_crew.sandbox.os.lstat", side_effect=_lstat_fails_for_target),
+        ):
+            with pytest.raises(sandbox_mod.SandboxCeilingUnsealable):
+                namespace_argv(["kiro-cli"], "strict")
 
     @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
     def test_launcher_script_is_executable(self, mock_resolve):

@@ -30,7 +30,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import DEFAULT, AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
@@ -84,8 +84,24 @@ def _request(body: object = None, *, query: dict[str, str] | None = None) -> Mag
     req.query = dict(query or {})
     state = MagicMock()
     state._background_tasks = set()
+    state.owner_id = ""  # no owner configured: the local bootstrap subject is the owner
     req.app = {"state": state}
+    _as_owner(req)
     return req
+
+
+def _as_owner(req: MagicMock) -> None:
+    """Give a mock request the dashboard owner's claims, leaving every other key as-is.
+
+    ``POST /api/update`` is owner-gated, so the dashboard-user request these tests
+    model carries ``app == ""`` and the owner's subject: ``state.owner_id`` when
+    one is configured, else the signed local bootstrap subject.
+    """
+    owner = str(getattr(req.app["state"], "owner_id", "") or "") or "local-app"
+    claims = {"app": "", "user": owner}
+    req.__contains__.side_effect = lambda key: key in claims
+    req.__getitem__.side_effect = lambda key: claims[key] if key in claims else DEFAULT
+    req.get.side_effect = lambda key, *default: claims[key] if key in claims else DEFAULT
 
 
 class _FakeProc:
@@ -143,17 +159,25 @@ def _sequence_procs(monkeypatch, procs: list[_FakeProc]) -> list[tuple[str, ...]
 def _git_proj(monkeypatch, tmp_path) -> str:
     """A directory the capability derivation accepts as this install's checkout.
 
-    ``.git/HEAD`` is written, not just ``.git/``: the derivation asks git first
-    and falls back to the on-disk markers of a working tree's own root, and a
-    bare ``.git`` directory satisfies neither — a fabricated one is refused on
-    purpose. The git lane also requires provenance (the running package loads
-    from the tree), which a fabricated directory cannot satisfy, so it is
-    declared here rather than derived.
+    The ``.git`` directory is the minimal one git ITSELF recognises -- ``HEAD``
+    plus empty ``objects/`` and ``refs/`` -- rather than a bare ``.git/HEAD``.
+    The derivation asks git first (``rev-parse --show-toplevel``) and only falls
+    back to on-disk markers when git cannot answer. A ``.git`` git rejects makes
+    it keep walking UP, so the verdict then depends on what sits above
+    ``tmp_path``: outside any repository git fails and the fallback accepts the
+    markers, but a temp root under a checkout (a developer's ``TMPDIR=./tmp``)
+    makes git report THAT checkout's top level, which is not this directory, and
+    the fixture reads as "not a checkout". A repository git accepts answers for
+    itself wherever it lives. The git lane also requires provenance (the running
+    package loads from the tree), which a fabricated directory cannot satisfy,
+    so it is declared here rather than derived.
     """
     proj = tmp_path / "checkout"
     proj.mkdir()
-    (proj / ".git").mkdir()
-    (proj / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    git_dir = proj / ".git"
+    (git_dir / "objects").mkdir(parents=True)
+    (git_dir / "refs").mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     monkeypatch.setattr(
         "kiro_crew.platform.update_capability.running_from_checkout",
         lambda root, **kw: True,

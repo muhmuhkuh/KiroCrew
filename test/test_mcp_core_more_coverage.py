@@ -2,10 +2,6 @@
 
 Focus areas, all confirmed uncovered before this file existed:
 
-* the parent-PID ladder (``_get_ppid`` / ``_ppid_via_libproc``) — every OS
-  branch is driven with an injected fake, so the macOS libproc path and the
-  ``ps`` last-resort fallback are exercised on any platform without ever
-  spawning a real process or loading a real dylib,
 * the four governance chokepoint helpers (``_deny_channel_agent_messaging``,
   ``_vet_messaging_governance``, ``_vet_channel_governance``,
   ``_vet_memory_writes_governance``) plus ``_audit_governance_deny`` — deny,
@@ -26,8 +22,6 @@ git, or a path outside ``tmp_path``.
 
 from __future__ import annotations
 
-import ctypes
-import struct
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -43,10 +37,9 @@ from kiro_crew.mcp_core import (
     _crew_identity,
     _crew_machine_markers,
     _crew_public_text,
+    _deny_channel_agent_dispatch,
     _deny_channel_agent_messaging,
-    _get_ppid,
     _governance_app,
-    _ppid_via_libproc,
     _redact_json_strings,
     _resolve_artifact_folder_id,
     _vet_channel_governance,
@@ -96,128 +89,6 @@ class _FakeClock:
         self.now += secs
 
 
-def _fake_libproc(ppid: int, ret: int = 232, expect_pid: int | None = None):
-    """Build a ``ctypes.CDLL`` replacement whose ``proc_pidinfo`` fills a buffer.
-
-    ``struct proc_bsdinfo`` opens with five uint32s; ``pbi_ppid`` is index 4,
-    which is what the product unpacks.
-    """
-
-    def cdll(name: str, use_errno: bool = False):
-        assert name == "libproc.dylib"
-
-        def proc_pidinfo(pid, flavor, arg, buf, size):
-            if expect_pid is not None:
-                assert pid == expect_pid
-            # flavor 3 == PROC_PIDTBSDINFO
-            assert flavor == 3
-            buf[0:20] = struct.pack("<5I", 0, 0, 0, pid, ppid)
-            return ret
-
-        return SimpleNamespace(proc_pidinfo=proc_pidinfo)
-
-    return cdll
-
-
-# ── _ppid_via_libproc ────────────────────────────────────────────────────
-
-
-class TestPpidViaLibproc:
-    def test_unpacks_pbi_ppid_from_the_libproc_buffer(self) -> None:
-        with patch.object(ctypes, "CDLL", _fake_libproc(4242, expect_pid=1234)):
-            assert _ppid_via_libproc(1234) == 4242
-
-    def test_short_read_is_rejected_rather_than_unpacked(self) -> None:
-        # n <= 16 means pbi_ppid (offset 16..20) was never written; a real
-        # unpack there would return whatever the zeroed buffer held (0) and
-        # look like a legitimate "parent is pid 0".
-        with patch.object(ctypes, "CDLL", _fake_libproc(4242, ret=16)):
-            assert _ppid_via_libproc(1234) == 0
-
-    def test_missing_dylib_returns_zero_so_the_caller_can_fall_back(self) -> None:
-        def boom(*_a: Any, **_kw: Any):
-            raise OSError("libproc.dylib not found")
-
-        with patch.object(ctypes, "CDLL", boom):
-            assert _ppid_via_libproc(1234) == 0
-
-
-# ── _get_ppid ───────────────────────────────────────────────────────────
-
-
-class _FakeProcStatus:
-    def __init__(self, text: str) -> None:
-        self._text = text
-
-    def read_text(self) -> str:
-        return self._text
-
-
-class TestGetPpid:
-    def test_windows_delegates_to_platform_compat(self) -> None:
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Windows")):
-            with patch.object(mcp_core.platform_compat, "get_ppid", return_value=77) as gp:
-                assert _get_ppid(5) == 77
-        gp.assert_called_once_with(5)
-
-    def test_windows_zero_is_normalized_and_never_falls_through_to_ps(self) -> None:
-        spawned: list[Any] = []
-        fake_sub = SimpleNamespace(check_output=lambda *a, **k: spawned.append(a))
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Windows")):
-            with patch.object(mcp_core.platform_compat, "get_ppid", return_value=0):
-                with patch.object(mcp_core, "subprocess", fake_sub):
-                    assert _get_ppid(5) == 0
-        assert spawned == []
-
-    def test_linux_parses_ppid_out_of_proc_status(self) -> None:
-        status = "Name:\tpython3\nState:\tS (sleeping)\nPPid:\t9931\nTracerPid:\t0\n"
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Linux")):
-            with patch.object(mcp_core, "Path", lambda p: _FakeProcStatus(status)):
-                assert _get_ppid(1) == 9931
-
-    def test_linux_status_without_a_ppid_line_falls_back_to_ps(self) -> None:
-        fake_sub = SimpleNamespace(check_output=lambda *a, **k: " 4004\n")
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Linux")):
-            with patch.object(mcp_core, "Path", lambda p: _FakeProcStatus("Name:\tx\n")):
-                with patch.object(mcp_core, "subprocess", fake_sub):
-                    assert _get_ppid(1) == 4004
-
-    def test_darwin_uses_libproc_when_it_answers(self) -> None:
-        fake_sub = SimpleNamespace(check_output=lambda *a, **k: pytest.fail("ps was spawned"))
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Darwin")):
-            with patch.object(mcp_core, "_ppid_via_libproc", return_value=515):
-                with patch.object(mcp_core, "subprocess", fake_sub):
-                    assert _get_ppid(9) == 515
-
-    def test_darwin_libproc_miss_falls_back_to_ps(self) -> None:
-        calls: list[Any] = []
-
-        def check_output(argv, **kw):
-            calls.append(argv)
-            return "  808 \n"
-
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Darwin")):
-            with patch.object(mcp_core, "_ppid_via_libproc", return_value=0):
-                with patch.object(mcp_core, "subprocess", SimpleNamespace(check_output=check_output)):
-                    assert _get_ppid(9) == 808
-        assert calls == [["ps", "-o", "ppid=", "-p", "9"]]
-
-    def test_blocked_ps_on_an_unknown_platform_returns_zero(self) -> None:
-        def check_output(*_a: Any, **_kw: Any):
-            raise PermissionError("Operation not permitted")
-
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Plan9")):
-            with patch.object(mcp_core, "subprocess", SimpleNamespace(check_output=check_output)):
-                assert _get_ppid(9) == 0
-
-    def test_only_the_first_ppid_line_is_read(self) -> None:
-        # Every OS branch here is driven by injected fakes, so this runs on the
-        # Windows runners too even though /proc is Linux-only in production.
-        with patch.object(mcp_core, "platform", SimpleNamespace(system=lambda: "Linux")):
-            with patch.object(mcp_core, "Path", lambda p: _FakeProcStatus("PPid:\t11\nPPid:\t22\n")):
-                assert _get_ppid(1) == 11
-
-
 # ── channel-agent containment + governance audit ─────────────────────────
 
 
@@ -242,6 +113,286 @@ class TestDenyChannelAgentMessaging:
         with patch("kiro_crew.sel.sel", boom):
             out = _deny_channel_agent_messaging("channel:C1:a", "send_notification")
         assert out is not None and "not available to channel agents" in out
+
+
+class TestDenyChannelAgentDispatch:
+    """The channel-agent boundary at the one chokepoint every core tool passes.
+
+    A spawned descendant's session key is ``subagent:<id>`` and carries no trace
+    of the chain it came from, so the confinement cannot be recognised one hop
+    down. These cases pin that it is recognised at the hop where it can be: the
+    channel agent's own call to the verb that would create the descendant.
+    """
+
+    @staticmethod
+    def _as(session_key: str) -> Any:
+        """Patch the strict resolver to answer *session_key*.
+
+        The guard reads identity through ``require_strict_session_key`` and never
+        the lenient ancestor walk, so this is the seam every case sets.
+        """
+        return patch.object(
+            mcp_core, "require_strict_session_key", lambda *a, **k: (session_key, "")
+        )
+
+    def test_non_channel_caller_is_not_denied(self) -> None:
+        with self._as("dashboard:chat-1-9"):
+            assert _deny_channel_agent_dispatch("spawn_run") is None
+
+    def test_unattributable_caller_is_not_treated_as_a_channel_agent(self) -> None:
+        """An empty strict key is not a channel agent.
+
+        The gateway injects a session key into every agent subprocess it
+        launches, so a channel agent's key is always resolvable; an empty one
+        means the launch was not a gateway launch at all.
+        """
+        with self._as(""):
+            assert _deny_channel_agent_dispatch("spawn_run") is None
+
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            "spawn_run",
+            "spawn_sub_agents",
+            "spawn_continue",
+            "spawn_steer",
+            "workflow_run",
+            "workflow_author",
+            "workflow_rerun_subtree",
+            "task_run",
+            "register_hook",
+            "pod_up",
+        ],
+    )
+    def test_every_dispatch_verb_is_denied_and_audited(self, tool: str) -> None:
+        rec = _RecordingSel()
+        with self._as("channel:C123:agent-1"), patch("kiro_crew.sel.sel", lambda: rec):
+            out = _deny_channel_agent_dispatch(tool)
+        assert out is not None
+        assert f"{tool} is not available to channel agents" in out
+        assert rec.tools[0]["outcome"] == "rejected_blocked_tool"
+        assert rec.tools[0]["session_key"] == "channel:C123:agent-1"
+        assert rec.tools[0]["tool_kind"] == "kirocrew-core"
+
+    @pytest.mark.parametrize(
+        "tool",
+        [
+            "spawn_list",
+            "spawn_status",
+            "spawn_release",
+            "workflow_status",
+            "workflow_result",
+            "workflow_list",
+            "workflow_cancel",
+            "workflow_library_list",
+            "pod_ls",
+            "pod_status",
+            "pod_down",
+        ],
+    )
+    def test_observe_and_teardown_verbs_stay_reachable(self, tool: str) -> None:
+        """A channel agent may still watch and end an existing context.
+
+        ``spawn_status`` returns a retained transcript and is scoped by the
+        gateway route it reads, not by this guard; this case records that the
+        boundary deliberately leaves that read alone, so a later decision to
+        contain it has to change this expectation on purpose.
+        """
+        with self._as("channel:C1:a"):
+            assert _deny_channel_agent_dispatch(tool) is None
+
+    def test_an_unlisted_verb_resolves_no_identity(self) -> None:
+        """A verb this gate does not hold must leave without resolving identity.
+
+        Every handler resolves its own caller, and the identity gate on a read
+        verb admits exactly one strict resolve, so resolving here too changes the
+        behaviour of a call the boundary has no business touching. The verb name
+        is therefore the first test, and identity is read only once a name is on
+        the list.
+        """
+        calls: list[str] = []
+
+        def _record(*a: Any, **k: Any) -> tuple[str, str]:
+            calls.append("resolved")
+            return ("channel:C1:a", "")
+
+        with patch.object(mcp_core, "require_strict_session_key", _record):
+            assert _deny_channel_agent_dispatch("workflow_list") is None
+        assert calls == []
+
+        with (
+            patch.object(mcp_core, "require_strict_session_key", _record),
+            patch("kiro_crew.sel.sel", lambda: _RecordingSel()),
+        ):
+            assert _deny_channel_agent_dispatch("workflow_run") is not None
+        assert calls == ["resolved"]
+
+    def test_the_arming_operation_is_denied_and_audited(self) -> None:
+        """A passthrough tool is held by operation, not by name.
+
+        ``POST /rotation/arm`` arms the app's crons, which fire unattended after
+        the confined turn has ended, so it starts work that outlives the turn just
+        as a spawn verb does.
+        """
+        rec = _RecordingSel()
+        with self._as("channel:C123:agent-1"), patch("kiro_crew.sel.sel", lambda: rec):
+            out = _deny_channel_agent_dispatch(
+                "ops_mission_control_api",
+                {"method": "POST", "path": "/rotation/arm"},
+            )
+        assert out is not None
+        assert "POST /rotation/arm on ops_mission_control_api" in out
+        assert rec.tools[0]["outcome"] == "rejected_blocked_tool"
+        assert rec.tools[0]["tool_name"] == "ops_mission_control_api"
+
+    def test_the_denial_names_the_operation_not_the_whole_tool(self) -> None:
+        """Naming the tool would tell the caller its reads are gone. They are not.
+
+        The agent reads this message and decides what to do next, so a message
+        that overstates the refusal sends it to report a blocked SOP it could in
+        fact have read.
+        """
+        with (
+            self._as("channel:C1:a"),
+            patch("kiro_crew.sel.sel", lambda: _RecordingSel()),
+        ):
+            out = _deny_channel_agent_dispatch(
+                "ops_mission_control_api",
+                {"method": "POST", "path": "/rotation/arm"},
+            )
+        assert out is not None
+        assert not out.startswith("Error: ops_mission_control_api is not available")
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            {"method": "GET", "path": "/state"},
+            {"method": "GET", "path": "/rotation"},
+            {"method": "POST", "path": "/ledger"},
+            {"method": "POST", "path": "/incident/claim"},
+        ],
+    )
+    def test_the_other_operations_of_that_tool_stay_reachable(
+        self, operation: dict[str, str]
+    ) -> None:
+        """Only the operation that starts work is held, so the rest must pass.
+
+        ``GET /rotation`` is the one worth naming: it reads the same rotation the
+        arming operation writes, and a deny keyed on the tool would have taken it
+        too.
+        """
+        with self._as("channel:C1:a"):
+            assert _deny_channel_agent_dispatch("ops_mission_control_api", operation) is None
+
+    def test_a_read_operation_resolves_no_identity(self) -> None:
+        """The operation test is as cheap as the name test, and runs before identity.
+
+        A held tool whose operation is not held must leave by the same free path
+        an unheld name leaves by, or the one-resolve contract breaks for every
+        read of this tool rather than for every read of every tool.
+        """
+        calls: list[str] = []
+
+        def _record(*a: Any, **k: Any) -> tuple[str, str]:
+            calls.append("resolved")
+            return ("channel:C1:a", "")
+
+        with patch.object(mcp_core, "require_strict_session_key", _record):
+            out = _deny_channel_agent_dispatch(
+                "ops_mission_control_api", {"method": "GET", "path": "/state"}
+            )
+        assert out is None
+        assert calls == []
+
+    def test_a_held_tool_called_with_no_arguments_is_not_denied(self) -> None:
+        """Absent arguments name no operation, so the operation deny cannot fire.
+
+        The arguments are the only thing that identifies the call, so a guard that
+        guessed here would refuse reads it has no evidence about. The tool's own
+        validator refuses the argument-less call straight after.
+        """
+        with self._as("channel:C1:a"):
+            assert _deny_channel_agent_dispatch("ops_mission_control_api") is None
+            assert _deny_channel_agent_dispatch("ops_mission_control_api", {}) is None
+
+    def test_audit_failure_never_unblocks_the_deny(self) -> None:
+        def boom() -> Any:
+            raise RuntimeError("SEL file unwritable")
+
+        with self._as("channel:C1:a"), patch("kiro_crew.sel.sel", boom):
+            out = _deny_channel_agent_dispatch("spawn_run")
+        assert out is not None and "not available to channel agents" in out
+
+    def test_call_tool_inner_refuses_before_the_handler_runs(self) -> None:
+        """The refusal has to beat the handler, not merely accompany it.
+
+        A guard that ran after ``dispatch`` would already have spawned the
+        descendant it exists to prevent, so the sentinel asserts the handler is
+        never reached.
+        """
+        reached: list[str] = []
+
+        def _sentinel(name: str, args: dict[str, Any]) -> str:
+            reached.append(name)
+            return "handler ran"
+
+        with self._as("channel:C9:a"), patch("kiro_crew.sel.sel", lambda: _RecordingSel()):
+            with patch.object(mcp_core, "dispatch", _sentinel):
+                out = _call_tool_inner("spawn_run", {"task": "x"})
+        assert "spawn_run is not available to channel agents" in out
+        assert reached == []
+
+    def test_call_tool_inner_hands_the_arguments_to_the_guard(self) -> None:
+        """The operation deny reads the arguments, so the chokepoint must pass them.
+
+        A name-only call site would leave the operation set unreachable in
+        production while every direct test of the guard still passed, so the
+        arming call is driven through the real entry point here.
+        """
+        reached: list[str] = []
+
+        def _sentinel(name: str, args: dict[str, Any]) -> str:
+            reached.append(name)
+            return "handler ran"
+
+        with self._as("channel:C9:a"), patch("kiro_crew.sel.sel", lambda: _RecordingSel()):
+            with patch.object(mcp_core, "dispatch", _sentinel):
+                out = _call_tool_inner(
+                    "ops_mission_control_api",
+                    {"method": "POST", "path": "/rotation/arm"},
+                )
+        assert "POST /rotation/arm on ops_mission_control_api" in out
+        assert reached == []
+
+    def test_call_tool_inner_serves_a_read_of_a_held_tool(self) -> None:
+        """Only the arming operation is refused, so a read reaches its handler."""
+        reached: list[str] = []
+
+        def _sentinel(name: str, args: dict[str, Any]) -> str:
+            reached.append(name)
+            return "handler ran"
+
+        with self._as("channel:C9:a"):
+            with patch.object(mcp_core, "dispatch", _sentinel):
+                out = _call_tool_inner(
+                    "ops_mission_control_api", {"method": "GET", "path": "/state"}
+                )
+        assert out == "handler ran"
+        assert reached == ["ops_mission_control_api"]
+
+    def test_call_tool_inner_still_serves_an_unlisted_tool(self) -> None:
+        """The gate is keyed on the verb, so a channel agent keeps the rest."""
+        reached: list[str] = []
+
+        def _sentinel(name: str, args: dict[str, Any]) -> str:
+            reached.append(name)
+            return "handler ran"
+
+        with self._as("channel:C9:a"):
+            with patch.object(mcp_core, "dispatch", _sentinel):
+                out = _call_tool_inner("spawn_status", {"agent_id": "abc123"})
+        assert out == "handler ran"
+        assert reached == ["spawn_status"]
 
 
 class TestAuditGovernanceDeny:
@@ -532,7 +683,9 @@ class TestCrewPublicText:
         assert "alice" not in out
 
     def test_a_posix_marker_is_scrubbed_once(self) -> None:
-        with patch.object(mcp_core, "_crew_machine_markers", return_value=[("/home/bob", "<home>")]):
+        with patch.object(
+            mcp_core, "_crew_machine_markers", return_value=[("/home/bob", "<home>")]
+        ):
             with patch.object(mcp_core, "redact", lambda s: s):
                 assert _crew_public_text("cwd=/home/bob/x") == "cwd=<home>/x"
 
@@ -638,9 +791,7 @@ class TestWaitTool:
             # Backend answering about somebody else's wait; we sent no wait_id.
             return {"end_wait": "whatever"}
 
-        out, clock, _rec, _ = self._run(
-            {"seconds": 60, "reason": "x"}, strict_key="", post=post
-        )
+        out, clock, _rec, _ = self._run({"seconds": 60, "reason": "x"}, strict_key="", post=post)
         assert out == "Waited 60s. Resuming: x"
         assert clock.slept == [60.0]
 
@@ -736,6 +887,83 @@ class TestSpawnStatusTool:
     def test_an_empty_result_is_reported_as_such(self) -> None:
         with patch.object(mcp_core, "_get", return_value={"result": ""}):
             assert _call_tool_inner("spawn_status", {"agent_id": "a1"}) == "_No result._"
+
+    def test_a_running_payload_renders_progress_and_partial_text(self) -> None:
+        payload = {
+            "done": False,
+            "result": "partial transcript",
+            "elapsed": 3141,
+            "turns": 16,
+            "last_tool": "git grep status",
+        }
+        with patch.object(mcp_core, "_get", return_value=payload):
+            out = _call_tool_inner("spawn_status", {"agent_id": "a1"})
+        assert (
+            out == "[RUNNING · 3141s · 16 turns · last tool: git grep status]\npartial transcript"
+        )
+
+    def test_a_running_payload_without_text_explains_the_delay(self) -> None:
+        payload = {"done": False, "result": "", "turns": 7}
+        with patch.object(mcp_core, "_get", return_value=payload):
+            out = _call_tool_inner("spawn_status", {"agent_id": "a1"})
+        assert out == (
+            "[RUNNING · 7 turns]\n"
+            "(no streamed text yet — 7 turns so far; "
+            "transcript arrives with the completion event)"
+        )
+
+    def test_a_run_parked_on_the_spawn_gate_is_not_reported_as_running(self) -> None:
+        # ``awaiting_approval`` is present-only and, per api_spawn_status, set only
+        # while the run sits on the SPAWN-approval gate: no process, no turn. The
+        # tool must say so the way spawn_list ("awaiting-approval") and the CLI
+        # waiter ("approve it ... to start this run") do, not claim work is
+        # under way and promise a transcript "with the completion event".
+        payload = {
+            "done": False,
+            "result": "",
+            "elapsed": 42,
+            "turns": 0,
+            "last_tool": "",
+            "awaiting_approval": True,
+        }
+        with patch.object(mcp_core, "_get", return_value=payload):
+            out = _call_tool_inner("spawn_status", {"agent_id": "a1"})
+        header, body = out.split("\n", 1)
+        assert header == "[AWAITING-APPROVAL · 42s · 0 turns]"
+        assert "RUNNING" not in out
+        assert "approve it in the dashboard (Approvals) to start this run" in body
+        assert "transcript arrives with the completion event" not in out
+
+    def test_an_empty_running_page_reports_filtered_partial_text(self) -> None:
+        payload = {
+            "done": False,
+            "result": "",
+            "turns": 7,
+            "result_meta": {
+                "total_lines": 3,
+                "matched_lines": 0,
+                "offset": 0,
+                "returned_lines": 0,
+                "has_more": False,
+            },
+        }
+        with patch.object(mcp_core, "_get", return_value=payload):
+            out = _call_tool_inner("spawn_status", {"agent_id": "a1"})
+        assert "no partial transcript lines in this view" in out
+        assert "no streamed text yet" not in out
+
+    def test_a_done_payload_ignores_progress_fields(self) -> None:
+        payload = {
+            "done": True,
+            "result": "finished transcript",
+            "elapsed": 3141,
+            "turns": 16,
+            "last_tool": "git grep status",
+            "awaiting_approval": True,
+        }
+        with patch.object(mcp_core, "_get", return_value=payload):
+            out = _call_tool_inner("spawn_status", {"agent_id": "a1"})
+        assert out == "finished transcript"
 
     def test_a_paged_read_is_prefixed_with_a_continuation_header(self) -> None:
         payload = {
@@ -963,9 +1191,7 @@ class TestOpsMissionControlApiTool:
             out = _call_tool_inner(
                 "ops_mission_control_api", {"method": "GET", "path": "/dispatch"}
             )
-        assert out == (
-            "Error: GET /dispatch is not part of the ops-mission-control agent surface."
-        )
+        assert out == ("Error: GET /dispatch is not part of the ops-mission-control agent surface.")
 
     def test_a_get_is_prefixed_with_the_app_route_and_carries_the_query(self) -> None:
         with patch.object(mcp_core, "_get", return_value={"incidents": []}) as g:
@@ -1013,9 +1239,7 @@ class TestOpsMissionControlApiTool:
 
     def test_an_oversized_response_is_truncated_with_a_narrowing_hint(self) -> None:
         with patch.object(mcp_core, "_get", return_value={"blob": "x" * 70_000}):
-            out = _call_tool_inner(
-                "ops_mission_control_api", {"method": "GET", "path": "/state"}
-            )
+            out = _call_tool_inner("ops_mission_control_api", {"method": "GET", "path": "/state"})
         assert len(out) < 70_000
         assert "truncated (" in out
         assert "Narrow the" in out
@@ -1023,9 +1247,7 @@ class TestOpsMissionControlApiTool:
     def test_the_response_is_redacted_before_truncation(self) -> None:
         payload = {"signal": "creds AKIAIOSFODNN7EXAMPLE here"}
         with patch.object(mcp_core, "_get", return_value=payload):
-            out = _call_tool_inner(
-                "ops_mission_control_api", {"method": "GET", "path": "/signals"}
-            )
+            out = _call_tool_inner("ops_mission_control_api", {"method": "GET", "path": "/signals"})
         assert "AKIAIOSFODNN7EXAMPLE" not in out
 
     def test_a_non_serializable_response_value_still_renders(self) -> None:
@@ -1078,13 +1300,12 @@ class TestResourceStatusTool:
                 "exec_ceiling": 64,
                 "spawn_gate_capacity": 4,
                 "gate_ceiling": 8,
-                "host_cap": 14,
                 "slow_start": True,
                 "last": {"action": "increase", "reason": "clean window earned x2 (slow start)"},
             },
         )
         assert "Execution cap: 8/64" in out
-        assert "Host cap (memory+CPU): 14" in out
+        assert "Growth toward ceiling: slow start (x2/window)" in out
         # With a live answer in hand the configured ceiling is not printed at all.
         assert "Sub-agent ceiling: 3" not in out
 
@@ -1133,9 +1354,9 @@ class TestLiveAdaptiveState:
         return _live_adaptive_state()
 
     def test_the_in_process_registry_wins_and_costs_no_request(self) -> None:
-        with patch("kiro_crew.resource_status.adaptive_state", return_value={"host_cap": 9}):
+        with patch("kiro_crew.resource_status.adaptive_state", return_value={"exec_ceiling": 9}):
             with patch.object(mcp_core, "_get") as get:
-                assert self._call() == {"host_cap": 9}
+                assert self._call() == {"exec_ceiling": 9}
         get.assert_not_called()
 
     def test_out_of_process_it_reads_the_gateway(self) -> None:
@@ -1178,7 +1399,7 @@ class TestLiveAdaptiveState:
         )
         app["state"] = SimpleNamespace(subagents=None)
         spawn_resume.setup_spawn_resume_routes(app)
-        live = {"effective_exec_cap": 8, "exec_ceiling": 64, "host_cap": 14}
+        live = {"effective_exec_cap": 8, "exec_ceiling": 64, "slow_start": True}
         async with TestClient(TestServer(app)) as client:
             with patch("kiro_crew.resource_status.adaptive_state", return_value=live):
                 resp = await client.get(
@@ -1338,9 +1559,7 @@ class TestIssueRadarRecordInvestigation:
         assert "AKIAIOSFODNN7EXAMPLE" not in findings["suggested_labels"][0]
 
     def test_a_gitlab_merge_request_is_referenced_with_a_bang(self) -> None:
-        args = dict(
-            self._BASE, provider="gitlab", host="gitlab.com", kind="pull", verdict="ok"
-        )
+        args = dict(self._BASE, provider="gitlab", host="gitlab.com", kind="pull", verdict="ok")
         saved = {"investigation": {"findings": {"verdict": "ok"}}}
         with patch.object(mcp_core, "_put", return_value=saved):
             out = _call_tool_inner("issue_radar_record_investigation", args)

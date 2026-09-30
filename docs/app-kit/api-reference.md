@@ -1,6 +1,6 @@
-# API Reference — KiroCrew Gateway API & Client
+# API Reference — Kiro Crew Gateway API & Client
 
-Reference for the KiroCrew Gateway HTTP and WebSocket APIs, and how apps consume
+Reference for the Kiro Crew Gateway HTTP and WebSocket APIs, and how apps consume
 them.
 
 How you talk to the Gateway depends on where your code runs:
@@ -10,7 +10,7 @@ How you talk to the Gateway depends on where your code runs:
   the dashboard host provides it at runtime through its import map (the bare
   specifier `@kirocrew/app-sdk` resolves to the host's vendored copy via
   `window.__kirocrew_modules`). See
-  [getting-started.md](getting-started.md) and the [App SDK Hooks](#app-sdk-hooks)
+  [getting-started.md](getting-started.md) and the [App SDK Hooks](#app-sdk-hooks-dashboard-ui)
   section below.
 - **Python apps / external CLI tools / services** — use the standalone
   `kirocrew-client` package, carried in this repository under
@@ -18,7 +18,7 @@ How you talk to the Gateway depends on where your code runs:
   the Kiro Crew main package, but it is not published to PyPI — use it from a source
   checkout. See the [Python Client](#python-client) section.
 - **Node.js / Electron apps** — call the Gateway REST/WS endpoints directly via
-  `fetch()` / a WebSocket. The full endpoint list is in
+  `fetch()` / a WebSocket. Selected endpoint paths are in
   [Gateway REST API Endpoints](#gateway-rest-api-endpoints).
 
 There is no published TypeScript gateway-client npm package, and none is planned
@@ -115,6 +115,17 @@ The composer accepts multiple lines. `Enter` sends the draft, `Shift+Enter`
 inserts a line break, and an Enter used to commit an input method editor (IME)
 candidate does not send. The box grows with the draft up to 240 pixels, then
 keeps its height and scrolls vertically.
+
+A host that boxes the embed at a fixed height passes `composerMaxHeight` (in
+pixels) to lower that cap, so a long draft cannot take most of the box from the
+transcript. The resting (empty) size of the composer is unchanged; only the cap
+moves. Omitted, the 240-pixel default applies.
+
+```tsx
+<div style={{ height: 420 }}>
+  <ChatEmbed slotKey="coder-abc123" composerMaxHeight={160} />
+</div>
+```
 
 ## Native Chat Panel
 
@@ -344,16 +355,24 @@ The `Returns` column describes the response shape. It is not a TypeScript type:
 no TypeScript client ships, so `SlotInfo`, `GatewayStatus`, `SystemInfo` and
 their siblings are response-shape names rather than importable types.
 
-When `app_name` is set and no explicit auth is provided, the client auto-reads
-the app secret from `~/.kiro/crew/apps/{name}/.app_secret` and exchanges it
-for a short-lived token via `POST /api/apps/{name}/token`.
+When `app_name` is set and no explicit auth is provided, the Python client reads
+the app secret from `~/.kiro/crew/apps/{name}/.app_secret`. For a remote Gateway,
+call `await client.authenticate()` before the first request; the context manager
+does not exchange the secret automatically. The same exchange refreshes a token
+after a 401/403 response.
+
+The Gateway names its authentication cookie from the Host header it receives,
+falling back to its own listen port. The Python client normally derives that name
+from `base_url`. For a port-less URL or a reverse proxy that strips or rewrites
+Host, pass `cookie_port=<gateway listen port>` to `KiroCrewClient`; the override
+applies to both HTTP requests and WebSocket handshakes created by `create_ws()`.
 
 ### Authentication
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `authenticate()` | `boolean` | Exchange app secret for token (auto-called if appName set) |
-| `setToken(token)` | `void` | Manually set auth token on both HTTP and WS clients |
+| `authenticate()` | `boolean` | Exchange the app secret for a token; call explicitly before the first remote request |
+| `setToken(token)` | `void` | Conceptual token assignment; the Python client accepts `token=` in its constructor |
 
 ### Connection
 
@@ -386,9 +405,13 @@ for a short-lived token via `POST /api/apps/{name}/token`.
 | `onToolCall(cb)` | `() => void` | Receive tool call events |
 | `onConnectionChange(cb)` | `() => void` | Connection state changes |
 | `onRaw(cb)` | `() => void` | All parsed WebSocket events |
-| `onRawMessage(cb)` | `() => void` | All raw WebSocket messages |
 
 All `on*` methods return an unsubscribe function.
+
+The Python client's `on_slot(slot_id, event_type, callback)` dispatches by
+`data.slot` for ordinary slot-bound frames. `slot_title` and `session_summary`
+instead carry the slot identifier as `data.key`; slot-scoped listeners handle
+both wire shapes.
 
 WebSocket event types: `chat_chunk`, `chat_done`, `chat_message`, `chat_error`,
 `tool_call`, `notification`, `slots`, `slot_title`, `dashboard`, `log`, `refresh`,
@@ -574,8 +597,12 @@ It is not checked against a vocabulary — a spelling of your own is kept, becau
 rewriting it would record something other than what happened. It is redacted and
 length-clipped like `resources` and `error`, so a credential that reaches it by
 accident is not written; that is a no-op for any real outcome value. This log is
-append-only and readable over `/api/sel/events`, so nothing put in it can be taken
-back — don't route free-form remote output through these fields.
+append-only and readable by the dashboard OWNER over `/api/sel/events` — that
+endpoint is owner-gated, so no non-owner dashboard user reads it. In-process app
+code is NOT isolated from it, though: as the next paragraph says, hook code runs
+inside the gateway and can reach the log directly, so treat anything you write
+here as readable by a co-resident app. Nothing put in it can be taken back:
+don't route free-form remote output through these fields.
 
 There is no `caller=` argument. Attribution is minted from your app name
 (`app:<name>`, the same tag `ctx.cron` uses for ownership), so there is no
@@ -585,6 +612,47 @@ the log directly, so treat `app:<name>` as "which app said this", not as proof.
 `operation` is namespaced the same way, so two apps cannot collide on a bare
 `"publish"`. No permission gates it: an app cannot obtain anything with it, only
 state what it did.
+
+### Gateway Application (`ctx.http_app`)
+
+The gateway's own aiohttp `Application`, for background work that must be anchored
+on it — a poller that has to read the same dashboard state your request handlers
+read, and stash its running service where those handlers look it up.
+
+```python
+async def on_startup(ctx):
+    if ctx.http_app is None:
+        ctx.health.mark_degraded("poller not started: no gateway application on this host")
+        return
+    await start_my_poller(ctx.http_app)
+
+
+async def on_shutdown(ctx):
+    if ctx.http_app is None:
+        return
+    await stop_my_poller(ctx.http_app)
+```
+
+Present **only if your manifest declares a `routes` hook**, and `None` otherwise.
+That gate is not a permission you can ask for: an app with routes is dispatched the
+real `web.Request`, so `request.app` is already this exact object and the field adds
+no reach. An app with lifecycle hooks and no routes has no request path either, so
+handing it the Application would be a genuinely new grant.
+
+Read it with `getattr(ctx, "http_app", None)` if your app must also run on a gateway
+older than this field, and **report the gap** — `ctx.health.mark_degraded` with the
+user-visible consequence — rather than returning quietly. Background work that
+silently never starts is indistinguishable from having nothing to do.
+
+Your `on_startup` and `on_shutdown` contexts are built by different code paths and
+are guaranteed to agree about this field, so work you start with it can always be
+stopped with it. That holds across a version bump too: teardown reuses the answer
+recorded when the app was enabled, so dropping your `routes` hook in a later release
+does not strand the work an earlier one started — your `on_shutdown` still receives
+the Application it was given. The same rule runs the other way, so adding a `routes`
+hook does not hand the object to a teardown whose startup never held it. Declare
+`on_shutdown` whenever you declare `on_startup`: anything you spawn outlives the
+startup call, and teardown is the only thing that stops it.
 
 ### Lessons
 
@@ -606,9 +674,9 @@ state what it did.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `approveAction(slotId, taskId)` | `—` (no body) | Approve a pending tool action |
+| `approveAction(slotId, taskId, pattern?)` | `—` (no body) | Approve a pending tool action; command/base trust requires the pending card pattern |
 | `rejectAction(slotId, taskId)` | `—` (no body) | Reject a pending tool action |
-| `resolveApproval(approvalId, approved)` | `—` (no body) | Resolve an approval by ID |
+| `resolveApproval(approvalId, action, slotId?, pattern?)` | `—` (no body) | Resolve an approval by ID; `trust_command` and `trust_base` require `pattern` |
 | `getApprovalMode()` | `'auto'` \| `'interactive'` | Get current approval mode |
 | `setApprovalMode(mode)` | `—` (no body) | Set approval mode |
 
@@ -702,21 +770,27 @@ Returns `{ ok, appended, visibleDeferred, deliveryConditional, contextSkipped, p
 
 ### Proxy Authentication (Server-side)
 
-Verify that an incoming request was signed by the KiroCrew gateway reverse proxy. Use in app backends to authenticate proxied requests.
+Verify that an incoming request was signed by the Kiro Crew Gateway reverse proxy.
+Use these main-package helpers in Python app backends:
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-
-Options: `{ secret?: string, maxAgeSecs?: number }`
+| `raw_request_target(request)` | `str` | Preserve the raw percent-encoded path and query that the Gateway signed |
+| `proxy_secret()` | `str` | Read the injected `KIROCREW_PROXY_SECRET`, or an empty string |
+| `verify_proxy_request(header, *, method, target, body, secret=None, now=None)` | `bool` | Verify the body-bound HMAC and fixed ±60-second freshness window; fail closed on malformed input |
 
 ---
 
 ## Python Client
 
 Standalone async client using `aiohttp`, carried in this repository under
-`packages/kirocrew-client-py/`. It is not published to PyPI, so use it from a
-source checkout rather than by installing it. It covers part of the Gateway API
+`packages/kirocrew-client-py/`. It is not published to PyPI or included in the
+main wheel. Install it from a source checkout; it covers part of the Gateway API
 surface documented above.
+
+```bash
+python -m pip install -e /path/to/KiroCrew/packages/kirocrew-client-py
+```
 
 ```python
 from kirocrew_client import KiroCrewClient
@@ -732,7 +806,7 @@ async with KiroCrewClient(app_name="my-app") as mc:
 KiroCrewClient(
     base_url="",              # default: http://localhost:{KIROCREW_PORT or 5476}
     token="",                 # optional for localhost
-    app_name="",              # for app-scoped storage & auto-auth
+    app_name="",              # app-scoped storage and secret lookup
     timeout=30,               # request timeout seconds
     max_retries=3,            # retry count
     retry_base_delay=1.0,     # base delay for backoff
@@ -740,6 +814,23 @@ KiroCrewClient(
     on_auth_expired=None,     # async callback returning new token
 )
 ```
+
+For a remote Gateway, pass `token=...` or call `await client.authenticate()`
+after entering the context. Local loopback requests need no token. Setting
+`app_name` alone only locates the app secret; it does not authenticate during
+`__aenter__`.
+
+Token authentication uses the Gateway's port-scoped `mc_token_<port>` cookie. If
+`base_url` omits the port, the client uses the scheme default (443 for HTTPS/WSS,
+80 for HTTP/WS). A Gateway receiving a Host header without a port instead keys
+the cookie to its own listen port, so a port-less URL matches only when the
+Gateway listens on the scheme-default port. Pass an explicit port when it listens
+elsewhere, including behind a reverse proxy that removes the port from Host.
+
+Core requests retry 429 responses for every HTTP method. They retry 5xx responses and
+transport failures only for `GET`, `PUT`, and `DELETE`; `POST` and `PATCH` are not replayed
+when the server may already have applied them. A 401/403 refusal may still refresh authentication
+and replay once because the Gateway rejected the request before applying it.
 
 ### Method Reference
 
@@ -749,10 +840,14 @@ column is the shipped Python method, in `snake_case` per Python convention.
 Rows marked *not implemented* are Gateway endpoints the shipped Python client
 does not wrap yet. Call those endpoints directly with `aiohttp` (or any HTTP
 client) using the paths in
-[Gateway REST API Endpoints](#gateway-rest-api-endpoints). The client also ships
-no WebSocket surface, so the `connect` / `disconnect` / `on*` handlers in
-[WebSocket Events](#websocket-events) are endpoint documentation for a raw
-WebSocket connection rather than client methods.
+[Gateway REST API Endpoints](#gateway-rest-api-endpoints).
+
+`create_ws()` returns a `WsClient` bound to `/api/ws` with this client's auth
+cookie. Its listeners (`on(type, cb)`, `on_slot(slot, type, cb)`, `on_raw`, and
+`on_connection_change`) each return an unsubscribe function;
+`connect()` starts a background reconnect loop with exponential backoff and
+`disconnect()` stops it for good. When the client can refresh its token, it
+does so before each reconnect.
 
 | API surface | Python |
 |-----------|--------|
@@ -762,34 +857,38 @@ WebSocket connection rather than client methods.
 | `createSlot(name, agent?)` | `create_slot(name, agent="")` |
 | `listSlots()` | `list_slots()` |
 | `deleteSlot(id)` | `delete_slot(id)` |
-| `getSlotHistory(id, limit?)` | *not implemented — call the endpoint* |
+| `getSlotHistory(id, limit?)` | `get_slot_history(id, limit=50)` |
 | `sendMessage(id, msg)` | `send_message(id, msg)` |
+| `streamChat(id, msg)` | `stream_chat(id, msg)` → async iterator of chunk dicts; an SSE response ends only at `[DONE]` (transport failure or earlier clean close raises `NETWORK_ERROR` without retry), while a successful JSON queue, steer, or orchestrator-control receipt is yielded once and ends the iterator |
+| `stopSlot(id, force?)` | `stop_slot(id, force=False)` |
+| `editResend(id, content, opts)` | `edit_resend(id, content, *, index=None, ts=None)` |
 | `spawn(task, agent?)` | `spawn(task, agent="")` |
 | `spawnMany(tasks, agents?)` | `spawn_many(tasks, agents=None)` |
-| `listSubagents()` | `list_subagents()` |
+| `listSubagents()` | `list_subagents()` (reads `agents`) |
 | `getSubagentStatus(id)` | `get_subagent_status(id)` |
 | `addCron(name, opts)` | `add_cron(name, **opts)` |
-| `listCrons()` | `list_crons()` |
-| `updateCron(id, opts)` | `update_cron(id, **opts)` |
+| `listCrons()` | `list_crons()` (reads `jobs`) |
+| `updateCron(id, opts)` | `update_cron(id, **opts)` (`PATCH`) |
 | `removeCron(id)` | `remove_cron(id)` |
 | `pauseCron(id)` | `pause_cron(id)` |
 | `resumeCron(id)` | `resume_cron(id)` |
 | `addLesson(rule, cat, scope?)` | `add_lesson(rule, cat, scope="")` |
-| `listLessons()` | `list_lessons()` |
+| `listLessons()` | `list_lessons()` (reads `lessons`) |
 | `removeLesson(query)` | `remove_lesson(query)` |
 | `sendNotification(text, opts?)` | `send_notification(text, **opts)` |
-| `listNotifications()` | *not implemented — call the endpoint* |
-| `ackNotifications()` | *not implemented — call the endpoint* |
-| `approveAction(slot, task)` | *not implemented — call the endpoint* |
-| `rejectAction(slot, task)` | *not implemented — call the endpoint* |
-| `resolveApproval(id, ok)` | *not implemented — call the endpoint* |
+| `listNotifications()` | `list_notifications()` → `{notifications, unread}` |
+| `ackNotifications()` | `ack_notification(ts)` / `ack_all_notifications()` |
+| `approveAction(slot, task, pattern?)` | `resolve_approval(request_id, "approved", slot_id=slot, pattern=pattern)`; command/base trust passes the pending card pattern |
+| `rejectAction(slot, task)` | `resolve_approval(request_id, "rejected", slot_id=slot)` |
+| `resolveApproval(id, action, slot?, pattern?)` | `resolve_approval(id, action="approve", slot_id="", pattern="")`; `approve`/`approved` and `reject`/`rejected` are aliases; without a slot, accepted actions are `approve`, `reject`, `reject_once`; with a slot, accepted actions are `approved`, `rejected`, `trust`, `trust_reads`, `trust_command`, `trust_base`, `yolo`; command/base trust requires `pattern` |
+| `listApprovals()` | `list_approvals()` |
 | `getApprovalMode()` | *not implemented — call the endpoint* |
-| `setApprovalMode(mode)` | *not implemented — call the endpoint* |
-| `listModels()` | *not implemented — call the endpoint* |
-| `setSlotModel(slot, model)` | *not implemented — call the endpoint* |
-| `getGatewayConfig(key)` | *not implemented — call the endpoint* |
-| `setGatewayConfig(key, val)` | *not implemented — call the endpoint* |
-| `listMcpServers()` | `list_mcp_servers()` |
+| `setApprovalMode(mode)` | `set_approval_mode(mode, slot_id="")`; accepted modes are `normal`, `trust_reads`, `trust`, `yolo`; `normal`, `trust_reads`, and `trust` may target one slot, while `yolo` is process-global and rejects `slot_id` |
+| `listModels()` | `list_models()` |
+| `setSlotModel(slot, model)` | `set_slot_model(slot, model)` |
+| `getGatewayConfig(key)` | `get_gateway_config(key)`; `key` is one of `GATEWAY_CONFIG_KEYS` (`kirocrew`, `stt`, `theme`, `default-agent`) |
+| `setGatewayConfig(key, val)` | `set_gateway_config(key, val)` (`PUT`, same keys) |
+| `listMcpServers()` | `list_mcp_servers()` (`GET /api/mcp`) |
 | `registerMcpServer(def)` | `register_mcp_server(name, cmd, args?, env?)` |
 | `removeMcpServer(name)` | `remove_mcp_server(name)` |
 | `registerAppMcp(name, entry)` | *not implemented — call the endpoint* |
@@ -804,58 +903,18 @@ WebSocket connection rather than client methods.
 | `getAppDataDir()` | `get_app_data_dir()` → `Path` |
 | `getAppConfig()` | `get_app_config()` |
 | `setAppConfig(cfg)` | `set_app_config(cfg)` |
-| `memorySearch(q, topK?)` | `memory_search(q, top_k=8)` |
+| `memorySearch(q, topK?)` | `memory_search(q, top_k=8)` (sent as `limit`, capped at 50) |
+| `transcribe(audio)` | `transcribe(audio_bytes, *, filename=, content_type=)` → text; transport failures raise `NETWORK_ERROR` without retry |
+| `connect()` / `on*` | `create_ws()` → `WsClient` (see above) |
 | `injectContext(slot, content, opts?)` | `inject_context(slot, content, *, source?, ephemeral?, max_age?)` |
 | `flushPendingContext(slot)` | `flush_pending_context(slot)` |
 | `setDefaultSlot(slot)` | `set_default_slot(slot)` |
 
-**Proxy Authentication (standalone functions):**
-
-| API surface | Python |
-|-----------|--------|
-
----
-
-## AppManifest
-
-Validate and serialize app.json manifests, via the `kirocrew-client` package.
-
-```python
-from kirocrew_client import AppManifest
-
-m = AppManifest.from_dict({"name": "my-app", "version": "1.0.0", ...})
-errors = m.validate()   # list[str] — empty if valid
-data = m.to_dict()
-```
-
-## AppLifecycle
-
-Manage app installation via the Gateway REST API.
-
-```python
-from kirocrew_client import KiroCrewClient, AppLifecycle
-
-async with KiroCrewClient() as mc:
-    lifecycle = AppLifecycle(mc)
-    await lifecycle.install("/path/to/my-app")
-    await lifecycle.enable("my-app")
-    await lifecycle.disable("my-app")
-    await lifecycle.uninstall("my-app")
-    apps = await lifecycle.list()
-```
-
-## GatewayManager
-
-Manage the KiroCrew Gateway process (start, stop, health check).
-
-```python
-from kirocrew_client import GatewayManager
-
-gm = GatewayManager(port=5476)
-await gm.start()
-healthy = await gm.is_healthy()
-await gm.stop()
-```
+The standalone package exports `KiroCrewClient`, `KiroCrewError`, `ErrorCode`,
+`WsClient`, `WsEvent` and `GATEWAY_CONFIG_KEYS`. It does not export
+`AppManifest`, `AppLifecycle`, `GatewayManager` or proxy-auth helpers. Validate
+manifests through the main package's install path, manage the Gateway with the `kirocrew` CLI, and use
+`kiro_crew.apps.proxy_auth` only from a backend that can import the main package.
 
 ---
 
@@ -871,9 +930,9 @@ All `kirocrew-client` errors are `KiroCrewError` instances with `code`,
 | `VALIDATION_ERROR` | Invalid input | No |
 | `NOT_FOUND` | 404 response | No |
 | `RATE_LIMITED` | 429 response | Yes (Retry-After or backoff) |
-| `SERVER_ERROR` | 5xx response | Yes (exponential backoff) |
-| `NETWORK_ERROR` | Timeout or connection failure | Yes (exponential backoff) |
-| `WS_DISCONNECTED` | WebSocket not connected | No |
+| `SERVER_ERROR` | 5xx response | `GET`/`PUT`/`DELETE`: yes; `POST`/`PATCH`: no |
+| `NETWORK_ERROR` | Timeout, connection failure, or truncated chat stream | Core `GET`/`PUT`/`DELETE`: yes; core `POST`/`PATCH`, `stream_chat`, and `transcribe`: no |
+| `WS_DISCONNECTED` | Reserved enum value; `WsClient` reconnects on its own and does not raise it | No |
 
 ```python
 from kirocrew_client import KiroCrewError
@@ -888,8 +947,30 @@ except KiroCrewError as e:
 
 ## Gateway REST API Endpoints
 
-The `useAppApi()` hook and the `kirocrew-client` package wrap these Gateway
-endpoints. Apps can also call them directly via `fetch()`.
+The `useAppApi()` hook can call declared paths, while the source-only Python
+client wraps the subset named below. These API routes require the appropriate
+dashboard, app, or internal credential; a bare `curl` request is not authenticated.
+
+### Core endpoints used by the Python client
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/status` | Gateway status and connectivity check |
+| GET | `/api/system` | System metrics |
+| GET/POST | `/api/chat/slots` | List or create chat slots |
+| GET/DELETE | `/api/chat/slots/{slot}` | Read slot detail/history or delete a slot |
+| POST | `/api/chat` | Send a chat turn |
+| GET/POST | `/api/spawn` | List or start subagents |
+| GET | `/api/spawn/{agent_id}` | Read subagent status |
+| GET/POST | `/api/crons` | List or create cron jobs |
+| PATCH/DELETE | `/api/crons/{job_id}` | Update or delete a cron job |
+| POST | `/api/crons/{job_id}/enable` | Pause or resume a cron job |
+| GET/POST/DELETE | `/api/lessons` | List, add, or remove lessons |
+| POST | `/api/send-message` | Send a notification/message |
+| GET | `/api/mcp` | List MCP server configuration |
+| PUT/DELETE | `/api/mcp/servers/{name}` | Register or remove an MCP server |
+| GET | `/api/memory/episodic/search` | Search memory |
+| POST | `/api/chat/slots/{slot}/context` | Inject silent context |
 
 ### App Management
 
@@ -901,6 +982,7 @@ endpoints. Apps can also call them directly via `fetch()`.
 | POST | `/api/apps/install` | Install from local path |
 | POST | `/api/apps/register` | Register a self-managed app |
 | POST | `/api/apps/registry/install` | Install from registry |
+| POST | `/api/apps/registry/install-stream` | Install from registry with an SSE progress stream |
 | GET | `/api/apps/{name}` | Get app details |
 | GET | `/api/apps/{name}/manifest` | Get app manifest |
 | GET/PUT | `/api/apps/{name}/config` | Read/write app config |
@@ -911,7 +993,7 @@ endpoints. Apps can also call them directly via `fetch()`.
 | POST | `/api/apps/{name}/dev` | Toggle dev mode (live reload) — body `{"enabled": bool}` |
 | POST | `/api/apps/{name}/open` | Launch app via openCommand |
 | GET | `/apps/{name}/ui/{path}` | Serve app UI bundle files |
-| * | `/apps/{name}/api/{path}` | Reverse proxy to app backend (HMAC-signed) |
+| * | `/apps/{name}/api/{path}` | Reverse proxy to app backend (HMAC-signed). An ordinary response is bounded at 30s total. A `text/event-stream` response has no total, but must emit an event or a `:` comment at least every 60s, or it is cut |
 
 ### Reverse Proxy Authentication
 
@@ -954,6 +1036,52 @@ the value in the `X-KiroCrew-Proxy` header (constant-time), rejecting stale time
 > constant-time compare and the ±60s freshness window. A gateway that signs body-bound
 > HMACs fails verification against any verifier that omits the body hash, so a
 > backend that implements the HMAC itself has to be updated in lockstep with the gateway.
+
+### Backend Environment Variables
+
+The gateway spawns each `backend.entryPoint` app as a sandboxed child and injects a fixed,
+generic set of environment variables. No app-specific variables are ever injected.
+
+| Variable | Always set | Meaning |
+|---|---|---|
+| `PORT` | yes | The loopback port your backend must bind (`127.0.0.1:$PORT`). |
+| `KIROCREW_APP_NAME` | yes | This app's installed name. |
+| `KIROCREW_HOME` | yes | The gateway's resolved data home, so the backend reads the same app tree. |
+| `KIROCREW_GATEWAY_ORIGIN` | only with bound-port evidence | The gateway's own origin, `http://<bound host>:<bound port>`, for calling back to the gateway (for example `POST /api/notifications/push`). It is set ONLY from the address the gateway ACTUALLY bound: its exported `KIROCREW_BOUND_PORT` (required to be numeric and in `1..65535`), with the host `127.0.0.1` for loopback and wildcard binds and `[::1]` for an IPv6-loopback bind. A gateway bound to one specific interface omits the variable entirely: backend callbacks carry no `Origin` header, which the gateway's CSRF barrier trusts only from a loopback peer, so a specific-interface origin would have every mutating callback refused. It is never your app's `PORT`, an inherited `KIROCREW_PORT`, a config value, a default, or a request-derived value, so a child can never be pointed at a sibling gateway. Without loopback bound-address evidence the variable is omitted entirely (see below). |
+| `KIROCREW_PROXY_SECRET` | only if a secret exists | The per-app secret used to verify the `X-KiroCrew-Proxy` header (see above). |
+| `KIROCREW_GATEWAY_ORIGIN_PROOF` | only if a secret exists and the origin is set | `HMAC-SHA256(app_secret, KIROCREW_GATEWAY_ORIGIN)`, hex. Recompute it with your secret to confirm the injected origin was minted by this gateway, rather than an inherited or spoofed env value. Omitted whenever the origin is omitted (nothing to prove) or no secret exists (nothing to key it with). |
+
+Security and lifecycle:
+
+- The per-app secret lives on disk at `<KIROCREW_HOME>/apps/<name>/.app_secret`, written
+  owner-only `0600` (owner-only DACL on Windows) by the gateway.
+- If no `.app_secret` exists, the gateway injects neither the secret nor anything derived from
+  it (including the proof); a secret-less backend is otherwise unchanged.
+- `KIROCREW_GATEWAY_ORIGIN` is fail-closed: it is present only when the gateway has real
+  evidence of the port it bound. A gateway that has not exported a valid `KIROCREW_BOUND_PORT`
+  hands the backend no origin, so a backend that needs a callback base stays dormant rather
+  than trusting a guessed address.
+- The origin and its proof are recomputed on every spawn, so a gateway restarted on a
+  different bound port hands the backend the current origin. That freshness guarantee is
+  scoped to SPAWNED instances: an externally managed backend the gateway ADOPTS (already
+  healthy on its port) keeps the environment of the generation that started it, so its
+  origin can be stale. A backend that keeps a long-lived callback base should treat
+  persistent push failures as a stale origin and restart to pick up the current one.
+- The proof is a SPAWN-TIME attestation, not a liveness or freshness signal: it says the
+  origin value in your environment was planted by a gateway holding your `.app_secret`
+  when your process started. Because the secret persists across gateway generations, a
+  stale origin (the adopted case above) still carries a valid proof — verifying the proof
+  tells you the origin was not planted by a secret-less spawner, and nothing about whether
+  that gateway is still the one serving. Do not use it as origin-trust for a long-lived
+  process; use the push-failure/restart guidance above for that.
+
+Using the origin for notifications:
+
+An entryPoint backend that declares `notifications.channels` in `app.json` pushes with
+`POST {KIROCREW_GATEWAY_ORIGIN}/api/notifications/push`, authenticating with its app secret
+(see App Notifications). Verify `KIROCREW_GATEWAY_ORIGIN_PROOF` before you trust the origin as
+your callback base. If `KIROCREW_GATEWAY_ORIGIN` is unset the gateway did not publish a
+bound-port origin, so the backend has no callback base and should not push.
 
 ## App Dev Mode (live reload)
 

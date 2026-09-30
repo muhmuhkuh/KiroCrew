@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew import history as H
+from kiro_crew.execution_context import STRICTEST_MEMORY_MODE
 from kiro_crew.history import (
     _CONSOLIDATION_BACKOFF_BASE_SECS,
     _CONSOLIDATION_BACKOFF_MAX_SECS,
@@ -524,7 +525,9 @@ class TestLastMessagePreview:
     def test_unpreviewable_markdown_yields_empty(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         log.append("k", "assistant", "text")
-        with patch("kiro_crew.history.strip_markdown_preview", return_value=""):
+        # The preview is built by preview_text.speech_preview, which reads the
+        # stripper from its own module; that is the seam to rebind.
+        with patch("kiro_crew.preview_text.strip_markdown_preview", return_value=""):
             assert log.last_message_preview("k") == ""
 
 
@@ -561,9 +564,9 @@ class TestListSessions:
     def test_metadata_cache_hit_is_used(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         _write(tmp_path / "s1.jsonl", _jsonl({"_type": "metadata"}))
-        mtime = (tmp_path / "s1.jsonl").stat().st_mtime
+        identity = log._cache_identity((tmp_path / "s1.jsonl").stat())
         log._meta_cache["s1"] = (
-            mtime,
+            identity,
             log._cache_gen("s1"),
             {
                 "_type": "metadata",
@@ -600,9 +603,9 @@ class TestListSessions:
     def test_message_cache_supplies_title_fallback(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         _write(tmp_path / "s1.jsonl", _jsonl({"_type": "metadata"}))
-        mtime = (tmp_path / "s1.jsonl").stat().st_mtime
+        identity = log._cache_identity((tmp_path / "s1.jsonl").stat())
         log._msg_cache["s1"] = (
-            mtime,
+            identity,
             log._cache_gen("s1"),
             [
                 {"role": "assistant", "content": "skip"},
@@ -911,6 +914,8 @@ class TestWriteStructuredMemory:
 
     def test_semantic_write_and_delete_keep_the_consolidation_source(self, caplog) -> None:
         vs = MagicMock()
+        vs.space_generation = 5
+        vs.embed_semantic.side_effect = [[0.1, 0.9], [0.2, 0.8]]
         vs.set_semantic.return_value = None
         vs.delete_semantic.return_value = True
         c = _consolidator(vector_store=vs)
@@ -927,6 +932,13 @@ class TestWriteStructuredMemory:
             c._write_structured_memory(result, "sess")
         sources = {kw["key"]: kw["source"] for _, kw in vs.set_semantic.call_args_list}
         assert sources == {"plain": "consolidation:sess", "explicit": "consolidation:sess"}
+        calls = [kwargs for _args, kwargs in vs.set_semantic.call_args_list]
+        assert [call["embedding"] for call in calls] == [[0.1, 0.9], [0.2, 0.8]]
+        assert all(call["embedding_resolved"] is True for call in calls)
+        assert all(call["embedding_generation"] == 5 for call in calls)
+        assert all(call["retirement_embedding_resolved"] is True for call in calls)
+        assert all(call["retirement_value_json"] is None for call in calls)
+        vs.embed_semantic_retirement.assert_not_called()
         vs.delete_semantic.assert_called_once_with("stale", "consolidation:sess")
         assert "2 written, 1 deleted" in caplog.text
 
@@ -939,6 +951,29 @@ class TestWriteStructuredMemory:
         assert "0 written" in caplog.text
         assert "1 refused" in caplog.text
 
+    def test_refusal_logs_the_reason_and_points_at_the_audit_trail(self, caplog) -> None:
+        """A bare reject code cannot say WHICH rule refused the write.
+
+        ``set_semantic`` returns ``(code, reason)`` and the reason carries the
+        specific cause -- here which confidence won. Dropping it left an operator
+        with ``conflict`` and no way to tell a confidence loss from a queued
+        proposal, so the warning must carry the reason and name the table that
+        holds the stored and rejected values.
+        """
+        vs = MagicMock()
+        vs.set_semantic.return_value = (
+            SemanticRejectCode.CONFLICT,
+            "Existing entry has higher confidence (0.90 vs 0.60)",
+        )
+        c = _consolidator(vector_store=vs)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+            c._write_structured_memory({"semantic": [{"key": "head_sha", "value": "b"}]}, "k")
+        assert "Existing entry has higher confidence (0.90 vs 0.60)" in caplog.text
+        # The pointer is scoped to audited causes: VALUE_SIZE and VALUE_ENCODING are
+        # outside ``_AUDITABLE_REJECT_CODES``, so a blanket promise of a row would send
+        # an operator to an audit record that was never written.
+        assert "audited causes carry both values in memory_events" in caplog.text
+
     def test_semantic_is_capped(self) -> None:
         vs = MagicMock()
         vs.set_semantic.return_value = None
@@ -949,6 +984,8 @@ class TestWriteStructuredMemory:
 
     def test_episodic_write_and_skips(self, caplog) -> None:
         vs = MagicMock()
+        vs.space_generation = 7
+        vs.embed_episodic.return_value = [0.25, 0.75]
         vs.write_episodic.return_value = True
         c = _consolidator(vector_store=vs)
         result = {
@@ -966,6 +1003,9 @@ class TestWriteStructuredMemory:
         # which is where ``_session_facets`` is built.
         vs.write_episodic.assert_called_once_with(
             text="a thing happened",
+            embedding=[0.25, 0.75],
+            embedding_resolved=True,
+            embedding_generation=7,
             conversation_id="sess",
             tags=["t"],
             importance=0.9,
@@ -1314,11 +1354,17 @@ class TestAttemptsDescribeCurrentSpan:
 
 
 class TestUpdateMetadataLocked:
-    def test_unparseable_first_line_is_left_untouched(self, tmp_path: Path) -> None:
+    def test_unparseable_first_line_is_rewritten_strictest(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         _write(log._path("k"), "{ broken\n")
         log.update_metadata("k", {"title": "T"})
-        assert log._path("k").read_text(encoding="utf-8") == "{ broken\n"
+        first_line = log._path("k").read_text(encoding="utf-8").splitlines()[0]
+        assert json.loads(first_line) == {
+            "_type": "metadata",
+            "last_consolidated": 0,
+            "memory_mode": STRICTEST_MEMORY_MODE,
+            "title": "T",
+        }
 
     def test_non_metadata_first_line_is_left_untouched(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
@@ -1360,6 +1406,98 @@ class TestUpdateMetadataLocked:
         log.append("k", "user", "hi")
         with patch.object(log, "_read_metadata_status", return_value=({}, False)):
             assert log.update_metadata_if("k", {"title": "T"}, lambda m: True) is False
+
+    def test_update_metadata_if_upserts_a_missing_record_by_default(
+        self, tmp_path: Path
+    ) -> None:
+        """The default contract, pinned so the new flag cannot quietly change it.
+
+        Callers that publish identity into a record which may not exist yet rely
+        on this -- ``bind_session_execution`` writes the execution context and
+        memory mode a session was admitted under, and a session with no record
+        must still end up carrying them.
+        """
+        log = _log(tmp_path)
+        assert log.update_metadata_if("k", {"title": "T"}, lambda m: True) is True
+        assert _log(tmp_path).get_metadata("k")["title"] == "T"
+
+    def test_require_existing_refuses_to_mint_a_record(self, tmp_path: Path) -> None:
+        """A guard cannot express this: a deleted session reads as ``({}, True)``.
+
+        No metadata, reported as readable, so a guard that accepts an empty
+        record cannot tell a session deleted since the caller's own read from one
+        that never had a metadata line -- and the merge upserts. Without the
+        flag the write below creates a metadata-only file with no transcript.
+        """
+        log = _log(tmp_path)
+        assert (
+            log.update_metadata_if("k", {"title": "T"}, lambda m: True, require_existing=True)
+            is False
+        )
+        # Not merely refused: nothing was written at all.
+        assert _log(tmp_path).get_metadata("k") == {}
+        assert list(tmp_path.glob("*.jsonl")) == []
+
+    def test_require_existing_still_merges_into_a_record_that_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """The flag must refuse only absence, never an ordinary merge."""
+        log = _log(tmp_path)
+        log.append("k", "user", "hi")
+        assert (
+            log.update_metadata_if("k", {"title": "T"}, lambda m: True, require_existing=True)
+            is True
+        )
+        assert _log(tmp_path).get_metadata("k")["title"] == "T"
+
+    def test_require_existing_refuses_a_session_deleted_after_its_own_read(
+        self, tmp_path: Path
+    ) -> None:
+        """The race itself: the session is there when read, gone when written."""
+        log = _log(tmp_path)
+        log.append("k", "user", "hi")
+        assert log.get_metadata("k") != {}
+        log.delete_session("k")
+
+        assert (
+            log.update_metadata_if(
+                "k", {"folder_id": "f1"}, lambda m: True, require_existing=True
+            )
+            is False
+        )
+        assert list(tmp_path.glob("*.jsonl")) == []
+
+    def test_the_existence_check_is_inside_the_write_lock(self) -> None:
+        """Hoisting it out of the lock reopens the exact window it closes.
+
+        A checked-then-written pair lets the deletion land between the two, so
+        this asserts placement rather than behaviour: the ``require_existing``
+        test must sit inside the ``with`` that takes the session lock, and
+        nothing resembling it may run before that ``with``.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from kiro_crew.history_projection import SessionMetadataProjection
+
+        source = textwrap.dedent(inspect.getsource(SessionMetadataProjection.update_metadata_if))
+        function = ast.parse(source).body[0]
+        assert isinstance(function, ast.FunctionDef)
+
+        def _mentions_flag(node: ast.AST) -> bool:
+            return any(
+                isinstance(inner, ast.Name) and inner.id == "require_existing"
+                for inner in ast.walk(node)
+            )
+
+        locks = [node for node in function.body if isinstance(node, ast.With)]
+        assert len(locks) == 1, ast.dump(function)
+        # Before the lock: nothing reads the flag, so no check can have been
+        # hoisted. Checking the body alone would pass while a hoisted copy sat
+        # above it -- the earlier one decides, and it is the unsafe one.
+        assert not any(_mentions_flag(node) for node in function.body if node is not locks[0])
+        assert any(_mentions_flag(node) for node in locks[0].body if isinstance(node, ast.If))
 
 
 # ── delete_session ─────────────────────────────────────────────────────────
@@ -1584,6 +1722,28 @@ class TestIsIncognitoTranscript:
         write gate normalizes via its own allowlist and denies on None, so
         stripping here would silently change which callers fail closed."""
         assert H.is_incognito_transcript("incognito ") is False
+
+
+class TestTranscriptPrivacyMode:
+    """The predicate's companion returns the MODE under the predicate's own rule."""
+
+    @pytest.mark.parametrize(
+        ("raw", "mode"),
+        [("temporary", "temporary"), ("Temporary", "temporary"), ("INCOGNITO", "incognito")],
+    )
+    def test_a_recognized_header_yields_its_normalized_mode(self, raw: str, mode: str) -> None:
+        assert H.transcript_privacy_mode(raw) == mode
+
+    @pytest.mark.parametrize("raw", [None, "", "persistent", "unknown", 42, "incognito ", False])
+    def test_anything_the_predicate_rejects_yields_no_mode(self, raw: object) -> None:
+        """Including the unstripped ``"incognito "``: the two answer alike by
+        construction, so no reader can see a mode the other does not."""
+        assert H.is_incognito_transcript(raw) is False
+        assert H.transcript_privacy_mode(raw) == ""
+
+    @pytest.mark.parametrize("raw", ["incognito", "Temporary", "x", None])
+    def test_the_two_agree_on_every_input(self, raw: object) -> None:
+        assert bool(H.transcript_privacy_mode(raw)) is H.is_incognito_transcript(raw)
 
 
 class TestSidecarSummariesSurviveMtimePreservingRewrites:

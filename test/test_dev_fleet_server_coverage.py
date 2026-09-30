@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -839,6 +841,9 @@ async def test_pod_up_json_output_is_merged(monkeypatch, allow_pod):
 @pytest.mark.asyncio
 async def test_pod_up_inactive_after_start_fails_closed(monkeypatch):
     monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "{}", "")))
     monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
     monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
@@ -854,6 +859,9 @@ async def test_pod_up_inactive_after_start_fails_closed(monkeypatch):
 @pytest.mark.asyncio
 async def test_pod_up_unverifiable_start_fails_closed(monkeypatch):
     monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "{}", "")))
     monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
     monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
@@ -869,18 +877,27 @@ async def test_pod_up_unverifiable_start_fails_closed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pod_down_refused_by_guard(monkeypatch):
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/worktrees/feat"}, None))
+    )
     monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value="denied"))
     assert await worktree_ops._pod_down("feat") == {"ok": False, "error": "denied"}
 
 
 @pytest.mark.asyncio
 async def test_pod_down_cli_failure_is_reported(monkeypatch, allow_pod):
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/worktrees/feat"}, None))
+    )
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(2, "out", "")))
     assert await worktree_ops._pod_down("feat") == {"ok": False, "error": "out"}
 
 
 @pytest.mark.asyncio
 async def test_pod_down_still_active_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/worktrees/feat"}, None))
+    )
     monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
@@ -896,6 +913,9 @@ async def test_pod_down_still_active_fails_closed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pod_down_unverifiable_shutdown_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/worktrees/feat"}, None))
+    )
     monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
@@ -912,6 +932,9 @@ async def test_pod_down_unverifiable_shutdown_fails_closed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pod_down_success(monkeypatch, allow_pod):
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/worktrees/feat"}, None))
+    )
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     assert await worktree_ops._pod_down("feat") == {"ok": True, "error": None}
 
@@ -1364,12 +1387,27 @@ async def test_rebase_locked_refuses_dirty_worktree(monkeypatch):
     assert res["dirty_untracked_paths"] == ["scratch.log"]
 
 
+async def _stated_main_snapshot() -> tuple[str | None, bool, str]:
+    """A stand-in for ``_resolve_base_snapshot`` returning a STATED ``main`` on origin.
+
+    ``_rebase_locked`` re-resolves the base into a LOCAL snapshot before reading its
+    gate, and fetches/rebases from the SAME remote the snapshot verified against. These
+    tests exercise the rebase mechanics PAST the gate, so the resolution is stubbed to a
+    positive ``main`` on ``origin`` and the mechanics run on it.
+    """
+    return "main", True, "origin"
+
+
 @pytest.mark.asyncio
 async def test_rebase_locked_fetch_failure(monkeypatch):
     async def fake_git(path, *args, **kw):
         return "" if args[0] == "status" else None
 
     monkeypatch.setattr(repository, "_git", fake_git)
+    # The base-branch gate sits before the fetch, and the rebase re-resolves
+    # first; these exercise the rebase mechanics past it, so the resolution is
+    # stubbed and the base pinned as STATED.
+    monkeypatch.setattr(repository, "_resolve_base_snapshot", _stated_main_snapshot)
     res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["ok"] is False
     assert res["error"] == "git fetch origin main failed"
@@ -1381,6 +1419,10 @@ async def test_rebase_locked_success(monkeypatch):
         return "" if args[0] == "status" else "ok"
 
     monkeypatch.setattr(repository, "_git", fake_git)
+    # The base-branch gate sits before the fetch, and the rebase re-resolves
+    # first; these exercise the rebase mechanics past it, so the resolution is
+    # stubbed and the base pinned as STATED.
+    monkeypatch.setattr(repository, "_resolve_base_snapshot", _stated_main_snapshot)
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     monkeypatch.setattr(
         repository, "_git_info", AsyncMock(return_value={"head": "abc1234", "behind": 0})
@@ -1399,6 +1441,10 @@ async def test_rebase_locked_conflict_aborted(monkeypatch):
         return "" if args[0] == "status" else "ok"
 
     monkeypatch.setattr(repository, "_git", fake_git)
+    # The base-branch gate sits before the fetch, and the rebase re-resolves
+    # first; these exercise the rebase mechanics past it, so the resolution is
+    # stubbed and the base pinned as STATED.
+    monkeypatch.setattr(repository, "_resolve_base_snapshot", _stated_main_snapshot)
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "CONFLICT", "in f.py")))
     res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["ok"] is False and res["conflict"] is True
@@ -1417,6 +1463,10 @@ async def test_rebase_locked_conflict_with_failed_abort(monkeypatch):
         return "ok"
 
     monkeypatch.setattr(repository, "_git", fake_git)
+    # The base-branch gate sits before the fetch, and the rebase re-resolves
+    # first; these exercise the rebase mechanics past it, so the resolution is
+    # stubbed and the base pinned as STATED.
+    monkeypatch.setattr(repository, "_resolve_base_snapshot", _stated_main_snapshot)
     monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "CONFLICT", "")))
     res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["conflict"] is True
@@ -2359,6 +2409,81 @@ async def test_hmac_denials(monkeypatch, headers, secret, reason):
     assert reason in json.loads(resp.text)["error"]
     assert sink.events[0]["outcome"] == "denied"
     assert sink.events[0]["tool_name"] == "dev-fleet:proxy-hmac"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("codepoint", [0x00E9, 0x63D0, 0x1F600])
+async def test_hmac_non_ascii_signature_is_a_clean_denial(monkeypatch, codepoint):
+    """A non-ASCII signature is refused like any other wrong one, not raised.
+
+    ``hmac.compare_digest`` rejects a ``str`` holding a non-ASCII character by
+    raising ``TypeError``. The header is attacker-chosen (any local process can
+    reach this loopback port) and aiohttp decodes a non-UTF-8 header byte into a
+    lone surrogate, so an unhandled raise would drop the connection and skip the
+    ``dev-fleet:proxy-hmac`` SEL denial record this middleware exists to write.
+    Same class as the shared verifier in ``apps/proxy_auth.py``, which this
+    backend reimplements inline. Code points are built rather than written
+    literally so a lone surrogate stays expressible.
+    """
+    sink = _sel_capture(monkeypatch)
+    monkeypatch.setattr(http_api, "_load_app_secret", lambda: "s3cr3t")
+
+    async def handler(request):  # pragma: no cover - must never run
+        raise AssertionError("handler must not be reached")
+
+    headers = {"X-KiroCrew-Proxy": f"{int(time.time())}:{chr(codepoint)}"}
+    request = make_mocked_request("GET", "/api/fleet", headers=headers)
+    resp = await http_api.hmac_proxy_middleware(request, handler)
+    assert resp.status == 401
+    assert "invalid proxy signature" in json.loads(resp.text)["error"]
+    assert sink.events[0]["outcome"] == "denied"
+    assert sink.events[0]["tool_name"] == "dev-fleet:proxy-hmac"
+
+
+@pytest.mark.asyncio
+async def test_hmac_a_valid_signature_suffixed_with_a_lone_surrogate_is_refused(monkeypatch):
+    """A surrogate must keep a signature distinct, not be dropped from it.
+
+    This is the case that separates ``surrogatepass`` from ``ignore`` at this
+    verifier. A lone surrogate cannot be encoded as UTF-8 at all, so ``ignore``
+    silently DROPS it: a valid signature with one appended encodes to the same
+    bytes as the valid signature alone and the request is ACCEPTED.
+    ``surrogatepass`` encodes it, so the bytes differ and the request earns the
+    usual denial. No encodable character exercises this, because ``ignore``
+    keeps those and the two encodings agree.
+
+    The request is a mock rather than ``make_mocked_request`` because aiohttp's
+    own header builder refuses to encode a lone surrogate. A real request does
+    reach the middleware with one: the parser decodes an invalid UTF-8 header
+    byte into exactly this shape.
+    """
+    sink = _sel_capture(monkeypatch)
+    monkeypatch.setattr(http_api, "_load_app_secret", lambda: "s3cr3t")
+
+    async def handler(request):
+        return web.json_response({"ok": True})
+
+    ts = int(time.time())
+    msg = f"{ts}:GET:/api/fleet:{hashlib.sha256(b'').hexdigest()}"
+    sig = hmac.new(b"s3cr3t", msg.encode(), hashlib.sha256).hexdigest()
+
+    request = MagicMock()
+    request.path = "/api/fleet"
+    request.raw_path = "/api/fleet"
+    request.method = "GET"
+    request.can_read_body = False
+
+    # A signature that verifies must be accepted first, so the refusal below is
+    # about the appended surrogate and not about a signature that never matched.
+    request.headers = {"X-KiroCrew-Proxy": f"{ts}:{sig}"}
+    accepted = await http_api.hmac_proxy_middleware(request, handler)
+    assert accepted.status == 200
+
+    request.headers = {"X-KiroCrew-Proxy": f"{ts}:{sig}{chr(0xDCFF)}"}
+    resp = await http_api.hmac_proxy_middleware(request, handler)
+    assert resp.status == 401
+    assert "invalid proxy signature" in json.loads(resp.text)["error"]
+    assert sink.events[0]["outcome"] == "denied"
 
 
 @pytest.mark.asyncio

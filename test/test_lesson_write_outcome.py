@@ -15,6 +15,8 @@ stored nothing.
 
 from __future__ import annotations
 
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -983,6 +985,7 @@ class TestCliLearnAddReportsTheOutcome:
         jsonl = MagicMock()
         args = argparse.Namespace(learn_action="add", rule=rule, category="tool", negative=negative)
         with (
+            closing(store),
             patch.object(cli_commands, "VectorMemoryStore", return_value=store),
             patch.object(cli_commands, "LessonStore", return_value=jsonl),
             patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
@@ -1220,6 +1223,135 @@ class TestLessonsRouteReportsTheOutcome:
         }
         assert store.load_all() == []
         state.push_refresh.assert_called_once_with("lessons")
+
+    async def test_a_clause_only_enrichment_still_guards_the_sweep(self, tmp_path) -> None:
+        """The guard must read the PERSISTED tier, not the submitted one.
+
+        The tier is write-once, so enriching a stored finding with a new clause --
+        the ordinary re-submit this route documents -- omits ``applies``. That
+        arrives as ``None`` while the row keeps ``on_topic``, so a guard gated on
+        the submitted value is skipped on exactly that input and the sweep can
+        retire a contradictory standing rule. There is no recovery: the
+        self-heals-next-time note covers a MISSED sweep, not a wrong deletion.
+        """
+        import json as _json
+
+        from kiro_crew.dashboard.handlers import cron
+        from kiro_crew.lesson_validation import LESSON_APPLIES_ON_TOPIC
+
+        store = _store(tmp_path)
+        try:
+            # A stored FINDING, and a standing rule the sweep must not touch.
+            store.write_lesson("flush the widget cache", applies="on_topic")
+            store.write_lesson("never force push to a protected branch", applies="always")
+
+            # Re-submit the finding with a clause only -- no `applies`.
+            request, state = self._request(
+                "flush the widget cache", negative="do not flush it mid-deploy"
+            )
+            captured: dict = {}
+
+            async def fake_sweep(_state, _sk, _rule, candidates, _vs):
+                captured["candidates"] = candidates
+
+            with (
+                patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=store)),
+                patch.object(cron, "_is_restricted_session", return_value=False),
+                patch.object(cron, "_sel"),
+                patch.object(cron, "_resolve_and_supersede", new=fake_sweep),
+                patch.object(
+                    store,
+                    "find_contradiction_candidates",
+                    return_value=[
+                        {
+                            "key": "lesson.standing",
+                            "rule": "never force push to a protected branch",
+                            "similarity": 0.6,
+                            "applies": "always",
+                        }
+                    ],
+                ),
+            ):
+                await cron.api_lessons_create(request)
+            for task in list(state._background_tasks):
+                await task
+
+            # The write enriched the stored finding, so the effective tier is the
+            # PERSISTED one and the guard has to fire. Filtering every candidate out
+            # leaves nothing to sweep, so the route schedules no task at all -- both
+            # "never scheduled" and "scheduled with an empty list" are the guard
+            # holding; a standing rule appearing here is the defect.
+            reached = captured.get("candidates") or []
+            assert (
+                reached == []
+            ), f"a standing rule reached the sweep on a clause-only enrichment: {reached}"
+            rules = {_json.loads(row["value_json"])["rule"] for row in store.get_lessons()}
+            assert "never force push to a protected branch" in rules
+            result = store.write_lesson(
+                "flush the widget cache", negative="another clause", applies=None
+            )
+            assert (
+                result.applies == LESSON_APPLIES_ON_TOPIC
+            ), "the write must report the persisted tier, not the submitted None"
+        finally:
+            store.close()
+
+    async def test_jsonl_capacity_refusal_is_not_reported_as_volatile_text(self, tmp_path) -> None:
+        """The JSONL store's TWO refusals must not collapse into one reason.
+
+        Both the volatile-text predicate and the row cap answer with the bare
+        ``refused`` string, so the route re-derives the cause. Reporting a
+        capacity refusal as ``volatile_session_fact`` sends a user whose store is
+        full to reword a rule whose wording was never the problem -- advice that
+        cannot succeed, on the one write outcome a caller has to act on.
+        """
+        import json as _json
+
+        from kiro_crew.dashboard.handlers import cron
+        from kiro_crew.learn import _MAX_LESSONS_TOTAL, Lesson, LessonStore
+        from kiro_crew.lesson_validation import (
+            LESSON_APPLIES_ALWAYS,
+            LESSON_REFUSED_AT_CAPACITY,
+            contains_volatile_lesson_fact,
+        )
+
+        # A full store of AUTHORED rules: every retained row outranks an incoming
+        # finding, so the prune drops the submission itself.
+        store = LessonStore(base_dir=tmp_path)
+        store._write_all(
+            [
+                Lesson(
+                    ts=f"2026-01-{i % 28 + 1:02d}",
+                    rule=f"standing rule number {i} about deploy step {i}",
+                    category="preference",
+                    applies=LESSON_APPLIES_ALWAYS,
+                )
+                for i in range(_MAX_LESSONS_TOTAL)
+            ]
+        )
+        submitted = "flush the widget cache after a rebuild"
+        assert not contains_volatile_lesson_fact(submitted, None), "fixture must be ordinary text"
+
+        request, state = self._request(submitted, category="knowledge")
+        state.lessons = store
+        with (
+            patch.object(cron, "_get_memory", return_value=MagicMock(vector_store=None)),
+            patch.object(cron, "_is_restricted_session", return_value=False),
+            patch.object(cron, "_sel"),
+        ):
+            resp = await cron.api_lessons_create(request)
+
+        assert _json.loads(resp.text) == {
+            "ok": False,
+            "outcome": "refused",
+            "reason": LESSON_REFUSED_AT_CAPACITY,
+            "superseded": [],
+        }
+        # The rule the user did submit is genuinely absent, and no authored row
+        # was evicted to make room for it.
+        rules = [le.rule for le in store.load_all()]
+        assert submitted not in rules
+        assert len(rules) == _MAX_LESSONS_TOTAL
 
     async def test_list_marks_legacy_volatile_jsonl_row_withheld(self, tmp_path) -> None:
         import json as _json
@@ -1901,6 +2033,7 @@ class TestASupersededRuleIsSanitizedBeforeItIsShown:
             negative=None,
         )
         with (
+            closing(store),
             patch.object(cli_commands, "VectorMemoryStore", return_value=store),
             patch.object(cli_commands, "LessonStore", return_value=MagicMock()),
             patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
@@ -1954,6 +2087,7 @@ class TestASupersededRuleIsSanitizedBeforeItIsShown:
             negative=None,
         )
         with (
+            closing(store),
             patch.object(cli_commands, "VectorMemoryStore", return_value=store),
             patch.object(cli_commands, "LessonStore", return_value=MagicMock()),
             patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
@@ -1997,6 +2131,7 @@ class TestASupersededRuleIsSanitizedBeforeItIsShown:
             negative=None,
         )
         with (
+            closing(store),
             patch.object(cli_commands, "VectorMemoryStore", return_value=store),
             patch.object(cli_commands, "LessonStore", return_value=MagicMock()),
             patch.object(cli_commands.KiroCrewConfig, "load", return_value=MagicMock()),
@@ -2034,7 +2169,7 @@ class TestASupersededRuleIsSanitizedBeforeItIsShown:
     def test_no_dedup_log_line_carries_lesson_text(self, tmp_path, caplog):
         """The whole scan logs IDENTITIES, never content, on every branch.
 
-        A lesson holds whatever the user once told the agent -- credentials, paths,
+        A lesson can hold whatever the user tells the agent -- credentials, paths,
         names -- so a log line carrying its text turns a silent-deletion bug into a
         disclosure bug, on a sink that persists to disk and may reach a notification
         channel. Filtering the text on the way out only narrows that; logging the
@@ -2087,3 +2222,259 @@ class TestASupersededRuleIsSanitizedBeforeItIsShown:
                     assert secret in result.superseded[0], "the result carries the text"
             finally:
                 store.close()
+
+
+class _EventInsertFailingConn:
+    """Delegates to a real sqlite3 connection but fails any memory_events insert.
+
+    ``sqlite3.Connection.execute`` is a read-only C attribute, so it cannot be
+    patched in place; wrapping the connection injects the event-write failure
+    while every other statement runs normally.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *args, **kwargs):
+        if "INSERT INTO memory_events" in sql:
+            raise sqlite3.OperationalError("no such table: memory_events")
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        return self._conn.__enter__()
+
+    def __exit__(self, *exc):
+        return self._conn.__exit__(*exc)
+
+
+class TestSupersedeRecordIsDurableAndAttributable:
+    """A dedup supersede must leave a durable, attributable on-disk trace.
+
+    A ``learn_add`` that supersedes a lesson records which lesson it deleted in the
+    tombstone itself, not only in the tool reply and a log line -- so a call that
+    returns ``timed out`` while committing can still be traced to what was retired.
+    These pin that the tombstone carries the winner and reason, that the deletion is
+    logged at a level a default install records to disk, and that an ordinary forget
+    is unaffected.
+    """
+
+    # Two rules that share >=50% of the larger keyword set without either
+    # containing the other, so the topic-overlap branch is the one that fires.
+    _STORED = "prefer ruff for linting python code in this repository"
+    _SUBMITTED = "prefer ruff for formatting python code in this repository"
+
+    def _supersede(self, store):
+        stored = store.write_lesson(self._STORED, "tool")
+        assert stored.outcome is LessonWriteOutcome.INSERTED
+        result = store.write_lesson(self._SUBMITTED, "tool")
+        assert result.superseded, "the overlap branch should have retired the stored rule"
+        return result
+
+    def _retired_key(self, store):
+        return next(e["memory_key"] for e in store.get_events() if e["event_type"] == "delete")
+
+    def test_delete_event_records_the_winning_key_and_reason(self, tmp_path) -> None:
+        import json
+
+        store = _store(tmp_path)
+        try:
+            self._supersede(store)
+            deletes = [e for e in store.get_events() if e["event_type"] == "delete"]
+            assert len(deletes) == 1, "exactly one lesson was superseded"
+            payload = json.loads(deletes[0]["new_value"])
+            # The winner is named by row id, and the reason is the overlap ratio.
+            assert payload["superseded_by"].startswith("lesson."), payload
+            assert "overlap" in payload["reason"], payload
+        finally:
+            store.close()
+
+    def test_supersede_tombstone_reads_apart_from_an_explicit_forget(self, tmp_path) -> None:
+        from kiro_crew import memory_record_metadata as meta
+
+        store = _store(tmp_path)
+        try:
+            self._supersede(store)
+            # The retired row's key is md5(rule, scope); recover it from the delete
+            # event rather than recomputing, so the test does not couple to the hash.
+            record = meta.get_record_metadata(store.db, "key:" + self._retired_key(store))
+            assert (
+                record["status"] == "superseded"
+            ), "a dedup supersede must not read as a plain 'forgotten' tombstone"
+        finally:
+            store.close()
+
+    def test_supersede_revision_records_the_operation(self, tmp_path) -> None:
+        """The retained revision names the deletion a 'supersede', not a 'forget'.
+
+        Pins the ``operation`` field independently of the record status, so a
+        reversion of the ``operation=`` ternary alone is caught.
+        """
+        store = _store(tmp_path)
+        try:
+            self._supersede(store)
+            rid = "key:" + self._retired_key(store)
+            ops = [
+                row[0]
+                for row in store.db.execute(
+                    "SELECT operation FROM memory_revisions WHERE record_id=?", (rid,)
+                )
+            ]
+            assert "supersede" in ops, ops
+            assert "forget" not in ops, "a supersede must not record itself as a forget"
+        finally:
+            store.close()
+
+    def test_supersede_is_logged_at_warning_so_a_default_install_records_it(
+        self, tmp_path, caplog
+    ) -> None:
+        """The supersede line logs at WARNING, not INFO.
+
+        A default install's file handler records WARNING+ only, so an INFO-level
+        supersede would leave no on-disk trace of a data deletion. Capture at WARNING
+        (not DEBUG) so the assertion FAILS if the level is reverted to INFO.
+        """
+        import logging
+
+        store = _store(tmp_path)
+        try:
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.vector_memory"):
+                self._supersede(store)
+            supersede_lines = [
+                r for r in caplog.records if r.getMessage().startswith("Lesson supersede:")
+            ]
+            assert supersede_lines, "the supersede must log at WARNING or above"
+            assert supersede_lines[0].levelno >= logging.WARNING
+        finally:
+            store.close()
+
+    def test_an_explicit_forget_is_unchanged_by_the_supersede_path(self, tmp_path) -> None:
+        """The non-supersede delete_semantic path still records forgotten/None.
+
+        Exercises the ``else`` arms of the new ternaries: a plain forget must keep
+        status 'forgotten', operation 'forget' (never 'supersede'), and a null audit
+        new_value.
+        """
+        from kiro_crew import memory_record_metadata as meta
+        from kiro_crew.vector_memory import _lesson_key
+
+        store = _store(tmp_path)
+        try:
+            store.write_lesson("always pin dependency versions in the lockfile", "tool")
+            key = _lesson_key("always pin dependency versions in the lockfile", "")
+            # A plain forget: no superseded_by / supersede_reason kwargs.
+            assert store.delete_semantic(key, "user_explicit")
+            record = meta.get_record_metadata(store.db, "key:" + key)
+            assert record["status"] == "forgotten", record
+            ops = [
+                row[0]
+                for row in store.db.execute(
+                    "SELECT operation FROM memory_revisions WHERE record_id=?",
+                    ("key:" + key,),
+                )
+            ]
+            assert "forget" in ops and "supersede" not in ops, ops
+            delete_evt = next(
+                e
+                for e in store.get_events()
+                if e["event_type"] == "delete" and e["memory_key"] == key
+            )
+            assert delete_evt["new_value"] in (None, ""), delete_evt["new_value"]
+        finally:
+            store.close()
+
+    def test_the_durable_record_carries_only_identities_not_rule_text(self, tmp_path) -> None:
+        """The audit new_value is exactly {superseded_by, reason} and nothing else.
+
+        Stronger than a bare 'linting'/'formatting' absence check: it asserts the
+        full parsed shape, so any future change that widened the payload to include
+        rule text (or any third key) would fail here.
+        """
+        import json
+
+        store = _store(tmp_path)
+        try:
+            self._supersede(store)
+            deletes = [e for e in store.get_events() if e["event_type"] == "delete"]
+            payload = json.loads(deletes[0]["new_value"])
+            assert set(payload) == {"superseded_by", "reason"}, payload
+            assert "linting" not in deletes[0]["new_value"], deletes[0]["new_value"]
+            assert "formatting" not in deletes[0]["new_value"], deletes[0]["new_value"]
+        finally:
+            store.close()
+
+    def test_a_text_shaped_supersede_reason_is_refused_at_the_sink(self, tmp_path) -> None:
+        """The 'identities only' invariant is structural, not just contractual.
+
+        A reason carrying a newline or long free text (e.g. a future caller
+        splicing rule text into it) is refused at delete_semantic rather than
+        written to the disk-persisted audit row.
+        """
+        from kiro_crew.vector_memory import _lesson_key
+
+        store = _store(tmp_path)
+        try:
+            store.write_lesson("always pin dependency versions in the lockfile", "tool")
+            key = _lesson_key("always pin dependency versions in the lockfile", "")
+            with pytest.raises(ValueError):
+                store.delete_semantic(
+                    key,
+                    "tool",
+                    superseded_by="lesson.deadbeef",
+                    supersede_reason="overlap with the user's secret rule\nsecond line",
+                )
+        finally:
+            store.close()
+
+    def test_a_plain_forget_survives_an_unavailable_audit_table(self, tmp_path) -> None:
+        """A plain forget commits its tombstone even when the event write fails.
+
+        The audit event on the forget path is best-effort: a failed
+        ``memory_events`` insert is swallowed, so the tombstone and revision still
+        commit. A supersede is the opposite -- its attribution event is atomic, so
+        the same failure rolls the whole supersede back and the row survives.
+        """
+        from kiro_crew.vector_memory import _lesson_key
+
+        store = _store(tmp_path)
+        try:
+            store.write_lesson("always pin dependency versions in the lockfile", "tool")
+            key = _lesson_key("always pin dependency versions in the lockfile", "")
+            real_conn = store._db
+            store._db = _EventInsertFailingConn(real_conn)
+            try:
+                assert store.delete_semantic(key, "user_explicit") is True
+            finally:
+                store._db = real_conn
+            # Event write failed, but the row is tombstoned: a re-forget finds nothing.
+            assert store.delete_semantic(key, "user_explicit") is False
+        finally:
+            store.close()
+
+    def test_a_supersede_rolls_back_when_its_attribution_event_fails(self, tmp_path) -> None:
+        """A supersede is atomic: a failed attribution event keeps the row alive."""
+        from kiro_crew.vector_memory import _lesson_key
+
+        store = _store(tmp_path)
+        try:
+            store.write_lesson("always pin dependency versions in the lockfile", "tool")
+            key = _lesson_key("always pin dependency versions in the lockfile", "")
+            real_conn = store._db
+            store._db = _EventInsertFailingConn(real_conn)
+            try:
+                with pytest.raises(sqlite3.OperationalError):
+                    store.delete_semantic(
+                        key,
+                        "tool",
+                        superseded_by="lesson.deadbeef",
+                        supersede_reason="62% keyword overlap",
+                    )
+            finally:
+                store._db = real_conn
+            # The rollback kept the row: a plain forget still finds it to tombstone.
+            assert store.delete_semantic(key, "user_explicit") is True
+        finally:
+            store.close()

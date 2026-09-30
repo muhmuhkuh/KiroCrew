@@ -73,6 +73,9 @@ _ERROR_CAP = 240
 # Servers per bucket. A stock install runs well under ten; the cap exists so a
 # misconfigured host cannot push an unbounded list into every slots snapshot.
 _BUCKET_CAP = 64
+# Shared with the session's sign-in tracker, which reads the same status
+# snapshots and must bound them the same way.
+BUCKET_CAP = _BUCKET_CAP
 # Names a one-line summary spells out before it counts the tail. A log line is
 # read at a glance, so the bound is far below ``_BUCKET_CAP``: the point is
 # which servers are broken, and a 64-name line answers that worse than eight.
@@ -245,7 +248,13 @@ class KasMcpReadiness:
         if self.tool_policy is None or "tools" not in self.tool_policy:
             return True
         raw = self.tool_policy["tools"]
-        tools = ["*"] if raw == "*" else raw if isinstance(raw, list) else []
+        tools: list[Any]
+        if raw == "*":
+            tools = ["*"]
+        elif isinstance(raw, list):
+            tools = raw
+        else:
+            tools = []
         excluded = self.tool_policy.get("excludedTools", [])
         if not isinstance(excluded, list):
             excluded = []
@@ -409,12 +418,14 @@ class McpSessionReport:
     #: Empty means Kiro Crew injected none — NOT that the session has none, since
     #: the backend also starts the agent spec's own servers.
     configured: tuple[str, ...] = ()
-    #: Agent-spec ``@server`` refs that named no server this session receives, as
-    #: :mod:`kiro_crew.acp.mcp_ref_guard` found them. A DIFFERENT claim from every
-    #: bucket below, and the difference is what makes it worth a slot: those say
-    #: what a configured server reported, this says the spec asked for a server
-    #: nothing configured -- so there is no row for it to be missing FROM, which
-    #: is exactly why the defect was invisible three times.
+    #: Agent-spec ``@server`` refs that named no server in Crew's projection for
+    #: this session, as :mod:`kiro_crew.acp.mcp_ref_guard` found them. Crew's
+    #: projection delivers none of them; the harness may still mount a same-named
+    #: server from its own configuration, which this field does not read. A
+    #: DIFFERENT claim from every bucket below, and the difference is what makes it
+    #: worth a slot: those say what a configured server reported, this says the
+    #: spec asked for a server nothing configured -- so there is no row for it to
+    #: be missing FROM, which is exactly why the defect was invisible three times.
     unresolved_refs: tuple[str, ...] = ()
     _ready: list[str] = field(default_factory=list)
     _failed: list[str] = field(default_factory=list)
@@ -452,7 +463,11 @@ class McpSessionReport:
         self._started = True
 
     def record_unresolved_refs(self, refs: Any) -> None:
-        """Record the spec refs that named no server this session receives.
+        """Record the spec refs that named no server in Crew's projection.
+
+        The guard's claim, not a stronger one: Crew's projection delivers none of
+        them, and the harness may still mount a same-named server from its own
+        configuration, which neither the guard nor this report reads.
 
         Sanitized and capped on the same terms as a server name: a ref is
         config-derived, so an installed app chooses the text, and it reaches a log
@@ -617,11 +632,10 @@ class McpSessionReport:
             # text would present a reason this failure never gave — the same
             # stale-evidence defect, one layer in, that this view exists to
             # remove.
-            if name in target:
-                if error:
-                    self._failures[name] = error
-                else:
-                    self._failures.pop(name, None)
+            if error:
+                self._failures[name] = error
+            else:
+                self._failures.pop(name, None)
         else:
             # A server that has since initialized (or gone back to asking for
             # authorization) must not keep showing the stale reason it failed

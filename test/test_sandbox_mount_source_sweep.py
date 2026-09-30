@@ -46,6 +46,7 @@ from pathlib import Path
 
 import pytest
 
+import kiro_crew.sandbox as sandbox_mod
 from kiro_crew.config.paths import config_dir
 from kiro_crew.sandbox import (
     _MOUNT_SOURCE_MAX_AGE_SECONDS,
@@ -56,6 +57,18 @@ from kiro_crew.sandbox import (
     _PinScanCoverage,
     cleanup_stale_sandbox_profiles,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    The staging sites read out of the launcher do not depend on that answer, and a
+    real ssh spawned from the test process is a host dependency this module is not
+    about. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox_mod, "_ssh_supports_accept_new", lambda: True)
+
 
 # ``_build_launcher_script`` calls POSIX-only ``os.getuid``/``os.getgid`` (the
 # namespace launcher never runs on Windows).
@@ -1100,6 +1113,62 @@ class TestMountPinnedSourceNames:
         assert _cleanup_stale_sandbox_mount_sources(roots=[str(tmp_path)]) == 0
         assert held.exists()
 
+    def test_identical_mount_tables_are_parsed_once_per_scan(self, tmp_path: Path):
+        """Every thread of a group reports its leader's mount table verbatim,
+        so a scan over a many-threaded host is thousands of reads of a few
+        dozen distinct tables; each distinct table is split and matched once,
+        and the repeats cost the read alone. ``matcher`` sees every line of a
+        parsed table, so its call count is the number of lines parsed."""
+        proc = tmp_path / "proc"
+        self._proc_task(proc, 1, mountinfo="")
+        table = (
+            "100 99 0:40 /kirocrew_sb_777_home /root/home rw - tmpfs tmpfs rw\n"
+            "101 99 0:40 /kirocrew_sb_777_ssh /root/.ssh rw - tmpfs tmpfs rw\n"
+        )
+        self._proc_task(proc, 500, mountinfo=table, threads={tid: table for tid in range(501, 521)})
+        self._proc_task(proc, 600, mountinfo=table)
+        matched: list[str] = []
+
+        def _matcher(name: str) -> bool:
+            matched.append(name)
+            return name.startswith("kirocrew_sb_")
+
+        coverage = _PinScanCoverage()
+        pinned, complete = _mount_pinned_source_names(
+            proc_root=str(proc), matcher=_matcher, coverage=coverage
+        )
+
+        assert pinned == {"kirocrew_sb_777_home", "kirocrew_sb_777_ssh"}
+        assert complete is True and coverage.covered is True
+        assert matched == ["kirocrew_sb_777_home", "kirocrew_sb_777_ssh"]
+
+    @pytest.mark.parametrize(
+        "cache_limit",
+        ["_MOUNT_TABLE_CACHE_MAX_ENTRIES", "_MOUNT_TABLE_CACHE_MAX_BYTES"],
+    )
+    def test_tables_past_cache_limit_remain_parsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cache_limit: str
+    ):
+        """A zero cache bound drops deduplication, not mount-source discovery."""
+        monkeypatch.setattr(f"kiro_crew.sandbox.{cache_limit}", 0)
+        proc = tmp_path / "proc"
+        first = "100 99 0:40 /kirocrew_sb_1_first /root/a rw - tmpfs tmpfs rw\n"
+        uncached = "101 99 0:40 /kirocrew_sb_2_later /root/b rw - tmpfs tmpfs rw\n"
+        self._proc_task(proc, 1, mountinfo=first)
+        self._proc_task(proc, 500, mountinfo=uncached, threads={501: uncached})
+        matched: list[str] = []
+
+        def _matcher(name: str) -> bool:
+            matched.append(name)
+            return name.startswith("kirocrew_sb_")
+
+        pinned, complete = _mount_pinned_source_names(proc_root=str(proc), matcher=_matcher)
+
+        assert pinned == {"kirocrew_sb_1_first", "kirocrew_sb_2_later"}
+        assert complete is True
+        assert set(matched) == {"kirocrew_sb_1_first", "kirocrew_sb_2_later"}
+        assert len(matched) == 3
+
     @pytest.mark.skipif(
         not os.path.isdir("/proc/1"),
         reason="needs an unfiltered procfs exposing pid 1 (Linux, no hidepid)",
@@ -1657,11 +1726,12 @@ class TestLauncherStagingSitesArePrefixed:
         tree = ast.parse(script)  # string-template edits must keep it parseable
 
         staging = self._staging_calls(tree)
-        # The template always emits all four staging sites (per-dir empties,
-        # per-file empties, SSH shadow, and the private-window stage that holds
-        # a window's real contents while its parent is masked); the level varies
-        # the DATA, not the code.
-        assert len(staging) == 4
+        # The template always emits all five staging sites (per-dir empties,
+        # per-file empties, SSH shadow, the private-window stage that holds a
+        # window's real contents while its parent is masked, and the nested
+        # re-mask that re-hides a masked leaf sitting INSIDE such a window after
+        # the window is bound); the level varies the DATA, not the code.
+        assert len(staging) == 5
         for call in staging:
             prefix_kw = next((k for k in call.keywords if k.arg == "prefix"), None)
             assert prefix_kw is not None, ast.dump(call)
@@ -1688,7 +1758,7 @@ class TestLauncherStagingSitesArePrefixed:
             and node.func.value.id == "tempfile"
             and node.func.attr in ("mkdtemp", "mkstemp")
         ]
-        assert len(calls) == 5  # four staging sites and the tmpfs probe
+        assert len(calls) == 6  # five staging sites and the tmpfs probe
         for call in calls:
             prefix_kw = next((k for k in call.keywords if k.arg == "prefix"), None)
             assert prefix_kw is not None, ast.dump(call)

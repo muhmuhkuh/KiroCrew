@@ -67,9 +67,14 @@ from kiro_crew.dashboard.channel_folders import (
     lookup_channel_folder,
 )
 from kiro_crew.dashboard.chat_title import _persist_title
-from kiro_crew.dashboard.chat_utils import effective_session_key
-from kiro_crew.dashboard.state import _normalize_slot_key, durable_row_count, row_mid
-from kiro_crew.history import carry_provenance, is_incognito_transcript
+from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots, effective_session_key
+from kiro_crew.dashboard.state import (
+    _normalize_slot_key,
+    durable_row_count,
+    note_crew_log_class,
+    row_mid,
+)
+from kiro_crew.history import HUMAN_TURN_META_KEY, carry_provenance, is_incognito_transcript
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import channel_namespace_of, is_channel_session_key
 from kiro_crew.messaging.upload_gate import live_dashboard_slot
@@ -181,6 +186,9 @@ def project_channel_turn_live(
                     user_text,
                     "msg msg-u",
                     broadcast_user=broadcast_user,
+                    # A PERSON sent this into the channel. See
+                    # history.HUMAN_TURN_META_KEY for why the marker is explicit.
+                    meta={HUMAN_TURN_META_KEY: True},
                 )
             )
             or ""
@@ -209,6 +217,40 @@ def project_channel_turn_live(
         except Exception:
             logger.debug("channel turn projection: slot push failed", exc_info=True)
     return user_mid, assistant_mid
+
+
+def project_channel_row_live(
+    dashboard_state: Any, session_key: str, role: str, text: str, cls: str
+) -> str | None:
+    """Append one extra row to the open dashboard slot and return its row id.
+
+    The channel-side twin of the dashboard runner's own turn-outcome cards: a
+    channel turn that closed with no assistant text mirrors the driver's notice
+    (``notice`` / ``msg msg-info``) into the live window, and one that raised
+    mirrors its error (``error`` / ``msg msg-err``), so the reader there sees
+    the same sentence the channel posted. Called AFTER
+    :func:`project_channel_turn_live` so the row lands behind the user's (and,
+    when there is one, the assistant's) in the window's order. Returns ``None``
+    when no live slot owns the session, or when the append failed, so the caller
+    persists the row under a freshly minted id instead.
+    """
+    slot = live_dashboard_slot(dashboard_state, session_key)
+    if slot is None:
+        return None
+    try:
+        mid = row_mid(slot.append(role, text, cls)) or ""
+    except Exception:
+        logger.debug(
+            "channel turn projection: %s append failed for %s", role, session_key, exc_info=True
+        )
+        return None
+    push = getattr(dashboard_state, "push_slots_update", None)
+    if callable(push):
+        try:
+            push()
+        except Exception:
+            logger.debug("channel turn projection: slot push failed", exc_info=True)
+    return mid or None
 
 
 async def rename_channel_title_live(
@@ -398,8 +440,63 @@ def needs_backfill_filing(meta: dict[str, Any]) -> bool:
     Used as the ``update_metadata_if`` guard as well as the pre-scan filter, so
     the decision is re-made against the locked on-disk record at the moment of
     the write -- a placement made while the scan ran wins.
+
+    It is deliberately not the WHOLE write decision. An empty record passes here,
+    which at scan time means "nothing has placed this" and is correct, but under
+    the write lock the same value also describes a conversation that has been
+    DELETED -- the store's metadata read cannot tell those apart. Existence is
+    therefore asked separately, by the write's ``require_existing`` flag, so that
+    one reading of an empty dict does not have to serve both questions.
     """
     return not (meta.get("folder_id") or meta.get("channel_folder_filed"))
+
+
+def _rebind_unbound_channel_slot(
+    state: "DashboardState", slot: "_ChatSlot", session_key: str
+) -> bool:
+    """Bind *slot* to *session_key* when it is an unbound channel survivor.
+
+    Returns True when a binding was applied.
+
+    A slot surfaced before the session map could answer for its stem holds the
+    history but routes nothing back, so the tab is one-way until a human
+    re-links it. The map answer is the trusted one, so the first pass that can
+    resolve the stem heals it.
+
+    The provenance check is not implied by the slot NAME: any caller can create
+    a slot named for a live channel stem, and binding on the name alone would
+    route that tab's later turns into the channel's conversation.
+
+    ``channel_origin`` alone is not enough either. It round-trips through the
+    transcript's own metadata line, so an agent able to write that file can hand
+    a lookalike the marker and the restore would arrive already claiming it. The
+    rebind therefore also requires the runtime record that THIS process surfaced
+    the slot from a channel session it observed.
+
+    That scopes the heal to the observing process. A restored survivor is bound
+    by ``get_or_create_slot``'s own resolve as it rehydrates, but only when the
+    session map can answer for the stem right then; a slot rehydrated while it
+    still cannot carries no runtime record, so it stays one-way for the rest of
+    the process even once the stem resolves, and the next start retries that
+    resolve. The window is the deliberate price of provenance that a writable
+    marker cannot supply.
+    """
+    if not slot.channel_origin or slot.linked_session_key:
+        return False
+    if not slot._channel_runtime_origin:
+        return False
+    if not session_key or not is_channel_session_key(session_key):
+        return False
+    slot.linked_session_key = session_key
+    note_crew_log_class(state, slot)
+    # Flagged, or the periodic flush skips it and the next restart refuses all over again.
+    slot._dirty = True
+    # The rebind changes the slot's effective key, so the registry still holds the
+    # unbound phantom -- and every "does this session have a tab?" gate reads it.
+    # Neither rebind path increments the reconciler's surfaced count, so the
+    # republish cannot live in its sync gate.
+    _sync_dashboard_slots(state)
+    return True
 
 
 def surface_channel_session(
@@ -454,6 +551,11 @@ def surface_channel_session(
     # it for free because the key is the slot's identity.
     slot_name = channel_slot_name(stem)
     if slot_name in state._slots:
+        # Covers the same-pass creation race ONLY. The reconciler never re-passes an
+        # existing slot here, so a survivor from an earlier pass is healed in
+        # _reconcile_channel_slots_locked instead.
+        if _rebind_unbound_channel_slot(state, state._slots[slot_name], session_key):
+            logger.info("channel surface: rebound previously unbound slot %s", slot_name)
         return None
     if session_key and not is_channel_session_key(session_key):
         logger.warning(
@@ -475,6 +577,11 @@ def surface_channel_session(
         logger.debug("channel slot %s exists with a conflicting memory_mode", slot_name)
         return None
 
+    # Reached only for a stem ``list_sessions`` just served, so the conversation was
+    # observed rather than claimed. This is the record a later rebind trusts; the
+    # persisted marker above cannot serve, being writable by whoever holds the file.
+    slot._channel_runtime_origin = True
+
     raw_title = session_info.get("title") or meta.get("title") or ""
     slot.title = _redact_assistant(raw_title) if raw_title else channel_label(stem)
     slot._titled = bool(raw_title)
@@ -492,6 +599,9 @@ def surface_channel_session(
     slot._memory_assignment_from_history = True
     if meta.get("model"):
         slot.model = meta["model"]
+    # `jev_route` is deliberately NOT read back here, for the reason the two
+    # persistence loaders state: it records an owner pick that spends money, and
+    # this file is editable by the agent's own tools.
     if meta.get("autocompact_pct") is not None:
         # Restore the per-session compaction threshold, mirroring the
         # persistence loaders: without this, a surfaced slot's field stays
@@ -503,6 +613,15 @@ def surface_channel_session(
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if slot.autocompact_pct is not None and state.sessions:
             state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
+    # Restore the dismissed source-link tombstones, mirroring the persistence
+    # loaders: this surfacing path applies metadata by hand rather than going
+    # through _rehydrate_slot_from_history, so without it an unlinked chip
+    # reappears when the channel session is re-surfaced and the next save erases
+    # the persisted tombstone. Local import for the same circular-import reason
+    # as _validate_autocompact_pct above.
+    from kiro_crew.dashboard.chat_persistence import _restore_dismissed_source_links
+
+    _restore_dismissed_source_links(slot, meta.get("dismissed_source_links"))
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
     if meta.get("memory_store"):
@@ -563,6 +682,18 @@ def surface_channel_session(
     # the frozen prefix a save never rewrites, and redact assistant content at
     # the read boundary.
     _rebuild_window(slot, messages)
+    # Channel transcripts bypass both dashboard restore drivers, so the local-turn
+    # marker a dashboard turn on this slot left behind is reconciled here, once
+    # the whole window exists. Local import: chat_persistence imports this module.
+    from kiro_crew.dashboard.chat_persistence import (
+        _local_turn_generation,
+        _local_turn_prompt,
+        _reconcile_local_turn_marker,
+    )
+
+    _reconcile_local_turn_marker(
+        slot, _local_turn_generation(meta), _local_turn_prompt(meta), persisted=messages
+    )
     # The window corresponds to the file as of this listing, so the refresh pass
     # has nothing to do until the channel writes again.
     slot._channel_window_mtime = float(session_info.get("modified", 0) or 0)
@@ -735,7 +866,7 @@ def _window_refresh_is_safe(slot: "_ChatSlot") -> bool:
     mistake those for missing history and duplicate them, so defer instead —
     the next pass retries once the turn has landed.
     """
-    return bool(slot.linked_session_key) and not slot.running and not slot._dirty
+    return bool(slot.linked_session_key) and not slot.turn_running and not slot._dirty
 
 
 #: Per-state reconcile lock. Keyed weakly so a discarded state is collectable —
@@ -920,7 +1051,22 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             continue
         if float(s.get("modified", 0) or 0) > slot._channel_window_mtime:
             refreshable.append(s)
-    if not pending and not refreshable:
+    # Unbound survivors. A slot surfaced before the session map could answer for its
+    # stem is in NEITHER list above -- `pending` excludes a slot that already exists,
+    # and `_window_refresh_is_safe` rejects one with no linked key -- so without this
+    # bucket the tab stays one-way for the process lifetime even once the stem
+    # resolves. Needs no transcript read, so the steady state stays a metadata scan.
+    rebindable: list[tuple[str, "_ChatSlot"]] = []
+    if state.sessions:
+        for s in eligible:
+            key = s.get("key", "")
+            slot = state._slots.get(channel_slot_name(key))
+            if slot is None or slot.linked_session_key or not slot.channel_origin:
+                continue
+            resolved = state.sessions.channel_key_for_stem(key)
+            if resolved:
+                rebindable.append((resolved, slot))
+    if not pending and not refreshable and not rebindable:
         return 0
 
     def _load_messages() -> dict[str, list[dict[str, Any]]]:
@@ -1170,7 +1316,15 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
         except Exception:
             logger.warning("channel reconcile: failed to refresh %s", key, exc_info=True)
 
-    if surfaced or refreshed:
+    rebound = 0
+    for resolved, slot in rebindable:
+        # Re-checked inside the helper: a turn on either surface may have bound the
+        # slot while this pass's reads were in flight.
+        if _rebind_unbound_channel_slot(state, slot, resolved):
+            rebound += 1
+            logger.info("channel reconcile: rebound previously unbound slot %s", slot.key)
+
+    if surfaced or refreshed or rebound:
         if surfaced:
             # Publish the new tab to the dashboard-surface registry BEFORE the
             # broadcast. Every gate that asks "does this session have a tab?"
@@ -1456,8 +1610,21 @@ async def backfill_channel_folder(state: "DashboardState", namespace: str) -> di
                 slot, placed = _live_slot_placement(state, key)
                 if placed:
                     continue
+                # ``require_existing`` because this pass's gap between reading a
+                # candidate and writing it is the widest in the feature -- up to
+                # BACKFILL_MOVE_LIMIT lock acquisitions and awaits -- and a
+                # conversation deleted inside that gap reads to the guard exactly
+                # like one that never had a metadata line. Without it the merge
+                # upserts and the deletion is undone as a metadata-only stub
+                # filed into the folder, with no transcript behind it: a row in
+                # the sidebar that opens onto nothing, and there is no undo for
+                # this button to walk it back.
                 filed = await asyncio.to_thread(
-                    log.update_metadata_if, key, filing_meta, needs_backfill_filing
+                    log.update_metadata_if,
+                    key,
+                    filing_meta,
+                    needs_backfill_filing,
+                    require_existing=True,
                 )
                 # Mirror the persisted placement onto the open tab, INSIDE the
                 # lock and against a freshly read slot. Without this the tab keeps
@@ -1497,9 +1664,12 @@ async def backfill_channel_folder(state: "DashboardState", namespace: str) -> di
             write_failures += 1
             continue
         if not filed:
-            # The guard refused under the lock -- the record gained a placement
-            # or a filing marker while this pass ran. That is the user's own
-            # action, so it stands and this is not retried.
+            # Two refusals reach here and neither is retried. The guard saw a
+            # placement or a filing marker that landed while this pass ran --
+            # the user's own action, so it stands. Or the conversation was
+            # DELETED while this pass ran, in which case there is nothing left
+            # to file. Neither is counted as a failure: both are decisions, not
+            # errors, and no write was attempted.
             continue
         report["moved"].append(
             {

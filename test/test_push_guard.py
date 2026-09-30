@@ -275,9 +275,21 @@ class TestPushGuardRefused:
 class TestPushGuardEdgeCases:
     """Edge cases and error handling."""
 
-    def test_not_a_git_repo(self, tmp_path):
-        """Running outside a git repo → exit 2."""
-        rc, stdout, stderr = _run_push_guard(str(tmp_path))
+    def test_not_a_git_repo(self, tmp_path, monkeypatch):
+        """Running outside a git repo → exit 2.
+
+        "Outside a git repo" is constructed, not assumed of ``tmp_path``: a harness
+        that pins ``TMPDIR`` under the checkout gives it a real ``.git`` among its
+        ancestors, and git's upward discovery would find it (exit 40, a refusal of
+        THIS checkout's branch state, rather than 2). ``GIT_CEILING_DIRECTORIES``
+        is git's own seam for that walk and the script inherits the environment;
+        the directory is a CHILD of the ceiling because git checks its starting
+        directory before consulting the ceiling.
+        """
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+        nowhere = tmp_path / "nowhere"
+        nowhere.mkdir()
+        rc, stdout, stderr = _run_push_guard(str(nowhere))
         assert rc == 2
 
     def test_custom_max_ahead(self, repo_pair):
@@ -1536,6 +1548,37 @@ class TestReplayFailClosed:
         combined = (stdout + stderr).lower()
         assert "refused" in combined and "rev-list" in combined, (
             "Expected a REFUSED diagnostic mentioning rev-list.\n"
+            f"stdout: {stdout}\nstderr: {stderr}"
+        )
+
+    def test_patchid_failure_refuses(self, repo_pair, tmp_path, monkeypatch):
+        """patch-id --stable failure → exit 40, and it is the INJECTED git that fails.
+
+        Both ``patch-id`` calls go through ``run()`` and so through ``_GIT_CMD``,
+        which is what lets this fake reach them: a bare ``git`` spawn of their
+        own would be untestable here and would cost every run of the class a
+        real host ``git``. Failing the fake on ``patch-id`` and getting the refusal proves
+        the calls now go through ``run()`` like every other command.
+        """
+        clone_dir, _ = repo_pair
+
+        _git(clone_dir, "checkout", "-b", "feature/patchid-fail-test")
+        Path(clone_dir, "change.py").write_text("# change\n")
+        _git(clone_dir, "add", "change.py")
+        _git(clone_dir, "commit", "-m", "feat: test commit")
+
+        fake_cmd = self._make_fake_git_cmd(tmp_path, "'patch-id' in args")
+
+        rc, stdout, stderr = self._run_push_guard_inprocess(monkeypatch, clone_dir, fake_cmd)
+        assert rc == 40, (
+            f"Expected refused (40), got {rc}. A failing "
+            f"patch-id must not produce SAFE TO PUSH.\n"
+            f"stdout: {stdout}\nstderr: {stderr}"
+        )
+        assert "SAFE TO PUSH" not in stdout
+        combined = (stdout + stderr).lower()
+        assert "refused" in combined and "patch-id" in combined, (
+            "Expected a REFUSED diagnostic mentioning patch-id.\n"
             f"stdout: {stdout}\nstderr: {stderr}"
         )
 

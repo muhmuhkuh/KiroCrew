@@ -560,6 +560,22 @@ def reasserter(path):
         assert not checker.scan_source(source)
 
 
+def _waiver_key(fixture: Path, function: str) -> str:
+    """The ``KNOWN_UNCONVERTED`` key ``main()`` will look up for *fixture*.
+
+    ``scan_path`` keys a file by its path RELATIVE to the checkout when it lies
+    inside one and by its absolute posix path otherwise, and ``main()`` derives
+    the checkout root from the checker's own location. A fixture under
+    ``tmp_path`` may be either -- pytest's temp root is not guaranteed to sit
+    outside the repository (a developer's ``TMPDIR=./tmp`` puts it inside) -- so
+    the key is derived through the checker's own keying rather than assumed to be
+    the absolute form.
+    """
+    root = Path(checker.__file__).resolve().parent.parent
+    rel = checker.scan_path(fixture, root)[0][0]
+    return f"{rel}::{function}"
+
+
 class TestTheRealTree:
     """The gate the CI job runs."""
 
@@ -572,19 +588,20 @@ class TestTheRealTree:
         `scan_path` results over the same `src/kiro_crew` tree; walking and
         re-parsing every file twice per test is what made this class slow.
 
-        Narrowed through ``source_corpus.candidate_sources`` rather than a bare
+        Narrowed through ``source_corpus.iter_candidate_sources`` rather than a bare
         `rglob` + re-read + re-parse of every module: `_lockdown_target` can only
         report a violation from a call to one of the lockdown primitives
         (`restrict_to_owner` / `chmod_safe` / `chmod` / `fchmod_safe` / `fchmod`),
         so a file whose text contains none of those names cannot possibly match
-        and is never a false negative to skip. `candidate_sources` shares the
-        one-time corpus read (and its NFKC-normalised copy) with every other
-        ratchet in the suite instead of re-reading `src/` from disk here.
+        and is never a false negative to skip. Streamed, because the ~145
+        candidates are the largest files in the tree (~13 M characters, stored at
+        four bytes each once a file holds an emoji) and a tuple of their texts
+        was ~50 MiB live for nothing.
         """
-        from source_corpus import candidate_sources  # noqa: PLC0415
+        from source_corpus import iter_candidate_sources  # noqa: PLC0415
 
         found: list[tuple[str, int, str, str]] = []
-        for path, text in candidate_sources(
+        for path, text in iter_candidate_sources(
             require_any=("restrict_to_owner", "chmod_safe", "chmod", "fchmod_safe", "fchmod")
         ):
             # Same relative-to convention as `scan_path` (relative to REPO_ROOT,
@@ -760,11 +777,10 @@ class TestTheRealTree:
             "    other.chmod(0o600)\n",
             encoding="utf-8",
         )
-        # `scan_path` keys a file outside the repo by its absolute posix path.
         monkeypatch.setattr(
             checker,
             "KNOWN_UNCONVERTED",
-            {f"{fixture.as_posix()}::save": ("#9999", "tracked")},
+            {_waiver_key(fixture, "save"): ("#9999", "tracked")},
         )
 
         exit_code = checker.main(["check", str(fixture)])
@@ -792,7 +808,7 @@ class TestTheRealTree:
         monkeypatch.setattr(
             checker,
             "KNOWN_UNCONVERTED",
-            {f"{fixture.as_posix()}::save": ("#9999", "tracked")},
+            {_waiver_key(fixture, "save"): ("#9999", "tracked")},
         )
 
         assert checker.main(["check", str(fixture)]) == 0

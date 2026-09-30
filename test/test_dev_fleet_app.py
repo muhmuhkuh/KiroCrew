@@ -968,6 +968,50 @@ async def test_upstream_remote_reads_config():
     repository_mod._UPSTREAM_REMOTE = None
 
 
+@pytest.mark.asyncio
+async def test_resolve_base_branch_clears_cached_upstream_remote():
+    """Re-resolving the base branch replaces the stale cached upstream remote.
+
+    F2 (GPT 5.6): ``_UPSTREAM_REMOTE`` latches on first resolution and is derived
+    from the remote the base was resolved against, while ``_rebase_locked`` re-resolves
+    the base. A base that moves from a guess to a stated default must NOT keep the
+    remote derived from the old resolution, or the worktree is rebased onto a
+    ``<stale-remote>/<new-base>`` with no undo. ``_resolve_base_branch`` therefore drops
+    the stale value and re-seeds the cache with the remote THIS resolution used, so
+    later reads and sync target the resolved remote rather than a stale or wrong one.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    # Save every module global this test mutates: _resolve_base_branch writes
+    # BASE_BRANCH and _BASE_BRANCH_POSITIVE, which other tests read at their default.
+    _saved_base = repository_mod.BASE_BRANCH
+    _saved_positive = repository_mod._BASE_BRANCH_POSITIVE
+    # A stale remote cached against a prior base.
+    repository_mod._UPSTREAM_REMOTE = "fork"
+
+    # Drive tier-1 resolution: origin advertises HEAD -> trunk (live ls-remote).
+    async def fake_git(_repo, *args, **kwargs):
+        if args[:1] == ("remote",):
+            return "origin\nfork"
+        if args[:1] == ("ls-remote",) and args[-1] == "HEAD":
+            return "ref: refs/heads/trunk\tHEAD\n<sha>\tHEAD\n"
+        return ""
+
+    try:
+        with patch.object(repository_mod, "_repo", return_value="/fake/repo"), \
+             patch.object(repository_mod, "_git", new=AsyncMock(side_effect=fake_git)):
+            await mod._resolve_base_branch()
+
+        # The stale 'fork' is gone; the cache now holds the remote this resolution used.
+        assert repository_mod._UPSTREAM_REMOTE == "origin"
+        assert repository_mod.BASE_BRANCH == "trunk"
+        assert repository_mod._BASE_BRANCH_POSITIVE is True
+    finally:
+        repository_mod.BASE_BRANCH = _saved_base
+        repository_mod._BASE_BRANCH_POSITIVE = _saved_positive
+        repository_mod._UPSTREAM_REMOTE = None
+
+
 # --- sync runner emits ::step:: markers ---
 @pytest.mark.asyncio
 async def test_sync_script_emits_step_markers():
@@ -2089,6 +2133,58 @@ def test_build_env_excludes_credentials(monkeypatch):
     assert mod._build_env(with_credentials=True)["PATH"] == mod._TRUSTED_PATH
 
 
+def test_build_env_passes_npm_registry_but_drops_credential_shaped_keys(monkeypatch):
+    """NPM_CONFIG_REGISTRY is a registry URL, not a credential -- it must reach
+    every Dev Fleet npm step (preflight AND the real ``npm ci``/``npm run
+    build``) so both resolve against the same registry. A credential-shaped
+    variable next to it must still be dropped by the same allowlist.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setenv("NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")
+    monkeypatch.setenv("NPM_CONFIG__AUTHTOKEN", "npm-secret-token")
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-secret")
+
+    for env in (mod._build_env(), mod._build_env(with_credentials=True)):
+        assert env["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org"
+        assert "NPM_CONFIG__AUTHTOKEN" not in env
+        assert "SLACK_BOT_TOKEN" not in env
+
+
+def test_build_env_rejects_npm_registry_values_that_smuggle_credentials(monkeypatch):
+    """``NPM_CONFIG_REGISTRY`` is forwarded only when it is a bare
+    ``http``/``https`` registry URL with no userinfo, query, fragment, or
+    embedded whitespace -- URL syntax otherwise permits a credential-bearing
+    value (``https://user:token@host/``) or a smuggled second value to reach
+    a worktree-controlled build script through this allowlist entry. A value
+    that fails validation is dropped outright (fail closed), never rewritten,
+    and an unrelated credential-shaped variable next to it is still dropped
+    too.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    dropped = (
+        "https://u:tok@registry.example/",  # userinfo
+        "https://registry.example/?x=1",  # query
+        "https://registry.example/#f",  # fragment
+        "file:///etc/passwd",  # non-http(s) scheme
+        "",  # empty
+        "https://registry.npmjs.org ",  # embedded whitespace
+    )
+    for value in dropped:
+        monkeypatch.setenv("NPM_CONFIG_REGISTRY", value)
+        monkeypatch.setenv("NPM_CONFIG__AUTHTOKEN", "npm-secret-token")
+        monkeypatch.setenv("NPM_TOKEN", "npm-secret-token-2")
+        env = mod._build_env()
+        assert "NPM_CONFIG_REGISTRY" not in env, value
+        assert "NPM_CONFIG__AUTHTOKEN" not in env
+        assert "NPM_TOKEN" not in env
+
+    # A clean value right after a dropped one still passes through.
+    monkeypatch.setenv("NPM_CONFIG_REGISTRY", "https://registry.npmjs.org")
+    assert mod._build_env()["NPM_CONFIG_REGISTRY"] == "https://registry.npmjs.org"
+
+
 def test_is_safe_env_key_matches_documented_spelling_on_windows():
     """A mixed-case allowlist entry must still match what ``os.environ`` yields.
 
@@ -2315,6 +2411,10 @@ def _assert_git_neutralizers(env):
     # git answers from, so every answer this handler acts on describes the
     # history the checkout actually holds rather than a grafted substitute.
     assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+    # Also not a config key: it pins WHAT GIT WRITES on a read. `git status`
+    # refreshes the index and saves it back under `index.lock`, so a command that
+    # is a read to its caller is a write to the repository.
+    assert env["GIT_OPTIONAL_LOCKS"] == "0"
     # Full config-driven-execution neutralizer set, injected as env so it
     # covers EVERY git call (background fetch, rebase, sync pull included).
     pairs = {
@@ -2326,6 +2426,15 @@ def _assert_git_neutralizers(env):
         "core.hooksPath": "/dev/null",
         "credential.helper": "",
         "core.sshCommand": "ssh",
+        # Signature verification is the third driver class, and it is reached by a
+        # READ: `[log] showSignature=true` makes every `git log` verify, and
+        # verification EXECS the program these name. All four spellings, because
+        # `gpg.openpgp.program` is a synonym that OVERRIDES the bare `gpg.program`.
+        "gpg.program": "true",
+        "gpg.openpgp.program": "true",
+        "gpg.ssh.program": "true",
+        "gpg.x509.program": "true",
+        "log.showSignature": "false",
     }
 
 
@@ -2941,7 +3050,8 @@ async def test_hmac_expired_timestamp_returns_401():
 
 @pytest.mark.asyncio
 async def test_hmac_health_bypasses_verification():
-    """Health endpoint does not require HMAC (used by backend.py health loop)."""
+    """Health endpoint does not require HMAC (used by the backend health loop in
+    ``apps/backend_runtime/supervision.py``)."""
     app = _make_hmac_app()
     with patch.object(http_api_mod, "_load_app_secret", return_value=""):
         async with TestClient(TestServer(app)) as client:
@@ -3409,9 +3519,10 @@ def test_git_env_neutralizers_present():
     assert n["GIT_ALLOW_PROTOCOL"] == "https:ssh"
     assert n["GIT_PROTOCOL_FROM_USER"] == "0"
     assert n["GIT_NO_REPLACE_OBJECTS"] == "1"
-    # GIT_NO_REPLACE_OBJECTS is an env var in its own right, NOT one of the
-    # config pairs, so the count must not have grown to cover it.
-    assert n["GIT_CONFIG_COUNT"] == "4"
+    # GIT_NO_REPLACE_OBJECTS and GIT_OPTIONAL_LOCKS are env vars in their own
+    # right, NOT config pairs, so the count must not have grown to cover them.
+    assert n["GIT_OPTIONAL_LOCKS"] == "0"
+    assert n["GIT_CONFIG_COUNT"] == "9"
     assert n["GIT_CONFIG_KEY_0"] == "core.fsmonitor"
     assert n["GIT_CONFIG_VALUE_0"] == "false"
     assert n["GIT_CONFIG_KEY_1"] == "core.hooksPath"
@@ -3420,6 +3531,27 @@ def test_git_env_neutralizers_present():
     assert n["GIT_CONFIG_VALUE_2"] == ""
     assert n["GIT_CONFIG_KEY_3"] == "core.sshCommand"
     assert n["GIT_CONFIG_VALUE_3"] == "ssh"
+    # Signature verification EXECS the program these name, and `showSignature` is
+    # the trigger that makes a plain `git log` reach for one. All four program
+    # spellings, because `gpg.openpgp.program` is a synonym that OVERRIDES the bare
+    # `gpg.program`, so pinning only the bare key leaves an unpinned way in.
+    assert n["GIT_CONFIG_KEY_4"] == "gpg.program"
+    assert n["GIT_CONFIG_VALUE_4"] == "true"
+    assert n["GIT_CONFIG_KEY_5"] == "gpg.openpgp.program"
+    assert n["GIT_CONFIG_VALUE_5"] == "true"
+    assert n["GIT_CONFIG_KEY_6"] == "gpg.ssh.program"
+    assert n["GIT_CONFIG_VALUE_6"] == "true"
+    assert n["GIT_CONFIG_KEY_7"] == "gpg.x509.program"
+    assert n["GIT_CONFIG_VALUE_7"] == "true"
+    assert n["GIT_CONFIG_KEY_8"] == "log.showSignature"
+    assert n["GIT_CONFIG_VALUE_8"] == "false"
+    # The count DERIVED, not retyped: an undercount silently drops the tail of the
+    # list, so the pins past it would be absent while this test still read green
+    # against a hardcoded number that matched the stale count.
+    pairs = sum(1 for k in n if k.startswith("GIT_CONFIG_KEY_"))
+    assert n["GIT_CONFIG_COUNT"] == str(pairs), "the count must cover every pinned pair"
+    for i in range(pairs):
+        assert f"GIT_CONFIG_VALUE_{i}" in n, f"key {i} has no value beside it"
 
 
 @pytest.mark.skipif(
@@ -3477,6 +3609,9 @@ def test_the_neutralizers_answer_from_the_real_object_graph(tmp_path, monkeypatc
     base_env["GIT_CONFIG_SYSTEM"] = os.devnull
 
     def run(*args, env=None):
+        # ``cwd=repo`` alongside ``-C repo``: the location is pinned twice on
+        # purpose. ``-C`` is what the module under test relies on; ``cwd`` keeps
+        # this fixture's real git from ever running in the worker's checkout.
         proc = subprocess.run(
             [git, "-C", str(repo), *args],
             capture_output=True,
@@ -3484,6 +3619,7 @@ def test_the_neutralizers_answer_from_the_real_object_graph(tmp_path, monkeypatc
             encoding="utf-8",
             timeout=60,
             env={**base_env, **(env or {})},
+            cwd=repo,
         )
         assert proc.returncode == 0, proc.stderr
         return proc.stdout.strip()
@@ -5938,8 +6074,17 @@ def test_trusted_bin_dirs_cover_homebrew_prefixes():
 def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_path):
     """Homebrew's `bin/gh` is a user-writable symlink into `Cellar/`. Caching the
     LINK would let it be repointed between validation and execution, so the
-    vetted real path is what gets cached and spawned."""
+    vetted real path is what gets cached and spawned.
+
+    ``_trusted_bin`` refuses any resolved target under ``Path.home()``. Whether
+    ``tmp_path`` is inside HOME is a property of the HOST (a ``TMPDIR`` under
+    ``~`` puts it there; CI and macOS keep it outside), so the home root is
+    pinned to a sibling directory that is NOT an ancestor of the fake Cellar.
+    """
     mod._TRUSTED_BIN_CACHE.clear()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     cellar = tmp_path / "Cellar" / "gh" / "1.0" / "bin"
     cellar.mkdir(parents=True)
     target = cellar / "gh"
@@ -5951,6 +6096,30 @@ def test_trusted_bin_pins_the_resolved_target_not_the_symlink(monkeypatch, tmp_p
     monkeypatch.setattr(runtime_mod, "_TRUSTED_BIN_DIRS", (str(bin_dir),))
 
     assert mod._trusted_bin("gh") == str(target.resolve())
+    mod._TRUSTED_BIN_CACHE.clear()
+
+
+def test_trusted_bin_refuses_target_under_home(monkeypatch, tmp_path):
+    """The HOME refusal is the guard the test above pins around: an otherwise
+    system-shaped target (0o555, not writable by us) whose resolved path lies
+    under ``Path.home()`` is never selected, because anything under the user's
+    home is the agent's to replace. Every platform: the refusal is decided on
+    the resolved path before any POSIX mode check, so the candidate is placed
+    directly in the trusted dir (no symlink) and the test runs on Windows too.
+    """
+    mod._TRUSTED_BIN_CACHE.clear()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    bin_dir = home / "Cellar" / "gh" / "1.0" / "bin"
+    bin_dir.mkdir(parents=True)
+    exe = "gh.exe" if platform_compat.IS_WINDOWS else "gh"
+    target = bin_dir / exe
+    target.write_text("#!/bin/sh\nexit 0\n")
+    target.chmod(0o555)
+    monkeypatch.setattr(runtime_mod, "_TRUSTED_BIN_DIRS", (str(bin_dir),))
+
+    assert mod._trusted_bin("gh") is None
     mod._TRUSTED_BIN_CACHE.clear()
 
 
@@ -6012,7 +6181,7 @@ def test_find_cli_is_module_invocation_only(nonbundled_python_without_user_site)
     entry (its __main__), never ``kiro_crew.cli`` (no __main__ guard -> #220)."""
     import sys as _sys
 
-    assert mod._find_cli() == [_sys.executable, "-s", "-m", "kiro_crew"]
+    assert mod._find_cli() == [_sys.executable, "-s", "-P", "-m", "kiro_crew"]
 
     import subprocess as _sp
 
@@ -6941,7 +7110,7 @@ def test_find_cli_targets_kiro_crew_package(nonbundled_python_without_user_site)
     ``kiro_crew.cli`` — the latter has no __main__ guard and no-ops silently."""
     import sys
 
-    assert mod._find_cli() == [sys.executable, "-s", "-m", "kiro_crew"]
+    assert mod._find_cli() == [sys.executable, "-s", "-P", "-m", "kiro_crew"]
 
 
 def test_kiro_crew_module_entry_actually_runs():
@@ -6968,7 +7137,9 @@ def test_kiro_crew_module_entry_actually_runs():
 @pytest.mark.asyncio
 async def test_pod_down_fails_closed_when_still_active():
     """A CLI exit 0 must NOT be reported as success if the unit is still up."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
@@ -6981,7 +7152,9 @@ async def test_pod_down_fails_closed_when_still_active():
 @pytest.mark.asyncio
 async def test_pod_down_ok_when_unit_gone():
     """rc 0 AND the unit not active -> genuine success."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
@@ -6994,7 +7167,9 @@ async def test_pod_down_ok_when_unit_gone():
 @pytest.mark.asyncio
 async def test_pod_down_fails_closed_when_verify_raises():
     """If the post-stop active-state check errors, fail closed (never claim ok)."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
@@ -7007,7 +7182,9 @@ async def test_pod_down_fails_closed_when_verify_raises():
 @pytest.mark.asyncio
 async def test_pod_down_nonzero_rc_is_failure():
     """A non-zero CLI exit is surfaced as failure verbatim."""
-    with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
+    with patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/worktrees/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(1, "", "stop failed")):
         result = await mod._pod_down("kirocrew-wt-x")
     assert result["ok"] is False
@@ -7126,6 +7303,8 @@ async def test_pod_up_fails_closed_when_not_active():
     with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
          patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "{}", "")), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
+         patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/repo/kirocrew-wt-x"}, None)), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
          patch.object(runtime_mod.rt, "active_names", return_value=set()):
         result = await mod._pod_up("kirocrew-wt-x")
@@ -7135,15 +7314,32 @@ async def test_pod_up_fails_closed_when_not_active():
 
 @pytest.mark.asyncio
 async def test_pod_up_ok_when_active():
-    """rc==0 AND the unit active -> success, parsed JSON merged in."""
+    """rc==0 AND the unit active -> success, parsed JSON merged in.
+
+    The token is minted IN THIS GATEWAY PROCESS (not by the sandboxed `pod up`
+    child, whose foreign namespace the pod refuses to certify), so the child is
+    launched with --no-token and the handle's token is the gateway's mint.
+    """
+    run_cmd = AsyncMock(return_value=(0, '{"port": 7999, "token": ""}', ""))
     with patch.object(worktree_ops_mod, "_pod_checkout_guard", new_callable=AsyncMock, return_value=None), \
-         patch.object(runtime_mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, '{"port": 7999}', "")), \
+         patch.object(runtime_mod, "_run_cmd", run_cmd), \
          patch.object(runtime_mod, "_load_cfg", return_value=object()), \
+         patch.object(repository_mod, "_find_worktree", new_callable=AsyncMock,
+                      return_value=({"path": "/repo/kirocrew-wt-x"}, None)), \
+         patch.object(worktree_ops_mod, "_read_pin_strict",
+                      return_value=(True, "/repo/kirocrew-wt-x")), \
+         patch.object(runtime_mod.rt, "pod_name_mutex", return_value=MagicMock()), \
+         patch.object(runtime_mod.rt, "derive_port", return_value=7999), \
+         patch.object(runtime_mod, "_sel", return_value=MagicMock()), \
          patch.object(runtime_mod, "_POD_AVAILABLE", True), \
-         patch.object(runtime_mod.rt, "active_names", return_value={"kirocrew-wt-x"}):
+         patch.object(runtime_mod.rt, "active_names", return_value={"kirocrew-wt-x"}), \
+         patch.object(runtime_mod.rt, "mint_token", return_value="tok-gw"):
         result = await mod._pod_up("kirocrew-wt-x")
     assert result["ok"] is True
     assert result["port"] == 7999
+    assert result["token"] == "tok-gw"
+    # The boot child never mints: it is told --no-token.
+    assert "--no-token" in run_cmd.await_args.args[0]
 
 
 @pytest.mark.asyncio

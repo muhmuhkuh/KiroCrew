@@ -631,13 +631,15 @@ class TestProbeCache:
         calls: list[str] = []
         from kiro_crew.acp import client
 
+        # ``probe_backends`` probes EVERY backend, and the pi/codex/self-served resolvers
+        # reach ``_mise_which`` -- the host's ``mise``. Stub the whole table through the
+        # file's one helper, then layer the counting kiro resolver on top.
+        _stub_resolvers(monkeypatch, adapter=(None, "/usr/bin"), claude_cli=None)
         monkeypatch.setattr(
             client,
             "_resolve_kiro_bin",
             lambda **_kw: (calls.append("kiro"), "/usr/local/bin/kiro-cli")[1],
         )
-        monkeypatch.setattr(client, "_resolve_claude_acp_bin", lambda: (None, "/usr/bin"))
-        monkeypatch.setattr(client, "_resolve_claude_code_executable", lambda: None)
         probe.probe_backends()
         assert calls == ["kiro"]
 
@@ -758,11 +760,17 @@ def _request(
 ):
     """A request shaped like a real dashboard call, for the owner predicate.
 
-    ``_is_dashboard_owner`` requires ``request["app"]`` present-and-EMPTY and
-    the caller to equal ``state.owner_id``, so a bare ``MagicMock`` (whose
-    ``get`` returns truthy stubs) is refused rather than admitted -- the stub has
-    to answer those two keys precisely or the test lands on the gate instead of
-    its subject.
+    ``_is_dashboard_owner`` requires the ``app`` claim present-and-EMPTY and the
+    caller to equal ``state.owner_id``, so a bare ``MagicMock`` (whose ``get``
+    returns truthy stubs) is refused rather than admitted -- the stub has to
+    answer those two keys precisely or the test lands on the gate instead of its
+    subject.
+
+    A real ``web.Request`` is a mapping, so it answers a claim through ``get``,
+    ``in`` and ``[]`` alike; this stub answers all three from one dict for the
+    same reason. Stubbing only one spelling would make the gate's behaviour a
+    function of how it happens to be WRITTEN, so the next reader who swaps an
+    equivalent form fails a test that has nothing to say about their change.
 
     ``json_body`` is what ``await request.json()`` answers. Left unset, it raises
     the way aiohttp does for a body that is absent or not JSON -- so a case has to
@@ -772,6 +780,8 @@ def _request(
     req.path = "/api/acp-backends"
     store = {"app": app, "user": user}
     req.get = lambda key, default=None: store.get(key, default)
+    req.__contains__ = lambda _self, key: key in store
+    req.__getitem__ = lambda _self, key: store[key]
     state = MagicMock()
     state.owner_id = owner
     req.app = {"state": state}
@@ -968,9 +978,10 @@ class TestEndpointPayloadShape:
 
         from kiro_crew.acp import client
 
+        # The handler probes EVERY backend; the pi/codex/self-served resolvers would reach
+        # the host's ``mise``. Stub the whole table, then make only kiro's resolver raise.
+        _stub_resolvers(monkeypatch, adapter=(None, "/usr/bin"), claude_cli=None)
         monkeypatch.setattr(client, "_resolve_kiro_bin", _boom)
-        monkeypatch.setattr(client, "_resolve_claude_acp_bin", lambda: (None, "/usr/bin"))
-        monkeypatch.setattr(client, "_resolve_claude_code_executable", lambda: None)
         import kiro_crew.dashboard.handlers.core as core
 
         monkeypatch.setattr(core, "_selectable_acp_backends", lambda: ["", "kas"])

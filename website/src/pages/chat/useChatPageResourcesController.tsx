@@ -27,7 +27,6 @@ import { i18nT } from '../../i18n/t'
 import type { AppDispatch } from '../../store'
 import { openActivityPanel } from '../../store/chatSlice'
 import type { ChatMessage } from '../../types'
-import { setConfigAutolinkRules } from '../../utils/autolinkRules'
 import { mergeIntoDraft, setDraft } from '../../utils/chatDrafts'
 import { setFileDraft } from '../../utils/chatFileDrafts'
 import { classifyDrop } from '../../utils/dropClassify'
@@ -161,28 +160,17 @@ export function useChatPageResourcesController({
   // on each tick. Instead the WS 'slots' push carries the allowlist generation
   // (see useWebSocket), which invalidates this query only when the allowlist
   // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[]; link_patterns?: Array<{ pattern: string; url: string }> }>({
+  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
     queryKey: ['dashboardConfig'],
     queryFn: () => api.dashboardConfig(),
     staleTime: 30_000,
   })
   const sourceHosts = sourceHostCfg?.gitlab_hosts ?? []
   const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
-  // Operator link rules feed the module-level autolink registry the renderer's
-  // remark plugin and inline-code chip already read; the registry validates
-  // each entry the same way an edition-registered rule is validated. Applied
-  // DURING render, before transcript children render, so the pass that
-  // delivers a config change also paints with it — an effect would run after
-  // memoized messages first painted with the previous rule set. The write is
-  // ref-guarded and idempotent, so a re-render or a discarded concurrent pass
-  // re-applying the same serialized value is a no-op.
-  const linkPatternRules = sourceHostCfg?.link_patterns
-  const linkPatternsKey = JSON.stringify(linkPatternRules ?? [])
-  const appliedLinkPatternsRef = useRef('')
-  if (appliedLinkPatternsRef.current !== linkPatternsKey) {
-    appliedLinkPatternsRef.current = linkPatternsKey
-    setConfigAutolinkRules(linkPatternRules ?? [])
-  }
+  // Operator link rules (dashboard.link_patterns) are registered into the
+  // autolink registry by the app shell (useConfigAutolinkRules), so every
+  // surface linkifies regardless of whether a chat page has rendered. This
+  // controller reads the same ['dashboardConfig'] query only for source hosts.
   // Read through refs by callbacks that must stay identity-stable (they are
   // handed to the sidebar, which re-renders every session row).
   const sourceHostsRef = useRef(sourceHosts)
@@ -624,6 +612,22 @@ export function useChatPageResourcesController({
     return () => window.removeEventListener(PREVIEW_SNIP_EVENT, onSnip)
   }, [snipSlotRef, activeSlotRef, takeScreenshot, setSnipFrame])
 
+  // EVERY live upload's controller, not one slot. The disabled attach button is
+  // not the only entry point: paste (ChatInput's paste handler), a drop and a
+  // Sketch insert all reach `uploadFiles` with no `uploading` gate, so two
+  // requests genuinely can be in flight and a single slot would leave the
+  // first one running with nothing holding its controller.
+  const uploadAbortsRef = useRef(new Set<AbortController>())
+  // Whether there is an upload to cancel, as STATE rather than a read of
+  // `uploading`. That flag is SHARED with takeScreenshot, so gating the control
+  // on it would offer a cancel during a macOS `screencapture -i` with no
+  // request behind it, and pressing it would abort nothing.
+  const [uploadCancellable, setUploadCancellable] = useState(false)
+  /** Abort every composer upload in flight. */
+  const cancelUpload = useCallback(() => {
+    uploadAbortsRef.current.forEach(controller => controller.abort())
+  }, [])
+
   /** Upload files via browser File API (cross-platform) */
   const uploadFiles = useCallback(async (files: File[], targetSlot?: string | null) => {
     if (!files.length) return
@@ -642,8 +646,11 @@ export function useChatPageResourcesController({
     const big = files.find(f => !VIDEO_EXT.test(f.name) && f.size > 50 * 1024 * 1024)
     if (big) { setUploadHint(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
     setUploading(true)
+    const controller = new AbortController()
+    uploadAbortsRef.current.add(controller)
+    setUploadCancellable(true)
     try {
-      const res = await api.uploadFiles(files)
+      const res = await api.uploadFiles(files, controller.signal)
       if (res.error) {
         setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: res.error }))
       } else if (res.paths?.length) {
@@ -659,8 +666,23 @@ export function useChatPageResourcesController({
       if (!res.error && res.resizedByPath && Object.keys(res.resizedByPath).length) {
         setResizedInfo(prev => ({ ...prev, ...res.resizedByPath }))
       }
-    } catch { setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb')) }
-    setUploading(false)
+    } catch (err) {
+      // A cancel the user asked for is not a failure. Without this branch the
+      // blanket message blames file type and a 50 MB cap for a 150 MB
+      // recording the user deliberately stopped.
+      if ((err as Error | undefined)?.name !== 'AbortError') {
+        setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb'))
+      }
+    } finally {
+      // Drop only THIS request's controller, and keep the control offered while
+      // a sibling upload is still running.
+      uploadAbortsRef.current.delete(controller)
+      setUploadCancellable(uploadAbortsRef.current.size > 0)
+      // Unchanged from main, and still wrong for concurrent uploads: the first
+      // request to settle clears the shared flag while a sibling runs. Left
+      // alone deliberately -- the cancel control reads the set above, not this.
+      setUploading(false)
+    }
   }, [activeSlotRef, setUploadError, setUploadHint, setUploading, setPendingFiles, fileDrafts, saveDrafts, setResizedInfo])
 
   // The Browser panel's element annotations arrive as a DRAFT plus a marker
@@ -760,6 +782,8 @@ export function useChatPageResourcesController({
     handleFileSave,
     handleCapture,
     uploadFiles,
+    cancelUpload,
+    uploadCancellable,
     handleOptimizeResult,
     dragOver,
     dropTargetProps,

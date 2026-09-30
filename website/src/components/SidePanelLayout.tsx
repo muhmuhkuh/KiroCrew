@@ -12,10 +12,15 @@ import { useTerminalPoppedOut } from '../utils/terminalPopout'
 import { safeGetSessionItem, safeSetSessionItem } from '../utils/safeStorage'
 
 import { i18nT } from '../i18n/t'
+import { Glass } from './Glass'
 export interface SidePanelTab {
   key: string
   label: string
   icon: React.ReactNode
+  /** Background of a coloured rounded tile drawn behind `icon` (a `--tile-*`
+   *  token), the way System Settings marks each section. Omitted: the bare icon
+   *  in `--muted`, as every other host of this layout renders it. */
+  tile?: string
   description?: string
   /** Presence dot after the label (e.g. About while an update is available). */
   dot?: boolean
@@ -61,8 +66,16 @@ interface SidePanelLayoutProps {
    *  Capabilities' Restart), which must stay reachable inside a tab.
    *  'bottom-float' renders it ONLY on the root list, inside the iOS-26-style
    *  floating glass capsule — right for a search field whose results
-   *  deep-link anywhere (Settings opts in). Desktop ignores this. */
+   *  deep-link anywhere (Settings opts in). On desktop 'bottom-float' renders
+   *  NOTHING in the header; a desktop consumer that still wants the control
+   *  supplies it through `navTop` (the sidebar-top slot) instead. */
   headerRightDock?: 'header' | 'bottom-float'
+  /** Desktop-only slot pinned at the TOP of the sidebar rail — under the title,
+   *  above the tab list — and STAYS put while the tab list scrolls beneath it.
+   *  Settings puts its search here; the mobile equivalent is the bottom-float
+   *  capsule (`headerRight` + `headerRightDock="bottom-float"`). Consumers that
+   *  omit it get the unchanged rail. */
+  navTop?: React.ReactNode
   /** When true, content area uses overflow-hidden + flex layout for Virtuoso/fixed-height children */
   fixedContent?: boolean
   /** Opt-in path-based navigation: the active tab reads from the first path
@@ -87,8 +100,9 @@ interface SidePanelLayoutProps {
  *  mobile root list's iOS-26-style floating bottom capsule: the control should
  *  render full-width, chrome-less (the capsule owns the border/blur), and open
  *  any dropdown UPWARD — at the bottom of the screen a downward panel is
- *  off-screen. */
-export const SidePanelDockContext = React.createContext<'header' | 'bottom-float'>('header')
+ *  off-screen. 'nav' is the desktop sidebar-top slot (`navTop`): full-width,
+ *  boxed, dropdown opening DOWNWARD within the rail. */
+export const SidePanelDockContext = React.createContext<'header' | 'bottom-float' | 'nav'>('header')
 
 /** A mounted pane's answer to "may I leave you?". `true` allows the switch,
  *  `false` keeps the pane exactly where it is. */
@@ -150,7 +164,7 @@ export function useSidePanelLeaveGuard(guard: SidePanelLeaveGuard, atStake = fal
 
 const TAB_MEMORY_PREFIX = 'kirocrew:sidepanel-tab:'
 
-export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, footer, headerRight, headerRightDock = 'header', paneOwnsHeader = false, fixedContent, basePath, children }: SidePanelLayoutProps) {
+export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, footer, headerRight, headerRightDock = 'header', navTop, paneOwnsHeader = false, fixedContent, basePath, children }: SidePanelLayoutProps) {
   const [params, setParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
@@ -449,7 +463,9 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                     className={`flex items-center gap-2.5 w-full px-2.5 py-2.5 ${COARSE_TOUCH_TARGET} rounded-md text-[14px] text-left font-medium cursor-pointer border-none bg-transparent text-text transition-colors hover:bg-bg-hover`}
                     onClick={() => setTab(t.key)}
                   >
-                    <span className="w-5 h-5 shrink-0 flex items-center justify-center text-muted">{t.icon}</span>
+                    {t.tile
+                      ? <span className="w-[30px] h-[30px] shrink-0 flex items-center justify-center rounded-[8px] text-[color:var(--tile-fg)] [&_svg]:w-4 [&_svg]:h-4" style={{ background: t.tile }}>{t.icon}</span>
+                      : <span className="w-5 h-5 shrink-0 flex items-center justify-center text-muted">{t.icon}</span>}
                     <span className="flex-1 min-w-0 truncate">{t.label}</span>
                     {t.dot && <span className="w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={i18nT('components.sidePanelLayout.update_available')} />}
                     <ChevronRight size={15} className="text-muted-strong shrink-0" />
@@ -484,11 +500,15 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
               // occludes the visual viewport.
               style={keyboardInset > 0 ? { transform: `translateY(-${keyboardInset}px)` } : undefined}
             >
-              <div className="pointer-events-auto mx-auto max-w-sm rounded-full border border-border shadow-lg backdrop-blur-xl bg-[color-mix(in_srgb,var(--bg-elevated)_92%,transparent)]">
+              {/* Liquid Glass capsule: the shared recipe (components/Glass.tsx) with the
+                * neutral rest shadow. Nothing changes on focus: the material never
+                * lights up, steps or deepens (maintainer decision); the caret in the
+                * search field is the focus indicator. */}
+              <Glass radius={24} className="glass-shadow pointer-events-auto mx-auto max-w-sm">
                 <SidePanelDockContext.Provider value="bottom-float">
                   {headerRight}
                 </SidePanelDockContext.Provider>
-              </div>
+              </Glass>
             </div>
           )}
         </div>
@@ -502,8 +522,19 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
 
   return (
     <div className="flex-1 min-h-0 flex overflow-hidden">
-      {!isMobile && <nav className="w-[200px] shrink-0 border-r border-border bg-bg overflow-y-auto pt-1 pb-3 px-3 flex flex-col gap-0.5">
-          <div className="text-lg font-bold text-text-strong px-2.5 py-2 mb-1">{title}</div>
+      {!isMobile && <nav className="w-[200px] shrink-0 border-r border-border bg-bg pt-1 pb-3 px-3 flex flex-col">
+          <div data-testid="side-panel-nav-title" className="text-sm font-semibold text-muted px-2.5 py-2 mb-1 shrink-0">{title}</div>
+          {/* Pinned sidebar-top slot: stays put while the tab list scrolls. The
+            * dropdown it may open renders full-rail-width and downward (dock
+            * 'nav'), so it never spills past the rail and gets clipped. */}
+          {navTop && (
+            <div className="shrink-0 px-0.5 pb-2">
+              <SidePanelDockContext.Provider value="nav">{navTop}</SidePanelDockContext.Provider>
+            </div>
+          )}
+          {/* Only the tab list scrolls — the title and navTop above and the
+            * footer below stay fixed. */}
+          <div className="flex-1 min-h-0 overflow-y-auto scrollbar-overlay scrollbar-overlay-thin flex flex-col gap-0.5">
           {tabs.map((t, i) => (
             <React.Fragment key={t.key}>
               {t.dividerBefore && <div className="h-px bg-border mx-2.5 my-2" role="separator" />}
@@ -520,15 +551,18 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
                 }`}
                 onClick={() => setTab(t.key)}
               >
-                <span className={`w-4 h-4 shrink-0 flex items-center justify-center ${tab === t.key ? 'text-accent' : 'text-muted'}`}>
-                  {t.icon}
-                </span>
+                {t.tile
+                  ? <span className="w-5 h-5 shrink-0 flex items-center justify-center rounded-[5px] text-[color:var(--tile-fg)] [&_svg]:w-3 [&_svg]:h-3" style={{ background: t.tile }}>{t.icon}</span>
+                  : <span className={`w-4 h-4 shrink-0 flex items-center justify-center ${tab === t.key ? 'text-accent' : 'text-muted'}`}>
+                      {t.icon}
+                    </span>}
                 {t.label}
                 {t.dot && <span className="ml-auto w-2 h-2 bg-accent rounded-full shrink-0" role="status" aria-label={i18nT('components.sidePanelLayout.update_available')} />}
               </button>
             </React.Fragment>
           ))}
-          {footer && <div className="mt-auto pt-3 px-2.5">{footer}</div>}
+          </div>
+          {footer && <div className="shrink-0 pt-3 px-2.5">{footer}</div>}
         </nav>}
 
       <div className={`flex-1 min-w-0 min-h-0 flex flex-col ${fixed ? 'overflow-hidden' : 'overflow-y-auto'}`}>
@@ -538,7 +572,10 @@ export default function SidePanelLayout({ title, tabs, defaultTab, rememberKey, 
             <div className="text-2xl font-bold tracking-tight text-text-strong">{meta?.label || ''}</div>
             {meta?.description && <div className="text-muted text-sm mt-1">{meta.description}</div>}
           </div>
-          {(!isMobile || headerRightDock === 'header') && headerRight}
+          {/* Only the 'header' dock renders here. 'bottom-float' lives in the
+            * mobile capsule and 'nav'-docked content lives in navTop, so a
+            * page using either does NOT also stamp headerRight in this row. */}
+          {headerRightDock === 'header' && headerRight}
         </div>}
         <div data-testid="side-panel-pane" className={`${isMobile ? 'px-4 pt-1' : 'px-6'} ${fixed ? 'flex-1 min-h-0 flex flex-col' : 'flex-1 pb-8'}`}>
           {renderPane()}

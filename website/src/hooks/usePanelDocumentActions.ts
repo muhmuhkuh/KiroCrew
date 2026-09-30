@@ -5,7 +5,7 @@ import { api } from '../api/client'
 import { clearInlineDraft, getInlineDraft, type usePanelTabs } from './usePanelTabs'
 import { i18nT } from '../i18n/t'
 import type { Artifact } from '../types'
-import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS } from '../utils/fileReadQuery'
+import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../utils/fileReadQuery'
 import { errMessage } from '../utils/thunkError'
 import { optsForReplace } from '../pages/chat/replaceGuard'
 
@@ -45,17 +45,23 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
   // placeholder tab; any other failure is REPORTED rather than shown as the
   // file's text. Bypassed entirely when the IntelliJ plugin handles file opens
   // — the user wanted IDE-native, not in-dashboard.
-  const openFile = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean }) => {
+  const openFile = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean; slot?: string | null }) => {
     try { window.dispatchEvent(new CustomEvent('kirocrew-file-open', { detail: { path: filePath } })) } catch { /* ignore */ }
     if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
     // Capture the slot BEFORE awaiting the read — the same discipline as
     // `saveFile`. `tabsCtl` was bound at the click, so the tab lands in the
     // INITIATING slot's bucket; stamping it with whatever slot is active once
     // the read resolves would route its comment submissions to a chat the user
-    // switched to mid-load.
-    const slot = slotRef.current ?? null
+    // switched to mid-load. In split view every pane shares ONE host opener but
+    // has its OWN slot, so a pane passes `opts.slot` to stamp the tab with the
+    // slot that owns the transcript the file was opened FROM, not whichever
+    // pane the host currently treats as active (#9487 / #9921). An `undefined`
+    // override falls back to the ref, keeping the single-chat and member-DM
+    // hosts byte-for-byte unchanged; an explicit `null` is a deliberate
+    // "no slot" and is honoured.
+    const slot = opts?.slot !== undefined ? opts.slot : (slotRef.current ?? null)
     try {
-      const [{ text, ok, status, binary }] = await Promise.all([
+      const [read] = await Promise.all([
         queryClient.fetchQuery({
           queryKey: fileReadQueryKey(filePath),
           // The shared fetch carries the backend's binary verdict with the text
@@ -69,6 +75,7 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
           queryFn: () => api.fileDiff(filePath),
         }),
       ])
+      const { text, ok, status, binary } = read
       if (!ok && status !== 404) {
         // Read failure — nothing in the viewer to lose, so the notice hands off.
         showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: i18nT('pages.chatPage.http_status', { status }) }))
@@ -76,8 +83,11 @@ export function usePanelDocumentActions({ tabsCtl, slotRef, queryClient, showAct
       }
       // A 404 is a real answer about the file (it is not on disk), so the
       // panel shows that placeholder. Any other failure was reported above.
+      // The read's partial verdicts travel with its text: this is the seed
+      // read that fills the tab before any panel mounts, so a verdict left
+      // behind here would be lost to the panel for good.
       const body = ok ? text : i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-      tabsCtl.openFile(filePath, body, slot, { ...optsForReplace(opts), binary: ok && binary })
+      tabsCtl.openFile(filePath, body, slot, { ...optsForReplace(opts), binary: ok && binary, partial: ok && isPartialRead(read) })
       onOpened?.()
     } catch (e) {
       // The read itself threw (network, aborted). Reported above the composer

@@ -13,27 +13,30 @@ build is driven by [`packaging/build-desktop.sh`](../../packaging/build-desktop.
 ## What `make desktop` produces
 
 ```bash
-make desktop               # macOS: ONE universal DMG (arm64 + x86_64) · Linux: AppImage + deb + rpm
-UNIVERSAL=0 make desktop   # macOS: faster host-arch-only DMG (local iteration)
+make desktop               # macOS: universal DMG + update ZIP · Linux: AppImage + deb + rpm
+UNIVERSAL=0 make desktop   # macOS: faster host-arch-only DMG + ZIP (local iteration)
+UNIVERSAL=0 TARGET_ARCH=x86_64 make desktop   # macOS: single-arch DMG for a NAMED arch (arm64 | x86_64)
 ```
 
 Output lands in **`website/electron/dist/`**:
 
 | Command | Platform | Artifact |
 |---------|----------|----------|
-| `make desktop` | macOS | `KiroCrew-<version>-universal.dmg` |
-| `UNIVERSAL=0 make desktop` | macOS | `KiroCrew-<version>-arm64.dmg` (Apple Silicon host) or `KiroCrew-<version>.dmg` (Intel host) |
+| `make desktop` | macOS | `KiroCrew-<version>-universal.dmg` plus `KiroCrew-<version>-universal-mac.zip` |
+| `UNIVERSAL=0 make desktop` | macOS | Host-arch DMG plus the matching `*-mac.zip` update archive |
+| `UNIVERSAL=0 TARGET_ARCH=<arch> make desktop` | macOS | `KiroCrew-<version>-arm64.dmg` / `KiroCrew-<version>-x64.dmg` plus `KiroCrew-<version>-<arch>-mac.zip` — the arch is always spelled, x64 included |
 | `make desktop` | Linux | `KiroCrew-*.AppImage`, `*.deb`, `*.rpm` (host arch) |
 
 The electron-builder configuration lives in
 [`website/electron/package.json`](../../website/electron/package.json):
 
-- **appId:** `dev.kirocrew.desktop`
+- **appId:** `com.amazon.kiro.crew`
 - **productName:** `KiroCrew`
 - macOS display name: `Kiro Crew` via `CFBundleDisplayName`; `CFBundleName`
   remains aligned with `productName` because Electron uses it to locate the
   `KiroCrew Helper` app bundles during startup
-- mac target: `dmg` (category `public.app-category.developer-tools`). The DMG
+- mac targets: `dmg` and `zip` (category
+  `public.app-category.developer-tools`). The DMG
   uses a 660×420 logical-size branded drag-to-Applications background, packaged
   as a multi-resolution TIFF with 660×420 (1×) and 1320×840 (2×) representations
   for Retina displays. The background is a flat light purple carrying the opening
@@ -67,14 +70,132 @@ The electron-builder configuration lives in
   `rpm.depends` needs no such thing but uses entirely different names
   (`gtk3`, `nss`, `alsa-lib`). Both lists are verified against a real
   `apt-get install` / `dnf` resolution by `scripts/smoke-linux-packages.sh`.
+- `build.files` is an explicit per-file allowlist, not a glob: electron-builder
+  packs exactly those paths into `app.asar` at the same relative location, plus
+  `package.json` and the production `node_modules`. The four lifecycle facades
+  (`gateway-supervisor.js`, `window-lifecycle.js`, `auto-update.js`,
+  `crash-collector.js`) sit beside `main.js`, and the owners they compose sit
+  under `runtime/gateway/`, `runtime/window/`, `runtime/update/` and
+  `runtime/crash/`, each listed one by one. The packaging closure is the set of
+  files reachable from `main.js` through double-quoted relative `require()`s.
+  `website/electron/test/shell-contract.test.js` checks every shipped source's
+  relative requires against the allowlist and every stale entry, and
+  `website/electron/test/packaging.test.js` walks the closure from `main.js`
+  and fails on a single-quoted or template-literal relative require, which
+  those scans cannot read, or on a runtime owner no facade composes.
+  Runtime owners resolve no path from their own directory; the Electron directory
+  (`loading.html`, `preload.js`, the icons, the baked `EXTERNALLY-MANAGED`
+  marker) is always the facade's. Which facade owns which module is mapped in
+  [`website/electron/README.md`](../../website/electron/README.md#main-process-owners).
 
 ### macOS default — one universal DMG for both arches
 
-On macOS, `make desktop` produces a single `KiroCrew-<version>-universal.dmg`
-running **natively** on both Apple Silicon and Intel Macs. It needs only
+On macOS, `make desktop` produces a `KiroCrew-<version>-universal.dmg` for
+first install and a matching `KiroCrew-<version>-universal-mac.zip` for the
+update/signing handoff. Both run **natively** on Apple Silicon and Intel Macs.
+It needs only
 **one Apple-Silicon machine** — no Intel host, no second build. (It requires
 an Apple-Silicon host with Rosetta 2; the script fails fast with instructions
 otherwise, and `UNIVERSAL=0` is the opt-out.)
+
+### Bundled kiro-cli — the app carries its own agent runtime
+
+By default (`BUNDLE_KIRO_CLI=1`), the build stages a pinned, sha256-verified
+kiro-cli into the app's resources at `backend-dist/kiro-cli/`. On macOS and
+Linux, the staged payload is the single `kiro-cli-chat` binary, not upstream's
+layout: the `kiro-cli` launcher resolves `kiro-cli-chat` through `$HOME/.local/bin` and
+`PATH` and never through its own directory, so a bundle entered through the
+launcher would silently run whatever copy the user has installed (or fail on a
+clean machine) while still answering `--version` and `whoami` itself.
+`kiro-cli-chat` is the process every session is anyway and carries every
+subcommand the app uses. The Windows build administratively extracts the
+upstream MSI without installing it or writing PATH/registry state, then stages
+its one self-contained `kiro-cli.exe`; `kiro_cli.bundled_kiro_cli_entry` owns
+the platform split. The release is pinned in two files that travel together:
+`packaging/kiro-cli-version`
+names the version and `packaging/kiro-cli-sha256` holds the sha256 of each
+artifact the build stages (the universal macOS DMG, the two Linux gnu zips, and
+the Windows x64 MSI) in
+`sha256sum` format keyed by the artifact's release path, `<version>/<file>`.
+Upstream hosts every release under that prefix but publishes a manifest — the
+only document naming sha256s — for `latest` alone, so a pinned build fetches the
+pinned version's own artifact URL and verifies it against the committed sha: it
+never reads the mutable manifest, a hotfix rebuild of an older tag keeps working
+after upstream releases, and a version bump without matching sha lines fails
+closed with the bump procedure in the error. `build-desktop.yml` passes the pin
+explicitly so the lane log names the release it bundled; `KIRO_CLI_VERSION=latest`
+resolves the manifest instead and takes the version and sha it names, for a local
+build that wants the newest release (still sha256-verified). Bumping both files,
+after testing the app against the new release, is the whole procedure for
+shipping a newer kiro-cli ([release](release.md), step 1). On macOS the binary is
+extracted from the universal `Kiro CLI.dmg` (one Mach-O serves both arches; the
+DMG download is ~360 MB for kiro-cli 2.24); Linux uses the matching per-arch zip
+(~160 MB); Windows uses the x64 MSI (~190 MB). Downloads are cached per user
+under `~/.cache/kirocrew-build/kiro-cli`,
+so a rebuild against the same pin fetches nothing. A `BUNDLED-VERSION` file
+beside the payload records provenance; a clean-room smoke — empty `HOME`, minimal
+`PATH`, so no install on the build host can answer for the staged binary — runs
+`--version` and then one ACP `initialize` round trip over stdio, the call every
+Kiro Crew session opens with, so the lane log on each platform proves the lone
+binary is self-contained there before it is sealed into the app; and a layout
+gate refuses a payload that carries a nested `.app`/`.framework` under
+`Resources/`, which the signing manifest cannot seal per file.
+
+At runtime the Electron shell (`gateway-env.js`, `bundledKiroCliEnvironment`)
+exports the directory as `KIROCREW_BUNDLED_KIRO_DIR` when it spawns the
+gateway, and only when the directory shipped; the backend resolver
+(`kiro_cli.known_kiro_cli_dirs`) ranks it **above** any system install (the app
+was built against that exact version) but **below** the `KIROCREW_KIRO_BIN`
+operator override. That override is the escape when the pinned release must be
+swapped without waiting for an app update, and a Finder- or Dock-launched app
+does not read the user's shell profile, so it is set the way
+[macos-troubleshooting](../guides/macos-troubleshooting.md) sets `PATH` for the
+app: `launchctl setenv KIROCREW_KIRO_BIN /absolute/path/to/kiro-cli`, then
+relaunch the app (the Electron shell spawns the gateway with its own
+environment, `main.js`, so a launchd-session variable reaches the resolver); on
+Linux the equivalent is `systemctl --user set-environment` for a
+desktop-session launcher. The same ranking feeds the pinned off-`PATH` spawns
+(`pin_kiro_cli`), so the version check, the readiness probe and every ACP
+session all run the bundled copy. The shell hands the directory over only after
+the staged entry has answered `--version` on the user's machine (one bounded
+`spawnSync` in `gateway-env.js`): a copy that is present but does not run there
+-- a glibc below the binary's floor, a quarantine flag, a truncated payload --
+is logged and NOT exported, so discovery falls through to the user's own
+kiro-cli exactly as an unbundled build does instead of every session failing
+on a binary the user never chose. Beside the directory, the shell sets
+`KIRO_NO_AUTO_UPDATE=1` once for the whole gateway process tree, so every child
+that runs the bundled copy — ACP sessions, the model listing, `whoami`, the
+usage scrape, `kirocrew doctor`, the readiness probes — inherits kiro-cli's
+documented switch for its startup update check by construction, rather than
+each spawn site remembering to merge it. Upstream compiles that check for
+Windows (the upstream chat-cli crate's `cli/mod.rs` at v2.24.0 gates the
+whole block on `target_os = "windows"`; upstream's auto-update guide documents
+the variable), so it stops the bundled Windows copy from self-updating. It also
+guards upstream's stated "FUTURE: re-enable for all platforms", which would
+otherwise write into the signed, sealed bundle. Accepted side effect: a system
+kiro-cli an operator forces through `KIROCREW_KIRO_BIN` also skips the check
+while running as a child of the app (its own terminal use is unaffected), and
+the user's `app.disableAutoupdates` setting is never written. The setup gate
+serves the copy's quoted absolute path as the click-to-copy sign-in command (it
+is not on the user's shell `PATH`) with a one-line hint that the path is the
+app's built-in kiro-cli (`bundled_cli` in the status payload). On Windows that
+command also sets `KIRO_NO_AUTO_UPDATE` for itself (`Set-Item Env:…` inside the
+`powershell.exe -Command` string, which an interactive PowerShell would
+interpolate away if it were `$env:`): the user's terminal is outside the
+gateway tree, and it is the Windows copy that compiles the self-update. The
+gate refuses the
+in-place **Update** (and the gateway auto-update's `kiro-cli update`
+step, and `kirocrew update`'s) because the copy is replaced by the next app
+update. `kiro-cli login` is still the user's own step — bundling covers the
+binary, never the credential. The Windows install smoke (`scripts/smoke-windows-install.ps1`) then checks the INSTALLED tree: the staged `kiro-cli.exe` runs from where the installer put it and reports the pinned version, and the installed `kirocrew doctor` resolves that copy when `KIROCREW_BUNDLED_KIRO_DIR` names its directory. The macOS install smoke (`scripts/smoke-macos-install.sh`, job `smoke-install-macos` in `build-desktop.yml`) mounts the unsigned DMG, copies the app out, runs the installed launcher and the installed `kiro-cli-chat`, then launches the REAL app and reads the gateway child's environment back: `KIROCREW_BUNDLED_KIRO_DIR` and `KIRO_NO_AUTO_UPDATE=1` present, no probe fall-through line in `gateway-launch.log`, and the installed doctor resolving the bundled copy. That launch is the only place the shell's hand-off runs against a shipped bundle.
+
+The payload adds one Mach-O of a few hundred MB to the macOS signing zip (about
+1 GB in total), which is what `packaging/signing/sign.sh`'s poll window is sized
+for.
+
+`BUNDLE_KIRO_CLI=0 make desktop` opts a build out (the payload is large);
+the app then detects a system kiro-cli exactly as before. The Windows installer
+grows by about 190 MB before outer installer compression.
 
 ### macOS opt-out and Linux — host-arch-only builds
 
@@ -88,10 +209,25 @@ an Intel Mac where the universal build cannot run. Per-arch targets:
 
 | Target | Build host | Produces |
 |--------|-----------|----------|
-| macOS arm64 (Apple Silicon) | Apple Silicon Mac (`UNIVERSAL=0`) | arm64 `.dmg` |
-| macOS x86_64 (Intel) | Intel Mac | x86_64 `.dmg` |
+| macOS arm64 (Apple Silicon) | Apple Silicon Mac (`UNIVERSAL=0`) | arm64 `.dmg` + matching `*-mac.zip` |
+| macOS x86_64 (Intel) | Intel Mac, **or** an Apple Silicon Mac with Rosetta 2 (`UNIVERSAL=0 TARGET_ARCH=x86_64`) | x86_64 `.dmg` + matching `*-mac.zip` |
 | Linux x86_64 | x86_64 Linux | x86_64 `.AppImage`, `.deb`, `.rpm` |
 | Linux aarch64 (Graviton/ARM) | aarch64 Linux | aarch64 `.AppImage`, `.deb`, `.rpm` |
+
+**Naming an arch instead of taking the host's.** `TARGET_ARCH=arm64|x86_64`
+(macOS, `UNIVERSAL=0` only) makes a single-arch build *for* that arch: the
+script provisions that arch's python-build-standalone interpreter (x86_64
+runs under Rosetta 2 on Apple Silicon, exactly as the universal build's
+x86_64 half does), arch-gates the bundled backend with `file`, passes
+`--arm64` / `--x64` to electron-builder, and post-gates the shell binary with
+`lipo -archs` so a host-arch shell can never land in an x86_64-labelled DMG.
+The artifact always spells its arch (`-arm64` / `-x64`), including for x64,
+where electron-builder's default pattern would otherwise drop it; the ZIP
+keeps electron-builder's `-mac.zip` suffix. `scripts/emit-symbols-manifest.mjs`
+reads the same variable so the symbols pin records the arch actually built.
+`TARGET_ARCH=arm64` needs an Apple Silicon host (an Intel Mac cannot run the
+arm64 backend it would have to gate); any other value, any use outside
+macOS, or setting it while `UNIVERSAL=1` is in effect, is refused.
 
 **Both Linux architectures ship.** `build-desktop.yml` builds them on
 `ubuntu-22.04` and `ubuntu-22.04-arm`, and `publish-linux.yml` runs once per
@@ -124,6 +260,9 @@ Two properties are load-bearing and worth knowing before you touch that lane:
   than assuming it equals the runner's glibc. The AppImage links against
   it, which is why both Linux legs stay on 22.04 (glibc 2.35) rather than moving
   to 24.04 (2.39) — the newer floor would exclude AL2023, Debian 12 and RHEL 9.
+  The bundled kiro-cli 2.24.0 stays inside that floor: `kiro-cli-chat` requires
+  `GLIBC_2.34` on x86_64 and `GLIBC_2.30` on aarch64, so it does not narrow the
+  supported distro set. Re-measure both pinned zips when updating the CLI pin.
 
 **Building your own package locally.** `make desktop` needs no arch flags: it
 detects the host and emits an AppImage for it, so running it on an ARM box
@@ -135,6 +274,41 @@ it builds the full matrix and uploads artifacts, with no publish lane attached.
 
 Anything you **distribute** for macOS should be the universal DMG — the
 host-arch build is a local-machine artifact.
+
+**Single-arch macOS DMGs in CI (opt-in).** `build-desktop.yml` has a second
+macOS job, `build-desktop-mac-single-arch`, behind the boolean input
+`mac_single_arch` (default `false`; `nightly.yml` and `release.yml` both pass
+`true`). When on, it runs the script twice on `macos-15` —
+`UNIVERSAL=0 TARGET_ARCH=arm64` and
+`UNIVERSAL=0 TARGET_ARCH=x86_64` — and uploads `unsigned-build-darwin-arm64`
+and `unsigned-build-darwin-x64` beside `unsigned-build-darwin-universal`. The
+job is `continue-on-error` only when the caller passes
+`soft_fail_mac_single_arch: true`, which `nightly.yml` does (a failed
+single-arch build never holds the universal signing or the Linux publishers
+there). `release.yml` keeps the default: both DMGs are required promotion-bundle
+roles, so a failed build fails the aggregate before any publisher writes a key.
+
+On nightly and on both release channels each single-arch artifact is then
+signed, notarized and published by its own call of `sign-and-notarize.yml`
+(`mac_variant: arm64 | x64` plus
+`mac_artifact`), which suffixes every shared name with the arch: signing-bucket
+keys, `desktop/<channel>/<version>/KiroCrew-<arch>.{zip,dmg}`, the alias
+`desktop/<channel>/latest/KiroCrew-<arch>.dmg`, and the channel file at
+`feed/<channel>/<arch>/latest-mac.yml`. The universal call passes neither input
+and still excludes the single-arch artifact names when it flattens the run, so
+its keys and `feed/<channel>/latest-mac.yml` are byte-identical to before. A
+single-arch app knows which feed to follow from `desktopDistArch` in its own
+`package.json` (`-c.extraMetadata.desktopDistArch=<arch>`, stamped by the
+script on `TARGET_ARCH` builds only): `auto-update.js` resolves that directory
+as the feed `variant` and offers `KiroCrew-<arch>.dmg` as the reinstall link;
+the universal app carries no stamp and keeps the channel root. On `release.yml`
+the two single-arch callers are required lanes: the stable promotion bundle
+carries all three zip/DMG pairs (the single-arch zip travels as
+`notarized-<arch>.zip` so the flat bundle can hold it beside the universal
+`notarized.zip`), a byte promotion republishes all three, and the GitHub
+Release page lists `KiroCrew-<v>-{universal,arm64,x64}.dmg`. To get the two
+DMGs unsigned from any ref, dispatch `build-desktop.yml` manually with the box
+ticked, or pick them up from the nightly run.
 
 Prerequisite: **Rosetta 2** on the build machine
 (`softwareupdate --install-rosetta --agree-to-license`) — the x86_64 PBS
@@ -207,7 +381,7 @@ hdiutil detach "/Volumes/KiroCrew $V-universal"
 post-gates, plus a resolver-agreement gate asserting `find-bin.js` resolves
 the arch-suffixed launcher.)
 
-**CI:** the `macos-14` (Apple Silicon) entry in `build-desktop.yml` runs
+**CI:** the `macos-15` (Apple Silicon) entry in `build-desktop.yml` runs
 `make desktop` (universal by default on macOS — GitHub's arm64 macOS runners
 include Rosetta 2)
 and uploads a single `unsigned-build-darwin-universal` artifact. Everything
@@ -264,7 +438,7 @@ pipeline end-to-end:
 3. pip-install kiro_crew + deps into the bundled interpreter
 4. Stage the dashboard into the package's static dir
 5. Prune caches/tests/unused stdlib to shrink bundle
-6. Package with electron-builder                      → website/electron/dist/ (DMG / AppImage / NSIS)
+6. Package with electron-builder                      → website/electron/dist/ (DMG/ZIP, AppImage/deb/rpm, or NSIS)
 ```
 
 On macOS (universal by default) the pipeline repeats steps 2–5 once per
@@ -310,6 +484,7 @@ The script honors these environment flags:
 | Flag | Effect |
 |------|--------|
 | `UNIVERSAL=0` | macOS: opt out of the universal default — host-arch-only build (faster local iteration; the only option on an Intel Mac). Universal (`UNIVERSAL=1`) is the macOS default; Linux is always host-arch |
+| `TARGET_ARCH=arm64` / `TARGET_ARCH=x86_64` | macOS, with `UNIVERSAL=0`: build the single-arch app for the NAMED arch rather than the host's (x86_64 on Apple Silicon runs under Rosetta 2). Arch-gates the backend and the shell; the artifact always carries `-arm64` / `-x64`. Refused outside macOS or with any other value |
 | `SKIP_FRONTEND=1` | Reuse an already-built `website/dist` |
 | `SKIP_ELECTRON=1` | Stop after the bundled backend (no electron-builder) |
 
@@ -325,13 +500,20 @@ same way). Key details:
 - **Interpreter** is a python-build-standalone CPython 3.12 with `@executable_path`-
   relative dylib references (genuinely portable, no system Python dependency).
 - **Entry point** is `bin/kirocrew` — a shell script that execs
-  `bin/python3.12 -s -m kiro_crew "$@"`.
+  `bin/python3.12 -s -P -m kiro_crew "$@"`. `-s` drops the user site; `-P`
+  keeps the caller's working directory off `sys.path`, so a stdlib-named
+  directory there (`~/concurrent/`, `~/json/`) cannot shadow the bundled
+  standard library. The Windows `bin\kirocrew.cmd` shim, the Electron
+  supervisor's direct `python.exe` spawn, and the CI replicas of both
+  (`.github/workflows/build.yml`'s shim, the installer test's gateway spawn)
+  pass the same two flags; `test/test_stdlib_shadow.py` pins every spelling.
 - **Stdlib probes verified** — `stdlib_probe_gate` fails the build if any package
   the launcher's readiness check probes is missing from the pruned tree, so a
   drifted probe list breaks the build instead of every user's launch (see
   [How the app finds and launches the backend](#how-the-app-finds-and-launches-the-backend)).
 - **Self-containment verified** — the build script runs
-  `PYTHONNOUSERSITE=1 bin/python3.12 -m kiro_crew --version` followed by
+  `PYTHONNOUSERSITE=1 bin/python3.12 -s -P -m kiro_crew --version` (the
+  launcher's exact argv) followed by
   `PYTHONNOUSERSITE=1 bin/python3.12 -c 'import kiro_crew.cli'` to catch any
   missing dependency before packaging. Bare `--version` is a pre-dispatch
   fast-path (see `docs/system-specs/modules/cli.md`), so the import probe is
@@ -362,8 +544,17 @@ When the app starts, [`main.js`](../../website/electron/main.js) composes the
 desktop lifecycle and delegates gateway ownership to
 [`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js). The
 supervisor first checks whether a gateway is already running. An existing
-gateway—including a local SSH forward to a remote gateway—is reused. Otherwise
-it locates the backend binary via
+gateway, including a local SSH forward to a remote gateway, is reused. Before
+reusing a same-family local gateway on a fixed-path POSIX install, the shell
+checks whether its sole listener is running from this app's current bundled
+backend path. If that bundled gateway reports an older version than the app,
+the shell warns that updated features may be unavailable and offers Continue or
+Quit. The warning explains how to stop the old gateway before reopening the
+app; it adds service guidance only when the listener is service-classified.
+Unknown owners, remote tunnels, separate CLI installs, same or newer versions,
+Windows, and moved AppImages keep the existing reuse behavior. The shell does
+not restart or force-stop a stale gateway automatically. Otherwise it locates
+the backend binary via
 [`find-bin.js`](../../website/electron/find-bin.js), spawns it as `kirocrew
 gateway --no-open`, polls `/api/status`, and loads the dashboard once it is
 healthy.
@@ -392,9 +583,24 @@ interpreter then dies on `from urllib.parse import …` reached through
 check probes stdlib packages spread across the alphabet — via each one's
 `__init__.py`, since an extractor creates a directory before filling it and a
 top-level `.py` file lands with the early batch — and, when any are missing,
-reports "still being installed" through the normal gateway-failure dialog, whose
-**Retry** succeeds once extraction completes. It stays silent for the legacy
-flat layout, which carries no interpreter tree to verify.
+reports "still being installed" through the normal gateway-failure dialog. It
+stays silent for the legacy flat layout, which carries no interpreter tree to
+verify.
+
+That dialog does not wait for a click. While it is open it re-runs the same
+refusal predicate (`launchBlockingBundleParts`, shared with the launcher so the
+probe can never be laxer than the refusal) every five seconds, repaints the
+remaining-component count in place, and — once every part is on disk — shows
+"Installation finished", lingers briefly, and fires its own **Retry**. That is
+the very action the button fires, resolved through the same window-closed
+handshake, so it re-enters `startGateway()` exactly once by the ordinary path
+and introduces no second respawn owner beside `recoverWedgedGateway` or the
+liveness monitor. A click always wins over the probe, and the probe stands down
+when an update install is dispatched (the updater stops the gateway on purpose)
+or the app is quitting. Only the pre-spawn refusal arms it; the reclassified
+crash below keeps the manual **Retry**, because there the probe cannot see what
+is missing and a permanently truncated bundle would otherwise respawn and crash
+on every tick.
 
 That pre-spawn check cannot be complete, and does not pretend to be: extraction
 order *within* a package is not the app's to control, so `import zoneinfo` can
@@ -458,8 +664,10 @@ so a `node`-less build environment still produces a bundle (unvalidated).
 The gateway-hosted dashboard then checks both prerequisites needed by the ACP
 provider:
 
-1. It discovers `kiro-cli` in the inherited `PATH`, `~/.local/bin`,
-   `~/.cargo/bin`, Homebrew locations, or the macOS `Kiro CLI.app` bundle.
+1. It discovers the app's own bundled copy — `kiro-cli-chat` in
+   `KIROCREW_BUNDLED_KIRO_DIR`, when built with one — then `kiro-cli` on the inherited
+   `PATH`, `~/.local/bin`, `~/.cargo/bin`, Homebrew locations, or the macOS
+   `Kiro CLI.app` bundle.
 2. It verifies the first candidate selected by the shared ACP resolver with
    `kiro-cli --version`. A broken or untrusted higher-priority candidate blocks
    readiness instead of approving a later binary that ACP would not launch.
@@ -509,9 +717,9 @@ closes the popup and collapses the labels back to the hamburger. The menu surfac
 uses the dashboard theme because native Windows popups capture window input and
 cannot support hover switching; a narrow IPC bridge keeps command execution and
 standard Electron roles in the main process.
-When a remote instance is connected, the instance switcher shares the same bounded
-left region as the menu: it is a single trigger naming the instance on screen (see
-InstanceTabBar's SwitcherMenu), not a row of per-instance tabs, so it costs constant
+When a remote crew is connected, the instance switcher shares the same bounded
+left region as the menu: it is a single trigger naming the crew on screen (see
+InstanceTabBar's SwitcherMenu), not a row of per-crew tabs, so it costs constant
 width whether the menu is collapsed to a hamburger or expanded to full labels.
 The centered command palette yields that region rather than the reverse — the
 correct priority while the menu is open is labels > instance status > an idle
@@ -521,9 +729,58 @@ The command-palette trigger is positioned from the window midpoint rather than
 the remaining flex space, so asymmetric menu and status controls do not shift it.
 Linux retains the window manager's native frame and menu bar.
 
+#### The frameless window-drag band
+
+On every frameless platform (`IS_MAC || IS_WIN || LINUX_FRAMELESS`),
+[`window-lifecycle.js`](../../website/electron/window-lifecycle.js) injects a
+42px `-webkit-app-region: drag` band, `#electron-drag-bar`, as the FIRST child
+of `<body>`, plus a document-wide exemption list marking
+`a, button, input, select, textarea, [role="button"], [tabindex], iframe` as
+`no-drag`. The band spans the full width on macOS and stops short of the caption
+controls elsewhere: 138px from the right on Windows, 108px on frameless Linux.
+That inset is load-bearing rather than cosmetic, because a drag rectangle over
+Close moves the window instead of closing it. `body.mc-focus-mode` collapses the
+band to `0` and `body.mc-focus-mode.mc-focus-chrome` restores it, so the band
+exists exactly when a header does.
+
+Two properties of it are easy to break by accident.
+
+**The band is prepended, and a later rectangle overrides an earlier one.**
+Electron accumulates the window's draggable region from element rectangles,
+unioning the `drag` ones and subtracting the `no-drag` ones in the order the
+renderer reports them, so the last rectangle over a pixel decides. The band goes
+at the front of the body so the app's own exemptions come after it and subtract
+from it; at the end it would re-add the whole strip on top of all of them. Two
+in-tree notes record that ordering from real windows: `.host-drag-strip`
+elements rendered after a remote pane's iframe re-add drag where the iframe's
+blanket `no-drag` took it away (`InstancesViewport`), and a full-width `drag`
+block following a `no-drag` button swallowed that button's lower half in the
+companion panel (`PanelCard`). Chromium contracts none of this, which is why the
+check below is manual.
+
+**The exemption list is document-wide on purpose.** `app-region` is resolved
+geometrically rather than by DOM containment, so a control anywhere in the page
+that merely overlaps the band needs `no-drag` to stay clickable. A list scoped
+to the bar's own subtree could not express that.
+
+Plain text is not exempt, so text under the band is unselectable and shows an
+arrow cursor. That is the deliberate half of the trade, and the failure on the
+other side is a window that cannot be moved. No conversation text is under the
+band in practice: docked, the band covers the top bar;
+in focus mode without chrome it is `0`; with the chrome peeked the transcript
+scroller carries `tabIndex={-1}`
+([`TranscriptScrollShell.tsx`](../../website/src/pages/chat/TranscriptScrollShell.tsx)),
+matches the exemption list, and subtracts its own column from the band. So
+widening the exemption to text, or narrowing the band's reach, would spend
+draggability on text the band does not cover.
+[`shell-contract.test.js`](../../website/electron/test/shell-contract.test.js)
+pins the five parts a change could silently drop: the 42px height, the
+per-platform right inset, the focus-mode collapse, the prepend, and `[tabindex]`
+together with the scroller attribute it keys on.
+
 #### Focus mode: verify these seams after an Electron or Radix bump
 
-Focus mode (hide the shell chrome behind hover) rests on three mechanisms that
+Focus mode (hide the shell chrome behind hover) rests on four mechanisms that
 key on behavior no API contract guarantees, and each fails **silently** — the
 unit tests mock these seams, so a broken one still passes CI and only manual
 macOS testing catches it. Run this short checklist whenever you bump Electron or
@@ -553,6 +810,16 @@ Radix (`website/electron/package.json`, `@radix-ui/*` in `website/package.json`)
    the ARIA a trigger emits (`aria-haspopup` absent, or `aria-expanded="true"`
    emitted by default with nothing open), the header either slides away under the
    open menu or pins permanently from first paint.
+4. **Peek the header, then try to select conversation text in the top 42px, and
+   try to drag the window from that same strip.** Exercises the drag band
+   described above: peeked, it is 42px again, and the transcript scroller's
+   `tabIndex={-1}` is what subtracts it over the conversation. Text there should
+   select with an I-beam cursor, and the peeked header's own empty regions should
+   still move the window. If a bump changes the order in which Chromium reports
+   app-region rectangles, one of those two stops working: either the top strip of
+   the conversation goes dead and shows an arrow cursor, or the header no longer
+   drags. A headless display cannot answer this one, because the region set is
+   resolved by the window rather than by the page.
 
 ### `find-bin.js` — locating the binary
 
@@ -584,6 +851,20 @@ unit-testable without mocking globals.
 
 ### `gateway-supervisor.js` — owning the gateway lifecycle
 
+The supervisor keeps every piece of gateway state in its own closure — the
+child, its ownership classification, the start-failure record, the liveness
+monitor and the update handoff — together with the spawn site, the port
+occupancy and identity decisions, the connect flow and recovery. It composes
+five owners under `runtime/gateway/` and hands each only the host modules and
+state getters it reads: `launch-preflight.js` (which backend binary to run,
+whether the bundle is complete, the project directory, the AppImage sandbox
+advice, the launchd `PATH`, and whether the app can relaunch itself),
+`port-holders.js` (the lsof/ps/netstat probes, trusted Windows gateway
+commands, the incumbent snapshot and exit wait, and force-stop),
+`family-takeover.js` (quitting the other release family's app),
+`token-sources.js` (the local-secret mint and the SSH token fetch), and
+`remote-crew-prompt.js` (the failure dialog's remote-crew form).
+
 - Ensures `KIROCREW_HOME` (default `~/.kiro/crew`, overridable via the
   `KIROCREW_HOME` env var) exists, then spawns the backend with
   `["gateway", "--no-open"]`. If a real pre-move `~/.kirocrew` directory exists,
@@ -592,8 +873,10 @@ unit-testable without mocking globals.
   A clean install never creates the legacy directory.
 - Honors the **`KIROCREW_PORT`** env var for the dashboard port (default `5476`,
   validated to `1–65535`). `BACKEND_URL` / health checks target that port.
-- Sets `KIROCREW_PROJECT_DIR` to the Electron app's parent directory so the
-  bundled `agents/` and `skills/` are discovered.
+- Sets `KIROCREW_PROJECT_DIR` to the packaged tree that contains `agents/` and
+  `skills/`. POSIX builds use the Electron app's parent; Windows probes one and
+  two levels above the Electron sources and takes the first tree carrying both
+  directories.
 - On every desktop platform, pins `PYTHONUTF8=1` and
   `PYTHONIOENCODING=utf-8:backslashreplace` at the Electron-to-Gateway spawn
   boundary. This applies before CPython constructs redirected stdout/stderr and
@@ -602,15 +885,60 @@ unit-testable without mocking globals.
   and stale-asset re-exec, and Electron liveness respawn all use the same UTF-8
   contract instead of falling back to the Windows ANSI code page or an
   incompatible inherited POSIX encoding override.
-- Leaves the inherited child `PATH` unchanged. The gateway prerequisite service
-  probes supported Kiro CLI locations independently — including the Windows
-  per-user install at `%LOCALAPPDATA%\Kiro-Cli` — so desktop launches find
-  user-local installations without mutating the shell environment or requiring
-  the already-running gateway to inherit an installer-updated `PATH`.
+- Leaves the inherited child `PATH` unchanged on Linux and Windows. A
+  GUI-launched macOS app appends only the user launchd domain's additions, after
+  the inherited entries, so an existing resolution cannot be shadowed. The
+  gateway prerequisite service also probes supported Kiro CLI locations
+  independently — including the Windows per-user install at
+  `%LOCALAPPDATA%\Kiro-Cli` — so an already-running gateway does not depend on
+  inheriting an installer-updated `PATH`.
 - [`window-lifecycle.js`](../../website/electron/window-lifecycle.js) hides the
   app to the tray on window close; the composition root delegates quit-time
   gateway teardown to the supervisor, which performs the graceful shutdown and
   signal escalation contract.
+- On macOS, leaving native fullscreen is an asynchronous AppKit transition that
+  can stall: the Space switches back and the real window is re-ordered in, but
+  the full-display snapshot overlay AppKit animates during the exit stays on
+  screen and `leave-full-screen` never fires. The overlay is not one of the
+  shell's windows (no traffic lights, cannot be moved or resized, covers every
+  other app), and hiding the real window underneath it leaves the user with only
+  the overlay. Two guards in the shell handle this:
+  [`hide-to-tray.js`](../../website/electron/hide-to-tray.js) waits for
+  `leave-full-screen` plus a short settle and then hides the **application**;
+  if the event never comes, its backstop takes the same app-level path. In both
+  cases `app.hide()` can order the overlay out together with the real window,
+  whereas `win.hide()` would leave the overlay behind;
+  [`fullscreen-transition-watch.js`](../../website/electron/fullscreen-transition-watch.js)
+  watches every transition from its first `resize` and, when an exit has not
+  completed after four seconds, logs `fullscreen: exit transition did not
+  complete` to `gateway-launch.log` and cycles `app.hide()` / `app.show()`,
+  which clears the overlay and restores the real window at its normal frame.
+  Both terminal fullscreen events are journaled (`fullscreen: entered` /
+  `fullscreen: left`) so a stalled transition is legible after the fact.
+- The same overlay is reachable without any stall, and that route is the common
+  one: AppKit does **not** queue a fullscreen toggle issued while one of its own
+  transitions is animating. It abandons the running transition, leaving that
+  transition's overlay orphaned on screen while every terminal event still
+  arrives normally, so no missing-event detector can see it. Its completion
+  callback is not the all-clear either — measured on macOS 26,
+  `enter-full-screen` lands well before the Space animation ends, and a close
+  issued after it still orphaned an overlay in roughly a third of runs (and the
+  hide itself was swallowed, so the window stayed on screen). The close path
+  therefore gates its exit on **quiet time** rather than on an event:
+  `fullscreen-transition-watch.js` exposes `quietFor()` (milliseconds since the
+  window last moved in fullscreen terms) and `hide-to-tray.js` issues
+  `setFullScreen(false)` only once that clears 700ms, then hides after the usual
+  settle and re-asserts the hide once a second later. Measured on the same
+  harness: 0 orphaned overlays in 20 randomized runs and the window hidden every
+  time, against 7 of 20 and 10 of 20 without the gate. A transition abandoned
+  some other way (a user toggling fullscreen twice inside one animation) is
+  reported as `fullscreen: … transition abandoned` and repaired like a stall,
+  with the unhide suppressed while a close-to-tray hide is pending so the repair
+  never re-surfaces a window the user just dismissed.
+- Because the fullscreen close hides the **application**, every user-intent show
+  path (`showMainWindow`, `activateMainWindow`, and therefore the tray items and
+  the summon hotkey) calls `app.show()` first: a hidden app ignores
+  `win.show()`.
 
 ## Code signing & notarization (macOS)
 
@@ -623,7 +951,7 @@ after right-click → Open or `xattr -dr com.apple.quarantine KiroCrew.app`.)
 
 The build is already wired for this — `website/electron/package.json` enables
 `hardenedRuntime` with `build/entitlements.mac.plist`, and the
-`scripts/notarize.js` afterSign hook notarizes when credentials are present and
+`website/electron/scripts/notarize.js` afterSign hook notarizes when credentials are present and
 silently skips when they aren't. You only supply the secrets at build time via
 env vars (nothing is committed):
 
@@ -930,6 +1258,32 @@ routes the dashboard's update check, badge, and Update button through the
 declared commands, and the gateway then reports no release channel at all.
 The `check_command` runs on every check — the 12-hourly background poll AND
 the manual Check button — so it must be side-effect-free and idempotent.
+If the `apply_command` installs into a new versioned tree and prunes the old one,
+it deletes the interpreter the running gateway was launched from. The gateway then
+has nothing to re-enter, and it says so rather than trying: the restart is refused
+while every session is still answerable, and on the orchestrator path it is
+deferred. Restore the interpreter and the deferred update finishes on its own.
+
+What it will not do is drain first and find out afterwards. That was the old
+failure. It saved, fenced, closed every session and only then found the
+interpreter gone, leaving a gateway alive and serving nobody with no way back
+except a manual relaunch.
+
+Checking early cannot cover every case, though: the target can be replaced
+between the check and the restart, and a present, executable file can still be an
+image this kernel refuses. When that happens the gateway EXITS rather than
+survive. Look for a CRITICAL line naming the target, followed by the process
+ending with status 1. That is deliberate — the sessions are already closed, so a
+surviving process would serve nothing while still holding the port your relaunch
+needs. Repair the install and start the gateway again.
+
+There is no policy key naming a fallback executable to re-enter instead, because
+such a key cannot be validated. A pathname's bytes do not decide what the kernel
+execs: a `#!` wrapper delegates to an interpreter the check never sees, and a
+header that parses can still belong to a truncated binary. Learning the answer
+for certain means exec'ing the candidate, which is either running an arbitrary
+binary or booting a second gateway. The supported recovery is to repair the
+install and let the retry finish, or to relaunch by hand.
 
 ## Remote tunnel mode
 
@@ -937,7 +1291,7 @@ The desktop app can also connect to a gateway running on a **remote** host (e.g.
 an always-on server) over an SSH tunnel, fetching a fresh token via
 `ssh <host> kirocrew token` on each launch instead of starting a local backend.
 See [`website/electron/README.md`](../../website/electron/README.md) and
-[remote-desktop-setup.md](../guides/remote-and-mobile.md) for setup.
+[remote-and-mobile.md](../guides/remote-and-mobile.md) for setup.
 
 ## See also
 

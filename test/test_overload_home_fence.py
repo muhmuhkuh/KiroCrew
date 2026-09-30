@@ -33,6 +33,17 @@ _HOME = os.path.expanduser("~")
 _CREW = os.path.join(_HOME, ".kiro", "crew")
 
 
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """``_build_launcher_script`` asks the HOST's ``ssh -V`` for accept-new support.
+
+    Every launcher-building test here reads the generated mask list; none is about
+    that probe, and a real ssh spawned from the test process is a host dependency
+    the launcher text must not vary with. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+
+
 def _real_paths(scratch: Path | None = None) -> dict[str, str]:
     """The modules' own layout, computed against a scratch home (so the test
     never opens anything under the operator's real crew home) and rebased onto
@@ -170,6 +181,19 @@ class TestPrivateWindowDoesNotCostDelegation:
         mock_detect.assert_not_called()
 
 
+def _outside_any_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the routing as a gateway does: not already inside a Kiro Crew sandbox.
+
+    ``wrap_argv`` passes argv through untouched -- no launcher, no profile, no
+    backend probe -- when the process carries the launcher-only
+    ``KIROCREW_SANDBOX_ACTIVE`` marker, because nested OS sandboxing is impossible
+    by design. A test process spawned by a sandboxed agent inherits that marker,
+    so the routing these tests pin would never be reached. The marker is the one
+    seam that decision reads.
+    """
+    monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
+
+
 class TestThePrivateWindowSurvivesTheRoutingItDependsOn:
     """Two lines carry the scratch window onto a real Linux spawn, and both read
     ZERO tests when deleted.
@@ -183,7 +207,9 @@ class TestThePrivateWindowSurvivesTheRoutingItDependsOn:
     """
 
     @pytest.mark.skipif(os.name == "nt", reason="the namespace backend is Linux")
-    def test_a_window_alone_still_routes_through_the_extra_paths_launcher(self) -> None:
+    def test_a_window_alone_still_routes_through_the_extra_paths_launcher(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A spawn whose ONLY extra path is its own scratch window must still get
         the launcher that carries it. The window is the one restriction that
         arrives on EVERY session spawn, so a condition that ignores it silently
@@ -192,6 +218,7 @@ class TestThePrivateWindowSurvivesTheRoutingItDependsOn:
         import re
         from unittest.mock import MagicMock, patch
 
+        _outside_any_sandbox(monkeypatch)
         own = os.path.join(_CREW, "scratch", "session-aaaa")
         with (
             patch("kiro_crew.sel.sel", return_value=MagicMock()),
@@ -223,7 +250,9 @@ class TestThePrivateWindowSurvivesTheRoutingItDependsOn:
             if cleanup is not None:
                 os.unlink(cleanup)
 
-    def test_a_window_alone_still_reaches_the_seatbelt_profile(self) -> None:
+    def test_a_window_alone_still_reaches_the_seatbelt_profile(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The macOS half of the same routing, so the fix is not one-of-two. The
         `sandbox-exec` branch has the identical condition, and its else-arm calls
         `sandbox_exec_argv` WITHOUT `extra_private_dirs` -- so dropping the window
@@ -231,6 +260,7 @@ class TestThePrivateWindowSurvivesTheRoutingItDependsOn:
         profile is the only fence."""
         from unittest.mock import MagicMock, patch
 
+        _outside_any_sandbox(monkeypatch)
         own = os.path.join(_CREW, "scratch", "session-aaaa")
         seen: dict[str, object] = {}
 

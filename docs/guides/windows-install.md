@@ -1,15 +1,15 @@
 # Installing & Testing Kiro Crew on Windows
 
-Kiro Crew runs **natively on Windows** as a Python **source install**.
-The cross-platform process / signal / file-lock / metrics behavior is routed
-through `kiro_crew.platform_compat`, so macOS + Linux behavior is unchanged and
-the same code path also runs on Windows.
+Kiro Crew runs **natively on Windows** through the desktop installer or a
+supported Python **source install**. The cross-platform process / signal /
+file-lock / metrics behavior is routed through `kiro_crew.platform_compat`, so
+macOS + Linux behavior is unchanged and the same code path also runs on Windows.
 
-Existing Memory V1 members remain usable on native Windows. New members require
-private Memory V2, so creation and explicit V1-to-V2 setup refuse before writing
-private files on a native Windows gateway. Use a WSL/Linux gateway with Crew's
-namespace sandbox and a supported member backend for those operations. Viewing
-and managing an already-owned V2 store remains available from the owner dashboard.
+Existing Memory V1 members remain usable on native Windows. New Crew Members
+automatically receive private Memory V2 stores there as on the other supported
+platforms; provisioning uses owner-only NTFS permissions, and SQLite's native
+file handles provide the Windows protection where POSIX uses a shared store-use
+lock.
 
 ## Desktop installer
 
@@ -141,7 +141,7 @@ Current status:
   still fails immediately and includes the launch-log cause.
   `.github/scripts/test-windows-installer.ps1` starts the just-installed
   bundled interpreter against an isolated data home and requires `/api/ready`
-  within 30 seconds, covering both the packaged caches and the full gateway
+  within 50 seconds, covering both the packaged caches and the full gateway
   handoff. **This runs on every qualifying PR.** `build.yml`'s installer job
   bundles a real python-build-standalone runtime carrying the wheel `build-wheel`
   produced, so the script's gateway leg has an interpreter to start and the job
@@ -188,7 +188,7 @@ The source install below remains the fully supported path.
 | **Git for Windows** | clone the repo | https://git-scm.com/download/win |
 | **kiro-cli** | the default agent backend (ACP); install and sign in separately | https://kiro.dev/cli/ |
 | **Python 3.12-3.13** | the venv runtime. `python_requires` is `>=3.12` and 3.13 is in the supported range, but **3.12 is the tested Windows runtime** (it is what the Windows CI shard runs, and numpy 1.x ships no 3.13 Windows wheel) | https://python.org (install user-scoped), or `winget install Python.Python.3.12` |
-| **Node.js** (optional) | builds the full React dashboard; without it the gateway serves the prebuilt bundle | `winget install OpenJS.NodeJS.LTS` |
+| **Node.js 22.12+** | required by `make.ps1 build` to build and stage the React dashboard; installed desktop/wheel artifacts already contain the bundle | `winget install OpenJS.NodeJS.LTS` |
 
 No admin is required — everything installs user-scoped under `%USERPROFILE%`.
 
@@ -344,9 +344,9 @@ while the other 503s. Concretely:
 | Theme-pack install, detail, assets, overlays, topbars, and removal | works — opened pack files are contained with `GetFinalPathNameByHandleW`; descriptor resolution fails closed instead of trusting a pathname-only check |
 | LLM cron jobs (the `message` kind) | works |
 | Script cron jobs | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) — they run through `wrap_argv`, which permits them on Windows because no backend is installable. With that opt-out declared the job fails with a message naming the setting (it no longer raises an uncaught error) |
-| Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash and performs brace expansion that hides `cat ~/.a{w,w}s/credentials` from the vet. The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
+| Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash. Routing a string vetted for one language through a shell that widens it is the hazard, so the resolver refuses rather than picking a shell. (Brace expansion used to be the example given here; it is now refused at storage time and on every fire, so it is no longer what the refusal rests on — a shell whose language is wider than the one the vet was written against is.) The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
 | Script hooks (Settings → Hooks) | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) (like script crons — the hook command routes through `wrap_argv`, which permits them on Windows because no backend is installable; with that opt-out declared the hook returns that message as its `error`). They run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
-| Pull-request source drawer provider fetch/check/resolve | not yet — and for a different reason than it used to be. The provider-CLI **trust** check now works here (see Issue Radar below), but the drawer does not share Issue Radar's spawn: it keeps its own async, sandbox-routed one (`source_providers._run_json`), which refuses on Windows because no OS sandbox backend exists. So the blocker is the sandbox, not the binary check |
+| Pull-request source drawer provider fetch/check/resolve | not yet — and for a different reason than it used to be. The provider-CLI **trust** check now works here (see Issue Radar below), but the drawer does not share Issue Radar's spawn: it keeps its own async, sandbox-routed one (`source_providers.runner._run_json`), which refuses on Windows because no OS sandbox backend exists. So the blocker is the sandbox, not the binary check |
 | Issue Radar | works — its `gh` spawn is not sandbox-routed, so the trust check is the only gate, and that is answered by reading the binary's Windows ACL (`kiro_crew.windows_acl`) in place of the POSIX `st_uid` + write-bit walk, which reports nothing on this platform. Refused when any principal outside `{you, SYSTEM, Administrators, TrustedInstaller}` can replace the binary or a parent directory, or when the security descriptor is unreadable. An **elevated** gateway (the built-in `Administrator` account, or a "Run as administrator" launch) is not refused for being elevated: Windows has no OS sandbox in this codebase, so the agent's shell already holds the gateway's full token and a refusal would remove the feature without removing any exposure — the same ACL walk applies, keyed on the gateway user's SID. GitHub only on this platform unless `glab` is installed. **If a `gh` you trust is refused**, the override variables (`KIROCREW_ISSUE_RADAR_GH`, `KIROCREW_GH_BIN`) re-enter the same check rather than bypassing it, so the recourse is to install `gh` somewhere only you and the system can write — a per-user `%LOCALAPPDATA%` install is accepted — or to file an issue quoting the refusal, which names the offending principal or the ACE type it could not evaluate |
 | Spec Builder | works, except **Duplicate** — crash-safe copy publication pins a staging directory and uses the platform's atomic no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS). Windows provides neither that native contract nor CPython's directory-descriptor operations, so the backend reports the capability as unavailable and the dashboard omits Duplicate instead of falling back to a check-then-rename race or a junction-prone path write. Approval, per-task runs, labels, archive/restore, chat, and whole-plan execution work normally |
 | Code Review Sage | not yet — the provider-CLI trust check now passes, but its review worker hands the session `python3 sage_lib/…` commands and `python3` is not an interpreter on Windows (the name resolves to the Microsoft Store app-execution alias, or to nothing). It refuses with that reason rather than starting a review that produces no result |
@@ -444,8 +444,8 @@ state, so a read-only filesystem must not take init down.
 > direction is right — the home also holds the security policy, sessions and
 > lessons, all private on the same boundary — but it is wider than memory and it
 > is the only place in the tree that does it today. `memory.py`'s FTS index
-> (`memory_index.db`) and its sidecars carry the same secrets and are **not** yet
-> covered by the per-file pass.
+> (`memory_index.db`) and its sidecars carry the same secrets; `memory.py` runs
+> an owner-only pass on them in `MemoryStore._restrict_index_files`.
 
 ## File locking on Windows
 
@@ -684,13 +684,98 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
   relaunches itself once with software rendering
   (`--in-process-gpu --use-angle=swiftshader`) when the GPU process dies
   before the dashboard has loaded, and keeps that choice for the installed
-  version under `gpuSoftwareFallback` in `%APPDATA%\KiroCrew\config.json`; a
+  version under `gpuSoftwareFallback` in `%APPDATA%\kirocrew-desktop\config.json`; a
   new version tries hardware rendering again once. The launch log then reads
   `gpu: software rendering ACTIVE`. `--no-sandbox` is never applied: if the
   relaunched app still cannot start, every Chromium child is being blocked
   (typically an endpoint-security DLL injected into every process), which is a
   different failure and needs a process exclusion for the app, not a rendering
   switch.
+- **A gray/blank window that exits, while `kirocrew gateway` plus a browser
+  work fine** — that "different failure" above, seen from the other side:
+  Chromium cannot start a sandboxed child process on this device at all, so the
+  software-rendering relaunch does not help, because rendering is not what is
+  failing.
+
+  `gateway-launch.log` (in `%APPDATA%\kirocrew-desktop\logs\`; a nightly install
+  uses `kirocrew-desktop-nightly`) shows `renderer died` lines up to the reload
+  limit. The exit code they carry is commonly `-2147483645`, which
+  `chromium.log` beside it echoes as `exit_code=-2147483645`; that value is
+  `0x80000003` (`STATUS_BREAKPOINT`) in hex, and Event Viewer may show it as
+  unsigned `2147483651`. A different code does not rule this failure out — the
+  launch check below settles it, not the number. It is not a graphics fault and
+  not a shortcut or gateway problem: it is usually software that injects a DLL
+  into every process (endpoint security, or a display driver such as
+  DisplayLink), which the sandbox then refuses to admit.
+
+  The same exit code also appears when a renderer loads and *later* crashes,
+  which is an ordinary V8 abort and unrelated. What separates them is that this
+  failure never renders anything, not even the brief boot splash: a window that
+  showed the splash or the dashboard before dying is the V8 case, not this one,
+  and the launch check below does not rescue it either.
+
+  **First, confirm the sandbox is the failing component:** launch once with
+  `--no-sandbox`. If the dashboard loads, continue below. If it still fails the
+  sandbox is *not* the cause — try `KIROCREW_DISABLE_GPU=1` for a failing
+  GPU/rendering path, then a reinstall for a damaged install; an
+  endpoint-security exclusion cannot fix either. Do not keep `--no-sandbox`
+  either way: it removes renderer, GPU and utility isolation for every child
+  process, and it is a diagnostic rather than a setting.
+
+  <details>
+  <summary>How to pass a flag or set the variable on Windows</summary>
+
+  **Fully exit Kiro Crew first.** This step is not optional: the app is
+  single-instance, and a second launch hands its arguments to the instance
+  already running and then exits, so the flag is silently ignored while the
+  broken window still appears. Close it from the tray icon, then confirm no
+  `KiroCrew.exe` remains in Task Manager > Details.
+
+  **A one-off launch with a flag** — open Command Prompt and run the executable
+  with the flag, so nothing about the installed shortcut changes. To get the
+  exact path for *your* install, right-click the Start-menu entry and choose
+  **Open file location**, then copy the target; a nightly or side-by-side build
+  has a different product name, so do not assume the one below. On a normal
+  stable per-user install (`perMachine: false`, no choice of directory) it is:
+
+  ```
+  "%LOCALAPPDATA%\Programs\KiroCrew\KiroCrew.exe" --no-sandbox
+  ```
+
+  **A one-off launch with the variable**, in the same Command Prompt window, so
+  it applies to that launch only:
+
+  ```
+  set KIROCREW_DISABLE_GPU=1
+  "%LOCALAPPDATA%\Programs\KiroCrew\KiroCrew.exe"
+  ```
+
+  To keep `KIROCREW_DISABLE_GPU` for a host that genuinely has no usable GPU,
+  make it durable with `setx KIROCREW_DISABLE_GPU 1` (no elevation needed; it
+  applies to new processes, so restart the app) or through **System Properties >
+  Environment Variables**. Do **not** make `--no-sandbox` durable this way —
+  editing the shortcut's Target keeps an isolation downgrade in place
+  permanently: the installer preserves an existing shortcut on every update,
+  arguments included, so the edit outlives each new version until you undo it
+  by hand.
+
+  </details>
+
+  **The fix is a process exclusion for the Kiro Crew executable** in the
+  endpoint security product managing the device. That addresses the cause and
+  leaves the sandbox intact. To identify what to exclude, open Event Viewer >
+  Windows Logs > Application and read the faulting module name in the
+  `AppCrash` entry for the child process that died. Microsoft Edge uses the same
+  Chromium sandbox, so if Edge renders normally the sandbox itself works on that
+  device and the difference is that Edge is already excluded.
+
+  **There is deliberately no supported way to make the sandbox opt-out
+  durable.** A persistent switch would let anything running as the user disable
+  process isolation invisibly, and the narrower Chromium hardening switches are
+  not a usable substitute: their names are version-specific and silently ignored
+  when wrong, and the most-cited one
+  (`--disable-features=RendererCodeIntegrity`) has been a no-op since Chromium
+  118 even though the Chrome enterprise *policy* of the same name still works.
 - **Desktop gateway recovery refuses to force-stop the port** - the Electron
   launcher uses `netstat -ano` to identify the listener, PowerShell
   (`Get-CimInstance`) with a WMIC fallback to read its command line, and

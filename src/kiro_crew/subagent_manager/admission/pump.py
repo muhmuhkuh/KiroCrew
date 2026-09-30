@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from kiro_crew import taskq as _taskq
 
     from ...subagent import (
+        _RELEASE_REPUMP_SECS,
         SpawnAdmissionCoordinator,
         SpawnApprovalUnreachable,
         Stats,
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
         asyncio,
         create_agent_folder,
         logger,
+        parent_spawn_policy,
         sel,
         time,
     )
@@ -36,15 +38,26 @@ class _PumpMixin(ManagerComponent):
         # Sibling-mixin methods this module reaches through ``self``; typing only.
         def taskq_store(self) -> "_taskq.TaskStore | None": ...
 
+        def taskq_admit_wait_secs(self) -> float: ...
+
+        async def taskq_child_registered_async(self, info: "SubagentInfo") -> None: ...
+
         def _record_crew_log_spawn_started(self, info: "SubagentInfo") -> None: ...
 
     def _should_stagger_queue_impl(self, now: float) -> tuple[bool, bool]:
         """Decide whether a spawn arriving at *now* must be queued.
 
-        Returns ``(should_queue, slot_free)``. A spawn is queued when either no
-        slot is free (at capacity) OR a spawn started within the stagger window
-        (``subagent_spawn_stagger_secs``) — so the initial fill never bursts and
-        no two agents start within the interval (dynamic-subagent-sizing.md §5.3).
+        Returns ``(should_queue, slot_free)``. A spawn is queued when any of
+        three holds: no slot is free (at capacity); a spawn started within the
+        stagger window (``subagent_spawn_stagger_secs``) -- so the initial fill
+        never bursts and no two agents start within the interval
+        (dynamic-subagent-sizing.md §5.3); or as many agents are already in
+        startup as ``_startup_cap`` allows (two session-start gate rounds)
+        -- so a slow-start regime cannot pile the whole cap into startup at
+        once. The three bound different things: the RUNNING population, the
+        RATE of starts, and the IN-STARTUP population. ``slot_free`` reports
+        only the first, so the caller can tell a hold that a running agent's
+        exit will release from one that needs the pump re-armed.
         """
         # The cap as the fairness dispatcher reads it: the effective cap, lifted
         # for the child reserve while a parent waits under an adaptive squeeze
@@ -52,7 +65,8 @@ class _PumpMixin(ManagerComponent):
         # the caller, which knows whether the spawn is nested.
         slot_free = self._manager._admission.capacity_view().any_slot
         too_soon = (now - self._manager._last_spawn_ts) < self._manager._spawn_stagger_secs
-        return (not slot_free or too_soon, slot_free)
+        startup_full = self._manager._startup_population() >= self._manager._startup_cap()
+        return (not slot_free or too_soon or startup_full, slot_free)
 
     def _drain_queue_impl(self) -> None:
         """Spawn the next queued task if a slot is available and the stagger
@@ -137,10 +151,83 @@ class _PumpMixin(ManagerComponent):
             if not getattr(self._manager, "_drain_again", False):
                 return
 
+    def _schedule_retained_claim_retry(self) -> None:
+        """Arm one later pump pass for an admitted claim awaiting the store."""
+        if not self._manager._retained_claims or self._manager._shutting_down:
+            return
+        pending = self._manager._retained_claim_retry_handle
+        if pending is not None and not pending.cancelled():
+            return
+        import asyncio as _asyncio
+
+        try:
+            loop = _asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        def _retry() -> None:
+            self._manager._retained_claim_retry_handle = None
+            self._manager._drain_queue()
+
+        delay = max(0.05, self.taskq_admit_wait_secs())
+        self._manager._retained_claim_retry_handle = loop.call_later(delay, _retry)
+
+    def _retain_claim(
+        self,
+        point: ClaimPoint,
+        generation: int,
+        reenter: "Callable[[tuple[int, bool, str]], Any]",
+        stop_params: "Mapping[str, Any] | None",
+    ) -> None:
+        """Keep one admitted generation and its reserved slot for retry."""
+        self._manager._retained_claims[point.agent_id] = (
+            point,
+            generation,
+            reenter,
+            dict(stop_params or {}),
+        )
+        self._schedule_retained_claim_retry()
+
+    async def retry_retained_claims(self) -> None:
+        """Retry one held generation before the pump considers queued rows."""
+        retained = self._manager._retained_claims
+        try:
+            agent_id, entry = next(iter(retained.items()))
+        except StopIteration:
+            return
+        retained.pop(agent_id, None)
+        point, generation, reenter, stop_params = entry
+        result = await self.claim_and_start(
+            point,
+            reenter,
+            stop_params=stop_params,
+            retained_generation=generation,
+        )
+        if result is not None and not result.done and result.id in self._manager._agents:
+            await self.taskq_child_registered_async(result)
+        self._after_dispatch_impl(stop_params, result, refill=lambda **_kw: 0)
+        if retained:
+            self._schedule_retained_claim_retry()
+        else:
+            pending = self._manager._retained_claim_retry_handle
+            if pending is not None and not pending.cancelled():
+                self._manager._cancel_task_intentionally(
+                    pending,
+                    reason="retained claim settled",
+                )
+            self._manager._retained_claim_retry_handle = None
+
     async def _drain_queue_pass_impl(self) -> None:
         admission = self._manager._admission
         retain_error_detail = True
+        # Bound before the ``try``: the ``finally`` below walks ``picked``, and a
+        # store error raised by the awaits ahead of the pick must reach the
+        # handler as itself, not as an UnboundLocalError over an empty pick.
+        picked: list[dict[str, Any]] = []
+        granting: list[dict[str, Any]] = []
         try:
+            await self._manager.retry_pending_boundary_cancellations()
+            await admission.retry_retained_claims()
             store = admission.taskq_store()
             if store is not None:
                 try:
@@ -158,8 +245,6 @@ class _PumpMixin(ManagerComponent):
                 if admission.capacity_view().any_slot:
                     await admission.taskq_refill_window_async()
                     await admission.taskq_refill_window_async(children_only=True)
-            picked: list[dict[str, Any]] = []
-            granting: list[dict[str, Any]] = []
             # The pick's own store read: an entry that does not name its lane
             # resolves its parent chain through ``store.get``. Resolved here, on
             # the writer thread, and nothing awaits between this and the pick
@@ -178,10 +263,30 @@ class _PumpMixin(ManagerComponent):
                     self._manager._drain_queue()
             for params in picked:
                 retain_error_detail = params.get("_memory_mode", "persistent") == "persistent"
-                drained = await self._dispatch_async_impl(params)
+                try:
+                    drained = await self._dispatch_async_impl(params)
+                finally:
+                    # The dispatching mark lives for ONE attempt. Whatever
+                    # ``spawn`` answered -- started, re-queued, parked, refused,
+                    # or raised -- the row is either registered (live-excluded)
+                    # or back in the store as waiting, and either way the
+                    # count and the refill must see it as the store does.
+                    self._unmark_dispatching(params)
                 self._after_dispatch_impl(params, drained, refill=lambda **_kw: 0)
         except Exception:
             logger.error("drain pump failed", exc_info=retain_error_detail)
+        finally:
+            # A row the pick marked but the loop never reached (a raise in the
+            # granting loop, or a cancelled pass) would otherwise keep its mark
+            # for the process lifetime and be skipped by every refill: the
+            # durable row would never run again. The store is the truth for
+            # every row this pass did not dispatch.
+            for params in picked:
+                self._unmark_dispatching(params)
+
+    def _unmark_dispatching(self, params: "Mapping[str, Any]") -> None:
+        """Drop the popped row's dispatching mark, if it carries an id."""
+        self._manager._dispatching_ids.discard(str(params.get("_preassigned_id") or ""))
 
     async def _dispatch_async_impl(self, params: dict[str, Any]) -> "SubagentInfo | None":
         """Start a picked window row with its claim (``store.claim``) on the
@@ -192,13 +297,31 @@ class _PumpMixin(ManagerComponent):
         ``store.defer`` is awaited the same way (``DeferPoint``)."""
         store = self._manager._admission.taskq_store()
         admission = self._manager._admission
+        # The parent agent spec's ``availableAgents`` declaration is re-read
+        # here, off the loop, so the gate's re-check at dispatch costs the loop
+        # no directory scan (same reason the record read above is threaded).
+        policy = await asyncio.to_thread(
+            parent_spawn_policy, str(params.get("parent_session_key") or "")
+        )
+        # Neither the queued entry nor the durable row carries a policy
+        # (``queue_params`` never stores one, ``taskq_build_record`` drops the
+        # key); the filter keeps a params dict that somehow holds one from
+        # shadowing the fresh read. ``params`` itself stays whole: it is the
+        # row's identity for the stop path below.
+        spawn_params = {k: v for k, v in params.items() if k != "_parent_spawn_policy"}
         first: Any = self._manager.spawn(
-            **params,
+            **spawn_params,
+            _parent_spawn_policy=policy,
             _from_queue=True,
             _stop_before_claim=store is not None,
             _child_registration=store is None,
         )
         if not isinstance(first, ClaimPoint):
+            # Not claimed: the gate re-queued, parked or refused the row, so
+            # it is waiting (or gone) again and the depth must count it as the
+            # store sees it. Cleared BEFORE the parked defer publishes its
+            # depth, or that emit would read the row as still dispatching.
+            self._unmark_dispatching(params)
             if first is not None:
                 # Ahead of the registration below, never after it: the row is
                 # durably parked -- or refused for want of a row -- before any
@@ -217,41 +340,138 @@ class _PumpMixin(ManagerComponent):
         result: Any = await admission.claim_and_start(
             first,
             lambda claimed: self._manager.spawn(
-                **params, _from_queue=True, _claimed=claimed, _child_registration=False
+                **spawn_params,
+                _parent_spawn_policy=policy,
+                _from_queue=True,
+                _claimed=claimed,
+                _child_registration=False,
             ),
+            stop_params=params,
         )
         if result is not None and not result.done and result.id in self._manager._agents:
             await admission.taskq_child_registered_async(result)
         return result
 
     async def claim_and_start(
-        self, point: ClaimPoint, reenter: "Callable[[tuple[int, bool, str]], Any]"
+        self,
+        point: ClaimPoint,
+        reenter: "Callable[[tuple[int, bool, str]], Any]",
+        *,
+        stop_params: "Mapping[str, Any] | None" = None,
+        retained_generation: int | None = None,
     ) -> "SubagentInfo | None":
-        """Second half of a reserved dispatch: the claim on the writer thread,
-        then *reenter* with the result. The reservation ``point`` holds is
-        consumed by a registered start and RELEASED on every other outcome --
-        a claim the store refused or could not take, a refusal at re-entry, or
-        the claim raising -- so the cap is never left spent by a row that did
-        not start. A registered run that the re-entry itself rejected (no
-        approval mechanism) already gave the count back inside ``spawn_impl``."""
+        """Claim a reserved row, settle its durable authority, then register it.
+
+        A failure before the claim leaves the row queued and releases the
+        reservation. A store outage after the claim retains the admitted
+        generation and reservation for a later pump pass. Registration consumes
+        the reservation; every durably refused outcome releases it.
+        """
         store = self.taskq_store()
         assert store is not None
+        report_params: dict[str, Any] | None = None
+        claim_will_register = False
+        claim_retained = False
+        result: Any = None
         try:
-            claimed = await store.run(self.taskq_claim, point.agent_id)
-            result: Any = reenter(claimed)
+            claimed = (
+                (retained_generation, True, "")
+                if retained_generation is not None
+                else await store.run(self.taskq_claim, point.agent_id)
+            )
+            generation, proceed, _reason = claimed
+            if proceed and point.boundary_owner:
+                from kiro_crew import taskq as _taskq
+
+                try:
+                    still_current = await store.run(
+                        self.taskq_claim_still_current,
+                        point.agent_id,
+                        generation,
+                    )
+                    cancellation_pending = getattr(
+                        self._manager,
+                        "_boundary_cancellation_pending",
+                        None,
+                    )
+                    pending = callable(cancellation_pending) and cancellation_pending(
+                        {
+                            "parent_session_key": point.parent_session_key,
+                            "_stage_boundary_owner": point.boundary_owner,
+                        }
+                    )
+                    if still_current and pending:
+                        stopped = await store.run(
+                            store.cancel,
+                            point.agent_id,
+                            reason="boundary_cancel_before_registration",
+                            only_from=frozenset({_taskq.ADMITTED}),
+                            generation=generation,
+                        )
+                        claimed = (generation, False, self.CLAIM_REFUSED)
+                        if stopped is not None:
+                            report_params = dict(stop_params or {})
+                            report_params.setdefault("_preassigned_id", point.agent_id)
+                            report_params.setdefault("parent_session_key", point.parent_session_key)
+                            report_params.setdefault("_stage_boundary_owner", point.boundary_owner)
+                except _taskq.TaskStoreUnavailable:
+                    still_current = None
+                    _glue_logger.warning(
+                        "taskq: post-claim settlement of %s failed; retaining generation %d",
+                        point.agent_id,
+                        generation,
+                        exc_info=True,
+                    )
+                if still_current is None:
+                    self._retain_claim(point, generation, reenter, stop_params)
+                    claim_retained = True
+                    if retained_generation is None:
+                        result = reenter((generation, False, self.CLAIM_RETAINED))
+                    return result
+                if not still_current:
+                    claimed = (generation, False, self.CLAIM_REFUSED)
+            # No await between a successful final durable/boundary check and
+            # registration: cancellation cannot interleave after the
+            # revalidation a registered start relies on. A refused claim may
+            # await its terminal store write because it never registers.
+            claim_will_register = bool(claimed[1])
+            if not claim_will_register:
+                # The claim did not take the row (store unavailable, refused,
+                # superseded): it is still QUEUED and the re-entry's own depth
+                # emit must count it. The emit snapshots the exclusion set
+                # synchronously, so the mark has to go BEFORE re-entry.
+                self._manager._dispatching_ids.discard(point.agent_id)
+            result = reenter(claimed)
         finally:
-            # Keyed on registration, not on success: a re-entry that raised
-            # (an unwrapped agent-directory scan, a broken hook) registered
-            # nothing, so the slot goes back and the row stays claimable for
-            # the pump -- never a silent, permanent hole in the cap.
-            if point.agent_id not in self._manager._agents:
+            # Queued-stop reporting temporarily installs a synthetic terminal
+            # record under this id. Only a still-proceeding claim that really
+            # registered may consume the reservation; terminal report identity
+            # is not a registered start. A retained claim keeps the reservation.
+            registered = claim_will_register and point.agent_id in self._manager._agents
+            if not registered and not claim_retained:
                 self.release_reservation(point.agent_id)
+            if registered:
+                # Every registered start re-publishes the parent's queued
+                # depth. A direct spawn owes nothing to the count, so its emit
+                # reports the depth as it stands; a row the drain popped was
+                # counted as waiting until this claim moved it out of the
+                # claimable states, and this emit is what removes it. Without
+                # it the chip keeps "1 waiting" and the old wait reason forever.
+                started = self._manager._agents[point.agent_id]
+                self._manager._emit_queue_depth(started.parent_session_key, started.batch_id)
+            if report_params is not None:
+                self._manager._report_queued_stop(report_params)
+                self._manager._emit_queue_depth(
+                    point.parent_session_key,
+                    str(report_params.get("batch_id") or ""),
+                )
         assert not isinstance(result, ClaimPoint)
         return result
 
     def release_reservation(self, agent_id: str) -> None:
         """Give back the slot a ``ClaimPoint`` reserved for a row that did not start."""
         self._manager._running_count = max(0, int(self._manager._running_count) - 1)
+        self._manager._startup_reservations = max(0, int(self._manager._startup_reservations) - 1)
         _glue_logger.debug("taskq: reservation for %s released", agent_id)
 
     def _drain_queue_sync_impl(
@@ -274,6 +494,16 @@ class _PumpMixin(ManagerComponent):
         off the loop by the caller for the same reason as the rest."""
         if not self._manager._queue and self._manager._admission.taskq_store() is None:
             return
+        # Approval-released starts first (they hold their slots already, so
+        # this must precede the capacity check): one per pass, under the
+        # stagger and the in-startup bound. Neither outcome ends the pass --
+        # a RESUME waits on a lane slot, never on the startup bound or the
+        # stagger, so the grants below run whether a start was released or is
+        # being held; and the fresh-spawn pick further down applies the same
+        # two checks itself, so a hold here is a hold there too. Guarded by the
+        # scan so a minimal facade with only a queue still pumps.
+        if any(p.get("_startup_release") for p in self._manager._queue):
+            self._release_admitted_start_impl()
         view = self._manager._admission.capacity_view()
         if not view.any_slot:
             return
@@ -289,10 +519,26 @@ class _PumpMixin(ManagerComponent):
         # this pump so a wake never bypasses capacity, but a resume is not a
         # process start -- the run is already resident -- so it neither waits
         # for the spawn stagger nor consumes it; granting hands the slot back
-        # to the waiting coroutine instead of spawning.
+        # to the waiting coroutine instead of spawning. Compatibility doubles
+        # can expose no cancellation predicate and therefore have no matching
+        # authority to apply.
+        boundary_cancellation_pending = getattr(
+            self._manager,
+            "_boundary_cancellation_pending",
+            None,
+        )
         while self._manager._queue:
             index = next(
-                (i for i, p in enumerate(self._manager._queue) if p.get("_resume_id")), None
+                (
+                    i
+                    for i, p in enumerate(self._manager._queue)
+                    if p.get("_resume_id")
+                    and not p.get("_startup_release")
+                    and not (
+                        callable(boundary_cancellation_pending) and boundary_cancellation_pending(p)
+                    )
+                ),
+                None,
             )
             if index is None:
                 break
@@ -320,6 +566,16 @@ class _PumpMixin(ManagerComponent):
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
+            return
+        # In-startup bound (``_startup_cap``, two session-start gate rounds): as many
+        # agents as ``_startup_cap`` allows are past admission but have no
+        # runtime, answer or turn yet. Hold the pick -- the resumes above were
+        # granted, a resume is not a start -- and arm nothing: the next edge is
+        # one of them leaving startup, which ``_note_startup_progress`` (PID or
+        # first answer) and the slot-release drain (terminal, including the
+        # watchdog's reap of a wedged one) both pump. A timer here would only
+        # poll for those same edges.
+        if self._manager._startup_population() >= self._manager._startup_cap():
             return
         # Lane-aware pick: the weighted round-robin over the lanes with
         # eligible entries (resumes were granted above). When only the child
@@ -357,6 +613,19 @@ class _PumpMixin(ManagerComponent):
             ),
             len(self._manager._queue),
         )
+        # The popped row is in flight between the window and its claim: it is
+        # in none of the exclusion sets the store count reads (not windowed,
+        # not registered, not admitting) while its durable state is still
+        # QUEUED, so every depth read until the claim lands counts it as
+        # waiting. Mark it dispatching so the emit below, and any refill or
+        # overflow read in the meantime, leave it out. The mark lives for one
+        # attempt and is released where the attempt ends: the ``finally``
+        # around each ``spawn`` call (inline pump below, coroutine pump in
+        # ``_drain_queue_pass_impl``), the not-a-claim branch of
+        # ``_dispatch_async_impl``, the non-proceeding claim in
+        # ``claim_and_start``, and the gate's failed-claim emit.
+        if queued_id:
+            self._manager._dispatching_ids.add(queued_id)
         # The popped item's parent just lost one waiting agent — re-emit its
         # queued depth (0 when this was its last) so the chip's "waiting" count
         # tracks the drain. Done before spawn() so an immediate re-queue there
@@ -371,7 +640,12 @@ class _PumpMixin(ManagerComponent):
         # start under the id its caller was already told (and, if the gate re-queues
         # it, keeps that id across the second round-trip too).
         if dispatch is None:
-            drained = self._manager.spawn(**params, _from_queue=True)
+            try:
+                drained = self._manager.spawn(**params, _from_queue=True)
+            finally:
+                # Same one-attempt lifetime as the coroutine pump: a ``spawn``
+                # that raises must not leave the row excluded from refill.
+                self._unmark_dispatching(params)
         else:
             # Event-loop pump: the dispatcher hands the picked row back and
             # takes the claim on the writer thread (see ``_dispatch_async_impl``).
@@ -588,8 +862,223 @@ class _PumpMixin(ManagerComponent):
                 await self._manager._safe_announce(info)
             return
 
+        # The prompt resolved; the START has not been admitted. While parked
+        # this agent counted against nothing (it was starting nothing), so its
+        # release is where the in-startup bound has to be applied -- and a bulk
+        # trust/yolo grant releases every parked prompt in one pass. It goes
+        # through the pump like a fresh spawn and is metered into startup by
+        # the same stagger and in-startup checks. Three ways out, each its own
+        # outcome, because they are announced differently:
+        outcome = await self._manager._admit_released_start(info)
+        if outcome == "admission_closed":
+            # Refused at release: the run holds a slot and a row but never
+            # started. Same terminal bookkeeping as a declined prompt, so the
+            # slot, the queue and the parent's completion event all settle.
+            info.done = True
+            info.error = (
+                "spawn rejected: the gateway closed admission before this "
+                "approved spawn could start"
+            )
+            if self._manager._release_slot(info):
+                self._manager._running_count -= 1
+                self._manager._drain_queue()
+            self._manager._tasks.pop(info.id, None)
+            sel().log_tool_invocation(
+                session_key=info.parent_session_key,
+                source="subagent",
+                tool_name="spawn_run",
+                outcome="rejected",
+                metadata={"subagent_id": info.id, "reason": "admission_closed"},
+            )
+            if self._manager._on_done and self._manager._claim_finalize(info):
+                await self._manager._safe_announce(info)
+            return
+        if outcome != "admitted":
+            # A user stop or a reap landed while the start waited for the bound.
+            # Neither is a rejection: ``_force_reap`` owns that run's terminal
+            # record (a stop is neutral; a reap names the wait it interrupted)
+            # and its announce, so nothing is written here.
+            return
+        # The confirmed-start funnel: recorded only for a start that is
+        # actually about to run, never for one refused or ended while waiting.
         self._manager._log_spawned(info)
         await self._manager._run(info)
+
+    async def _admit_released_start_impl(self, info: SubagentInfo) -> str:
+        """Wait for the pump to meter *info* -- released from the approval
+        prompt -- into startup. Answers one of three outcomes: ``"admitted"``
+        (it may run); ``"admission_closed"`` (gateway admission is closed at
+        release time -- an approved start that has not begun is new work, and
+        the updater's pause admits none; the caller writes that refusal); or
+        ``"ended"`` (a user stop or a reap landed while it waited -- the path
+        that ended it owns the terminal record and the announce, so the caller
+        writes nothing).
+
+        The entry reuses the queue's RESIDENT shape (``_resume_id``): every
+        scan that separates unstarted spawns from resident runs -- the
+        queued-stop paths, the refill census, the eviction, the continuation
+        lookup -- already leaves such an entry alone, and the run IS resident:
+        registered, holding its slot, its row claimed. ``_startup_release``
+        tells the pump this resident is waiting to START rather than to resume,
+        so it is admitted by the stagger + in-startup gate
+        (:meth:`_release_admitted_start_impl`) and never by the resume grant, which
+        hands back a yielded lane slot this run never gave up. Accounting while
+        it waits: in ``_agents``, in ``_running_count``, in the queue depth its
+        parent's chip shows, and NOT in ``_startup_population`` -- it is not
+        starting until the pump says so.
+        """
+        # A stop or a reap that landed while the approval prompt was open wins
+        # over the admission gate: its own path owns the record, and a closed
+        # gateway must not add a rejection to a run already being ended.
+        if info.done or info.user_stopped or info.reaped or info._reap_started:
+            return "ended"
+        # The same admission gate every registration in this package sits
+        # behind: yield-free with the append below, so the start is either
+        # queued for release before the updater's pause or refused after it.
+        if getattr(self._manager._sessions, "admission_closed", False) is True:
+            logger.info(
+                "Subagent %s: approved start refused (gateway admission is closed)", info.id
+            )
+            return "admission_closed"
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        info._start_release = fut
+        entry = {
+            "_resume_id": info.id,
+            "_startup_release": True,
+            # The waiter itself, so the pump can always wake it -- including a
+            # run that is not registered in ``_agents`` at the time it is metered.
+            "_start_info": info,
+            "parent_session_key": info.parent_session_key,
+            "batch_id": info.batch_id,
+        }
+        self._manager._queue.append(entry)
+        self._manager._emit_queue_depth(info.parent_session_key, info.batch_id)
+        # The wait is edge-driven (PID / first answer / terminal / stagger
+        # boundary all pump), with a slow self-re-arming re-pump as the
+        # backstop: a pump pass that failed on an unrelated row is logged and
+        # swallowed, and without this the released start would wait for the
+        # next edge to arrive by itself. A timer rather than ``wait_for`` so the
+        # wake stays ONE hop from ``set_result``: the pump re-arms itself at the
+        # stagger boundary right after a release, and the released run's first
+        # step (which puts it in ``_startup_population``) must land before that
+        # re-arm can admit the next one -- the same ordering the direct
+        # dispatch paths rely on.
+        repump: Any = None
+
+        def _repump() -> None:
+            nonlocal repump
+            repump = None
+            if fut.done():
+                return
+            self._manager._drain_queue()
+            repump = loop.call_later(_RELEASE_REPUMP_SECS, _repump)
+
+        try:
+            self._manager._drain_queue()
+            if not fut.done():
+                repump = loop.call_later(_RELEASE_REPUMP_SECS, _repump)
+            granted = bool(await fut)
+        finally:
+            if repump is not None:
+                repump.cancel()
+            info._start_release = None
+            # A stop or a reap while waiting leaves the entry behind; drop it
+            # so the pump never meters a run that already ended.
+            for index, params in enumerate(list(self._manager._queue)):
+                if (
+                    params.get("_startup_release")
+                    and str(params.get("_resume_id") or "") == info.id
+                ):
+                    self._manager._queue.pop(index)
+                    self._manager._emit_queue_depth(info.parent_session_key, info.batch_id)
+                    break
+        if info.done or info.user_stopped or info.reaped or info._reap_started:
+            return "ended"
+        return "admitted" if granted else "ended"
+
+    def _release_admitted_start_impl(self) -> str:
+        """The pump's released-start phase: meter ONE approval-released start
+        into startup, under the same stagger and in-startup checks a fresh
+        spawn passes. Returns ``"released"`` when a start was let into startup
+        this pass, ``"held"`` when one is waiting but may not start yet (the
+        stagger or the in-startup bound), and ``""`` when none is waiting. The
+        caller treats none of these as the end of the pass: a held start holds
+        only STARTS, and the resume grants that follow it wait on lane slots,
+        not on the startup bound.
+
+        Runs BEFORE the capacity check on purpose: a released start already
+        holds its slot, so at a full cap ``any_slot`` is False and a pass that
+        checked capacity first would never reach it -- two approved spawns at a
+        cap of two would wait on each other forever. It also runs before the
+        resume grants, since a released start is older than anything admitted
+        after it and the bound it waits on is the one the resumes skip.
+        """
+        queue = self._manager._queue
+        while True:
+            index = next(
+                (i for i, p in enumerate(queue) if p.get("_startup_release")),
+                None,
+            )
+            if index is None:
+                return ""
+            params = queue[index]
+            info = params.get("_start_info")
+            fut = getattr(info, "_start_release", None) if info is not None else None
+            if (
+                info is None
+                or fut is None
+                or fut.done()
+                or info.done
+                or info.user_stopped
+                or info.reaped
+                or info._reap_started
+            ):
+                # Ended while waiting, or already released: not a start. Wake
+                # the waiter with False so it returns without running.
+                queue.pop(index)
+                if fut is not None and not fut.done():
+                    fut.set_result(False)
+                continue
+            break
+        elapsed = time.monotonic() - self._manager._last_spawn_ts
+        if elapsed < self._manager._spawn_stagger_secs:
+            try:
+                asyncio.get_event_loop().call_later(
+                    self._manager._spawn_stagger_secs - elapsed, self._manager._drain_queue
+                )
+            except RuntimeError:
+                pass  # no running loop (sync/test context)
+            return "held"
+        if self._manager._startup_population() >= self._manager._startup_cap():
+            # Held; the next edge out of startup pumps again (see the same
+            # hold on the spawn side below).
+            return "held"
+        queue.pop(index)
+        # This start begins NOW. Stamp the stagger clock as every direct
+        # dispatch does at ``create_task``: ``_run_inner`` writes
+        # ``_exec_started`` on its first step, one loop iteration from here,
+        # and the stamp keeps the pump from admitting into that gap -- the
+        # same cover the direct paths rely on. One release per pass; the
+        # re-arm at the stagger boundary takes the next.
+        self._manager._last_spawn_ts = time.monotonic()
+        logger.info(
+            "Releasing approved spawn %s into startup (%d left queued, in_startup=%d/%d)",
+            info.id,
+            len(queue),
+            self._manager._startup_population(),
+            self._manager._startup_cap(),
+        )
+        fut.set_result(True)
+        self._manager._emit_queue_depth(info.parent_session_key, info.batch_id)
+        if queue:
+            try:
+                asyncio.get_event_loop().call_later(
+                    self._manager._spawn_stagger_secs, self._manager._drain_queue
+                )
+            except RuntimeError:
+                pass
+        return "released"
 
     def _log_spawned_impl(self, info: SubagentInfo) -> None:
         """Record spawn metrics and audit log entry.
@@ -678,6 +1167,10 @@ class _PumpMixin(ManagerComponent):
     #: the claim. The row is NOT started -- an unclaimed start would run at
     #: generation 0 with no lease for reconcile to find -- it stays queued.
     CLAIM_UNAVAILABLE = "claim_unavailable"
+    #: ``claim_and_start`` reason: the row is already ADMITTED under this
+    #: process, but its post-claim durable check could not finish. The caller
+    #: receives a queued handle while the retained-claim pump owns retry.
+    CLAIM_RETAINED = "claim_retained"
     #: ``taskq_claim`` reason: the store knows the row and refuses it
     #: (cancelled, or claimed by another dispatcher).
     CLAIM_REFUSED = "claim_refused"
@@ -715,6 +1208,34 @@ class _PumpMixin(ManagerComponent):
             return (rec.generation if rec else 0, True, "")
         _glue_logger.info("taskq: %s not started, store state is %s", agent_id, state)
         return (0, False, self.CLAIM_REFUSED)
+
+    def taskq_claim_still_current(self, agent_id: str, generation: int) -> bool | None:
+        """Whether this dispatcher still owns the admitted claim generation.
+
+        ``None`` means the store could not answer and makes re-entry retry rather
+        than registering work whose durable lease cannot be proved. Called only
+        through :meth:`TaskStore.run`, immediately before loop registration.
+        """
+        store = self.taskq_store()
+        if store is None:
+            return False
+        from kiro_crew import taskq as _taskq
+
+        try:
+            rec = store.get(agent_id)
+        except _taskq.TaskStoreUnavailable:
+            _glue_logger.warning(
+                "taskq: claim revalidation of %s failed",
+                agent_id,
+                exc_info=True,
+            )
+            return None
+        return bool(
+            rec is not None
+            and rec.state == _taskq.ADMITTED
+            and rec.generation == generation
+            and rec.lease_owner == store.incarnation
+        )
 
     def taskq_lease_is_ours(self, agent_id: str) -> bool:
         store = self.taskq_store()

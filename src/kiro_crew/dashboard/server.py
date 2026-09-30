@@ -9,12 +9,14 @@ import faulthandler
 import functools
 import logging
 import os
+import socket
 import stat
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from urllib.parse import quote
 
 from aiohttp import web
@@ -23,6 +25,7 @@ from kiro_crew import platform_compat, port_resolution, shutdown_event
 from kiro_crew.apps.backend import start_deferred_app_backends, start_enabled_app_backends
 from kiro_crew.apps.hook_reconcile import init_hook_reconciler, stop_hook_reconciler
 from kiro_crew.apps.hooks_integration import (
+    _stop_spawned_backends,
     init_hooks_system,
     on_gateway_shutdown,
     on_gateway_startup,
@@ -38,6 +41,7 @@ from kiro_crew.browser_cli import view as browser_cli_view
 from kiro_crew.channel_transcript_migration import migrate_channel_transcripts
 from kiro_crew.config import data_home
 from kiro_crew.config.loader import (
+    STT_PROVIDER_LOCAL,
     KiroCrewConfig,
     consume_managed_service_launch_environment,
     degraded_config_files,
@@ -48,6 +52,7 @@ from kiro_crew.config.loader import (
     tailnet_effective_allowed_logins,
     tailnet_identity_unknown,
 )
+from kiro_crew.crewmate_prune_migration import prune_synced_crewmates
 from kiro_crew.dashboard import (
     cautious_boot,
     channel_slots,
@@ -128,7 +133,11 @@ from kiro_crew.dashboard.handlers.source_providers import (
 from kiro_crew.dashboard.handlers.spawn_resume import setup_spawn_resume_routes
 from kiro_crew.dashboard.handlers.weixin_qr import setup_weixin_routes
 from kiro_crew.dashboard.handlers.whatsapp_setup import setup_whatsapp_routes
-from kiro_crew.dashboard.listener_guard import ListenerGuard, release_site
+from kiro_crew.dashboard.listener_guard import (
+    LISTENER_LOST_EXIT_CODE,
+    ListenerGuard,
+    release_site,
+)
 from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog
 from kiro_crew.dashboard.origin import (
     AUDIT_CLAIMED_KEY,
@@ -139,6 +148,7 @@ from kiro_crew.dashboard.origin import (
     check_origin,
     dashboard_socket_path,
     frame_ancestors_value,
+    is_proxied_request,
     mark_audit_claimed,
     resolve_dashboard_host,
     should_canonicalize_host,
@@ -146,6 +156,7 @@ from kiro_crew.dashboard.origin import (
 from kiro_crew.dashboard.port_reclaim import (
     FOREIGN_HOLDER,
     HEALTHY_PEER,
+    NO_HOLDER,
     RECLAIMED,
     reclaim_stale_gateway_port,
 )
@@ -189,6 +200,7 @@ from kiro_crew.safety_override import (
     take_dropped_grant,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.security.argv_floor import warm_own_host_names
 from kiro_crew.sel import sel, sel_is_warm, warm_sel_singleton
 from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader, set_pending_consumed_hook, set_pending_staged_hook
@@ -235,6 +247,13 @@ _PREVENT_SLEEP_POLL_INTERVAL_SECS = 15.0
 # hook that starts this task runs before either socket binds. Anything past the first
 # few seconds of boot works, since the sweep's own interval is a minute.
 _STT_SWEEP_BOOT_DELAY_SECS = 30.0
+
+# How long the boot prewarm waits before loading the speech model. Shorter than the
+# sweep's delay because this one is racing a user: its whole purpose is to be resident
+# BEFORE the first dictation, and someone who opens the dashboard to dictate does it
+# within seconds. Still non-zero, so the load never competes with binding the
+# listener, serving the first page, or restoring sessions.
+_STT_PREWARM_BOOT_DELAY_SECS = 5.0
 
 
 async def _prune_browser_snapshots_loop() -> None:
@@ -492,6 +511,27 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # browser reads its own log through the cookie-only
         # "/api/sessions/{id}/crew-log" pair this entry does not cover.
         "/api/crew-log",
+        # MCP-only (the five kirocrew-debug read tools); no browser caller at all.
+        # Prefix matching covers "/gateway", "/refusals", "/threads", "/processes"
+        # and "/snapshots". STRICT, not mixed, and the argument is stronger than the
+        # crew log's: four of the five reads are HOST-WIDE (the interpreter's
+        # threads, every process in the family, the recorded host series), so a
+        # forwarded browser must be hard-denied rather than fall through to a
+        # cookie. Strict membership is NOT the whole gate -- a loopback request with
+        # no secret header still reaches the handler through cookie auth -- so
+        # handlers/debug.py refuses a cookie-authed caller itself. Unlike the crew
+        # log there is no cookie-only door to send it to: the dashboard has no debug
+        # panel, so a browser has no door here.
+        "/api/debug",
+        # MCP-only (panel_publish / panel_templates tools); no browser caller --
+        # the drawer READS through "/api/members/{slug}/panel", which is
+        # registered by the same module a few lines below and deliberately NOT
+        # under this prefix so it keeps cookie auth. Prefix matching covers both
+        # "/api/agent-panel/publish" and "/api/agent-panel/templates". Same
+        # wiring class as the ledger above: without this entry the
+        # internal-secret call falls through to cookie auth and every publish
+        # fails with 403.
+        "/api/agent-panel",
         # MCP-only (knowledge_add_document tool); no browser caller — the
         # dashboard ingests via its own cookie-authed knowledge routes. Same
         # wiring class as "/api/notifications/agent" above.
@@ -510,10 +550,18 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         # and the handler's own internal_auth re-assert then refuses it -- the
         # tool is unreachable in production while handler-level tests still pass.
         "/api/session-control/create",
+        "/api/session-control/fork",
         "/api/session-control/stop",
+        "/api/session-control/set-model",
         "/api/session-control/close",
+        "/api/session-control/revive",
         "/api/session-control/send",
+        "/api/session-control/broadcast",
+        "/api/session-control/status",
+        "/api/session-control/adopt",
+        "/api/session-control/release",
         "/api/session-control/read",
+        "/api/session-control/summary",
         # MCP-only structured monitor inspection. The caller selects its
         # session identity through X-Session-Key, so cookie authentication can
         # never authorize this leaf.
@@ -528,6 +576,54 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
 #: RETURNS its 401/403 and audits each itself), but a barrier that raises one is
 #: the same class of event as a raised 403, so it is covered by position too.
 _PRE_AUDIT_DENY_STATUSES = frozenset({401, 403})
+
+
+#: Suffix appended to an audited identity that reached the gateway THROUGH a
+#: proxy rather than from the client itself. ``<name>_via_proxy`` means a
+#: forwarder presented it.
+#:
+#: The converse does NOT read across the whole SEL. A plain name means "made
+#: directly" only on the records :func:`audit_actor` reaches: the ok/error rows
+#: of both servers' ``sel_audit_middleware``, and the raised-refusal rows that
+#: go through :func:`_audit_denied`. ``token_auth`` writes its own returned
+#: 401/403 records with its own ``caller`` (``user_id``, ``app_name``,
+#: ``"unattributable"``, ``peer.login``, ...) and never calls this helper, so a
+#: forwarded request refused there is filed under a plain name. Routing those
+#: sites through here would edit a module this change does not touch.
+_VIA_PROXY_SUFFIX = "_via_proxy"
+
+
+def audit_actor(request: web.Request, caller: str) -> str:
+    """The identity to file this request's audit record under.
+
+    ``caller`` is the label the middleware was built with (``dashboard_user``
+    for the full dashboard, ``mcp_tool`` for the headless API server), or an
+    identity a deny site already derived from the request.
+
+    A FORWARDED request is filed under a DIFFERENT name. The gateway binds
+    loopback, so remote access arrives through a same-host forwarder (a tunnel,
+    a sidecar, a reverse proxy) which presents the credential it was given: with
+    the owner's cookie that is indistinguishable from the owner sitting at the
+    machine, and every such request was recorded as plain ``dashboard_user``.
+    That is the one fact an operator reading the log afterwards most needs and
+    could not get -- whether an action was taken by the person or arrived over a
+    forwarding path on their behalf.
+
+    The signal is :func:`origin.is_proxied_request`: any ``Forwarded`` /
+    ``X-Forwarded-*`` / ``X-Real-IP`` header. It is the predicate the rest of
+    this module already trusts for "``request.remote`` is not the client", and
+    it over-warns rather than under-warns (a client that sends a forwarding
+    header with no proxy in the path is reported as forwarded). For an audit
+    label, over-warning is the safe direction: it never files a forwarded action
+    as the person's own.
+
+    Its known limit is the same one :func:`origin.is_direct_local_request`
+    documents: a forwarder that strips every forwarding header is invisible
+    here. This makes the ordinary product paths distinguishable, which is what
+    the log could not do at all before; it is not a boundary against a forwarder
+    that is deliberately hiding.
+    """
+    return f"{caller}{_VIA_PROXY_SUFFIX}" if is_proxied_request(request) else caller
 
 
 async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
@@ -561,12 +657,18 @@ async def _audit_denied(caller: str, request: web.Request, error: str) -> None:
     a second time. The claim is set unconditionally, before the write: a write
     that failed here fails identically in the boundary, so retrying in the
     boundary buys nothing.
+
+    ``caller`` goes through :func:`audit_actor`, so a refusal that arrived
+    through a forwarder is filed under ``<caller>_via_proxy``. Applied here, in
+    the one helper every barrier's deny path already calls, rather than at each
+    of the three call sites -- a new barrier gets it by using the helper.
     """
     mark_audit_claimed(request)
+    actor = audit_actor(request, caller)
 
     def _write() -> None:
         sel().log_api_access(
-            caller=caller,
+            caller=actor,
             operation=f"{request.method} {request.path}",
             outcome="denied",
             resources=request.path,
@@ -1642,21 +1744,32 @@ def _precompute_telemetry(state: "DashboardState") -> None:
         _log.debug("telemetry.record_event(gateway_start) failed", exc_info=True)
 
 
-def _deferred_session_control(handler_name: str) -> Callable:
-    """Bind a session-control route without importing the subsystem at boot.
+def _deferred(module_name: str, handler_name: str) -> Callable:
+    """Bind a route without importing its handler module at gateway boot.
 
-    Session control is feature-flagged (``agent.session_control``), and the
-    enabled check lives inside the handler -- so a module-level import would be
-    an eager import of an optional subsystem whose gate runs after it, which the
-    boot-path rule names explicitly. Route registration itself is allowed at
-    boot; only the import moves to first request, so an operator who disabled the
-    feature never pays for loading it.
+    The boot-path rule forbids an eager import of an OPTIONAL subsystem inside
+    ``_register_mcp_routes``: it runs on every gateway launch before the socket
+    binds, so an operator who never enables the feature still pays to load it, and
+    for a feature-flagged subsystem the import precedes its own gate. Route
+    registration at boot is fine -- only the import moves to first request.
+
+    Both original callers wanted exactly this and differed only in which module they
+    named, so the module is a parameter rather than a second copy of the closure:
+
+    * ``session_control`` -- feature-flagged (``agent.session_control``), with the
+      enabled check inside the handler.
+    * ``agent_panel`` -- the crew webview store, whose MCP server ships gated off
+      (``opt_in``) and which most installs never publish to.
+    * ``mcp_apps`` -- feature-flagged (``mcp_gateway.apps_enabled``); its module
+      scope imports the gateway backend, which must never load on dashboard boot.
+
+    ``module_name`` is a submodule of ``kiro_crew.dashboard.handlers``, not a
+    dotted path, so this cannot be pointed at an arbitrary module.
     """
 
     async def _route(request: web.Request) -> web.StreamResponse:
-        from kiro_crew.dashboard.handlers import session_control
-
-        handler = getattr(session_control, handler_name)
+        module = import_module(f"kiro_crew.dashboard.handlers.{module_name}")
+        handler = getattr(module, handler_name)
         return await handler(request)
 
     _route.__name__ = handler_name
@@ -1689,7 +1802,8 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/spawn/lost", handlers.api_spawn_lost)
     app.router.add_post("/api/spawn/mark-collected", handlers.api_spawn_mark_collected)
     # MCP Apps (SEP-1865): embedded app iframe -> gateway tool callback.
-    app.router.add_post("/api/mcp-apps/call", handlers.api_mcp_apps_call)
+    app.router.add_post("/api/mcp-apps/call", _deferred("mcp_apps", "api_mcp_apps_call"))
+    app.router.add_post("/api/mcp-apps/message", _deferred("mcp_apps", "api_mcp_apps_message"))
     app.router.add_get("/api/spawn", handlers.api_spawn_list)
     app.router.add_post("/api/spawn/stop-all", handlers.api_spawn_stop_all)
     # Fairness: the resume-hold, lanes and adaptive routes
@@ -1711,6 +1825,47 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/work-ledger/record", _deferred_work_ledger("api_work_ledger_record"))
     app.router.add_get("/api/work-ledger/brief", _deferred_work_ledger("api_work_brief"))
     app.router.add_post("/api/work-ledger/report", _deferred_work_ledger("api_work_report"))
+    app.router.add_post(
+        "/api/work-ledger/rebuild", _deferred_work_ledger("api_work_ledger_rebuild")
+    )
+    # The Crew page's masked read of a conductor's work ledger (RFC Phase 4).
+    # Deliberately NOT in ``_STRICT_INTERNAL_API_PATHS``: a browser is its only
+    # caller, so it stays on cookie auth — the same split the agent-panel surface
+    # draws between its MCP write and its browser read. Rows are masked of
+    # ``worker_session_key``; see the module.
+    #
+    # Spelled "/api/crew-board" and NOT "/api/work-ledger/board" on purpose. That
+    # list matches ``path == p or path.startswith(p + "/")`` and already holds
+    # "/api/work-ledger" to cover "/record", "/brief" and "/report" — so a path
+    # under that prefix would inherit MCP-only auth and 403 every browser call.
+    # Keeping it off the prefix means the strict list needs no exception, which is
+    # not a mechanism a security matcher should have to grow for a read route.
+    app.router.add_get("/api/crew-board", _deferred("work_ledger_board", "api_work_ledger_board"))
+    # The action half. Cookie-authed like the read above and for the same reason:
+    # its principal is the dashboard owner, who already stops any session from the
+    # Stop button. It resolves the worker session key from the store and never
+    # returns it, which is what lets the page offer an affordance whose target the
+    # masked read deliberately withholds.
+    app.router.add_post(
+        "/api/crew-board/action",
+        _deferred("work_ledger_board", "api_work_ledger_board_action"),
+    )
+    # The write half of the agent panel surface -- MCP-only, like the ledger
+    # above. The READ, "/api/members/{slug}/panel", is registered here too and
+    # stays on cookie auth because a browser is its only caller.
+    #
+    # Registered route-by-route through the deferred binder rather than by
+    # calling the module's own `register_agent_panel_routes`: that call would
+    # import the module at boot, which is what the boot-path rule forbids for an
+    # optional subsystem. The paths are duplicated from that function, and
+    # `test_agent_panel_routes` pins both spellings against each other.
+    app.router.add_get(
+        "/api/agent-panel/templates", _deferred("agent_panel", "api_agent_panel_templates")
+    )
+    app.router.add_post(
+        "/api/agent-panel/publish", _deferred("agent_panel", "api_agent_panel_publish")
+    )
+    app.router.add_get("/api/members/{slug}/panel", _deferred("agent_panel", "api_member_panel"))
     app.router.add_get("/api/crons", handlers.api_crons)
     app.router.add_post("/api/crons", handlers.api_crons_create)
     app.router.add_delete("/api/crons", handlers.api_cron_batch_delete)
@@ -1750,19 +1905,48 @@ def _register_mcp_routes(app: web.Application) -> None:
     # _STRICT_INTERNAL_API_PATHS, which test_session_control_routes_are_strict
     # pins by deriving the route set from the router rather than a hand-copied list.
     app.router.add_post(
-        "/api/session-control/create", _deferred_session_control("api_session_control_create")
+        "/api/session-control/create", _deferred("session_control", "api_session_control_create")
     )
     app.router.add_post(
-        "/api/session-control/stop", _deferred_session_control("api_session_control_stop")
+        "/api/session-control/fork", _deferred("session_control", "api_session_control_fork")
     )
     app.router.add_post(
-        "/api/session-control/close", _deferred_session_control("api_session_control_close")
+        "/api/session-control/stop", _deferred("session_control", "api_session_control_stop")
     )
     app.router.add_post(
-        "/api/session-control/send", _deferred_session_control("api_session_control_send")
+        "/api/session-control/set-model",
+        _deferred("session_control", "api_session_control_set_model"),
+    )
+    app.router.add_post(
+        "/api/session-control/close", _deferred("session_control", "api_session_control_close")
+    )
+    app.router.add_post(
+        "/api/session-control/revive", _deferred("session_control", "api_session_control_revive")
+    )
+    app.router.add_post(
+        "/api/session-control/send", _deferred("session_control", "api_session_control_send")
+    )
+    app.router.add_post(
+        "/api/session-control/broadcast",
+        _deferred("session_control", "api_session_control_broadcast"),
     )
     app.router.add_get(
-        "/api/session-control/read", _deferred_session_control("api_session_control_read")
+        "/api/session-control/status",
+        _deferred("session_control", "api_session_control_status"),
+    )
+    app.router.add_post(
+        "/api/session-control/adopt", _deferred("session_control", "api_session_control_adopt")
+    )
+    app.router.add_post(
+        "/api/session-control/release",
+        _deferred("session_control", "api_session_control_release"),
+    )
+    app.router.add_get(
+        "/api/session-control/read", _deferred("session_control", "api_session_control_read")
+    )
+    app.router.add_get(
+        "/api/session-control/summary",
+        _deferred("session_control", "api_session_control_summary"),
     )
     app.router.add_get("/api/browser/install", handlers.api_browser_install_get)
     app.router.add_put("/api/browser/token", handlers.api_browser_token_put)
@@ -1770,6 +1954,16 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post("/api/browser/engine", handlers.api_browser_engine_install)
     app.router.add_get("/api/browser/view", handlers.api_browser_view_get)
     app.router.add_post("/api/browser/view/start", handlers.api_browser_view_start)
+    # Same-origin relay for the CLI browser view: the panel frames this path
+    # instead of the raw loopback URL, so the live view is reachable wherever
+    # the dashboard is (SSH forward, tunnel) with no second forwarded port.
+    # HTTP and WebSocket both. Authenticated by the per-instance capability
+    # token embedded in the path (NOT the session cookie: the panel frames it
+    # in an opaque-origin sandbox that sends none) — the prefix is on
+    # token_auth's bypass list and the handler enforces the token itself. See
+    # handlers/browser_view_relay.py for the rewrites and the full posture.
+    app.router.add_get("/browser-view", handlers.api_browser_view_relay)
+    app.router.add_get("/browser-view/{tail:.*}", handlers.api_browser_view_relay)
     # The Browser panel's address bar on the non-native transport: opens an
     # owner-typed URL in the gateway host's Playwright CLI browser and shows it
     # through the view above. Owner-only (cookie/token) and deliberately NOT on
@@ -2066,6 +2260,27 @@ def _resolved_bound_port(runner: web.AppRunner, port: int) -> int:
     return 0
 
 
+def _resolved_bound_host(runner: web.AppRunner, requested: str) -> str:
+    """The address actually bound, falling back to the *requested* one.
+
+    A credential is keyed by a listener, and a listener is an address AND a port.
+    Reading the sockname rather than trusting the requested value keeps the key
+    paired with what the kernel bound, which is what a client dials.
+
+    Returns ``""`` when neither is readable, which suppresses the listener-keyed
+    publication rather than filing the credential under a guess. A reader that
+    finds no entry refuses, so the empty case costs an explicit sign-in instead
+    of pointing a client at the wrong listener.
+    """
+    for addr in runner.addresses:
+        # Same sockname shape as _resolved_bound_port; a unix socket's is a str.
+        if isinstance(addr, (tuple, list)) and len(addr) >= 2 and isinstance(addr[1], int):
+            host = addr[0]
+            if isinstance(host, str) and host:
+                return host
+    return requested if isinstance(requested, str) else ""
+
+
 async def _start_site(
     site: web.TCPSite,
     port: int,
@@ -2111,7 +2326,7 @@ async def _start_site(
                     outcome = ""
                 if outcome == RECLAIMED:
                     logger.warning(
-                        "Reclaimed port %d from a stale KiroCrew gateway — rebinding.",
+                        "Reclaimed port %d from a stale Kiro Crew gateway — rebinding.",
                         port,
                     )
                 elif outcome not in (HEALTHY_PEER, FOREIGN_HOLDER):
@@ -2128,10 +2343,152 @@ async def _start_site(
             if attempt < retries - 1:
                 await asyncio.sleep(delay)
     logger.error(
-        "Port %d still in use after %.0fs — is another KiroCrew gateway running?\n"
+        "Port %d still in use after %.0fs — is another Kiro Crew gateway running?\n"
         "Stop it with: kirocrew stop  or  sudo systemctl stop kirocrew",
         port,
         retries * delay,
+    )
+    raise SystemExit(1) from last_exc
+
+
+def _bind_once(host: str, port: int) -> socket.socket:
+    """Bind and listen once, synchronously, for dashboard port reservation.
+
+    Family-resolved from *host* (KIROCREW_BIND may name an IPv6 address such
+    as ``::`` or an interface-specific literal — an AF_INET socket cannot bind
+    those). Callers run this off the event loop (``asyncio.to_thread``):
+    getaddrinfo on a non-literal host and the bind syscall are blocking work
+    that must not run on the sole loop (no-blocking-call-on-event-loop).
+    """
+    family = socket.AF_INET
+    with contextlib.suppress(OSError):
+        family = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)[
+            0
+        ][0]
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        # Match asyncio.create_server's socket posture. SO_REUSEADDR on POSIX
+        # lets our next generation rebind through TIME_WAIT. Windows requires
+        # exclusive ownership because SO_REUSEADDR allows a co-resident process
+        # to overlap a live listener.
+        if os.name == "posix":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        # An IPv6 wildcard must not silently expose the listener on IPv4 too.
+        if family == socket.AF_INET6 and hasattr(socket, "IPPROTO_IPV6"):
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((host, port))
+        # listen() IMMEDIATELY — this is load-bearing, not cosmetic. A
+        # SO_REUSEADDR socket that is bound but NOT listening permits a
+        # co-resident process to overlap-bind the same port (both the
+        # exact and the specific-over-wildcard forms) and steal the
+        # loopback callbacks carrying app secrets; entering TCP_LISTEN
+        # makes that bind a hard EADDRINUSE conflict. Listening does NOT
+        # serve anything: connections queue in the backlog until
+        # SockSite.start() attaches the HTTP protocol, so the boot pass stays
+        # race-free and an early child callback waits instead of being refused.
+        sock.listen(128)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+# Windows TcpTimedWaitDelay default: remnant connections from the previous
+# generation pin the port for up to 4 minutes, during which an exclusive
+# (SO_EXCLUSIVEADDRUSE) bind is refused. The reservation ladder stretches to
+# this budget ONLY on Windows and ONLY when the reclaim probe found no live
+# holder — see _reserve_dashboard_port.
+_TIME_WAIT_BUDGET_SECS = 240
+
+
+async def _reserve_dashboard_port(
+    host: str,
+    port: int,
+    *,
+    retries: int = 30,
+    delay: float = 0.5,
+    reclaim: Callable[[int], Awaitable[str]] | None = None,
+) -> socket.socket:
+    """Bind AND listen on the dashboard port; return the owned socket.
+
+    This is _start_site's reclaim/retry contract moved to the moment of BIND,
+    so the gateway OWNS its port before anything downstream (the app-backend
+    boot pass) acts on the port's value. Bound-and-LISTENING is the reserved
+    state: entering TCP_LISTEN is what makes any overlap bind a hard
+    EADDRINUSE for other processes (see the listen() note in _bind_once), yet
+    nothing is served — connections queue in the kernel backlog until the
+    runner wraps the socket in a SockSite and starts accepting. The bound
+    socket's real name is also what makes ``--port auto`` (port 0) knowable
+    BEFORE the app backends spawn.
+
+    Same recovery ladder as _start_site: first EADDRINUSE probes/reclaims a
+    stale Kiro Crew holder, otherwise wait up to retries*delay for a graceful
+    handover, then SystemExit(1). Non-EADDRINUSE OSErrors re-raise. One
+    Windows widening: when the probe finds NO live holder (the TIME_WAIT
+    signature — remnant connections pin the port with no process to reclaim),
+    the wait budget stretches to ``_TIME_WAIT_BUDGET_SECS``, because the
+    exclusive bind (``SO_EXCLUSIVEADDRUSE`` in ``_bind_once``) is documented
+    to refuse the port until those remnants expire and a routine restart
+    right after serving must out-wait them rather than fail boot.
+    """
+    _reclaim = reclaim if reclaim is not None else reclaim_stale_gateway_port
+    last_exc: OSError | None = None
+    budget = retries
+    attempt = 0
+    while attempt < budget:
+        try:
+            return await asyncio.to_thread(_bind_once, host, port)
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            last_exc = exc
+            if attempt == 0:
+                try:
+                    outcome = await _reclaim(port)
+                except Exception:  # never let a reclaim bug block startup
+                    logger.exception(
+                        "Port %d reclaim probe failed — falling back to wait/retry.",
+                        port,
+                    )
+                    outcome = ""
+                if outcome == RECLAIMED:
+                    logger.warning(
+                        "Reclaimed port %d from a stale Kiro Crew gateway — rebinding.",
+                        port,
+                    )
+                elif outcome not in (HEALTHY_PEER, FOREIGN_HOLDER):
+                    # NO_HOLDER + EADDRINUSE is the TIME_WAIT signature: the
+                    # previous generation's connections still pin the port in
+                    # the kernel with no process to reclaim. On Windows the
+                    # reservation binds SO_EXCLUSIVEADDRUSE (see _bind_once),
+                    # which is documented to refuse a bind while TIME_WAIT
+                    # remnants exist — so a routine restart right after serving
+                    # must be able to out-wait TcpTimedWaitDelay (4 min default)
+                    # rather than dying on a 15s ladder sized for a graceful
+                    # handover. Gated on NO_HOLDER EXACTLY: UNAVAILABLE (probe
+                    # tooling missing) and RECLAIM_FAILED (a live holder that
+                    # would not die) are not TIME_WAIT, and stretching on them
+                    # would stall boot four minutes for a port that waiting
+                    # cannot free. A live holder (healthy peer or foreign
+                    # process) keeps the short ladder and its fast exit.
+                    if outcome == NO_HOLDER and os.name == "nt":
+                        budget = max(budget, int(_TIME_WAIT_BUDGET_SECS / delay))
+                    logger.warning(
+                        "Port %d in use — waiting up to %.0fs for the previous"
+                        " gateway to release it…",
+                        port,
+                        budget * delay,
+                    )
+            attempt += 1
+            if attempt < budget:
+                await asyncio.sleep(delay)
+    logger.error(
+        "Port %d still in use after %.0fs — is another Kiro Crew gateway running?\n"
+        "Stop it with: kirocrew stop  or  sudo systemctl stop kirocrew",
+        port,
+        budget * delay,
     )
     raise SystemExit(1) from last_exc
 
@@ -2158,6 +2515,132 @@ def _remove_stale_unix_socket(path: Path) -> None:
         path.unlink()
     except OSError as exc:
         logger.warning("could not remove stale dashboard socket %s: %s", path, exc)
+
+
+SECONDARY_LOOPBACK_FOR = {"127.0.0.1": "::1", "::1": "127.0.0.1"}
+
+#: Hostnames that name a SET of loopback listeners rather than one, so reaching
+#: them can land on either family. The client side keeps the same list
+#: (``AMBIGUOUS_LOOPBACK_NAMES`` in ``website/electron/local-token.js``), because
+#: both sides answer the same question: may a credential be sent to this host?
+AMBIGUOUS_LOOPBACK_HOSTS = frozenset({"localhost", "kirocrew.localhost"})
+
+
+def _holds_every_loopback_family(state: DashboardState) -> bool:
+    """Whether this gateway currently holds BOTH loopback families.
+
+    The server-side counterpart of ``listenerSecretsFor``: a name that resolves to
+    two families is safe to send a credential to -- or to redirect a
+    cookie-carrying navigation onto -- only while one gateway answers on all of
+    them.
+
+    Read from the claims this process recorded plus each guard's live socket, so a
+    family that was never bound and a family whose listener has since died give the
+    same answer. Fails closed before publication, when no claim is recorded yet:
+    the gateway has nothing to prove coverage with, and a redirect suppressed
+    during boot costs one un-canonicalized document.
+    """
+    sidecars = getattr(state, "_listener_sidecars", None) or {}
+    if "primary" not in sidecars or "secondary" not in sidecars:
+        return False
+    for attr in ("_listener_guard", "_secondary_listener_guard"):
+        guard = getattr(state, attr, None)
+        if guard is not None and not guard.listener_open():
+            return False
+    return True
+
+
+class SecondaryLoopback(NamedTuple):
+    """The second loopback listener: the address it holds, and its live site.
+
+    The site is carried, not discarded, because the address alone cannot be
+    maintained. A published sidecar asserts that this gateway holds this address
+    NOW, and the only object that can answer whether it still does -- or rebind
+    it when it does not -- is the site's own LISTEN socket. Returning the address
+    by itself made the claim permanent and the listener unguardable at once.
+    """
+
+    address: str
+    site: web.SockSite
+
+
+async def _start_secondary_loopback_site(
+    runner: web.AppRunner, port: int, primary_host: str
+) -> SecondaryLoopback | None:
+    """Additionally serve the OTHER loopback family on the same port.
+
+    A client reaching the gateway by name rather than by address dials
+    ``localhost``, which resolves to BOTH loopback families on an ordinary host.
+    That name therefore identifies a SET of listeners, and whichever family the
+    gateway did not bind is free for a co-resident process to take -- so a
+    credential sent to the name can land on a party the gateway never was. Two
+    ways out: rewrite the name to a literal at every call site, which moves the
+    document's web origin and splits every comparison that holds the configured
+    string; or hold both families, so the name can only reach this gateway.
+
+    This is the second. Binding ``::1`` beside ``127.0.0.1`` (or the reverse)
+    makes the ambiguity harmless rather than routed around, and the evidence a
+    client needs is already published: one ``run/gateway-<port>-<address>.secret``
+    per bound address, so "this gateway holds every family the name reaches" is
+    readable from local disk with nothing asked of the peer.
+
+    Strictly additive, in the sense ``_start_unix_site`` established: same
+    :class:`web.AppRunner`, so both listeners serve the identical app and
+    middleware chain, and ANY failure logs once and leaves the primary listener
+    exactly as it is. Failure is the interesting case and it is safe: without the
+    second entry a client dialling the name finds a family uncovered, refuses to
+    send its secret, and falls through to the token prompt. That is one explicit
+    sign-in, and it is the same cost a single-family gateway already pays.
+
+    Deliberately NOT using the reclaim/retry ladder that guards the primary bind.
+    A process already holding the other family's socket is precisely the threat
+    this exists to exclude; reclaiming it would terminate a stranger's listener,
+    and waiting for it would delay boot for a port the gateway does not need.
+    One attempt, then degrade.
+
+    Only the two loopback literals have a counterpart. A wildcard or an
+    interface-specific bind is not a loopback family pair, and
+    ``KIROCREW_BIND=<something else>`` is an operator naming one listener on
+    purpose, so neither gets a second socket.
+
+    Returns the address actually bound together with its live site, or ``None``
+    when there is no second listener -- which the caller treats as "publish one
+    address, not two". The site goes back to the caller so the listener can be
+    guarded and its sidecar withdrawn if it dies: see
+    :func:`_arm_secondary_listener_guard`.
+    """
+    secondary = SECONDARY_LOOPBACK_FOR.get(primary_host)
+    if secondary is None:
+        return None
+    try:
+        # Offloaded for the same reason as the primary reservation: getaddrinfo
+        # and bind are blocking syscalls (no-blocking-call-on-event-loop).
+        sock = await asyncio.to_thread(_bind_once, secondary, port)
+    except OSError as exc:
+        logger.info(
+            "second loopback listener on [%s]:%d unavailable (%s); clients dialling a "
+            "name that resolves there will sign in explicitly",
+            secondary,
+            port,
+            exc,
+        )
+        return None
+    try:
+        site = web.SockSite(runner, sock)
+        await site.start()
+    except Exception as exc:
+        with contextlib.suppress(OSError):
+            sock.close()
+        logger.info(
+            "second loopback listener on [%s]:%d could not start (%s); the primary "
+            "listener is unaffected",
+            secondary,
+            port,
+            exc,
+        )
+        return None
+    logger.info("dashboard also listening on [%s]:%d", secondary, port)
+    return SecondaryLoopback(secondary, site)
 
 
 async def _start_unix_site(runner: web.AppRunner, port: int) -> Path | None:
@@ -2248,14 +2731,26 @@ def _live_sibling_port(own_port: int) -> int | None:
     return None
 
 
-def _write_instance_credentials(secret_path: Path, port: int, secret: str) -> None:
+def _write_instance_credentials(
+    secret_path: Path,
+    port: int,
+    host: str,
+    secret: str,
+    extra_hosts: Sequence[str] = (),
+) -> None:
     """Publish this gateway's internal-API credential.
 
-    Writes two files with different lifetimes:
+    Writes up to three files with different lifetimes:
 
-    * ``run/gateway-<port>.secret`` -- ALWAYS. Paired with the listener, so a
-      client that resolved a port reads the credential of the process that owns
-      that port rather than whichever gateway wrote the shared file last.
+    * ``run/gateway-<port>.secret`` -- ALWAYS, and FIRST. Paired with the port
+      rather than the listener, for readers that resolve a port and nothing
+      finer. First because it is load-bearing for boot: a pod waits on it.
+    * ``run/gateway-<port>-<address>.secret`` -- whenever the bound address is
+      known. Names ONE listener, so a client that dialled a specific address
+      either reads the credential of the party it reached or reads nothing. A
+      port number alone cannot carry that: ``KIROCREW_BIND=::1`` leaves IPv4
+      ``127.0.0.1:<port>`` free for a co-resident to take, and a port-keyed
+      lookup would hand that co-resident this gateway's credential.
     * ``.local_secret`` -- only when no other gateway in this data home is
       verifiably alive on a different port. Overwriting it while a sibling is
       serving is the desync this guard exists to prevent: the sibling keeps
@@ -2265,9 +2760,47 @@ def _write_instance_credentials(secret_path: Path, port: int, secret: str) -> No
       is still written in the single-instance case because pre-per-port clients
       (an older CLI, a cron script from a previous install) read only that path.
 
+    The listener-keyed write is CONTAINED rather than fatal, and it is ordered
+    after the credential a booting pod waits on. ``_write_secret_file`` raises
+    ``OSError`` on any failure -- including a Windows DACL apply that cannot
+    resolve the invoking SID -- and the caller answers an ``OSError`` here by
+    tearing the runner down, so letting this one propagate would let an extra
+    artifact stop the gateway from starting at all. Its absence is safe in a way
+    that is not true of the others: a client that finds no entry for the address
+    it dialled refuses and asks for a token, so the cost is one explicit
+    sign-in.
+
+    An empty *host* suppresses the listener-keyed write for the same reason
+    rather than filing the credential under a guessed address.
+
     Blocking fs I/O; the caller offloads this whole function.
     """
     _write_secret_file(run_marker.secret_path(int(port)), secret)
+    # One sidecar per address this generation actually bound. The SET of them is
+    # what a client reads to answer "does this gateway hold every family the host
+    # I am dialling can resolve to?" -- so a gateway holding both loopback
+    # families publishes two, and a name that resolves to either reaches only
+    # this gateway. A single-family gateway publishes one, and a client dialling
+    # the name finds a family uncovered and signs in explicitly instead.
+    for address in dict.fromkeys(a for a in (host, *extra_hosts) if a):
+        listener_path = run_marker.listener_secret_path(int(port), address)
+        try:
+            _write_secret_file(listener_path, secret)
+        except OSError:
+            # Named, not silent: a client dialling this address falls through to
+            # the sign-in prompt, and the operator should be able to see why.
+            # Only the file NAME is logged, never a value read from it.
+            logger.warning(
+                "Could not publish the listener sidecar %s; clients dialling that "
+                "address will sign in explicitly instead.",
+                listener_path.name,
+                exc_info=True,
+            )
+        else:
+            # Recorded only on success, so shutdown deletes exactly what this
+            # generation put on disk and never a sibling's entry (see
+            # run_marker.clear_marker).
+            run_marker.note_published_listener(int(port), address)
     sibling = _live_sibling_port(int(port))
     if sibling is not None:
         logger.warning(
@@ -2396,6 +2929,42 @@ def _apply_startup_yolo(state: DashboardState, cfg: Any) -> None:
         "Safety override enabled at startup (dangerouslySkipPermissions=true, %s)",
         "no expiry" if result.ttl == 0 else f"expires in {result.ttl}s per policy",
     )
+
+
+async def _retake_hops_then_revive(registry: InstancesRegistry, manager: SshTunnelManager) -> None:
+    """Re-take the lent hop ports, then revive. Both off the boot path, in this order.
+
+    A hop lease is PERSISTED and the listening socket that enforces it is not, so a
+    restart arrives holding leases that keep ports out of this gateway's own allocator
+    and own them in no other sense -- the window the lease alone cannot close, reopened
+    by the restart. Re-taking them is therefore startup work, not a nicety.
+
+    But it is not BOOT-PATH work. `_instances_startup` is an `on_startup` hook, so it
+    runs inside `runner.setup()` before the HTTP port is bound, and the re-take costs a
+    registry read plus one bind per live lease -- data-scaled work on the path the
+    desktop app's gateway-wait window measures. So it moves in here, behind the same
+    tracked task that already backgrounds the revive below for that exact reason, and
+    the read itself goes to a thread because it is a file read on the event loop.
+
+    Ordering is load-bearing and is why this is one task rather than two: the revive
+    reconnects instances that will ALLOCATE ports, and a lease whose hold is not yet
+    taken is a port the allocator already avoids but nothing owns. Re-taking first
+    means no reconnect can race a lease that is still unenforced.
+    """
+    try:
+        unheld = await asyncio.to_thread(manager.sync_hop_holds)
+    except Exception:
+        logger.exception("Could not re-take lent hop ports after restart")
+    else:
+        if unheld:
+            logger.error(
+                "Could not re-take %d lent hop port(s) after restart: %s. A chained "
+                "credential naming each is still valid, so another process may hold "
+                "it; the guard retries each until it is taken or its lease lapses.",
+                len(unheld),
+                sorted(unheld),
+            )
+    await _revive_intended_instances(registry, manager)
 
 
 async def _revive_intended_instances(
@@ -3059,6 +3628,205 @@ def _register_workflow_lifecycle(app: web.Application, state: DashboardState) ->
     app.on_cleanup.append(_workflow_shutdown)
 
 
+# How long a mutating request waits for the startup crewmate prune before it is
+# answered 503. The pass is marker-gated and runs immediately after the bind, so
+# on every boot but the first after the upgrade the wait is the few milliseconds
+# the pass takes to find the marker; on that first boot it is one config read
+# and one read of each candidate's DM transcript.
+_CREWMATE_PRUNE_GATE_TIMEOUT_S = 60.0
+_CREWMATE_PRUNE_GATE_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+#: Held whatever the method, so the roster is read once the pass has settled
+#: and never lists a row the pass is removing. ``GET /api/members`` is not a
+#: pure read either: it calls ``MemberEventLogService.ensure`` for every row
+#: and ``reconcile_member_config`` appends to the member log. Every
+#: ``/api/members`` route reaches the same rows, so the whole prefix waits.
+_CREWMATE_PRUNE_GATE_HELD_PREFIXES = ("/api/members",)
+
+
+def _register_crewmate_prune_gate(app: web.Application, state: DashboardState) -> None:
+    """Arm the crewmate-prune barrier before bind; the pass itself runs after.
+
+    The startup prune (``crewmate_prune_migration``) decides from each
+    candidate's Crewmates-page DM thread which sync-generated crewmates were
+    never chatted with, then
+    deletes their rows. Every writer that can bind an agent to a session while
+    the gateway is up reaches it through a mutating request -- the chat send,
+    slot create, slot agent switch, member thread, channel and import routes
+    under ``/api/``, and the OpenAI-compatible ``POST /v1/chat/completions`` --
+    so ONE middleware holds every non-safe-method request until the pass
+    settles, with no path list to keep in step with the route table. The
+    member roster is held too, whatever its method, so it is read once the
+    pass has settled and never lists a row the pass is removing
+    (``_CREWMATE_PRUNE_GATE_HELD_PREFIXES``). The writers that do not come
+    through HTTP wait in ``await_crewmate_prune_settled`` instead.
+
+    Armed HERE, before ``_start_site`` binds the listener, so no request can
+    pass between the bind and the pass. The pass itself is kicked as a tracked
+    background task right after the bind (``_kick_crewmate_prune``) and sets
+    ``crewmate_prune_settled`` in its ``finally``, so the hold is the pass
+    alone and readiness is not gated by it. Other reads are never held, and
+    the fast path is one ``is_set()`` read, which is what every request pays
+    once the pass has settled. A held request that outlives the budget is
+    answered 503 and writes nothing; it does not abandon the pass.
+    """
+    state.crewmate_prune_settled.clear()
+
+    @web.middleware
+    async def _crewmate_prune_gate(request: web.Request, handler: Any) -> web.StreamResponse:
+        if not state.crewmate_prune_settled.is_set() and (
+            request.method not in _CREWMATE_PRUNE_GATE_SAFE_METHODS
+            or _crewmate_prune_gate_holds_path(request.path)
+        ):
+            try:
+                await asyncio.wait_for(
+                    state.crewmate_prune_settled.wait(), timeout=_CREWMATE_PRUNE_GATE_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                return web.json_response(
+                    {
+                        "error": "Crewmates are being tidied; retry shortly.",
+                        "code": "prune_in_progress",
+                    },
+                    status=503,
+                )
+        return await handler(request)
+
+    app.middlewares.append(_crewmate_prune_gate)
+
+
+def _crewmate_prune_gate_holds_path(path: str) -> bool:
+    """Whether *path* is one the gate holds whatever the request's method."""
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in _CREWMATE_PRUNE_GATE_HELD_PREFIXES
+    )
+
+
+def _kick_crewmate_prune(state: DashboardState) -> None:
+    """Run the one-time crewmate prune as a tracked background task, post-bind.
+
+    ``prune_synced_crewmates`` scans the first line of every session file, so
+    its cost scales with the user's history and it must not sit between the
+    bind and ``KIROCREW_READY`` (``no-new-work-on-gateway-boot-path``, item 3).
+    Same shape as ``_kick_knowledge_orphan_reclaim``: kicked after ``_start_site``
+    returns, run on a worker thread (config lock and file reads are IO). The
+    gate armed before the bind holds every mutating request until the event is
+    set, which happens in ``finally`` whatever the pass does. Nothing on the
+    readiness path waits for it -- not even the slot restores: a row the pass
+    removes has, by its own evidence rule, no DM binding and no session whose
+    metadata names it, so no restore can rebuild a slot for it. The writers
+    that do NOT come through HTTP -- channel agent resume, cron dispatch, the
+    subagent pump -- start only after ``await_crewmate_prune_settled`` returns
+    (``GatewayOrchestrator.run`` after the memory barrier, past
+    ``KIROCREW_READY``; the standalone dashboard before its inline channel
+    resume), so none of them can bind a crewmate while the pass is judging it.
+    The one startup step that DELETES a transcript, the channel transcript
+    migration, merges but keeps its copies while the event is clear and
+    removes them from ``_kick_deferred_transcript_removal`` once it is set, so
+    the pass reads every first line the boot started with; a transcript that
+    still vanishes under the pass voids it (nothing removed).
+    The pass reads ``crewmate_prune_abandon`` before each candidate and again
+    inside the config lock before each delete; that helper sets it when the
+    pass outlives its budget, and the pass then finishes without deleting.
+    The pass itself takes a cross-process lock beside its marker for its whole
+    length, so a second gateway on the same data home cannot run its own pass
+    beside this one -- its pass waits on that lock (its writers held by its
+    own barrier meanwhile) and then finds the marker. On every boot but the
+    first after the upgrade the pass is that lock and one marker stat.
+    """
+
+    async def _run() -> None:
+        try:
+            prune = await asyncio.to_thread(
+                prune_synced_crewmates,
+                state.conversation_log,
+                abandoned=state.crewmate_prune_abandon.is_set,
+            )
+            if prune.removed:
+                logger.info(
+                    "removed %d unused auto-generated crewmates: %s",
+                    len(prune.removed),
+                    ", ".join(prune.removed),
+                )
+        except Exception:  # noqa: BLE001 -- the pass never raises for unreadable history
+            logger.warning("crewmate prune migration failed", exc_info=True)
+        finally:
+            state.crewmate_prune_settled.set()
+
+    task = asyncio.create_task(_run())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+async def await_crewmate_prune_settled(state: DashboardState, *, before: str) -> None:
+    """Wait for the startup crewmate prune before starting a session writer.
+
+    Every writer that binds an agent to a session without an HTTP request --
+    the channel agent resume, cron dispatch, the subagent pump -- calls this
+    first, so the pass's history snapshot cannot be overtaken by a binding it
+    never saw. Returns only once ``crewmate_prune_settled`` is set, which the
+    pass does in ``finally`` after it has RETURNED -- so no writer ever runs
+    beside a pass that can still delete. The budget bounds how long the pass
+    may keep deleting, not how long the writer waits: when the pass outlives
+    it, this sets ``crewmate_prune_abandon`` -- the pass reads it before each
+    candidate and inside the config lock before each delete, keeps whatever it
+    has not judged, writes its marker and returns -- and then waits for the
+    event. The pass always returns: its file opens are non-blocking and its
+    lock acquires are bounded (``platform_compat.file_lock`` raises rather
+    than waits on a stuck holder), and either outcome ends in ``finally``.
+    ``before`` names the writer for the log line.
+    """
+    try:
+        await asyncio.wait_for(
+            state.crewmate_prune_settled.wait(), timeout=_CREWMATE_PRUNE_GATE_TIMEOUT_S
+        )
+        return
+    except asyncio.TimeoutError:
+        state.crewmate_prune_abandon.set()
+        logger.warning(
+            "crewmate prune has not settled in %.0fs; it will keep its unjudged "
+            "crewmates, and %s starts once it has returned",
+            _CREWMATE_PRUNE_GATE_TIMEOUT_S,
+            before,
+        )
+    await state.crewmate_prune_settled.wait()
+
+
+def _kick_deferred_transcript_removal(state: DashboardState, claimed: frozenset[str]) -> None:
+    """Remove the channel transcript copies the startup merge left for the prune.
+
+    ``start_dashboard`` merges every orphaned dashboard copy into its channel
+    transcript before the session restores read it, but while the crewmate
+    prune has not settled it passes ``remove=False``: the copy's first line is
+    the only record of the agent that dashboard surface ran as, and the pass
+    reads exactly that line to decide which crewmates were used. Deleting the
+    copy under the pass would leave a used crewmate with no evidence and get
+    its row removed. So the delete waits here, off the readiness path, for
+    the pass to RETURN (``crewmate_prune_settled`` is set in its ``finally``),
+    then re-runs the migration with removal on; the re-merge is byte-identical
+    and only the deletes are new. Best-effort like the startup call: a failure
+    leaves the copies for the next start, which merges and removes them again.
+    """
+
+    async def _run() -> None:
+        await state.crewmate_prune_settled.wait()
+        try:
+            removed = await asyncio.to_thread(
+                migrate_channel_transcripts, dashboard_slots=claimed, remove=True
+            )
+            if removed:
+                logger.info(
+                    "Removed %d leftover channel transcript copies after the crewmate prune",
+                    removed,
+                )
+        except Exception:  # noqa: BLE001 -- the copies stay for the next start
+            logger.warning("deferred channel transcript removal failed", exc_info=True)
+
+    task = asyncio.create_task(_run())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
 def _kick_workflow_initialization(state: DashboardState) -> None:
     """Called only after listener bind and successful credential publication."""
     if state.workflow_startup_task is not None or state.workflow_startup_stopping:
@@ -3123,78 +3891,129 @@ def _kick_connections_warm_scavenge(state: DashboardState) -> None:
 
 
 def _kick_session_search_index(state: DashboardState) -> None:
-    """Keep the session search candidate index caught up, post-bind.
+    """Keep the session search candidate index caught up, in its OWN process.
 
-    Without this the index never gets built and search silently stays on the
-    scan path — correct, and as slow as it was (measured 6.7 s per keystroke on
-    a 2.96 GB corpus, against ~0.3 s indexed).
+    Without an indexer the index never gets built and search silently stays on
+    the scan path — correct, and as slow as it was (measured 6.7 s per keystroke
+    on a 2.96 GB corpus, against ~0.3 s indexed).
 
-    Shape, and why each part is what it is:
+    The indexing itself runs in a spawned child process, not here. It is
+    pure-Python CPU (read, ``casefold``, project, insert), so as an
+    ``asyncio.to_thread`` call it held the GIL that this gateway's event loop
+    needs: ``py-spy top --gil`` attributed 28% of all GIL-holding samples to it,
+    and the loop showed ``event-loop heartbeat: lag 1.0-6.6s`` on an 84%-idle
+    machine. See ``kiro_crew.history_index_worker`` for why a process rather than
+    a thread, why spawn rather than fork, and why deletion stays here.
 
-    * post-bind and in a worker thread, like the warm scavenge — a first pass
-      over a large corpus reads and parses every session in the search window
-      (~70 s for 500 files here) and must never sit in front of the listener or
-      on the event loop;
-    * budgeted per pass rather than run to completion, so the first pass yields
-      the thread repeatedly instead of holding it for a minute;
-    * paced by a sleep between passes once caught up, because the only work then
-      is picking up sessions that changed since the last pass;
-    * ``optimize`` on a slow multiple of the pass, since FTS5 deletes leave
-      tombstones that every query pays for until segments merge.
+    This gateway keeps only the read-only query path, plus the one index write
+    that belongs to deletion (``delete_session`` removes a session's indexed text
+    before unlinking the transcript and aborts if it cannot).
 
-    A failure is logged and the loop continues: a missing row costs one scanned
-    file, so the honest response to an index that will not build is to keep
-    serving searches from the files.
+    What is left here is supervision: start the child, restart it if it dies,
+    stop it when this gateway stops. Three things retire the child, and the
+    order matters because the first two can be skipped: this task's ``finally``
+    asks it to stop, ``daemon=True`` has ``multiprocessing`` reap it at
+    interpreter exit, and failing both the child retires ITSELF once it sees this
+    process is gone. Only the third survives a hard exit — the shutdown and
+    restart paths can end this process with ``os._exit``, which runs no
+    ``atexit`` handler, so neither parent-side path is guaranteed to run. That is
+    why the child re-checks its parent on a short slice rather than once per pass:
+    it bounds how long an orphan can keep indexing beside its replacement.
+
+    A failure to keep a child running is logged once and then left alone: a
+    missing row costs one scanned file, so the honest response to an indexer that
+    will not stay up is to keep serving searches from the transcripts.
     """
 
-    #: Seconds of indexing work per pass, and the pause between passes once the
-    #: window is fully indexed. The pass budget is small enough that the thread
-    #: is returned promptly; the idle pause is what keeps a caught-up gateway
-    #: from re-stat'ing the window in a tight loop.
-    pass_budget_secs = 5.0
-    idle_pause_secs = 60.0
-    busy_pause_secs = 2.0
-    optimize_every_passes = 60
+    # The child's own pass cadence lives with the loop that honours it, in
+    # ``history_index_worker``. Blocking calls (``Process.start`` costs a fresh
+    # interpreter, ``stop`` waits on a signal) go through ``to_thread`` so the
+    # event loop this change exists to protect is never the thing that waits.
+    def _migrate_index_schema() -> None:
+        """Bring the index schema to the current version from ONE process.
 
-    def _pass_in_thread() -> dict[str, int]:
+        ``SessionSearchIndex._init_schema`` DROPs the tables when the stored
+        ``user_version`` is stale, and the only thing guarding that is a
+        per-PROCESS lock. This change introduces a second opener, so after a
+        version bump the gateway and the child can both read the stale version
+        and both run the DROP — the later one discarding the tables the earlier
+        one just built, along with anything indexed in between. Nothing
+        authoritative is lost (the rows derive from transcripts) but search falls
+        back to scanning until a later pass repopulates it.
+
+        Opening it here, before the child is started, means the on-disk version is
+        already current when the child first opens and the gate cannot fire in two
+        processes at once. Blocking, so the caller hands it to a thread.
+        """
         log = state.conversation_log
         if log is None:
-            return {"indexed": 0, "dropped": 0, "remaining": 0}
-        return log._catalog_projection.backfill_index(budget_secs=pass_budget_secs)
+            return
+        try:
+            index = log._catalog_projection.search_index
+        except Exception:  # noqa: BLE001 — search must survive a bad index
+            logger.warning("Session search index schema migration failed", exc_info=True)
+            return
+        if not index.available:
+            logger.warning(
+                "Session search index is unavailable; the indexer will run but "
+                "search falls back to scanning the transcripts"
+            )
 
-    def _optimize_in_thread() -> None:
+    async def _session_index_supervisor() -> None:
         log = state.conversation_log
-        if log is not None:
-            log._catalog_projection.search_index.optimize()
-
-    async def _session_index_loop() -> None:
-        if state.conversation_log is None:
+        if log is None:
             # No transcript store on this gateway: nothing to index, and the
             # search path it would serve does not exist either.
             return
-        passes = 0
-        while True:
-            try:
-                report = await asyncio.to_thread(_pass_in_thread)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 — search must survive a bad index
-                logger.warning("Session search index pass failed", exc_info=True)
-                await asyncio.sleep(idle_pause_secs)
-                continue
-            passes += 1
-            if passes % optimize_every_passes == 0:
-                try:
-                    await asyncio.to_thread(_optimize_in_thread)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    logger.warning("Session search index optimize failed", exc_info=True)
-            # More to do means come straight back; caught up means idle until
-            # something changes on disk.
-            await asyncio.sleep(busy_pause_secs if report["remaining"] else idle_pause_secs)
+        # Deferred import, per ``no-new-work-on-gateway-boot-path``: this module
+        # is reached only once the listener is already serving.
+        from kiro_crew.history_index_worker import SessionIndexWorkerSupervisor
 
-    task = asyncio.create_task(_session_index_loop())
+        # The supervisor refuses a transcript directory that is not an existing
+        # absolute path, because the child would otherwise resolve it against
+        # its own working directory and create it there.
+        supervisor = SessionIndexWorkerSupervisor(log._dir)
+        try:
+            await asyncio.to_thread(_migrate_index_schema)
+            # A failed FIRST spawn is not treated differently from a child that
+            # dies later: both fall into the poll loop, which retries with backoff
+            # and eventually gives up for good. Returning here instead would let a
+            # transient failure at boot -- memory pressure, an fd limit, the very
+            # conditions this change exists to ease -- leave search scanning
+            # transcripts for the whole life of the gateway. A refusal that cannot
+            # improve by retrying, such as a transcript directory that is not
+            # there, sets ``gave_up`` inside ``start`` and so exits immediately.
+            await asyncio.to_thread(supervisor.start)
+            while not supervisor.gave_up:
+                wait_secs = await asyncio.to_thread(supervisor.poll)
+                await asyncio.sleep(wait_secs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — search must survive a bad indexer
+            logger.warning("Session search index supervisor failed", exc_info=True)
+        finally:
+            # The child is reaped OFF this loop. ``terminate`` and ``join``
+            # block, and a shutdown that freezes the loop for seconds is the
+            # exact failure this change exists to remove
+            # (no-blocking-call-on-event-loop).
+            #
+            # ``request_stop`` is the non-blocking half — one ``waitpid`` and one
+            # SIGTERM — so the child is already on its way down before anything
+            # is awaited. The waiting half goes to a thread, shielded so that
+            # cancelling THIS task does not cancel the reap with it.
+            supervisor.request_stop()
+            try:
+                await asyncio.shield(asyncio.to_thread(supervisor.reap))
+            except asyncio.CancelledError:
+                # Cancelled mid-reap. The signal is already delivered and the
+                # child is daemonic, so ``multiprocessing`` reaps it at
+                # interpreter exit regardless; blocking the loop to wait here
+                # would trade a leak that cannot happen for a stall that can.
+                raise
+            except Exception:  # noqa: BLE001 — the loop may already be closing
+                logger.warning("Session search index writer did not stop cleanly", exc_info=True)
+
+    task = asyncio.create_task(_session_index_supervisor())
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
 
@@ -3286,6 +4105,10 @@ def _register_browser_view_cleanup(app: web.Application, state: DashboardState) 
 
     async def _browser_view_shutdown(app_: web.Application) -> None:
         try:
+            await handlers.close_relay_client(app_)
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.debug("browser view relay client close failed during shutdown", exc_info=True)
+        try:
             await asyncio.to_thread(browser_cli_launcher.close_all)
         except Exception:  # noqa: BLE001 - shutdown must not raise
             logger.debug("browser launcher session close failed during shutdown", exc_info=True)
@@ -3358,7 +4181,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
         # the port bind immediately; tunnels reconnect (or surface their error
         # on the instance tab, which persists on failure) without gating
         # startup.
-        revive_task = asyncio.create_task(_revive_intended_instances(registry, manager))
+        revive_task = asyncio.create_task(_retake_hops_then_revive(registry, manager))
         state._background_tasks.add(revive_task)
         revive_task.add_done_callback(state._background_tasks.discard)
 
@@ -3381,7 +4204,7 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
             # Imported here, not at module scope: this file is on the gateway boot
             # path, and the emitter is flag-gated behind KIROCREW_CREW_LOG.
             # AUTOSDE's no-new-work-on-gateway-boot-path rule asks for the IMPORT to
-            # be gated, not just the handler, so a launch with the flag unset pays
+            # be gated, not just the handler, so a launch with the flag off pays
             # nothing for a subsystem it will never call.
             from kiro_crew.crew_log import emit as crew_log_emit
 
@@ -3394,7 +4217,9 @@ def _register_instances_hooks(app: web.Application, state: DashboardState, port:
     app.on_cleanup.append(_crew_log_drain)
 
 
-def build_host_canonical_redirect(canonical_host: str) -> Any:
+def build_host_canonical_redirect(
+    canonical_host: str, holds_every_family: Callable[[], bool] | None = None
+) -> Any:
     """Build the loopback-host-canonicalization middleware.
 
     Converges non-canonical loopback aliases (127.0.0.1 / ::1 / localhost) onto
@@ -3404,6 +4229,25 @@ def build_host_canonical_redirect(canonical_host: str) -> Any:
     sub-resource fetches are untouched. Pass ``canonical_host=""`` (e.g. when not
     local_only) to make the middleware a no-op so reverse-proxy / remote-host
     deployments are never redirected.
+
+    *holds_every_family* answers, at REDIRECT time, whether this gateway holds
+    every loopback family the destination name can resolve to. It gates the same
+    rule the local-token mint follows, for the same reason: an ambiguous name
+    names a SET of listeners, and a 302 onto it is a credential send, because the
+    browser follows it carrying the host-only ``Lax`` session cookie on exactly
+    the top-level navigation this middleware converts. ``?token=`` in the query
+    is refused separately and is not the only credential in play.
+
+    A destination this gateway does not fully hold therefore gets NO redirect: the
+    document stays on the literal it dialled, which this gateway does hold. The
+    cost is the split-localStorage annoyance the redirect exists to avoid, paid
+    only while a family is uncovered -- and the most common reason it is uncovered
+    is that another process holds that family's port, which is the party the
+    redirect would hand the cookie to.
+
+    Omitting the callable keeps the redirect ungated, for callers whose
+    *canonical_host* is not an ambiguous name (a literal names one listener) and
+    for unit tests of the gating rules themselves.
 
     Extracted to a module-level factory (rather than an inline closure) so the
     runtime behavior — the 302, port+path+``?token=`` preservation, and the
@@ -3420,8 +4264,20 @@ def build_host_canonical_redirect(canonical_host: str) -> Any:
             canonical_host,
             method=request.method,
             sec_fetch_dest=request.headers.get("Sec-Fetch-Dest"),
+            carries_credential=bool(request.query.get("token")),
         ):
-            # Preserve port + path + query (including ?token=) — only host changes.
+            if holds_every_family is not None and not holds_every_family():
+                logger.warning(
+                    "not canonicalizing %s onto %s: this gateway does not hold every "
+                    "loopback family that name resolves to, so the redirect would carry "
+                    "the session cookie to whoever holds the rest",
+                    request.host,
+                    canonical_host,
+                )
+                return await handler(request)  # type: ignore[operator]
+            # Preserve port + path + query -- only host changes. A navigation
+            # carrying ?token= never reaches here, so that query cannot be moved
+            # to a host other than the one it was addressed to.
             raise web.HTTPFound(location=str(request.url.with_host(canonical_host)))
         return await handler(request)  # type: ignore[operator]
 
@@ -3547,25 +4403,35 @@ def _register_prevent_sleep_shutdown(app: web.Application, state: DashboardState
 
 
 def _register_listener_guard_shutdown(app: web.Application, state: DashboardState) -> None:
-    """Register the on_cleanup hook that detaches the listener guard.
+    """Register the on_cleanup hook that detaches the listener guard(s).
 
     MUST be called BEFORE ``runner.setup()`` freezes the app's signal lists. The
     guard is created after the TCP site binds (:func:`_arm_listener_guard`) and
     resolved here lazily via ``getattr``. Detaching first matters: cleanup stops
     every site, and a guard still armed would read its own site's closed
     listener as a lost one and try to rebind it mid-shutdown.
+
+    Both guards are detached, SECONDARY FIRST, because that is the reverse of the
+    order they were armed and the order is load-bearing. ``arm()`` captures the
+    handler it displaced and delegates to it, so the secondary guard sits in
+    front of the primary, and each guard restores its neighbour only while it is
+    still the installed handler. Detaching the primary first therefore restores
+    nothing and leaves the secondary's handler installed on the loop for good.
     """
 
     async def _listener_guard_shutdown(app_: web.Application) -> None:
-        guard = getattr(state, "_listener_guard", None)
-        if guard is not None:
-            guard.stop()
+        for attr in ("_secondary_listener_guard", "_listener_guard"):
+            guard = getattr(state, attr, None)
+            if guard is not None:
+                guard.stop()
 
     app.on_cleanup.append(_listener_guard_shutdown)
 
 
-def _arm_listener_guard(state: DashboardState, runner: web.AppRunner, site: web.TCPSite) -> None:
-    """Watch the just-started TCP *site* and rebind it if its listener dies.
+def _arm_listener_guard(
+    state: DashboardState, runner: web.AppRunner, site: web.TCPSite | web.SockSite
+) -> None:
+    """Watch the just-started *site* and rebind it if its listener dies.
 
     Windows only, because the defect is: one failed ``accept()``
     (``ERROR_NETNAME_DELETED`` from an aborted tunnelled peer) makes the
@@ -3582,9 +4448,271 @@ def _arm_listener_guard(state: DashboardState, runner: web.AppRunner, site: web.
     if not platform_compat.IS_WINDOWS:
         return
 
-    guard = ListenerGuard(runner, site, shutdown_event)
+    # The guard's recovery contract is "rebind the listener's REAL bound name"
+    # (see ``ListenerGuard.__init__``): it captures host/port from the live
+    # LISTEN socket at construction. A site with no live asyncio server — an
+    # inert site double in wiring tests, or a site whose ``start()`` was faked
+    # out — gives the guard no name to capture and no listener to probe, and
+    # arming it would misread boot as a dead listener. Real sites cannot hit
+    # this: both callers arm immediately after ``await site.start()``, which
+    # is what creates ``_server`` and its sockets.
+    if not getattr(getattr(site, "_server", None), "sockets", None):
+        return
+
+    guard = ListenerGuard(
+        runner,
+        site,
+        shutdown_event,
+        bind_factory=_bind_once,
+        # The primary's listener-keyed sidecar is subject to the same invariant
+        # as the secondary's: it claims this gateway holds that address NOW, and
+        # a rebind window is a stretch of time when nobody holds it. The
+        # port-keyed credential is deliberately untouched -- it names the
+        # generation, not a listener, and a booting pod waits on it.
+        on_listener_lost=lambda: _withdraw_listener_sidecar(state, "primary"),
+        on_listener_restored=lambda: _republish_listener_sidecar(state, "primary"),
+    )
     guard.arm()
     state._listener_guard = guard
+
+
+def _withdraw_listener_sidecar(state: DashboardState, which: str) -> bool:
+    """Stop advertising one listener's address while this gateway does not hold it.
+
+    Returns whether the address is unadvertised, which is a fact about the FILE
+    rather than about this call: a claim that was never recorded advertises
+    nothing, so it answers True. False means the sidecar could neither be
+    removed nor blanked, so the credential is still readable for an address this
+    generation does not hold -- the one outcome a caller must not treat as
+    cleanup, because a co-resident that takes the address receives whatever a
+    client sends to the name.
+    """
+    claim = getattr(state, "_listener_sidecars", {}).get(which)
+    if claim is None:
+        return True
+    port, address, _secret = claim
+    if run_marker.withdraw_published_listener(port, address):
+        logger.warning(
+            "Withdrew the %s listener sidecar for [%s]:%d: this gateway no longer holds "
+            "that address, so clients dialling a name that resolves there will sign in "
+            "explicitly instead of sending a credential to whoever takes it.",
+            which,
+            address,
+            port,
+        )
+        return True
+    # A False from the retraction has TWO causes that must not be collapsed: the
+    # filesystem refused, and there was nothing of ours to retract (an address
+    # this process never published, or one a previous call already withdrew --
+    # the give-up path repeats the withdrawal by design). Only the first is an
+    # advertised credential, so the answer is read off the file rather than off
+    # the call: absent or empty covers no family, and a reader skips a blank
+    # secret. An unreadable file is the refusal case and answers False.
+    try:
+        sidecar = run_marker.listener_secret_path(port, address)
+        return not sidecar.exists() or sidecar.stat().st_size == 0
+    except OSError:
+        return False
+
+
+def _republish_listener_sidecar(state: DashboardState, which: str) -> None:
+    """Re-advertise a listener's address after a rebind has actually bound it."""
+    claim = getattr(state, "_listener_sidecars", {}).get(which)
+    if claim is None:
+        return
+    port, address, secret = claim
+    if not secret:
+        return
+    try:
+        _write_secret_file(run_marker.listener_secret_path(port, address), secret)
+    except OSError:
+        logger.warning(
+            "Could not re-publish the %s listener sidecar for [%s]:%d after a rebind; "
+            "clients dialling that address will sign in explicitly.",
+            which,
+            address,
+            port,
+            exc_info=True,
+        )
+        return
+    run_marker.note_published_listener(port, address)
+
+
+def _note_listener_sidecar(
+    state: DashboardState, which: str, port: int, address: str, secret: str
+) -> None:
+    """Tell the guards which sidecar each listener owns, so they can maintain it.
+
+    Called AFTER publication, because a claim that was never written must not be
+    withdrawn or re-published. Recorded on *state* rather than captured in the
+    guard's closure because the guard is armed at bind time, before the resolved
+    port and the bound address are known -- the hooks resolve the claim when they
+    fire instead.
+
+    The credential rides along, and that is not a second copy of it: ``secret`` is
+    the same immutable ``str`` object already held as ``app["local_secret"]`` for
+    the auth middleware to compare against, so the process's exposure is
+    unchanged. The alternative -- reading the value back off the port-keyed
+    sidecar at re-publication time -- would make a rebind trust a file instead of
+    the value this generation minted.
+    """
+    if not address:
+        return
+    sidecars = getattr(state, "_listener_sidecars", None)
+    if sidecars is None:
+        sidecars = {}
+        state._listener_sidecars = sidecars
+    sidecars[which] = (int(port), address, secret)
+
+
+def _arm_secondary_listener_guard(
+    state: DashboardState,
+    runner: web.AppRunner,
+    secondary: SecondaryLoopback,
+    port: int,
+) -> None:
+    """Watch the SECOND loopback listener and stop advertising it if it dies.
+
+    The primary listener gets :func:`_arm_listener_guard`; this one needs its own
+    guard for the same Windows defect and a different terminal action. One failed
+    ``accept()`` closes a LISTEN socket for good while the process lives on, so
+    without this the second family's socket can be gone while its sidecar still
+    tells every client that this gateway holds that address -- and a co-resident
+    that then binds the freed address receives the credential a client sends to
+    the name. The sidecar's whole meaning is presence, so an unguarded second
+    listener makes the claim unfalsifiable.
+
+    Two differences from the primary, both deliberate:
+
+    * **Its own attribute.** ``ListenerGuard`` keeps a reference to the handler it
+      displaced and delegates to it, so two guards chain correctly -- but
+      ``state._listener_guard`` is a single slot and reusing it would drop the
+      primary's guard on the floor. Detachment then has to run in the REVERSE of
+      the arming order (see :func:`_register_listener_guard_shutdown`), or the
+      inner guard stays installed on the loop.
+    * **It never exits the process.** The primary's terminal action is right for
+      the listener a gateway exists to serve. Losing an ADDITIONAL family costs a
+      client dialling a name one explicit sign-in, so killing a gateway that is
+      still serving its primary listener would turn a degradation into an outage.
+      The injected action withdraws the sidecar and stops guarding, which lands
+      exactly in the degraded state this feature already handles and tests: a
+      family uncovered, so clients refuse to send and prompt instead.
+    """
+    if not platform_compat.IS_WINDOWS:
+        return
+    if not getattr(getattr(secondary.site, "_server", None), "sockets", None):
+        return
+    guard = ListenerGuard(
+        runner,
+        secondary.site,
+        shutdown_event,
+        bind_factory=_bind_once,
+        on_listener_lost=lambda: _withdraw_listener_sidecar(state, "secondary"),
+        on_listener_restored=lambda: _republish_listener_sidecar(state, "secondary"),
+        on_give_up=lambda reason: _secondary_listener_given_up(state, port, secondary, reason),
+    )
+    guard.arm()
+    state._secondary_listener_guard = guard
+
+
+def _reconcile_listener_publication(
+    state: DashboardState, which: str, port: int, address: str
+) -> None:
+    """Check a just-published listener against its live socket, once.
+
+    Closes the window neither half can see on its own. Publication is an executor
+    await, and a Windows accept failure landing inside it leaves a published claim
+    for a closed listener: the guard either is not armed yet (the second family) or
+    is armed with no claim recorded yet (the primary), and a withdrawal with no
+    recorded claim answers True without touching the file, which recovery reads as
+    "proceed". Either way the sidecar keeps naming an address this gateway does not
+    hold, and nothing revisits it -- the probe is 60 seconds away and a rebind only
+    helps if it binds.
+
+    So EVERY published claim is reconciled the moment it is recorded, on every
+    startup path. ``listener_open`` is the same test the guard's probe uses, so this
+    asks the probe's question early rather than a different question, and a closed
+    socket goes to ``check_now`` -- the guard's own entry point -- so the remedy is
+    withdraw, rebind, escalate, not a second implementation of them here.
+
+    Scheduled as a task because recovery is async and boot must not wait on a
+    rebind; the guard holds every decision that follows. An unarmed guard (every
+    POSIX platform, where the defect does not exist) has nothing to reconcile.
+    """
+    attr = "_listener_guard" if which == "primary" else "_secondary_listener_guard"
+    guard = getattr(state, attr, None)
+    if guard is None or guard.listener_open():
+        return
+    logger.critical(
+        "The %s listener on [%s]:%d was already closed when its credential finished "
+        "publishing, so the sidecar named an address this gateway does not hold; "
+        "reconciling now instead of waiting for the probe",
+        which,
+        address,
+        port,
+    )
+    task = asyncio.create_task(guard.check_now("closed during credential publication"))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+def _request_listener_lost_exit(state: DashboardState, reason: str) -> None:
+    """Ask every armed guard for the listener-lost exit, so the process ends.
+
+    Both guards, because the exit status is read off ONE of them
+    (``_listener_guard``) while the condition can be discovered by the other, and
+    a request that lands only on the discoverer would set the shutdown event with
+    an exit status of 0 -- a clean stop, which is what a supervisor does NOT
+    relaunch. Missing guards are skipped rather than required: neither arms off
+    Windows, and the caller reaches here only from a guard that did.
+    """
+    for attr in ("_listener_guard", "_secondary_listener_guard"):
+        guard = getattr(state, attr, None)
+        if guard is not None:
+            guard.request_exit(reason)
+
+
+def _secondary_listener_given_up(
+    state: DashboardState, port: int, secondary: SecondaryLoopback, reason: str
+) -> None:
+    """Terminal state for the second family: uncovered, and the gateway serves on.
+
+    ``on_listener_lost`` has already withdrawn the sidecar by the time a give-up
+    is reached, so this is idempotent by construction -- it repeats the
+    withdrawal because the guard also gives up on the path where a rebind BOUND
+    the address and the listener still answers nothing, and on that path the
+    address was re-advertised in between.
+
+    Serving on is right only while the withdrawal LANDED. A sidecar that can be
+    neither removed nor blanked keeps advertising a live credential for an address
+    this gateway has stopped holding, and no later pass revisits it: the guard is
+    done, and ``clear_marker`` uses the same filesystem that just refused. That is
+    not the one-explicit-sign-in degradation this terminal action exists for, so
+    it escalates to the primary's action -- ending the process, which is what
+    makes the readable value stop authenticating anywhere.
+    """
+    if not _withdraw_listener_sidecar(state, "secondary"):
+        logger.critical(
+            "The second loopback listener on [%s]:%d is gone (%s) and its sidecar could "
+            "not be withdrawn, so a live credential stays readable for an address this "
+            "gateway no longer holds; exiting with status %d instead of serving on "
+            "behind a claim nothing can retract",
+            secondary.address,
+            port,
+            reason,
+            LISTENER_LOST_EXIT_CODE,
+        )
+        _request_listener_lost_exit(state, reason)
+        return
+    logger.warning(
+        "The second loopback listener on [%s]:%d is not coming back (%s). The gateway "
+        "keeps serving its primary listener; clients dialling a name that resolves to "
+        "[%s] will sign in explicitly.",
+        secondary.address,
+        port,
+        reason,
+        secondary.address,
+    )
 
 
 def _import_stt_engine() -> Any:
@@ -3623,8 +4751,162 @@ async def _stt_idle_sweep() -> None:
     await engine.idle_sweep_loop()
 
 
+def _log_prewarm_outcome(task: "asyncio.Task[None]") -> None:
+    """Consume the boot prewarm's result so a failure is logged, not raised.
+
+    The sweep's callback re-raises deliberately: a janitor that died is a defect. This
+    one must not, because every reason a prewarm fails (no model on disk, no
+    recogniser, a slow load that timed out) is a state the gateway is expected to run
+    in, and turning any of them into an unhandled task exception would report a
+    working gateway as broken.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Boot prewarm of the speech model failed", exc_info=exc)
+
+
+async def _stt_startup_prewarm() -> None:
+    """Load and warm the speech model in the background, shortly after boot.
+
+    **Why this exists.** Prewarming was triggered only by the browser's pointer-down
+    on the microphone, which is too late to help: the digest verification and the
+    native load sit in front of the first utterance's own decode, so a user who says
+    a short phrase and stops is still waiting on them after they have finished
+    speaking. Paying them at boot, when nobody is waiting, removes them from the
+    first utterance -- and the context is then resident for every later one, so the
+    cost lands once per gateway rather than once per cold start.
+
+    **What it does and does not save.** It removes the hash and the load, NOT the
+    decode, which has to happen either way. Measured on a 32-core aarch64 CPU build
+    (11 s clip, time from "ready to decode" to "transcript in hand"): ``base``
+    1.36 s -> 0.66 s, ``small`` 4.39 s -> 2.44 s, ``large-v3-turbo`` 15.47 s ->
+    13.59 s. So the saving is 0.7-2.0 s here, and is dominated by the digest check,
+    which scales with model size and with how cold the page cache is -- the same
+    1.6 GB model hashed in 1.14 s warm and 5.48 s cold, so the upper bound on a cold
+    host is several seconds. The first decode's graph allocation, by contrast, is
+    negligible on a CPU build: 30-40 ms, measured as the gap between the first and
+    second decode after a load.
+
+    **What it deliberately does not do.**
+
+    * It never FETCHES A MODEL THE HOST DOES NOT HAVE. Only an already-present model
+      is warmed, checked with ``is_present`` before the engine is asked for anything.
+      A gateway that pulls 1.6 GB because it booted would be spending a user's
+      bandwidth on a feature they have not used yet, and the first-run download stays
+      where it is: an explicit ``POST /api/stt/prepare``.
+
+      Not quite "never downloads", and the gap is worth stating: ``is_present`` is a
+      stat, while the load path's ``ensure`` verifies the file against its pinned
+      digest. A present-but-corrupt file therefore does re-download here -- a repair,
+      not a first fetch, and the alternative would be warming a model whose bytes
+      are not the ones we pinned.
+    * It never touches the microphone. This is model residency only.
+    * It does not block boot, and it does not run on the event loop: the same two
+      costs ``_stt_idle_sweep`` documents apply identically here, and the load itself
+      goes to the STT executor inside ``prewarm``.
+    * It does not fail anything. A missing model, an unavailable recogniser or a
+      failed warm decode all leave the gateway exactly as it was -- the next real
+      session prepares on its own behalf and reports its own errors.
+
+    Cancelled at shutdown like the sweep. A cancel during the native load cannot stop
+    it (there is no abort hook for a load), which is why the work is a plain
+    ``await`` on ``prewarm`` rather than something that pretends otherwise: the
+    engine's own ``_load_future`` bookkeeping is what keeps a second load from
+    starting alongside one that outlived its caller.
+    """
+    await asyncio.sleep(_STT_PREWARM_BOOT_DELAY_SECS)
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    if not cfg.stt.enabled or cfg.stt.provider != STT_PROVIDER_LOCAL:
+        return
+    # Off the loop, and BEFORE the lazy imports below, for the reason
+    # `_stt_idle_sweep` documents: this pulls numpy and the recogniser binding,
+    # measured at 169 ms, which on the loop stalls every socket the gateway is
+    # serving. Both imports below resolve through modules this one has already
+    # brought in, so they are cheap by the time they run.
+    engine = await asyncio.to_thread(_import_stt_engine)
+    from kiro_crew.stt import models as stt_models
+    from kiro_crew.transcribe import _whisper_language
+
+    model = stt_models.resolve(cfg.stt.model)
+    # `is_present` is a stat, so it runs off-loop with everything else in this step.
+    if not await asyncio.to_thread(stt_models.is_present, model):
+        logger.debug("Speech model %s is not downloaded; skipping the boot prewarm", model.name)
+        return
+    # Enough memory to hold it, and enough left over afterwards. The fourth gate,
+    # the same shape as the three above: withhold unless we are sure.
+    #
+    # Without it a boot warm is a guess about intent that costs whatever the chosen
+    # model weighs, on every launch, for `idle_evict_secs`. `large-v3-turbo` measured
+    # 1861 MB peak RSS on a reviewer's Mac -- and on a desktop install the gateway
+    # restarts with the app, so an 8 GB machine pays that per launch whether or not
+    # its owner ever dictates that session. The pointer-down prewarm still covers the
+    # case, exactly as it did before this task; only the speculative half is skipped.
+    #
+    # The margin is the model's own size again rather than a tuned constant: the
+    # resident cost is roughly the weights plus working buffers, so "twice the
+    # weights free" is the cheapest defensible floor, and a reading that could not be
+    # taken is treated as "do not speculate".
+    #
+    # The reading is cgroup-CLAMPED, not the host's `MemAvailable`. In a
+    # memory-capped container `/proc/meminfo` reports the host, so a 1.6 GB model can
+    # clear a host-wide check and then be OOM-killed against the cgroup limit -- and
+    # because this runs on every boot, that is a crash loop no config change escapes.
+    # `subagent._available_memory_gb` already takes the minimum of the host reading
+    # and the tightest visible cgroup headroom on every platform, so it answers the
+    # question this gate is actually asking; `resource_status` reuses it the same way
+    # and for the same reason.
+    from kiro_crew.subagent import _available_memory_gb
+
+    available_gb = await asyncio.to_thread(_available_memory_gb)
+    available_mib = int(available_gb * 1024) if available_gb > 0 else 0
+    needed_mib = 2 * model.size_bytes // (1024 * 1024)
+    if available_mib <= 0 or available_mib < needed_mib:
+        logger.debug(
+            "Skipping the boot prewarm for %s: %d MiB available, %d MiB wanted",
+            model.name,
+            available_mib,
+            needed_mib,
+        )
+        return
+    # The engine's bounds come from config here for the same reason the session path
+    # passes them: `shared_engine` is a process singleton, and the first caller to
+    # supply bounds is the one that sets them. Booting without them would leave the
+    # module defaults in force until some later caller happened to pass the
+    # operator's real values.
+    engine.shared_engine(idle_evict_secs=cfg.stt.idle_evict_secs, timeout_secs=cfg.stt.timeout_secs)
+    from kiro_crew import stt
+
+    started = time.monotonic()
+    # The package-level `prewarm`, which is the same entry point
+    # `POST /api/stt/prewarm` uses. Reused rather than reimplemented so a boot warm
+    # and a pointer-down warm cannot drift apart.
+    result = await stt.prewarm(
+        model_name=model.name,
+        language=_whisper_language(cfg.stt.language_code),
+    )
+    if not result.ok:
+        # Debug, not warning: a gateway whose recogniser is unavailable has nothing to
+        # act on here, and the surfaces that DO need to say so (the status endpoint,
+        # a real session) report it against a user who is actually asking.
+        logger.debug("Boot prewarm of the speech model did not complete: %s", result.detail)
+        return
+    # Off the loop: `capabilities` reads the build (a native call) behind its
+    # preflight gate, which can spawn the probe child if the wheel changed.
+    backend = (await asyncio.to_thread(engine.WhisperEngine.capabilities)).backend
+    logger.info(
+        "Speech model %s warmed in the background %.1fs after boot (backend=%s); "
+        "the first dictation skips the cold start",
+        model.name,
+        time.monotonic() - started,
+        backend,
+    )
+
+
 def _register_stt_hooks(app: web.Application) -> None:
-    """Register the STT idle sweep and the model release, for both server modes.
+    """Register the STT idle sweep, the boot prewarm and the model release, for both
+    server modes.
 
     MUST be called BEFORE ``runner.setup()`` freezes the app's signal lists. Shared by
     ``start_dashboard`` and the headless ``start_api_server`` rather than written out
@@ -3636,13 +4918,21 @@ def _register_stt_hooks(app: web.Application) -> None:
         task = asyncio.create_task(_stt_idle_sweep())
         task.add_done_callback(lambda t: t.result() if not t.cancelled() else None)
         app_["stt_idle_sweep"] = task  # prevent GC
+        # A SEPARATE task from the sweep, not a step inside it: the sweep is an
+        # infinite loop, so folding the prewarm into it would either delay the first
+        # sweep by a model load or delay the prewarm by the sweep interval.
+        warm = asyncio.create_task(_stt_startup_prewarm())
+        warm.add_done_callback(_log_prewarm_outcome)
+        app_["stt_boot_prewarm"] = warm  # prevent GC
 
     async def _stt_shutdown(app_: web.Application) -> None:
-        sweep = app_.get("stt_idle_sweep")
-        if sweep is not None:
-            sweep.cancel()
+        for key in ("stt_idle_sweep", "stt_boot_prewarm"):
+            task = app_.get(key)
+            if task is None:
+                continue
+            task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await sweep
+                await task
         # Gated on the engine module having been imported AT ALL, which is the cheap
         # and exact test for "could a model be resident". `stt.close()` resolves
         # through `stt.session`, which imports numpy at module scope and whose
@@ -3657,6 +4947,42 @@ def _register_stt_hooks(app: web.Application) -> None:
 
     app.on_startup.append(_stt_startup)
     app.on_cleanup.append(_stt_shutdown)
+
+
+def _register_own_host_warm(app: web.Application) -> None:
+    """Start reading this machine's own addresses at boot, without waiting on it.
+
+    The ssh self-target floor denies every IP literal until the address table
+    is read.  Left to the first ssh check, that check is what starts the read
+    and it sees the unpublished flag in the same instant, so the first IP-literal
+    ssh of every process is refused.  This hook starts the read in a worker
+    thread and returns at once: nothing is awaited in front of the listener
+    (``no-new-work-on-gateway-boot-path``).  The netlink dump is a kernel-local
+    read of about a millisecond, so it has published long before an agent's
+    first command; until it does, the floor stays fail-closed.
+    """
+
+    async def _own_host_warm(_app: web.Application) -> None:
+        task = asyncio.ensure_future(asyncio.to_thread(warm_own_host_names))
+        _OWN_HOST_WARM_TASKS.add(task)
+        task.add_done_callback(_own_host_warm_done)
+
+    app.on_startup.append(_own_host_warm)
+
+
+# Strong references to in-flight warm tasks, so the loop cannot collect one
+# before it finishes.
+_OWN_HOST_WARM_TASKS: "set[asyncio.Future[None]]" = set()
+
+
+def _own_host_warm_done(task: "asyncio.Future[None]") -> None:
+    """Drop the finished warm task and log a failure instead of raising it."""
+    _OWN_HOST_WARM_TASKS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("own-address read failed at startup", exc_info=exc)
 
 
 def _register_config_watch(
@@ -3677,6 +5003,9 @@ def _register_config_watch(
     from kiro_crew.config import live
     from kiro_crew.config.live import ConfigChange
     from kiro_crew.dashboard.handlers.updates import apply_log_level_from_config
+
+    # Wiring only: optional producer import/construction belongs after bind.
+    live.bind("dashboard.dynamic_dashboard_cards", state.set_dynamic_cards_enabled)
 
     async def _switch_provider(cfg: KiroCrewConfig) -> None:
         # Refresh agent artifacts so the target provider is immediately usable.
@@ -3748,6 +5077,99 @@ def _register_config_watch(
         except Exception:
             logger.warning("background-model rebuild failed", exc_info=True)
 
+    default_model_failure_notified = False
+
+    async def _apply_default_model(change: ConfigChange) -> None:
+        # The default (chat) model is baked into the main ``kirocrew`` spec at
+        # agent-build time via ``_refresh_dynamic_fields`` (which reads
+        # config.json ``agent.model``). A dashboard/CLI change to that key only
+        # rewrites config.json, so without this rebuild the installed
+        # ``~/.kiro/agents/kirocrew.json`` keeps its previous ``model`` and
+        # kiro-cli's ``--agent`` startup loads the STALE pin — a newly created
+        # session then runs the old model even though the picker shows the new
+        # default (and "auto" can never clear a prior concrete pin). Mirrors
+        # ``_apply_background_model``: same authoritative rebuild, keyed on the
+        # chat-model config key instead of the background role key.
+        if not change.touched("agent.model"):
+            return
+        nonlocal default_model_failure_notified
+        try:
+            from kiro_crew.agent import rebuild_agent_config_reporting
+
+            # ``rebuild_agent_config_reporting`` returns ``wrote=False`` — WITHOUT
+            # writing — exactly when the shared-home guard refuses to rewrite this
+            # instance's spec. That is a no-op, not a success: the installed
+            # ``kirocrew.json`` keeps its old ``model`` pin, so treating it as
+            # applied would clear the failure state, broadcast a refresh, and log
+            # "rebuilt" while new sessions still run the previous model. Route a
+            # refusal into the failure branch below so it notifies once and defers
+            # for the watcher's retry, the same as any other unwritten spec.
+            _spec_path, wrote = await asyncio.to_thread(rebuild_agent_config_reporting)
+            if not wrote:
+                raise RuntimeError(
+                    "agent spec rebuild was refused (shared agent home); "
+                    "config saved but kirocrew.json still pins the previous model"
+                )
+            # Close the ordering window against SessionManager's own applier.
+            # It subscribes to ``agent.model`` FIRST (its subscription predates
+            # this one), so on the same change it runs ``refresh_defaults``
+            # before this rebuild — draining the warm pool and re-filling it
+            # via ``start_pool(blocking=False)`` from the spec as it stood
+            # BEFORE the rebuild. A warm provider spawned in that window still
+            # pins the previous model until consumed or TTL-evicted. Now that
+            # the spec on disk is correct, re-run the same idempotent refresh so
+            # any provider minted in the race is discarded and re-spawned from
+            # the rebuilt spec. Best-effort and re-entrant: it never touches a
+            # live session, and a manager that is absent (tests) simply has no
+            # pool to reconcile.
+            sessions = getattr(state, "sessions", None)
+            if sessions is not None:
+                try:
+                    await sessions.refresh_defaults(cfg=change.new)
+                except Exception:
+                    logger.warning(
+                        "default-model warm-pool reconcile after rebuild failed",
+                        exc_info=True,
+                    )
+            # The config value and generated agent spec now agree. Tell every
+            # dashboard window to refetch both the config-backed picker and the
+            # effective-model endpoints only after that rebuild has completed;
+            # otherwise an eager refetch can cache the old spec indefinitely.
+            recovered = default_model_failure_notified
+            default_model_failure_notified = False
+            state.push_refresh("agents")
+            if recovered:
+                try:
+                    state.notify(
+                        "agent",
+                        "Default model applied",
+                        "The saved default model is now active. New sessions will use it.",
+                    )
+                except Exception:
+                    logger.debug("default-model recovery notification failed", exc_info=True)
+            logger.info("agent.model changed -- kirocrew agent spec rebuilt")
+        except Exception:
+            logger.warning("default-model rebuild failed", exc_info=True)
+            # The config write is already durable, but the generated spec is
+            # still the one new sessions actually consume. Surface that split
+            # to the operator instead of silently reporting the saved setting
+            # as active. Re-raise so ConfigWatch records this subscriber as
+            # stale and retries it on later ticks; a successful retry emits the
+            # refresh above and brings every open dashboard back into sync.
+            if not default_model_failure_notified:
+                default_model_failure_notified = True
+                try:
+                    state.notify(
+                        "agent",
+                        "Default model could not be applied",
+                        "The setting was saved but new sessions will keep using the "
+                        "previous model. Kiro Crew retries automatically; "
+                        "check the gateway logs if this persists.",
+                    )
+                except Exception:
+                    logger.debug("default-model failure notification failed", exc_info=True)
+            raise
+
     # The workflow-run ceiling and the channel caps are not registered here:
     # WorkflowService and ChannelManager bind their own setters in their
     # constructors (``live.bind``), the rule for an applier a long-lived object owns.
@@ -3758,6 +5180,7 @@ def _register_config_watch(
             callback=_apply_background_model,
             name="agent.role_models.background",
         ),
+        live.subscribe("agent.model", callback=_apply_default_model, name="agent.model"),
         live.subscribe(
             "agent.log_level", callback=apply_log_level_from_config, name="agent.log_level"
         ),
@@ -3776,6 +5199,11 @@ def _register_config_watch(
 
     async def _config_watch_shutdown(app_: web.Application) -> None:
         await live.watch().stop()
+        lifecycle = getattr(state, "_dynamic_cards", None)
+        if lifecycle is not None:
+            lifecycle.set_enabled(False)
+            if lifecycle.worker is not None:
+                await asyncio.gather(lifecycle.worker, return_exceptions=True)
 
     app.on_cleanup.append(_config_watch_shutdown)
 
@@ -3806,6 +5234,12 @@ def _kick_config_watch(app: web.Application, state: DashboardState) -> None:
         watcher.prime(initial)
 
     async def _start() -> None:
+        try:
+            current = live.snapshot() or initial
+            if current is not None:
+                state.set_dynamic_cards_enabled(current.dashboard.dynamic_dashboard_cards)
+        except Exception:  # noqa: BLE001 — optional cards must not disable live configuration
+            logger.warning("Automatic dashboard cards failed to start", exc_info=True)
         try:
             await live.watch().start(initial=initial)
         except Exception:  # noqa: BLE001 — a dead watcher must not take the gateway down
@@ -4195,6 +5629,21 @@ async def start_dashboard(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # Seed the retirement baseline with the account on disk RIGHT NOW, before
+    # anything can spawn a kiro-backed child. Every child postdates this read,
+    # so the once-per-lifetime unset-baseline boot sweep -- which on a live
+    # gateway can never satisfy its completion precondition and degenerates
+    # into a retire/respawn loop -- is unnecessary: a real account change after
+    # this still compares unequal and sweeps. A store that cannot be
+    # fingerprinted refuses the seed and keeps the fail-safe sweep.
+    await app["kiro_prerequisite_service"].seed_sessions_baseline()
+    # Stamp every kiro-backed spawn with the account the store holds at that
+    # moment: the turn gate compares those stamps against its fresh read, so a
+    # child from an account round trip NO read ever observed -- the one case
+    # the seeded baseline and the interim latch are both blind to -- is still
+    # retired before reuse (see flag_identity_stamp_mismatches). Unwired (the
+    # CLI, tests), spawns stay unstamped and keep the pre-stamping behavior.
+    state.sessions.spawn_identity_reader = app["kiro_prerequisite_service"].read_spawn_identity
     # Probe Kiro readiness during boot rather than on the dashboard's first
     # status request: the cold probe spawns sandboxed CLI subprocesses and can
     # take seconds, which is what made the first-run setup chrome visible to
@@ -4349,460 +5798,556 @@ async def start_dashboard(
     # gateway restart.
     setup_link_meta_routes(app)
 
-    # Start backends for enabled apps on the subprocess_executor bulkhead: the
-    # startup stale-reap shells out to `ps` per orphan and may SIGTERM→sleep→
-    # SIGKILL for seconds, and start_app_backend blocks on a survival poll — all
-    # wedge-prone blocking work that would freeze this event loop if run inline.
-    # subprocess_executor (not the default to_thread pool) isolates it so a hung
-    # `ps` cannot starve asyncio's default executor (the RFC's bulkhead intent).
-    # This wave runs BEFORE ``runner.setup()`` so an app's startup hooks find its
-    # backend running. The one exception is deferred: a backend that is handed the
-    # gateway's actually-bound port at spawn (``KIROCREW_BOUND_PORT``) is started
-    # after ``_export_bound_port`` below, because that value does not exist yet.
-    await cautious_boot.pause_before("app backends")
-    started_apps = await asyncio.get_running_loop().run_in_executor(
-        subprocess_executor(), start_enabled_app_backends
-    )
-    if started_apps:
-        logger.info("Started %d app backend(s): %s", len(started_apps), ", ".join(started_apps))
+    # Reserve the dashboard port BEFORE the app-backend boot pass below, and
+    # publish the reserved socket's REAL name as bound-port evidence (the
+    # origin/proof injection in apps.backend is fail-closed on
+    # KIROCREW_BOUND_PORT). Bound-and-LISTENING is the point: this gateway
+    # OWNS the port kernel-hard — a squatter cannot overlap-bind it while
+    # backends spawn trusting its value, which is what made exporting the mere
+    # CONFIGURED port a credential-exposure window (a backend would present
+    # its X-App-Secret to whatever answered there). Nothing is served yet —
+    # connections queue in the backlog until the runner wraps this socket and
+    # starts accepting — so no HTTP lifecycle handler can race the boot pass,
+    # and an early child callback waits instead of being refused. Binding here
+    # also makes --port auto (port == 0) real before the spawn: every
+    # boot-spawned backend gets the true origin, fixed and auto alike.
+    _dashboard_sock = await _reserve_dashboard_port(bind_address_for(local_only), port)
+    runner: web.AppRunner | None = None
+    try:
+        os.environ["KIROCREW_BOUND_PORT"] = str(_dashboard_sock.getsockname()[1])
+        # Callback-host evidence, classified by FAMILY. IPv4 loopback and
+        # wildcard binds are reachable at 127.0.0.1 (absent var = that
+        # default, the shape every existing bound-port consumer assumes). An
+        # IPv6 loopback or wildcard bind is NOT: KIROCREW_BIND=::1 listens
+        # only on the v6 loopback and leaves IPv4 127.0.0.1:<port> unbound —
+        # seizable by a co-resident, which would then receive the backends'
+        # secrets — so those export ::1 (reaches a v6-loopback, v6-wildcard,
+        # and dual-stack listener alike; the injection brackets it). A
+        # SPECIFIC-interface bind of either family exports its own address.
+        _bind_ip = str(_dashboard_sock.getsockname()[0])
+        if _bind_ip in ("::", "::1"):
+            os.environ["KIROCREW_BOUND_HOST"] = "::1"
+        elif _bind_ip in ("0.0.0.0", "127.0.0.1", ""):
+            os.environ.pop("KIROCREW_BOUND_HOST", None)
+        else:
+            os.environ["KIROCREW_BOUND_HOST"] = _bind_ip
 
-    # Both adapters are shared with the enable path (apps/routes.py) so the two
-    # entry points cannot drift into giving an app different capabilities.
-    from kiro_crew.apps.event_bus import build_broadcast_fn
-    from kiro_crew.apps.spawn_sdk import build_spawn_impl
+        # Start backends for enabled apps on the subprocess_executor bulkhead:
+        # the startup stale-reap shells out to `ps` per orphan and may SIGTERM→
+        # sleep→SIGKILL for seconds, and start_app_backend blocks on a survival
+        # poll — all wedge-prone blocking work that would freeze this event loop
+        # if run inline. subprocess_executor (not the default to_thread pool)
+        # isolates it so a hung `ps` cannot starve asyncio's default executor
+        # (the RFC's bulkhead intent).
+        await cautious_boot.pause_before("app backends")
+        started_apps = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), start_enabled_app_backends
+        )
+        if started_apps:
+            logger.info("Started %d app backend(s): %s", len(started_apps), ", ".join(started_apps))
 
-    _app_event_broadcast = build_broadcast_fn(state.broadcast_ws)
-    _app_spawn = build_spawn_impl(state.subagents)
+        # Both adapters are shared with the enable path (apps/routes.py) so the two
+        # entry points cannot drift into giving an app different capabilities.
+        from kiro_crew.apps.event_bus import build_broadcast_fn
+        from kiro_crew.apps.spawn_sdk import build_spawn_impl
 
-    # Initialize App SDK Gateway Hooks system
-    init_hooks_system(
-        app,
-        cron_service=state.crons,
-        broadcast_fn=_app_event_broadcast,
-        spawn_impl=_app_spawn,
-    )
+        _app_event_broadcast = build_broadcast_fn(state.broadcast_ws)
+        _app_spawn = build_spawn_impl(state.subagents)
 
-    async def _hooks_startup(app_: web.Application) -> None:
-        await on_gateway_startup(
+        # Initialize App SDK Gateway Hooks system
+        init_hooks_system(
+            app,
             cron_service=state.crons,
             broadcast_fn=_app_event_broadcast,
             spawn_impl=_app_spawn,
         )
-        # App dev-mode live reload: watch dev-flagged apps' ui/ dirs and
-        # broadcast app_reload WS events on change (see apps/dev_mode.py).
-        from kiro_crew.apps.dev_mode import init_dev_mode_watcher
 
-        await init_dev_mode_watcher(state.broadcast_ws)
-
-        # App hook reconciler: the CLI (`kirocrew app enable/disable/install/
-        # uninstall`) mutates apps on disk in a DIFFERENT process and never
-        # notifies this gateway, so without reconciliation a CLI reinstall leaves
-        # the old backend.hooks module live, its on_startup task running, and its
-        # .app_secret stale. This poll reloads changed hooks in-process — the same
-        # "CLI writes disk, gateway reconciles" contract already used for crons
-        # and UI files. Started AFTER on_gateway_startup so the boot pass has
-        # already recorded its loaded-hook signatures in the shared registry and
-        # the reconciler's first tick sees no drift. Synchronous + IO-free, so it
-        # adds nothing before the dashboard socket binds.
-        init_hook_reconciler(
-            cron_service=state.crons,
-            broadcast_fn=_app_event_broadcast,
-            spawn_impl=_app_spawn,
-        )
-
-    app.on_startup.append(_hooks_startup)
-
-    async def _hooks_shutdown(app_: web.Application) -> None:
-        # Stop the background pollers BEFORE the gateway hook shutdown sweep.
-        # The reconciler and the dev-mode watcher can each LOAD/START app hooks
-        # on a tick; if either is still live while on_gateway_shutdown() tears
-        # hooks down, a poll landing mid-sweep could re-import a module or spawn
-        # an on_startup task AFTER it was torn down, so that app's code would
-        # survive an in-process gateway restart. Cancelling them first also stops
-        # their module-global tasks from leaking stale gateway service handles /
-        # a stale broadcast_ws across the restart. Await cancellation so neither
-        # can fire one more tick during the sweep.
-        from kiro_crew.apps.dev_mode import stop_dev_mode_watcher
-
-        # on_gateway_shutdown() is the sweep that actually tears down app
-        # backends; it MUST run even if stopping a poller hangs (its bounded
-        # drain can burn its budget) or raises, otherwise a spawned app backend
-        # survives gateway exit. Stop the pollers first (preserving the
-        # no-tick-during-sweep ordering) but never let a stop failure abort the
-        # sweep: catch and log it, then always run on_gateway_shutdown.
-        try:
-            await stop_dev_mode_watcher()
-            await stop_hook_reconciler()
-        except Exception:
-            logger.exception(
-                "Error stopping background pollers on shutdown; proceeding to the "
-                "gateway hook shutdown sweep so app backends are torn down"
+        async def _hooks_startup(app_: web.Application) -> None:
+            await on_gateway_startup(
+                cron_service=state.crons,
+                broadcast_fn=_app_event_broadcast,
+                spawn_impl=_app_spawn,
             )
-        await on_gateway_shutdown()
+            # App dev-mode live reload: watch dev-flagged apps' ui/ dirs and
+            # broadcast app_reload WS events on change (see apps/dev_mode.py).
+            from kiro_crew.apps.dev_mode import init_dev_mode_watcher
 
-    app.on_cleanup.append(_hooks_shutdown)
+            await init_dev_mode_watcher(state.broadcast_ws)
 
-    # Edition-contributed dashboard routes + background services (CPP
-    # DashboardContributor seam). The Default contributes nothing, so the public
-    # dashboard is unchanged. Routes are mounted HERE — before the SPA static
-    # catch-all below and well before ``runner.setup()`` freezes the route table
-    # and the on_startup/on_cleanup signal lists (see _register_instances_hooks).
-    # Fail-closed: a non-standalone host that cannot compose its companion raises.
-    safe_context_call(
-        lambda: current_context().dashboard.contribute_routes(app),
-        fallback=None,
-        log_message="dashboard.contribute_routes failed; no edition routes mounted",
-    )
+            # App hook reconciler: the CLI (`kirocrew app enable/disable/install/
+            # uninstall`) mutates apps on disk in a DIFFERENT process and never
+            # notifies this gateway, so without reconciliation a CLI reinstall leaves
+            # the old backend.hooks module live, its on_startup task running, and its
+            # .app_secret stale. This poll reloads changed hooks in-process — the same
+            # "CLI writes disk, gateway reconciles" contract already used for crons
+            # and UI files. Started AFTER on_gateway_startup so the boot pass has
+            # already recorded its loaded-hook signatures in the shared registry and
+            # the reconciler's first tick sees no drift. Synchronous + IO-free, so it
+            # adds nothing before the dashboard socket binds.
+            init_hook_reconciler(
+                cron_service=state.crons,
+                broadcast_fn=_app_event_broadcast,
+                spawn_impl=_app_spawn,
+            )
 
-    # The service lifecycle hooks are async; they route through
-    # ``async_safe_context_call`` so they share the SAME fail-closed discipline as
-    # every sync seam call (re-raise ``PlatformCompositionError`` from a host that
-    # could not compose its companion; degrade any other transient service error,
-    # logged, rather than bricking the gateway start/stop) — kept in one place so
-    # a future fail-closed policy change cannot diverge per hand-written copy.
-    async def _contrib_startup(app_: web.Application) -> None:
-        await async_safe_context_call(
-            lambda: current_context().dashboard.start_services(app_),
-            fallback=None,
-            log_message="dashboard.start_services failed; no edition services",
-        )
+        app.on_startup.append(_hooks_startup)
 
-    async def _contrib_shutdown(app_: web.Application) -> None:
-        await async_safe_context_call(
-            lambda: current_context().dashboard.stop_services(app_),
-            fallback=None,
-            log_message="dashboard.stop_services failed",
-        )
+        async def _hooks_shutdown(app_: web.Application) -> None:
+            # Stop the background pollers BEFORE the gateway hook shutdown sweep.
+            # The reconciler and the dev-mode watcher can each LOAD/START app hooks
+            # on a tick; if either is still live while on_gateway_shutdown() tears
+            # hooks down, a poll landing mid-sweep could re-import a module or spawn
+            # an on_startup task AFTER it was torn down, so that app's code would
+            # survive an in-process gateway restart. Cancelling them first also stops
+            # their module-global tasks from leaking stale gateway service handles /
+            # a stale broadcast_ws across the restart. Await cancellation so neither
+            # can fire one more tick during the sweep.
+            from kiro_crew.apps.dev_mode import stop_dev_mode_watcher
 
-    app.on_startup.append(_contrib_startup)
-    app.on_cleanup.append(_contrib_shutdown)
-
-    # Static files — prefer React dist/ build, fall back to legacy static/
-    if _DIST_DIR.is_dir():
-        _register_dist_static_routes(app, _DIST_DIR)
-    if _STATIC_DIR.is_dir():
-        app.router.add_static(
-            "/static",
-            _STATIC_DIR,
-            show_index=False,
-            append_version=True,
-        )
-    else:
-        logger.warning("Static dir not found: %s", _STATIC_DIR)
-
-    # ── Middleware ────────────────────────────────────────────────────────────
-
-    # No-cache: prevents Chrome from caching stale assets
-    @web.middleware  # type: ignore[misc]
-    async def no_cache_middleware(
-        request: web.Request,
-        handler: object,
-    ) -> web.StreamResponse:
-        resp = await handler(request)  # type: ignore[operator]
-        if hasattr(resp, "headers"):
-            _apply_security_headers(resp, request.app, request.path, request)
-        return resp  # type: ignore[return-value]
-
-    # The static handler's FileResponse decides 200-vs-404 only in prepare(),
-    # after the middleware above has already stamped immutable. This hook sees
-    # the final status and strips immutable from any /assets/ error.
-    _install_asset_cache_control_finalizer(app)
-
-    # SPA fallback: serve index.html for client-side React Router paths.
-    # Uses the same _is_spa_shell_request predicate as the auth middleware so
-    # the two layers never drift. Bare /apps/{name} paths (no sub-path) are
-    # treated as SPA navigations and served index.html — this fixes browser
-    # refresh on e.g. /apps/code-review-sage which has no server-side route.
-    @web.middleware  # type: ignore[misc]
-    async def spa_fallback(
-        request: web.Request,
-        handler: object,
-    ) -> web.StreamResponse:
-        try:
-            return await handler(request)  # type: ignore[operator]
-        except web.HTTPNotFound:
-            if _is_spa_shell_request(request):
-                return await handlers.index(request)
-            raise
-
-    # SEL: log mutating API operations
-    _sel_log_methods = {"POST", "PUT", "DELETE", "PATCH"}
-
-    @web.middleware  # type: ignore[misc]
-    async def sel_audit_middleware(
-        request: web.Request,
-        handler: object,
-    ) -> web.StreamResponse:
-        if request.method in _sel_log_methods and request.path.startswith("/api/"):
-            # Claim only what this middleware actually records. Its except arm
-            # logs a refusal raised below this point, so the boundary must not
-            # add a second entry for it — but a request OUTSIDE this branch is
-            # logged nowhere here, and claiming it would hand the boundary a
-            # promise no one keeps (a cross-origin WebSocket GET refused in its
-            # handler would be silently unaudited).
-            mark_audit_claimed(request)
-            from kiro_crew.sel import sel
-
+            # on_gateway_shutdown() is the sweep that actually tears down app
+            # backends; it MUST run even if stopping a poller hangs (its bounded
+            # drain can burn its budget) or raises, otherwise a spawned app backend
+            # survives gateway exit. Stop the pollers first (preserving the
+            # no-tick-during-sweep ordering) but never let a stop failure abort the
+            # sweep: catch and log it, then always run on_gateway_shutdown.
             try:
-                resp = await handler(request)  # type: ignore[operator]
-                sel().log_api_access(
-                    caller="dashboard_user",
-                    operation=f"{request.method} {request.path}",
-                    outcome="ok" if resp.status < 400 else "error",
-                    resources=request.path,
+                await stop_dev_mode_watcher()
+                await stop_hook_reconciler()
+            except Exception:
+                logger.exception(
+                    "Error stopping background pollers on shutdown; proceeding to the "
+                    "gateway hook shutdown sweep so app backends are torn down"
                 )
-                return resp  # type: ignore[return-value]
-            except Exception as exc:
-                sel().log_api_access(
-                    caller="dashboard_user",
-                    operation=f"{request.method} {request.path}",
-                    outcome="error",
-                    resources=request.path,
-                    error=str(exc)[:200],
-                )
-                raise
-        return await handler(request)  # type: ignore[operator]
+            await on_gateway_shutdown()
 
-    # Tailnet origin (RFC §4): this machine's own MagicDNS name, so
-    # `tailscale serve` works without the operator hand-writing dashboard.url.
-    # Off by default; resolved in a thread so the daemon call cannot stall the
-    # loop; "" whenever Tailscale is absent, stopped, or produced nothing that
-    # validated.
-    _cfg = KiroCrewConfig.load()
-    _ts_cfg = _cfg.dashboard.tailscale
-    _tailnet_host = await tailnet.resolve_tailnet_host(_ts_cfg.enabled)
-    # Identity trust (RFC §2–§3.1): validated at config load, governance
-    # ceiling applied inside the shared helper — ONE code path for both
-    # startup surfaces, so they cannot drift.
-    _tailnet_trust = await tailnet.governed_tailnet_trust(
-        _ts_cfg.trust_identity,
-        tailnet_effective_allowed_logins(_cfg.degraded_sections, _ts_cfg.allowed_logins),
-        _ts_cfg.pin_scope,
-        bind_refresh_chains=_ts_cfg.bind_refresh_chains,
-        # An unreadable tailnet policy resolves allowed_logins to [] and so
-        # trust_identity to False, which is "no login restriction". The values
-        # alone cannot tell that from "never configured"; degraded_sections can.
-        identity_unknown=tailnet_identity_unknown(_cfg.degraded_sections),
-        unreadable_files=tuple(degraded_config_files(_cfg.degraded_sections)),
-    )
-    if _tailnet_host:
-        logger.info(
-            "tailnet access enabled: trusting origin https://%s (bind and auth unchanged)",
-            _tailnet_host,
+        app.on_cleanup.append(_hooks_shutdown)
+
+        # Edition-contributed dashboard routes + background services (CPP
+        # DashboardContributor seam). The Default contributes nothing, so the public
+        # dashboard is unchanged. Routes are mounted HERE — before the SPA static
+        # catch-all below and well before ``runner.setup()`` freezes the route table
+        # and the on_startup/on_cleanup signal lists (see _register_instances_hooks).
+        # Fail-closed: a non-standalone host that cannot compose its companion raises.
+        safe_context_call(
+            lambda: current_context().dashboard.contribute_routes(app),
+            fallback=None,
+            log_message="dashboard.contribute_routes failed; no edition routes mounted",
         )
-    # Keep the initial snapshot on both startup surfaces for compatibility.
-    # Runtime-aware handlers read the mutable state installed below, which can
-    # acquire one validated origin after a Tailscale/Gateway boot race.
-    app["tailnet_host"] = _tailnet_host
-    app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
-    # The governance-filtered identity-trust value the middleware was built
-    # with, for handlers the middleware bypasses (POST /api/auth/refresh must
-    # re-bind a rotated access token to the same verified peer identity).
-    app["tailnet_trust"] = _tailnet_trust
-    app["allowed_origins"] = build_allowed_origins(
-        port, local_only, configured_host, tailnet_host=_tailnet_host
-    )
-    # Exposed to handlers (e.g. knowledge.pick_folder) that only make sense when
-    # the browser and gateway are co-located on localhost.
-    app["local_only"] = local_only
 
-    # DNS-rebinding defense-in-depth — shared factory (single source of truth
-    # for the barrier AND the PROBE_PATHS exemption; see
-    # _make_host_validation_middleware).
-    host_validation_middleware = _make_host_validation_middleware("dashboard_user")
-    # Same factory as the headless server's barrier, so the CSRF exemption set is
-    # one decision rather than two (see _make_csrf_middleware).
-    csrf_middleware = _make_csrf_middleware("dashboard_user")
-    # Audit boundary for refusals raised before sel_audit_middleware runs. Same
-    # factory as the headless server's, so the guarantee cannot hold on one
-    # entrypoint and not the other (see _make_deny_audit_middleware).
-    deny_audit_middleware = _make_deny_audit_middleware("dashboard_user")
-
-    # Generate per-session secret for local app / IPC authentication.
-    # NOTE: file write (and parent mkdir) deferred until after port bind
-    # succeeds — both live in _write_secret_file, offloaded below — to avoid
-    # poisoning the secret file when a second instance fails to start and to
-    # keep blocking fs I/O off the event loop.
-    _secret_path = data_home() / ".local_secret"
-    _internal_secret = os.urandom(16).hex()
-    app["local_secret"] = _internal_secret
-
-    # Host canonicalization: converge loopback aliases (127.0.0.1 / localhost /
-    # kirocrew.localhost) onto a single origin so the SPA's per-origin
-    # localStorage (theme, zoom, layout, notifications, ...) is never split
-    # across hostnames. localStorage keys on scheme://host:port, so reaching the
-    # dashboard on "localhost" one time and "kirocrew.localhost" the next (e.g.
-    # `kirocrew token` printing localhost while the gateway
-    # auto-opens kirocrew.localhost) lands the browser in a different, empty
-    # bucket and all settings appear reset. The canonical host is resolved once
-    # at startup (it is stable for the gateway's lifetime). Only top-level
-    # document GET/HEAD navigations on a non-canonical loopback alias are
-    # redirected (see should_canonicalize_host); APIs, WebSockets, and
-    # sub-resource fetches are untouched — once the document settles on the
-    # canonical host every later request is already canonical. Disabled unless
-    # local_only, so reverse-proxy / remote-host deployments are never affected.
-    _canonical_host = resolve_dashboard_host(local_only) if local_only else ""
-
-    host_canonical_redirect = build_host_canonical_redirect(_canonical_host)
-
-    # Warm the auth singletons (signing secret + revoked-nonce store) off the
-    # event loop BEFORE building the middleware chain, so no blocking key-file
-    # I/O lands on the loop on the first auth op.
-    await warm_auth_singletons()
-
-    # Warm the SecurityEventLog singleton off the loop before any handler or
-    # middleware can be its first touch, so a first ``log_api_access`` is a
-    # non-blocking enqueue on every path — call sites need no per-site
-    # ``asyncio.to_thread`` hop. Best-effort inside the helper: a
-    # failed warm never blocks readiness.
-    await warm_sel_singleton()
-
-    # Bind the crew-log push to this loop and register it with the session
-    # emitter. Installed here rather than lazily on a first request: the frame
-    # exists so a watching client learns of a growth it did not ask for, and a
-    # publisher armed by the first read would miss every growth before it.
-    handlers.install_crew_log_publisher(state)
-
-    # Explicit middleware ordering — self-documenting and immune to future insertions
-    app.middlewares[:] = [
-        # Outermost: privacy-safe per-route latency. Times the FULL
-        # in-gateway handling (all middleware + handler). Labels are limited to
-        # method / bounded route_template / status_class — never a real path,
-        # query, id, or body — so it cannot leak content or explode cardinality.
-        make_route_latency_middleware(),
-        # Outer to every barrier that can refuse, so a pre-audit 403 is recorded
-        # by POSITION rather than by each deny site remembering to. Inner to the
-        # latency middleware only, which keeps that one's "times the FULL
-        # in-gateway handling" contract intact.
-        deny_audit_middleware,
-        host_canonical_redirect,
-        host_validation_middleware,
-        no_cache_middleware,
-        csrf_middleware,
-        token_auth_middleware(
-            internal_paths=_STRICT_INTERNAL_API_PATHS,
-            mixed_internal_paths=_mixed_internal_api_paths(),
-            internal_secret=_internal_secret,
-            port=port,
-            local_only=local_only,
-            spa_shell_handler=handlers.index,
-            tailnet_trust=_tailnet_trust,
-        ),
-        sel_audit_middleware,
-        spa_fallback,
-    ]
-
-    # Verify security invariant: if dashboard_url expands the CSRF origin
-    # set for a remote URL, token auth middleware MUST be active.
-    if dashboard_url:
-        _has_token_auth = any(getattr(mw, "_is_token_auth", False) for mw in app.middlewares)
-        if _has_token_auth:
-            app["allowed_origins"] = build_allowed_origins(
-                port, local_only, configured_host, dashboard_url, tailnet_host=_tailnet_host
+        # The service lifecycle hooks are async; they route through
+        # ``async_safe_context_call`` so they share the SAME fail-closed discipline as
+        # every sync seam call (re-raise ``PlatformCompositionError`` from a host that
+        # could not compose its companion; degrade any other transient service error,
+        # logged, rather than bricking the gateway start/stop) — kept in one place so
+        # a future fail-closed policy change cannot diverge per hand-written copy.
+        async def _contrib_startup(app_: web.Application) -> None:
+            await async_safe_context_call(
+                lambda: current_context().dashboard.start_services(app_),
+                fallback=None,
+                log_message="dashboard.start_services failed; no edition services",
             )
-            logger.info(
-                "dashboard_url=%s: added to CSRF allowed origins (token auth verified)",
-                dashboard_url,
+
+        async def _contrib_shutdown(app_: web.Application) -> None:
+            await async_safe_context_call(
+                lambda: current_context().dashboard.stop_services(app_),
+                fallback=None,
+                log_message="dashboard.stop_services failed",
+            )
+
+        app.on_startup.append(_contrib_startup)
+        app.on_cleanup.append(_contrib_shutdown)
+
+        # Static files — prefer React dist/ build, fall back to legacy static/
+        if _DIST_DIR.is_dir():
+            _register_dist_static_routes(app, _DIST_DIR)
+        if _STATIC_DIR.is_dir():
+            app.router.add_static(
+                "/static",
+                _STATIC_DIR,
+                show_index=False,
+                append_version=True,
             )
         else:
-            logger.error(
-                "dashboard_url=%s requires token auth — refusing to start without it. "
-                "Enable Slack or remove dashboard.url from config.",
-                dashboard_url,
+            logger.warning("Static dir not found: %s", _STATIC_DIR)
+
+        # ── Middleware ────────────────────────────────────────────────────────────
+
+        # No-cache: prevents Chrome from caching stale assets
+        @web.middleware  # type: ignore[misc]
+        async def no_cache_middleware(
+            request: web.Request,
+            handler: object,
+        ) -> web.StreamResponse:
+            resp = await handler(request)  # type: ignore[operator]
+            if hasattr(resp, "headers"):
+                _apply_security_headers(resp, request.app, request.path, request)
+            return resp  # type: ignore[return-value]
+
+        # The static handler's FileResponse decides 200-vs-404 only in prepare(),
+        # after the middleware above has already stamped immutable. This hook sees
+        # the final status and strips immutable from any /assets/ error.
+        _install_asset_cache_control_finalizer(app)
+
+        # SPA fallback: serve index.html for client-side React Router paths.
+        # Uses the same _is_spa_shell_request predicate as the auth middleware so
+        # the two layers never drift. Bare /apps/{name} paths (no sub-path) are
+        # treated as SPA navigations and served index.html — this fixes browser
+        # refresh on e.g. /apps/code-review-sage which has no server-side route.
+        @web.middleware  # type: ignore[misc]
+        async def spa_fallback(
+            request: web.Request,
+            handler: object,
+        ) -> web.StreamResponse:
+            try:
+                return await handler(request)  # type: ignore[operator]
+            except web.HTTPNotFound:
+                if _is_spa_shell_request(request):
+                    return await handlers.index(request)
+                raise
+
+        # SEL: log mutating API operations
+        _sel_log_methods = {"POST", "PUT", "DELETE", "PATCH"}
+
+        @web.middleware  # type: ignore[misc]
+        async def sel_audit_middleware(
+            request: web.Request,
+            handler: object,
+        ) -> web.StreamResponse:
+            if request.method in _sel_log_methods and request.path.startswith("/api/"):
+                # Claim only what this middleware actually records. Its except arm
+                # logs a refusal raised below this point, so the boundary must not
+                # add a second entry for it — but a request OUTSIDE this branch is
+                # logged nowhere here, and claiming it would hand the boundary a
+                # promise no one keeps (a cross-origin WebSocket GET refused in its
+                # handler would be silently unaudited).
+                mark_audit_claimed(request)
+                from kiro_crew.sel import sel
+
+                # Every mutating /api/ call was filed under the flat
+                # ``dashboard_user``, so an action a forwarder relayed on the
+                # owner's behalf read exactly like the owner performing it.
+                actor = audit_actor(request, "dashboard_user")
+                try:
+                    resp = await handler(request)  # type: ignore[operator]
+                    sel().log_api_access(
+                        caller=actor,
+                        operation=f"{request.method} {request.path}",
+                        outcome="ok" if resp.status < 400 else "error",
+                        resources=request.path,
+                    )
+                    return resp  # type: ignore[return-value]
+                except Exception as exc:
+                    sel().log_api_access(
+                        caller=actor,
+                        operation=f"{request.method} {request.path}",
+                        outcome="error",
+                        resources=request.path,
+                        error=str(exc)[:200],
+                    )
+                    raise
+            return await handler(request)  # type: ignore[operator]
+
+        # Tailnet origin (RFC §4): this machine's own MagicDNS name, so
+        # `tailscale serve` works without the operator hand-writing dashboard.url.
+        # Off by default; resolved in a thread so the daemon call cannot stall the
+        # loop; "" whenever Tailscale is absent, stopped, or produced nothing that
+        # validated.
+        _cfg = KiroCrewConfig.load()
+        _ts_cfg = _cfg.dashboard.tailscale
+        _tailnet_host = await tailnet.resolve_tailnet_host(_ts_cfg.enabled)
+        # Identity trust (RFC §2–§3.1): validated at config load, governance
+        # ceiling applied inside the shared helper — ONE code path for both
+        # startup surfaces, so they cannot drift.
+        _tailnet_trust = await tailnet.governed_tailnet_trust(
+            _ts_cfg.trust_identity,
+            tailnet_effective_allowed_logins(_cfg.degraded_sections, _ts_cfg.allowed_logins),
+            _ts_cfg.pin_scope,
+            bind_refresh_chains=_ts_cfg.bind_refresh_chains,
+            # An unreadable tailnet policy resolves allowed_logins to [] and so
+            # trust_identity to False, which is "no login restriction". The values
+            # alone cannot tell that from "never configured"; degraded_sections can.
+            identity_unknown=tailnet_identity_unknown(_cfg.degraded_sections),
+            unreadable_files=tuple(degraded_config_files(_cfg.degraded_sections)),
+        )
+        if _tailnet_host:
+            logger.info(
+                "tailnet access enabled: trusting origin https://%s (bind and auth unchanged)",
+                _tailnet_host,
             )
-            raise RuntimeError("dashboard_url requires token auth middleware")
+        # Keep the initial snapshot on both startup surfaces for compatibility.
+        # Runtime-aware handlers read the mutable state installed below, which can
+        # acquire one validated origin after a Tailscale/Gateway boot race.
+        app["tailnet_host"] = _tailnet_host
+        app["tailnet_resolved_at"] = int(time.time()) if _tailnet_host else 0
+        # The governance-filtered identity-trust value the middleware was built
+        # with, for handlers the middleware bypasses (POST /api/auth/refresh must
+        # re-bind a rotated access token to the same verified peer identity).
+        app["tailnet_trust"] = _tailnet_trust
+        app["allowed_origins"] = build_allowed_origins(
+            port, local_only, configured_host, tailnet_host=_tailnet_host
+        )
+        # Exposed to handlers (e.g. knowledge.pick_folder) that only make sense when
+        # the browser and gateway are co-located on localhost.
+        app["local_only"] = local_only
 
-    # Register only after the final allowed-origin set is selected.  The startup
-    # hook schedules a sleeping background task and returns immediately, so this
-    # cannot extend listener startup; cleanup owns cancellation before aiohttp
-    # freezes the signal lists in runner.setup().
-    tailnet.install_tailnet_origin_recovery(
-        app,
-        enabled=_ts_cfg.enabled,
-        initial_host=_tailnet_host,
-        load_enabled=_tailnet_origin_enabled,
-    )
+        # DNS-rebinding defense-in-depth — shared factory (single source of truth
+        # for the barrier AND the PROBE_PATHS exemption; see
+        # _make_host_validation_middleware).
+        host_validation_middleware = _make_host_validation_middleware("dashboard_user")
+        # Same factory as the headless server's barrier, so the CSRF exemption set is
+        # one decision rather than two (see _make_csrf_middleware).
+        csrf_middleware = _make_csrf_middleware("dashboard_user")
+        # Audit boundary for refusals raised before sel_audit_middleware runs. Same
+        # factory as the headless server's, so the guarantee cannot hold on one
+        # entrypoint and not the other (see _make_deny_audit_middleware).
+        deny_audit_middleware = _make_deny_audit_middleware("dashboard_user")
 
-    # ── Loop stall watchdog shutdown ─────────────────────────────────────────
-    # Register the cleanup hook HERE, before ``runner.setup()`` freezes the
-    # app's signal lists (appending after setup raises "Cannot modify frozen
-    # list"). The watchdog itself is created after ``runner.setup()`` and stored
-    # on ``state._loop_watchdog``; this hook only fires at shutdown — long after
-    # that assignment — so the lazy ``getattr`` always resolves it.
-    async def _watchdog_shutdown(app_: web.Application) -> None:
-        wd = getattr(state, "_loop_watchdog", None)
-        if wd is not None:
-            wd.stop()
+        # Generate per-session secret for local app / IPC authentication.
+        # NOTE: file write (and parent mkdir) deferred until after port bind
+        # succeeds — both live in _write_secret_file, offloaded below — to avoid
+        # poisoning the secret file when a second instance fails to start and to
+        # keep blocking fs I/O off the event loop.
+        _secret_path = data_home() / ".local_secret"
+        _internal_secret = os.urandom(16).hex()
+        app["local_secret"] = _internal_secret
 
-    app.on_cleanup.append(_watchdog_shutdown)
+        # Host canonicalization: converge loopback aliases (127.0.0.1 / localhost /
+        # kirocrew.localhost) onto a single origin so the SPA's per-origin
+        # localStorage (theme, zoom, layout, notifications, ...) is never split
+        # across hostnames. localStorage keys on scheme://host:port, so reaching the
+        # dashboard on "localhost" one time and "kirocrew.localhost" the next (e.g.
+        # `kirocrew token` printing localhost while the gateway
+        # auto-opens kirocrew.localhost) lands the browser in a different, empty
+        # bucket and all settings appear reset. The canonical host is resolved once
+        # at startup (it is stable for the gateway's lifetime). Only top-level
+        # document GET/HEAD navigations on a non-canonical loopback alias are
+        # redirected (see should_canonicalize_host); APIs, WebSockets, and
+        # sub-resource fetches are untouched — once the document settles on the
+        # canonical host every later request is already canonical. Disabled unless
+        # local_only, so reverse-proxy / remote-host deployments are never affected.
+        _canonical_host = resolve_dashboard_host(local_only) if local_only else ""
 
-    # ── Prevent-sleep inhibitor shutdown ─────────────────────────────────────
-    # Registered HERE (before runner.setup freezes the signal lists) for the
-    # same reason as the watchdog hook above. The inhibitor + poll task are
-    # created after runner.setup by _arm_prevent_sleep_poll and released here.
-    _register_prevent_sleep_shutdown(app, state)
-    # Listener guard detach hook -- same ordering constraint; the guard itself
-    # is armed after the TCP site binds (below).
-    _register_listener_guard_shutdown(app, state)
+        # Gated on holding every family the canonical name resolves to, resolved at
+        # redirect time rather than here: the canonical host is fixed before either
+        # socket is bound, so a degraded second bind -- or a listener that dies
+        # later -- must be able to withdraw the redirect, not just the sidecar.
+        host_canonical_redirect = build_host_canonical_redirect(
+            _canonical_host,
+            holds_every_family=(
+                (lambda: _holds_every_loopback_family(state))
+                if _canonical_host in AMBIGUOUS_LOOPBACK_HOSTS
+                else None
+            ),
+        )
 
-    async def _kiro_prerequisite_shutdown(app_: web.Application) -> None:
-        await app_["kiro_prerequisite_service"].close()
+        # Warm the auth singletons (signing secret + revoked-nonce store) off the
+        # event loop BEFORE building the middleware chain, so no blocking key-file
+        # I/O lands on the loop on the first auth op.
+        await warm_auth_singletons()
 
-    app.on_cleanup.append(_kiro_prerequisite_shutdown)
+        # Warm the SecurityEventLog singleton off the loop before any handler or
+        # middleware can be its first touch, so a first ``log_api_access`` is a
+        # non-blocking enqueue on every path — call sites need no per-site
+        # ``asyncio.to_thread`` hop. Best-effort inside the helper: a
+        # failed warm never blocks readiness.
+        await warm_sel_singleton()
 
-    async def _kas_login_shutdown(app_: web.Application) -> None:
-        # Releases the service's aiohttp session IF a KAS request created it. It is
-        # lazily built on first use (never at boot), so an app that never served a
-        # KAS request has nothing to close.
-        service = app_.get("kas_login_service")
-        if service is not None:
-            await service.close()
+        # Explicit middleware ordering — self-documenting and immune to future insertions
+        app.middlewares[:] = [
+            # Outermost: privacy-safe per-route latency. Times the FULL
+            # in-gateway handling (all middleware + handler). Labels are limited to
+            # method / bounded route_template / status_class — never a real path,
+            # query, id, or body — so it cannot leak content or explode cardinality.
+            make_route_latency_middleware(),
+            # Outer to every barrier that can refuse, so a pre-audit 403 is recorded
+            # by POSITION rather than by each deny site remembering to. Inner to the
+            # latency middleware only, which keeps that one's "times the FULL
+            # in-gateway handling" contract intact.
+            deny_audit_middleware,
+            host_canonical_redirect,
+            host_validation_middleware,
+            no_cache_middleware,
+            csrf_middleware,
+            token_auth_middleware(
+                internal_paths=_STRICT_INTERNAL_API_PATHS,
+                mixed_internal_paths=_mixed_internal_api_paths(),
+                internal_secret=_internal_secret,
+                port=port,
+                local_only=local_only,
+                spa_shell_handler=handlers.index,
+                tailnet_trust=_tailnet_trust,
+            ),
+            sel_audit_middleware,
+            spa_fallback,
+        ]
 
-    app.on_cleanup.append(_kas_login_shutdown)
+        # Verify security invariant: if dashboard_url expands the CSRF origin
+        # set for a remote URL, token auth middleware MUST be active.
+        if dashboard_url:
+            _has_token_auth = any(getattr(mw, "_is_token_auth", False) for mw in app.middlewares)
+            if _has_token_auth:
+                app["allowed_origins"] = build_allowed_origins(
+                    port, local_only, configured_host, dashboard_url, tailnet_host=_tailnet_host
+                )
+                logger.info(
+                    "dashboard_url=%s: added to CSRF allowed origins (token auth verified)",
+                    dashboard_url,
+                )
+            else:
+                logger.error(
+                    "dashboard_url=%s requires token auth — refusing to start without it. "
+                    "Enable Slack or remove dashboard.url from config.",
+                    dashboard_url,
+                )
+                raise RuntimeError("dashboard_url requires token auth middleware")
 
-    # Releases the resident speech model (148MB default, 1.6GB largest) when idle
-    # and at shutdown. Registered here, before runner.setup freezes the signal lists.
-    _register_stt_hooks(app)
-    # Live config: one poller for every writer (dashboard, CLI, $EDITOR), started
-    # on_startup because it needs the running loop; primed with this boot's config.
-    _register_config_watch(app, state, _cfg)
+        # Register only after the final allowed-origin set is selected.  The startup
+        # hook schedules a sleeping background task and returns immediately, so this
+        # cannot extend listener startup; cleanup owns cancellation before aiohttp
+        # freezes the signal lists in runner.setup().
+        tailnet.install_tailnet_origin_recovery(
+            app,
+            enabled=_ts_cfg.enabled,
+            initial_host=_tailnet_host,
+            load_enabled=_tailnet_origin_enabled,
+        )
 
-    # ── Instances (multi-instance management) ────────────────────────────────
-    # Register the opt-in instances startup/cleanup hooks HERE, before
-    # ``runner.setup()`` freezes the app's signal lists. See
-    # ``_register_instances_hooks`` for why ordering matters.
-    _register_instances_hooks(app, state, port)
-    _register_browser_view_cleanup(app, state)
-    _register_connections_warm_lifecycle(app, state)
-    _register_workflow_lifecycle(app, state)
+        # ── Loop stall watchdog shutdown ─────────────────────────────────────────
+        # Register the cleanup hook HERE, before ``runner.setup()`` freezes the
+        # app's signal lists (appending after setup raises "Cannot modify frozen
+        # list"). The watchdog itself is created after ``runner.setup()`` and stored
+        # on ``state._loop_watchdog``; this hook only fires at shutdown — long after
+        # that assignment — so the lazy ``getattr`` always resolves it.
+        async def _watchdog_shutdown(app_: web.Application) -> None:
+            wd = getattr(state, "_loop_watchdog", None)
+            if wd is not None:
+                wd.stop()
 
-    # Unix-socket cleanup hook — registered before runner.setup freezes the
-    # signal lists; the path itself only becomes known after the site starts
-    # (below), hence the holder indirection.
-    _unix_socket_holder: dict[str, Path | None] = {"path": None}
-    _register_unix_socket_cleanup(app, _unix_socket_holder)
+        app.on_cleanup.append(_watchdog_shutdown)
 
-    # Hardened runner: bounds the request-line/header read time (slowloris /
-    # CWE-400) and reaps idle keep-alive connections. See dashboard.slowloris.
-    # max_field_size is raised from aiohttp's 8190 default so the accumulated
-    # shared per-port cookie jar can't 400 at the parser before a handler
-    # prunes it (see refresh_tokens.foreign_port_cookies).
-    runner = build_hardened_runner(app, max_field_size=_MAX_HEADER_FIELD_SIZE)
-    await runner.setup()
-    site = web.TCPSite(runner, bind_address_for(local_only), port)
-    await _start_site(site, port)
+        # ── Diagnostic recorder shutdown ─────────────────────────────────────────
+        # Registered HERE for the same reason as the watchdog hook above: appending
+        # to ``on_cleanup`` after ``runner.setup()`` raises "Cannot modify frozen
+        # list". The recorder is created after setup and reached through its module
+        # singleton, so this resolves whatever instance boot published (and nothing,
+        # harmlessly, in a test that never started one). Stopping it cancels its two
+        # tasks, stops the GIL probe thread and removes the gc callback that probe
+        # installed -- a dashboard spun up repeatedly in tests would otherwise
+        # accumulate both.
+        async def _diag_recorder_shutdown(app_: web.Application) -> None:
+            from kiro_crew.diag.recorder import get_recorder
+
+            recorder = get_recorder()
+            if recorder is not None:
+                try:
+                    # Awaited, not fired and forgotten: stop() hands back the task
+                    # doing the off-loop finish, and cleanup returning before it runs
+                    # lets loop teardown drop the closing event and leave the probe
+                    # thread joined by nobody. Awaiting a thread yields, so this does
+                    # not put the join back on the loop.
+                    pending = recorder.stop()
+                    if pending is not None:
+                        await pending
+                except Exception:  # noqa: BLE001 - shutdown must not raise
+                    logger.debug("diag recorder stop failed", exc_info=True)
+
+        app.on_cleanup.append(_diag_recorder_shutdown)
+
+        # ── Prevent-sleep inhibitor shutdown ─────────────────────────────────────
+        # Registered HERE (before runner.setup freezes the signal lists) for the
+        # same reason as the watchdog hook above. The inhibitor + poll task are
+        # created after runner.setup by _arm_prevent_sleep_poll and released here.
+        _register_prevent_sleep_shutdown(app, state)
+        # Listener guard detach hook -- same ordering constraint; the guard itself
+        # is armed after the TCP site binds (below).
+        _register_listener_guard_shutdown(app, state)
+
+        async def _kiro_prerequisite_shutdown(app_: web.Application) -> None:
+            await app_["kiro_prerequisite_service"].close()
+
+        app.on_cleanup.append(_kiro_prerequisite_shutdown)
+
+        async def _kas_login_shutdown(app_: web.Application) -> None:
+            # Releases the service's aiohttp session IF a KAS request created it. It is
+            # lazily built on first use (never at boot), so an app that never served a
+            # KAS request has nothing to close.
+            service = app_.get("kas_login_service")
+            if service is not None:
+                await service.close()
+
+        app.on_cleanup.append(_kas_login_shutdown)
+
+        # Releases the resident speech model (148MB default, 1.6GB largest) when idle
+        # and at shutdown. Registered here, before runner.setup freezes the signal lists.
+        _register_stt_hooks(app)
+        # Own-address read for the ssh self-target floor, started at boot.
+        _register_own_host_warm(app)
+        # Live config: one poller for every writer (dashboard, CLI, $EDITOR), started
+        # on_startup because it needs the running loop; primed with this boot's config.
+        _register_config_watch(app, state, _cfg)
+
+        # ── Instances (multi-instance management) ────────────────────────────────
+        # Register the opt-in instances startup/cleanup hooks HERE, before
+        # ``runner.setup()`` freezes the app's signal lists. See
+        # ``_register_instances_hooks`` for why ordering matters.
+        _register_instances_hooks(app, state, port)
+        _register_browser_view_cleanup(app, state)
+        _register_connections_warm_lifecycle(app, state)
+        _register_workflow_lifecycle(app, state)
+        _register_crewmate_prune_gate(app, state)
+
+        # Unix-socket cleanup hook — registered before runner.setup freezes the
+        # signal lists; the path itself only becomes known after the site starts
+        # (below), hence the holder indirection.
+        _unix_socket_holder: dict[str, Path | None] = {"path": None}
+        _register_unix_socket_cleanup(app, _unix_socket_holder)
+
+        # Hardened runner: bounds the request-line/header read time (slowloris /
+        # CWE-400) and reaps idle keep-alive connections. See dashboard.slowloris.
+        # max_field_size is raised from aiohttp's 8190 default so the accumulated
+        # shared per-port cookie jar can't 400 at the parser before a handler
+        # prunes it (see refresh_tokens.foreign_port_cookies).
+        runner = build_hardened_runner(app, max_field_size=_MAX_HEADER_FIELD_SIZE)
+        await runner.setup()
+        # Serve on the socket reserved BEFORE the app-backend boot pass (see
+        # _reserve_dashboard_port above): the socket is already listening, so
+        # SockSite.start()'s create_server re-listen is a harmless backlog update
+        # and starting to ACCEPT here drains any callbacks that queued during the
+        # pass. The origin evidence the backends were spawned with is this
+        # socket's own kernel-assigned name.
+        site = web.SockSite(runner, _dashboard_sock)
+        await site.start()
+    except BaseException:
+        # Every post-reservation failure must release both the app processes and
+        # the socket before another process can claim this trusted origin.
+        if runner is not None:
+            with contextlib.suppress(Exception):
+                await runner.cleanup()
+        with contextlib.suppress(Exception):
+            await _stop_spawned_backends()
+        _dashboard_sock.close()
+        raise
     # The listener is up -- keep it up. One failed accept() on Windows would
     # otherwise close it for the life of the process (see listener_guard).
     _arm_listener_guard(state, runner, site)
-    # Export the port this gateway ACTUALLY bound so child processes resolve
-    # loopback callbacks against the truth, not a re-derived config guess.
-    _export_bound_port(runner, port)
-
+    # One-time prune of the crewmates an enrol-on-mount agent sync generated
+    # from the user's own specs (see crewmate_prune_migration). Kicked here,
+    # right after the bind, as a tracked background task -- its cost scales
+    # with the session count, so it stays off the boot path and nothing here
+    # awaits it -- while the gate armed before the bind holds every mutating
+    # request until it settles.
+    _kick_crewmate_prune(state)
+    # (No _export_bound_port republish here: the reservation above already
+    # exported this same socket's name before the spawn pass — the one
+    # authoritative write on this path. The headless entrypoint, which binds
+    # via _start_site with no reservation step, still exports post-listen.)
     # The backend the main wave deferred (``apps.backend.DEV_FLEET_APP_NAME``):
     # ``apps/backend.py`` hands the Dev Fleet backend ``KIROCREW_BOUND_PORT`` at
-    # spawn, and that value exists only once the site is bound — a backend spawned
-    # before the export reads pointer state through no port at all until something
-    # restarts it. Same bulkhead as the main wave; admission already ran there.
+    # spawn. Under the reservation above that value existed before the main wave
+    # too, but the admission split lives in ``apps/backend_runtime/startup.py`` and is shared
+    # with the headless entrypoint, where the value only exists post-listen —
+    # so the second wave stays. Same bulkhead as the main wave; admission
+    # already ran there.
     deferred_apps = await asyncio.get_running_loop().run_in_executor(
         subprocess_executor(), start_deferred_app_backends
     )
@@ -4813,24 +6358,59 @@ async def start_dashboard(
     # Additional kernel-verifiable transport for the internal API (POSIX only;
     # degrades to TCP-only on any failure — see _start_unix_site).
     _unix_socket_holder["path"] = await _start_unix_site(runner, port)
+    # Hold the OTHER loopback family too, so a client dialling a NAME cannot be
+    # answered by anyone else -- see _start_secondary_loopback_site. None when
+    # there is no second listener, and the client then signs in explicitly.
+    # Resolved ONCE, and used for both the second bind and the publication below.
+    # Under `--port auto` the requested port is 0 and stays 0, so binding the
+    # second family on it lands on an unrelated ephemeral port while the sidecar
+    # is filed under the real one -- which would publish coverage for an address
+    # nothing listens on and leave the real one free for anyone to take.
+    _bound_port = _resolved_bound_port(runner, port)
+    _second_loopback = await _start_secondary_loopback_site(runner, _bound_port, _bind_ip)
 
     # Port bind succeeded — now safe to write the secret file. Offloaded:
     # _write_secret_file does blocking fs I/O (os.open/os.close, plus the
     # owner-only lockdown on Windows), so it must not run on the
     # event loop (no-blocking-call-on-event-loop). The port is passed so the
     # credential is published per listener, not only into the shared file every
-    # gateway in this data home writes (see _write_instance_credentials).
+    # gateway in this data home writes (see _write_instance_credentials). The
+    # bound ADDRESS goes with it because a port number names a set of listeners:
+    # the same port on another address is a different party, and a client that
+    # dialled one must not resolve the other's credential.
     try:
         await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
             _write_instance_credentials,
             _secret_path,
-            _resolved_bound_port(runner, port),
+            _bound_port,
+            _bind_ip,
             _internal_secret,
+            (_second_loopback.address,) if _second_loopback else (),
         )
     except OSError:
         await runner.cleanup()
         raise
+
+    # Published -- now the guards may maintain those claims. Recorded after the
+    # write, so a claim that never landed is never withdrawn or re-published.
+    _note_listener_sidecar(state, "primary", _bound_port, _bind_ip, _internal_secret)
+    # The publication above ran in an executor, so it is an AWAIT between each bind
+    # and the line that records its claim -- and one failed accept() on Windows
+    # closes a LISTEN socket for good while the process lives on. A death inside
+    # that await is invisible to both halves: for the second family the guard is
+    # not armed yet, and for the primary the guard IS armed but has no claim to
+    # withdraw, which a withdrawal answers True without touching the file. Either
+    # way the sidecar advertises an address this gateway does not hold, and arming
+    # earlier only moves the hole, because the write is in flight either way. So
+    # every claim is reconciled against its live socket the moment it is recorded.
+    _reconcile_listener_publication(state, "primary", _bound_port, _bind_ip)
+    if _second_loopback is not None:
+        _note_listener_sidecar(
+            state, "secondary", _bound_port, _second_loopback.address, _internal_secret
+        )
+        _arm_secondary_listener_guard(state, runner, _second_loopback, _bound_port)
+        _reconcile_listener_publication(state, "secondary", _bound_port, _second_loopback.address)
 
     # Listener is bound and credentials are published — now kick the warm
     # crash-residue scavenge. Deliberately NOT an on_startup hook: those run
@@ -4845,6 +6425,12 @@ async def start_dashboard(
     # the constructor (which runs pre-bind, on the loop) and runs here on a
     # worker thread once requests are already being served.
     _kick_knowledge_orphan_reclaim(state)
+    # Bind the crew-log push to this loop and register it with the session emitter,
+    # once the listener is serving: installing it imports and builds the publisher,
+    # which the crew log's default-on flag would otherwise put in front of the bind.
+    # It is installed here rather than on a first request because the frame exists
+    # so a watching client learns of a growth it did not ask for.
+    handlers.install_crew_log_publisher(state)
 
     # Event-loop heartbeat: proves the asyncio loop is live (the off-loop /proc
     # sampler can't — it runs in a subprocess). Sleeps 10s, then logs actual
@@ -4886,19 +6472,23 @@ async def start_dashboard(
     _heap_trim_maintainer = platform_compat.HeapTrimMaintainer()
 
     async def _loop_heartbeat() -> None:
-        # 5s (not 10s) so the watchdog's armed dump-then-exit timer is re-petted
-        # at a finer resolution. The timer fires exit_after seconds after the
-        # LAST beat, so the real silence the gateway tolerates before _exit is
+        # 5s (not 10s) so the watchdog's dump-then-exit alarm is re-armed at a
+        # finer resolution. The alarm fires exit_after seconds after the LAST
+        # beat, so the real silence the gateway tolerates before the exit is
         # ``exit_after - (time since last beat)`` — i.e. up to one interval less
         # than exit_after. A 5s interval keeps that worst case at ~20s (vs ~15s
         # at 10s), so genuinely-recoverable 15-20s stalls are less likely to be
-        # killed while still landing well under the Electron probe's kill window.
+        # ended while still landing well under the Electron probe's kill window.
+        # The alarm pauses while the host sleeps and this loop's clock does not
+        # advance either, so a laptop resume is not silence to the watchdog.
         interval = 5.0
         while True:
             t0 = time.monotonic()
             await asyncio.sleep(interval)
-            _loop_watchdog.beat()
             lag = time.monotonic() - t0 - interval
+            # Claimed before beat(): check() holds its own capture flag until a beat.
+            capture_lag = _loop_watchdog.claim_lag_enrichment(lag)
+            _loop_watchdog.beat()
             # Resource-pressure notifications ride the heartbeat cadence
             # rather than owning a task: the notifier self-gates to its own
             # sample interval, never raises, and off-loads its synchronous
@@ -4919,6 +6509,16 @@ async def start_dashboard(
                 # stays silent unless it actually wedges (the tripwire), and we
                 # don't emit ~8.6k INFO lines/day when DEBUG is enabled.
                 logger.debug("event-loop heartbeat ok (lag %.2fs)", lag)
+            if capture_lag:
+                # Bounded like the probes above so a busy executor cannot starve
+                # beat(); shielded so the capture still clears its in-flight flag.
+                try:
+                    capture = asyncio.get_running_loop().run_in_executor(
+                        None, _loop_watchdog.log_lag_enrichment, lag
+                    )
+                    await asyncio.wait_for(asyncio.shield(capture), 2.0)
+                except Exception:
+                    logger.debug("heartbeat lag capture not awaited", exc_info=True)
 
     def _heartbeat_done(task: "asyncio.Task") -> None:  # type: ignore[type-arg]
         if task.cancelled():
@@ -4946,6 +6546,105 @@ async def start_dashboard(
         _loop_watchdog.start()
     # Stopped on shutdown via the ``_watchdog_shutdown`` on_cleanup hook,
     # which is registered before ``runner.setup()`` freezes the signal lists.
+
+    # ── Diagnostic recorder ──────────────────────────────────────────────────
+    # Sits beside the watchdog because it answers the question the watchdog
+    # cannot: the watchdog captures the moment the loop wedges, and the adaptive
+    # controller samples the host every 5s into a 60-entry in-memory ring that
+    # dies with the process — so "what was this host doing at 21:50:44?" had no
+    # answer at all. The recorder writes one row every 30s to
+    # ``<config_dir>/diag/snapshots-<day>.jsonl`` and keeps a week.
+    #
+    # On by default, per the design: the recorder starts no process-killing timer,
+    # and a test that spins the dashboard up directly gets a task it cancels on
+    # cleanup rather than a leaked thread. The switch is read HERE, before the
+    # import, so an operator who turned it off pays neither the import nor the
+    # construction on the boot path. The off values are spelled out rather than
+    # imported from the module, because importing it is the cost being avoided.
+    _diag_off = os.environ.get("KIROCREW_DIAG_RECORDER", "").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    _diag_recorder = None
+    if not _diag_off:
+        from kiro_crew.diag.recorder import Recorder as _DiagRecorder
+
+        _diag_recorder = _DiagRecorder()
+
+    def _diag_gateway_source() -> dict:
+        """Gateway-owned counters for one recorder row.
+
+        Registered here rather than read inside the recorder so that module
+        keeps no dashboard import — it starts on this boot path, where an import
+        cycle is fatal. Every read is an EXISTING canonical accessor
+        (``state.sessions.count``, ``state.subagents.count``,
+        ``inventory_gauges.read_active_monitor_loops``,
+        ``resource_status.adaptive_state``), so the recorder's numbers are the
+        same ones the dashboard and ``resource_status`` report rather than a
+        second opinion. Each field degrades to ``None`` on its own, because a
+        gauge that cannot be read must not cost the whole row.
+        """
+        from kiro_crew import resource_status as _rs
+        from kiro_crew.metrics import inventory_gauges as _gauges
+
+        out: dict = {}
+        try:
+            out["sessions"] = state.sessions.count
+        except Exception:  # noqa: BLE001 - a gauge failure is a null field
+            out["sessions"] = None
+        try:
+            out["subagents"] = state.subagents.count if state.subagents else 0
+        except Exception:  # noqa: BLE001
+            out["subagents"] = None
+        try:
+            out["live_loops"] = _gauges.read_active_monitor_loops()
+        except Exception:  # noqa: BLE001
+            out["live_loops"] = None
+        try:
+            adaptive = _rs.adaptive_state() or {}
+        except Exception:  # noqa: BLE001
+            adaptive = {}
+        last = adaptive.get("last_sample") or {}
+        decision = adaptive.get("last") or {}
+        try:
+            # The same choice ``resource_status`` makes between the effective cap
+            # and the ceiling, rather than a second reading of it. It answers 0
+            # for "unknown", which must not reach the drop detector as a cap that
+            # fell to zero — so it becomes None.
+            cap = _rs.adaptive_exec_cap() or None
+        except Exception:  # noqa: BLE001
+            cap = None
+        out.update(
+            {
+                # ``adaptive_cap`` is the key ``_detect_adaptive_drop`` watches,
+                # so a cap that falls becomes an event rather than a number a
+                # reader has to diff by hand.
+                "adaptive_cap": cap,
+                "adaptive_action": decision.get("action"),
+                "adaptive_reason": decision.get("reason"),
+                "adaptive_signals": decision.get("signals"),
+                "adaptive_paused": decision.get("paused"),
+                "adaptive_enabled": adaptive.get("enabled"),
+                "subagents_running": last.get("running"),
+                "subagents_queued": last.get("queued"),
+                "controller_loop_lag_ms": last.get("loop_lag_ms"),
+            }
+        )
+        return out
+
+    if _diag_recorder is not None:
+        _diag_recorder.register_source("gateway", _diag_gateway_source)
+        try:
+            _diag_recorder.start(asyncio.get_running_loop())
+        except Exception:  # noqa: BLE001 - a diagnostic must never block the boot
+            logger.warning("diag recorder failed to start", exc_info=True)
+    # Deliberately NOT stashed on ``state``: ``Recorder.start`` publishes the
+    # instance through ``diag.recorder.get_recorder()``, the single publication
+    # point a future reader resolves. A second reference here would be a second
+    # source of truth for the same object -- and an attribute this class does not
+    # declare, which mypy rejects.
     state._loop_watchdog = _loop_watchdog  # prevent GC; stop on cleanup
 
     # Surface any prior crash dump from a previous gateway session.
@@ -5181,9 +6880,20 @@ async def start_dashboard(
         # dashboard session that merely happens to be named like a channel
         # stem is never mistaken for an orphan of it.
         _claimed = await asyncio.to_thread(_claimed_dashboard_slots, state)
-        merged = await asyncio.to_thread(migrate_channel_transcripts, dashboard_slots=_claimed)
+        # The crewmate prune reads the first line of every transcript, and an
+        # orphan is the only file that recorded the agent of the dashboard
+        # surface it came from. While the prune has not settled the merge is
+        # written but the copy stays, so the prune still finds that evidence;
+        # a follow-up removes the copies once the pass has returned. Nothing
+        # here waits for the pass: the readiness path stays as it was.
+        _remove = state.crewmate_prune_settled.is_set()
+        merged = await asyncio.to_thread(
+            migrate_channel_transcripts, dashboard_slots=_claimed, remove=_remove
+        )
         if merged:
             logger.info("Merged %d leftover channel transcript copies", merged)
+        if not _remove:
+            _kick_deferred_transcript_removal(state, _claimed)
     except Exception:
         # A failed migration leaves the orphan in place rather than losing
         # messages, so starting up without it is safe.
@@ -5207,6 +6917,9 @@ async def start_dashboard(
         # Reseed it past the highest restored index so the next new chat can't
         # re-mint a colliding low index (which scrambles the tab -> session map).
         state.reseed_slot_counter()
+
+    if state._dynamic_cards is not None:
+        state._dynamic_cards.seed_open_sessions()
 
     # Surface conversations started on Slack/Discord/Teams (etc.) in the chat
     # list. These persist under channel-namespaced keys (``slack:<ts>``), which
@@ -5256,8 +6969,13 @@ async def start_dashboard(
             )
 
     if defer_channel_agent_resume:
+        # The gateway resumes them after its memory barrier, behind
+        # ``await_crewmate_prune_settled`` (GatewayOrchestrator.run).
         state.resume_channel_agents = _resume_channel_agents
     else:
+        # A resumed channel agent binds its crewmate to a session; the prune
+        # must have judged every candidate before that binding can appear.
+        await await_crewmate_prune_settled(state, before="channel agent resume")
         _resume_channel_agents()
 
     # ── AEA Tunnel ───────────────────────────────────────────────────────────
@@ -5399,6 +7117,21 @@ async def start_api_server(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # Seed the retirement baseline with the account on disk RIGHT NOW, before
+    # anything can spawn a kiro-backed child. Every child postdates this read,
+    # so the once-per-lifetime unset-baseline boot sweep -- which on a live
+    # gateway can never satisfy its completion precondition and degenerates
+    # into a retire/respawn loop -- is unnecessary: a real account change after
+    # this still compares unequal and sweeps. A store that cannot be
+    # fingerprinted refuses the seed and keeps the fail-safe sweep.
+    await app["kiro_prerequisite_service"].seed_sessions_baseline()
+    # Stamp every kiro-backed spawn with the account the store holds at that
+    # moment: the turn gate compares those stamps against its fresh read, so a
+    # child from an account round trip NO read ever observed -- the one case
+    # the seeded baseline and the interim latch are both blind to -- is still
+    # retired before reuse (see flag_identity_stamp_mismatches). Unwired (the
+    # CLI, tests), spawns stay unstamped and keep the pre-stamping behavior.
+    state.sessions.spawn_identity_reader = app["kiro_prerequisite_service"].read_spawn_identity
     # Probe Kiro readiness during boot rather than on the dashboard's first
     # status request: the cold probe spawns sandboxed CLI subprocesses and can
     # take seconds, which is what made the first-run setup chrome visible to
@@ -5488,10 +7221,13 @@ async def start_api_server(
             mark_audit_claimed(request)
             # ``sel`` is imported at module scope (top of file); no in-function
             # import needed (host/csrf middleware below call it unqualified too).
+            # Same forwarder distinction as the dashboard chain's: this server is
+            # reached the same way, so its records must be readable the same way.
+            actor = audit_actor(request, "mcp_tool")
             try:
                 resp = await handler(request)  # type: ignore[operator]
                 sel().log_api_access(
-                    caller="mcp_tool",
+                    caller=actor,
                     operation=f"{request.method} {request.path}",
                     outcome="ok" if resp.status < 400 else "error",
                     resources=request.path,
@@ -5499,7 +7235,7 @@ async def start_api_server(
                 return resp  # type: ignore[return-value]
             except Exception as exc:
                 sel().log_api_access(
-                    caller="mcp_tool",
+                    caller=actor,
                     operation=f"{request.method} {request.path}",
                     outcome="error",
                     resources=request.path,
@@ -5590,6 +7326,8 @@ async def start_api_server(
     # Releases the resident speech model (148MB default, 1.6GB largest) when idle
     # and at shutdown. Registered here, before runner.setup freezes the signal lists.
     _register_stt_hooks(app)
+    # Own-address read for the ssh self-target floor, started at boot.
+    _register_own_host_warm(app)
     # Same live-config watcher as start_dashboard: a headless gateway must pick
     # up a CLI or $EDITOR write identically.
     _register_config_watch(app, state, _cfg)
@@ -5630,6 +7368,15 @@ async def start_api_server(
     # Additional kernel-verifiable transport for the internal API (parity with
     # start_dashboard; POSIX only, degrades to TCP-only on any failure).
     _unix_socket_holder["path"] = await _start_unix_site(runner, port)
+    # Parity with start_dashboard: hold the other loopback family so a client
+    # dialling a NAME cannot be answered by anyone else.
+    # Same resolve-once rule as start_dashboard: `--port auto` leaves the
+    # requested port at 0, and the second family must bind the port the sidecar
+    # will name.
+    _bound_port = _resolved_bound_port(runner, port)
+    _second_loopback = await _start_secondary_loopback_site(
+        runner, _bound_port, _resolved_bound_host(runner, bind_addr)
+    )
 
     # Port bind succeeded — now safe to persist the secret file (parity with
     # start_dashboard: write deferred so a failed bind can't poison it).
@@ -5637,18 +7384,45 @@ async def start_api_server(
     # on Windows, the owner-only DACL), so it must not run
     # on the event loop (no-blocking-call-on-event-loop). Same per-listener
     # publication as start_dashboard: both surfaces must pair the credential
-    # with the port or a client cannot tell which generation it reached.
+    # with the address AND the port, or a client that dialled one address can
+    # resolve the credential of a listener sharing only the port number.
     try:
         await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
             _write_instance_credentials,
             _secret_path,
-            _resolved_bound_port(runner, port),
+            _bound_port,
+            _resolved_bound_host(runner, bind_addr),
             _internal_secret,
+            (_second_loopback.address,) if _second_loopback else (),
         )
     except OSError:
         await runner.cleanup()
         raise
+
+    # Parity with start_dashboard: record the claims only after the write landed,
+    # then guard the second family so its sidecar cannot outlive its listener.
+    _note_listener_sidecar(
+        state,
+        "primary",
+        _bound_port,
+        _resolved_bound_host(runner, bind_addr),
+        _internal_secret,
+    )
+    # Both startup paths publish through the same executor await, so both own the
+    # same window and both reconcile every claim in it. Arming alone leaves the 60s
+    # probe as the only recovery, which is a live sidecar for an address this
+    # gateway does not hold for up to a minute -- and a guard armed without a
+    # reconcile is the harder defect to find, because the code looks complete.
+    _reconcile_listener_publication(
+        state, "primary", _bound_port, _resolved_bound_host(runner, bind_addr)
+    )
+    if _second_loopback is not None:
+        _note_listener_sidecar(
+            state, "secondary", _bound_port, _second_loopback.address, _internal_secret
+        )
+        _arm_secondary_listener_guard(state, runner, _second_loopback, _bound_port)
+        _reconcile_listener_publication(state, "secondary", _bound_port, _second_loopback.address)
 
     # Listener is bound — kick the warm crash-residue scavenge (parity with
     # start_dashboard: never an on_startup hook, which would run the deferred

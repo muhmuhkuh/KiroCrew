@@ -32,7 +32,7 @@ test.describe('Settings Page', () => {
     await expect(page.getByRole('button', { name: 'Overview', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Display', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'Chat', exact: true })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Remote Instances', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Remote Crew', exact: true })).toBeVisible()
     await expect(page.getByRole('button', { name: 'About', exact: true })).toBeVisible()
   })
 
@@ -58,8 +58,9 @@ test.describe('Settings Page', () => {
     await displayTab.click()
 
     // URL should update to the path segment — navigation state lives in the
-    // path now, never in ?tab=.
-    await expect(page).toHaveURL(/\/settings\/display(?:[?#]|$)/)
+    // path now, never in ?tab=. Display is a rail, so its first item's segment
+    // may follow the tab (as Chat's does), e.g. /settings/display/view.
+    await expect(page).toHaveURL(/\/settings\/display(?:\/[a-z-]+)?(?:[?#]|$)/)
 
     // Click About tab button
     await page.getByRole('button', { name: 'About', exact: true }).click()
@@ -72,7 +73,8 @@ test.describe('Settings Page', () => {
     // The Chat panel should render its content — check for a known setting label
     // ChatPanel contains the "Timestamps" toggle and other settings
     await expect(page.locator('[data-setting-label]').first()).toBeVisible({ timeout: 10000 })
-    expect(new URL(page.url()).pathname).toBe('/settings/chat')
+    // The Chat rail writes its default group into the path, as Channels does.
+    expect(new URL(page.url()).pathname).toMatch(/^\/settings\/chat(\/transcript)?$/)
   })
 
   test('a legacy ?tab= link translates to the path form and still renders the panel', async ({ page }) => {
@@ -89,8 +91,9 @@ test.describe('Settings Page', () => {
     const before = await (await request.get('/api/config/kirocrew')).json()
     const originalCount: number = before?.dashboard?.recent_tint_count ?? 0
 
-    // Navigate to the Display tab
-    await page.goto('/settings/display', { waitUntil: 'domcontentloaded' })
+    // Navigate to the Display tab's Sidebar Colors rail item, where the
+    // "Highlight recent sessions" stepper now lives after the rail split.
+    await page.goto('/settings/display/sidebar', { waitUntil: 'domcontentloaded' })
 
     // Find the "Highlight recent sessions" stepper
     const field = page.locator('[data-setting-label="Highlight recent sessions"]')
@@ -138,7 +141,7 @@ test.describe('Settings Page', () => {
   test('/instances redirects to /settings/instances', async ({ page }) => {
     await page.goto('/instances', { waitUntil: 'domcontentloaded' })
     await page.waitForURL('**/settings/instances', { timeout: 10000 })
-    // Remote Instances panel should render — check for the tab being active
-    await expect(page.getByRole('button', { name: 'Remote Instances', exact: true })).toBeVisible({ timeout: 5000 })
+    // Remote Crew panel should render — check for the tab being active
+    await expect(page.getByRole('button', { name: 'Remote Crew', exact: true })).toBeVisible({ timeout: 5000 })
   })
 })

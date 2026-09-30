@@ -11,9 +11,9 @@ end-to-end subsystem (install pipeline, validation, routes, security model).
 ## The rule for contributors
 
 **Pack manifest versioning:** every `theme.json` MUST declare
-`"formatVersion": 1` (integer). KiroCrew rejects packs with a missing value or
+`"formatVersion": 1` (integer). Kiro Crew rejects packs with a missing value or
 an unknown major with an explicit "this pack requires a newer version of
-KiroCrew" error. Author against the current major; breaking manifest changes
+Kiro Crew" error. Author against the current major; breaking manifest changes
 bump it.
 
 **Every new UI element MUST be themable at least at the color layer.** Style it
@@ -81,6 +81,27 @@ other side, so a code or output block that relies on the well being darker than 
 card gets the same `border-border` — and a `hover:bg-card` on a row that sits on
 the page is not a hover at all in this theme; hover states use `bg-bg-hover`.
 
+**Polarity-fixed variables are not roles.** A few `index.css` variables are read
+from `data-mode` (the polarity `useTheme` paints), not from the theme, and a pack
+cannot override them: `--glass-tint`, `--glass-band`,
+`--glass-edge` and `--glass-hairline` — the fill, the top/bottom light bands, the
+side-line / in-pane-divider hairline, and the half-pixel dark sliver outside each
+lit band (none has a focus form: a pane looks the same whether or not a control
+inside it has focus) that
+the Liquid Glass surfaces (the composer dock and everything in it, the mobile
+Settings search capsule, the session list's and the crew roster's search field)
+lay over their blurred backdrop (the pane draws no ring:
+lit top and bottom, a line down each side). `--glass-tint-accent`, `-warn` and
+`-hover` are derived from `--glass-tint` on `:root` (the picked chip, the
+incognito chip and a hovered pane swap them in via `glass-accent` / `glass-warn`
+/ `glass-hover`), so they follow the polarity too. And
+the `--tile-*` set behind the Settings section icons. They are fixed on purpose —
+the glass must read as a lit pane on any light palette and as smoked glass on any
+dark one, and a section's tile is an identity mark that must look the same in
+every theme — the same reasoning as the neutral `glass-shadow` rest shadow. Adding one
+of these takes a `:root` line plus a `[data-mode="light"]` line and no allowlist
+work; adding a color a pack should be able to change takes the role path below.
+
 ## Adding a new color role
 
 When you genuinely need a new color role, add the variable to **both** sides in
@@ -146,12 +167,13 @@ that mode actually renders. Where a mode NAME travels beside the palette, keep
 both in one memoized value so they cannot be read independently
 (`McpAppFrame`'s `themeSnapshot`).
 
-Six sites still key on the three-dep spelling and are **not** fixed here — find
+Seven sites still key on the three-dep spelling and are **not** fixed here — find
 them with `grep -rn '\[theme, colorTheme, themeVersion\]' src/`, which lists
 `components/WidgetFrame.tsx`, `components/ArtifactBody.tsx`,
-`components/library/ArtifactThumbs.tsx`, `pages/ArtifactDetailPage.tsx` and
-`pages/RemoteArtifactDetailPage.tsx`, plus `hooks/useSessionPalette.ts` (a
-`useLayoutEffect` on `[themeMode, colorTheme, themeVersion]`, same ordering). A
+`components/library/ArtifactThumbs.tsx`, `pages/ArtifactDetailPage.tsx`,
+`pages/RemoteArtifactDetailPage.tsx`, and `pages/members/CrewWebview.tsx`, plus
+`hooks/useSessionPalette.ts` (a `useLayoutEffect` on
+`[themeMode, colorTheme, themeVersion]`, same ordering). A
 grep rather than line numbers on purpose: a cited line goes stale silently, and
 the dep array IS the defect, so the pattern is the honest locator. Each takes an
 extra early read that the `themeVersion` re-read then corrects, and none pairs a
@@ -465,7 +487,19 @@ Authoring a compiled (edition) theme end to end — CSS specificity against the
 core palette, module resolution, typechecking — is covered in
 [extension-seams § Authoring an edition](extension-seams.md#authoring-an-edition-the-build-pitfalls).
 
-## Checker (advisory)
+## Checkers
+
+Two are blocking, in the `eslint src/ --max-warnings 0` CI gate through
+`@shadcn/lint` (the `shadcn` block of `eslint.config.js`):
+`shadcn/no-raw-colors` reports a raw Tailwind palette class (`text-red-500`)
+or a literal color in an SVG `fill`/`stroke`/`stopColor` attribute, and
+`shadcn/no-unknown-classes` reports a color utility whose token was never
+declared (`bg-surface-2`) along with every other class Tailwind emits nothing
+for. Rule scope and the sanctioned exceptions are in
+[frontend-conventions § Styling](frontend-conventions.md#styling).
+
+The literal checker below covers what those rules do not read: `#hex` /
+`rgb()` literals in CSS and in `style={}` values.
 
 ```bash
 npm run lint:theme-colors          # report raw literals in src/ (exit 0)

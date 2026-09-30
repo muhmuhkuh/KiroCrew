@@ -7,11 +7,11 @@ Builds use plain `pip` + `npm`/Vite + `pytest`, driven by the repo-root
 [`Makefile`](../../Makefile). There is no proprietary build tooling.
 
 > **Platforms: macOS, Linux, and Windows.** macOS and Linux use the `Makefile` /
-> `setup.sh` paths below. Windows runs natively from a Python source install
-> (`pip install -e ".[voice]"`, launched via `python -m kiro_crew gateway`); all
-> POSIX-only process, signal, file-lock and metrics calls route through
-> `kiro_crew.platform_compat`. See
-> [windows-install.md](windows-install.md) for the Windows walkthrough.
+> `setup.sh` paths below. Windows supports both the signed desktop installer and
+> a native Python source install (`.\make.ps1 build`, launched via
+> `.\.venv\Scripts\python.exe -m kiro_crew gateway`); all POSIX-only process,
+> signal, file-lock and metrics calls route through `kiro_crew.platform_compat`.
+> See [windows-install.md](windows-install.md) for the Windows walkthrough.
 
 ---
 
@@ -89,9 +89,14 @@ Global V1 retains its existing session-start memory retrieval. Crew Member V2
 injects current persona, permanent rules and admitted project guides every turn;
 facts and past experiences are retrieved through the explicit `memory_recall`
 tool. All stores share one model and inference worker. The interactive
-`memory.embedding_threads` default is 4; `memory.embedding_bulk_threads` remains
-1. Explicit settings are honored up to the host's CPU count. Bulk threads may
-be 0 to inherit the normal setting. Background jobs share the configured bulk
+`memory.embedding_threads` default is 4, capped at one core below the CPUs the
+process may run on -- which a CPU-set restriction (`--cpuset-cpus`, `taskset`)
+narrows below the host's core count -- and never below one thread, so the event
+loop keeps a core wherever
+there is one to spare; `memory.embedding_bulk_threads` remains 1. The value 4 means that default policy, so pinning threads
+where the process may use 4 or fewer CPUs takes a different number; any other explicit setting is
+honored up to that same count. Bulk threads may be 0 to inherit the normal
+setting. Background jobs share the configured bulk
 duty cycle, while waiting interactive queries take priority. A full inference
 queue leaves new rows pending and permits keyword retrieval, so additional
 members do not create unbounded native work.
@@ -127,11 +132,11 @@ PATH and AppArmor mechanics that make the one-line install work apply to them
 too.
 
 The **AppImage** stays available for hosts where you cannot install a system
-package (no root, an unsupported distro). It needs FUSE present, and because it
-runs from a randomized temporary mount there is no durable path to attach an
-AppArmor profile to or to point a `kirocrew` launcher at — so on a distro that
-restricts unprivileged user namespaces it needs the extra manual step described
-in the sandbox section. Prefer a package where you can.
+package (no root, an unsupported distro). It needs FUSE present, and it provides
+no `kirocrew` launcher on `PATH`. On a distro that restricts unprivileged user
+namespaces, keep the AppImage at a durable path and attach the manual AppArmor
+profile described in the sandbox section; moving or renaming the AppImage breaks
+that path binding. Prefer a package where you can.
 
 | You want | Use |
 |---|---|
@@ -223,7 +228,10 @@ release tree and `UV_PYTHON_INSTALL_MIRROR` at a mirror of the interpreter
 archives — the pinned SHA-256 digests are enforced either way. The signed
 installer never pipes an unsigned third-party script into a shell: uv is
 fetched as a tarball and verified against pinned digests, exactly like the
-wheel itself. When it finishes it prints the next step: `kirocrew gateway` to
+wheel itself. On a terminal the slow steps (wheel download, venv creation,
+pip) draw a single live progress line; `KIROCREW_INSTALL_PLAIN=1` turns that
+off and prints one line per step instead, which is also what a piped or
+logged run gets. When it finishes it prints the next step: `kirocrew gateway` to
 start now, or `kirocrew service install` to run it as a service.
 
 Dependencies are installed from **prebuilt wheels only** (`pip
@@ -286,8 +294,9 @@ venv puts its executables in `.venv\Scripts\`, and the macOS-only
 
 Both targets bootstrap their toolchain first (`ensure-node.sh`,
 `ensure-python.sh`) and fall back to whatever is on `PATH` if that fails. The
-backend target refuses to build a venv from an interpreter older than 3.10
-rather than letting the install backtrack forever.
+backend target refuses to build a venv from an interpreter older than 3.12,
+matching `pyproject.toml`'s `requires-python`, rather than letting dependency
+resolution backtrack or the package fail at import.
 
 `make.ps1` resolves the same toolchain but installs none of it: the bootstrap
 scripts' install paths are `curl … | sh`, so on Windows it searches (`py`
@@ -313,7 +322,7 @@ The equivalent by hand:
 git clone https://github.com/kirodotdev/KiroCrew.git
 cd KiroCrew
 cd website && npm install && npm run build && cd ..
-pip install -e ".[voice]"    # [voice] adds the optional speech-to-text extras
+pip install -e ".[dev]"      # contributor tooling, matching `make backend`
 ```
 
 ### c. Self-contained pip wheel
@@ -327,12 +336,14 @@ pip install dist/*.whl
 kirocrew gateway          # -> http://localhost:5476
 ```
 
-Kiro Crew is pure Python, so the wheel is platform-independent:
+The published wheel is tagged `py3-none-any` and carries the supported
+platforms' vendored llama.cpp libraries in its package data, so one wheel serves
+every supported OS and architecture:
 `dist/kirocrew-<version>-py3-none-any.whl` (for example
-`kirocrew-0.1.2-py3-none-any.whl`). One wheel serves every OS. The dashboard is
-folded in by the custom `BuildWithFrontend` build step in
-[`setup.py`](../../setup.py), which also bundles `CHANGELOG.md` so the
-dashboard's changelog view works on a wheel install with no source tree.
+`kirocrew-0.1.2-py3-none-any.whl`). The dashboard is folded in by the custom
+`BuildWithFrontend` build step in [`setup.py`](../../setup.py), which also
+bundles `CHANGELOG.md` so the dashboard's changelog view works on a wheel install
+with no source tree.
 
 The pip install name is **`kirocrew`**; the import package is `kiro_crew`.
 
@@ -382,10 +393,13 @@ prints the exact command, already pointed at the right interpreter.
 
 | Extra | Adds | For |
 |-------|------|-----|
-| `voice` | `boto3`, `amazon-transcribe`, `pywhispercpp` | Speech-to-text transcription |
+| `voice-aws` | `boto3`, `amazon-transcribe` | AWS Transcribe provider without the local recognizer |
+| `voice` | `voice-aws`, `pywhispercpp` | Full speech-to-text transcription |
 | `otlp` | `opentelemetry-exporter-otlp-proto-http` | OTLP/HTTP metrics export. Installing it does not enable egress; that still needs an explicit `telemetry.otlp_endpoint` |
 | `perf` | `py-spy` | Out-of-process profiling (`kirocrew perf sample --pid`). The in-process sampler needs nothing extra |
 | `teams` | `PyJWT[crypto]` | Microsoft Teams channel (validates the inbound Bot Framework RS256 JWT) |
+| `whatsapp` | `neonize` | QR-linked WhatsApp channel |
+| `feishu` | `lark-oapi` | Feishu/Lark long-connection channel |
 | `dev` | pytest, black, isort, flake8, mypy, ... | Contributor tooling; what `make build` installs |
 
 `make desktop` and `make backend-bin` need no extra: both run
@@ -451,10 +465,12 @@ excludes Ubuntu 20.04, Debian 11 and Amazon Linux 2 — on those, use the
 [one-line install](#a-one-line-install-fastest) instead.
 
 Prebuilt downloads for the release channels are linked from the
-[README](../../README.md#app-downloads). The Windows desktop installer remains
-a preview artifact; see [windows-install.md](windows-install.md) for its current
-publishing and signing status. The source install remains the fully supported
-Windows path.
+[README](../../README.md#app-downloads). The Windows NSIS installer is
+published on nightly, insider, and stable when its build succeeds, is
+Authenticode-signed, and participates in auto-update; SmartScreen can still show
+a first-download reputation warning for a new file hash. See
+[windows-install.md](windows-install.md) for the current signing, publishing,
+and fallback source-install details.
 
 See [desktop-app.md](../build/desktop-app.md) for the full pipeline (frontend,
 PBS provisioning, pip install, pruning, electron-builder) and how the app
@@ -516,11 +532,13 @@ in place of `kirocrew`.
 ### What `kirocrew setup` asks
 
 The wizard installs the agent config, then walks through the workspace
-directory, timezone, dashboard URL, and (on macOS) the desktop app. It does NOT
-configure any messaging channel: pass `--slack` to opt into the guided Slack
-credential and slash-command setup. It also does NOT install a browser: browsing
-is available when `playwright-cli` is on PATH, and you install it separately (see
-[Browser](#browser)).
+directory, timezone, dashboard URL, and (on macOS) the desktop app. Messaging
+channels are opt-in: pass `--slack` for guided Slack credentials and slash
+commands, or `--whatsapp` to check the optional dependency and pairing state
+before enabling WhatsApp. It also does NOT install a browser: browsing is
+available through the desktop app's built-in Browser panel, while the separate
+Playwright CLI fallback is installed from **Settings → Browser** or manually
+(see [Browser](#browser)).
 
 **Want the Playwright CLI at your own shell?** That is a separate tool from the
 Browser Mode above, and it has its own installer, which bootstraps Node when your
@@ -558,7 +576,9 @@ channel later -- Slack (`kirocrew setup --slack` or
 [Teams](../../src/kiro_crew/docs/teams-integration.md),
 [Webex](../../src/kiro_crew/docs/webex-integration.md),
 [WeCom](../../src/kiro_crew/docs/wecom-integration.md),
-[WeChat](../../src/kiro_crew/docs/weixin-integration.md), or
+[Weixin](../../src/kiro_crew/docs/weixin-integration.md),
+[Feishu](../../src/kiro_crew/docs/feishu-integration.md),
+[iMessage](../../src/kiro_crew/docs/imessage-integration.md), or
 [WhatsApp](../../src/kiro_crew/docs/whatsapp-integration.md) --
 when you want to reach the same agent away from your desk.
 
@@ -568,6 +588,7 @@ These flags narrow the wizard:
 |------|--------|
 | `--agent-only` | Install the agent config and stop, skipping the workspace and every credential prompt |
 | `--slack` | Run the guided Slack credential + slash-command setup (opt-in) |
+| `--whatsapp` | Check the optional WhatsApp dependency and pairing state, then enable the channel (opt-in) |
 | `--clean` | Fresh agent config: ignore the existing `kirocrew.json` and regenerate from defaults instead of merging your MCP servers and tools forward |
 | `--electron-only` | Install only the macOS desktop app |
 
@@ -578,34 +599,40 @@ so all user customizations survive.
 
 ## Browser
 
-Browsing is optional and installed separately. The agent drives a browser by
-running `playwright-cli` commands, so it needs Node.js 20 or newer:
+The desktop app includes the Browser panel and its native embedded Chromium
+path. An agent uses the bounded `browser` MCP operation set (`navigate`,
+`snapshot`, `click`, `type`, and related actions) against that visible panel; no
+Playwright CLI installation is required for this path.
+
+When no native panel serves the session, or `dashboard.use_builtin_browser` is
+off, Kiro Crew directs the agent to the `playwright-cli` fallback. Install the
+managed copy from **Settings → Browser**. For a system-wide manual install, use
+Node.js 20 or newer:
 
 ```bash
 npm install -g @playwright/cli@latest
-playwright-cli install-browser              # --with-deps on Debian/Ubuntu only
+playwright-cli install-browser chromium
 playwright-cli install --skills agents --global
 ```
 
-`--with-deps` installs OS libraries through `apt` and needs root. Playwright
-implements it for apt alone, so on Fedora, RHEL, CentOS or Amazon Linux it
-misfires against Ubuntu package names; install the libraries with your own
-package manager instead. The Settings → Browser install button adapts to the
-host and reports the command to run when it needs root — see
-[the browser module spec](../system-specs/modules/browser.md#os-dependencies).
+The explicit `chromium` argument avoids installing every browser engine.
+`--with-deps` is useful only on Debian/Ubuntu because Playwright implements its
+OS-package step through `apt`; on Fedora, RHEL, CentOS, or Amazon Linux install
+the required libraries with the host package manager. The Settings installer
+adapts to the host and reports any root-only command separately. See the
+[browser module spec](../system-specs/modules/browser.md#install-flow).
 
-The dashboard's **Browser** panel embeds the CLI's own dashboard over loopback,
-which shows the live session and lets you take over with real mouse and keyboard.
-That is how you complete a CAPTCHA or a 2FA prompt, and how you log in once so a
-session can be captured with `playwright-cli state-save`.
+The Browser panel shows the live page and lets you take over with real mouse and
+keyboard for CAPTCHA or 2FA. The CLI fallback can also attach to your own running
+Chrome with `playwright-cli attach --extension`; treat that browser as borrowed
+because it carries your live tabs and logins.
 
-**Installing the CLI makes browsing available; it does not auto-approve it.**
-There is no separate capability toggle because the CLI has no way to expose only
-a subset of its verbs. Every `playwright-cli` shell command still follows the
-ordinary approval flow. Under normal mode the first command prompts; you can
-approve once, trust its command pattern for the session, or deliberately enable a
-wider trust mode. This matters most for `playwright-cli attach --extension`, which
-drives your own running Chrome with the sessions you are already logged into.
+The native MCP path has its own bounded, governance-checked surface and drives
+only public HTTP(S) navigation automatically; local and private targets are
+refused to the approval-gated CLI path. CLI commands follow the ordinary shell
+approval ladder: under normal mode the first command prompts, after which you
+may approve once or trust a command pattern for the session. Installing the CLI
+makes the capability available; it does not silently widen approval.
 
 ## Configuration
 
@@ -719,12 +746,30 @@ crash-looping service enabled at every boot.
 A per-user unit is not affected, because the per-user systemd manager does not
 run in PID 1's domain. Follow the commands the refusal prints, then manage the
 service with `systemctl --user status|restart kirocrew` and `journalctl --user -u
-kirocrew -f`. Note that `kirocrew service status` / `uninstall` only look at the
-system unit, so they will not see a user unit ([#7165] tracks adding a first-class
-`--user` scope). Installing kirocrew onto a system-labelled path such as
-`/usr/local/bin` also avoids the problem.
+kirocrew -f`. `kirocrew service status` reports it as the **user scope** (the
+output names both scopes: `system scope: not installed`, then `user scope: active
+(running)` with the `systemctl --user status` block; it exits 0 only while the
+unit is `active`, so a unit stuck in `activating (auto-restart)` exits 1 with
+that state in the headline), `kirocrew stop` /
+`kirocrew restart` act on it through your own manager (`restart` confirms the
+unit stays up and, if it lands in `activating (auto-restart)` instead, says so and
+prints that unit's own journal read, `journalctl --user -u kirocrew.service -n 50
+--no-pager`, rather than a `sudo systemctl` command that
+would not find the unit), `kirocrew logs` tails its
+user journal, `kirocrew doctor`'s service checks read its unit file, and
+`kirocrew service uninstall` removes it and says which scope it
+removed. It only ever removes what it installed: the unit file it wrote, or
+one carrying its `Environment="KIROCREW_SERVICE_MANAGED=1"` line (a copy of
+ours you `systemctl --user link`ed loses the link and keeps the file); a unit
+of your own, or a distribution's, that holds the name is left untouched and is
+not stopped. Run these as your own
+account, not under `sudo`: a root shell cannot reach your user manager, and the
+commands then report `user scope: not reachable from this shell` rather than
+guessing. `service install` itself still writes a system unit — [#10813] tracks
+preferring user units at install time. Installing kirocrew onto a system-labelled
+path such as `/usr/local/bin` also avoids the problem.
 
-[#7165]: https://github.com/kirodotdev/KiroCrew/issues/7165
+[#10813]: https://github.com/kirodotdev/KiroCrew/issues/10813
 
 ### Setting the service port
 
@@ -797,8 +842,20 @@ For remote hosts, see [remote-and-mobile.md](remote-and-mobile.md).
 ## Linux: the agent sandbox and unprivileged user namespaces
 
 On Linux, Kiro Crew isolates the agent by entering a **user namespace** and then
-a **mount namespace**, over-mounting credential paths such as `~/.aws` and
-`~/.ssh` so the agent cannot read them. If that sandbox cannot be built,
+a **mount namespace**, over-mounting credential paths with empty directories so
+the agent cannot read them. Which paths depends on the tier: the default
+`agent.sandbox: "auto"` runs the **standard** tier, which hides `~/.gnupg`,
+`~/.docker`, `~/.azure`, `~/.config/gcloud` and Kiro Crew's own secret vault but
+deliberately leaves `~/.aws`, `~/.ssh` and `~/.kube` visible so the `aws` CLI,
+`credential_process`, git-over-SSH and `kubectl` keep working inside the agent.
+`agent.sandbox: "strict"` additionally hides `~/.aws` (including the
+`sso/cache` grant store remote-MCP OAuth uses), `~/.ssh` (except
+`known_hosts`), `~/.kube`, `~/.config/gh` and the credential files `~/.npmrc`,
+`~/.pypirc`, `~/.netrc` and `~/.git-credentials`, and the tools that read them
+stop working inside the agent as a result; it applies to sessions started after
+the change. See the
+[Sandbox section of the configuration guide](../../src/kiro_crew/docs/configuration.md#sandbox).
+If the sandbox cannot be built,
 Kiro Crew **refuses to run the agent** rather than run it unisolated: spawns fail
 closed. This is deliberate and is not something to work around casually.
 
@@ -861,10 +918,10 @@ path under `/opt`, so the sandbox works on a stock Ubuntu 23.10+ host with no
 manual step and nothing to re-point later. That fixed path is the whole
 difference — everything below exists because an AppImage does not have one.
 
-The profile above is applied **by systemd**, so it covers the installed service
-and nothing else. Launching the AppImage directly gives systemd no part to play:
-the app execs the bundled backend itself, so neither process gets a profile and
-agent spawns fail closed exactly as before. Attach a profile to the AppImage
+The service-installed profile is attached to the resolved `kirocrew` launcher
+path. An AppImage launch does not execute that path: the app starts its bundled
+backend from a randomized temporary mount, so the service profile cannot match
+it and agent spawns fail closed. Attach a profile to the durable AppImage path
 instead:
 
 ```bash
@@ -925,11 +982,13 @@ never matches. `kirocrew sandbox status` detects that and names the stale path;
 re-running `install-profile` re-points it. Replacing the file in place (an
 in-place update) keeps working, since the path is unchanged.
 
-**Running the gateway in a terminal** (`kirocrew gateway`) is not covered by
-either profile. Use `kirocrew service install` and let systemd run it. There is
-no correct profile to attach for a foreground run: the only executable involved
-is a shared Python interpreter, and attaching there would hand unprivileged user
-namespaces to every Python process on the machine.
+**Running the gateway in a terminal** (`kirocrew gateway`) is covered only when
+the shell resolves the exact launcher path to which `service install` attached
+its profile. `python -m kiro_crew`, another venv's entry point, or a recreated
+launcher at a different path is not covered; `kirocrew doctor` reports a stale
+attachment. Do not attach the profile to a shared interpreter such as
+`/usr/bin/python3`, because that would grant unprivileged user namespaces to
+every program on the host that runs it.
 
 > Earlier versions of this page suggested `aa-exec -p kirocrew-userns -- kirocrew
 > gateway`. That does not work and has been removed. Entering a **named** profile
@@ -1184,8 +1243,9 @@ desktop app) as described in the [Install paths](#install-paths) section above.
 
 For reference, the data home structure and what each uninstall path touches:
 
-- `kirocrew service uninstall` removes only the systemd unit (plus the AppArmor
-  profile it installed) or the launchd plist.
+- `kirocrew service uninstall` removes only the systemd unit — the system unit
+  and, when your own user manager has one loaded, the per-user unit, naming each
+  scope it touched — (plus the AppArmor profile it installed) or the launchd plist.
 - Python and npm package removal has no `preuninstall` or `postuninstall`
   cleanup hook.
 - The macOS DMG/zip and the Linux AppImage have no cleanup hook, so removing the
@@ -1219,7 +1279,9 @@ sign-off is tracked in
   [Teams](../../src/kiro_crew/docs/teams-integration.md),
   [Webex](../../src/kiro_crew/docs/webex-integration.md),
   [WeCom](../../src/kiro_crew/docs/wecom-integration.md),
-  [WeChat](../../src/kiro_crew/docs/weixin-integration.md), and
+  [Weixin](../../src/kiro_crew/docs/weixin-integration.md),
+  [Feishu](../../src/kiro_crew/docs/feishu-integration.md),
+  [iMessage](../../src/kiro_crew/docs/imessage-integration.md), and
   [WhatsApp](../../src/kiro_crew/docs/whatsapp-integration.md).
 - [Remote and mobile access](remote-and-mobile.md): 24/7 operation on a remote
   host, and reaching the dashboard from a phone.

@@ -22,6 +22,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app as _make_chat_app
 from chat_test_helpers import _make_state as _make_chat_state
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.apps.manager import APP_MANIFEST_FILENAME
 from kiro_crew.apps.routes import register_app_routes
@@ -37,6 +38,18 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.handlers import api_mcp_server_detail
 from kiro_crew.dashboard.state import _MAX_PENDING_CONTEXT, DashboardState, _ChatSlot
+
+
+class _StageManager:
+    def running_agents_for(self, _parent: str) -> list[dict]:
+        return []
+
+    async def has_pending_work_for_async(self, _parent: str) -> bool:
+        return False
+
+    async def wait_for_parent_reports(self, _parent: str, _owner: str = "") -> bool:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -139,7 +152,20 @@ class TestMcpServerRegistration:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        # ``/api/mcp/servers`` is listed in
+        # ``dashboard.server._STRICT_INTERNAL_API_PATHS``, so the transport this
+        # class exercises is the App Kit SDK's: a loopback process presenting
+        # ``X-Internal-Secret``, which ``token_auth`` grants and marks
+        # ``internal_auth``. The handler reads that mark to tell this caller from a
+        # browser session, which must be the dashboard owner, so the fixture has to
+        # publish it the way the middleware does or every request here lands on the
+        # owner gate instead of on the registration behaviour under test.
+        @web.middleware
+        async def _internal_secret_grant(request, handler):
+            request["internal_auth"] = True
+            return await handler(request)
+
+        app = web.Application(middlewares=[_internal_secret_grant])
         app.router.add_put("/api/mcp/servers/{name}", api_mcp_server_detail)
         app.router.add_delete("/api/mcp/servers/{name}", api_mcp_server_detail)
         async with TestClient(TestServer(app)) as c:
@@ -2390,6 +2416,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2420,6 +2450,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2722,6 +2756,10 @@ class TestNoteEndpoint:
         class _Req:
             app = {"state": state}
             match_info = {"slot": "s1"}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def get(self, key, default=""):
                 return "owner-app" if key == "app" else default
@@ -2803,8 +2841,7 @@ class TestNoteEndpoint:
         state = MagicMock()
         state.broadcast_ws = MagicMock()
         state.push_slots_update = MagicMock()
-        state.subagents = MagicMock()
-        state.subagents.running_agents_for = MagicMock(return_value=[])
+        state.subagents = _StageManager()
 
         slot = _ChatSlot("stage-slot", mode="orchestrator")
         slot._auto_run = False
@@ -2849,8 +2886,7 @@ class TestNoteEndpoint:
         state = MagicMock()
         state.broadcast_ws = MagicMock()
         state.push_slots_update = MagicMock()
-        state.subagents = MagicMock()
-        state.subagents.running_agents_for = MagicMock(return_value=[])
+        state.subagents = _StageManager()
 
         slot = _ChatSlot("stage-slot", mode="orchestrator")
         slot._auto_run = True
@@ -3459,7 +3495,7 @@ class TestUninstallAppSourcesCleanup:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        app = as_owner(web.Application())
         register_app_routes(app)
         async with TestClient(TestServer(app)) as c:
             yield c
@@ -3575,7 +3611,18 @@ class TestRegistryInstallStream:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        from types import SimpleNamespace
+
+        # Stands in for token_auth_middleware authenticating the dashboard
+        # owner, which the registry-install owner gate requires.
+        @web.middleware
+        async def _owner(request, handler):
+            request["app"] = ""
+            request["user"] = "owner"
+            return await handler(request)
+
+        app = web.Application(middlewares=[_owner])
+        app["state"] = SimpleNamespace(owner_id="owner")
         register_app_routes(app)
         async with TestClient(TestServer(app)) as c:
             yield c
@@ -3842,7 +3889,18 @@ class TestRegistryInstallStreamSecurity:
 
     @asynccontextmanager
     async def _make_client(self):
-        app = web.Application()
+        from types import SimpleNamespace
+
+        # Stands in for token_auth_middleware authenticating the dashboard
+        # owner, which the registry-install owner gate requires.
+        @web.middleware
+        async def _owner(request, handler):
+            request["app"] = ""
+            request["user"] = "owner"
+            return await handler(request)
+
+        app = web.Application(middlewares=[_owner])
+        app["state"] = SimpleNamespace(owner_id="owner")
         register_app_routes(app)
         async with TestClient(TestServer(app)) as c:
             yield c

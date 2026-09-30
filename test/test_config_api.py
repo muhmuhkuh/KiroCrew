@@ -21,6 +21,7 @@ from kiro_crew.config.schema import (
     SCHEMA_REGISTRY,
     config_entry_to_dict,
 )
+from kiro_crew.members import is_crew_id, is_valid_member_name
 
 
 @pytest.fixture(autouse=True)
@@ -300,6 +301,17 @@ class TestAgentCrudProperties:
                         },
                     )
                     create_data = await resp.json()
+                    # The route refuses, before anything else about the body is
+                    # judged, a name the roster (``GET /api/members``) would skip:
+                    # one ``validate_member_name`` rejects (hidden characters, a
+                    # tab, edge whitespace). The strategy stays wide on purpose so
+                    # this branch is exercised, not sidestepped -- and the config
+                    # file is byte-identical after a refusal.
+                    if not is_valid_member_name(name):
+                        assert resp.status == 400
+                        assert create_data["code"] == "invalid_member_name"
+                        assert json.loads(tmp.read_text()) == _seed_config()
+                        return
                     if memory_store not in ("", "default"):
                         assert resp.status == 400
                         assert create_data["code"] == "member_memory_required"
@@ -308,21 +320,31 @@ class TestAgentCrudProperties:
                     assert resp.status == 200
                     private_store = create_data["memory_store"]
                     assert private_store != "default"
+                    # The immutable identity a client binds to (never the name).
+                    assert create_data["member_id"]
+                    # An id-shaped name is the key as sent; a free-form one is
+                    # the label of a derived id.
+                    key = create_data["name"]
+                    if is_crew_id(name):
+                        assert key == name
+                    else:
+                        assert is_crew_id(key)
 
                     # List and verify
                     resp = await client.get("/api/agents")
                     assert resp.status == 200
                     data = await resp.json()
                     agents_by_name = {a["name"]: a for a in data["agents"]}
-                    assert name in agents_by_name
-                    created = agents_by_name[name]
+                    assert key in agents_by_name
+                    created = agents_by_name[key]
+                    assert created["display_name"] == ("" if is_crew_id(name) else name)
                     assert created["kiro_agent"] == kiro_agent
                     assert created["workspace"] == workspace
                     assert created["memory_store"] == private_store
                     persisted = json.loads(tmp.read_text())
-                    assert persisted["agents"][name]["memory_store"] == private_store
+                    assert persisted["agents"][key]["memory_store"] == private_store
                     store = persisted["memory_stores"][private_store]
-                    assert store["owner_member"] == name
+                    assert store["owner_member"] == key
                     assert store["memory_version"] == 2
         finally:
             tmp.unlink(missing_ok=True)
@@ -491,6 +513,77 @@ class TestAgentCrudEdgeCases:
                 assert "not found" in data["error"]
 
     @pytest.mark.asyncio
+    async def test_update_rejects_free_form_template_identifier(self, tmp_path: Path) -> None:
+        tmp = tmp_path / "config.json"
+        tmp.write_text(json.dumps(_seed_config()), encoding="utf-8")
+
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+            async with TestClient(TestServer(_make_crud_app())) as client:
+                resp = await client.put(
+                    "/api/agents/default",
+                    json={"kiro_agent": "dr. eggbot"},
+                )
+                assert resp.status == 400
+                assert (await resp.json())["code"] == "invalid_kiro_agent_name"
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_non_text_member_name(self, tmp_path: Path) -> None:
+        tmp = tmp_path / "config.json"
+        tmp.write_text(json.dumps(_seed_config()), encoding="utf-8")
+
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+            async with TestClient(TestServer(_make_crud_app())) as client:
+                response = await client.post(
+                    "/api/agents", json={"name": ["not", "text"], "kiro_agent": "kirocrew"}
+                )
+                assert response.status == 400
+                assert (await response.json())["code"] == "invalid_member_name"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target", ["", "reviewer.v2"])
+    async def test_binding_only_update_allows_unchanged_legacy_template(
+        self, tmp_path: Path, target: str
+    ) -> None:
+        data = _seed_config()
+        data["agents"]["default"]["kiro_agent"] = target
+        tmp = tmp_path / "config.json"
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+            async with TestClient(TestServer(_make_crud_app())) as client:
+                response = await client.put("/api/agents/default", json={"kiro_agent": target})
+                assert response.status == 200, await response.text()
+
+    @pytest.mark.asyncio
+    async def test_binding_only_update_rejects_changed_empty_template(self, tmp_path: Path) -> None:
+        tmp = tmp_path / "config.json"
+        tmp.write_text(json.dumps(_seed_config()), encoding="utf-8")
+
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+            async with TestClient(TestServer(_make_crud_app())) as client:
+                response = await client.put("/api/agents/default", json={"kiro_agent": ""})
+                assert response.status == 400
+                assert (await response.json())["code"] == "invalid_kiro_agent_name"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target", ["", "reviewer.v2"])
+    async def test_update_allows_unchanged_legacy_template_binding(
+        self, tmp_path: Path, target: str
+    ) -> None:
+        data = _seed_config()
+        data["agents"]["default"]["kiro_agent"] = target
+        tmp = tmp_path / "config.json"
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+            async with TestClient(TestServer(_make_crud_app())) as client:
+                response = await client.put(
+                    "/api/agents/default",
+                    json={"kiro_agent": target, "triggers": "review pull requests"},
+                )
+                assert response.status == 200, await response.text()
+
+    @pytest.mark.asyncio
     async def test_delete_default_agent_returns_409(self, tmp_path: Path) -> None:
         """DELETE /api/agents/{name} targeting default_agent returns 409."""
         tmp = tmp_path / "config.json"
@@ -533,8 +626,8 @@ class TestAgentCrudEdgeCases:
                 assert "required" in data["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_create_whitespace_name_returns_400(self, tmp_path: Path) -> None:
-        """POST /api/agents with whitespace-only name returns 400."""
+    @pytest.mark.parametrize("name", ["   ", " leading", "trailing "])
+    async def test_create_whitespace_name_returns_400(self, tmp_path: Path, name: str) -> None:
         tmp = tmp_path / "config.json"
         tmp.write_text(json.dumps(_seed_config()), encoding="utf-8")
 
@@ -542,9 +635,10 @@ class TestAgentCrudEdgeCases:
             async with TestClient(TestServer(_make_crud_app())) as client:
                 resp = await client.post(
                     "/api/agents",
-                    json={"name": "   ", "kiro_agent": "kirocrew"},
+                    json={"name": name, "kiro_agent": "kirocrew"},
                 )
                 assert resp.status == 400
+                assert (await resp.json())["code"] == "invalid_member_name"
 
 
 @pytest.mark.asyncio
@@ -726,6 +820,42 @@ async def test_binding_only_update_is_stale_checked_and_merge_safe(tmp_path: Pat
             assert on_disk["agents"]["test-agent"]["kiro_agent"] == "oncall"
             # ...and ONLY the delta: fields the payload did not carry stay.
             assert on_disk["agents"]["test-agent"]["workspace"] == "custom-ws"
+
+
+@pytest.mark.asyncio
+async def test_binding_only_unchanged_value_refuses_a_concurrent_rebind(tmp_path: Path) -> None:
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    seed = _seed_config()
+    seed["agents"]["test-agent"] = {
+        "kiro_agent": "kirocrew",
+        "workspace": "default",
+        "memory_store": "default",
+    }
+    tmp = tmp_path / "config.json"
+    tmp.write_text(json.dumps(seed), encoding="utf-8")
+    real_load = KiroCrewConfig.load
+
+    def load_before_concurrent_rebind():
+        loaded = real_load()
+        concurrent = json.loads(tmp.read_text(encoding="utf-8"))
+        concurrent["agents"]["test-agent"]["kiro_agent"] = "oncall"
+        tmp.write_text(json.dumps(concurrent), encoding="utf-8")
+        return loaded
+
+    with (
+        unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp),
+        unittest.mock.patch.object(
+            KiroCrewConfig, "load", side_effect=load_before_concurrent_rebind
+        ),
+    ):
+        async with TestClient(TestServer(_make_crud_app())) as client:
+            response = await client.put("/api/agents/test-agent", json={"kiro_agent": "kirocrew"})
+            assert response.status == 409
+            assert (await response.json())["code"] == "stale_binding"
+
+    persisted = json.loads(tmp.read_text(encoding="utf-8"))
+    assert persisted["agents"]["test-agent"]["kiro_agent"] == "oncall"
 
 
 @pytest.mark.asyncio

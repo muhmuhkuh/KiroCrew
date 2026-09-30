@@ -46,13 +46,16 @@ pull_request
   |     |-- ci.yml's `await-fast-gate` job releases the heavy jobs
   |     '-- the fork-*-review.yml lanes trigger on its completion
   |
+  |-- internal-content-scan-gate.yml
+  |                     "Internal Content Scan"  added-line external marker scan, blocking
+  |
   |-- ci.yml            "CI"           lint, sharded tests, coverage gate, e2e
-  |-- build.yml         "Build"        wheel + desktop artifacts still build
-  |-- code-review.yml   "Code Review"  grep rules, woke, Semgrep, PR hygiene, dep audit
+  |-- build.yml         "Build"        wheel + desktop/installer artifacts build
+  |-- code-review.yml   "Code Review"  grep rules, woke, Semgrep, PR hygiene
   |-- dependency-review.yml            license allowlist
   |-- docker-smoke.yml                 container contract (paths-filtered)
   |-- crew-image-build.yml             crew image recipes build (paths-filtered)
-  |-- claude-review.yml "Opus 4.8 Review"     line-level, code-only, blocking
+  |-- claude-review.yml "Opus 5 Review"     line-level, code-only, blocking
   |-- codex-review.yml  "GPT 5.6 Review"    line-level + PR intent, blocking
   |-- design-review.yml "Design Review"     design shape, advisory
   |-- ux-review.yml     "UX Review"         rendered experience, advisory
@@ -129,8 +132,8 @@ Out-of-band lanes that never gate a PR:
   call, and `test-durations.yml` already pays for a full suite on `main`.
   Contributor-facing half: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 - **Maintenance:** `ship-report.yml` (a scheduled Slack summary),
-  `test-durations.yml` (re-measures `.test_durations` so pytest-split's shards stay
-  balanced by recorded runtime, and opens a PR with the update), `issue-triage.yml`
+  `test-durations.yml` (re-measures `.test_durations`, which no sharding lane reads
+  any more, and opens a PR with the update), `issue-triage.yml`
   (a model picks `type:` / `area:` / `platform:` labels from the repository's own
   live label set, because keyword rules mislabel often enough to be worse than no
   label), `issue-summary.yml` (a second, deliberately separate lane posts ONE
@@ -144,24 +147,34 @@ Out-of-band lanes that never gate a PR:
   button, not a CI comment), `pr-merge-conflict-label.yml` and `fork-pr-label.yml`
   (both mirror a fact GitHub does not surface in the `/pulls` list onto a label), and
   `add-contributor.yml` (a daily cron, plus manual dispatch, adds each merged
-  PR's author AND the reporters of the issues that PR closed to the README
+  PR's author, the linked authors and co-authors of the commits that landed via
+  a merged PR, AND the reporters of the issues those PRs closed to the README
   Contributors block via
   `scripts/update_contributors.py`; because the default branch is protected it
   opens a rolling PR rather than committing directly, like `test-durations.yml`.
   A login in `.github/contributors-optout.txt` is never added, which keeps the
   README's removal promise enforceable against the full-rebuild collector).
-  One paginated GraphQL sweep over `pullRequests(states: MERGED)` drives it,
-  reading each node's `author` and its `closingIssuesReferences` authors. The
-  reporter side is deliberately keyed on that link rather than on listing
-  `/issues`: the connection is populated only when a PR declares it closes the
-  issue, and only merged PRs are scanned, so an entry is evidence the report
-  changed the product — which keeps duplicates, invalid reports and
-  credit-farming issues out. It undercounts by design (a fix that omitted the
-  closing keyword is invisible), and the remedy is the manual `--login` path, not
-  loosening the rule. Dedup is two-layered: `sort -u` over the union, because
-  someone can be both a PR author and a reporter, then the script's own README
-  scan. The same block also holds contributors whose contribution left neither
-  trace — a review, a translation, a private security report — added with
+  Two independent paginated GraphQL sweeps drive it: one over
+  `pullRequests(states: MERGED)`, reading each node's `author` and its
+  `closingIssuesReferences` authors; and a separate commit-history sweep over
+  the default branch, scoped to commits whose `associatedPullRequests` include a
+  merged PR, reading each commit's `authors` (which resolves `Co-authored-by:`
+  trailers to linked accounts). The commit sweep is kept separate rather than
+  nested in the PR query because GraphQL cost scales with the product of nested
+  connections, and it is scoped to merged-PR commits so it credits the same
+  public-contribution boundary the author/reporter paths do — reaching an
+  original author whose work was cherry-picked or co-authored into a maintainer's
+  replacement PR. The reporter side is deliberately keyed on that closing link
+  rather than on listing `/issues`: the connection is populated only when a PR
+  declares it closes the issue, and only merged PRs are scanned, so an entry is
+  evidence the report changed the product — which keeps duplicates, invalid
+  reports and credit-farming issues out. It undercounts by design (a fix that
+  omitted the closing keyword is invisible), and the remedy is the manual
+  `--login` path, not loosening the rule. Dedup is two-layered: `sort -u` over
+  the three-way union (someone can be a PR author, a merged-PR commit co-author
+  and a reporter at once), then the script's own README scan. The same block also
+  holds contributors whose contribution left neither trace — a review, a
+  translation, a private security report — added with
   `scripts/update_contributors.py --login`. Those entries survive every later run
   because the collector only ever inserts and never rewrites an existing line;
   that preservation is what makes one shared list workable instead of a second
@@ -185,10 +198,57 @@ Out-of-band lanes that never gate a PR:
   `test/test_workflow_pr_create_handoff.py` holds them in step and fails a new
   `gh pr create` step that skips the guard.
 
+### Scheduled workflows: failure surfacing
+
+A red `schedule:` run notifies nobody on its own: no pull request carries its
+check and no commit author gets the e-mail, so it stays invisible until someone
+opens the Actions tab. `scheduled-failure-watch.yml` is the one messenger for
+every scheduled workflow that does not already file its own failure issue. It
+runs on `workflow_run: completed` of each listed workflow, only when that run was
+a *scheduled* one (a manual dispatch has a human watching; a `workflow_call` run
+is surfaced by its caller) that ended `failure` or `timed_out` (a run that hit
+its workflow-level clock is as invisible as a red one). `cancelled` is deliberately
+not a trigger: `pr-merge-conflict-label.yml`, `nightly.yml` and
+`memory-benchmark.yml` cancel their own in-flight scheduled run by design
+(`cancel-in-progress: true`), so a cancelled scheduled run is a collapse, not a
+failure, and filing on it would make every merge to `main` during a sweep a false
+report. It opens
+ONE issue per source workflow titled `<workflow name> scheduled run is failing`,
+deduped by that fixed title compared for *equality* over the open issues
+carrying its `scheduled-failure` label. The lookup reads the issues API by label
+and never `--search`: the search index lags a create by minutes while two watched
+workflows tick every 10 and 15, and title search is a phrase match that would let
+a human-filed issue merely containing the phrase absorb the report. A repeat run
+comments `Still failing (<conclusion>): <run url>`
+on the open issue rather than filing a second -- at most once per 6 hours,
+counting only its own bumps so a human triaging in the thread does not silence
+the run links, since two watched lanes tick every 10 and 15 minutes and an
+unthrottled bump would bury those links under ~144 comments a day. Closing the
+issue resets the cycle on the same window: a red run within 6 hours of the close
+is logged in the watcher's run, not filed, so a maintainer closing the issue
+while a 10-minute lane is still red does not get a fresh issue every tick. It
+holds `issues: write` and nothing else, never checks out code, and runs at most
+one watcher per source workflow at a time without ever killing the one in
+progress (GitHub evicts an older *pending* run when a newer one queues, which
+costs nothing: the newest completion still runs after the incumbent and finds
+its issue).
+
+The rule for a new `schedule:` workflow is one line: add its `name:` to the
+watcher's `workflows:` list. Three scheduled workflows are deliberately NOT
+listed because each already files its own issue on failure and watching them too
+would report every red run twice: `add-contributor.yml` and
+`fix-loop-analysis.yml` (each carries a per-workflow "Surface failure as an
+issue" step, the hand-copied ancestor of this watcher) and `gui-user-test.yml`
+(its nightly report issue). `test/test_scheduled_failure_watch.py` fails when a
+`schedule:` workflow is neither listed nor self-reporting, when one is both, or
+when a listed name matches no workflow -- a `workflow_run` trigger on a misspelt
+name never fires and never says so.
+
 ### Code ownership
 
-`.github/CODEOWNERS` assigns every repository path to `@kirodotdev/kirocrew-team`
-through a single wildcard rule. GitHub reads that file to request reviews; the file
+`.github/CODEOWNERS` assigns every repository path to
+`@kirodotdev/kirocrew-pr-review` through a single wildcard rule. GitHub reads that
+file to request reviews; the file
 itself establishes no approval count and enforces no branch protection, so a tier, a
 required number of reviewers, or a designated-maintainer requirement cannot be
 inferred from it. The wildcard rule carries the ownership declaration, and GitHub
@@ -229,20 +289,27 @@ review fork PRs opened against a non-main base — which today get no review at 
 because they wait on a `CI` run that `ci.yml`'s own branch filter never starts.
 Widening that is a separate decision from moving the gates.
 
+The separately required **Internal Content Scan** is not a `fast-gate.yml` job:
+it needs OIDC credentials and runs through `internal-content-scan-gate.yml` for
+same-repository PRs or `fork-internal-content-scan.yml` for forks. Both publish the
+same check name that PR Readiness consumes; `push` to `main` remains the backstop.
+See [oss-fork-boundaries](../system-specs/oss-fork-boundaries.md).
+
 | Job | What it enforces |
 |---|---|
-| `internal-content-scan` | Checks the lines a change ADDS against a marker list held outside this repo, fetched per run over OIDC. Its own workflow, not `fast-gate.yml`, because it needs credentials. **Blocking**: `PR Readiness` reads it, so an added internal marker fails readiness. A same-repo PR is scanned by `internal-content-scan-gate.yml`; a fork PR by the privileged Stage-2 `fork-internal-content-scan.yml`, which posts the same check name. `push` to `main` remains the backstop. See [oss-fork-boundaries](../system-specs/oss-fork-boundaries.md) |
 | `vendor-manifest` | `scripts/verify_vendor_manifest.py`. Hashes every file under `src/kiro_crew/_vendor` against the committed `scripts/vendor_manifest.sha256` — the tree is excluded from semgrep and the AI reviewers' diff, so this checksum is its only content review. Hashing the ~26MB tree takes seconds, so it is always-on like the rest of this workflow |
 | `brand-lint` | `scripts/check_brand_name.py`, self-test first. Fails on a newly added line that joins the two words of the product name. Diff-scoped: the tree still carries thousands of pre-convention prose lines, so a whole-tree gate would charge that backlog to whoever pushed next; the whole-tree count is still printed as a non-failing report |
+| `comment-history-lint` | `scripts/check_comment_history.py`, self-test first. Fails when an added Python comment or docstring narrates change history (PR/issue ids, commit SHAs, dated incidents, review rounds, or past-tense change markers) instead of explaining current behavior. Diff-scoped; whole-tree runs report the backlog without enforcing it |
 | `focus-cue-lint` | `scripts/check_focus_cue.py`, self-test first. Fails when a change writes the `className` of an element that then has no visible focus cue. Diff-scoped for the same reason as `brand-lint`, and reports whole-tree |
 | `feature-map-lint` | `scripts/check_feature_map.py`, self-test first. Fails when a file is ADDED or DELETED under `website/src/pages/` or `src/kiro_crew/dashboard/handlers/`, or a `<Route>` entry arrives or leaves `website/src/App.tsx`, while `docs/feature-map/README.md` stays untouched. The blocking root AUTOSDE rule `feature-map-correctness` is the semantic half: it verifies changed rows against the code, rejects unrelated or cosmetic map churn, and checks that the map's net diff matches the PR's stated scope. Structural on purpose: an edit to an existing page changes a feature's behavior, which the map does not describe, so an edit-only diff never fires — a gate demanding a map review on every UI fix produces a map nobody reads. Fails OPEN on an unreadable diff, unlike the other gates here: this one guards a documentation habit, not an invariant a bad line carries into `main` forever |
 | `changelog-history` | `scripts/check_changelog_history.py`, self-test first. Fails when a shipped `CHANGELOG.md` section loses lines. Every section already in that file describes software a user has installed, and it has been silently truncated once already — a commit titled "docs: add 0.3.0-insider.9 changelog" REPLACED the file (53 insertions, 322 deletions) and nothing noticed until the Releases page had gone nearly empty |
+| `decision-ledger-history` | `scripts/check_decisions_history.py`, self-test first. Fails when a file under `docs/decisions/` other than its README is deleted, renamed or edited: each file there records a decision a person on the team made, so a change to one silently rewrites what was decided. A change of mind is a new entry naming the one it supersedes, so the only legal diff in that directory is additions. The blocking root AUTOSDE rule `recorded-decisions-are-not-regressions` is the judgment half: it blocks a change to a label, placement or behaviour an entry records unless a superseding entry quoting a maintainer arrives with it |
 | `builtin-skill-scope` | `scripts/check_builtin_skill_scope.py`, self-test first. Fails on a marker for THIS repository (its GitHub slug, a `src/` checkout path, a test or workflow file) inside a skill body under `src/kiro_crew/builtin_skills/`, because those install on every machine and resolve for exactly one of them. The `kirocrew-dev/` family is exempt by directory, since this repository is its subject matter |
 | `loop-bound-locks` | `scripts/check_loop_bound_locks.py`, self-test first. Fails on any module-global `asyncio.Lock()`/`Event()`/`Queue()` declaration — those bind to the import-time (or first-use) event loop and raise `RuntimeError` when acquired from another loop (Python 3.10+). #4800 converted the tree to `kiro_crew.loop_lock.LoopBoundLock`; whole-tree, since the backlog is zero |
 | `testpaths-coverage` | `scripts/check_testpaths_coverage.py`, self-test first. Fails on a `test_*.py` file outside the roots `setup.cfg` pins in `testpaths` — such a file is never collected, so it is green by omission and rots against the code it claims to cover (#6577 found twelve). Whole-tree, since the backlog is zero |
 | `harness-parity` | `scripts/check_harness_parity.py`, self-test first. Fails on a newly added line that expresses "this is the Kiro harness" as the absence of another one — a shape that fails toward the permissive answer, so nothing else goes red. Diff-scoped; the whole-tree backlog is a non-failing report |
 | `memory-store-seam` | `scripts/check_memory_store_seam.py`, self-test first, with `MEMSTORE_BASE_REF` resolved to the diff base. Enforces explicit store selection on added memory-context calls. The prepare-pr floor runs both commands; the main ratchet lane classifies this as a diff-only gate because its whole-tree backlog is a non-failing report |
-| `docs-lint` | `scripts/docs_lint.py --test` then `scripts/docs-lint.sh`. Every internal link resolves, every doc is reachable from its directory index, every directory holding docs has one, no code comment cites a doc that does not exist, no doc cites a source LINE past the end of the file it names, no module spec names a source file that exists nowhere, and no doc whose filename is hardcoded in code has been renamed out from under its consumer. Four trees are walked: `docs/`, the packaged `src/kiro_crew/docs/`, `website/docs/`, and the markdown a builtin app ships under `src/kiro_crew/apps/builtins/`. Plus the fact checks below, behind a shrink-only baseline |
+| `docs-lint` | `scripts/docs_lint.py --test` then `scripts/docs-lint.sh`. Every internal link resolves, every doc is reachable from its directory index, every directory holding docs has one, no code comment cites a doc that does not exist, no doc cites a source LINE past the end of the file it names, no module spec names a source file that exists nowhere, every bare Autopilot `S<n>` ID in a source comment names a row in `autopilot.md`, and no doc whose filename is hardcoded in code has been renamed out from under its consumer. Four trees are walked: `docs/`, the packaged `src/kiro_crew/docs/`, `website/docs/`, and the markdown a builtin app ships under `src/kiro_crew/apps/builtins/`. Plus the fact checks below, behind a shrink-only baseline |
 
 Each of these runs its own self-test in the same step, ahead of the real check. A
 gate that has silently stopped matching reads as a green signal, which is worse than
@@ -300,31 +367,42 @@ Every job here is blocking. Every job that costs real runner time also `needs:`
 | Job | What it enforces |
 |---|---|
 | `changes` | "Detect changed surface". Resolves the path filters every other job reads, so a diff that cannot affect a surface does not pay for it |
-| `await-fast-gate` | Polls the `Fast Gate` run for this exact head commit and **fails closed** in all three ways it can go wrong: a run that never appears (180s budget), one that never completes (720s budget), and one that completes non-success. A barrier that passed when it could not read its subject would be worse than none, because the matrix would run anyway and the log would claim it was cleared to. One extra ~1-minute job buys the whole matrix the right to not start |
+| `await-fast-gate` | Polls the `Fast Gate` run for this exact head commit and **fails closed** in all three ways it can go wrong: a run that never appears (180s budget), one that never completes (720s budget), and one whose conclusion is a decided non-success. `action_required` is not one of them: GitHub reports a fork run still awaiting maintainer approval as `completed`/`action_required`, so the barrier polls it as pending under the 720s budget rather than letting approval order decide whether the matrix runs. A barrier that passed when it could not read its subject would be worse than none, because the matrix would run anyway and the log would claim it was cleared to. One extra ~1-minute job buys the whole matrix the right to not start |
 | `backend-lint` | `isort --check-only`, `flake8`, `mypy` on Python 3.12, plus `scripts/check_black_formatting.py` — black enforced on every file outside `.github/black-baseline.txt`, which can only shrink — and `scripts/check_subprocess_encoding.py` (self-test first) — no text-mode subprocess call without an explicit `encoding=`, `**UTF8_TEXT`, or a `# subprocess-encoding: locale` marker, outside `.github/subprocess-encoding-baseline.txt`, which can only shrink — and `scripts/check_sync_io_in_async.py` (self-test first) — no blocking db / subprocess / http / `time.sleep` call inside an `async def` under `src/`, outside `.github/sync-io-in-async-baseline.txt`, which can only shrink. A stall past `dashboard.loop_stall_exit_after_secs` (25s) makes the watchdog kill the gateway and drop every in-flight turn (#3057, #1572); the escape is an offload (`await asyncio.to_thread(...)`, or a named lane from `src/kiro_crew/executors.py`) or a `# on-loop-io-ok: <why it cannot block>` marker whose reason is mandatory. All four baselined gates in this job read their diff scope from the one shared resolver in `scripts/ratchet_scope.py`, so they cannot disagree about which lines a change added; the env-base gates (`check_brand_name.py`, `check_harness_parity.py`, `check_focus_cue.py`) share the same diff parsing through its explicit-base entry points while keeping their `*_BASE_REF` base semantics |
 | `backend-test` | 8 whole-file shards on Python 3.12, assigned before import, `-n auto` within each; 60-minute job budget includes coverage upload, with the 120-second per-test timeout retained. Large CodeBuild compute with the non-root boundary for eligible actors; hosted fallback |
 | `backend-test-windows` | All 8 whole-file shards use large CodeBuild compute for eligible actors, windows-latest otherwise; `--no-cov`, 180s per-test timeout. See the migration contract below |
 | `backend-test-ipv6` | Five native IPv6 cases on hosted Linux and Windows; fail-closed report check, Linux full-run coverage merged with the ordinary shards |
+| `backend-test-kernel-lock-owner` | Runs the two strict live-holder/orphan flock cases on uncontainerized `ubuntu-latest` with `KIROCREW_LOCK_OWNER_STRICT=1`; full-scope coverage is merged with the shard and IPv6 artifacts |
+| `pod-boot-windows` | Boots a real worktree Pod under Windows Task Scheduler and pins three canary tests. A PR carrying `ci:pod-scenarios` before its next push also runs the 55-test Pod scenario suite against a built SPA |
 | `backend-test-windows-fail-closed` | Same actor-gated Windows routing, single `-n0` run of `test/test_windows_fail_closed_optin.py` BY NODE ID with the pass count grepped, so a silent skip cannot go green. It boots a real gateway and drives one ACP prompt turn on Windows against real filesystem state |
-| `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those 85 assertions (the `~/.kiro/crew` keystone among them) actually execute |
-| `backend-test-crew-container` | "Backend Tests (crew container)". The only lane that runs the crew container image's suite (`aws_control/crew/runtime/container_tests/`, 327 tests). It is separate from the shards because it installs the image's own runtime pins (`container/requirements.txt`: fastapi, uvicorn, httpx, boto3), which that file's header forbids becoming dependencies of the application, and the shards' environment IS the application's, so there the suite's conftest collects nothing. Sets `CREW_CONTAINER_TESTS_REQUIRED=1`, which turns every reason that conftest would decline to collect into a hard error and checks the collection against the tree |
+| `backend-test-sandbox` | The one job that clears the AppArmor userns restriction, so the tests guarded by `skipif(not userns_available())` EXECUTE instead of skipping. Runs all eleven sandbox-dependent suites. The shards collect the same files — nothing is deselected — but there the sandbox-guarded tests skip, so this is the only lane where those assertions (the `~/.kiro/crew` keystone among them) actually execute |
+| `backend-test-crew-container` | "Backend Tests (crew container)". The only lane that runs the crew container image's suite (`aws_control/crew/runtime/container_tests/`). It is separate from the shards because it installs the image's own runtime pins (`container/requirements.txt`: fastapi, uvicorn, httpx, boto3), which that file's header forbids becoming dependencies of the application, and the shards' environment IS the application's, so there the suite's conftest collects nothing. Sets `CREW_CONTAINER_TESTS_REQUIRED=1`, which turns every reason that conftest would decline to collect into a hard error and checks the collection against the tree: every module and every named test the source declares must yield an item, and the total must be at or above `_MIN_COLLECTED` and no more than `_FLOOR_MARGIN` above it. A declared module or test name that stops yielding an item reds on its own name, with no number involved; the count is what catches a test whose parametrize cases drain while its name is still collected. `_MIN_COLLECTED`'s own comment states what that does and does not catch, and is the only place that bound is spelled out |
 | `real-adapter-contract` | "Real Adapter Contract Tests". The one lane that INSTALLS the adapters the codex and opencode projections were measured against — `@agentclientprotocol/codex-acp` and `opencode-ai`, `npm ci` from the locked manifest in `test/real_adapters/` (its own manifest, not the product's; Dependabot bumps it weekly so drift shows up in the bump PR) — so the four contract tests that drive a real adapter execute instead of skipping. Everywhere else they skip, which left the element shape, the child environment, the refused transports and the eviction verb resting on one local run. Selects them by the `real_adapter` marker, so one added later is included rather than left out of a list. Sets `KIROCREW_E2E_REQUIRE=1` — the repository's existing "this job declared its preconditions must hold" switch, shared with the E2E suites — which turns an absent adapter into a failure, and then asserts on the junit report that at least the known contracts ran and none was skipped, so a broken install cannot report a green lane that measured nothing |
 | `coverage-combine` then `coverage-gate` | Combines the 3.12 shard data, then enforces the project line-rate floors, plus a per-file floor with a shrink-only baseline (all floors live in the job's `env:` block). **CodeBuild-hosted runner** (pilot, below) except for forks |
 | `frontend-lint` | `tsc -p tsconfig.app.json`, `eslint` under a hard-zero warning ceiling, `jscpd`, and `npm run i18n:check` |
 | `electron-test` | The Electron shell's own node:test suite (`website/electron`) |
+| `electron-test-windows` | Runs the native Windows port-owner identity tests against real NTFS junction and `Win32_Process` behavior; no npm install is needed because the tested modules use Node's standard library only |
 | `frontend-test` | `vitest run --coverage`. **CodeBuild-hosted runner, `instance-size:large`** (pilot, below) except for forks |
 | `frontend-coverage-merge` | Merges the frontend coverage shards so the gate reads one report. **CodeBuild-hosted runner** (pilot, below) except for forks |
 | `cfn-lint` | Lints the artifact-deploy templates with a pinned `cfn-lint`. **Runs on the CodeBuild-hosted runner** (pilot, below) except for fork PRs |
 | `linux-packaging` | "Linux Packaging (build + smoke-install)". Builds all three Linux desktop formats from one backend tree through `packaging/build-desktop.sh`, then installs them in their target distros with `scripts/smoke-linux-packages.sh`. Path-filtered on the packaging surface |
 | `lockfile-engines-floor` | "Lockfile Installs On Declared Node Floor". Runs a real `npm ci` in `website/` on the LOWEST Node version `engines.node` declares, so a lockfile that only resolves under the newer npm major cannot land. The version is a literal pinned to that floor by `test_the_engines_floor_job_pins_the_declared_floor` rather than a range, because resolving a range picks the newest match and makes the job vacuous |
 | `bundle-size` | "Bundle Size Gate". Builds the frontend with `--mode analyze` (which is the only build that emits `dist/bundle-report.json`) and then runs TWO checks over that one build: per-chunk ceilings from `website/scripts/check-bundle-size.mjs`, with a 500 KB default for any chunk not named there, and an acyclic-graph check from `website/scripts/check-chunk-cycles.mjs`. The job name is narrower than its scope on purpose — it is a required check, so renaming it would silently stop satisfying branch protection. **An acyclic chunk graph is a deliberate invariant and the cycle check has no allowlist**, unlike the size ceilings: a chunk cycle has no valid initialization order, so a body can run against a binding that is still uninitialized and blank the page before React mounts, and whether a given cycle does that is not decidable from the chunk graph. Fix the chunking rather than waiving it. Skipped on a backend-only diff, which cannot change the bundle |
-| `e2e` | The i18n render-time gate, then `python setup.py test_e2e`. **CodeBuild-hosted runner, `instance-size:large`**, behind the same `run-as-runner` boundary as the backend shards. The suite's disposable gateway takes `agent.sandbox_allow_unsandboxed_exec` (seeded in `test/test_playwright_e2e.py`) because the fleet container refuses `CLONE_NEWUSER` at the runtime policy level and the agent binary is a stdlib echo stub; a sandboxed spawn doing real work stays proven by `e2e-private-namespace` and `e2e-boot-matrix` |
+| `e2e` | Runs `python scripts/ci_e2e_parallel.py`, which awaits `python setup.py test_e2e`, the dedicated Memory UI pytest command, and `npm --prefix website run i18n:render` in parallel. **CodeBuild-hosted large runner where eligible**, behind the same `run-as-runner` boundary as the backend shards. The suite's disposable gateway takes `agent.sandbox_allow_unsandboxed_exec` (seeded in `test/test_playwright_e2e.py`) because the fleet container refuses `CLONE_NEWUSER` at the runtime policy level and the agent binary is a stdlib echo stub; a sandboxed spawn doing real work stays proven by `e2e-private-namespace` and `e2e-boot-matrix`. Details: [e2e-gate.md](e2e-gate.md) |
 | `e2e-private-namespace` | "E2E (private member namespace, hosted)". The one E2E step the fleet cannot host: `test/e2e/test_private_workflow_memory.py` runs a Crew Member's private workflow MCP inside the member sandbox, which needs `unshare --map-root-user`. Hosted `ubuntu-latest`, clears the AppArmor userns restriction first, no SPA or browser |
+| `integration` | "Integration (in-process gateway)". The middle layer: `test/integration/` boots the real `GatewayOrchestrator.run()` inside the pytest process on a scratch `KIROCREW_HOME` with the packaged fake ACP backend and talks HTTP to the port it bound, so one test can assert across a restart, across two concurrent requests on one event loop, or on a file the boot itself wrote. Opt-in by `KIROCREW_INTEGRATION=1`, so the unit shards collect and skip it; Linux only. Gated on ROUTE coverage -- `scripts/check_integration_route_coverage.py` reports the share of registered dashboard routes the suite requested (`--min` is a ratchet kept a little under what `main` measures) and the report is uploaded as the `integration-route-coverage` artifact. Details: `docs/system-specs/common/testing-conventions.md`, "The integration layer" |
+| `e2e-boot-matrix` | Boots a real fake-backed gateway and pins seven tests on Linux and Windows for PRs; push-to-main runs add `macos-15`. Every leg is fail-closed on missing prerequisites or a collapsed pass count |
+
+`backend-lint` also runs `scripts/check_python_audit.py` (report-only findings,
+fail-closed execution), `scripts/check_acp_frame_host_data.py`,
+`scripts/check_agent_sdk_boundary.py`, and
+`scripts/check_lockdown_before_publish.py`. The Agent SDK boundary check is the
+fourth shrink-only, diff-scoped baseline gate referenced in the table above.
 
 ### Backend file sharding
 
-The Linux and Windows matrices assign whole files before pytest imports their
-items. `scripts/ci_file_shards.py` is an opt-in pytest plugin, loaded only by
+The Linux, Windows and macOS matrices assign whole files before pytest imports
+their items. `scripts/ci_file_shards.py` is an opt-in pytest plugin, loaded only by
 those matrix commands. It uses SHA-256 of the root-relative POSIX path to choose
 one of `SHARD_COUNT` owners. Each xdist worker reaches the same assignment.
 Adding a file does not move existing files between shards.
@@ -334,8 +412,8 @@ platform-specific conftest ignores, and creates its normal file collectors.
 The plugin returns an empty collection report for files owned by another shard,
 before their collector imports them. It does not rewrite discovery into explicit
 file arguments, which would bypass `collect_ignore`. Within its owner, the
-ordinary shard excludes only `ipv6_required`; the dedicated hosted lane runs those
-items. Explicit reduced-scope targets keep their
+ordinary Linux shard excludes only `ipv6_required` and the dedicated hosted lane runs
+those items; the macOS command passes no marker filter at all. Explicit reduced-scope targets keep their
 existing discovery semantics and are partitioned at the same file boundary.
 Leaf-test repeat runs do not load the file-sharding plugin and remain unsharded.
 
@@ -360,14 +438,19 @@ suite, with no duplicates within each OS. Invalid shard options fail as usage
 errors. A shard collecting no tests retains
 pytest's nonzero exit; it never falls back to the whole suite or reports success.
 `loadgroup` still serializes marked tests within a job. Like the former item
-split, this is not a cross-runner serialization mechanism. Namespace jobs and
-macOS keep their existing collection; `pytest-split` remains installed for macOS
-and the optional duration-recording workflow.
+split, this is not a cross-runner serialization mechanism. Namespace jobs keep their
+own collection, and macOS now file-shards like the two backend jobs, so no job
+splits items any more. `pytest-split` stays
+installed for `test-durations.yml`'s `--store-durations` recording run and for three
+tests that load its plugin directly (`test_ci_pytest_progress.py`,
+`test_ci_file_shards.py`, `test_xdist_escaped_failure_guard.py`); what has no consumer
+is the `.test_durations` those runs record.
 
 This reduces repeated test-module imports and item collection. It does not avoid
 shared conftest/package imports or imports made by another test. Hashing does not
-balance duration, and one large test file is indivisible. The eight shards per OS
-trade more runner slots and repeated setup for less work per shard. Keep runner
+balance duration, and one large test file is indivisible. The eight Linux/Windows
+shards, and macOS's four, trade more runner slots and repeated setup for less work per
+shard. Keep runner
 routing, timeout values and coverage gates fixed when comparing CI runs; report
 the shard count alongside queue, collection and execution timings.
 Use actual phase timing rather than buffered log timestamps to measure collection.
@@ -396,7 +479,7 @@ recorded line ran in the unmodified variant. Whole-suite coverage and baseline
 graduations still require the resulting CI artifact.
 
 Rollback: replace the plugin and `--file-shards` / `--file-shard` flags in the
-three matrix invocations with the previous `--splits` / `--group` flags. No
+four matrix invocations with the previous `--splits` / `--group` flags. No
 infrastructure, worker-count or privilege change is needed.
 
 ### Required native IPv6 tests
@@ -439,11 +522,17 @@ All eight `backend-test` shards use `linux_runner_large`; all eight
 `backend-test-windows` shards and `backend-test-windows-fail-closed` use the
 centrally resolved large Windows label. `e2e-boot-matrix` maps its Linux and
 Windows legs to those outputs without changing `matrix.os`, names, timeouts or
-artifact names. `backend-lint` uses large on the fleet. The formatter gate keeps
-Black's original native CLI and default worker selection when `RUNNER_ENVIRONMENT`
-is explicitly `github-hosted`; the CI step does not set `BLACK_NUM_WORKERS`.
-Fleet and local checks use `scripts/bounded_black.py`, with at most eight workers
-regardless of the native pool size. `scripts/ci_black_diagnostics.py` runs the gate
+artifact names. `backend-lint` uses large on the fleet. The formatter gate runs
+`scripts/bounded_black.py` on every runner -- fleet, GitHub-hosted and local --
+with at most eight workers regardless of the native pool size; the CI step does
+not set `BLACK_NUM_WORKERS`. Hosted runners originally kept Black's native CLI and
+default pool, and every fork PR's lint job then died mid-step with exit 143 after
+6-9 minutes ([#13689](https://github.com/kirodotdev/KiroCrew/issues/13689)):
+`ubuntu-latest` installs the compiled Black wheel, whose per-worker retention is
+the same failure the fleet measured, and the hosted VM has no cgroup cap
+(`memory.max: max`, 16 GB host), so the runner itself was torn down instead of a
+worker being OOM-killed. Recycling costs about 1.6x native wall time on four
+cores; more workers than cores do not shorten it. `scripts/ci_black_diagnostics.py` runs the gate
 once, preserves its failure status and stderr, and records bounded cgroup readings
 and child peak RSS. Worker count alone does not bound retained formatting trees:
 [the env-only two-worker fleet run](https://github.com/kirodotdev/KiroCrew/actions/runs/35417525930/job/105829161045)
@@ -592,8 +681,8 @@ Where the coverage went:
 
 | Lane | Where | Blocking? |
 |---|---|---|
-| `backend-test-macos` (full suite, 3 shards) | `platform-tests.yml`: called by `nightly.yml` at 06:00 UTC, plus `workflow_dispatch` against any branch | Holds the nightly **publish** jobs, never the builds — the artifacts are the evidence a fixer works from. Maintains one tracking issue (`platform-tests-macos` label) carrying the failing node ids and the pull requests merged in the last 24h |
-| The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`) | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
+| `backend-test-macos` (full suite, 4 shards) | `platform-tests.yml`: called by `nightly.yml` at 06:00 UTC, plus `workflow_dispatch` against any branch | Holds the nightly **publish** jobs, never the builds — the artifacts are the evidence a fixer works from. Maintains one tracking issue (`platform-tests-macos` label) carrying the failing node ids and the pull requests merged in the last 24h |
+| The same suite, on demand | `macos-on-demand.yml`, `pull_request`, calls `platform-tests.yml` against the PR head; a Linux `decide` job runs it when the diff touches a darwin-sensitive path, **or** the PR carries the `ci:macos` label, **or** the head SHA falls in a 1-in-20 sample (`16#${HEAD_SHA:0:8} % 20`, deterministic per commit) (acts immediately -- the workflow listens for `labeled`). Over those three sits a CEILING: the path and sample switches are refused while this lane already holds `LANE_MAX_LIVE_RUNS` (4) live runs of the hosted macOS pool (a run holds one job per shard, so the ceiling is expressed in runs but felt in jobs, and it moves with the shard count), because on 2026-09-24 it held 53 of the 56 in-progress macOS jobs and one shard waited 14 hours for a runner while `build.yml` and `release.yml` queued behind it. A capped run is skipped, not queued, so the ceiling bounds demand and settles the lane at about six verdicts an hour -- a timely verdict for a few pull requests instead of a 14-hour one for all of them, with the nightly still covering every merge. The `ci:macos` label is never refused, and neither is a re-run, so a retry cannot turn a red lane into a skip | Advisory. It is a separate workflow ON PURPOSE: a macOS job inside `ci.yml` holds that workflow's completion even with `continue-on-error`, so it would still hold readiness. Readiness evaluates neither this workflow nor its check |
 | Real gateway boot on macOS | `ci.yml`'s `e2e-boot-matrix`, push-to-main leg; `nightly.yml`'s `pod-scenarios` | Blocking on main / holds nothing in the nightly |
 
 `test/test_macos_platform_tests_gate.py` pins all of it, including the property that
@@ -719,41 +808,261 @@ Details worth knowing:
     carries a watchdog rather than waiting for it:
     `.github/workflows/ci-runner-watchdog.yml` runs `scripts/ci/runner_watchdog.py`
     every ten minutes on `ubuntu-latest` (never on CodeBuild — a watchdog for a
-    path cannot depend on that path). It lists the queued and in-progress `CI`
-    runs, and calls a run *orphaned* when one of its jobs is still `queued`,
+    path cannot depend on that path). It lists the queued and in-progress runs
+    REPO-WIDE — one paginated `GET /repos/{repo}/actions/runs?status=…` per
+    status returns runs of every workflow at once — and keeps only those whose
+    `path` names a workflow that routes jobs to the CodeBuild fleet — `ci.yml`,
+    `fast-gate.yml`, `main-ratchet-audit.yml`, `build.yml` and eleven others,
+    the set pinned in the script as `WATCHED_WORKFLOWS` and tested against the
+    workflows whose `runs-on` actually carries the fleet label (the watchdog's
+    own workflow is excluded, since that label appears only in its comment). One
+    listing per status covers the whole watched set as a client-side filter, which
+    reaches a fleet-routed workflow nobody registered — breadth a per-workflow loop
+    cannot have, and not the same thing as reaching further back in time. Depth is
+    the page walk: this endpoint returns pages below `per_page` mid-listing (98,
+    then 100, then 100, then 99 while `total_count` stood at 927, measured
+    2026-09-24), so only an EMPTY page ends the walk. Reading a short page as the
+    tail stopped every tick after page one, which left the sweep seeing the newest
+    couple of minutes of runs against a 15-minute orphan threshold and hid two
+    six-hour `main` outages; the six-hour orphan behind the second one sat on page
+    seven. Live statuses read at most ten
+    pages each — the API's reachable window, since a status-filtered runs listing
+    stops at 1000 results — and each live classification sweep reads jobs for at
+    most 50
+    runs: up to 10 reserved for the newest runs that are themselves at least one
+    saturation wait old (a younger run cannot hold a served start that waited that
+    long and so could only ever report the fleet dispatching), falling back to the
+    newest runs when none qualifies, since an empty reserve reads as an outage; the
+    rest go to the classify slice, ranked actionable-shaped first (a `push` run of a
+    heal-safe workflow past the orphan threshold) then oldest. The split is dynamic —
+    a short reserve hands its unused reads to the classify slice instead of leaving
+    them unspent. Spending the whole bound oldest first would
+    leave a backlogged sweep unable to tell a dead fleet from a busy one, so it
+    would heal nothing exactly when the watchdog is needed. Ranking inside the classify
+    slice puts the heal-eligible shape first — a same-repository `push` or
+    `pull_request` run of a workflow declared heal-safe for that event, AND past the
+    orphan threshold — then oldest within each class, because age alone hands those
+    slots to runs no heal will ever touch: 220 watched live runs sat past the orphan
+    threshold on 2026-09-24 and 18 past a day, the oldest 36 days, runs that stay
+    listed and re-read the same slot on every tick (a fork's run, or a closed pull
+    request's, which the heal now cancels rather than re-reads). The log names the
+    bound when other runs wait for the
+    next tick. Cancelled recovery reads at most ten pages, the same as the live
+    listings, because GitHub caps a status-filtered runs listing at 1000 results —
+    measured on this repository, page 11 returns an empty `workflow_runs` and
+    `total_count: 0`, not an error — so a deeper cap describes pages the endpoint
+    never serves. Ten pages hold 1000 cancellations, about five hours at the 200 an
+    hour this repo was measured at, and the 2026-09-20 orphans were 21 hours old,
+    so that reach is BEST-EFFORT and carries no coverage claim. GitHub offers no
+    ordering by cancellation time, so nothing readable from the listing can prove
+    every run cancelled inside the window was seen; truncation logs a warning, and a
+    cancelled run that never got listed needs `gh run rerun` by hand. The reach only
+    changes how often that is true. Because that 1000-result ceiling also serves an
+    empty page, an empty page is not proof of the tail: every live listing compares
+    the runs it yielded against the first page's `total_count`, and a shortfall on an
+    ACTIONABLE status (`in_progress`, `queued`) records a tick-level failure so the
+    scheduled run goes red. A `pending` shortfall only warns, because those runs are
+    held by their concurrency group, have no jobs, and are never healed — and
+    `pending` is what grows during the saturation the watchdog has to survive. The
+    remedy the failure prints is to NARROW the listing, not to raise the cap, since
+    the cap is already the reachable window. The three live indexes plus
+    the cancelled index cost at most 40 calls
+    per tick. It
+    calls a run *orphaned* when one of its jobs is still `queued`,
     carries a `codebuild-` label, and has waited more than 15 minutes
     (queue-to-start on CodeBuild is measured in seconds here, so that margin is
     generous). It then cancels the run, waits for the cancellation to land, and
     re-runs it: the re-run is a new attempt, so `changes` recomputes the label
     with the new attempt suffix and GitHub emits fresh `workflow_job.queued`
-    webhooks that start fresh runners. The watchdog re-runs *all* jobs rather
+    webhooks that start fresh runners. The re-run cap of five per tick is one
+    global budget across every watched workflow, not five per workflow. The
+    watchdog re-runs *all* jobs rather
     than only the failed ones, because `gh run rerun --failed` reuses the first
     attempt's `changes` outputs and therefore re-queues the routed jobs under a
     label whose attempt suffix is stale, and CodeBuild's documentation does not
-    say whether it honours that. Slow is not dead: a queued `codebuild-` job is
+    say whether it honours that. A workflow clears TWO heal-safety gates. The
+    declared gate is `HEAL_SAFE_WORKFLOWS`, a written judgement that a full
+    re-run is safe, and it is the LOAD-BEARING one: a workflow joining the
+    watched set is exempt until a person puts it there. There are two declared
+    sets, keyed the way their successor check needs. `HEAL_SAFE_WORKFLOWS` is
+    REF-KEYED and covers every event: a push run's successor is the newest run of
+    its branch in the runs listing, which filters by head branch, event and head
+    repository, never by pull-request number. `HEAL_SAFE_PULL_REQUEST_WORKFLOWS` is
+    PR-KEYED and covers pull-request runs only: a pull-request run is judged by HEAD
+    SHA — one `pulls?head=owner:branch&state=open` read says which SHAs the open
+    pull requests on the branch have — and then by the branch listing for a newer
+    run AT that SHA. Superseded when the head moved (its successor is the newest
+    listed run at an open head) or when no open pull request has the branch
+    (nothing to restore; a live orphan is cancelled and not re-run). A newer run at
+    the SAME SHA — `labeled`, `unlabeled`, `edited` and `reopened` each start one,
+    and every declared pull-request workflow cancels the run in progress when it
+    arrives — is the successor when both payloads name the same pull request,
+    a sibling pull request's run (shared head branch, its own group) when they name
+    different ones, and when either names none the listing cannot say and the
+    watchdog fails closed: the run is left untouched (a live pull-request orphan is
+    judged before its cancel, so nothing is cancelled that nobody can then re-run),
+    the tick reds and names both runs. It deliberately does not resolve that case by
+    watching the group's own cancel: every orphan this script meets exists during a
+    fleet outage, where the run to watch stays queued and observation cannot settle,
+    and a green resting on an unobserved provider behaviour is the false green this
+    script must never produce. A successor is restored only when identified as the
+    same pull request's; a same-SHA run of unknown pull request, or a head move with
+    no identifiable successor, that appears after the re-run started withdraws the
+    re-run and reds the tick naming the head, rather than restore a sibling's run and
+    hide the loss. The one green path that touches a concurrency group — cancel, then
+    re-run of a run judged current with no newer run at its SHA — is the path push
+    runs already take. That is the only use of `pull_requests[].number`
+    on the run payload; the head question never depends on it (most same-repository
+    runs lack it). On a push
+    the PR number is empty and a PR-keyed group is a constant, so a push run of a
+    PR-keyed workflow is exempt; a test pins every PR-keyed entry pull-request-only.
+    `macos-on-demand.yml`, ref-keyed and pull-request-only, is declared: its runs
+    are pull-request runs, which are healed, and a test pins that every declared
+    workflow has a trigger a heal can act on. Nine of the fifteen are auto-healed.
+    The derived gate is
+    BEST-EFFORT. It requires a run-level concurrency group
+    keyed on `github.ref`, `github.ref_name` or `github.head_ref` — or, for a
+    pull-request run and only then, on the pull-request number — which is a
+    structural fact it reads
+    reliably, and it rejects the publish and deploy spellings it knows: package
+    or release
+    publishing, Pages deployment, Docker pushes, S3 or CodeArtifact publishing,
+    `twine` uploads,
+    signing or notarization, any job-level `environment:`, and `pages: write`,
+    `packages: write`, or `deployments: write`. `id-token: write` alone is
+    ordinary OIDC authentication. A publish step in a spelling the patterns miss
+    — a new marketplace action, a toolchain nobody here uses yet — is caught by
+    neither gate, which is why the declaration is the judgement and the
+    derivation is a backstop rather than the reverse. Pinning each declared
+    workflow's content instead would expire the declaration on every edit to
+    `ci.yml` or `fast-gate.yml`, the two most-edited files in the repo, so the
+    cost lands on every unrelated change. `HEAL_SAFE_WORKFLOWS` in
+    `scripts/ci/runner_watchdog.py` is the membership, and a partition test
+    pins it against `WATCHED_WORKFLOWS`, so read the set rather than a count
+    here: prose restating a pinned set goes stale in silence. The reasons a
+    workflow lands outside it are publishing, a per-commit, per-run or
+    PULL-REQUEST concurrency key, no run-level group at all, and a constant group.
+    A pattern earns its place by naming a route this repo could really grow, and a
+    test fails on one that matches nothing here and names no such route, so the
+    backstop cannot drift into chasing spellings for toolchains nobody uses. The derived
+    gate is fail-closed, so it can silently DISABLE healing as well as allow it: a
+    test asserts it admits each declared workflow's own real YAML, which is what
+    turns a benign edit that the hand-rolled parser misreads into a red at edit
+    time rather than a surprise at the next incident. Exempt
+    runs stay listed, classified, logged, and named in the
+    step summary with a `human-required-heal-exempt-workflow` outcome, which is a
+    FAILED outcome: most of the watched set is exempt, so reporting a stuck run
+    there as a warning inside a passing scheduled run would leave the shape of the
+    incident this watchdog exists for — a stuck run nobody is told about — intact
+    for the majority of the repository. The
+    watchdog never cancels or fully re-runs them. Immediately before a live
+    orphan is cancelled, the watchdog reads the workflow file from that run's
+    `head_sha` through the repository contents API and re-derives heal-safety.
+    Cancelled-orphan recovery performs the same run-revision check before its
+    re-run. A revision read and judged unsafe is human-required and healthy; a
+    revision nobody could read, or a run with no SHA, is UNKNOWN rather than
+    unsafe and reports `heal-safety-unreadable-at-run-revision`, a FAILED
+    outcome, so a cancelled run cannot age out of its window behind a green
+    tick. Neither answer cancels anything. A queued `codebuild-` job is
     also what CodeBuild account-concurrency saturation looks like, so the
     watchdog reads what the *other* routed jobs are doing, counting only starts
     after the orphaned job queued (a fleet that was fine before the orphan
-    queued says nothing about the fleet it is waiting on) — if a CodeBuild job
-    that did get a runner started in that window after waiting five
-    minutes or more, CodeBuild is queueing, and the tick reports the runs as
+    queued says nothing about the fleet it is waiting on). The orphaned job's
+    *own* queue is asked first: a routed label is
+    `codebuild-<project>-<run>-<attempt>`, optionally with an `instance-size`
+    override, and the project plus override name the queue while the run and
+    attempt are only there because CodeBuild requires them. A start served by that
+    same queue after the orphan queued stood in the same line and got out of it —
+    one that waited a third of the orphan threshold or more inside the last 30
+    minutes means that queue is saturated and the tick holds; prompt ones and
+    nothing slow mean the orphan was never in that line, whatever another label's
+    queue is doing. The usual carrier is the run's own sibling jobs: thirteen of
+    fourteen fast-gate jobs starting in under a minute while one sits for an hour
+    and a half is the dropped-dispatch shape exactly, and before this reading a
+    seven-minute start on another fleet held such an orphan unhealed for six hours.
+    Old prompt starts count for that reading (the orphan's place in line does not
+    age); an old slow start with nothing recent counts for nothing. Only when the
+    orphan's own queue served nothing usable is the fleet-wide, label-blind reading
+    used — if a CodeBuild job that did get a runner started in that window after
+    waiting a third of the orphan threshold or more, CodeBuild is queueing, and the
+    tick reports the runs as
     `skipped-saturated` and heals nothing; if *nothing* has started on
     CodeBuild in that window (live runs, then the newest completed runs), the
     evidence is inconclusive — a fleet outage looks exactly like an orphan from
     the queued side — and the tick reports `skipped-no-dispatch-evidence`,
-    heals nothing, and points at the rollback above. Guard rails: runs younger than
-    15 minutes are never actionable (their jobs are still read, since a slow
-    start inside one is saturation evidence); the verdict is re-derived from a fresh read
+    heals nothing, and points at the rollback above. That outage hold applies even
+    when the orphan's own queue read as dispatching, because the own-queue reading
+    settles the orphan's place in line, not whether the fleet is up now. If a run old
+    enough to hold a
+    served start past the threshold went unread against the per-tick job-read bound,
+    the sweep reports `skipped-partial-dispatch-evidence` instead of acting, because
+    the completed-run sample cannot close that gap: it reads the newest completions,
+    and a fleet serving some jobs promptly while queueing others past the threshold
+    puts a prompt start there. The premise is the unread saturation-capable runs
+    rather than the bound being reached, so a sweep whose unread band is all too
+    young to have carried such a start may still act. An own-queue dispatching
+    reading does not lift this hold: it is read off the starts the sweep read, and
+    the slow same-queue start that would refute it can sit in a run nobody read.
+    On a tick that has an orphan to judge, the sweep first reads the jobs of every
+    unread run that could hold such a start, up to 200 more reads (all or nothing:
+    a partial read cannot lift the hold, so a larger set is not read at all), so the
+    hold is reached only past that top-up bound; a tick with no orphan spends none
+    of those reads, which is why they are not folded into the per-tick bound.
+    The unread runs are retained
+    with their creation times and re-judged on age at each cancel, not counted once:
+    the cancel phase re-reads the listing once and then judges several cancels
+    against it, so a run just under the line at the read is over it minutes later.
+    The bound's reserved reads go
+    to the newest runs at least one saturation wait old, since a younger run cannot
+    contain a wait that long and so could only ever report the fleet dispatching. The
+    line is deliberately low because the fleet-wide reading is label-blind: a start
+    served quickly on another label says nothing about the queue the orphaned job is
+    in, so raising it would widen the window in which a queued-but-alive job is
+    cancelled.
+    A tick that observed any served CodeBuild start logs the slowest of them against
+    the line, which is the drift a raise has to be calibrated from (#13644); a tick
+    that saw none has nothing to measure and logs nothing. Guard rails: runs younger than
+    the orphan threshold are never actionable, and the two age bands differ -- a run at
+    least a third of that threshold old is what the evidence reserve is spent on, while
+    a younger one is not reserved a read while any run qualifies and is read only if a
+    classify slot remains after the actionable-shaped and older runs (a prompt start
+    inside one is dispatch evidence) -- the exception being the reserve's fallback,
+    where NO run can carry a slow start and the newest are reserved anyway because an
+    empty reserve reads as an outage; the verdict is re-derived from a fresh read
     immediately before the cancel and the cancel is sent only if the same
     attempt is still orphaned (a human who re-ran it by hand has moved it to a
-    new attempt, which is left alone); fork runs are reported, never touched; a
+    new attempt, which is left alone); fork runs are reported, never touched, and so
+    are PULL-REQUEST runs -- the successor check asks whether a newer run of this
+    branch is in flight, GitHub's runs listing can only be filtered by branch NAME,
+    and two pull requests can share one head branch, so each would read as the
+    other's successor and abandon a cancelled orphan behind a green
+    `skipped-superseded`; matching by pull-request number instead is not available
+    (of 20 sampled same-repository `pull_request` runs only 9 carried
+    `pull_requests[].number`). Their owners read their own pull request's checks,
+    unlike the `main` orphans this watchdog exists for, which still heal; a
     run at attempt 3 or later is reported, never touched, so a run that keeps
-    orphaning is escalated rather than looped; at most five runs are healed per
-    tick; a refused cancel or re-run (403 when a human got there first) is
-    logged and left for the next tick. Once a cancel is accepted the watchdog
+    orphaning is escalated rather than looped — unless its workflow is heal-exempt,
+    where the cap is not the operative reason (we never re-run those at all) and the
+    orphan reports `human-required` so it does not sit behind a green tick; at most
+    five runs are healed per
+    tick, and a recovery pass cut short by a rate limit still reports the slots it
+    already spent, so the abort cannot buy five more; a refused cancel or re-run
+    (403 when a human got there first) is
+    logged and left for the next tick. A pre-cancel evidence re-read that fails on a
+    one-off error defers and stays green, but one that fails on a RATE LIMIT carries
+    `aborted-rate-limited` and reds the tick: a limit is a condition, not a one-off,
+    so every tick would otherwise defer and look healthy while the orphan keeps
+    parking later pushes behind it. Once a cancel is accepted the watchdog
     owns the run until it is re-run: it polls to `completed`, escalates to
     `force-cancel` after 90 s, and re-runs each run as it completes inside one
     shared five-minute budget. The whole tick runs inside the script's own
+    Every tick logs its OWN footprint -- how many GitHub API calls it made and the
+    last `X-RateLimit-Remaining` the API reported -- because this watchdog is a
+    heavy consumer of the very shared installation quota whose exhaustion it exists
+    to survive: the cancelled index alone is sixteen pages per tick. That reading is
+    logged, never enforced. A self-imposed call cap would silently stop healing,
+    which is the failure this script ends; read the numbers across a few scheduled
+    ticks to judge whether the bounds are sustainable per hour.
     nine-minute budget, and a re-run is begun only while enough of it remains
     to verify the re-run at its longest (a newer run landing in the window and
     being restored, in turn), so the job's `timeout-minutes` — set above the
@@ -767,10 +1076,12 @@ Details worth knowing:
     remains to verify its re-run. The API has no conditional cancel or
     re-run, so each mutation is verified after the fact: once a cancel lands, the run's
     conclusion and attempt are read back (a run that finished on its own keeps
-    its verdict; one somebody re-ran in the gap is re-run again), and each
-    re-run is bracketed by newest-of-branch checks — before it, and again after
-    a short settle — so a newer run that appeared in the window is never left
-    cancelled by the re-run's entry into the concurrency group: the re-run is
+    its verdict; one somebody re-ran in the gap is re-run again), and every
+    re-run is bracketed by unconditional newest-of-branch checks — before it,
+    and again after a short settle. Heal-safety determines whether the watchdog
+    may reach that guard; the guard itself treats every heal-safe run alike.
+    This keeps a newer run from being left cancelled by the re-run's entry into
+    a supersedable concurrency group: the re-run is
     cancelled, that cancellation is waited out (force-cancelled if slow; if it
     still has not completed the tick fails rather than judge), and the newer run is read
     until it reaches a terminal state or the settle window closes (a cancelled
@@ -798,19 +1109,62 @@ Details worth knowing:
     recognises the orphan fingerprint on their cancelled jobs (`codebuild-`
     label, no runner name, queued past the threshold when cancelled — a shape a
     healthy run a human stopped never shows, so a deliberate cancel is not
-    resurrected) and re-runs only those still the newest run of their branch.
+    resurrected), applies the same unconditional newest-of-branch guard, and
+    re-runs only those still newest.
     The saturation/outage hold does not apply to it: that hold protects
     finished work, and a cancelled orphan has none left — re-running it into an
     outage leaves it queued until the fleet returns, whereas holding it would
     let the recovery window expire and abandon it silently. It runs before the
     live heals and takes the per-tick cap first, so a sustained backlog of live
-    orphans cannot starve it until the window expires. **The schedule ships disarmed**: `WATCHDOG_ARMED` at the top of the
-    workflow is `"false"`, so every scheduled tick is a dry run — it classifies
-    and writes its step summary but touches nothing — until a maintainer, having
-    read a few summaries against real API shapes and seen no healthy run called
-    `orphaned`, flips it to `"true"` in a one-line commit. A manual dispatch is
-    governed by its own `dry_run` input regardless, so a stuck run can be healed
-    by hand before arming. A `CI` run in *pending* with no jobs is
+    orphans cannot starve it until the window expires. It walks the window
+    **oldest first** and classifies at most `RECOVERY_CLASSIFY_READS` (50) runs
+    per tick, because classifying one costs a job read. Almost none of the
+    cancellation traffic reaches that bound: every `main` push cancels the run it
+    supersedes, and a cancelled run that did not live as long as the orphan
+    threshold cannot hold a job that queued past it, since a job's queue wait is
+    contained in its run's lifetime. Those are skipped for free — of 1000
+    consecutive cancelled runs measured over 6.8 days the median lived 4 seconds
+    and 2 reached the threshold, so the busiest 90-minute window holds 400
+    cancelled runs but 2 candidates. What the bound does spend goes on the runs
+    closest to ageing out, and a newer arrival waits for the next tick instead of
+    displacing an older orphan; a tail run with less than one schedule interval of
+    window left has no next tick, so it is recorded rather than deferred. The same
+    zero-read exclusion applies there, so a run that could not have held an orphan
+    never asks a human to look. **A GitHub rate limit is
+    survivable, not a lost tick.** A 403 or 429 whose body names a rate limit is
+    honoured against its `Retry-After` / `X-RateLimit-Reset` with one cheap,
+    in-budget wait-and-retry -- the cancelled-recovery pass's reads included, since
+    a run with less window left than one schedule interval has no next tick and a
+    five-second reset must not cost its verdict; recovery's MUTATIONS are never
+    retried, because a cancel or re-run that may be on the wire is never repeated.
+    When the reset is too far off, the tick stops
+    gathering, acts on the runs it already classified, and ends with an
+    `aborted-rate-limited` outcome the summary names. That outcome is a FAILURE
+    and the tick exits nonzero, whatever it managed to classify first: the same
+    abort skips the cancelled-orphan recovery pass, and recovery is the only
+    thing between a cancelled run and the end of its 90-minute window, so
+    "the next tick re-lists" is no answer for a run in the final tick-interval of
+    that window while the limit persists. What the abort still buys is the work
+    already done: one exhausted listing page leaves the runs already classified
+    acted on rather than lost. Every other status (401, 404, 5xx) and every
+    malformed payload still raises. **The schedule is armed**: `WATCHDOG_ARMED` at the top of the
+    workflow is `"true"`, so a scheduled tick cancels and re-runs what it
+    classifies, within the per-tick caps below. It shipped disarmed — every
+    scheduled tick a dry run that classified and wrote its step summary and
+    touched nothing — and was armed once detection-without-action had been
+    measured to cost two six-hour `main` outages, on 2026-09-23 and 2026-09-24.
+    Both times one stuck `fast-gate.yml` run held `main`'s single concurrency
+    slot, every later push lost its gate to eviction, `ci.yml` failed closed at
+    its 720-second wait, and a human cleared it with one
+    `POST /actions/runs/<id>/cancel` — the call the armed tick now makes itself.
+    The hold that would otherwise have refused those heals is cleared by the
+    supersession check: a run a newer push has replaced holds no result worth
+    protecting, so a busy fleet no longer shields the exact run that is blocking
+    the branch -- at attempt 1. Past attempt 1 the heal path refuses the cancel
+    itself (a later attempt may be somebody's hand re-run, see below) and the
+    tick goes red naming the run. A manual dispatch is
+    governed by its own `dry_run` input regardless, so a run can still be
+    inspected without acting. A `CI` run in *pending* with no jobs is
     **not** something the watchdog touches — that run is waiting on its
     concurrency group, not on a runner, and healing the run that holds the group
     is what releases it; the step summary names it so the reader knows why it
@@ -819,7 +1173,22 @@ Details worth knowing:
     for the run to report `completed`, then `gh run rerun <run-id>`
     (`gh run rerun <run-id> --failed` keeps the successful jobs but carries the
     stale-label caveat). `workflow_dispatch` with `dry_run: true` (the default
-    for a manual dispatch) detects and reports without acting.
+    for a manual dispatch) detects and reports without acting. **A hand re-run is
+    safe from the watchdog's cancel once a newer push supersedes it**: a run past
+    attempt 1 may be the very `gh run rerun` above, and cancelling a superseded run
+    is never followed by a re-run (the heal path declines to re-run a superseded
+    run, `superseded-before-cancel` is not a failed outcome, and the recovery pass
+    classifies a superseded cancelled run out), so it would be a silent loss. The
+    guard sits at the cancel itself, so every route reaches it -- an orphan with
+    no fleet hold, and one whose hold the supersession check released alike: for
+    any attempt past the first the heal path asks the supersession question
+    immediately before cancelling and leaves a superseded (or undecidable) run
+    untouched. That is a failed outcome
+    (`rerun-attempt-superseded-left-untouched`): the run keeps its concurrency
+    group's running slot and the watchdog will never free it, so the tick goes
+    red and its log names the `gh run cancel <run-id>` to type. A re-run attempt
+    that is still its branch's newest is healed like any orphan. A held
+    concurrency group a human is told about is the cheaper failure.
   - **Trust model.** A self-hosted runner exposes its host identity to the job it
     runs; that is inherent, not something this PR adds. What bounds it: only runs
     triggered by accounts that can push here reach the runner (forks never do);
@@ -863,14 +1232,22 @@ Details worth knowing:
 - **`backend-test-crew-container` cannot go green by skipping.** Installing the
   image's runtime dependencies in a dedicated lane fixes one instance of the
   problem; the mechanism that caused it, a conftest that answers a missing
-  dependency with `collect_ignore_glob`, so 226 tests read as present while
+  dependency with `collect_ignore_glob`, so the whole suite reads as present while
   executing zero times, survives any dependency rename or extras split. So the lane
   that installs them also sets `CREW_CONTAINER_TESTS_REQUIRED=1`, and under that
   variable the suite refuses to skip: a missing dependency or a non-POSIX host is a
   collection error, every `test_*.py` that defines a test function must contribute at
-  least one collected item, and the total must clear a floor read off a real
-  collection. The variable can only ever turn a skip into a failure, never the
-  reverse, so setting it can hide nothing. This is the same shape as
+  least one collected item, every `test*` name the source declares must yield an item
+  of its own, and the total must sit at or above `_MIN_COLLECTED` while running no
+  more than `_FLOOR_MARGIN` above it. That last bound is what keeps the floor honest:
+  a hand-written floor left behind by a growing suite stops measuring anything, so
+  the collection outrunning it is an error rather than a cushion, and the message
+  names the value to write. Its accepted cost is a merge race: two branches may each
+  add up to `_FLOOR_MARGIN` tests, clear the bound separately, and compose past it
+  without either one editing the constant, so the lane can red on `main` for a commit
+  that did not grow the suite. That is a one-integer follow-up rather than a
+  regression, and the error message says so. The variable can only ever turn a skip
+  into a failure, never the reverse, so setting it can hide nothing. This is the same shape as
   `backend-test-sandbox`'s `unshare` probe, moved inside the instrument.
 - **`coverage-gate` is fail-closed, and the split made that load-bearing.** It runs
   `if: always()` and its first step converts any non-success upstream result into an
@@ -917,14 +1294,9 @@ Details worth knowing:
   `test_eslint_warning_ceiling.py` pins the zero and pins that `ci.yml` declares
   exactly one ceiling, so it cannot be lifted quietly — and because the value is
   fixed rather than measured, naming it here cannot go stale.
-- **The i18n gates split into three tiers,** and only two can fail: diff-scoped
-  zero-tolerance checks (a user-visible literal on a line this branch wrote, a
-  file holding more than it did at the base, new English key shape, changed catalog
-  values) and whole-repo hard zeros (a `t()` naming a key that does not exist,
-  plural concatenation, a stale pseudolocale). Everything else is report-only,
-  because a stored whole-repo total is written by whichever branch measured it last,
-  so another branch can push it past its number without touching your files and the
-  failure then names no diff anyone can fix. Full rules:
+- **The i18n chain separates diff-scoped zero-tolerance checks, whole-repo hard
+  zeros, a whole-repo growth ceiling, and report-only measurements.** The first
+  three classes can fail; report-only rows cannot. Full rules:
   [i18n-gates.md](i18n-gates.md).
 - **Every gate that needs a base ref fails rather than skipping when it cannot
   resolve one.** `actions/checkout` fetches depth 1, so
@@ -941,6 +1313,26 @@ Details worth knowing:
   otherwise count as a pass having run zero browser specs. Details:
   [e2e-gate.md](e2e-gate.md).
 
+### Expand a bash array the `+` way, not the quoted way
+
+In a workflow `run:` block, write an array's value expansion as
+`${arr[@]+"${arr[@]}"}` rather than `"${arr[@]}"`. Bash only stopped treating an
+EMPTY array's expansion as an unset variable in 4.4, and macOS ships 3.2.57 as
+`/bin/bash`, so under `set -u` the quoted form aborts the whole step with
+`arr[@]: unbound variable` the moment the array happens to be empty. The `+` form
+expands to nothing when the array is unset or empty and to every element
+otherwise, on every bash, so it changes nothing about how Actions runs these
+scripts on Linux.
+
+That matters because these scripts do not only run on the Actions runner: about
+two dozen tests EXTRACT a `run:` block and execute it with the host `bash`
+(`test_pr_readiness_evaluate.py`, `test_fork_pr_description_workflow.py`,
+`test_release_macos_fail_closed.py`, and others), so the macOS suite above runs
+this shell under 3.2. A count guard is not a substitute: the array that cost a
+nightly HAD one, and was emptied again after it, which is why
+`test_workflow_array_expansion_bash32.py` asks for the local form at the
+expansion instead of reasoning about reachability.
+
 ## `build.yml`: the artifacts still build
 
 PR-time proof only, no publishing.
@@ -953,8 +1345,13 @@ PR-time proof only, no publishing.
   `import kiro_crew.cli` probe is what carries that meaning; the wheel lane
   does not run one, so an undeclared runtime dependency reaches gateway boot
   before any pip-install lane fails.
-- **`build-desktop`** builds the Electron app unsigned on macos-15 and
-  ubuntu-22.04 via `make desktop`, and uploads the artifacts.
+- **`build-desktop`** builds the Electron app unsigned through `make desktop` on
+  `ubuntu-22.04` and `ubuntu-22.04-arm` for every PR; `macos-15` joins the matrix
+  only when a packaging-sensitive path changed. Non-PR runs include all three,
+  and every instantiated leg uploads its artifacts.
+- **`build-windows-installer`** assembles the real python-build-standalone backend
+  payload, builds and silently installs the NSIS artifact, then runs the installed
+  gateway and bytecode-floor checks. See [e2e-gate.md](e2e-gate.md#buildymls-installer-job-boots-the-gateway-it-installed-on-every-pr).
 
 **Neither desktop lane ever RUNS the bundled backend.** `build-desktop` here and
 `build-desktop.yml` in the release lane both build the real `kirocrew-backend`
@@ -1010,10 +1407,17 @@ of the AUTOSDE rules; the semantic half is delegated to the line reviewers.
   retried inside one shared time budget before it fails (see the
   transient-failure contract in the security spec).
 - **`pr-hygiene`** enforces a Conventional-Commits PR title (it becomes the
-  squash-merge message) and at most two commits (`git rev-list --count <= 2`).
-  One commit stays the norm; the second is there so a mechanical follow-up (a
-  regenerated artifact, a formatting sweep) can stay separable from the change
-  it accompanies. Both blocking.
+  squash-merge message), at most two commits (`git rev-list --count <= 2`), and a
+  `## Pattern harvest` section on `fix`/`revert` PRs containing either
+  `Rule candidate:` or `Not generalizable:`. One commit stays the norm; the second
+  is there so a mechanical follow-up (a regenerated artifact, a formatting sweep)
+  can stay separable from the change it accompanies. It also runs
+  `.github/scripts/pr-description-check.sh`, the same rules `fork-pr-description.yml`
+  applies to forks: the template's required headings, `## Not a goal` included, and
+  a filled `**Goal:**` line under Problem / Motivation. On failure its error
+  annotation names the missing parts and the fix (rebuild from the template,
+  save the description, no push), and the step writes the full steps to the job
+  summary. All four checks are blocking.
 
 Separately, **`dependency-review.yml`** fails a PR that adds or changes a
 dependency whose license is off the curated allowlist in
@@ -1067,11 +1471,97 @@ design axis is **what each is allowed to read** (its prompt-injection surface) a
 
 | Reviewer | Check name | Harness | Reads | Question | Blocks? |
 |---|---|---|---|---|---|
-| Opus 4.8 | `Opus 4.8 Review` | Agentic, `--max-turns 120` per stage, **two real invocations** (discovery -> validation) | **Code only**: `Read`, `Grep`, `Glob`, `Bash(gh pr diff:*)` | Line-level correctness, security, AUTOSDE | Yes, fail-closed |
-| GPT 5.6 | `GPT 5.6 Review` | Non-agentic, **two** invocations (discovery, then authoritative falsification), `reasoning_effort: medium` | Code plus PR title and body as nonce-wrapped **UNTRUSTED** context | Line-level second perspective, plus description-versus-diff consistency (advisory) | Yes, fail-closed |
-| Design Review | `Design Review` | Agentic Fable 5, with an Opus fallback model | Code plus `gh pr view` (it must judge intent) | Should we build this, and is it the right *shape*? | Advisory; red only on a genuine `BLOCK` |
-| UX Review | `UX Review` | Agentic Fable 5, with the same fallback; **two real invocations** on same-repo PRs (blind read -> reconcile) | Pass 1: the PR's screenshots **only** -- the attachments its body links, downloaded, plus any committed image; pass 2: code, PR text, and pass 1's report | Can a first-time user who has read nothing tell what each new element is and does, and do state changes stay one continuous element? | Advisory; red only on a genuine `BLOCK` |
-| First Principles | `First Principles Review` | Agentic Fable 5, same fallback, `--max-turns 120` (inventorying and counting is grep-heavy) | Code, the whole repository, and `gh pr view` | What is the author trying to do, and does each thing this ships *deserve to exist*, already exist, or only patch a symptom? | Advisory; red only on a genuine `BLOCK` |
+| Opus 5 | `Opus 5 Review` | Agentic Opus 5 with Opus 4.8 as the overload fallback, `--max-turns 180` per stage, **two real invocations** (discovery -> validation) | **Code only, and no shell**: `Read`, `Grep`, `Glob`. The diff is prefetched to a file, so `Bash(gh pr diff:*)` is not granted -- its prefix match also admits `gh pr diff <n> > <path>`, which a directive in the PR-authored diff could use to overwrite the stage-2 prompt | Line-level correctness, security, AUTOSDE | Yes, fail-closed |
+| GPT 5.6 | `GPT 5.6 Review` | Non-agentic, **two GPT invocations** (discovery, then authoritative falsification), `reasoning_effort: medium`, plus conditional Opus 5 adjudication of blocking candidates | Code plus PR title and body as nonce-wrapped **UNTRUSTED** context | Line-level second perspective, plus description-versus-diff consistency (advisory) | Yes, fail-closed |
+| Design Review | `Design Review` | Agentic Fable 5, with an Opus fallback model | **Code only, and no shell**: `Read`, `Grep`, `Glob`. The diff and the PR title/description are prefetched to the data files `authentic.patch` and `pr-intent.txt`, so no `Bash(...)` is granted -- every such grant is prefix-matched, so one admits `<verb> ... > <path>`, which a directive in the PR-authored diff could use to overwrite this job's own inputs | Should we build this, and is it the right *shape*? | Advisory; red only on a genuine `BLOCK` |
+| UX Review | `UX Review` | Agentic Fable 5, with the same fallback; **two real invocations** on same-repo PRs (blind read -> reconcile) | Pass 1: the PR's screenshots **only** -- the attachments its body links, downloaded, plus any committed image; pass 2: **no shell** (`Read`, `Grep`, `Glob`), reading pass 1's report plus the prefetched `authentic.patch` and `pr-intent.txt` | Can a first-time user who has read nothing tell what each new element is and does, and do state changes stay one continuous element? | Advisory; red only on a genuine `BLOCK` |
+| First Principles | `First Principles Review` | Agentic Fable 5, same fallback, `--max-turns 120` (inventorying and counting is grep-heavy) | **The whole repository, and no shell**: `Read`, `Grep`, `Glob`. The diff and the PR title/description are prefetched to `authentic.patch` and `pr-intent.txt`, for the same prefix-match reason as the rows above | What is the author trying to do, and does each thing this ships *deserve to exist*, already exist, or only patch a symptom? | Advisory; red only on a genuine `BLOCK` |
+
+### The description a verdict read, and the digest that names it
+
+Every lane whose model judges the author's stated intent reads the title and
+description from ONE shared capture, `.github/scripts/pr-description-capture.sh`,
+sourced by `design-review`, `ux-review`, `first-principles-review` and their three
+fork counterparts. The capture runs once per job, writes `pr-intent.txt`, and the
+prompt points the model at that file and at nowhere else.
+
+It is one script rather than a copy per lane because each lane stamps the digest of
+those bytes into its published verdict, under a `### Description read` heading:
+
+    [DESCRIPTION-READ] <sha256>
+
+What that digest is taken over depends on whether the lane's verdict reads anything
+besides the prose, and the heading says which:
+
+| lanes | the stamp is | why |
+|---|---|---|
+| `first-principles-review` and its fork twin | `sha256` of `pr-intent.txt` | the verdict reads the prose and the diff, and the diff is pinned to a commit so it cannot move underneath it |
+| `design-review`, `ux-review` and their fork twins | `sha256` of a **manifest** naming `pr-intent.txt` and each evidence file the lane's model is pointed at | the media strip replaces every attachment URL with the same placeholder, so swapping one attachment for another leaves the prose byte-identical while the reviewer sees different evidence |
+
+The manifest is one `<label> <sha256>` line per input, newline-terminated, in the
+order the lane listed them -- `description`, then `evidence-1`, `evidence-2` and so
+on -- so the composition is reproducible by hand and two evidence files cannot be
+confused for one longer one. An evidence file whose own bytes are per-run paths is
+folded in by its normalized content instead: every line starting with `/` reduced to
+its basename, every other line verbatim. That is what makes the manifest reproducible
+off the runner at all, since the screenshot list and the rendered-evidence manifest
+that embeds it are written as absolute temp paths.
+
+The heading states the evidence count, so a reader knows which of the two forms to
+recompute before concluding anything from a mismatch. The recipe at the top of
+`pr-description-capture.sh` reproduces the `pr-intent.txt` form; against a lane with
+a non-zero count it mismatches by construction rather than because the description
+moved.
+
+#### One read per job
+
+The four lanes that stamp a manifest read that description twice: once in the
+evidence step, through `.github/scripts/pr-attachment-evidence.sh`, and once in
+the capture step. While each script fetched the API itself, a description edited
+between the two steps paired the OLD attachments with the NEW prose, and the
+manifest digest was taken over that pair -- a revision that never existed,
+reported to a reader recomputing it as a match. No later run corrected it,
+because the lanes fire on `opened, synchronize, reopened` and a description edit
+starts none. The window was ordinary: pushing a commit starts the run, and
+pasting a screenshot in the next minute lands inside it.
+
+`.github/scripts/pr-body-snapshot.sh` is now the only place either script reaches
+the API. It fetches the whole pull request once, splits the title and the body out
+of that one response, and caches them under `$RUNNER_TEMP`; whichever consumer
+runs first pays the read and the other reads those same bytes. Keying the cache to
+`$RUNNER_TEMP` makes "one read per job" the default rather than something a lane
+has to opt into, so a lane added later inherits it without wiring. A *later* job
+still reads afresh, which is what keeps a re-run after an edit judging the new
+text. The composed bytes are unchanged from the two-read form, so a digest
+published before this existed still recomputes to the same value.
+
+Two implementations of the media strip or the 8000-byte cap would make the same
+digest mean two different things, and a reader recomputing it would get a mismatch
+from a description nobody had touched.
+
+The digest covers the bytes the MODEL received -- after the media strip and the cap --
+not the raw API body. That is deliberate and it cuts both ways: an edit the strip
+erases cannot change the model's input, so it must not move the digest either, or the
+stamp would report a description the verdict never saw. What the stamp therefore
+answers is one question: has the description changed since this verdict was formed?
+A mismatch means any finding drawn from the description is unproven.
+
+Three properties are load-bearing, and each is pinned:
+
+- The digest is taken at CAPTURE time, so it names what the model was given rather
+  than whatever the description says when the verdict is published. A publish-time
+  digest would match in exactly the window it needs to catch.
+- It is a bare 64-character sha256 or the step fails closed. `sha256sum <file>`
+  escapes a filename containing a backslash and prefixes the line with one, so the
+  digest reads from stdin; a guard that only tested for empty would publish the
+  escaped form, which no reader can reproduce.
+- The capture step runs BEFORE any `configure-aws-credentials` step in its lane. On a
+  same-repo PR the checkout is the merge ref, so a sourced script is the PR's own
+  copy; a session assumed earlier persists for every later step.
+
+A read failure is not a missing description. The capture retries three times and then
+fails the step, naming the read as the cause, rather than handing the reviewer an
+empty file and letting it judge a PR that appears to state no intent.
 
 ### Why a first-principles lane is not a second Design Review
 
@@ -1227,7 +1717,7 @@ is deliberate — premise and cause here, shape quality there — and if the two
 converge in practice, the answer is to trim the overlap out of Design Review, not to
 tune two prompts against each other.
 
-### Why Opus 4.8 is code-only
+### Why Opus 5 is code-only
 
 It is the agentic reviewer, so pulling attacker-controllable PR prose into its
 context is a prompt-injection surface. `gh pr view` and `gh api` are disallowed, and
@@ -1296,7 +1786,7 @@ and therefore cannot contradict itself across rounds.
 
 The markers are the **only** gate:
 
-- Opus 4.8 emits `[OPUS-REVIEWED] <sha>` always, and `[BLOCK-MERGE] <sha>` only when a
+- Opus 5 emits `[OPUS-REVIEWED] <sha>` always, and `[BLOCK-MERGE] <sha>` only when a
   blocking finding exists. Both are parsed out of the action's `execution_file`
   transcript rather than a `--json-schema` structured output, because the harness's
   internal structured-output tool is unreliable when other tools are enabled:
@@ -1495,9 +1985,11 @@ Two lanes stay outside that function, and both exclusions are deliberate:
   secret-key or session-token shapes before any public comment.
 - Dependabot PRs skip the review work and let the gate pass, since they run with a
   read-only token and no credential access.
-- A 90-minute job timeout is a runaway backstop, not a review budget: a healthy
-  review self-terminates well before it, so the timeout exists solely to fail the
-  gate closed on a true hang.
+- A lane's job timeout is a runaway backstop, not a review budget: 30 to 160
+  minutes, sized per lane off its turn budget so a healthy review self-terminates
+  well before it, so the timeout exists solely to fail the gate closed on a true
+  hang. The Opus lanes sit at 120, because both of their stages share one job and
+  the wall therefore bounds their sum.
 
 ### Advisory means advisory, with one exception
 
@@ -1524,13 +2016,17 @@ The Design trigger accepts the same evidence the UX lane admits: a
 HEAD -- and it reads presence the same way. Both Design lanes run a "Collect
 rendered evidence" step that sources the shared allowlisted fetch script, downloads
 and types every attachment the description offers, lists the committed images the
-revision adds or changes (same-repo only; the fork head is never checked out), and
-writes one evidence file the prompt is told to read; the description's text is not
-the predicate, so a fabricated or dead URL does not count as evidence. A transport
-failure is listed as "presence unconfirmed" and caps the Design verdict at `CONCERNS`
-rather than failing the lane, because the UX lane fails its run on the same failure
-and readiness already holds. An image hosted off a commit outside the PR, or one the
-description says shows another PR, is not evidence of this revision.
+revision adds or changes (by sourcing `.github/scripts/pr-committed-evidence.sh`,
+which reads every blob out of the object store at the head SHA with `git cat-file`
+and never off a working tree -- one admission path through one set of gates for a
+same-repo PR and a fork PR alike; the two differ only in where the workflow learns
+the head SHA), and writes one evidence file the prompt is told to read; the
+description's text is not the predicate, so a fabricated or dead URL does not count
+as evidence. A transport failure is listed as "presence unconfirmed" and caps the
+Design verdict at `CONCERNS` rather than failing the lane, because the UX lane fails
+its run on the same failure and readiness already holds. An image hosted off a
+commit outside the PR, or one the description says shows another PR, is not evidence
+of this revision.
 
 **Design Review owns the long-term / one-way-door lens** as its gate 8, "LONG-TERM
 REVERSIBILITY", in both the same-repo and fork variants. An unsafe one-way door is
@@ -1552,7 +2048,8 @@ It runs only when the diff touches `website/`, `temp-screenshots/**` or
 `.github/screenshots/**` (the last two are gitignored, so in practice `website/` is the
 trigger). A backend, CI or docs PR skips it with no model call and no comment churn,
 and the check passes. Review evidence is uploaded as a GitHub attachment, not
-committed: the author writes local paths in the PR body and runs
+committed -- except by a fork contributor, whom the upload endpoint refuses (see the
+fork lane below): the author writes local paths in the PR body and runs
 `gh pr create|edit --attach <path>`, which rewrites each into a permanent
 `https://github.com/user-attachments/assets/...` URL (dragging the file into the
 description in the web UI yields the same URL). The lane reads the body from the API when
@@ -1564,6 +2061,29 @@ findings in them, and it is instructed to treat screenshot content as untrusted 
 screenshot, title, commit message or filename attempting to grant leniency is
 ignored, and screenshot polish never waives a lens). `screenshot-evidence.yml`, the
 gate that requires evidence on a UI diff, accepts the same URLs.
+
+### Waiving the screenshot requirement
+
+A watched file can change without any visual delta, so `screenshot-evidence.yml`
+carries two waiver paths — and both emit a warning rather than passing silently,
+so the waiver stays visible in the run:
+
+- **`no-screenshots` label.** For maintainers, who can label a PR.
+- **`<!-- no-visual-delta -->` marker in the PR body, plus a
+  `**Why no screenshot:** <reason>` line.** Self-service, so a fork contributor
+  who cannot apply labels is not blocked. The marker *without* a justification
+  line is an error, not a waiver.
+
+Gating a genuinely non-visual change would train contributors to paste a
+meaningless screenshot to get green, which is worse than no gate — hence the
+waivers rather than a stricter requirement.
+
+What counts as evidence is "does it render for a reviewer": a markdown image, an
+HTML `<img>` or `<video>`, a `temp-screenshots/` path, or a
+`user-attachments/` URL. The check's own guidance names the attachment ceilings it
+expects authors to stay under — 10 MB per image or GIF, 100 MB per video — and
+asks for a recording (video or GIF) rather than a still whenever the change is an
+animation, transition, hover or focus state.
 
 A diff that changes an Electron-only surface -- the application menu, its
 accelerator captions, the window chrome -- cannot be photographed by any of the
@@ -1642,6 +2162,20 @@ Three rules follow from the split, all read off evidence rather than judged:
   attached to the PR body, or committed); none is an evidence gap. The reviewer
   cannot play the recording -- it verifies the mechanism in the diff and that the
   recording exists, and a human watches it.
+- **Placement is an app-wide question (lens 0).** Every control, row, page, menu
+  entry or setting the diff adds or moves must sit where a user looking for it
+  would go first, next to the controls about the same thing -- judged across the
+  whole app (settings tabs, sidebar sections, menus, modals, the command palette),
+  not within the one panel the screenshot shows. The reviewer names the surface
+  that is already about that thing; if one exists and the control is elsewhere,
+  that is a finding. A placement defended only by where a reporter, an issue or the
+  author asked for it is not a design decision and is itself a finding: a request
+  fixes that the control must be reachable, not where it lives. The lens exists
+  because PR #12037 put a *billing* opt-in (spend credits to read the balance) on
+  Settings > Display, said in a code comment that this was "the reporter's
+  placement rather than" a design choice, and every lane passed it: the UX lane
+  checked the toggle's look, words and states inside Display and never asked
+  whether Display was the page.
 
 The fork lane (`fork-ux-review.yml`) carries the same rules but has **no blind-read
 pass**: it reviews in a single pass, after the diff. Its evidence step reads the PR
@@ -1649,15 +2183,41 @@ description from the API and downloads the allowlisted `user-attachments` URLs o
 the runner (the job's egress allowlist names the two hosts a download touches,
 `github.com` and the `github-production-user-asset-6210df.s3.amazonaws.com` bucket
 its 302 points at), so the reviewer
-opens the same images a same-repo review would. An image a fork PR *commits* is not
-on disk -- the fork head is never checked out -- so a control shown only there is an
-evidence gap, which is a `BLOCK` (`cannot evaluate`) the author closes by attaching
-the image to the description. A control the attachments *do* show but no blind
-reader has read caps the fork PR at `CONCERNS`: that is the lane's limitation, not
-the author's gap, so it does not block. A maintainer who wants
-the blind read pushes the branch to this repository. A fork contributor without push
-access cannot run `gh --attach`; dragging the file into the PR description in the web
-UI yields the same `user-attachments` URL.
+opens the same images a same-repo review would. Media the fork PR *commits* under
+`temp-screenshots/` or `.github/screenshots/` is read too, by
+`.github/scripts/pr-committed-evidence.sh`: the blobs come out of the object store
+the authentic-diff step already fetched, typed by their bytes and copied under the
+same index names, so the fork head is still never checked out as files. That matters
+because `gh --attach` is *unavailable* to a fork contributor -- its upload endpoint
+answers read permission with a 404 ([cli/cli#14302](https://github.com/cli/cli/issues/14302))
+-- leaving them the web-UI drag and the committed path. The script carries its
+admission contract in one block at its head: every path the head holds under those
+directories is a candidate whatever its diff status, and a screenshot that was only
+*moved* from a path the base already held (a `git mv`, status `R100`) is refused by
+name and counted, not read -- its bytes show the base's rendering, not this
+revision's -- while a moved file whose bytes changed is read like any other. A control
+no supplied screenshot shows is still an evidence gap, a `BLOCK` (`cannot evaluate`)
+the author closes by attaching *or* committing the image. A control the evidence
+*does* show but no blind reader has read caps the fork PR at `CONCERNS`: that is the
+lane's limitation, not the author's gap, so it does not block. A maintainer who wants
+the blind read pushes the branch to this repository.
+
+**What happens to committed evidence at merge.** It merges. The squash lands the
+`temp-screenshots/` files on `main` as tracked files (the ignore rule stops mattering
+once a path is tracked) and their blobs in history, and it never does so silently:
+they are in the diff the maintainer merges. The merging maintainer then removes them
+from the tip in a follow-up `chore(evidence): drop the committed review media of #<n>`
+PR (`git rm -r temp-screenshots/<topic>`), so review media does not accumulate on
+`main` the way it did before the sweep that emptied the directory. That removal is
+the reversible half. The blobs are the irreversible half: a deletion commit leaves
+them in every clone's pack, and only a history rewrite -- which that sweep deferred to
+a separate, maintainer-approved change -- takes them out. This cost is accepted
+because it is bounded: fork PRs are the minority, `pr-committed-evidence.sh` refuses a
+file over its size ceiling, and the guidance asks for two or three shots. The
+evidence stays readable at the squash commit
+(`https://github.com/<owner>/<repo>/blob/<sha>/temp-screenshots/...`) after the
+removal, so the removal PR names that SHA. The why lives with the rule it excepts, in
+prepare-pr's `references/rationale.md`.
 
 The PR identity (number, repository, shas, data-file paths) is passed to both passes
 in `--append-system-prompt`, not in `prompt:`. GitHub rejects a workflow file
@@ -1673,7 +2233,19 @@ silently (zero jobs, nothing on the PR) when any expression-bearing string excee
 /ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-head-sha>: <one-sentence reason>
 ```
 
-`scope` targets the [Security Scope Review](#security-scope-review-what-a-tightening-newly-refuses) lanes; every target maps to its like-named reviewer.
+`scope` targets the [Security Scope Review](#security-scope-review-what-a-tightening-newly-refuses) lanes. Each target names a lane by its command spelling, and `pr_status.py` resolves that spelling to a reviewer through the lane's comment key — so `gpt` is the `codex-ai-review` lane's reviewer `GPT`, and `fable` is the `claude-ai-review` lane's reviewer `OPUS`. `scope` is the exception: its lane consumes the record like any other, but it has no reviewer binding, so the script has no row to report it under.
+
+`pr_status.py` reads the marker too, and reports an accepted record as its own row —
+`GPT: OVERRIDDEN by @<actor>` — rather than as a fresh stamp. The two markers prove
+different things: `[<NAME>-REVIEWED] <sha>` is proof a **model** produced a verdict for
+this commit, and the override record is proof a **human** adjudicated it on a path where
+the model is deliberately not re-run, so no stamp exists to find. Without that, an
+accepted override turns the lane's check green while the canonical script still reports
+`stale reviewer stamp(s)` for it. The record must name the head **exactly**: it is written
+by the workflow from `.head.sha`, so the prefix-and-elision tolerance that exists for
+model-transcribed stamps does not apply. A record naming one lane also keeps that lane in
+the evaluation, so deleting the bot comment that carries a stale stamp cannot make the
+reviewer disappear from the check instead of answering for it.
 
 `issue_comment` workflows execute from the trusted default branch, never from the PR
 head. The handler validates the command shape, a 7-to-40-hex SHA that must be the
@@ -1802,7 +2374,7 @@ steps still run, which is deliberate, because a lane reporting `skipped` is read
 "the review has not posted yet" and waited on. What the gate buys is that the two
 failure sources this ruling is about — an outage and a flaky matrix leg — cannot red
 a PR the lane would not have judged. And
-it matches `Opus 4.8 Review` and `GPT 5.6 Review`, both fail-closed in the table
+it matches `Opus 5 Review` and `GPT 5.6 Review`, both fail-closed in the table
 above; a security lane resolving softer than them would be the weakest link in the
 same rollup. To reverse the ruling, set `_UNSETTLED_CONCLUSION = "concerns"` — one
 constant, no other edit, both lanes already map `concerns` to a non-blocking
@@ -1838,17 +2410,19 @@ check-run `[scope-floor:unsettled]`, sets no per-head floor, and clears on a re-
 ## `pr-readiness.yml`: the aggregator
 
 It executes no tests. It resolves the PR's current head SHA, **drops stale events**,
-queries the latest run per monitored workflow, and publishes **one `PR Readiness`
-commit status plus one `readiness:` label**.
+reads the head's `pull_request` workflow runs **once** and picks the latest run per
+monitored workflow out of that page, and publishes **one `PR Readiness` commit
+status plus one `readiness:` label**.
 
-- **Always required:** Fast Gate, CI, Build, Code Review. `Fast Gate` is a lane in
+- **Always required:** Fast Gate, CI, Build, Code Review, and Internal Content
+  Scan (the same-repository workflow or the fork check-run). `Fast Gate` is a lane in
   its own right and not merely CI's precondition — a red gate must red the PR, and
   `await-fast-gate` reports `failure` rather than the gate that actually broke, so
   the readable verdict has to come from the gate workflow itself. It carries CI's
   `branches: [main]` filter, so it sits in the same stacked-PR carve-out: on a PR
   whose base is not the default branch it never starts, and a monitored lane that
   reads `(not started)` would freeze the verdict at pending forever.
-- **Additionally required on a same-repo PR:** CodeQL, Opus 4.8 Review, GPT 5.6
+- **Additionally required on a same-repo PR:** CodeQL, Opus 5 Review, GPT 5.6
   Review, Security Scope Review, and completion of Design Review, UX Review and
   First Principles Review.
 - **Design Review, UX Review and First Principles Review are completion-required
@@ -1904,7 +2478,7 @@ commit status plus one `readiness:` label**.
   `issue_comment` trigger**, so correcting the offending comment fires nothing by
   itself. `pr-readiness-sweep.yml` mode 5 covers that — it treats a disposition
   record whose `updated_at` is newer than the verdict as evidence the verdict is
-  stale, and re-fires the recompute within ~15 minutes. Deleting the record with
+  stale, and re-fires the recompute within one sweep tick (~5 minutes). Deleting the record with
   no replacement leaves nothing observable and waits for a push or a manual
   dispatch. The comparison is not race-free and is not claimed to be: the gate
   reads the comments early in the readiness job while the status is published at
@@ -1914,6 +2488,74 @@ commit status plus one `readiness:` label**.
   adjudication ledger downgrade a REPEATED finding on a later review round, and a
   later review round takes a push, which recomputes readiness and catches the
   violation.
+- **An advisory lane that published no verdict is neither passed nor failed.**
+  Design, UX and First Principles decide their conclusion from their own output
+  file, so a lane that computed a verdict and then failed to write its PR comment
+  still completes `success` — the publish-failure arms of the shared comment
+  upsert emit an `::error::` and return 0. Counting that as reviewed is what let
+  the required status read green while `pr_status.py` read BLOCKED off the same
+  slot. The same `--disposition-gate` call reports which of those lanes owe the
+  head a verdict they never published, from `evaluate_reviewer_markers` — so the
+  freshness, enrolment and human-override rules have one definition and the two
+  gates cannot disagree. The question is asked of a slot that EXISTS and is
+  stale, not of the whole lane set: a lane with no slot has two causes that read
+  identically from the comments -- it published nothing because it deliberately
+  had nothing to say, and its create-path publish was lost -- and only the lane
+  itself can tell them apart, by leaving a notice naming the head. Reporting
+  absence before the scope-skip arms write one would hold every revision that
+  touches no UI surface on a lane a re-run cannot fill, so that half waits on a
+  change to those lanes. Two answers still exempt a lane whose slot is there: a
+  writer's override record for this head (that path does not re-run the model, so
+  no stamp can exist), and a slot holding the lanes' own stampless "skipped"
+  notice FOR THIS HEAD (a re-run reproduces it rather than filling it; a notice
+  naming an earlier head is not an answer for this one). Readiness lists an owing
+  lane as a named **pending** that re-running that lane clears, never a red: a
+  `failed` there would publish a BLOCK verdict no reviewer reached (#13363).
+- **It also reports a verdict this head's own re-sample replaced.** A review
+  lane's marker comment is ONE slot keyed on the lane, never on the head, so a
+  second sample at one head overwrites the first and the board keeps only the
+  survivor. Every body the slot ever held survives in GraphQL
+  `userContentEdits`, so readiness runs `pr_status.py --supersession-gate` and
+  folds each lane where a replaced sample BLOCKED this head, while the body now
+  presented does not, into its blocking list. A sample blocks in either spelling
+  the lanes use: `[BLOCK-MERGE] <head>`, which GPT and Opus write, or a
+  `<Lane>-Verdict: BLOCK` line from Design, UX or First Principles, which never
+  write that marker at all. The history read is a cheap question first — how
+  many bodies has this slot held — and pays for the bodies themselves only when
+  that count exceeds one, because a slot holding one body has nothing that could
+  have been superseded. An unreadable count is not zero.
+- **A sanctioned clear is read where a model cannot write, and only on the one
+  lane that has one.** Adjudication and `/ai-review override` clear a GPT block
+  by rewriting `[BLOCK-MERGE] <head>` to `[BLOCK-MERGE-DOWNGRADED] <head>`,
+  which necessarily leaves a superseded blocking body behind — so that clear
+  must be recognised or the gate reds a legitimate one forever. It is NOT
+  recognised by grepping the marker: on the non-blocking path the presented body
+  embeds the model's own output file verbatim, so review prose over a diff
+  containing that string would forge a clearance, the same reason
+  `codex-review.yml` refuses to grep its own refusal marker. It is read from the
+  workflow-authored `(all downgraded on adjudication)` heading, which is printed
+  from the parsed decision ABOVE the first `<details>` while the model's output
+  sits inside one, head-scoped to that same region. That shape holds only for
+  `codex-review.yml` and `fork-gpt-review.yml`, so the exemption is restricted
+  to the GPT lane by name and `test_prepare_pr_supersession.py` asserts from
+  source both that no other workflow prints the heading and that only those two
+  wrap their prose — a lane gaining the path, or GPT losing its wrapper, reddens
+  there instead of quietly widening the exemption.
+- **The clearance path differs by lane family, and the gate's failure text says
+  which.** On the GPT lane, clear the verdict the sanctioned way and the gate
+  reads it as cleared. The whole-design lanes have no downgrade artifact at all,
+  so a superseded BLOCK there cannot be stamped away: the only exit is pushing a
+  new head, and that is what their failure text names. An ordinary same-head
+  re-sample that did not drop a block is reported for information and does NOT
+  gate. A reading the gate could not establish is `pending`, never red, for the
+  same reason the disposition gate's is — an unreadable comment history is not
+  "no verdict was superseded" — and the step is skipped for `dependabot[bot]`
+  with the same condition the lanes carry, because on such a pull request no
+  lane ever publishes and `pending` would strand the status for the life of the
+  head with nothing able to clear it. The local `pr_status.py` fails closed on a
+  dropped block and on an unreadable reading, because that exit code is what
+  arms `gh pr merge --auto`; an empty lane population is a separate cause and
+  does not, since the marker evaluation beside it already reports it.
 - **Unapproved fork runs remain blocking but are attributed separately.** GitHub
   reports a fork workflow held behind *Approve and run* as `action_required`
   even though it has not executed. Readiness keeps the failure status and
@@ -1924,21 +2566,107 @@ commit status plus one `readiness:` label**.
 
 Two subtleties:
 
-- **It refreshes while a workflow is re-running, but not when one starts.** It triggers
-  on `workflow_run` `in_progress` and `completed`, not on `requested`. `in_progress` is a
-  merge guard, not a cosmetic: it is the only type that sees a monitored workflow go back
-  to running, because a re-run reuses the same run and increments its attempt instead of
-  creating a new one. Without it, a re-run of an already-green lane would leave readiness
-  publishing the pre-re-run `success` for the whole re-run -- and since that status is the
-  branch-protection handle for the entire fan-out, armed auto-merge could merge a revision
-  whose lane is failing at that moment. `requested` is the type that carries nothing: it
-  fires at run CREATION, when no lane can have a verdict yet and readiness has already
-  published `checking` from the `pull_request_target` path. Since every type fires once per
-  monitored workflow per revision, listing all three dispatched up to 42 readiness runs per
-  head update and made readiness ~67% of every workflow run this repository created; two
-  types put the ceiling at 28. The `pr+sha` concurrency group collapses the burst for
-  execution, but a collapsed run has already consumed its dispatch slot, so the group does
-  not bound that cost.
+- **It refreshes when a lane STARTS re-running; a lane's completion reaches it through
+  the sweep.** Readiness subscribes to `workflow_run: in_progress` only -- not `completed`,
+  not `requested`. A `workflow_run` dispatch is spent the moment GitHub delivers the event,
+  before the job runs a step, and every subscribed type fires once per monitored workflow
+  per revision plus once per re-run attempt. With `completed` listed that was 24 runs per
+  head update by construction and 30 measured, 3006 an hour against ~100 head updates,
+  ≥60% of every workflow run this repository created, for a job whose full evaluation
+  takes 9-16 seconds. The `pr+sha` concurrency group collapses the burst for execution,
+  but a collapsed run has already consumed its dispatch, so the group does not bound that
+  cost -- and neither does anything a step does. The only lever on dispatch is which
+  events are subscribed.
+
+  So completions are delivered by `pr-readiness-sweep.yml`, every 5 minutes (GitHub's
+  shortest schedule). It scans every open pull request over GraphQL -- a separate pool
+  from the REST budget the lanes share, a handful of requests for the whole open set --
+  and dispatches a recompute for exactly the heads on which a monitored check completed
+  after the current verdict was published: 37 heads in a measured 15-minute window,
+  against 282 completion events. A pending is examined once it is at least the publish
+  lag old (180 s), and a check counts as evidence when it completed after the verdict's
+  publication minus that same lag; binding the two to one value is what makes a rescue
+  self-terminating on the next tick whatever the cadence (`test_pr_readiness_sweep.py`
+  pins the pairing and the reasoning). The cost is latency in the safe direction only: a
+  verdict goes green up to one tick plus the lag later than the event made it, never
+  earlier.
+
+  `in_progress` stays because it is the one signal completions cannot carry: a monitored
+  workflow going BACK to running. A re-run reuses the same run and increments its attempt,
+  so `requested` never fires for it and the runs page shows the pre-re-run conclusion
+  until the attempt finishes. Without it, a re-run of an already-green lane would leave
+  readiness publishing the pre-re-run `success` for the whole re-run -- and since that
+  status is the branch-protection handle for the entire fan-out, armed auto-merge could
+  merge a revision whose lane is failing at that moment. A sweep cannot close that: its
+  evidence is completed checks, and a running lane has none yet. `requested` is the type
+  that carries nothing: it fires at run CREATION, when no lane can have a verdict yet and
+  readiness has already published `checking` from the `pull_request_target` path.
+- **A lane that is itself `workflow_run`-triggered cannot be monitored.** GitHub runs such
+  a workflow from the default branch, so the `workflow_run` payload its completion hands
+  readiness names the default branch as `head_branch` and the default branch's tip as
+  `head_sha` — never the pull request's head. `Resolve current pull request revision` then
+  asks which open pull request has `<this repo>:<default branch>` as its head, an answer
+  that is empty by construction, and the run exits `SKIP` having published nothing and
+  spent one request from the shared hourly REST pool. The seven stage-2 fork reviewers
+  (`Fork * Review`, `Fork Internal Content Scan`) all key on Fast Gate this way and were
+  listed for years on the stated intent that their completion refreshed a fork verdict; it
+  never could. Measured 2026-09-26: 700/700 runs across those seven lanes carried the
+  default branch, and because their dispatches all keyed on ONE concurrency group (the
+  default branch's tip) rather than per head update, they accumulated across every open
+  pull request at once — 158 no-op readiness runs on a single default-branch SHA, 96% of
+  readiness's run creation, ~5,100 wasted requests an hour against a 15,000/hour
+  installation pool. A fork verdict is refreshed instead the way every verdict is:
+  `pr-readiness-sweep.yml` re-fires by PR number when a check on its head completes.
+  Two fences hold the rule
+  — the trigger allowlist and the job gate's event check — and
+  `test_ai_review_workflows.py` pins both.
+- **A run triggered by an `in_progress` event holds the verdict and stops.** That event
+  MEANS a monitored lane is running, so nothing the status says is known to be true. The
+  run makes one read -- of the workflow run the event names, never of the commit status --
+  to ask whether that is STILL true, because queue delay can execute a hold long after its
+  event. A lane that has since completed gets no hold: its completion is the sweep's
+  evidence, and a hold written now would stamp the status newer than that completion and
+  push it below the evidence floor with no later event left to lift it. A lane still
+  running gets `pending`, written unconditionally, and the run does nothing else -- three
+  requests in all, no evaluation. Reading the STATUS first would reopen the stale-success
+  window the publish step's POST comment records three guards failing to close; a pending
+  over a pending only moves the stamp, and a pending over a failure blocks the merge just
+  the same. An unreadable run holds anyway, stamped `[read-failed]`, so the sweep's
+  age-based retry recomputes it regardless of evidence. The lane's completion then reaches
+  the sweep as evidence newer than the hold, and the recompute it dispatches publishes the
+  real verdict with the labels to match. `test_pr_readiness_publish.py` runs the hold step
+  against the publish harness and pins all three arms.
+
+  A `success` is re-checked before it is published, on every head: the publish step reads
+  the runs page once more and downgrades to `pending` if a monitored lane has started since
+  (to `failure` if one has turned red), so a run in an isolated `pull_request_target` or
+  `workflow_dispatch` group cannot land a stale success over a re-run -- and this is the
+  write a re-run's hold cannot defend against on its own, since the hold lands in seconds
+  and the delayed publish lands after it. A fork head's runs list the fork as
+  `head_repository`, so the same filter answers for a fork's CI, Fast Gate, Build, Code
+  Review and content-scan re-runs. The seven Stage-2 fork review lanes run from the default
+  branch and never appear there; on a fork success they are read once more from the head
+  SHA's check-runs, bound as the verdict step binds them -- to this pull request AND to Fast
+  Gate's newest run + attempt, since a Fast Gate re-run leaves the previous attempt's seven
+  green rows on the SHA until the re-run's lanes post theirs -- and a lane with no current
+  row or a row still running holds the publish, while a row completed red (each fork lane
+  fails its check ONLY on a real BLOCK) publishes red. Both arms collapse a lane's runs the
+  way the verdict step does, a cancelled max-id run yielding to a later-started sibling, so
+  the re-check never reds a lane the evaluation scored green. CodeQL is read on same-repo heads only -- it
+  is a `dynamic` run, invisible to a re-check filtered to `event=pull_request`, and its
+  security verdict is a separate exact-SHA check-run a re-scan re-opens; a fork head cannot
+  run it.
+
+  Each run ends with a `pr-readiness: core rate limit -- N/M remaining` log line
+  (`GET /rate_limit` is free) so the pool's draw can be measured rather than estimated.
+  Screening events before the evaluation was measured and then withdrawn: settling an
+  event skips the publish, and the publish is the only write that corrects an isolated,
+  never-cancelled publisher's stale success, so every screened shape moved that write
+  earlier and widened the window in which such a success is the last write on the sole
+  required status. Commit statuses are last-write-wins with no conditional write, so no
+  read closes it. That is why the remaining reduction was taken at DISPATCH -- dropping
+  the `completed` subscription -- which carries no such exposure: it moves no write
+  earlier, it only delivers the final one a few minutes later.
 - **A `pull_request_target` run gets its own isolated concurrency group.** Those are
   the only readiness runs that surface as a CheckRun in the PR's rollup, and GitHub
   marks any superseded run "cancelled" whichever way `cancel-in-progress` is set, so
@@ -1955,12 +2683,37 @@ Two subtleties:
   recompute it on an unchanged commit, freezing the status at pending indefinitely.
   So it is added only when the live evaluation still found something genuinely
   incomplete.
+- **It reads each collection once, not once per lane.** All monitored workflow runs
+  come from one `actions/runs?event=pull_request&head_sha=` page (19 workflows in this
+  repository fire on `pull_request`, one run each per head), selected per lane by
+  `.path`; on a fork, all seven check-run lanes come from one paginated read of the
+  head's check-runs, bound per lane by `external_id`. Per-lane reads were ~11
+  requests per evaluation at ~250 evaluations an hour under load -- the largest
+  single draw on the hourly REST pool every workflow here shares through
+  `GITHUB_TOKEN` (15,000 requests an hour, the Enterprise Cloud ceiling). That pool
+  ran dry on 2026-09-15 and again on 2026-09-23: every AI lane failed closed and this
+  job logged `API rate limit exceeded for installation`. The one cost of the
+  consolidated read is that a renamed monitored workflow file reads as
+  `(not started)` instead of a loud 404; `test_pr_readiness_evaluate.py` pins every
+  monitored file to `.github/workflows/`, so the rename fails its own PR instead.
+  The PR lookup for a `workflow_run` event is scoped the same way: the event
+  carries the head repository and branch, so `pulls?state=open&head=<owner>:<branch>`
+  answers in one request; the walk over every open PR (seven pages at 600 open PRs)
+  remains only for an event that carries neither field. The default branch comes from
+  the event payload, and `pr_status.py --disposition-gate` reads the PR's comment pages
+  once for both the disposition records and the reviewer markers (it walked them twice),
+  and `pr_findings.py` uses the same shared read.
 - **A transport error during evaluation is non-terminal.** Every read-only `gh`
   call goes through a bounded retry helper (3 attempts with backoff, 120s cap per
   attempt); a non-429 HTTP 4xx is treated as permanent misconfiguration and fails
-  the job loudly instead of retrying. If an **evaluation** read still fails after
-  the retries, the evaluate step publishes an explicit non-terminal "could not be
-  evaluated" verdict (`pending` under `readiness: checking`) instead of exiting
+  the job loudly instead of retrying. A secondary rate limit (`HTTP 403 ... secondary
+  rate limit`) is retried like a 429; the **primary** limit (`API rate limit exceeded
+  for installation`) is not -- it refills at the top of the hour, not within the
+  backoff, so a retry only adds to the volume that emptied the shared pool. It takes
+  the same non-terminal branch below after a single attempt. If an **evaluation**
+  read still fails after the retries, the evaluate step publishes an explicit
+  non-terminal "could not be evaluated" verdict (`pending` under
+  `readiness: checking`) instead of exiting
   non-zero — so a transient network/TLS blip during evaluation never leaves a red
   check-run or skips the publish step (issue #2753: the same commit evaluated
   green then red 39 seconds apart). Exhausted retries in the other steps (context
@@ -1986,11 +2739,14 @@ Two subtleties:
 - **Nothing keys off `workflow_run.pull_requests`.** That array is empty whenever the
   head repository is a fork, the same GitHub behaviour the `fork-*` workflows already
   work around. The job gate admits every `pull_request` and `dynamic` run and lets the
-  head SHA resolve to a PR via `repos/:repo/commits/:sha/pulls`, and a monitored run is
-  bound back to the PR by `(head_repository.full_name, head_branch)` on top of the
-  `head_sha=` query — a pair that is populated on a fork run, and unique because only
-  one open PR can exist per source repository + branch. Keying either place on the PR
-  number froze a fork PR at pending forever: the gate skipped every re-evaluation, so
+  head SHA resolve to a PR through `pulls?state=open&head=<owner>:<branch>` matched on
+  `head.sha` (not `repos/:repo/commits/:sha/pulls`, which lists only PRs whose head
+  commit is reachable in this repository -- empty for every open fork PR), and a
+  monitored run is bound back to the PR by `(head_repository.full_name, head_branch)`
+  on top of the `head_sha=` query — a pair that is populated on a fork run, and
+  unique because only one open PR can exist per source repository + branch. Keying
+  either place on the PR number froze a fork PR at pending forever: the gate skipped
+  every re-evaluation, so
   the verdict was whatever the `pull_request_target` run saw *before* the monitored
   workflows existed, and the lookup independently reported already-green workflows as
   `(not started)`.
@@ -2017,13 +2773,15 @@ directly without Fast Gate re-running, so the trigger-bound id stays identical
 between the stale failed attempt and the fresh rerun -- readiness resolves that by
 collapsing every check-run sharing an id to the newest by check-run id (distinct per
 POST, monotonically increasing), so the fresh rerun always wins. `pr-readiness.yml`
-also triggers on that same rerun's own `workflow_run: in_progress` event, which
-fires the instant the rerun starts and can race the rerun's own "Open check-run"
-step -- reading check-runs at that exact moment would still see only the OLD
-completed verdict. Readiness recognizes when its own evaluation was triggered by
-that lane's `in_progress` event (by name and status on the triggering
-`workflow_run`) and reads pending directly, without querying check-runs at all;
-the rerun's own completion re-triggers a real evaluation. CodeQL is
+does NOT see that rerun's own `workflow_run: in_progress` event: a `Fork <lane>` run
+is `workflow_run`-triggered, so it is barred from the trigger allowlist and its
+payload could not resolve a pull request anyway. The evaluation therefore reads
+check-runs at whatever state the triggering lane's event found them in, and a rerun
+whose fresh "Open check-run" row lands after that read still shows its OLD completed
+verdict until the next event. `pr-readiness-sweep.yml` mode 2 closes that within 15
+minutes on the check evidence. The `WR_NAME = "Fork $cname"` branch in the evaluate
+step was written for this race and has never been reachable; its comment records that.
+CodeQL is
 the single ineligible lane, reported as a non-blocking "Not eligible" note rather
 than a blocker. Readiness therefore says the same thing on a fork as anywhere else: the
 eligible automated validation passed for this revision. Human approval and branch
@@ -2036,7 +2794,7 @@ protection remain separate gates.
 **completion of `Fast Gate`** (stage 1) and run privileged from the default branch
 (stage 2), gated on
 `workflow_run.head_repository.full_name != github.repository`. Each posts a check-run
-named exactly like its same-repo twin (`Opus 4.8 Review`, `GPT 5.6 Review`,
+named exactly like its same-repo twin (`Opus 5 Review`, `GPT 5.6 Review`,
 `Design Review`, `UX Review`, `First Principles Review`, `Security Scope Review`),
 so branch protection is
 satisfied on either path, and it opens that check-run as early as possible keyed to
@@ -2084,7 +2842,11 @@ Nothing the fork controls can influence these reviews:
   of any prompt injection. That allowlist is coupled to the reviewer's own setup, not
   just to the model call: `allowed_non_write_users` auto-enables the action's
   bubblewrap isolation, which the action bootstraps over apt, so the ubuntu archive
-  hosts are load-bearing. Remove them and the install exits before any model call --
+  hosts are load-bearing -- and it then installs the CLI itself over `claude.ai`
+  and `downloads.claude.ai`, so those are too. The two phases are sequential, so an
+  allowlist carrying only the first still never reaches the model: a green apt phase
+  is not evidence the bootstrap resolves. Remove either and the install exits before
+  any model call --
   the blocking lane then goes red, and an **advisory** lane publishes `review
   incomplete` as a *neutral* check, which is how three reviewers can stop reviewing
   every fork PR without turning anything red (#12099). The endpoints for both that
@@ -2270,9 +3032,10 @@ capped at 6,000 bytes, and explicitly untrusted data: it can downgrade the
 repetition of an adjudicated finding class to advisory, and it can never
 waive a new defect or authorize a green verdict.
 
-GPT makes exactly two model calls. Pass 1 discovers candidates across the
-full diff; pass 2 attempts to falsify each candidate and emits the only
-verdict exposed to the comment and gate. Pass 2 also drops or downgrades a
+GPT makes exactly two GPT calls. Pass 1 discovers candidates across the
+full diff; pass 2 attempts to falsify each candidate and emits the only GPT
+verdict exposed to the comment and gate. Blocking candidates may then receive a
+separate, conditional Opus 5 adjudication. Pass 2 also drops or downgrades a
 candidate whose proposed fix violates the FIX BAR, a BLOCKING candidate that
 cannot be anchored to an AUTOSDE rule or residual defect class, and a
 relocated variant of a ledger-adjudicated class; an adjudication goes stale
@@ -2295,9 +3058,10 @@ the automated lanes passed for that SHA; it does not represent human approval.
 Making `PR Readiness` a required status remains an explicit branch-protection
 or ruleset setting outside the workflow.
 
-The aggregate covers the latest PR run for CI, Build,
-Code Review, Opus 4.8 Review, GPT 5.6 Review (the reconciled result of its three
-calls), Security Scope Review, and Design Review. For managed CodeQL it requires
+The aggregate covers the latest PR result for Fast Gate, CI, Build, Code Review,
+Internal Content Scan, Opus 5 Review, GPT 5.6 Review (two GPT passes plus
+conditional Opus adjudication), Security Scope Review, Design Review, UX Review,
+and First Principles Review. For managed CodeQL it requires
 both the dynamic analysis workflow and the exact-head `CodeQL` security result
 published by the
 `github-advanced-security` app. This preserves failures from an Analyze job and
@@ -2313,10 +3077,10 @@ the head SHA's check-runs, leaving CodeQL as the only lane explicitly ineligible
 for a fork. Missing or running eligible lanes
 produce `checking`; blocking workflow/check failures produce
 `action required`; drafts remain `checking`.
-Design Review completion is required, but its verdict and
-infrastructure conclusion are advisory. It emits one `PASS | CONCERNS | BLOCK`
-verdict and no separate blast-radius rating, and it owns the long-term
-reversibility (one-way-door) lens. Mergeability, behind-base state,
+Design Review, UX Review, and First Principles Review must complete. `PASS` and
+`CONCERNS` remain advisory, while a genuine `BLOCK` fails the lane and blocks
+readiness; same-repository model execution failures also remain blocking until a
+successful re-run or authorized override. Mergeability, behind-base state,
 and human review decisions are not part of this event-driven aggregate because
 they can change without an aggregate refresh event; branch protection and the
 live `prepare-pr` status check own them.
@@ -2360,14 +3124,14 @@ resists this:
 - **Both line reviewers share an identical FIX BAR:** every finding must carry a fix
   expressible as an edit to lines **this PR changed**. If the fix would need a new
   function, module, abstraction, config knob, dependency, or an edit to untouched
-  code, it is out of scope for the bot. GPT 5.6 drops such a finding; Opus 4.8
+  code, it is out of scope for the bot. GPT 5.6 drops such a finding; Opus 5
   **demotes it to advisory instead of dropping it** -- the author cannot land the
   remedy in this PR, so it must not gate the merge, but the signal is real and a
   human decides. A regression the diff itself introduces still blocks either way,
   since reverting the hunk is an in-diff fix. **The absence of a
   mechanism is never a finding.** This makes "add mechanism X" structurally
   un-reportable: the demand fails the bar before it can become a finding. A scope cap
-  complements it: Opus 4.8 stays within the evident scope of the diff (it is code-only),
+  complements it: Opus 5 stays within the evident scope of the diff (it is code-only),
   and GPT 5.6 stays within the PR's stated purpose, flagging a
   description-versus-diff mismatch as an **advisory** finding rather than a block.
 - **The WHAT BLOCKS list is closed:** exhaustive, never extended, never reasoned about

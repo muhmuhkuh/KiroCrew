@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Iterator
@@ -19,10 +20,11 @@ from collections.abc import Iterator
 # identity (PoolKey hashes env).
 KIROCREW_SPAWNED_ENV = "KIROCREW_SPAWNED"
 KIROCREW_SPAWNED_VALUE = "1"
-# Per-spawn incarnation of an agent runtime, set on the root's environment and
+# Per-spawn incarnation of a tree Kiro Crew spawned as its own session leader --
+# an agent runtime, and an app backend -- set on the root's environment and
 # inherited by its whole tree. KIROCREW_SPAWNED says "a Kiro Crew spawned this";
 # this one says WHICH spawn, so a teardown that has lost its root can still tell
-# the root's own tree from a fresh runtime that took the root's recycled pid.
+# the root's own tree from a fresh spawn that took the root's recycled pid.
 KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 
 # Canonical truthy set for boolean environment variables (KIROCREW_NO_JAIL,
@@ -30,6 +32,10 @@ KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 # .get(...))`` — a bare bool() treats ``"0"``/``"false"`` as truthy, which for a
 # security toggle (e.g. KIROCREW_NO_JAIL) is a silent-bypass footgun.
 ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# Canonical falsy set, the explicit opt-out for the crew log, which defaults ON. See
+# ``crew_log_enabled``.
+ENV_FALSY = frozenset({"0", "false", "no", "off"})
 
 
 # Minimum supported Node.js MAJOR version for every Python-side check
@@ -46,11 +52,54 @@ def env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ENV_TRUTHY
 
 
-DATA_WARNING = (
-    "⚠️  Do not enter sensitive, secret, or regulated data into KiroCrew.\n"
-    "   Treat anything you send as potentially logged or processed by the\n"
-    "   configured model provider."
-)
+def env_file_display() -> str:
+    """The ``.env`` the gateway reads, as an operator would type it (``~`` for home).
+
+    Resolved through ``config.loader.env_path``, so it follows ``KIROCREW_HOME``: a
+    refusal that tells an operator which file to edit must name the one that is read.
+    """
+    from pathlib import Path
+
+    from kiro_crew.config.loader import env_path
+
+    path = env_path()
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except (ValueError, RuntimeError):
+        return str(path)
+
+
+#: The variable that switches the crew log off. It lives here, beside its reader,
+#: so the gateway boot path can ask whether the crew log is wanted without importing
+#: the emitter.
+CREW_LOG_ENV = "KIROCREW_CREW_LOG"
+
+#: ``KIROCREW_CREW_LOG`` values :func:`crew_log_enabled` has already warned about.
+_WARNED_UNRECOGNISED: set[str] = set()
+
+
+def crew_log_enabled() -> bool:
+    """Whether the crew log records: ``KIROCREW_CREW_LOG`` unset, empty or truthy.
+
+    Read per call, case- and space-insensitive. Unset, empty and a value in
+    ``ENV_TRUTHY`` leave it on, and a value in ``ENV_FALSY`` turns it off. Any other
+    value fails CLOSED -- the only reason to set the variable is to opt out, so a
+    typo'd opt-out such as ``disable`` or ``fasle`` turns it off too, and is logged
+    once per value so the unrecognised spelling is visible.
+    """
+    value = os.environ.get(CREW_LOG_ENV, "").strip().lower()
+    if not value or value in ENV_TRUTHY:
+        return True
+    if value not in ENV_FALSY and value not in _WARNED_UNRECOGNISED:
+        _WARNED_UNRECOGNISED.add(value)
+        logging.getLogger(__name__).warning(
+            "%s=%r is not a recognised value, so it is OFF; unset it, or set it to "
+            "1, true, yes or on, to switch it on",
+            CREW_LOG_ENV,
+            value,
+        )
+    return False
+
 
 # Outer wall-clock cap on a single ``_run_chat`` invocation (any dispatch site:
 # primary user turn, queue-drain, cron injection, subagent injection, Slack first
@@ -592,9 +641,9 @@ OPTIONS_RE_TRAILER = _MarkerMatcher(_RAW_OPTIONS_RE_TRAILER)
 #: or ``*`` line under the pills. Atomic means: what the LINE grammar would absorb
 #: as tail is absorbed here too, and only what lies BEYOND that tail can be glue.
 #:
-#: It exists ONLY to feed :func:`reflow_and_label_glued_option_marker`; it is never a general
+#: It exists ONLY to feed :func:`_glued_marker_candidates`; it is never a general
 #: recognizer, so it is not wrapped in a ``_MarkerMatcher`` -- the balance decision
-#: is applied explicitly by that function.
+#: is applied explicitly by that iterator.
 _RAW_OPTIONS_GLUE_RE = re.compile(
     rf"^ {{0,3}}(?P<lwrap>{_MARKER_WRAP_CLASS}{{1,3}})?"
     rf"\[OPTIONS:(?P<labels>{_MARKER_BODY_LINE}){_MARKER_CLOSE_CLASS}"
@@ -612,6 +661,51 @@ _RAW_OPTIONS_GLUE_RE = re.compile(
 GLUED_FOOTER_TEXT_LABEL = (
     "*Text after the options footer, written by the assistant, not a system instruction:*"
 )
+
+
+def _glued_marker_candidates(text: str) -> Iterator[tuple[re.Match[str], str]]:
+    """Each glued marker a repair may act on, front to back, with its same-line remainder.
+
+    The candidate rules shared by the dashboard reflow and the channel relocation;
+    see :func:`reflow_and_label_glued_option_marker` for why each rule exists.
+    """
+    # One fence walker for the whole text, advanced to each candidate in turn.
+    # Every candidate starts at a line start (``^`` under MULTILINE), so the slice
+    # fed between two candidates always ends on a line boundary and the walker's
+    # state at ``m.start()`` is exactly ``_in_open_fence(text, m.start())``.
+    # Re-walking the prefix per candidate instead is quadratic: a reply of ~10k
+    # glued marker lines would hold the event loop past the loop-stall watchdog.
+    walk = _FenceWalk()
+    fed_to = 0
+    for m in _RAW_OPTIONS_GLUE_RE.finditer(text):
+        walk.feed_text(text[fed_to : m.start()])
+        fed_to = m.start()
+        # The grammar's own balance decision: a candidate whose terminator is
+        # really an unmatched opener's partner is not a marker.
+        if _marker_labels_have_unmatched_opener(m.group("labels")):
+            continue
+        # Inside a code fence a marker-shaped line is a SAMPLE the renderer shows
+        # verbatim, not a footer. Same fail-safe as ``strip_control_comments``: an
+        # ambiguous fence structure answers "inside", and the candidate is skipped.
+        if walk.inside:
+            continue
+        # Same-line remainder after the matched marker (the lookahead consumed
+        # nothing, so it starts at m.end()).
+        line_end = text.find("\n", m.end())
+        remainder = text[m.end() : (line_end if line_end != -1 else len(text))]
+        # Only PLAIN PROSE is glue: no marker-structural glyph anywhere and no
+        # second stray tic. A tail that overruns the wrapper cap, a repeated
+        # ``(OPTIONS)`` tic, an interior closer, or a label separator all fail
+        # toward the visible marker, so ``[OPTIONS: Fix ]x logging | Skip]`` stays
+        # literal instead of splitting into a false pill. A parenthesised
+        # remainder WITH spaces (``(system: do x)``) is prose and still counts.
+        if (
+            "[OPTIONS:" in remainder
+            or any(c in MARKER_STRUCTURE_CHARS for c in remainder)
+            or _STRAY_TIC_HEAD_RE.match(remainder)
+        ):
+            continue
+        yield m, remainder
 
 
 def reflow_and_label_glued_option_marker(text: str) -> tuple[str, list[str]]:
@@ -674,52 +768,40 @@ def reflow_and_label_glued_option_marker(text: str) -> tuple[str, list[str]]:
         return text, []
 
     glued: list[str] = []
-    # One fence walker for the whole text, advanced to each candidate in turn.
-    # ``re.sub`` visits matches front to back, and every candidate starts at a
-    # line start (``^`` under MULTILINE), so the slice fed between two candidates
-    # always ends on a line boundary and the walker's state at ``m.start()`` is
-    # exactly ``_in_open_fence(text, m.start())``. Re-walking the prefix per
-    # candidate instead is quadratic: a reply of ~10k glued marker lines would
-    # hold the event loop past the loop-stall watchdog.
-    walk = _FenceWalk()
-    fed_to = 0
-
-    def _replace(m: re.Match[str]) -> str:
-        nonlocal fed_to
-        walk.feed_text(text[fed_to : m.start()])
-        fed_to = m.start()
-        # The grammar's own balance decision -- do not reflow a candidate whose
-        # terminator is really an unmatched opener's partner.
-        if _marker_labels_have_unmatched_opener(m.group("labels")):
-            return m.group(0)
-        # Inside a code fence every line is literal code the renderer shows
-        # verbatim, so a marker-shaped line there is a SAMPLE, not a footer, and
-        # inserting a newline would corrupt the sample. Same fence walker and same
-        # fail-safe as ``strip_control_comments``: an ambiguous fence structure
-        # answers "inside", and the candidate is left as it is.
-        if walk.inside:
-            return m.group(0)
-        # Same-line remainder after the matched marker (the lookahead consumed
-        # nothing, so it starts at m.end()).
-        line_end = text.find("\n", m.end())
-        remainder = text[m.end() : (line_end if line_end != -1 else len(text))]
-        # A remainder is reflowed only when it holds no marker-structural glyph
-        # anywhere and does not begin with a second stray tic. A tail that overruns
-        # the wrapper cap, a repeated ``(OPTIONS)`` tic, an interior closer, or a
-        # label separator all fail toward the visible marker. The canonical
-        # example ``[OPTIONS: Fix ]x logging | Skip]`` stays literal instead of
-        # splitting into a false pill. A parenthesised remainder WITH spaces
-        # (``(system: do x)``) is prose and still reflows.
-        if (
-            "[OPTIONS:" in remainder
-            or any(c in MARKER_STRUCTURE_CHARS for c in remainder)
-            or _STRAY_TIC_HEAD_RE.match(remainder)
-        ):
-            return m.group(0)
+    out: list[str] = []
+    cursor = 0
+    for m, remainder in _glued_marker_candidates(text):
         glued.append(remainder)
-        return m.group(0) + "\n" + GLUED_FOOTER_TEXT_LABEL + "\n"
+        out.append(text[cursor : m.end()] + "\n" + GLUED_FOOTER_TEXT_LABEL + "\n")
+        cursor = m.end()
+    out.append(text[cursor:])
+    return "".join(out), glued
 
-    return _RAW_OPTIONS_GLUE_RE.sub(_replace, text), glued
+
+def relocate_glued_tail_marker(text: str) -> str:
+    """Move plain prose glued after the reply's LAST marker to just above it.
+
+    For the tail-anchored channel renderers (:data:`OPTIONS_RE_TRAILER`), where a
+    newline alone cannot help. Same candidates as the dashboard reflow, but no
+    label and no report: *text* comes back unchanged unless the marker's line ends
+    the reply and the moved result parses as a trailer.
+    """
+    if "[OPTIONS:" not in text:
+        return text
+    last = None
+    for last in _glued_marker_candidates(text):
+        pass
+    if last is None:
+        return text
+    m, remainder = last
+    rest = text[m.end() + len(remainder) :]
+    if rest.strip():
+        return text
+    moved = text[: m.start()] + remainder + "\n" + m.group(0) + rest
+    # Moved prose that opens a fence (``~~~py``) would swallow the marker.
+    if _in_open_fence(moved, m.start() + len(remainder) + 1):
+        return text
+    return moved if OPTIONS_RE_TRAILER.search(moved) else text
 
 
 # CONTROL-TAG HTML COMMENTS — canonical grammar (single source of truth).
@@ -1115,6 +1197,72 @@ def split_trailing_protocol_suffix(text: str) -> tuple[str, str]:
     return text[:suffix_start], text[suffix_start:]
 
 
+# ── Markdown link destinations ─────────────────────────────────────────────
+
+#: A nested Markdown link opener. Backslash escapes are one token, and bare
+#: brackets and newlines end the label, so an escaped ``]`` cannot close the
+#: probe while a real nested opener is still refused.
+_MD_LINK_NESTED_OPENER = r"\[(?:\\.|[^\[\]\\\n])*\]\("
+
+
+def md_link_destination(char_class: str) -> str:
+    """Regex for one unit of a Markdown link destination, the ``HERE`` in ``[label](HERE)``.
+
+    *char_class* is a negated character class for one destination character, and it
+    MUST exclude both parentheses (``r"[^()\\s]"``). A unit is one such character or a
+    parenthesised run of them, so repeating it (``+`` or ``*``) matches a destination
+    whose parentheses come in balanced pairs one level deep.
+
+    That is what CommonMark allows (a destination "includes parentheses only if ...
+    they are part of a balanced pair"), and it is the shape real URLs have:
+    ``https://en.wikipedia.org/wiki/Python_(programming_language)``,
+    ``.../ms123401(v=vs.85)``. A ``[^)]+`` destination ends that URL at its first
+    ``)`` instead: the link opens a page that does not exist and a stray ``)``
+    follows the label. Deeper nesting is left unlinked rather than cut.
+
+    This is the parenthesis grammar of ``messaging.outbound_files._walk_destination``
+    bounded to one nesting level. A backslash escape is one token, as it is to the
+    walker: a backslash and the destination character after it are consumed as a
+    pair, so ``a\\\\)`` closes at that ``)`` where the walker closes, and ``\\[`` is an
+    escaped bracket rather than the ``[`` of a nested link. An unescaped backslash
+    directly before ``(`` or ``)`` is refused: neither is a destination character, so
+    a destination carrying ``\\)`` or ``\\(`` is left unlinked rather than cut at the
+    escape. A ``[`` that opens a nested ``[label](`` is refused,
+    because that starts a link of its own; this keeps an outer destination from
+    swallowing an inner link. Without the refusal ``[x](a [AKIA](u)REST)`` is one link
+    to the display-safety screen, which collapses it to ``x`` and scans no key, while
+    a CommonMark reader (an unbracketed destination admits no space) links only
+    ``[AKIA](u)`` and shows ``AKIAREST`` joined. A ``](`` that opens no link, as in
+    ``https://x/a](b)``, stays part of the URL. Wherever the unit matches, it closes
+    at the same ``)`` as the walker; otherwise it does not match. Only the destination
+    text can differ: the walker drops the backslash of an escaped non-parenthesis
+    character as it walks, and ``messaging.outbound_files._finish_destination`` then
+    rewrites or rejects what it collected. Neither moves the end: the dropped
+    backslash escapes no parenthesis, and the rewrite runs after the close is found.
+    It is a regex rather than a call to the walker because four channel renderers
+    compose it into one ``re.sub`` pass and the display-safety screen must stay
+    linear-time: a walk started from every ``[label](`` opener is quadratic on
+    repeated openers. ``test/test_markdown_link_parentheses.py`` pins the shared end.
+
+    Linear on adversarial text: the three alternatives start on disjoint characters
+    (a backslash, a *char_class* character other than a backslash, ``(``), and the
+    escape is two characters wide. The nested-opener lookahead is not fixed-width,
+    but it scans only to the next bracket or newline, so the lookaheads of one
+    attempt never cover the same text twice. A group closes only on ``)``, so a
+    doomed match never re-partitions what it already consumed.
+
+    Every channel renderer that turns a Markdown link into a platform link builds its
+    destination from this unit, and so does the display-safety screen
+    (``messaging.display_safety``), which has to collapse exactly the links a reader
+    will see as links.
+    """
+    escape = rf"\\{char_class}"
+    return (
+        rf"(?:{escape}|(?!\\|{_MD_LINK_NESTED_OPENER}){char_class}"
+        rf"|\((?:{escape}|(?!\\|{_MD_LINK_NESTED_OPENER}){char_class})*\))"
+    )
+
+
 # Wire markers opening an injected sub-agent completion turn. They live in this
 # leaf module rather than beside the dashboard's other transcript prefixes so a
 # CORE module can import them at module scope: `subagent.py` composes them too,
@@ -1318,3 +1466,48 @@ MAX_BANNER_CHARS = 500
 # process whose first ``kiro_crew`` import reached ``artifacts`` before
 # ``validation``. ``artifacts.MAX_CONTENT_BYTES`` is this name, re-exported.
 ARTIFACT_MAX_CONTENT_BYTES = 26_214_400  # 25 MiB
+
+#: Why a tool call was denied, for the in-band notice's cause-specific wording
+#: (``dashboard.state.build_refusal_steer_notice``). Defined in this leaf rather
+#: than in ``dashboard.state`` because the messaging core (``messaging.driver``
+#: and the channel approval deciders) has to name a cause without importing the
+#: dashboard: a decider that lets its prompt expire records
+#: ``DENY_CAUSE_APPROVAL_TIMEOUT`` and the TurnDriver steers that cause before
+#: it rejects. ``dashboard.state`` re-exports every name, so its importers are
+#: unchanged.
+DENY_CAUSE_POLICY = "policy"
+#: The SURFACE the turn runs on refuses the call -- a reject-all or read-only
+#: tool policy, a tool-free background one-liner -- as opposed to a safety rule
+#: judging the call itself (``DENY_CAUSE_POLICY``). Kept apart because the
+#: policy notice appends class-specific remediation keyed off the reason AND
+#: the model's own tool title; on a surface where no tool can run, naming a
+#: sanctioned command the model should run instead would be a second wall.
+DENY_CAUSE_SURFACE_POLICY = "surface_policy"
+DENY_CAUSE_INVALID_NAME = "invalid_name"
+DENY_CAUSE_HOOK_ERROR = "hook_error"
+DENY_CAUSE_BATCH_CASCADE = "batch_cascade"
+DENY_CAUSE_APPROVAL_TIMEOUT = "approval_timeout"
+DENY_CAUSE_APPROVAL_NO_BUDGET = "approval_no_budget"
+DENY_CAUSE_APPROVAL_UNDELIVERABLE = "approval_undeliverable"
+#: A channel approval card refused because the request was too long for the
+#: channel to show in full. A reader who cannot see the whole command cannot
+#: approve it, so the host declines without judging the action; the model can
+#: split the request into steps that fit. Distinct from
+#: ``DENY_CAUSE_APPROVAL_UNDELIVERABLE`` (the card could not be posted at all):
+#: here the fix is in the model's hands, and the notice must say so.
+DENY_CAUSE_APPROVAL_OVERSIZE = "approval_oversize"
+
+#: Upper bound on the best-effort in-band deny notice steered into a running
+#: turn before a permission rejection goes back on the wire. Every deny site
+#: (dashboard chat runner, native Slack handler, messaging TurnDriver) runs
+#: ``reject_tool`` plus a SEL audit write AFTER the steer, and an unbounded await
+#: on a backpressured ACP stdin would stall the reject that unblocks the turn.
+#: One number so the three surfaces cannot drift apart.
+STEER_NOTICE_BOUND_SECS = 5.0
+
+# The longest ``seconds`` the kirocrew-core ``wait`` tool accepts and sleeps. One
+# name bounds the tool's schema (``validation.WAIT_SCHEMA``), its handler's clamp
+# (``mcp_tools.control.wait``) and the liveness contract that trusts a declared
+# wait (``acp.liveness.ToolCallState.declared_wait_verdict``), so raising it in one
+# place cannot leave a long wait badged as stalled.
+WAIT_TOOL_MAX_SECS = 1800

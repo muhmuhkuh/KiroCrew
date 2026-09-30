@@ -31,18 +31,22 @@ other track's work.
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import logging
 import os
 import signal
 import sys
 import threading
-from collections.abc import Sequence
+import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from .. import common
 from ..common import Settings
 from . import backend as backend_mod
 from . import bundle as bundle_mod
+from . import kiro_login as kiro_login_mod
 from .process import ProcessGroup, spawn_process_group
 
 log = logging.getLogger("container.supervisor")
@@ -70,12 +74,39 @@ def _start_front(settings: Settings) -> ProcessGroup:
     return spawn_process_group("front", [sys.executable, "-m", "container.front"])
 
 
-def _wait_for_shutdown(children: Sequence[ProcessGroup]) -> str:
-    """Block until a stop signal arrives or any child exits. Return the reason.
+#: The shutdown reason a spent lifetime produces.
+_LIFETIME_REASON: str = "lifetime"
 
-    Returns ``"signal"`` on SIGTERM/SIGINT, or ``"<name> exited"`` if a child
-    dies first (the backend dying is fatal; so is either other child, since the
-    task cannot do its job).
+#: Shutdown reasons that mean the task did what was asked of it, so the process
+#: exits zero. Both members are produced by ``_wait_for_shutdown`` a few lines
+#: below, and a reason added there without being decided here reports a clean stop
+#: as a failure -- which is why the two live next to each other. Everything else,
+#: including a reason this code cannot account for, is a failure: see ``run``.
+_ORDERLY_REASONS: frozenset[str] = frozenset({"signal", _LIFETIME_REASON})
+
+
+def _wait_for_shutdown(children: Sequence[ProcessGroup], *, ttl_seconds: int = 0) -> str:
+    """Block until a stop signal arrives, a child exits, or the lifetime is spent.
+
+    Returns ``"signal"`` on SIGTERM/SIGINT, ``"lifetime"`` when *ttl_seconds* has
+    passed, or ``"<name> exited"`` if a child dies first (the backend dying is
+    fatal; so is either other child, since the task cannot do its job).
+
+    ``ttl_seconds`` of zero is UNBOUNDED, which is what a launch path saying
+    nothing about lifetime gets: the wait then ends only on a signal or a child.
+
+    The deadline is measured from here on the monotonic clock, so a wall-clock
+    correction inside the task cannot cut the lifetime short or extend it. Here
+    rather than at process start because this is the point from which the task is
+    doing its job; the launch-time sweep measures the same bound from the task's
+    own ``startedAt``, which is EARLIER, so where both enforcement points exist
+    the sweep is the one that fires. That ordering is the intended one: this
+    deadline is the backstop for a cluster no further launch ever sweeps.
+
+    Elapsed time is compared against *ttl_seconds*, which is never added to the
+    clock: an integer bound larger than any representable float would raise on
+    that addition, and a bound nobody can reach must read as a long lifetime
+    rather than as a crash. The sweep compares the same way.
     """
     stop = threading.Event()
     reason = {"why": ""}
@@ -87,11 +118,15 @@ def _wait_for_shutdown(children: Sequence[ProcessGroup]) -> str:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
+    started = time.monotonic()
+    bounded = ttl_seconds > 0
     while not stop.wait(0.5):
         for child in children:
             if child.poll() is not None:
                 reason["why"] = f"{child.name} exited (code {child.returncode()})"
                 return reason["why"]
+        if bounded and time.monotonic() - started >= ttl_seconds:
+            return _LIFETIME_REASON
     return reason["why"]
 
 
@@ -108,6 +143,21 @@ def _our_live_children(exclude: set[int]) -> list[int]:
     backend spawns its workers and tells nobody. Linux-only, which ``crew/runtime/**`` already
     is; a missing ``/proc`` yields an empty list rather than an error, so a host without it
     degrades to the previous behaviour instead of failing the shutdown.
+
+    A child in OUR OWN process group is NOT one of these, and is excluded here rather than in
+    the caller. The subject is a process whose REAPER is gone; a process sharing our group
+    still has us, and the caller's remedy is a group signal, which on our own group SIGKILLs
+    this process -- so the sweep's remaining rounds never run and every real orphan is left
+    alive. One such child is enough, and it is a reachable shape rather than a theoretical
+    one: a library this process uses can hold a pool of helper children (the sensitive-path
+    resolver keeps several), and those sit in our group. Nothing the sweep exists to reach is
+    lost, because every one of those is in a group of its own -- an escaped worker by
+    ``start_new_session``, the front and backend by being spawned into theirs -- and a
+    same-group child dies with us when this process exits, which is the next thing to happen.
+
+    The group comes from the SAME ``/proc`` line the parent does (``pgrp`` is the field after
+    ``ppid``), so it is one read rather than a second syscall on a pid that may already be
+    gone, and this function keeps its one source of truth about a candidate.
     """
     mine = os.getpid()
     found: list[int] = []
@@ -115,6 +165,7 @@ def _our_live_children(exclude: set[int]) -> list[int]:
         entries = os.listdir("/proc")
     except OSError:
         return found
+    my_group = _own_process_group()
     for name in entries:
         if not name.isdigit():
             continue
@@ -131,19 +182,43 @@ def _our_live_children(exclude: set[int]) -> list[int]:
             # pid exiting mid-scan. Failing the whole teardown over one alien pid would be
             # worse than missing it.
             continue
-        # After the ')' closing comm: state, ppid. Split this way because comm can contain
-        # spaces and parentheses, which is why the naive field index is wrong.
-        if len(fields) < 2:
+        # After the ')' closing comm: state, ppid, pgrp. Split this way because comm can
+        # contain spaces and parentheses, which is why the naive field index is wrong.
+        if len(fields) < 3:
             continue
         if fields[0] == "Z":
             # Already dead and waiting to be reaped; the wait below collects it.
             continue
         try:
-            if int(fields[1]) == mine:
-                found.append(pid)
+            if int(fields[1]) != mine:
+                continue
+            if my_group is not None and int(fields[2]) == my_group:
+                continue
         except ValueError:
             continue
+        found.append(pid)
     return found
+
+
+def _own_process_group() -> int | None:
+    """This process's group, from ``/proc/self/stat``, or ``None`` when unreadable.
+
+    Read the same way and from the same field as every candidate's, so the comparison in
+    :func:`_our_live_children` is between two values of one kind. ``None`` means the question
+    could not be answered, and the caller then excludes nothing -- the previous behaviour,
+    rather than a guess that could either skip a real orphan or keep a self-kill.
+    """
+    try:
+        with open("/proc/self/stat", encoding="utf-8", errors="replace") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+    except OSError:
+        return None
+    if len(fields) < 3:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
 
 
 def _sweep_orphans_the_backend_cannot_reap(exclude: set[int]) -> None:
@@ -185,7 +260,10 @@ def _sweep_orphans_the_backend_cannot_reap(exclude: set[int]) -> None:
             break
         for pid in live:
             # Group first: reaches the worker's whole session in one signal. A pid whose
-            # group cannot be resolved (already gone) falls back to a direct kill.
+            # group cannot be resolved (already gone) falls back to a direct kill. Safe on
+            # every pid that reaches here because ``_our_live_children`` has already
+            # withheld anything in THIS process's group -- see its docstring for why a
+            # group signal there is a self-kill.
             try:
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -291,6 +369,112 @@ def verify_layout(settings: Settings) -> None:
         )
 
 
+def export_kiro_home(settings: Settings) -> Path:
+    """Point this task's kiro home at ``<data home>/kiro``. Returns the agents dir.
+
+    Exported into THIS process's environment, not just handed to the backend, because
+    the bundle installer resolves the agents directory from ``os.environ``
+    (``bundle.default_kiro_agents_dir``, which mirrors kiro-cli's own
+    ``$KIRO_HOME``-or-``~/.kiro`` rule and imports no ``kiro_crew``). One export is
+    therefore what makes the installer and the backend agree on one directory; the
+    backend additionally gets the value from ``settings`` (``build_backend_env``), so
+    neither side depends on the other having run first.
+
+    WHY the default is wrong here, which is the whole reason this exists. With no
+    ``KIRO_HOME`` the agents directory is the process HOME's ``~/.kiro/agents``, which
+    every instance under that ``$HOME`` shares. The backend runs on a non-default data
+    home (``KIROCREW_HOME=<data home>``) and Kiro Crew REFUSES to rewrite a shared
+    agents dir from one: the specs it writes pin the writer's data home into every
+    managed MCP server entry, which fails strict session identity for a default-home
+    gateway (kirodotdev/KiroCrew#9690). Measured consequence in the container: the
+    supervisor's crew spec landed in the shared dir with no ownership provenance, the
+    backend read it as another home's, declined to write, and every turn died with
+    ``DerivedSpecStale: the default agent spec .../kirocrew.json is missing``.
+
+    ``<data home>/kiro`` is that guard's own documented private-target case (see
+    ``Settings.kiro_home``), so this fixes the refusal by giving the task a directory
+    it owns -- NOT by relaxing the guard, which protects a real poisoning bug.
+
+    Fails CLOSED on four things, because every one of them is silent otherwise:
+
+    * A SYMLINK at either path this function owns. The privacy exemption is decided on
+      RESOLVED paths on both sides, so a link at ``<data home>/kiro`` or at its
+      ``agents`` child pointing into the shared tree makes the shared directory itself
+      test as "provably private" -- and the backend then rewrites the specs the guard
+      exists to protect, which is worse than the failure this function fixes. The
+      reachable planter is a previous task's model worker: it runs unsandboxed under
+      this uid with the volume writable, so a link it leaves behind survives into the
+      next boot. Refused with ``is_symlink``, which does NOT follow, and refused BEFORE
+      the export so a poisoned layout never reaches the backend's environment.
+    * A path that resolves outside ``<data home>/kiro/agents``. The check above reads the
+      path and the ``mkdir`` below uses it, so a link appearing in that window is
+      followed rather than refused; this closes the window by stating the guard's own
+      equation on what actually landed. The guard compares
+      ``resolve(<kiro home>/agents)`` against ``resolve(<data home>)/kiro/agents``, so an
+      equality here means the exemption the backend will take is genuine rather than
+      forged. Cheap, and it needs no assumption about where a link could be planted.
+    * A directory that cannot be created. The backend would then decline for a second
+      reason and the turn would die the same way, several minutes later and with the
+      refusal attributed to the guard instead of to the filesystem.
+    * The two resolvers disagreeing. This asserts that the installer's own resolver,
+      read back after the export, answers ``<kiro home>/agents``. That is the single
+      invariant the fix rests on, and a future change to either spelling breaks it
+      quietly -- the deployment would boot, install the crew in one directory and
+      serve agents out of another. It is checked SEPARATELY from the resolved-location
+      check above because the installer's resolver deliberately does not resolve, so a
+      symlinked home passes it while pointing somewhere else entirely.
+    """
+    agents = settings.kiro_home / "agents"
+    for path, what in ((settings.kiro_home, "kiro home"), (agents, "agent-spec directory")):
+        if path.is_symlink():
+            raise common.ConfigError(
+                f"the task's {what} {path} is a symlink, and the container refuses to "
+                f"start on it. Whether this directory is private is decided on the "
+                f"RESOLVED path, so a link pointing into a shared agents tree would make "
+                f"that tree test as this task's own and let the backend rewrite specs "
+                f"belonging to another data home. Remove it, or start on a clean data "
+                f"home."
+            )
+    try:
+        agents.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        raise common.ConfigError(
+            f"the task's agent-spec directory cannot be created: {agents} exists and is "
+            f"not a directory. The container refuses to start rather than crash on it "
+            f"every time the task restarts. Remove it, or start on a clean data home."
+        ) from exc
+    except OSError as exc:
+        raise common.ConfigError(
+            f"could not create the task's agent-spec directory {agents} ({exc}). This is "
+            f"where both the crew's spec and Kiro Crew's own default spec must live; "
+            f"refusing to start rather than letting the backend fall back to the shared "
+            f"agents directory under the process home, which it is not allowed to rewrite "
+            f"from a non-default data home and which would kill every turn at "
+            f"DerivedSpecStale."
+        ) from exc
+    expected = settings.data_home.resolve() / "kiro" / "agents"
+    landed = agents.resolve()
+    if landed != expected:
+        raise common.ConfigError(
+            f"the task's agent-spec directory {agents} resolves to {landed}, not to "
+            f"{expected}. Something along that path redirects it out of the data home, "
+            f"and the privacy the backend's write depends on is decided on the resolved "
+            f"path -- so this would hand it a directory it must not rewrite. Refusing to "
+            f"start."
+        )
+    os.environ[backend_mod.ENV_KIRO_HOME] = str(settings.kiro_home)
+    resolved = bundle_mod.default_kiro_agents_dir()
+    if resolved != agents:
+        raise common.ConfigError(
+            f"the crew installer resolves the agents directory as {resolved}, but this "
+            f"task owns {agents}. The installer reads $KIRO_HOME the way kiro-cli does "
+            f"and the backend reads it through Kiro Crew's own resolver; if the two "
+            f"disagree the crew is installed where nothing serves it. Refusing to start."
+        )
+    log.info("kiro home: %s (agent specs in %s)", settings.kiro_home, agents)
+    return agents
+
+
 #: The three things the sandbox probe can conclude. A verdict is a string rather
 #: than a tri-state boolean because the interesting case carries information: an
 #: undetermined verdict names WHY it could not be settled, and an operator needs
@@ -354,73 +538,285 @@ def _user_namespaces_available() -> str:
     )
 
 
-def verify_sandbox(settings: Settings, *, probe=_user_namespaces_available) -> None:
-    """Refuse to start unless the model subprocess can run sandboxed.
+#: ``prctl`` option number for the dumpable flag (``linux/prctl.h``). Value 0 clears it.
+PR_SET_DUMPABLE: int = 4
+
+
+def _clear_dumpable() -> str:
+    """Clear this process's dumpable flag. Returns "" on success, else a reason.
+
+    A string rather than a bool so the caller can report WHY, and a reason rather than
+    an exception so a platform without ``prctl`` is distinguishable from a ``prctl``
+    that ran and refused.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except OSError as err:
+        # Not Linux, or a libc under another name. The image is Linux; this path exists
+        # so importing this module on a developer's or CI runner's other platform does
+        # not fail.
+        return f"libc.so.6 not loadable ({err})"
+    if not hasattr(libc, "prctl"):
+        return "libc has no prctl"
+    if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+        return f"prctl(PR_SET_DUMPABLE, 0) failed with errno {ctypes.get_errno()}"
+    return ""
+
+
+def make_non_dumpable(*, clear=_clear_dumpable) -> None:
+    """Make this process's ``/proc`` entries unreadable by other processes of its uid.
+
+    The credential reaches this process in its environment, and `/proc/<pid>/environ`
+    exposes the region the exec set up rather than the live ``environ`` array -- so
+    clearing the variable does not unpublish the value. The model worker runs under this
+    same uid with no PID namespace between them, so it can read this process's
+    environment directly, and it runs an auto-approved shell on untrusted prompt
+    content. Clearing the dumpable flag makes the kernel reparent this process's
+    ``/proc`` entries to root, and a same-uid reader then gets ``EACCES``.
+
+    Side effects, and why they are acceptable here: a non-dumpable process cannot be
+    ``ptrace``d and produces no core dump. The supervisor needs neither -- it spawns and
+    drains children and reads no ``/proc`` entry of its own.
+
+    On Linux a ``prctl`` that RAN and refused is fatal: the alternative is to serve
+    turns with the credential published to the worker. A platform with no ``prctl`` at
+    all is a different case and only logs, because this module is imported by tests on
+    runners that are not the image.
+    """
+    reason = clear()
+    if not reason:
+        log.info("supervisor is non-dumpable: its /proc entries are root-owned")
+        return
+    if sys.platform.startswith("linux"):
+        raise common.ConfigError(
+            f"could not make the supervisor non-dumpable: {reason}. This process holds "
+            "the model identity in its environment, and the model worker runs under the "
+            "same uid with no PID namespace, so without this its /proc entries are "
+            "readable by a worker that auto-approves every tool it calls on untrusted "
+            "prompt content. Refusing to start."
+        )
+    log.warning("not making this process non-dumpable (%s): %s", sys.platform, reason)
+
+
+def verify_sandbox(
+    settings: Settings, *, env: Mapping[str, str], probe=_user_namespaces_available
+) -> None:
+    """Refuse to start unless the model subprocess can run sandboxed, or the
+    deployment declares the internal-only trust boundary.
 
     kiro-cli runs the model subprocess inside a sandbox. On Linux that needs an
-    unprivileged user namespace; without one, ``wrap_argv`` fails CLOSED
-    (sections.py:636). This container ships SANDBOXED-ONLY: if the host has no
-    user namespace we refuse to start rather than run the model subprocess
-    without one.
+    unprivileged user namespace; without one, ``wrap_argv`` fails CLOSED. This
+    container is sandboxed-only by default, so a host that cannot provide one is
+    refused here, loudly, rather than left to fail every turn.
 
-    There is deliberately no opt-in to run unsandboxed. kiro-cli auto-approves
-    every tool (``--approval yolo``, nothing in the container clicks Approve),
-    and the backend's environment carries the model credential ``KIRO_API_KEY``,
-    which kiro-cli re-injects into the worker. An unsandboxed worker would then
-    run an auto-approved shell driven by untrusted customer prompt content with
-    that credential readable in its environment -- a prompt-injection-to-
-    credential-exfiltration path the ECS boundary does not close, because the
-    attacker is the prompt content, already inside the boundary. Offering that
-    safely needs the credential brokered out of the worker's environment, which
-    is not part of this change; until then the only posture this container
-    accepts is sandboxed. On a host without user namespaces (Fargate today) it
-    refuses to start, loudly, rather than boot into the exposed posture.
+    **Why taking the credential out of the worker's environment does not earn an
+    unsandboxed posture.** The worker auto-approves every tool it calls on untrusted
+    prompt content, so what matters is whether it can REACH a credential -- not whether
+    one is resident in its own environment. ``build_backend_env`` closes the
+    environment route, and this function asserts that below. The route it cannot close
+    is the vault: the backend answers the engine's token request from it, so the
+    backend's uid must be able to decrypt it, and the worker is a child of the backend
+    under that same uid. Measured -- a uid-1000 process reads and decrypts that vault
+    directly. So no clean environment can be traded for this refusal, and the
+    assertion below is a tripwire on that invariant rather than a posture.
 
-    **Only ``SANDBOX_AVAILABLE`` proceeds.** Undetermined refuses, and so does any
+    **What CAN lift it is a trust boundary, not a credential claim.** With
+    ``settings.internal_only`` the deployment states that this task runs the operator's
+    OWN crews and that the operator bears the risk of what those crews read. The
+    exposure is then ACCEPTED, and it is worth being exact about its size: it is NOT
+    only a prompt an outsider types. An internal crew consumes untrusted CONTENT as a
+    matter of course -- tool output, fetched web pages, connector and API payloads,
+    repository and ticket text -- any of which can carry an injection, and all of which
+    reach the worker whoever sent the prompt. So with this set, a worker injected
+    through any of those routes can read the vault. What the claim buys is not "no
+    injection can happen" but "the credential at risk and the account it belongs to are
+    the operator's own". That is why the switch names the boundary and not the
+    consequence -- an operator cannot set "allow unsandboxed" without saying whose crews
+    these are and therefore who bears it. Closing the route properly still needs a user
+    namespace, a worker under a different uid from the BACKEND (the gateway's own spawn
+    path), or a credential not worth stealing; a Firecracker-based runtime is the answer
+    for multi-tenant or external callers.
+
+    **Only ``SANDBOX_AVAILABLE`` proceeds unconditionally, and only ``SANDBOX_DENIED``
+    is lift-able.** Undetermined refuses whatever the boundary says, and so does any
     verdict this function does not recognise. Reading a probe that cannot reach an
     answer as permission to continue is the same defect as reading the environment
     through a denylist: it holds for the hosts someone already thought of and fails
-    open on the next one, and here failing open means an auto-approving worker
-    holding the model credential with no sandbox. The refusal repeats the verdict
-    verbatim so an operator learns what could not be determined rather than only
-    that something could not be.
+    open on the next one. A boundary can accept a KNOWN exposure and cannot accept an
+    unknown one. The refusal repeats the verdict verbatim so an operator learns what
+    could not be determined rather than only that something could not be.
     """
+    # The environment route, asserted rather than decided -- and checked before the
+    # probe, because it is broken whatever the host can provide. `build_backend_env`
+    # withholds both credential shapes, so a value here means that withholding was
+    # removed or defeated, which is a broken invariant and not a host posture. It is
+    # deliberately NOT a decision: the code that builds `env` is the code that empties
+    # it, so a posture taken from this reading could only ever confirm itself.
+    leaked = sorted(
+        name
+        for name in (backend_mod.ENV_KIRO_IDENTITY, backend_mod.ENV_KIRO_API_KEY)
+        if (env.get(name) or "").strip()
+    )
+    if leaked:
+        raise common.ConfigError(
+            f"the environment prepared for the backend carries {', '.join(leaked)}. "
+            "build_backend_env withholds the model credential in both of its shapes, "
+            "so a value here means that withholding was removed or defeated. The "
+            "backend spawns the model worker, which auto-approves every tool it calls "
+            "on untrusted prompt content. Refusing to start."
+        )
     verdict = probe()
     if verdict == SANDBOX_AVAILABLE:
         return
     if verdict == SANDBOX_DENIED:
+        # The internal-only branch. A DENIED verdict is a definite, informative answer
+        # about the host -- "no unprivileged user namespace here" -- and the internal-only
+        # boundary is the deployment stating that this consequence is accepted, so there
+        # IS something for it to accept. That is why the branch sits under DENIED and not
+        # under the undetermined verdict below, which carries no answer at all: a boundary
+        # can accept a known exposure and cannot accept an unknown one.
+        #
+        # Deliberately no second condition about the environment: the credential assertion
+        # above already refused on every verdict, so reaching here means the environment
+        # route is closed whatever this branch decides.
+        if settings.internal_only:
+            log.warning(
+                "no user-namespace sandbox on this host; starting UNSANDBOXED because "
+                "SMC_INTERNAL_ONLY is set. The model subprocess runs without a sandbox "
+                "and can reach the crew's vault under the backend's uid, so any "
+                "untrusted content it reads -- tool output, a fetched page, a connector "
+                "payload -- can inject a worker that reads the model credential. "
+                "Accepted because the deployment declares these are the operator's own "
+                "crews and the operator bears that risk."
+            )
+            return
         raise common.ConfigError(
             "No user-namespace sandbox is available on this host, so kiro-cli cannot "
             "spawn the model subprocess sandboxed. This container runs sandboxed-only "
-            "and does not offer an unsandboxed posture, so it refuses to start rather "
-            "than run the model subprocess -- which auto-approves every tool and holds "
-            "the model credential in its environment -- without a sandbox. Run where "
-            "unprivileged user namespaces are permitted."
+            "unless the deployment declares the internal-only trust boundary by setting "
+            "SMC_INTERNAL_ONLY=1. Accepting that boundary means: these are the "
+            "operator's OWN crews and the operator bears the risk of what they read. Be "
+            "clear about that risk before setting it -- it is NOT only about who sends "
+            "the prompt. The worker auto-approves every tool it calls; the backend "
+            "answers the engine's token request from the crew's vault so the backend's "
+            "uid must be able to decrypt it, and the worker runs as a child of the "
+            "backend under that same uid. So untrusted CONTENT the crew reads in the "
+            "ordinary course of its work -- tool output, a fetched web page, a connector "
+            "or API payload, text someone else wrote -- can inject that worker into "
+            "reading the model credential, whoever sent the prompt. Taking the "
+            "credential out of the worker's environment does not change that and is not "
+            "a substitute for the declaration. Do NOT set it where the credential at "
+            "risk is not the operator's own to lose: a user namespace is the real "
+            "containment, and a Firecracker-based runtime is the answer for multi-tenant "
+            "callers. Otherwise, run where unprivileged user namespaces are permitted."
         )
     raise common.ConfigError(
         f"Whether this host permits an unprivileged user-namespace sandbox could not be "
         f"determined: {verdict}. This container runs sandboxed-only, so an undetermined "
-        "answer refuses exactly as a denial does: continuing would run the model "
-        "subprocess -- which auto-approves every tool and holds the model credential in "
-        "its environment -- with no evidence that a sandbox is in place. Run this image "
-        "on Linux where unprivileged user namespaces are permitted, and fix what "
-        "stopped the probe rather than reading its silence as consent."
+        "answer refuses exactly as a denial does: continuing would run a model "
+        "subprocess that auto-approves every tool, with no evidence that a sandbox is "
+        "in place. SMC_INTERNAL_ONLY does not cover this case and is not the fix for it: "
+        "that setting accepts a KNOWN absence of isolation, and this verdict says the "
+        "probe reached no answer at all, so there is nothing for a boundary to accept. "
+        "Run this image on Linux where unprivileged user namespaces are permitted, and "
+        "fix what stopped the probe rather than reading its silence as consent."
     )
 
 
-def run(settings: Settings, *, wait_for_shutdown=_wait_for_shutdown) -> int:
+def run(settings: Settings, *, wait_for_shutdown=None) -> int:
     """Order, supervise and drain the task. Return a process exit code.
 
     ``wait_for_shutdown`` is injected so tests can drive the supervise phase
-    without signals or real processes.
+    without signals or real processes. It takes the watched children and returns a
+    reason; the task's lifetime is bound onto the default here, where the settings
+    are, so an injected stub keeps the one-argument shape and a test that is not
+    about the lifetime does not have to say anything about it.
     """
+    if wait_for_shutdown is None:
+        wait_for_shutdown = functools.partial(
+            _wait_for_shutdown, ttl_seconds=settings.task_ttl_seconds
+        )
     # 0. Fail loudly, before anything starts, if the environment cannot run a
-    #    turn: bad path layout, no model credential, an unspawnable sandbox, or a
-    #    bundle that is absent or names a different crew.
+    #    turn: bad path layout, no model identity, a sandbox absent where one is
+    #    required, or a bundle that is absent or names a different crew.
     verify_layout(settings)
+    # Before anything reads or writes an agent spec: give this task its OWN kiro home,
+    # so the crew's spec and Kiro Crew's default spec share one directory that the
+    # backend is allowed to write. Ahead of `build_backend_env` only for readability --
+    # that function takes the value from the settings, not from this export -- but it
+    # MUST precede `install_bundle`, which resolves its destination from the environment.
+    export_kiro_home(settings)
     env = backend_mod.build_backend_env(settings)
-    backend_mod.require_api_key(env)
-    verify_sandbox(settings)
+    # The identity is delivered in the SUPERVISOR's environment and moved into the
+    # vault here, which is where the backend's auth callback reads it.
+    #
+    # A seed that did not store anything is FATAL, not a return value to discard. The
+    # delivered identity is what makes this task this account, so "nothing was
+    # delivered" must not fall through to the vault check: that check reads
+    # `TokenStore.resolve`, which would accept a slot left behind by a prior task on
+    # this persistent volume and start the task authenticated as the previous account,
+    # silently. A blank or whitespace secret is exactly that case.
+    if not backend_mod.seed_model_identity(settings):
+        raise common.ConfigError(
+            f"no model identity was delivered: {backend_mod.ENV_KIRO_IDENTITY} is unset "
+            "or blank. The task injects one from Secrets Manager. Refusing to start "
+            "rather than continuing on whatever identity this data home already holds, "
+            "which would authenticate the task as another account without saying so."
+        )
+    backend_mod.require_model_identity(settings)
+    # Then satisfy kiro-cli's OWN login check, which is a separate question from
+    # whether this task has an identity.
+    #
+    # `kiro-cli acp` validates its own credential store before it offers an ACP
+    # handshake, so on a store it has never signed into it exits rc=1 "You are not
+    # logged in" and the `_kiro/auth/getAccessToken` request the vault answers is
+    # never reached: the container serves /health 200 and answers every dashboard
+    # turn with a 503. The row written here is a NON-SECRET sentinel, not a copy of
+    # the credential -- Crew is the auth owner and the engine asks the host for the
+    # token it uses, so what the store needs is the answer to "has this been signed
+    # into", which carries nothing worth reading.
+    #
+    # AFTER the vault check, because the order is what makes each refusal say the
+    # right thing: no identity is that check's verdict, and this one's is that
+    # kiro-cli would refuse to start. Both are startup refusals, because the thing
+    # they prevent is a container that starts and then 503s every turn.
+    #
+    # Handed `env`, NOT this process's own environment. The step runs kiro-cli to ask
+    # its login check a question, and this process still holds the delivered
+    # credential in its environment at this point -- the pop below has not run yet,
+    # and cannot run earlier because `build_backend_env` above is what reads it. An
+    # inherited copy would put the credential in a child that kiro-cli may outlive
+    # through a helper, readable by the later same-uid model worker. `env` is the
+    # dictionary `build_backend_env` already scrubbed of both credential shapes, and
+    # it carries the same HOME, so the store resolves to the same path either way.
+    kiro_login_mod.seed_kiro_cli_login(env=env)
+    # Now drop BOTH credential shapes from this process's own environment. The front is
+    # spawned with no env argument and so inherits this one whole, and
+    # `build_backend_env` only ever cleaned the COPY handed to the backend -- so without
+    # this a credential reaches a second long-lived process for no reason. The front's
+    # own exec resets the dumpable flag cleared below, so its `/proc` entry is readable
+    # by a same-uid worker whatever this process does about its own.
+    #
+    # `ENV_KIRO_API_KEY` is popped even though nothing is supposed to deliver it. The
+    # secrets path derives each destination variable from its secret's name with no
+    # allowlist refusing this one, so an operator CAN provision it, and the container's
+    # posture is not to rely on the absence of a delivery path. Both names, because
+    # covering one and leaving its sibling is how the same route stays open beside the
+    # fix.
+    for name in (backend_mod.ENV_KIRO_IDENTITY, backend_mod.ENV_KIRO_API_KEY):
+        os.environ.pop(name, None)
+    # And make THIS process unreadable through procfs before anything is spawned.
+    #
+    # Clearing the variable above does not remove it from `/proc/<pid>/environ`, which
+    # exposes the exec-time region rather than the live `environ` array -- measured, not
+    # assumed. The model worker runs as a child of the backend under this same uid with
+    # no PID namespace between them, and it auto-approves every tool it calls on
+    # untrusted prompt content, so it could read this process's environment directly.
+    # `PR_SET_DUMPABLE=0` makes the kernel reparent this process's `/proc` entries to
+    # root, so a same-uid reader gets EACCES. Before the spawn, because after it the
+    # window is already open.
+    make_non_dumpable()
+    verify_sandbox(settings, env=env)
     # Install the crew into the paths Kiro Crew reads BEFORE the backend starts,
     # so "it started" means "the named crew is installed" rather than a default
     # agent. Refuses closed on any mismatch (see bundle.install_bundle).
@@ -467,10 +863,15 @@ def run(settings: Settings, *, wait_for_shutdown=_wait_for_shutdown) -> int:
     # both told ECS a crash loop was a clean shutdown, so the console showed a task
     # exiting normally over and over with nothing marked failed.
     #
-    # `signal` is the ONLY success case. Anything else, including an empty reason,
-    # is reported as a failure: a reason this code cannot account for is not
-    # evidence that things went well.
-    if why == "signal":
+    # A spent lifetime joins "signal" as a success: the task ran for as long as it
+    # was allowed and then stood down, which is the bound working rather than
+    # anything going wrong. Reporting it as a failure would leave an operator
+    # reading every expiry as an incident.
+    #
+    # Anything outside `_ORDERLY_REASONS`, including an empty reason, is reported as
+    # a failure: a reason this code cannot account for is not evidence that things
+    # went well.
+    if why in _ORDERLY_REASONS:
         return 0
     log.error("exiting non-zero: %s", why or "shutdown reason unknown")
     return 1

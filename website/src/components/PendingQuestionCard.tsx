@@ -3,7 +3,7 @@ import QuestionCard from './QuestionCard'
 import ErrorNotice from './ErrorNotice'
 import { i18nT } from '../i18n/t'
 import { useAppDispatch, useAppSelector } from '../store'
-import { clearQuestionCard, pendingQuestionFor, resolveQuestionCard, retireStatelessQuestion, setQuestionDraft } from '../store/chatSlice'
+import { clearQuestionCard, pendingQuestionFor, resolveQuestionCard, setQuestionDraft } from '../store/chatSlice'
 import { api, ApiError } from '../api/client'
 
 interface PendingQuestionCardProps {
@@ -75,7 +75,27 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
      the reason above. */
   const lockKey = askId ?? pending.serverCardId ?? cardSlot
   const busy = busyFor === lockKey
-  const asText = (answers: Record<string, string>) => Object.values(answers).join('\n')
+  /* Q/A pairs, never bare answers. The map is keyed by QUESTION TEXT, and for a
+     stateless card (what the MCP `ask_question` tool posts -- see
+     `api.answerQuestion`) this string IS the message the agent reads, not just
+     what the transcript shows. `Object.values` dropped the keys, so a
+     multi-question card handed the agent N unlabelled lines and left it to pair
+     them back up by position -- and a question whose answer is itself a list
+     ("a, b, c") is indistinguishable from two answers. The key is the only
+     thing on either side that says which question an answer settled.
+
+     One question is the exception, and the common case: the agent asked a single
+     thing, so the answer alone already says what it settled, and wrapping it
+     would quote the whole question back at the user in their own chat bubble. */
+  const asText = (answers: Record<string, string>) => {
+    const pairs = Object.entries(answers)
+    if (pairs.length === 1) return pairs[0][1]
+    return pairs
+      .map(([question, answer]) =>
+        i18nT('components.pendingQuestionCard.qa_pair', { question, answer }),
+      )
+      .join('\n\n')
+  }
 
   /* Clearing by ask_id, never by slot: a slow response for ask A must not erase
      a newer ask B that already replaced it in the same slot, which would leave
@@ -133,25 +153,22 @@ export default function PendingQuestionCard({ slotKey, onFallbackSend, onDirectS
    *  later message happens to retire it. And clearing by slot afterwards is the
    *  mirror-image bug: a newer card can arrive while the request is in flight, and
    *  a slot-wide delete would take that card off screen while its own status stays
-   *  pending. Both halves are identity-guarded — `serverCardId` names the record
-   *  the server retires, `cardId` names the delivery this component is showing.
+   *  pending. Both halves are guarded by the same identity — `serverCardId`, the
+   *  server's name for the record it retires and for the card this component is
+   *  showing.
    *
-   *  A card with no server identity (an older payload, or a fixture) is cleared
-   *  locally without a request: there is no record this dismissal could name, and
-   *  a slot-only clear is exactly what the identity check exists to prevent. */
+   *  A card with no server identity (a fixture) is cleared locally without a
+   *  request: there is no record this dismissal could name, and a slot-only
+   *  clear is exactly what the identity check exists to prevent. */
   const dismissStateless = () => {
     if (busy) return
     const serverCardId = pending.serverCardId
-    const deliveryId = pending.cardId
     if (!serverCardId) {
       clearThisCard()
       return
     }
-    /** Retire THIS delivery, never whatever currently occupies the slot. */
-    const retireThisDelivery = () => {
-      if (deliveryId) dispatch(retireStatelessQuestion({ slot: cardSlot, expected: deliveryId }))
-      else clearThisCard()
-    }
+    /** Retire THIS card, never whatever currently occupies the slot. */
+    const retireThisDelivery = () => dispatch(clearQuestionCard({ slot: cardSlot, card_id: serverCardId }))
     setBusyFor(lockKey)
     setFailure(null)
     const failureId = lockKey

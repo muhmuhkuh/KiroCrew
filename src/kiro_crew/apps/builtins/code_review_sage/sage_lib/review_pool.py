@@ -38,9 +38,9 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 # The app root holds ``sage_lib/``; put it on sys.path so ``from sage_lib import store``
 # resolves on import (mirrors the sys.path setup in sibling ``review_driver.py``).
@@ -60,16 +60,39 @@ try:
         STOP_REASON_STALE_RECOVER,
         STOP_REASON_TOOL_STALL,
     )
+    from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR, refusal_for
 except ImportError:  # pragma: no cover - standalone / test fallback
     AcpClient = None  # type: ignore[assignment,misc]
     AcpRuntime = None  # type: ignore[assignment,misc]
-    ACP_BACKEND_PI = None  # type: ignore[assignment]  # harness-ok: standalone fallback
+    ACP_BACKEND_PI = ""  # harness-ok: standalone fallback
+    OUTCOME_REJECTED_TRANSPORT_FLOOR = "rejected_transport_floor"
+
+    def refusal_for(
+        event: Any,
+        *,
+        session_key: str = "",
+        agent: str = "",
+        app: str = "",
+        security_only: bool = True,
+    ) -> str | None:
+        return "Blocked: the tool security gate could not be consulted"
+
     EVENT_TEXT_CHUNK = "text_chunk"  # type: ignore[assignment]
     EVENT_TOOL_CALL = "tool_call"  # type: ignore[assignment]
     EVENT_PERMISSION_REQUEST = "permission_request"  # type: ignore[assignment]
     EVENT_COMPLETE = "complete"  # type: ignore[assignment]
     STOP_REASON_STALE_RECOVER = "stale_recover"  # type: ignore[assignment]
     STOP_REASON_TOOL_STALL = "error: tool stall"  # type: ignore[assignment]
+
+try:
+    from kiro_crew.workspace_cli_settings import workspace_cli_settings_lock
+except ImportError:  # pragma: no cover - standalone app fallback
+
+    @contextmanager
+    def workspace_cli_settings_lock(work_dir: Path, *, timeout: float = 0.0) -> Iterator[Path]:
+        raise OSError("shared workspace CLI settings lock is unavailable")
+        yield work_dir  # pragma: no cover - marks this function as a context manager
+
 
 try:  # agents dir resolver — honors KIRO_HOME so a pod reads its own specs
     from kiro_crew.config.paths import kiro_agents_dir
@@ -396,29 +419,38 @@ def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT
     hermetic. Merge-safe + idempotent; best-effort (logs and continues on error so a
     bad overlay write never breaks a review)."""
     try:
-        settings_dir = Path(work_dir) / ".kiro" / "settings"
-        settings_dir.mkdir(parents=True, exist_ok=True)
-        cli_json = settings_dir / "cli.json"
-        try:
-            existing = json.loads(cli_json.read_text(encoding="utf-8")) if cli_json.exists() else {}
-        except (json.JSONDecodeError, OSError):
-            existing = {}
-        if not isinstance(existing, dict):
-            existing = {}
-        defaults = existing.get("chat.modelDefaults")
-        if not isinstance(defaults, dict):
-            defaults = {}
-        model_cfg = defaults.get(model)
-        if not isinstance(model_cfg, dict):
-            model_cfg = {}
-        output_cfg = model_cfg.get("output_config")
-        if not isinstance(output_cfg, dict):
-            output_cfg = {}
-        output_cfg["effort"] = effort
-        model_cfg["output_config"] = output_cfg
-        defaults[model] = model_cfg
-        existing["chat.modelDefaults"] = defaults
-        cli_json.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        with workspace_cli_settings_lock(Path(work_dir)) as cli_json:
+            # Through `read_json_nolink`, not `read_text`: `cli.json` sits under
+            # the review worker's own `work_dir`, and the settings lock verifies
+            # the LOCK file, never this one. A plain read dereferences a link
+            # planted at this name, and the merged document is published straight
+            # back under it -- so the read is the leg that would copy a foreign
+            # document's bytes into a file the next worker loads as its settings.
+            # Missing, a plant, oversize and a non-object all arrive as None and
+            # mean "no overlay yet", which is what an empty file means here too.
+            existing = store.read_json_nolink(cli_json, cli_json.parent) or {}
+            defaults = existing.get("chat.modelDefaults")
+            if not isinstance(defaults, dict):
+                defaults = {}
+            model_cfg = defaults.get(model)
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+            output_cfg = model_cfg.get("output_config")
+            if not isinstance(output_cfg, dict):
+                output_cfg = {}
+            output_cfg["effort"] = effort
+            model_cfg["output_config"] = output_cfg
+            defaults[model] = model_cfg
+            existing["chat.modelDefaults"] = defaults
+            # Not `write_text`: that follows a link at the final name and
+            # TRUNCATES what it points at, and `work_dir` is the review worker's
+            # own cwd -- the one tree a prompt-injected worker can plant in. The
+            # shared helper refuses a linked PARENT and stages the write, then
+            # renames over the final name -- so a link sitting at that name is
+            # REPLACED by a real file rather than written through, and the file it
+            # pointed at keeps its bytes. A reader never sees a half-written
+            # overlay either, because the rename publishes it whole.
+            store.atomic_write_text(cli_json, json.dumps(existing, indent=2))
     except Exception:
         logger.debug("could not write review effort overlay (work_dir=%s)", work_dir, exc_info=True)
 
@@ -714,13 +746,37 @@ class ReviewPool:
                             # requires every permission decision to emit an SEL event, and
                             # the EVENT_TOOL_CALL audit carries no decision/request id.
                             req_id = getattr(ev, "request_id", "")
+                            reason = await asyncio.to_thread(
+                                refusal_for,
+                                ev,
+                                session_key=getattr(handle, "session_id", "") or "",
+                                agent=self._agent,
+                                app="code-review-sage",
+                                security_only=False,
+                            )
+                            if reason is not None:
+                                await self._audit_tool(
+                                    handle,
+                                    ev,
+                                    request_id=req_id,
+                                    outcome="rejected_hook_deny",
+                                )
+                                await handle.reject_tool(req_id)
+                                continue
                             try:
-                                await handle.approve_tool(req_id)
+                                approval_sent = await handle.approve_tool(req_id)
                             except Exception:
                                 logger.debug("tool approve failed", exc_info=True)
                             else:
                                 await self._audit_tool(
-                                    handle, ev, request_id=req_id, outcome="auto_approved"
+                                    handle,
+                                    ev,
+                                    request_id=req_id,
+                                    outcome=(
+                                        "auto_approved"
+                                        if approval_sent is not False
+                                        else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                                    ),
                                 )
                         elif kind == EVENT_COMPLETE:
                             stop_reason = getattr(ev, "stop_reason", "") or ""

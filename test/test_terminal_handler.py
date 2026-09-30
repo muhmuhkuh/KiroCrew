@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import sys
 import threading
@@ -3044,6 +3045,15 @@ def test_runner_sigint_normalization_preserves_other_signals(tmp_path, normalize
             "-q",
             "-c",
             "/dev/null",
+            # No conftest above the probe's own directory. ``-c /dev/null`` roots
+            # the inner session at ``/dev``, so pytest would otherwise still load
+            # every conftest.py between the probe and ``/`` -- and on a host whose
+            # temp dir is inside this checkout that is the repository conftest,
+            # which registers an xdist hook the autoload-disabled child cannot
+            # validate (INTERNALERROR, exit 3). ``--confcutdir`` is pytest's own
+            # bound on that walk.
+            "--confcutdir",
+            str(tmp_path),
             "-o",
             "cache_dir=" + str(tmp_path / "cache"),
             str(probe),
@@ -3199,6 +3209,61 @@ def _unwrapped(buf: bytes) -> bytes:
     return buf.replace(b"\r", b"").replace(b"\n", b"").replace(b" ", b"")
 
 
+async def _drain_ws_until(ws, predicate, *, budget_secs: float) -> bytes:
+    """Read PTY frames into an accumulator until ``predicate(buf)`` is true or
+    the overall ``budget_secs`` runs out. Returns the accumulated bytes (the
+    caller decides whether the predicate held)."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + budget_secs
+    buf = bytearray()
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return bytes(buf)
+        try:
+            msg = await ws.receive(timeout=remaining)
+        except asyncio.TimeoutError:
+            return bytes(buf)
+        if msg.type == web.WSMsgType.BINARY:
+            buf.extend(msg.data)
+            if predicate(bytes(buf)):
+                return bytes(buf)
+        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+            return bytes(buf)
+
+
+async def _drain_ws_while(ws, condition, *, budget_secs: float) -> bool:
+    """Keep consuming PTY frames until ``condition()`` holds or the budget runs out.
+
+    The condition is about the PTY's PROCESS state (who owns the foreground),
+    not its output, so it is re-read on every short receive slice rather than
+    only when a frame happens to arrive; the frames are still consumed so the
+    shell is never blocked writing into a full controller buffer. Returns
+    whether the condition held.
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + budget_secs
+    while not condition():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        try:
+            msg = await ws.receive(timeout=min(0.02, remaining))
+        except asyncio.TimeoutError:
+            continue
+        if msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+            return condition()
+    return True
+
+
+def _pty_foreground_pgid(sess) -> int | None:
+    """The process group the PTY delivers Ctrl+C to, or None once the controller is gone."""
+    try:
+        return os.tcgetpgrp(sess.master_fd)  # wokeignore:rule=master
+    except OSError:
+        return None
+
+
 async def _recv_matching(ws, predicate, what: str, *, frames: int = 40, timeout: float = 3):
     """Return the first frame satisfying *predicate*, skipping the ones it does not.
 
@@ -3264,6 +3329,186 @@ class TestTerminalWsIntegration:
     10s readiness budget ("shell never produced any PTY output"). Sharing one
     group serializes the heavy PTY tests, matching the gateway-test pattern.
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_terminal_shell(self, monkeypatch, tmp_path):
+        """Keep ordinary PTY tests out of the operator's login profiles.
+
+        A developer may auto-attach every interactive login to an existing tmux
+        session. Letting these transport tests start the configured ``bash -l``
+        would then write payloads such as the multibyte boundary probe into that
+        live pane. The shim keeps a Bash basename so the readiness-marker branch
+        is still exercised, but the real shell starts without system or user
+        profiles. Tests whose subject is login-profile behavior explicitly move
+        ``HOME`` to their own synthetic profile; those calls retain the shipped
+        login-shell path.
+        """
+        if not terminal.platform_compat.IS_POSIX:
+            yield None
+            return
+
+        # Resolve Bash from a fixed set of system directories rather than the
+        # developer's PATH: a PATH-planted wrapper named ``bash`` is exactly the
+        # kind of interposer this fixture exists to keep away from the test
+        # payload, so selecting the shell through the ambient PATH would reopen
+        # that door. The trusted list still covers the ordinary developer host
+        # (``/bin`` and ``/usr/bin`` on Linux, ``/opt/homebrew/bin`` and
+        # ``/usr/local/bin`` for a Homebrew Bash on macOS), so the readiness
+        # marker branch keeps exercising the same real Bash.
+        _TRUSTED_BASH_PATH = os.pathsep.join(
+            (
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/usr/sbin",
+                "/sbin",
+                # NixOS and Nix-managed hosts expose the system Bash here rather
+                # than under /bin or /usr/bin.
+                "/run/current-system/sw/bin",
+            )
+        )
+        real_bash = shutil.which("bash", path=_TRUSTED_BASH_PATH)
+        if real_bash is None:
+            # This is an AUTOUSE fixture on the whole PTY-integration class, so a
+            # no-op or a skip here would silently hand the sibling tests back to
+            # the shipped resolver, which spawns ``$SHELL -l`` under the ambient
+            # HOME (the test harness pins KIROCREW_HOME, not HOME) -- exactly the
+            # side-effect this fixture exists to prevent, with no assertion left
+            # to witness it. Fail loudly instead: a host with no Bash in any
+            # trusted location must extend the list above, not run these tests
+            # unisolated.
+            raise RuntimeError(
+                "no Bash found in a trusted system location "
+                f"({_TRUSTED_BASH_PATH!r}); extend the trusted list for this host "
+                "rather than running the PTY integration tests unisolated"
+            )
+
+        ambient_home = tmp_path / "ambient-home"
+        ambient_home.mkdir()
+        profile_sentinel = tmp_path / "ambient-profile-ran"
+        profile_marker = b"__KIROCREW_AMBIENT_PROFILE_RAN__"
+        # The profile ALSO installs a PROMPT_COMMAND hook: a developer whose
+        # login profile sets PROMPT_COMMAND (e.g. an auto tmux attach, a
+        # `history -a`) is the exact case that must not fire inside the transport
+        # tests. A `--noprofile --norc` shell never sources this file, so neither
+        # the profile body nor the PROMPT_COMMAND it would install ever runs.
+        prompt_command_sentinel = tmp_path / "ambient-prompt-command-ran"
+        prompt_command_marker = b"__KIROCREW_AMBIENT_PROMPT_COMMAND_RAN__"
+        (ambient_home / ".bash_profile").write_text(
+            "printf '__KIROCREW_AMBIENT_PROFILE_RAN__\\n'\n"
+            f": > {shlex.quote(str(profile_sentinel))}\n"
+            "export PROMPT_COMMAND="
+            + shlex.quote(
+                "printf '__KIROCREW_AMBIENT_PROMPT_COMMAND_RAN__\\n'; "
+                f": > {shlex.quote(str(prompt_command_sentinel))}"
+            )
+            + "\n"
+        )
+
+        shim_dir = tmp_path / "isolated-shell"
+        shim_dir.mkdir()
+        shim = shim_dir / "bash"
+        shim.write_text("#!/bin/sh\n" f"exec {shlex.quote(real_bash)} --noprofile --norc -i\n")
+        shim.chmod(0o755)
+
+        ambient_home_text = str(ambient_home)
+        original_resolve = terminal._resolve_shell
+        original_resolve_with_fences = terminal._resolve_shell_with_fence_shells
+        monkeypatch.setenv("HOME", ambient_home_text)
+        # The readiness helper deliberately preserves a PROMPT_COMMAND exported
+        # by a real gateway. Generic tests must not execute the developer's
+        # exported hook; the dedicated preservation test installs its own value
+        # after this fixture runs.
+        monkeypatch.delenv("PROMPT_COMMAND", raising=False)
+        # An operator may export an ABSOLUTE HISTFILE from their own dotfiles.
+        # Pinning HOME does not contain it: Bash reads HISTFILE straight from the
+        # environment, and the interactive teardown flushes history on SIGHUP, so
+        # a stale absolute value would write these tests' commands outside
+        # tmp_path. Point it inside the temp home to keep the run self-contained.
+        monkeypatch.setenv("HISTFILE", str(ambient_home / ".bash_history"))
+
+        def _profiles_are_under_test() -> bool:
+            return os.environ.get("HOME") != ambient_home_text
+
+        def _resolve(cfg):
+            if not terminal.platform_compat.IS_POSIX or _profiles_are_under_test():
+                return original_resolve(cfg)
+            return str(shim), None
+
+        def _resolve_with_fences(cfg):
+            if not terminal.platform_compat.IS_POSIX or _profiles_are_under_test():
+                return original_resolve_with_fences(cfg)
+            return str(shim), None, {}
+
+        monkeypatch.setattr(terminal, "_resolve_shell", _resolve)
+        monkeypatch.setattr(terminal, "_resolve_shell_with_fence_shells", _resolve_with_fences)
+        yield {
+            "marker": profile_marker,
+            "sentinel": profile_sentinel,
+            "prompt_command_marker": prompt_command_marker,
+            "prompt_command_sentinel": prompt_command_sentinel,
+            "shell": shim,
+        }
+
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS,
+        reason="POSIX login-profile isolation; Windows uses ConPTY",
+    )
+    @pytest.mark.asyncio
+    async def test_default_shell_does_not_source_ambient_profiles(
+        self,
+        monkeypatch,
+        tmp_path,
+        _isolated_terminal_shell,
+    ):
+        """The ordinary integration shell cannot execute an ambient profile."""
+        isolation = _isolated_terminal_shell
+        assert isolation is not None
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        output = bytearray()
+        ready_seen = False
+        try:
+            async with TestClient(TestServer(app)) as client:
+                async with client.ws_connect("/api/ws/terminal/profile-isolation") as ws:
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + 15
+                    while loop.time() < deadline:
+                        msg = await ws.receive(timeout=deadline - loop.time())
+                        if msg.type == web.WSMsgType.BINARY:
+                            output.extend(msg.data)
+                        elif msg.type == web.WSMsgType.TEXT:
+                            if json.loads(msg.data).get("type") == "ready":
+                                ready_seen = True
+                                break
+                        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                            break
+                    await ws.close()
+        finally:
+            spawned = registry.get("profile-isolation")
+            if spawned is not None:
+                await terminal._kill_session(spawned)
+
+        assert ready_seen, "isolated Bash never emitted its readiness marker"
+        assert registry["profile-isolation"].shell == str(isolation["shell"])
+        assert isolation["marker"] not in bytes(output)
+        assert not isolation["sentinel"].exists()
+        # A PROMPT_COMMAND set by the ambient login profile (e.g. a developer's
+        # auto tmux attach) must not fire either: --noprofile --norc never
+        # sources the profile that would export it.
+        assert isolation["prompt_command_marker"] not in bytes(
+            output
+        ), "the ambient profile's PROMPT_COMMAND ran inside the isolated shell"
+        assert not isolation["prompt_command_sentinel"].exists()
 
     @pytest.mark.asyncio
     async def test_ws_spawn_and_disconnect(self, monkeypatch, tmp_path):
@@ -3441,10 +3686,11 @@ class TestTerminalWsIntegration:
         shell that writes line by line hands the reader whole lines and every
         read then lands on a character boundary by accident — an earlier version
         of this test passed against the corrupting code for exactly that reason.
-        A single unbroken run of 3-byte characters longer than one 4096-byte read
-        cannot be split cleanly, since 4096 is not a multiple of 3."""
-        char = "中"
-        count = 3000  # 9000 bytes: at least two reads, neither aligned
+        The repeated token starts with a 4-byte ghost emoji and is 9 bytes in
+        total. A 4096-byte read retains one byte of the next token, so the read
+        boundary cuts through that emoji instead of landing between code points."""
+        token = "👻Kiro!"
+        count = 1000  # 9000 bytes: at least two reads, first splits the emoji
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
         monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
@@ -3458,7 +3704,7 @@ class TestTerminalWsIntegration:
         async with TestClient(TestServer(app)) as client:
             async with client.ws_connect("/api/ws/terminal/multibyte") as ws:
                 await ws.send_bytes(
-                    f"printf '{char}%.0s' $(seq 1 {count}); printf 'DO''NE\\n'\n".encode()
+                    f"printf '{token}%.0s' $(seq 1 {count}); printf 'DO''NE\\n'\n".encode()
                 )
                 seen = b""
                 for _ in range(400):
@@ -3472,7 +3718,7 @@ class TestTerminalWsIntegration:
             await terminal._kill_session(registry["multibyte"])
 
         assert "\ufffd".encode() not in seen, "a read boundary corrupted a character"
-        assert seen.count(char.encode()) >= count
+        assert seen.count(token.encode()) >= count
 
     @pytest.mark.asyncio
     async def test_submitted_line_invalidates_the_cwd_memo(self, monkeypatch, tmp_path):
@@ -3897,6 +4143,37 @@ class TestTerminalWsIntegration:
         output" helpers: deterministic on a fast host, falls back to a
         generous overall budget on a slow one.
         """
+        await self._drive_ctrl_c_through_the_pty(monkeypatch, tmp_path)
+
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS,
+        reason="POSIX SIGINT via PTY; on Windows Ctrl+C is handled inside ConPTY",
+    )
+    @pytest.mark.asyncio
+    async def test_ws_ctrl_c_reaches_the_child_when_the_gateway_ignores_sigint(
+        self, monkeypatch, tmp_path
+    ):
+        """A gateway that inherited ``SIGINT`` as ignored still ships a live Ctrl+C.
+
+        ``SIG_IGN`` survives ``exec``: a shell script that backgrounds the gateway
+        with ``&`` hands it SIGINT and SIGQUIT ignored, and an interactive shell
+        keeps a signal ignored on entry ignored in every command it runs, so
+        without a reset in the spawn path ``sleep`` here never dies and Ctrl+C is
+        dead in every terminal that gateway opens -- with bash's own disposition
+        looking normal. The post-exec shim restores the login defaults; this
+        pins it by running the whole Ctrl+C exchange from a process whose SIGINT
+        is ignored. Restored in ``finally`` so the disposition never leaks past
+        this test into the worker.
+        """
+        import signal
+
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            await self._drive_ctrl_c_through_the_pty(monkeypatch, tmp_path)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+
+    async def _drive_ctrl_c_through_the_pty(self, monkeypatch, tmp_path):
         cfg_file = tmp_path / "config.json"
         cfg_file.write_text(json.dumps({"dashboard": {"terminal": {"enabled": True}}}))
         monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
@@ -3907,154 +4184,158 @@ class TestTerminalWsIntegration:
 
         from aiohttp.test_utils import TestClient, TestServer
 
-        async def _drain_until(ws, predicate, *, budget_secs: float):
-            """Read PTY frames into an accumulator until ``predicate(buf)`` is
-            true or the overall ``budget_secs`` runs out.  Returns the
-            accumulated bytes (caller can decide whether the predicate held)."""
-            loop = asyncio.get_event_loop()
-            deadline = loop.time() + budget_secs
-            buf = bytearray()
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    return bytes(buf)
-                try:
-                    msg = await ws.receive(timeout=remaining)
-                except asyncio.TimeoutError:
-                    return bytes(buf)
-                if msg.type == web.WSMsgType.BINARY:
-                    buf.extend(msg.data)
-                    if predicate(bytes(buf)):
-                        return bytes(buf)
-                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
-                    return bytes(buf)
+        try:
+            async with TestClient(TestServer(app)) as client:
+                async with client.ws_connect("/api/ws/terminal/sigint-sess") as ws:
+                    await self._exchange_ctrl_c(ws, registry)
+        finally:
+            # On the failure path as well: a ``sleep`` that ignored SIGINT, the
+            # shell waiting on it and the reader task must not outlive the test.
+            sess = registry.get("sigint-sess")
+            if sess is not None:
+                await terminal._kill_session(sess)
 
-        async with TestClient(TestServer(app)) as client:
-            async with client.ws_connect("/api/ws/terminal/sigint-sess") as ws:
-                # The backend's Bash init stream emits readiness only after the
-                # login profile chain returns. Wait for that control frame
-                # before writing the first probe, exactly as Run in terminal
-                # does; prompt text and timing are deliberately irrelevant.
-                loop = asyncio.get_event_loop()
-                ready_deadline = loop.time() + 15
-                ready_seen = False
-                while loop.time() < ready_deadline:
-                    msg = await ws.receive(timeout=ready_deadline - loop.time())
-                    if msg.type == web.WSMsgType.TEXT:
-                        if json.loads(msg.data).get("type") == "ready":
-                            ready_seen = True
-                            break
-                    elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
-                        break
-                assert ready_seen, "shell never emitted the post-profile ready frame"
+    @staticmethod
+    async def _exchange_ctrl_c(ws, registry):
+        # The backend's Bash init stream emits readiness only after the
+        # login profile chain returns. Wait for that control frame
+        # before writing the first probe, exactly as Run in terminal
+        # does; prompt text and timing are deliberately irrelevant.
+        loop = asyncio.get_event_loop()
+        ready_deadline = loop.time() + 15
+        ready_seen = False
+        while loop.time() < ready_deadline:
+            msg = await ws.receive(timeout=ready_deadline - loop.time())
+            if msg.type == web.WSMsgType.TEXT:
+                if json.loads(msg.data).get("type") == "ready":
+                    ready_seen = True
+                    break
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                break
+        assert ready_seen, "shell never emitted the post-profile ready frame"
 
-                # Drive the PTY off INPUT ECHO, not an unsolicited prompt. A
-                # login shell on a minimal build host (no MOTD, empty PS1) may
-                # render no recognizable prompt. The probe confirms the shell
-                # is interactive and consuming stdin without depending on one.
-                await ws.send_bytes(b"echo __PTY_READY__\n")
-                ready = await _drain_until(
-                    ws,
-                    lambda b: b"__PTY_READY__" in _unwrapped(b),
-                    budget_secs=15,
-                )
-                assert b"__PTY_READY__" in _unwrapped(ready), (
-                    "shell never echoed the readiness probe — PTY input/echo "
-                    "path is not live"
-                )
+        # Drive the PTY off INPUT ECHO, not an unsolicited prompt. A
+        # login shell on a minimal build host (no MOTD, empty PS1) may
+        # render no recognizable prompt. The probe confirms the shell
+        # is interactive and consuming stdin without depending on one.
+        await ws.send_bytes(b"echo __PTY_READY__\n")
+        ready = await _drain_ws_until(
+            ws,
+            lambda b: b"__PTY_READY__" in _unwrapped(b),
+            budget_secs=15,
+        )
+        assert b"__PTY_READY__" in _unwrapped(ready), (
+            "shell never echoed the readiness probe — PTY input/echo " "path is not live"
+        )
 
-                # Run a long-lived sleep in the foreground; drain until we see
-                # the command echoed back (so we know the shell is processing
-                # it, not buffering it pre-prompt). The duration is chosen to be
-                # far larger than the SIGINT-verification budget below: a
-                # genuinely dropped SIGINT must leave `sleep` running for the
-                # whole budget, so it can never end on its own and let the shell
-                # run the queued marker echo (which would be a false pass). Here
-                # this drain WANTS the line-discipline echo — it only proves the
-                # shell received the input, so matching the echoed command text
-                # is correct.
-                await ws.send_bytes(b"sleep 120\n")
-                echoed = await _drain_until(
-                    ws,
-                    lambda b: b"sleep120" in _unwrapped(b),
-                    budget_secs=5,
-                )
-                assert b"sleep120" in _unwrapped(echoed), (
-                    "shell did not echo `sleep 120` within 5s — "
-                    f"input may not have reached an interactive shell: {echoed[-200:]!r}"
-                )
+        # Run a long-lived sleep in the foreground; drain until we see
+        # the command echoed back (so we know the shell is processing
+        # it, not buffering it pre-prompt). The duration is chosen to be
+        # far larger than the SIGINT-verification budget below: a
+        # genuinely dropped SIGINT must leave `sleep` running for the
+        # whole budget, so it can never end on its own and let the shell
+        # run the queued marker echo (which would be a false pass). Here
+        # this drain WANTS the line-discipline echo — it only proves the
+        # shell received the input, so matching the echoed command text
+        # is correct.
+        await ws.send_bytes(b"sleep 120\n")
+        echoed = await _drain_ws_until(
+            ws,
+            lambda b: b"sleep120" in _unwrapped(b),
+            budget_secs=5,
+        )
+        assert b"sleep120" in _unwrapped(echoed), (
+            "shell did not echo `sleep 120` within 5s — "
+            f"input may not have reached an interactive shell: {echoed[-200:]!r}"
+        )
 
-                # Deliver SIGINT and confirm the child actually received it.
-                # This step is inherently racy against shell scheduling on a
-                # loaded CI host, in two ways the old single-shot version did
-                # not survive:
-                #   * The ``sleep 120`` echo drained above is emitted by the PTY
-                #     line discipline the instant the bytes arrive — BEFORE the
-                #     shell has necessarily read the line and forked ``sleep``
-                #     into the foreground process group. A ``\x03`` that lands in
-                #     that window is delivered to the shell sitting at its prompt
-                #     (which simply discards the pending line) rather than to
-                #     ``sleep``, so the FIRST Ctrl+C can miss the child.
-                #   * Under this class's xdist integration group the forked shell
-                #     / reader thread can go unscheduled past a fixed budget, so
-                #     a single marker drain can time out even when delivery would
-                #     eventually succeed.
-                # Handle both by re-poking with Ctrl+C and re-probing the marker
-                # over a generous overall budget, rather than the old "\x03 once,
-                # wait for a prompt redraw, probe once" — a login shell on a
-                # minimal host may render no prompt at all (see the readiness-gate
-                # note above), which made the prompt drain a pure time sink and
-                # left the single probe to absorb the whole race.
-                #
-                # EXECUTION-only marker: the probe command is written so the PTY
-                # line-discipline echo of our own keystrokes never contains the
-                # search token. The typed bytes are ``echo SIG''INT_OK`` (an
-                # empty '' splits the literal), so the echoed input reads
-                # ``SIG''INT_OK`` — no ``SIGINT_OK`` substring — while only the
-                # shell's *execution* of the echo emits the concatenated
-                # ``SIGINT_OK`` on stdout. A match therefore proves the shell ran
-                # a command, i.e. SIGINT killed the foreground ``sleep`` and
-                # returned the shell to its prompt. Matching the bare echoed input
-                # (the previous version) let the test pass even when SIGINT was
-                # never delivered — a false pass that would hide a real
-                # terminal-signal regression.
-                sess = registry["sigint-sess"]
-                loop = asyncio.get_event_loop()
-                overall_deadline = loop.time() + 25
-                found = False
-                while True:
-                    remaining = overall_deadline - loop.time()
-                    if remaining <= 0:
-                        break
-                    # Ctrl+C (ETX): kills the foreground `sleep` if it is
-                    # running, or harmlessly aborts an empty prompt line if a
-                    # previous iteration already recovered the shell.
-                    await ws.send_bytes(b"\x03")
-                    await ws.send_bytes(b"echo SIG''INT_OK\n")
-                    # Clamp each drain to the remaining budget so the overall
-                    # wait cannot overshoot ``overall_deadline`` by a full drain.
-                    tail = await _drain_until(
-                        ws,
-                        lambda b: b"SIGINT_OK" in _unwrapped(b),
-                        budget_secs=min(5.0, remaining),
-                    )
-                    if b"SIGINT_OK" in _unwrapped(tail):
-                        found = True
-                        break
-                    # Signal may instead have torn down the whole session — that
-                    # is also a valid "SIGINT was delivered" outcome.
-                    if sess.proc.returncode is not None:
-                        break
+        # The echo above is emitted by the line discipline the instant the
+        # bytes arrive -- BEFORE the shell has read the line and put ``sleep``
+        # in the foreground. A ``\x03`` that lands in that window is a VINTR
+        # on a canonical-mode PTY: the kernel FLUSHES the unread ``sleep 120``
+        # line and signals the shell at its prompt, which redraws it and then
+        # runs the marker echo -- a pass with no ``sleep`` ever born, and so
+        # no evidence about whether the child would have received SIGINT. The
+        # sweep saw exactly that: the run that passed took 48 ms while the
+        # four that failed showed ``sleep`` alive with SIGINT ignored. So wait
+        # until the terminal's foreground process group differs from the
+        # shell's own before the first Ctrl+C: bash runs a job in its own
+        # group and hands it the terminal, so that transition IS ``sleep``
+        # being the thing Ctrl+C will reach.
+        sess = registry["sigint-sess"]
+        shell_pgid = sess.proc.pid
+        job_in_foreground = await _drain_ws_while(
+            ws,
+            lambda: _pty_foreground_pgid(sess) not in (shell_pgid, None),
+            budget_secs=10,
+        )
+        assert job_in_foreground, (
+            "the shell never handed the terminal to a foreground job: "
+            f"foreground pgid is still {_pty_foreground_pgid(sess)} "
+            f"(shell {shell_pgid})"
+        )
 
-                # Success: the shell executed a command after Ctrl+C (SIGINT
-                # killed sleep, shell continued) OR the process exited (signal
-                # was delivered, just tore the whole session down). A dropped
-                # SIGINT leaves `sleep 120` running for the whole 25s budget, so
-                # neither branch can become true — the test correctly fails.
-                assert found or sess.proc.returncode is not None, _sigint_failure_evidence(sess)
-                await ws.close()
+        # Deliver SIGINT and confirm the child actually received it.
+        # This step is racy against shell scheduling on a loaded CI host:
+        # under this class's xdist integration group the forked shell /
+        # reader thread can go unscheduled past a fixed budget, so a single
+        # marker drain can time out even when delivery would eventually
+        # succeed. Handle it by re-poking with Ctrl+C and re-probing the
+        # marker over a generous overall budget, rather than the old "\x03
+        # once, wait for a prompt redraw, probe once" — a login shell on a
+        # minimal host may render no prompt at all (see the readiness-gate
+        # note above), which made the prompt drain a pure time sink and
+        # left the single probe to absorb the whole race.
+        #
+        # EXECUTION-only marker: the probe command is written so the PTY
+        # line-discipline echo of our own keystrokes never contains the
+        # search token. The typed bytes are ``echo SIG''INT_OK`` (an
+        # empty '' splits the literal), so the echoed input reads
+        # ``SIG''INT_OK`` — no ``SIGINT_OK`` substring — while only the
+        # shell's *execution* of the echo emits the concatenated
+        # ``SIGINT_OK`` on stdout. A match therefore proves the shell ran
+        # a command, i.e. SIGINT killed the foreground ``sleep`` and
+        # returned the shell to its prompt. Matching the bare echoed input
+        # (the previous version) let the test pass even when SIGINT was
+        # never delivered — a false pass that would hide a real
+        # terminal-signal regression.
+        overall_deadline = loop.time() + 25
+        found = False
+        while True:
+            remaining = overall_deadline - loop.time()
+            if remaining <= 0:
+                break
+            # Ctrl+C (ETX): kills the foreground `sleep` if it is
+            # running, or harmlessly aborts an empty prompt line if a
+            # previous iteration already recovered the shell.
+            await ws.send_bytes(b"\x03")
+            await ws.send_bytes(b"echo SIG''INT_OK\n")
+            # Clamp each drain to the remaining budget so the overall
+            # wait cannot overshoot ``overall_deadline`` by a full drain.
+            tail = await _drain_ws_until(
+                ws,
+                lambda b: b"SIGINT_OK" in _unwrapped(b),
+                budget_secs=min(5.0, remaining),
+            )
+            if b"SIGINT_OK" in _unwrapped(tail):
+                found = True
+                break
+            # Signal may instead have torn down the whole session — that
+            # is also a valid "SIGINT was delivered" outcome.
+            if sess.proc.returncode is not None:
+                break
 
-            await terminal._kill_session(registry["sigint-sess"])
+        # Success: the shell executed a command after Ctrl+C (SIGINT
+        # killed sleep, shell continued) OR the process exited (signal
+        # was delivered, just tore the whole session down). A dropped
+        # SIGINT leaves `sleep 120` running for the whole 25s budget, so
+        # neither branch can become true — the test correctly fails.
+        assert found or sess.proc.returncode is not None, _sigint_failure_evidence(sess)
+        if found:
+            # The shell only runs the marker once its foreground job is gone,
+            # so the terminal is back in the shell's own group.
+            assert _pty_foreground_pgid(sess) == shell_pgid, _sigint_failure_evidence(sess)
+        await ws.close()
 
     @pytest.mark.skipif(
         terminal.platform_compat.IS_WINDOWS or not shutil.which("bash"),

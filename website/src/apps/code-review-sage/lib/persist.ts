@@ -104,8 +104,8 @@ export interface PersistedUiState {
   detailTab: string | null;
 }
 
-const MAIN_VIEWS: readonly string[] = ["reviews", "learning", "settings"];
-const LIST_TABS: readonly string[] = ["pulls", "reviews"];
+const MAIN_VIEWS: readonly string[] = ['reviews', 'learning', 'settings']
+const LIST_TABS: readonly string[] = ['pulls', 'reviews', 'queue']
 
 /** Coerce a persisted view back to one that still exists. A view removed since
  * the value was written must not survive a reload, or the main area renders

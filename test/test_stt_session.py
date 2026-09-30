@@ -16,7 +16,7 @@ import pytest
 from kiro_crew.stt import engine as engine_mod
 from kiro_crew.stt import models
 from kiro_crew.stt import session as session_mod
-from kiro_crew.stt import vad
+from kiro_crew.stt import telemetry, vad
 
 SR = vad.SAMPLE_RATE_HZ
 
@@ -65,6 +65,8 @@ class _FakeEngine:
         #: model prepared for it rather than one another session swapped in.
         self.loaded_key = engine_mod.LoadedKey("/stub/ggml-base.bin", "en", 4)
         self.expected: list[object] = []
+        #: The `kind` each decode was labelled with, in order.
+        self.kinds: list[str] = []
         #: Set to a `DecodeFailed` to make every decode fail. Assigned per test rather
         #: than fixed at construction because the interesting cases are transitions:
         #: a session that keeps working after a failed partial, and one that recovers.
@@ -76,9 +78,21 @@ class _FakeEngine:
             return engine_mod.Availability(True)
         return engine_mod.Availability(False, engine_mod.CODE_EXTRA_MISSING, "no recogniser")
 
-    async def decode(self, pcm, *, superseding: bool = False, expect=None, abort_if=None) -> str:
+    async def decode(
+        self,
+        pcm,
+        *,
+        superseding: bool = False,
+        expect=None,
+        abort_if=None,
+        kind: str = telemetry.KIND_FINAL,
+    ) -> str:
         self.decodes.append((len(pcm), superseding))
         self.expected.append(expect)
+        # Recorded so a test can assert WHICH path spent inference. The kind decides
+        # what the partial budget reads back and what a diagnostic attributes cost
+        # to, so a decode mislabelled as cosmetic would silently be budgeted.
+        self.kinds.append(kind)
         if self.fail_with is not None:
             raise self.fail_with
         return self._text
@@ -842,6 +856,74 @@ async def test_empty_batch_recognition_is_not_decoded_twice(fake):
     text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
     assert availability.ok and text == ""
     assert len(fake.decodes) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_batch_decode_refused_once_is_decoded_on_the_retry(fake):
+    """One concurrent swap is covered by the single re-prepare."""
+    real_decode = fake.decode
+    decodes = 0
+
+    async def _refuse_once(pcm, **kw):
+        nonlocal decodes
+        decodes += 1
+        if decodes == 1:
+            fake.loaded_key = engine_mod.LoadedKey("/stub/swapped.bin", "fr", 4)
+            return ""  # the key check refused
+        return await real_decode(pcm, **kw)
+
+    fake.decode = _refuse_once  # type: ignore[method-assign]
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert decodes == 2
+    assert availability.ok
+    assert text == "spoken words"
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_decodes_to_silence_is_success_not_a_failure(fake):
+    """A retry that decodes with the key unchanged and hears nothing is ``("", ok)``.
+
+    Only a SECOND key change marks the retry's ``""`` as a refusal; an empty
+    transcript under the expected key is the recogniser hearing nothing.
+    """
+    decodes = 0
+
+    async def _refuse_then_silence(pcm, **kw):
+        nonlocal decodes
+        decodes += 1
+        if decodes == 1:
+            fake.loaded_key = engine_mod.LoadedKey("/stub/swapped.bin", "fr", 4)
+        return ""
+
+    fake.decode = _refuse_then_silence  # type: ignore[method-assign]
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert decodes == 2
+    assert text == ""
+    assert availability.ok
+
+
+@pytest.mark.asyncio
+async def test_a_batch_decode_refused_on_the_retry_too_is_a_failure_not_silence(fake):
+    """Audible audio whose retry is also refused must not read as ``("", ok)``.
+
+    ``("", ok)`` is the success-with-nothing-heard answer, which the transcribe
+    endpoint turns into a 200 with an empty transcript, so the spoken recording
+    would be dropped without any failure being reported.
+    """
+    decodes = 0
+
+    async def _always_refuse(pcm, **kw):
+        nonlocal decodes
+        decodes += 1
+        fake.loaded_key = engine_mod.LoadedKey(f"/stub/swapped-{decodes}.bin", "fr", 4)
+        return ""
+
+    fake.decode = _always_refuse  # type: ignore[method-assign]
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert decodes == 2, f"expected exactly one retry, got {decodes} decodes"
+    assert text == ""
+    assert not availability.ok
+    assert availability.code == engine_mod.CODE_DECODE_FAILED
 
 
 @pytest.mark.asyncio

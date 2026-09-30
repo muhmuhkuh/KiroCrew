@@ -182,7 +182,14 @@ _AMBIENT_CREDENTIAL_ENV_KEYS = frozenset(
 
 
 def path_parents(path: Path) -> list[Path]:
-    """Return every parent through the filesystem root."""
+    """Return every parent through the filesystem root, LEXICALLY.
+
+    Names each ancestor spelling and never a symlink hop, so it serves the
+    Windows ACL chain in :func:`validate_provider_executable` only; the POSIX
+    provenance walk there enumerates with
+    :func:`kiro_crew.platform_compat.traversed_components`, which visits every
+    directory the walk actually reads.
+    """
     parents: list[Path] = []
     current = path.parent
     while True:
@@ -434,11 +441,30 @@ def validate_provider_executable(candidate: str, *, require_protected: bool = Fa
                 raise ValueError(f"executable is inside the agent-writable tree {root}")
 
     _check(resolved, label="executable")
-    # A symlink's own directory chain is part of the provenance too (relaxed
-    # mode allows symlinks, so /opt/homebrew/bin gets checked as well).
-    parents = list(path_parents(resolved))
-    if not strict and not same_path:
-        parents += [p for p in path_parents(original) if p not in parents]
+    if windows:
+        # The ACL walk asks its question of lexical spellings, and the
+        # component-by-component walker below is POSIX-shaped (``os.sep``-rooted),
+        # so Windows keeps the two chains: the resolved path's parents plus, in
+        # relaxed mode, the original spelling's.
+        parents = list(path_parents(resolved))
+        if not strict and not same_path:
+            parents += [p for p in path_parents(original) if p not in parents]
+    else:
+        # Every directory the walk to the target actually reads: the original
+        # spelling's side, each symlink hop's side and the target's side. Two
+        # lexical chains over the endpoints never name a hop in the middle
+        # (``gh -> /tmp/link -> /usr/bin/gh`` visits ``/usr/bin`` and the entry's
+        # own directory, never ``/tmp``), which is why the enumeration is the
+        # walker's and not ``Path.parents``. The set is a superset of both chains:
+        # every lexical ancestor of ``resolved`` is walked, and a symlinked
+        # directory component's lexical spelling stats the same inode as the
+        # target-side directory the walk records in its place.
+        components = platform_compat.traversed_components(original)
+        if components is None:
+            raise ValueError("executable hierarchy is not accessible")
+        if components[-1] != resolved:
+            raise ValueError("executable path did not resolve consistently")
+        parents = components[:-1]
     for parent in parents:
         try:
             if not stat.S_ISDIR(parent.stat().st_mode):
@@ -831,7 +857,22 @@ def run_gh(
     return decoded
 
 
-_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+#: GitHub's own maximum widths for the two path segments a repository URL carries,
+#: used as the length bound on each: an account login -- user or organization -- is
+#: 1-39 characters, and a repository name is at most 100. A charset with no
+#: quantifier is satisfied by a segment of ANY width, so bounding only the charset
+#: leaves the size half of the guard below unenforced on values that reach a
+#: subprocess argv. These are the public shape of a GitHub owner/repository
+#: segment for this package: the monitoring adapters bind the same two patterns
+#: rather than each redeclaring one, which is how three copies drift apart.
+GITHUB_MAX_OWNER_CHARS = 39
+GITHUB_MAX_REPO_CHARS = 100
+#: ``\Z`` and not ``$``, so the quantifier above is a bound on the segment's width:
+#: ``$`` also matches immediately before a final newline, which admits one
+#: character past the maximum and makes the two anchors disagree with each other
+#: depending on whether a caller uses ``match`` or ``fullmatch``.
+GITHUB_OWNER_SEGMENT_RE = re.compile(rf"^[A-Za-z0-9._-]{{1,{GITHUB_MAX_OWNER_CHARS}}}\Z")
+GITHUB_REPO_SEGMENT_RE = re.compile(rf"^[A-Za-z0-9._-]{{1,{GITHUB_MAX_REPO_CHARS}}}\Z")
 
 
 def parse_github_repo_url(link: str) -> tuple[str, str]:
@@ -839,8 +880,9 @@ def parse_github_repo_url(link: str) -> tuple[str, str]:
 
     Deliberately strict (full URL only, per product decision — no bare
     ``owner/repo`` shorthand): rejects non-github.com hosts (SSRF guard) and
-    constrains owner/repo to a safe charset before either value is ever
-    interpolated into a subprocess argv.
+    constrains owner/repo to a safe charset AND to GitHub's own maximum width
+    for each (:data:`GITHUB_MAX_OWNER_CHARS`, :data:`GITHUB_MAX_REPO_CHARS`)
+    before either value is ever interpolated into a subprocess argv.
     """
     if not link or not isinstance(link, str):
         raise RepoUrlError("repo link is empty")
@@ -857,7 +899,8 @@ def parse_github_repo_url(link: str) -> tuple[str, str]:
     if (
         owner in (".", "..")
         or repo in (".", "..")
-        or not (_SEGMENT_RE.match(owner) and _SEGMENT_RE.match(repo))
+        or not GITHUB_OWNER_SEGMENT_RE.match(owner)
+        or not GITHUB_REPO_SEGMENT_RE.match(repo)
     ):
         raise RepoUrlError(f"invalid owner/repo segment in {link!r}")
     return owner, repo

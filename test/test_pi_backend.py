@@ -116,6 +116,7 @@ def test_pi_permission_is_correlated_to_original_tool_call(tmp_path):
 
     event = client._build_permission_event(permission)
 
+    assert event is not None
     assert event.tool_call_id == tool_id
     assert event.tool_input == '{\n  "command": "echo safe"\n}'
     assert event.is_shell
@@ -563,7 +564,8 @@ def test_prepare_pi_environment_wires_prompt_mcp_and_launcher(tmp_path):
     assert env["KIROCREW_PI_MCP_ADAPTER"] == str(adapter)
 
 
-def test_pi_rpc_proxy_keeps_trusted_extensions(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sealed_gate", [False, True])
+def test_pi_rpc_proxy_keeps_trusted_extensions(tmp_path, monkeypatch, sealed_gate):
     from kiro_crew import pi_support
 
     prompt = tmp_path / "prompt.md"
@@ -594,7 +596,16 @@ def test_pi_rpc_proxy_keeps_trusted_extensions(tmp_path, monkeypatch):
     monkeypatch.setattr(pi_support, "_run_pi_rpc_proxy", fake_proxy)
     modes = (tmp_path / "ponytail.js", tmp_path / "caveman.ts", tmp_path / "skills")
     monkeypatch.setattr(pi_support, "resolve_pi_mode_resources", lambda: modes)
-    monkeypatch.setattr(pi_support.sys, "argv", ["kirocrew-pi", "--mode", "rpc"])
+    gate = pi_support.Path(pi_support.__file__).parent / "config" / "pi-tool-gate.ts"
+    argv = ["kirocrew-pi", "--mode", "rpc"]
+    if sealed_gate:
+        gate = tmp_path / "sealed-gate.ts"
+        gate.write_text("export default () => {}")
+        monkeypatch.setenv("KIROCREW_PI_GATE_EXTENSION", str(gate))
+        argv.extend(["--extension", str(gate)])
+    else:
+        monkeypatch.delenv("KIROCREW_PI_GATE_EXTENSION", raising=False)
+    monkeypatch.setattr(pi_support.sys, "argv", argv)
 
     with pytest.raises(SystemExit) as raised:
         pi_support.main()
@@ -603,16 +614,18 @@ def test_pi_rpc_proxy_keeps_trusted_extensions(tmp_path, monkeypatch):
     args = captured["args"]
     assert isinstance(args, list)
     assert "--no-extensions" in args
-    assert args[args.index("--extension") + 1].endswith("config/pi-tool-gate.ts")
+    assert args.count(str(gate)) == 1
     assert str(adapter) in args
     assert str(mcp_config) in args
     assert str(prompt) in args
-    assert [args[i + 1] for i, value in enumerate(args) if value == "--extension"] == [
-        str(pi_support.Path(pi_support.__file__).parent / "config" / "pi-tool-gate.ts"),
-        str(adapter),
-        str(modes[0]),
-        str(modes[1]),
-    ]
+    expected_extensions = [str(adapter), str(modes[0]), str(modes[1])]
+    if sealed_gate:
+        expected_extensions.append(str(gate))
+    else:
+        expected_extensions.insert(0, str(gate))
+    assert [
+        args[i + 1] for i, value in enumerate(args) if value == "--extension"
+    ] == expected_extensions
     assert args[args.index("--skill") + 1] == str(modes[2])
     assert "--no-skills" in args
 

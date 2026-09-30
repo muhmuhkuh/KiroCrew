@@ -27,10 +27,16 @@ Schedule page → fill in the form:
 ```bash
 kirocrew cron add "pipeline-check" "check pipeline health" --every 1800
 kirocrew cron add "weekday-9am" "check tickets" --cron "0 9 * * MON-FRI" --approval-mode auto
+kirocrew cron add "reminder" "call the vet" --at "tomorrow 9am"          # one-shot, deletes itself after firing
+kirocrew cron add "version-check" "" --every 3600 \
+  --script ~/.kiro/crew/crons/check.py:run --no-persistent-session --minimal-context   # zero-token script job
+kirocrew cron add "disk" "" --every 600 --command "df -h /" --timeout 30 --timeout-secs 60  # zero-token command job
 kirocrew cron update <job-id> --name "new name" --message "new prompt" --approval-mode auto
 kirocrew cron list
 kirocrew cron remove <id>
 ```
+
+A `--script` file must already live under `~/.kiro/crew/crons/`; the CLI registers it, it does not copy it. `--script`/`--command` and `--agent` are mutually exclusive, as are `--every`/`--cron`/`--at`. Every refusal prints on stderr and exits non-zero with nothing written (2 for a flag-combination error, 1 for a validation, security or store refusal), so an installer can register a job headlessly.
 
 ### Via Slack
 
@@ -46,10 +52,12 @@ cron resume <id>
 | Type | Syntax | Example |
 |------|--------|---------|
 | Interval | MCP `every=<seconds>` or CLI `--every <seconds>` | `every=300` (5 min, minimum 60s) |
-| One-shot | MCP or `POST /api/crons` `at=<Unix timestamp>`, `delay=<seconds>`, or `at_time=<human time>` | `at_time="tomorrow 9am"` |
+| One-shot | MCP or `POST /api/crons` `at=<Unix timestamp>`, `delay=<seconds>`, or `at_time=<human time>`; CLI `--at <timestamp or time string>` | `at_time="tomorrow 9am"` |
 | Cron expression | MCP `cron_expr=<5-field expression>` or CLI `--cron <expression>` | `cron_expr="0 9 * * 1-5"` (weekdays 9am) |
 
 `cron_expr` uses five fields: `min hour dom month dow`; the MCP schema documents numeric day-of-week values `0=Sun` through `6=Sat`.
+
+A job's `timezone` (CLI `--timezone`) is the zone its wall clock is read in: a `cron_expr`'s hour and minute fields, and a clock time given as `at_time` / `--at` such as `"9am"` or `"tomorrow 17:30"`. Without one, both are read in the global config timezone, falling back to UTC. `cron_add(at_time="9am", timezone="America/Los_Angeles")` therefore fires at 9am in Los Angeles even on a gateway whose config timezone is UTC. A clock time the zone skips (such as the hour lost when daylight saving time starts) is refused rather than moved. A relative `at_time` (`"in 2 hours"`), a Unix `at` and a `delay` name an instant already, so the timezone only changes how the job is displayed.
 
 ## How It Works
 

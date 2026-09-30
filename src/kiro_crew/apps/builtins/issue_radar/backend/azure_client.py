@@ -501,6 +501,16 @@ def _az_run(argv: list[str], *, host: str, timeout: float) -> subprocess.Complet
             [az, *argv[1:]],
             capture_output=True,
             text=True,
+            # `az devops invoke` answers with work-item JSON -- titles, descriptions
+            # and comments written by people -- so non-ASCII is the normal case, not
+            # an edge one. `text=True` alone decodes it with
+            # `locale.getpreferredencoding(False)`, which on a Windows console code
+            # page is cp950 / cp932 / cp1252. A `UnicodeDecodeError` is neither
+            # `FileNotFoundError` nor `TimeoutExpired`, so it would escape both
+            # handlers below and this chokepoint's own error contract with it; a
+            # lenient code page is quieter and worse, mojibaking every title that
+            # reaches the board. az writes UTF-8, so name it.
+            encoding="utf-8",
             timeout=timeout,
             check=False,
             env=_az_env(resolved_host),
@@ -2408,6 +2418,34 @@ _norm_evaluation = _normalization._norm_evaluation
 _norm_build = _normalization._norm_build
 
 
+# A repository's GUID, cached per organization/project/name for the same reason
+# the project's is: it is immutable for the life of the repository.
+_repo_id_cache: dict[tuple[str, str, str], str] = {}
+
+
+def _repo_id(org: str, project: str, repo: str, *, host: str, timeout: float) -> str:
+    """The repository's GUID, which the TfsGit build filter is addressed by."""
+    cached = _repo_id_cache.get((org, project, repo))
+    if cached:
+        return cached
+    data = _obj(
+        _az_invoke(
+            org=org,
+            area="git",
+            resource="repositories",
+            host=host,
+            timeout=timeout,
+            route={"project": project, "repositoryId": repo},
+            api_version=_API_GIT,
+        )
+    )
+    value = str(data.get("id") or "").strip()
+    if not _GUID_RE.match(value):
+        raise ProviderCliError(f"could not resolve the repository id for {org}/{project}/{repo}")
+    _repo_id_cache[(org, project, repo)] = value
+    return value
+
+
 def _builds_for_sha(
     org: str, project: str, repo: str, sha: str, *, host: str, timeout: float
 ) -> list[dict]:
@@ -2428,7 +2466,7 @@ def _builds_for_sha(
             timeout=timeout,
             route={"project": project},
             query={
-                "repositoryId": f"{project}/{repo}",
+                "repositoryId": _repo_id(org, project, repo, host=host, timeout=timeout),
                 "repositoryType": "TfsGit",
                 "$top": _BUILD_SCAN_TOP,
                 "queryOrder": "queueTimeDescending",

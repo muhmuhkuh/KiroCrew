@@ -19,6 +19,7 @@ def _make_cfg(
     import_onboarded: bool = False,
     language: str = "",
     privacy_acked: bool = False,
+    crewmates_onboarded: bool = False,
 ):
     """Build a mock KiroCrewConfig with dashboard display fields.
 
@@ -34,7 +35,20 @@ def _make_cfg(
     cfg.dashboard.import_onboarded = import_onboarded
     cfg.dashboard.language = language
     cfg.dashboard.privacy_acked = privacy_acked
+    cfg.dashboard.crewmates_onboarded = crewmates_onboarded
     return cfg
+
+
+def _owner_request() -> MagicMock:
+    request = MagicMock(spec=web.Request)
+    state = MagicMock()
+    state.owner_id = ""
+    request.app = {"state": state}
+    claims = {"user": "local-app", "app": ""}
+    request.get = lambda key, default=None: claims.get(key, default)
+    request.__contains__.side_effect = lambda key: key in claims
+    request.__getitem__.side_effect = lambda key: claims[key]
+    return request
 
 
 @pytest.mark.asyncio
@@ -54,6 +68,7 @@ async def test_theme_boot_returns_defaults() -> None:
         "onboarded": False,
         "import_onboarded": False,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
 
 
@@ -78,6 +93,7 @@ async def test_theme_boot_returns_configured_values() -> None:
         "onboarded": True,
         "import_onboarded": True,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
 
 
@@ -103,6 +119,7 @@ async def test_theme_config_get() -> None:
         "onboarded": True,
         "import_onboarded": True,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
 
 
@@ -112,7 +129,7 @@ async def test_theme_config_put_updates_and_saves() -> None:
     cfg = _make_cfg(theme_mode="", theme_color="", onboarded=False, import_onboarded=False)
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(
             return_value={
@@ -132,6 +149,7 @@ async def test_theme_config_put_updates_and_saves() -> None:
         "onboarded": True,
         "import_onboarded": True,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
     cfg.save.assert_called_once()
 
@@ -142,7 +160,7 @@ async def test_theme_config_put_validates_mode() -> None:
     cfg = _make_cfg()
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"mode": "invalid"})
         with pytest.raises(web.HTTPBadRequest):
@@ -155,7 +173,7 @@ async def test_theme_config_put_validates_import_onboarded_boolean() -> None:
     cfg = _make_cfg()
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"import_onboarded": "false"})
         with pytest.raises(web.HTTPBadRequest):
@@ -173,7 +191,7 @@ async def test_theme_config_put_persists_privacy_acked() -> None:
     cfg = _make_cfg()
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"privacy_acked": True})
         resp = await core_mod.api_theme_config(req)
@@ -188,11 +206,45 @@ async def test_theme_config_put_validates_privacy_acked_boolean() -> None:
     cfg = _make_cfg()
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"privacy_acked": "true"})
         with pytest.raises(web.HTTPBadRequest):
             await core_mod.api_theme_config(req)
+
+
+@pytest.mark.asyncio
+async def test_theme_config_put_persists_crewmates_onboarded() -> None:
+    """The route must persist the Meet CrewMates first-run flag.
+
+    The flow is gated server-side so a second machine does not replay it; the
+    browser's localStorage mirror is only a render cache the gateway cannot see.
+    """
+    cfg = _make_cfg()
+    with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
+        mock_cls.load.return_value = cfg
+        req = _owner_request()
+        req.method = "PUT"
+        req.json = AsyncMock(return_value={"crewmates_onboarded": True})
+        resp = await core_mod.api_theme_config(req)
+    assert resp.status == 200
+    assert cfg.dashboard.crewmates_onboarded is True
+    assert json.loads(resp.body)["crewmates_onboarded"] is True
+    cfg.save.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_theme_config_put_validates_crewmates_onboarded_boolean() -> None:
+    """A truthy string must not silently mark the Meet CrewMates flow as done."""
+    cfg = _make_cfg()
+    with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
+        mock_cls.load.return_value = cfg
+        req = _owner_request()
+        req.method = "PUT"
+        req.json = AsyncMock(return_value={"crewmates_onboarded": "true"})
+        with pytest.raises(web.HTTPBadRequest):
+            await core_mod.api_theme_config(req)
+    cfg.save.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -206,7 +258,7 @@ async def test_theme_config_put_no_change_no_save() -> None:
     )
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(
             return_value={
@@ -224,7 +276,7 @@ async def test_theme_config_put_no_change_no_save() -> None:
 @pytest.mark.asyncio
 async def test_theme_config_put_rejects_non_object_body() -> None:
     """PUT /api/config/theme rejects arrays instead of raising during key access."""
-    req = MagicMock(spec=web.Request)
+    req = _owner_request()
     req.method = "PUT"
     req.json = AsyncMock(return_value=["import_onboarded"])
 
@@ -242,6 +294,7 @@ async def test_theme_config_put_serializes_full_load_modify_save_transaction() -
         "onboarded": False,
         "import_onboarded": False,
         "privacy_acked": False,
+        "crewmates_onboarded": False,
     }
     json_waiters = 0
     both_parsed = asyncio.Event()
@@ -255,6 +308,7 @@ async def test_theme_config_put_serializes_full_load_modify_save_transaction() -
             self.dashboard.onboarded = persisted["onboarded"]
             self.dashboard.import_onboarded = persisted["import_onboarded"]
             self.dashboard.privacy_acked = persisted["privacy_acked"]
+            self.dashboard.crewmates_onboarded = persisted["crewmates_onboarded"]
 
         def save(self) -> None:
             persisted.update(
@@ -265,6 +319,7 @@ async def test_theme_config_put_serializes_full_load_modify_save_transaction() -
                     "onboarded": self.dashboard.onboarded,
                     "import_onboarded": self.dashboard.import_onboarded,
                     "privacy_acked": self.dashboard.privacy_acked,
+                    "crewmates_onboarded": self.dashboard.crewmates_onboarded,
                 }
             )
 
@@ -276,10 +331,10 @@ async def test_theme_config_put_serializes_full_load_modify_save_transaction() -
         await both_parsed.wait()
         return value
 
-    first = MagicMock(spec=web.Request)
+    first = _owner_request()
     first.method = "PUT"
     first.json = lambda: body({"mode": "dark"})
-    second = MagicMock(spec=web.Request)
+    second = _owner_request()
     second.method = "PUT"
     second.json = lambda: body({"import_onboarded": True})
 
@@ -327,7 +382,7 @@ async def test_theme_config_put_accepts_valid_language_tags(tag: str) -> None:
     cfg = _make_cfg()
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"language": tag})
         resp = await core_mod.api_theme_config(req)
@@ -342,7 +397,7 @@ async def test_theme_config_put_clears_language_to_auto() -> None:
     cfg = _make_cfg(language="zh-CN")
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"language": ""})
         resp = await core_mod.api_theme_config(req)
@@ -370,7 +425,7 @@ async def test_theme_config_put_rejects_malformed_language(bad: str) -> None:
     cfg = _make_cfg()
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"language": bad})
         with pytest.raises(web.HTTPBadRequest):
@@ -384,7 +439,7 @@ async def test_theme_config_put_rejects_non_string_language() -> None:
     cfg = _make_cfg()
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"language": ["zh-CN"]})
         with pytest.raises(web.HTTPBadRequest):
@@ -402,7 +457,7 @@ async def test_theme_config_put_omitting_language_leaves_it_untouched() -> None:
     cfg = _make_cfg(language="zh-CN")
     with patch.object(core_mod, "KiroCrewConfig") as mock_cls:
         mock_cls.load.return_value = cfg
-        req = MagicMock(spec=web.Request)
+        req = _owner_request()
         req.method = "PUT"
         req.json = AsyncMock(return_value={"color": "monokai"})
         resp = await core_mod.api_theme_config(req)

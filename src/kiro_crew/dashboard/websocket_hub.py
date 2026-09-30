@@ -11,6 +11,14 @@ from typing import Any, Protocol
 
 from aiohttp import web
 
+#: Capability a dashboard tab declares in the ``caps`` query parameter of
+#: ``/api/ws`` when its bundle applies ``slot_patch`` frames.
+SLOT_PATCH_CAPABILITY = "slot_patch"
+
+#: Socket attribute recording that declaration. Only a dashboard-user socket
+#: carries it; every other socket keeps receiving the full ``slots`` list.
+SLOT_PATCH_WS_FLAG = "_slot_patch"
+
 
 class WebSocketHubOwner(Protocol):
     """The mutable facade-owned state the hub operates on.
@@ -137,7 +145,52 @@ class WebSocketHub:
         data: object,
     ) -> bool:
         """Apply the deny-by-default event-scope gate for one client."""
+        # Checked BEFORE the dashboard-user short-circuit, and gated on a plain
+        # dict lookup because this predicate runs for every frame on every socket:
+        # the mark is absent for all but a socket still awaiting its
+        # members_subscribed baseline, so the common path costs one `get`.
+        #
+        # A projection delivered before that baseline is worse than a projection
+        # delayed: the baseline's lastSeqs is computed before the append, so the
+        # client's prune rule reads the newer row as stale and deletes it, and
+        # nothing corrects it until that slug next changes. Hold it back here and
+        # record the slug; send_members_subscribed replays the current value once
+        # the baseline is out.
+        pending = ws.get("_members_baseline_pending")
+        if pending is not None:
+            from kiro_crew.eventlog import types as eventlog_types
+
+            if msg_type == eventlog_types.WS_MEMBER_PROJECTION:
+                slug = data.get("slug") if isinstance(data, dict) else None
+                if isinstance(slug, str) and slug:
+                    pending.add(slug)
+                return False
         if ws.get("_is_dashboard_user", False):
+            # Granted, and the grant is a permission decision like any other:
+            # ``AUTOSDE.yaml`` wants an SEL record for it, not only for the
+            # refusals below. Recorded HERE, at the chokepoint every dashboard
+            # frame passes (live broadcast via ``_send_ws_all``, the log
+            # fan-out's per-send recheck, and the subagent reconnect replay in
+            # ``ws.py`` all funnel through this predicate), rather than at each
+            # sender, so a send path added later is covered by construction --
+            # the same reasoning ``ws_event_allowed`` gives for app tokens.
+            # Under a reserved auditee rather than the empty app claim, so the
+            # operator can tell their own socket's grants from an unnamed
+            # app's. Never raises: a failing audit sink must not withhold a
+            # frame the owner is entitled to.
+            try:
+                from kiro_crew.dashboard.ws_event_scope import (
+                    DASHBOARD_USER_AUDITEE,
+                    _audit_allow,
+                )
+
+                _audit_allow(DASHBOARD_USER_AUDITEE, msg_type)
+            except Exception:
+                self._log.debug(
+                    "state: SEL audit for dashboard-user grant %s failed",
+                    msg_type,
+                    exc_info=True,
+                )
             return True
         ws_app: str = ws.get("_app", "")
         snapshot: frozenset[str] = ws.get("_allowed_events", frozenset())
@@ -251,6 +304,11 @@ class WebSocketHub:
         """Send one typed frame through the per-client authorization chokepoint."""
         dead: list[web.WebSocketResponse] = []
         skip_owners = msg_type == "slots"
+        # A legacy-only slots frame repeats a change every patch-capable socket
+        # already applied from its ``slot_patch`` frame.
+        skip_patch_clients = (
+            skip_owners and isinstance(data, dict) and bool(data.get("_legacy_only", False))
+        )
         owners = getattr(self._owner, "_owner_ws_clients", None) or set()
         client_allowed = self._owner_method("_ws_client_allowed", self._ws_client_allowed)
         serialize = self._owner_method("_serialize_for_client", self._serialize_for_client)
@@ -261,6 +319,8 @@ class WebSocketHub:
                 dead.append(ws)
                 continue
             if skip_owners and ws in owners:
+                continue
+            if skip_patch_clients and ws.get(SLOT_PATCH_WS_FLAG, False):
                 continue
             if not client_allowed(ws, msg_type, data):
                 continue
@@ -283,7 +343,7 @@ class WebSocketHub:
         for ws in dead:
             remove(ws)
 
-    def _send_ws_owners(self, msg: str) -> None:
+    def _send_ws_owners(self, msg: str, *, skip_slot_patch_clients: bool = False) -> None:
         """Send a pre-serialized message only to owner-authenticated clients."""
         dead: list[web.WebSocketResponse] = []
         spawn = self._owner_method("_spawn_ws_send", self._spawn_ws_send)
@@ -292,12 +352,41 @@ class WebSocketHub:
             if ws.closed:
                 dead.append(ws)
                 continue
+            if skip_slot_patch_clients and ws.get(SLOT_PATCH_WS_FLAG, False):
+                continue
             try:
                 spawn(ws, msg)
             except Exception:
                 dead.append(ws)
         for ws in dead:
             remove(ws)
+
+    def send_ws_slot_patch(self, msg: str) -> int:
+        """Send a pre-serialized ``slot_patch`` frame to patch-capable sockets.
+
+        Returns how many sockets it was handed to. Only dashboard-user sockets
+        are ever flagged (see ``api_ws``), so no scope gate applies here: the
+        frame carries fields of the dashboard-user slot projection, which those
+        sockets already receive in full.
+        """
+        dead: list[web.WebSocketResponse] = []
+        sent = 0
+        spawn = self._owner_method("_spawn_ws_send", self._spawn_ws_send)
+        remove = self._owner_method("_remove_ws", self._remove_ws)
+        for ws in list(self._owner._ws_clients):
+            if ws.closed:
+                dead.append(ws)
+                continue
+            if not ws.get(SLOT_PATCH_WS_FLAG, False):
+                continue
+            try:
+                spawn(ws, msg)
+                sent += 1
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            remove(ws)
+        return sent
 
     def broadcast_ws(self, msg_type: str, data: object) -> None:
         """Send a typed message to every authorized WS client."""
@@ -348,8 +437,8 @@ class WebSocketHub:
         token is one of them (``_is_dashboard_user`` False, set from the auth
         middleware in ``dashboard/ws.py``). Such a socket does not receive an
         owner-surface frame unless its manifest declared that event -- the same
-        first line ``_ws_client_allowed`` gates on -- so a caller asking "is a
-        human watching?" must not count it.
+        ``_is_dashboard_user`` gate ``_ws_client_allowed`` applies -- so a caller
+        asking "is a human watching?" must not count it.
 
         Closed-but-not-yet-pruned sockets are skipped: the registry prunes
         lazily, on the next broadcast.
@@ -387,6 +476,102 @@ class WebSocketHub:
         if owner:
             self._owner._owner_ws_clients.add(ws)
         self._serving_loop_provider()
+
+    async def send_members_subscribed(self, ws: web.WebSocketResponse) -> None:
+        """Send the one-shot ``members_subscribed`` frame to a NEW owner socket.
+
+        Carries ``{"lastSeqs": {slug: last_seq}}`` from the per-member event-log
+        service, so the client can drop any held member_projection frame whose
+        seq is newer than this baseline (a replay/stale-frame guard). Sent to
+        THIS socket alone, right after the connect-time snapshot. The snapshot is
+        the first frame a socket receives by contract, so the baseline cannot
+        precede it: ``test_chat_send_echo_scope`` reads that first frame and treats
+        its arrival as proof the socket is registered for echoes.
+
+        THE WINDOW IS CLOSED BY SUPPRESSION, NOT BY ORDERING: the read below awaits
+        a thread and the socket is already registered for owner broadcasts, so a
+        ``member_projection`` append landing in that window would be delivered
+        ahead of a baseline computed before it and the client would prune the newer
+        row. So the socket is marked pending before that await, and
+        ``_ws_client_allowed`` -- the predicate the fan-out already consults per
+        socket -- holds ``member_projection`` back from a marked socket and records
+        its slug. Once the baseline is out the mark is cleared and each recorded
+        slug's CURRENT projection is replayed. Reordering instead is not available:
+        the connect snapshot must stay the first frame a socket receives.
+
+        Owner-only: the caller must gate on a dashboard-user connection and skip
+        app-token connections (``member_projection`` / ``members_subscribed`` are
+        classified owner-only in ``ws_event_scope``). Best-effort — a serialize
+        or send fault is logged and swallowed so it never fails the connection.
+        """
+        # Marked BEFORE the await below, because the socket is already in the owner
+        # broadcast set: any member_projection published while this coroutine waits
+        # would otherwise reach the client ahead of a baseline computed before it,
+        # and the client's prune rule deletes the newer row. _ws_client_allowed
+        # holds those frames back and records their slugs here; the release at the
+        # end of this method sends each one's CURRENT value instead.
+        pending: set[str] = set()
+        ws["_members_baseline_pending"] = pending
+        try:
+            from kiro_crew.eventlog.service import get_service
+
+            # last_seqs() iterates and parses every uncached member log on first
+            # dashboard connect -- synchronous file I/O that would stall the serving
+            # loop. Offload it, matching the sibling _handle_eventlog_frame read.
+            last_seqs = await asyncio.to_thread(get_service().last_seqs)
+        except Exception:
+            self._log.debug("members_subscribed: last_seqs read failed", exc_info=True)
+            # Release on the failure path too. A socket left marked is suppressed
+            # for the rest of its life, which turns a missed baseline into a
+            # permanently blank Members page.
+            ws.pop("_members_baseline_pending", None)
+            return
+        try:
+            msg = json.dumps({"type": "members_subscribed", "data": {"lastSeqs": last_seqs}})
+            await ws.send_str(msg)
+        except Exception:
+            self._log.debug("members_subscribed send failed", exc_info=True)
+        finally:
+            # Cleared before the replay, so the replayed frames are not themselves
+            # suppressed, and so a fault in the replay cannot leave the socket
+            # permanently held back.
+            ws.pop("_members_baseline_pending", None)
+        await self._replay_suppressed_projections(ws, pending)
+
+    async def _replay_suppressed_projections(
+        self, ws: web.WebSocketResponse, slugs: set[str]
+    ) -> None:
+        """Send each held-back slug's CURRENT projection to one socket.
+
+        Whole-value frames plus the client's higher-seq-wins rule make the replay
+        safe to run after the baseline: a value newer than what was suppressed is
+        simply the one the client keeps.
+
+        Routed through the service's ``redacted_snapshot`` rather than serializing
+        ``snapshot`` directly, because the broadcast redacts every projection before
+        it leaves the process and a second egress path that skipped that would put
+        an unredacted view on the wire.
+        """
+        if not slugs:
+            return
+        try:
+            from kiro_crew.eventlog import types as eventlog_types
+            from kiro_crew.eventlog.service import get_service
+
+            service = get_service()
+            for slug in sorted(slugs):
+                snap = await asyncio.to_thread(service.redacted_snapshot, slug)
+                seq = snap.get("asOfSeq", -1)
+                for key, view in (snap.get("values") or {}).items():
+                    # Same type constant and same payload keys as the service's own
+                    # broadcast, so a change to the frame moves both together.
+                    frame = {
+                        "type": eventlog_types.WS_MEMBER_PROJECTION,
+                        "data": {"slug": slug, "key": key, "value": view, "seq": seq},
+                    }
+                    await ws.send_str(json.dumps(frame))
+        except Exception:
+            self._log.debug("members_subscribed: replay failed", exc_info=True)
 
     def unregister_ws(self, ws: web.WebSocketResponse) -> None:
         remove = self._owner_method("_remove_ws", self._remove_ws)

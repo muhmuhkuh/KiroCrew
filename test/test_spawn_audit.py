@@ -160,6 +160,8 @@ _SPAWN_NAMES = {
     "create_subprocess_limited",
     "run_limited",
     "popen_limited",
+    # kiro_prerequisite's one-shot wrapper; its call sites must stay visible.
+    "spawn_supervised_oneshot",
 }
 
 # Tokens whose presence anywhere in the enclosing function marks the spawn as
@@ -195,6 +197,8 @@ _PREEXEC_TOKENS = (
     "create_subprocess_limited(",
     "run_limited(",
     "popen_limited(",
+    # Spawns through create_subprocess_limited, so its callers get the same limits.
+    "spawn_supervised_oneshot(",
     "resource_limit_preexec()",
     "session_host_preexec(",
 )
@@ -240,7 +244,14 @@ PREEXEC_EXEMPT: frozenset[str] = frozenset(
 # category breakdown and follow-up hardening candidates.
 BENIGN_SPAWNS: frozenset[str] = frozenset(
     {
-        "acp/runtime.py::_get_rss_mb",
+        "acp/runtime_process_tree.py::_get_rss_mb",
+        # The spawn primitive for three fixed-argv kiro-cli one-shots
+        # (`chat --list-models`, `whoami`, the `/usage` scrape). Every caller has
+        # already wrapped the argv with sandbox.wrap_argv and cgroup_scope_argv
+        # before handing it over; this function only prefixes the immutable
+        # process-group supervisor and spawns through create_subprocess_limited
+        # in a new session. Nothing agent-influenced reaches the argv here.
+        "kiro_prerequisite.py::spawn_supervised_oneshot",
         # Eight pre-existing spawns in one app's own test module, invisible to this
         # audit until receivers were derived from each file's imports: they are
         # reached through a function-local ``import subprocess as sp``. Every one is
@@ -260,8 +271,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_red_base_staging_does_not_dereference_a_credential_symlink",
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_the_pin_refuses_a_symlink_and_fails_closed",
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::test_the_pin_survives_a_normal_repo",
-        # Four pre-existing spawns in ``acp/client.py`` that the scan could not see
-        # until receivers were derived from each file's imports (it binds the module
+        # Four pre-existing spawns in ``acp/client.py`` and
+        # ``acp/runtime_process_tree.py`` that the scan could not see until receivers
+        # were derived from each file's imports (``acp/client.py`` binds the module
         # as ``subprocess_mod``). None is
         # agent-influenced and each is a fixed argv with a bounded timeout and no
         # shell: ``mise which <tool>`` where the tool is a module-level binary-name
@@ -273,9 +285,9 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # observe the machine, and the sandbox they would route through is a thing
         # they run underneath.
         "acp/client.py::_mise_which",
-        "acp/client.py::_direct_children",
-        "acp/client.py::_get_start_time",
-        "acp/client.py::_read_basename",
+        "acp/runtime_process_tree.py::_direct_children",
+        "acp/runtime_process_tree.py::_get_start_time",
+        "acp/runtime_process_tree.py::_read_basename",
         # The opencode routing read-back. ONE fixed argv -- the resolved harness
         # binary plus the two literal words in ``_OPENCODE_CONFIG_READBACK_ARGS``
         # (``debug config``) -- with no shell, a 30s timeout, and a cwd that is the
@@ -317,6 +329,48 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # directories. Called from a worker thread, never the event loop --
         # ``test/test_acp_pi_backend.py`` pins that.
         "acp/client.py::_verify_pi_gate",
+        # The DeepSeek Harness gate read-back, the same shape as the pi one above:
+        # the argv is the SESSION'S own argv already wrapped by ``wrap_argv_async``
+        # before it reaches this method, so the sandbox and credential mask are
+        # applied by the caller rather than here. Nothing in it is agent-influenced
+        # -- the harness binary comes from its ``ACP_BACKEND_LAUNCH`` row, the sealed
+        # plugin and its patch from the owner-only gate-artifact directory, and the
+        # marker path from the probe's OWN private scratch window (allocated in the
+        # arm, passed as ``extra_private_dirs``, removed in its ``finally``) -- the
+        # one argument the child writes, and it lands nowhere the child could plant
+        # something a later session loads. stdin is a pipe that carries nothing and
+        # is closed once the plugin publishes its marker (EOF is the profile's own
+        # shutdown). The env adds only the operator's configured key NAMES under
+        # canary values, never the key. Called from a worker thread, never the
+        # event loop.
+        "acp/client.py::_verify_deepseek_gate",
+        # The subprocess-pool child interpreter: ONE fixed argv, ``sys.executable -I -S
+        # -c <leaf source>``, where the source is the text of a module-relative
+        # constant script (the sensitive-path resolver's
+        # ``security/_child_realpath.py``; tests pass their own stub) captured when
+        # the executor module loads, so a later edit to the file reaches no respawn.
+        # No agent value reaches the command, the args or the cwd -- the
+        # path to resolve travels over stdin as a length-prefixed frame, never as an
+        # argument, and no shell is involved. It is listed rather than routed because
+        # this child exists to ``lstat``/``readlink`` the very paths the
+        # sensitive-path gate is checking, sensitive ones included: under the agent
+        # sandbox it would be denied exactly those reads, and a resolver answering
+        # "cannot resolve" where the true answer is a credential symlink's target
+        # would weaken the gate rather than harden it. ``-I`` drops ``PYTHONPATH``
+        # and the script directory from ``sys.path`` so nothing can be planted in
+        # front of its four stdlib imports; the cwd is inherited deliberately, so a
+        # path resolves in the child to what it resolves to in the parent.
+        "subprocess_pool/executor.py::_spawn",
+        # The PDF extractor child: ONE fixed argv, ``sys.executable -P -m
+        # kiro_crew.pdf_extract_child --max-chars=N --max-pages=M`` with both
+        # numbers module constants of the two callers (file-grep, knowledge
+        # ingest). The untrusted input -- the document -- travels on stdin, never
+        # on argv, cwd or env, and the env is ``scrub_env()``. It is spawned
+        # through ``popen_limited`` under ``RLIMIT_PROFILE_EXTRACTOR``, whose
+        # fixed ``RLIMIT_AS`` is the containment this spawn exists to add:
+        # ``pdfplumber`` commits a page's whole character list before any caller
+        # can measure it, so the memory bound has to sit one process down.
+        "pdf_extract.py::extract_pdf_segments",
         # The shadow-venv update engine's four spawns. None is agent-influenced
         # and none can route through sandboxed_spawn_argv, because the engine's
         # whole job is to build the NEXT gateway install outside the agent
@@ -354,6 +408,25 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # it executes nothing else (the shim dlopens the already-loaded libc
         # rather than letting ctypes.util.find_library exec ldconfig/gcc).
         "sandbox.py::_probe_unshare_via_spawn",
+        # The speech-runtime preflight child: `sys.executable -I -S -c <module-level
+        # string constant> <extension path>`, no shell, a bounded timeout, cwd
+        # pinned to the interpreter prefix, `-I` keeping the working directory
+        # off `sys.path` so nothing the gateway was started from can shadow the
+        # import, `-S` keeping `site` -- and with it every `.pth` in the venv's
+        # site-packages -- from running at all in a child that is unsandboxed on
+        # purpose, and an environment reduced to a fixed allow-list (no credentials,
+        # no `PYTHON*`, no `KIROCREW_*`). The one argument is the path of the
+        # installed `_pywhispercpp` extension as the interpreter's OWN finder
+        # resolved it (`binary_identity()`, i.e. `importlib.util.find_spec`), never
+        # anything an agent supplied; it is passed so the `-I` child, which cannot
+        # see a user-site install by name, loads the same file the parent would.
+        # The child prints the build's compile-time feature string. It is a
+        # subprocess for exactly one reason: that load can SIGILL on a CPU the build
+        # was not compiled for, which kills the process it runs in, so it must not
+        # be this one (kirodotdev/KiroCrew#13179); the child zeroes its own
+        # RLIMIT_CORE first so that death writes no core file. The interpreter is
+        # the one running the gateway, like the userns probe above.
+        "stt/preflight.py::_run_probe_child",
         # _get_rss_tree_mb is deliberately NOT listed: its own spawn moved into
         # _ps_process_table below, so an entry for it would be stale and would
         # mask a future regression that put a spawn back inline.
@@ -364,7 +437,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # timeout, no shell, no cwd, and no arguments at all — nothing here is
         # agent-influenced, and the binary is resolved through
         # platform_compat.trusted_system_bin (a vetted absolute path), not PATH.
-        "acp/runtime.py::_ps_process_table",
+        "acp/runtime_process_tree.py::_ps_process_table",
         # (_bootstrap.py::_self_heal removed — the console-entry self-heal now
         # delegates its install to dep_sync.sync_or_reinstall, so the spawn lives
         # at that key below and an entry here would be stale.)
@@ -387,6 +460,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # agent can write to names the executable; a resource ceiling / sandbox
         # adds nothing to a `--version` call.
         "diagnostics.py::_kiro_cli_version",
+        # The spec-permissions version gate: the same fixed argv
+        # ``[<kiro-cli>, "--version"]`` as the diagnostics probe above, 5s timeout,
+        # no shell, no cwd, pinned through ``pin_kiro_cli`` (no pin, no spawn), and
+        # cached per binary identity so it runs once per install rather than once
+        # per spec rebuild. Its answer decides whether ``agent.py`` writes the KAS
+        # ``permissions`` block a pre-2.23 kiro-cli refuses; nothing an agent says
+        # in a turn reaches the argv, and a sandbox adds nothing to ``--version``.
+        "kiro_cli.py::installed_kiro_cli_version",
         # Tailnet origin derivation + forwarded-peer whois (RFC:
         # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
         # "status", "--json"]`` or ``["<tailscale>", "whois", "--json",
@@ -530,6 +611,14 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # it, and it runs once per process (lru_cache) to name the code revision the
         # MCP gateway daemon and its owner compare.
         "code_fingerprint.py::_git_fingerprint",
+        # Fixed `git log -1 --format=%ct` argv (shell=False), run against the same
+        # `code_fingerprint._PACKAGE_ROOT` the entry above uses, and derived from
+        # `__file__` rather than from any request. No agent-influenced input reaches
+        # the command, the args or the cwd: `debug_gateway` takes no parameters at
+        # all. It answers HEAD's commit time so the route can say whether the running
+        # gateway predates the caller's fix, and it is bounded by a 5s timeout with
+        # every failure answering None.
+        "dashboard/handlers/debug.py::_head_commit_time",
         # Fixed `git rev-parse --verify` argv (shell=False) against the OPERATOR-chosen
         # clone, asking whether the operator's `scopeDiffBase` resolves. The ref comes from
         # config (`_CONFIG_WRITABLE`), not from the agent, and it is passed as one argv
@@ -1146,7 +1235,7 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # The binary is pinned via ``platform_compat.trusted_system_bin("ps")``;
         # a miss means no spawn at all. Operator-invoked doctor, 2s-capped, no
         # shell. Same classification as the ``ps``-based probe in
-        # ``acp/runtime.py::_get_rss_mb``.
+        # ``acp/runtime_process_tree.py::_get_rss_mb``.
         "cli_doctor.py::_gateway_rss_bytes",
         # ``<kiro-cli> acp --help`` readiness probe for the KAS backend: fixed
         # argv (subcommand and flag are module constants), 15s-capped, no shell,
@@ -1252,6 +1341,17 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "cloud/source.py::_git_tracked_files",
         "cloud/source.py::_tracked_tree_is_dirty",
         "cloud/source.py::_use_git_archive",
+        # Release-tag probe before a packaged install's cloud launch: `<trusted
+        # git> ls-remote --exit-code --tags -- <repo> refs/tags/<ref>`, a fixed
+        # argv with no shell. The binary comes from
+        # `platform_compat.trusted_git_bin` (never PATH); `ref` is built by
+        # `release_channel.release_refs` from this build's own `__version__`
+        # through a `\d+\.\d+\.\d+` regex, and `repo` is the template's public
+        # URL or a caller argument `ec2.deploy` charset-validates -- neither is
+        # agent-reachable. Env drops every inherited `GIT_*` and pins global /
+        # system config off; stdin is DEVNULL; the exit code is the only thing
+        # read. Same classification as the `cloud/source.py` git probes above.
+        "cloud/ec2.py::release_tag_exists",
         # Windows tunnel teardown: `taskkill /T /F /PID <pid>`, a fixed argv whose
         # only variable is the pid of a child THIS process created (the Popen handed
         # to kill_port_forward) -- never agent-supplied, no shell, no PATH shim
@@ -1370,7 +1470,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # Messages.app through the operator's own Full Disk Access and
         # Automation grants, which a scrubbed-env sandbox strips.
         "imessage/rpc.py::start",
-        "mcp_core.py::_get_ppid",
         "mcp_gateway/backend.py::spawn_backend",
         # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run`` (attr
         # ``run`` on base ``asyncio``), used here only to drive the one-shot
@@ -1433,7 +1532,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # and every failure (openssl missing included) already fails safe to
         # "no floor".
         "platform/feed_trust.py::_verify_signature",
-        "mcp_shared.py::_get_ppid",
         # File-manager launchers for the dashboard's reveal action. The
         # command is an absolute literal resolved in this module (never a bare
         # argv name, so an agent-writable PATH entry cannot supply it), the
@@ -1484,6 +1582,15 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # verb set plus a label built from a validate_name-checked pod name —
         # not agent-influenced. Same disposition as the systemctl wrapper.
         "pod/launchd.py::launchctl",
+        # Windows interpreter discovery for the worktree venv, the same class as
+        # platform_compat.py::find_python_interpreter above. Fixed argv: the `py`
+        # launcher plus `-<version>` and a literal `-I -X utf8 -c` probe that
+        # prints sys.executable. The only variable is the version string, which is
+        # this module's own "3.12" default or a caller-supplied literal -- never
+        # agent input -- and it is a later argv element, never the command. No
+        # shell, no cwd, bounded timeout, stderr discarded, and the result is used
+        # only after it is confirmed to name a real file.
+        "pod/provision.py::_find_python_via_launcher",
         "pod/provision.py::_run",
         "pod/runtime.py::_git_worktrees",
         "pod/runtime.py::_run",
@@ -2111,7 +2218,7 @@ def test_agent_influenced_sites_are_routed():
         "task_executor.py::run_tests",
         "git_coord.py::_git",
         "git_coord.py::_is_git_repo",
-        "dashboard/handlers/source_providers.py::_run_json",
+        "dashboard/source_providers/runner.py::_run_provider",
     ):
         assert key not in unrouted, (
             f"{key} must route its spawn through sandboxed_spawn_argv "

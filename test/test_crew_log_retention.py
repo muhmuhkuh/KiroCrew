@@ -18,6 +18,7 @@ import multiprocessing
 import os
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 from crew_log_type_helpers import minimal_data
@@ -351,7 +352,7 @@ def test_remove_unit_never_follows_a_unit_directory_linked_to_another_unit():
     except (OSError, NotImplementedError):  # pragma: no cover - platform without symlinks
         pytest.skip("symlinks unavailable")
 
-    assert _remove("s-attacker") == store.REMOVE_ABSENT
+    assert _remove("s-attacker") == store.REMOVE_LINKED
     assert (victim_dir / "log.jsonl").exists()
     assert CrewLog.exists(lg.KIND_SESSION, "s-victim")
 
@@ -369,7 +370,7 @@ def test_a_unit_directory_linked_outside_the_root_is_refused_by_containment(tmp_
     except (OSError, NotImplementedError):  # pragma: no cover - platform without symlinks
         pytest.skip("symlinks unavailable")
 
-    assert _remove("s-outside") == store.REMOVE_ABSENT
+    assert _remove("s-outside") == store.REMOVE_LINKED
     assert (elsewhere / "keep.txt").read_text(encoding="utf-8") == "intact"
 
 
@@ -400,7 +401,7 @@ def test_a_linked_unit_directory_never_causes_the_target_to_be_removed():
 
     assert store.sweep_expired(30) == (0, 0)
     assert (stash / "log.jsonl").exists()
-    assert _remove("s-hidden") == store.REMOVE_ABSENT
+    assert _remove("s-hidden") == store.REMOVE_LINKED
     assert (stash / "log.jsonl").exists()
 
 
@@ -905,6 +906,135 @@ def test_a_partial_removal_reports_that_the_history_is_already_gone(caplog, monk
     assert "history is intact" not in text
 
 
+def test_a_partial_removal_keeps_lineage_whose_opening_record_still_reads(monkeypatch):
+    """ "Some history went" is not "the opening record went".
+
+    Segments go first, so the ordinary lease-only refusal really does take the opening
+    entry with them. But a refusal on a LATER segment can leave the earliest one -- and
+    the opening entry in it -- readable, and dropping the edge then would lose a valid
+    citation until the process re-seeds. The disk is asked rather than assumed, so this
+    pins the answer for the case where it still yields a record.
+
+    The citation is only the FIRST segment's contribution. A decision is appended later, so
+    the segments this pass did take can be the ones holding it -- which is why a record
+    surviving intact still owes a re-read of the decision.
+    """
+    from kiro_crew.crew_log import session_tree
+    from kiro_crew.crew_log import session_tree_projection as stp
+
+    forgotten: list[str] = []
+    retracted: list[str] = []
+    reconciled: list[tuple[str, str]] = []
+    monkeypatch.setattr(stp, "forget_unit", lambda sid: forgotten.append(sid))
+    monkeypatch.setattr(stp, "retract_unit_parent", lambda sid: retracted.append(sid))
+    monkeypatch.setattr(
+        stp, "reconcile_unit_edge", lambda sid, slot: reconciled.append((sid, slot))
+    )
+
+    log = _closed_session()
+    del log
+    real_unlink = store.Path.unlink
+
+    def _refuse_lock(self, *args, **kwargs):
+        if self.name.endswith(".lock"):
+            raise OSError("held")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(store.Path, "unlink", _refuse_lock)
+    # An earliest segment survived this pass and still parses as an opening record.
+    survivor = store.Path(__file__)
+    monkeypatch.setattr(store, "segment_paths", lambda kind, unit_id: [survivor])
+    monkeypatch.setattr(store, "read_head", lambda path: ({}, None, True))
+    monkeypatch.setattr(
+        session_tree,
+        "opened_record",
+        lambda directory, header, entry: session_tree.OpenedRecord(
+            sid=SESSION, slot="slot-a", created_at=1, parent_slot="slot-parent"
+        ),
+    )
+
+    assert _remove() == store.REMOVE_FAILED
+    assert forgotten == [], "a still-readable opening record was forgotten"
+    assert retracted == [], "a citation the log still carries was retracted"
+    assert reconciled == [
+        (SESSION, "slot-a")
+    ], "a surviving record's DECISION was never re-read from the segments that are left"
+
+
+def test_a_partial_removal_downgrades_to_parentless_when_the_creating_segment_went(
+    monkeypatch,
+):
+    """The creating segment went, later ones survive: the citation goes, the record stays.
+
+    A fresh scan of this unit contributes the slot with NO parent in that case, so a
+    projection still serving the old edge disagrees with the disk it is an image of.
+    Dropping the whole record instead would orphan this unit's CHILDREN, which cite its
+    SLOT -- a slot with no record reads as a creator that never existed, rather than one
+    whose own creator is unknown.
+    """
+    from kiro_crew.crew_log import session_tree
+    from kiro_crew.crew_log import session_tree_projection as stp
+
+    forgotten: list[str] = []
+    retracted: list[str] = []
+    monkeypatch.setattr(stp, "forget_unit", lambda sid: forgotten.append(sid))
+    monkeypatch.setattr(stp, "retract_unit_parent", lambda sid: retracted.append(sid))
+
+    log = _closed_session()
+    del log
+    real_unlink = store.Path.unlink
+
+    def _refuse_lock(self, *args, **kwargs):
+        if self.name.endswith(".lock"):
+            raise OSError("held")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(store.Path, "unlink", _refuse_lock)
+    # A later segment survives with a readable header, but its first entry is not the
+    # opening one -- which is exactly what the scanner reads as "no parent".
+    survivor = store.Path(__file__)
+    monkeypatch.setattr(store, "segment_paths", lambda kind, unit_id: [survivor])
+    monkeypatch.setattr(store, "read_head", lambda path: ({}, None, True))
+    monkeypatch.setattr(
+        session_tree,
+        "opened_record",
+        lambda directory, header, entry: session_tree.OpenedRecord(
+            sid=SESSION, slot="slot-a", created_at=1, parent_slot=None
+        ),
+    )
+
+    assert _remove() == store.REMOVE_FAILED
+    assert retracted == [SESSION], "the citation the log no longer carries was kept"
+    assert forgotten == [], "the record was dropped, which orphans this unit's children"
+
+
+def test_a_partial_removal_drops_lineage_once_the_opening_record_is_unreadable(monkeypatch):
+    """The other half: nothing on disk still yields an opening record, so the edge goes.
+
+    Left held, the projection serves an edge into a log nobody can read and writes it to
+    the checkpoint, so a restart reads it back as fact.
+    """
+    from kiro_crew.crew_log import session_tree_projection as stp
+
+    forgotten: list[str] = []
+    monkeypatch.setattr(stp, "forget_unit", lambda sid: forgotten.append(sid))
+    # Whatever survives the pass, the disk cannot prove an opening record.
+    monkeypatch.setattr("kiro_crew.crew_log.session_tree.opened_record", lambda *a, **k: None)
+
+    log = _closed_session()
+    del log
+    real_unlink = store.Path.unlink
+
+    def _refuse_lock(self, *args, **kwargs):
+        if self.name.endswith(".lock"):
+            raise OSError("held")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(store.Path, "unlink", _refuse_lock)
+    assert _remove() == store.REMOVE_FAILED
+    assert forgotten == [SESSION], "a partial removal left the projection serving a gone unit"
+
+
 def test_a_removal_that_got_nowhere_reports_the_history_intact(caplog, monkeypatch):
     """The other half of the same line: nothing went, so nothing may be implied gone."""
     log = _closed_session()
@@ -945,7 +1075,7 @@ def _provider_factory_reporting(session_id: str):
         provider.context_usage_pct = lambda: 0.0
         provider.context_window_tokens = lambda: 0
         provider.has_active_turn = lambda: False
-        provider.runtime_info = lambda: (None, None)
+        provider.runtime_abort_target = lambda: None
         provider.session_id = session_id
         return provider
 
@@ -1327,3 +1457,78 @@ async def test_a_session_opened_after_a_destroy_makes_the_unit_uncollectable_aga
         assert CrewLog.exists(lg.KIND_SESSION, "acp-revived")
     finally:
         emit.reset_caches()
+
+
+def _stage_target(unit_id: str):
+    return (
+        store.crew_log_trash_root() / "batch-1" / "uid-1" / _unit_dir(lg.KIND_SESSION, unit_id).name
+    )
+
+
+def test_staging_syncs_both_parents_after_the_rename(monkeypatch):
+    """A rename is not a move until both directories are on disk."""
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-stage")
+    del log
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-stage").parent
+    target = _stage_target("s-stage")
+    synced: list = []
+    monkeypatch.setattr(atomic_write, "fsync_dir", lambda path, **_k: synced.append(Path(path)))
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-stage", target) == store.REMOVE_REMOVED
+
+    assert target.is_dir()
+    assert target.parent in synced
+    assert source_parent in synced
+
+
+def test_a_sync_that_fails_after_the_rename_puts_the_unit_back(monkeypatch):
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-unsynced")
+    del log
+    target = _stage_target("s-unsynced")
+    calls = {"n": 0}
+    real_rename = os.rename
+
+    def _rename(src, dst):
+        calls["n"] += 1
+        real_rename(src, dst)
+
+    after_rollback: list = []
+
+    def _fsync(path, **_k):
+        if calls["n"] == 1:
+            raise OSError("sync failed")
+        if calls["n"] == 2:
+            after_rollback.append(Path(path))
+
+    monkeypatch.setattr(os, "rename", _rename)
+    monkeypatch.setattr(atomic_write, "fsync_dir", _fsync)
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-unsynced").parent
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-unsynced", target) == store.REMOVE_FAILED
+
+    assert CrewLog.exists(lg.KIND_SESSION, "s-unsynced")
+    assert not target.exists()
+    assert source_parent in after_rollback, "the rollback was not made durable"
+
+
+def test_the_windows_branch_stages_an_idle_unit_and_refuses_a_held_one(monkeypatch):
+    """Windows renames only after releasing the lease; the lease still refuses a holder."""
+    monkeypatch.setattr(store, "_RENAME_UNDER_LEASE", False)
+    idle = _closed_session(unit_id="s-idle")
+    del idle
+    held = _closed_session(unit_id="s-held")
+    held.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="gateway")
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-idle", _stage_target("s-idle")) == (
+        store.REMOVE_REMOVED
+    )
+    assert store.stage_unit(lg.KIND_SESSION, "s-held", _stage_target("s-held")) == (
+        store.REMOVE_OWNED
+    )
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-idle")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-held")
+    del held

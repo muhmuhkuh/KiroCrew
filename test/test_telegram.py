@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import html
+import re
 import threading
 import time
 from contextlib import contextmanager
@@ -20,11 +22,17 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from conftest import assert_rejected_without_backtracking
+from conftest import CREDENTIAL_STRADDLE_SHAPES, assert_rejected_without_backtracking
 from kiro_crew.acp.client import AcpError
 from kiro_crew.acp.types import EVENT_COMPACTION_STATUS, EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.token_auth import parse_duration
+from kiro_crew.messaging import driver as messaging_driver
 from kiro_crew.messaging.commands import parse_dashboard_ttl
+from kiro_crew.messaging.display_safety import (
+    canonicalize_display,
+    joins_to_a_credential,
+    severs_a_credential,
+)
 from kiro_crew.messaging.link import (
     UNBIND_REASON_UNSPECIFIED,
     ChannelLink,
@@ -43,6 +51,7 @@ from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import BACKGROUND_KEY, _opt_out_key
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
+from kiro_crew.telegram import renderer as telegram_renderer
 from kiro_crew.telegram.client import (
     TELEGRAM_CHUNK_LIMIT,
     TELEGRAM_MAX_TEXT,
@@ -66,6 +75,8 @@ from kiro_crew.telegram.commands import (
 from kiro_crew.telegram.renderer import (
     TelegramApprovalDecider,
     TelegramRenderer,
+    _default_redactor,
+    _delivered_form,
     _extract_options,
     _has_table,
     _may_exceed_rendered,
@@ -79,6 +90,7 @@ from kiro_crew.telegram.renderer import (
     _split_table_rows,
     _strip_steering,
     build_inline_keyboard,
+    safe_split_offset,
 )
 from kiro_crew.telegram.transport import (
     TELEGRAM_CAPABILITIES,
@@ -88,10 +100,48 @@ from kiro_crew.telegram.transport import (
 )
 from kiro_crew.telegram.transport_dispatch import (
     _MODEL_PICKER_TTL_SECS,
+    _NOT_A_SENDER,
     _STEER_ACK_EMOJI,
     TelegramDispatcher,
+    _inbound_origin,
+    _origin_kwargs,
+    _queued_origin,
+    _QueuedOrigin,
     _user_safe_failure_reason,
 )
+
+
+def _tg_origin(
+    user: int | str = 7,
+    chat: int | str = 7,
+    *,
+    thread: str = "",
+    chat_type: str = "private",
+    username: str = "",
+) -> _QueuedOrigin:
+    """One queued message's origin: who sent it, and where its reply goes.
+
+    Defaults are user 7 in chat 7, the DM these tests use throughout.
+    """
+    return _QueuedOrigin(
+        user_id=str(user),
+        chat_id=str(chat),
+        thread_id=thread,
+        chat_type=chat_type,
+        username=username,
+    )
+
+
+def _origin(*a: Any, **kw: Any) -> dict[str, str]:
+    """:func:`_tg_origin` as queue-entry kwargs, spelled by the PRODUCTION writer.
+
+    A queue entry carries who sent it and where its reply goes, because the drain
+    replays it under that envelope rather than under the turn that opened the queue.
+    Built through ``_origin_kwargs`` rather than by spelling the storage keys, so
+    renaming one moves this fixture with it instead of leaving it green against a
+    shape production does not write.
+    """
+    return _origin_kwargs(_tg_origin(*a, **kw))
 
 
 @pytest.fixture(autouse=True)
@@ -149,6 +199,12 @@ class FakeClient:
     def __init__(self) -> None:
         self.sent: list[tuple[str, Any]] = []
         self.edits: list[tuple[int, str, Any]] = []
+        #: chat_id per send_message / edit_message call (parallel to `sent` / `edits`).
+        #: Which CHAT an outbound call addressed is otherwise invisible here, and it is
+        #: the whole question for a queue shared by two people: a receipt edited under
+        #: the wrong chat's address reaches a chat that message id does not exist in.
+        self.send_chats: list[int] = []
+        self.edit_chats: list[int] = []
         self.drafts: list[tuple[int, str]] = []
         self.markup_edits: list[tuple[int, Any]] = []
         self.answered: list[str] = []
@@ -203,6 +259,7 @@ class FakeClient:
         await asyncio.sleep(0)  # yield like a real network await (exposes races)
         self._mid += 1
         self.sent.append((text, reply_markup))
+        self.send_chats.append(chat_id)
         self.reply_targets.append(reply_to_message_id)
         self.send_threads.append(message_thread_id)
         self.send_silent.append(disable_notification)
@@ -234,7 +291,8 @@ class FakeClient:
         retry_plain: bool = True,
     ) -> bool:
         self.edits.append((message_id, text, reply_markup))
-        return True
+        self.edit_chats.append(chat_id)
+        return getattr(self, "edit_ok", True)
 
     async def edit_message_reply_markup(
         self, chat_id: int, message_id: int, reply_markup: Any = None
@@ -373,8 +431,13 @@ class FakeSessions:
         self.queued: list = []
         self._gp = FakeProvider()
         self.mirror_links: dict[str, Any] = {}
+        self.origin_links: dict[str, Any] = {}
         self.inbound_keys: set[str] = set()
         self.mirror_opt_outs: set[str] = set()
+        #: Per key, what ``get_or_create`` captured as the superseded store.
+        self.allocation_predecessors: dict[str, str] = {}
+        #: Per key, the model ``get_or_create`` was asked for (the boundary's stamp).
+        self.requested_models: dict[str, str] = {}
         self.batch_depth = 0
         self.batched_writes: list[bool] = []
         self._pid: Any = None
@@ -395,7 +458,22 @@ class FakeSessions:
         self.last_model = model
         if self.raise_on_get:
             raise RuntimeError("cold-start failed")
+        # The real boundary captures the store this allocation supersedes INSIDE
+        # its registration's critical section; the double mirrors that contract by
+        # reading its mapping stand-in at the moment it "allocates", when attached.
+        reader = getattr(self, "mapped_sid", None)
+        if callable(reader):
+            self.allocation_predecessors[key] = str(reader(key) or "")
+        # The real boundary stamps the model the allocation SELECTED on the
+        # session; the double records the argument it was handed.
+        self.requested_models[key] = str(model or "")
         return FakeProvider(), True, False
+
+    def allocation_predecessor(self, key: str) -> str:
+        return self.allocation_predecessors.get(key, "")
+
+    def allocation_requested_model(self, key: str) -> str:
+        return self.requested_models.get(key, "")
 
     def begin_turn(self, key: str) -> None:
         """The real manager's synchronous pre-dispatch closing gate."""
@@ -453,6 +531,13 @@ class FakeSessions:
     def get_mirror_link(self, key: str) -> Any:
         return self.mirror_links.get(key)
 
+    def set_origin_link(self, key: str, link: Any) -> None:
+        """The in-memory origin record the dispatcher writes beside the mirror bind."""
+        self.origin_links[key] = link
+
+    def get_origin_link(self, key: str) -> Any:
+        return self.origin_links.get(key)
+
     def find_mirror_sessions(self, link: Any, *, inbound_only: bool = False) -> list[str]:
         return [
             key
@@ -504,7 +589,7 @@ class FakeSessions:
     def dequeue(self, key: str) -> Any:
         return self.queued.pop(0) if self.queued else None
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.queued.clear()
 
     def has_session(self, key: str) -> bool:
@@ -1766,14 +1851,68 @@ class TestRenderer:
         assert "<b>after</b>" in out, "prose around it keeps its formatting"
 
     def test_strip_steering_complete_and_unclosed(self) -> None:
-        # Complete marker is removed anywhere in the text.
-        out = _strip_steering("BANANA [STEERING steer-x: rephrase] tail")
+        # Complete marker is removed anywhere in the text. The id is hex because
+        # that is the grammar `messaging.driver` accepts -- the old "steer-x"
+        # fixture was never a frame the driver would have taken.
+        out = _strip_steering("BANANA [STEERING steer-ab12: rephrase] tail")
         assert "STEERING" not in out and out.startswith("BANANA") and out.endswith("tail")
         # UNCLOSED trailing marker (still streaming, no closing "]") is also
         # removed, so the live draft never previews text that on_done strips.
         assert _strip_steering("BANANA\n\n[STEERING steer-abc: interpreted as wanting") == "BANANA"
         # No marker -> unchanged.
         assert _strip_steering("just text") == "just text"
+
+    def test_prose_that_merely_opens_with_the_sentinel_stays(self) -> None:
+        """Opening with the sentinel is not being a marker.
+
+        ``messaging.driver`` already rules that -- it requires ``steer-<id>`` --
+        and so does the dashboard's own parser. A bare ``[STEERING`` class deleted
+        ordinary prose from the delivered message, and because the class does not
+        stop at a line end it ran on to whatever ``]`` came next: here a Markdown
+        link two lines down, taking the text in between with it.
+        """
+        one_line = "Read the [STEERING] section, then [docs](x) for more."
+        assert _strip_steering(one_line) == one_line
+        across_lines = "[STEERING is the feature I mean\n\nsee the [docs](x) for it"
+        assert _strip_steering(across_lines) == across_lines
+
+    def test_a_dashed_steer_id_is_one_frame_to_both_patterns(self) -> None:
+        """``messaging.driver`` accepts ``[0-9a-f-]+`` for the id, so a dashed id
+        is a real frame -- and the two patterns here have to agree about it.
+
+        ``_rotate_at_markers`` reads the summary at the offset the MARKER pattern
+        chose, so an id class the marker accepts and the summary does not leaves
+        the steer chip with no summary at all, which is the only new information
+        that chip carries.
+        """
+        text = "[STEERING steer-a180-ae7f: checked the job id] tail"
+        marker = telegram_renderer._STEER_MARKER_RE.search(text)
+        assert marker is not None
+        summary = telegram_renderer._STEER_SUMMARY_RE.match(text, marker.start())
+        assert summary is not None and summary.group(1) == "checked the job id"
+        assert _strip_steering(text) == "tail"
+
+    def test_the_renderer_patterns_agree_with_the_driver_on_a_frame_corpus(self) -> None:
+        """``messaging.driver`` is the authority on this grammar, so the renderer
+        must not recognise a frame the driver rejects, or reject one it takes."""
+        frames = [
+            "[STEERING steer-ab12: switching to the job id]",
+            "[STEERING steer-a180-ae7f: checked]",
+            "[STEERING steer-ab12: switching to the job id\nand re-running it]",
+            "[STEERING steer-ab12]",
+        ]
+        for frame in frames:
+            assert messaging_driver._STEER_MARKER_RE.match(frame) is not None, frame
+            assert telegram_renderer._STEER_MARKER_RE.fullmatch(frame) is not None, frame
+            assert _strip_steering(f"before {frame} after") == "before  after"
+        not_frames = [
+            "[STEERING]",
+            "[STEERING is the feature I mean]",
+            "[STEERING steer-: nothing]",
+        ]
+        for frame in not_frames:
+            assert messaging_driver._STEER_MARKER_RE.match(frame) is None, frame
+            assert telegram_renderer._STEER_MARKER_RE.search(frame) is None, frame
 
     def _drive(self, events: list[OutputEvent]) -> FakeClient:
         cli = FakeClient()
@@ -3420,10 +3559,11 @@ class TestTelegramMidTurn:
             {"file_id": f"b{i}", "file_name": f"b{i}.jpg", "mime_type": "image/jpeg"}
             for i in range(cap)
         ]
-        # Two albums already sitting in the queue when the turn ends.
+        # Two albums already sitting in the queue when the turn ends. Same sender,
+        # so only the attachment cap can defer them.
         sess.queued = [
-            (str(1), "album A", {"attachments": album_a}),
-            (str(2), "album B", {"attachments": album_b}),
+            (str(1), "album A", {"attachments": album_a, **_origin()}),
+            (str(2), "album B", {"attachments": album_b, **_origin()}),
         ]
         sess._busy = False
 
@@ -3437,7 +3577,7 @@ class TestTelegramMidTurn:
         async def _go() -> None:
             d.handle_message = _spy  # type: ignore[assignment]
             try:
-                await d._drain_queue("k", 7, 7)
+                await d._drain_queue("k")
             finally:
                 d.handle_message = original  # type: ignore[assignment]
 
@@ -3692,6 +3832,136 @@ class TestTelegramMidTurn:
         assert sess.queued == []  # NOT queued
         assert cli.reactions == [(12, _STEER_ACK_EMOJI)]  # steer-ack on the steer message
 
+    # -- the privacy confirmation follows the steer's result -------------------
+
+    @staticmethod
+    def _incognito_steer(steer_result):
+        """A busy session in steer mode, a ``/incognito`` message, and a provider
+        whose steer answers *steer_result* (a bool, or an exception to raise).
+        Returns the dispatcher, the client and the provider's steer log."""
+        from kiro_crew.messaging import privacy_mode
+
+        privacy_mode.reset()
+        d, cli, sess = _dispatcher({7})
+        sess._busy = True
+        d.cfg.messaging.queue_mode = "steer"
+        _prime_live(d.cfg)
+        provider = sess._gp
+        sent_at_steer: list[list[str]] = []
+
+        async def _steer(text: str) -> bool:
+            provider.steered.append(text)
+            sent_at_steer.append([t for t, _ in cli.sent])
+            if isinstance(steer_result, BaseException):
+                raise steer_result
+            return steer_result
+
+        provider.steer = _steer  # type: ignore[method-assign]
+
+        async def _go() -> None:
+            await d.handle_message(
+                TelegramInboundMessage(
+                    channel_type="telegram",
+                    user_id="7",
+                    conversation_id="7",
+                    text="/incognito stop now",
+                    message_id=12,
+                )
+            )
+
+        return d, cli, sess, sent_at_steer, _go
+
+    def test_a_steer_that_raises_keeps_the_mode_and_says_the_message_is_unconfirmed(
+        self,
+    ) -> None:
+        """The reservation applies the mode ahead of the steer; the steer RAISES
+        -- after its bytes may have reached the backend, so nobody knows whether
+        the message is in the turn. Fail-closed: the mode stays on, and the user
+        is told the mode is ON and that the message itself may not have run,
+        through the same producer -- never that the mode was not applied (a
+        message the backend records would then run unprotected). RED-BEFORE:
+        the raise released the mode and announced "not made incognito"."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(RuntimeError("acp gone"))
+        with pytest.raises(RuntimeError, match="acp gone"):
+            asyncio.run(go())
+        texts = [t for t, _ in cli.sent]
+        assert texts == [
+            f"{privacy_mode.NOTICE_INCOGNITO} {privacy_mode.NOTICE_UNCONFIRMED_SUFFIX}"
+        ], f"a raised steer did not keep the mode and say the message is unconfirmed: sent={texts}"
+        assert (
+            list(privacy_mode._tracker("incognito")) != []
+        ), "the mode was taken back over a message the backend may be recording"
+        assert sess.queued == [], "a message whose steer raised was queued anyway"
+
+    def test_a_raised_steer_whose_notice_also_fails_still_raises_its_own_error(
+        self,
+    ) -> None:
+        """The steer RAISES and the confirmation the commit sends fails too (the
+        Bot API is down). The commit records the mode BEFORE it sends, so the
+        notice failure changes nothing about the mode -- and it must not replace
+        the steer's own exception, which is what the caller diagnoses from.
+        RED-BEFORE: the bare ``await commit(...)`` in the ``except BaseException``
+        arm let the sender's error escape, so its ``raise`` never ran and the
+        caller saw the notice failure instead of the steer's."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(RuntimeError("acp gone"))
+        notices: list[str] = []
+
+        async def _down(chat_id: int, text: str, **kw: Any) -> int:
+            notices.append(text)
+            raise OSError("bot api down")
+
+        cli.send_message = _down  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="acp gone"):
+            asyncio.run(go())
+        assert notices == [
+            f"{privacy_mode.NOTICE_INCOGNITO} {privacy_mode.NOTICE_UNCONFIRMED_SUFFIX}"
+        ], f"the unconfirmed notice was not the one attempted: {notices}"
+        assert (
+            list(privacy_mode._tracker("incognito")) != []
+        ), "a failed notice took the mode back over a message the backend may be recording"
+        assert not [
+            k for k in privacy_mode._pending if k[0] == "incognito"
+        ], "the reservation was left pending after its commit"
+        assert sess.queued == [], "a message whose steer raised was queued anyway"
+
+    def test_a_steer_that_declines_confirms_nothing_here(self) -> None:
+        """The provider declines the steer: the message falls through to the queue
+        and runs at the drain, where the modifier is applied and announced. This
+        path says nothing about the mode -- a confirmation here, for a message
+        that has not run, would be false -- and takes the reservation back."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(False)
+        asyncio.run(go())
+        texts = [t for t, _ in cli.sent]
+        assert (
+            privacy_mode.NOTICE_INCOGNITO not in texts
+        ), f"a declined steer left a confirmation: sent={texts}"
+        assert [text for _, text, _ in sess.queued] == ["stop now"], sess.queued
+        assert list(privacy_mode._tracker("incognito")) == [], "the mode was not taken back"
+
+    def test_a_steer_that_lands_is_confirmed_once_after_it_landed(self) -> None:
+        """The confirmation follows the steer's result: one notice, sent AFTER the
+        provider reported the message in the turn -- never before it."""
+        from kiro_crew.messaging import privacy_mode
+
+        d, cli, sess, sent_at_steer, go = self._incognito_steer(True)
+        asyncio.run(go())
+        assert sess._gp.steered == ["stop now"]
+        assert sent_at_steer == [
+            []
+        ], f"the confirmation was sent before the steer reported: at steer={sent_at_steer}"
+        texts = [t for t, _ in cli.sent]
+        assert texts == [
+            privacy_mode.NOTICE_INCOGNITO
+        ], f"one confirmation, after the steer: {texts}"
+        assert list(privacy_mode._tracker("incognito")), "the steered message's mode was not kept"
+        privacy_mode.reset()
+
     def test_busy_queue_mode_enqueues(self) -> None:
         d, cli, sess = _dispatcher({7})
         sess._busy = True
@@ -3726,10 +3996,10 @@ class TestTelegramMidTurn:
 
     def test_drain_collapses_queued_into_one_turn(self) -> None:
         d, cli, sess = _dispatcher({7})
-        sess.queued = [("t1", "first", {}), ("t2", "second", {})]
+        sess.queued = [("t1", "first", _origin()), ("t2", "second", _origin())]
 
         async def _go() -> None:
-            await d._drain_queue("telegram:kirocrew:direct:7", 7, 7)
+            await d._drain_queue("telegram:kirocrew:direct:7")
 
         asyncio.run(_go())
         # All queued messages collapse into ONE combined turn (drain=False ->
@@ -3824,7 +4094,7 @@ class TestTelegramMidTurn:
         # remainder runs in a SECOND turn of the same drain rather than waiting
         # for unrelated future input. A 2+ item remainder is what exposes any
         # FIFO reordering of the surplus.
-        sess.queued = [(f"t{i}", f"m{i}", {}) for i in range(52)]
+        sess.queued = [(f"t{i}", f"m{i}", _origin()) for i in range(52)]
         seen: list[str] = []
         original = d.handle_message
 
@@ -3835,7 +4105,7 @@ class TestTelegramMidTurn:
         async def _go() -> None:
             d.handle_message = _spy  # type: ignore[assignment]
             try:
-                await d._drain_queue("telegram:kirocrew:direct:7", 7, 7)
+                await d._drain_queue("telegram:kirocrew:direct:7")
             finally:
                 d.handle_message = original  # type: ignore[assignment]
 
@@ -3858,9 +4128,9 @@ class TestTelegramMidTurn:
         async def _go() -> None:
             # Build the receipt + queue via the real enqueue path (52 > cap 50).
             for i in range(52):
-                await d._enqueue_with_receipt(key, 7, f"m{i}")
+                await d._enqueue_with_receipt(key, 7, f"m{i}", origin=_tg_origin())
             sess._busy = False  # turn finished
-            await d._drain_queue(key, 7, 7)
+            await d._drain_queue(key)
 
         asyncio.run(_go())
         flips = [txt for _mid, txt, _ in cli.edits if "Now answering" in txt]
@@ -3874,7 +4144,9 @@ class TestTelegramMidTurn:
         sess._busy = False  # turn ended before the mid-turn message could queue
 
         async def _go() -> bool:
-            return await d._enqueue_with_receipt("telegram:kirocrew:direct:7", 7, "late message")
+            return await d._enqueue_with_receipt(
+                "telegram:kirocrew:direct:7", 7, "late message", origin=_tg_origin()
+            )
 
         queued = asyncio.run(_go())
         # enqueue is a no-op once the semaphore is free -> not queued, and no
@@ -4024,6 +4296,186 @@ class TestAutomaticOriginMirror:
         link = sess.mirror_links[d._session_key(("direct", "7"))]
         assert link == ChannelLink("telegram", channel_id="7", thread_id=None)
 
+    def test_inbound_turn_records_this_chat_as_the_origin(self) -> None:
+        # The same conversation the mirror is bound to, recorded as the session's
+        # ORIGIN: the in-memory fact unattended output about the session and the
+        # owner-DM check read. A mirror that equals it is the DM itself; one that
+        # does not is a retarget, and only this record can tell the two apart.
+        d, _cli, sess = _dispatcher({7})
+        self._turn(d)
+        key = d._session_key(("direct", "7"))
+        assert sess.origin_links[key] == ChannelLink("telegram", channel_id="7", thread_id=None)
+        assert sess.origin_links[key] == sess.mirror_links[key]
+
+    def test_forum_turn_records_the_topic_as_the_origin(self) -> None:
+        d, _cli, sess = _dispatcher({7}, allow_forum=True, allowed_forum_chat_ids=[-1001234567890])
+        asyncio.run(
+            d.handle_message(
+                TelegramInboundMessage(
+                    channel_type="telegram",
+                    user_id="7",
+                    conversation_id="-1001234567890",
+                    text="hi",
+                    chat_type="supergroup",
+                    thread_id="5",
+                    message_id=1,
+                )
+            )
+        )
+        key = d._session_key(("forum", "-1001234567890:5"))
+        assert sess.origin_links[key] == ChannelLink(
+            "telegram", channel_id="-1001234567890", thread_id="5"
+        )
+
+    def test_a_unified_bucket_records_no_origin(self) -> None:
+        # ``dm_scope="unified"`` collapses every allowed user's DMs into one
+        # session, so "the origin conversation" has no single answer and recording
+        # one user's chat would aim unattended output at whoever wrote last.
+        d, _cli, sess = _dispatcher({7})
+        d.cfg.messaging.dm_scope = "unified"
+        self._turn(d)
+        assert sess.origin_links == {}
+
+    def test_a_dm_turn_opens_the_crew_log_the_work_ledger_writes_into(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The work ledger is a projection of the crew log: every write appends a
+        ``work/recorded`` entry to the ACTING session's log and rolls the cache back
+        (``crew_log_unrecorded``) when there is nowhere to append. A DM that session
+        control admits as a conductor therefore needs its log to exist before its
+        first ledger call, and only the turn path can create it -- the dashboard
+        runner does so on every turn, and this dispatcher runs its own turn loop.
+
+        Real emitter, real writer, isolated home. The admission itself is another
+        suite's subject (``test_session_control_owner_dm.py``) and is granted here.
+        """
+        import json
+        from unittest.mock import MagicMock
+
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.crew_log import emit, projection
+        from kiro_crew.crew_log.resolve import unit_for_session_key
+        from kiro_crew.dashboard.handlers import work_ledger as ledger_routes
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+        monkeypatch.setattr(emit, "_retry_delay", lambda _attempts: 0.0)
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-owner-dm-turn", raising=False)
+        ledger_routes._BOARD_LOCKS.clear()
+
+        async def _recognized(*a: Any, **k: Any) -> None:
+            return None
+
+        monkeypatch.setattr(ledger_routes, "_recognize_session", _recognized)
+        monkeypatch.setattr(ledger_routes, "_is_restricted_session", lambda *a: False)
+        monkeypatch.setattr(ledger_routes, "_contained_channel_caller", lambda request, sk: "")
+
+        async def _goal_write(sess: Any, key: str) -> tuple[int, dict[str, Any]]:
+            app = web.Application()
+            state = MagicMock()
+            state.sessions = sess
+            app["state"] = state
+            req = make_mocked_request(
+                "POST", "/api/work-ledger/record", app=app, headers={"X-Session-Key": key}
+            )
+            req["internal_auth"] = True
+            req.json = AsyncMock(  # type: ignore[method-assign]
+                return_value={"action": "goal", "goal": "ship it", "round": 1}
+            )
+            resp = await ledger_routes.api_work_ledger_record(req)
+            return resp.status, json.loads(resp.text)
+
+        emit.reset_caches()
+        try:
+            d, _cli, sess = _dispatcher({7})
+            self._turn(d)
+            key = d._session_key(("direct", "7"))
+            unit = unit_for_session_key(sess, key)
+            assert unit == "acp-owner-dm-turn"
+            status, body = asyncio.run(_goal_write(sess, key))
+            assert (status, body.get("code")) == (200, None), body
+
+            handle = projection.open_session_log(unit)
+            assert handle is not None
+            entries = list(handle.iter_from(1, known=projection.KNOWN_TYPES))
+            opened = [e for e in entries if e.type == "session/opened"]
+            assert len(opened) == 1
+            assert opened[0].data["slot"] == key.replace(":", "_")
+            assert "class" not in opened[0].data, "no live policy reader on this builder"
+            assert [e.type for e in entries].count("work/recorded") == 1
+        finally:
+            emit.drain_for_shutdown(timeout=2.0)
+            emit.reset_caches()
+            ledger_routes._BOARD_LOCKS.clear()
+
+    def test_a_recycled_conversation_opens_its_successor_log_citing_the_predecessor(
+        self, monkeypatch
+    ) -> None:
+        """The Telegram twin of the Discord succession pin: what the allocation
+        boundary captured as the store this claim superseded -- after a compaction
+        recycle, the stashed predecessor -- reaches ``on_session_opened`` as
+        ``previous_sid``, consumed after ``get_or_create`` returns, so the successor's
+        log cites the one it replaces. A store without the accessor hands over
+        nothing, never a raise."""
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        opened: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            crew_log_emit,
+            "on_session_opened",
+            lambda session_id, **kw: opened.append((session_id, kw.get("previous_sid", ""))),
+        )
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-gen-2", raising=False)
+        d, _cli, sess = _dispatcher({7})
+        # What the mapping named when the boundary registered this cold start.
+        sess.mapped_sid = lambda key: "acp-gen-1"
+        self._turn(d)
+        assert opened == [("acp-gen-2", "acp-gen-1")]
+        # A store that cannot answer hands over "" -- nothing to follow, never a raise.
+        monkeypatch.setattr(sess, "allocation_predecessor", None)
+        self._turn(d)
+        assert opened[-1] == ("acp-gen-2", "")
+
+    def test_the_opener_states_the_workspace_off_the_conversations_dashboard_slot(
+        self, monkeypatch
+    ) -> None:
+        """The Telegram twin of the Discord one-class pin: ``workspace`` reaches
+        ``on_session_opened`` from the slot the dashboard surfaces this conversation
+        under -- the source a tab on it states the same fact from, so the two
+        writers of one log never take turns recording a move. No slot yet (surfacing
+        follows the first persisted turn) or no state attached states nothing, and a
+        slot answering with something other than a string states nothing rather than
+        its repr."""
+        from types import SimpleNamespace
+
+        from kiro_crew.crew_log import emit as crew_log_emit
+        from kiro_crew.dashboard.channel_slots import channel_slot_name
+
+        stated: list[str] = []
+        monkeypatch.setattr(
+            crew_log_emit,
+            "on_session_opened",
+            lambda session_id, **kw: stated.append(kw.get("workspace", "<absent>")),
+        )
+        monkeypatch.setattr(FakeProvider, "session_id", "acp-ws", raising=False)
+        d, _cli, _sess = _dispatcher({7})
+        key = d._session_key(("direct", "7"))
+        slots: dict[str, object] = {}
+        d.dashboard_state = SimpleNamespace(get_slot=slots.get)
+        self._turn(d)
+        assert stated == [""], "no slot yet: the opening entry states no workspace"
+        slots[channel_slot_name(key)] = SimpleNamespace(workspace="ws-2")
+        self._turn(d)
+        assert stated[-1] == "ws-2"
+        slots[channel_slot_name(key)] = SimpleNamespace(workspace=object())
+        self._turn(d)
+        assert stated[-1] == "", "a non-string answer is not a statement"
+        d.dashboard_state = None
+        self._turn(d)
+        assert stated[-1] == ""
+
     def test_forum_turn_binds_the_topic_not_the_supergroup_general(self) -> None:
         # The bind shares _origin_mirror_link with /link, so a forum turn must
         # carry the Topic id — a General-scoped binding would thread dashboard
@@ -4094,15 +4546,32 @@ class TestAutomaticOriginMirror:
         self._turn(d)
         assert sess.mirror_links == {key: chosen}
 
-    def test_a_binding_for_another_channel_does_not_block_the_bind(self) -> None:
-        # set_channel writes the legacy slack_channel_id for a new telegram
-        # session, so the first turn can see a synthesized non-telegram link.
-        # That says nothing about telegram mirroring and must not suppress it.
+    def test_the_first_turns_bucket_row_does_not_block_the_bind(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # set_channel writes the legacy slack_channel_id bucket for a new telegram
+        # session with no thread. The STORE reads that row as no mirror (a Slack
+        # mirror is never synthesized without a thread), so the first turn's bind
+        # lands; a Slack binding that names a thread is deliberate and is left alone.
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        store = SessionMap()
         d, _cli, sess = _dispatcher({7})
+        sess.get_mirror_link = store.get_mirror_link
+        sess.set_mirror_link = store.set_mirror_link
         key = d._session_key(("direct", "7"))
-        sess.mirror_links[key] = ChannelLink("slack", channel_id="telegram:7")
+        store.set_slack_link(key, "", "telegram:7")
+        assert store.get_mirror_link(key) is None
         self._turn(d)
-        assert sess.mirror_links[key] == ChannelLink("telegram", channel_id="7", thread_id=None)
+        assert store.get_mirror_link(key) == ChannelLink("telegram", channel_id="7", thread_id=None)
+
+        store.set_slack_link(key, "1786300000.000100", "C0OPS")
+        store.clear_mirror_link(key)
+        threaded = store.get_mirror_link(key)
+        assert threaded == ChannelLink("slack", channel_id="C0OPS", thread_id="1786300000.000100")
+        self._turn(d)
+        assert store.get_mirror_link(key) == threaded, "a deliberate binding is never repointed"
 
     def test_the_refusal_survives_a_generation_rotation(self) -> None:
         # /new and the configured idle/daily reset rotate the :genN suffix. Keyed
@@ -4606,31 +5075,392 @@ class TestForumQueueDrain:
     """Fix B: a message queued mid-turn in a forum Topic drains under the FORUM
     session key, not the DM key."""
 
+    def test_the_surface_reports_whether_the_edit_landed(self) -> None:
+        """A rate-limited chat answers a refusal rather than raising, and the registry
+        can only keep that transition retryable if the wrapper reports it."""
+        d, cli, _sess = _dispatcher({7})
+        surface = d._receipt_surface(7, None)
+
+        async def go() -> tuple[bool, bool]:
+            cli.edit_ok = True
+            ok = await surface.edit_receipt(11, "body")
+            cli.edit_ok = False
+            refused = await surface.edit_receipt(11, "body")
+            return ok, refused
+
+        ok, refused = asyncio.run(go())
+        assert ok is True
+        assert refused is False
+
     def test_queued_forum_message_drains_under_forum_key(self) -> None:
         d, cli, sess = _dispatcher({7})
         forum_key = "telegram:kirocrew:forum:-1001234567890:5"
-        # Simulate one message queued mid-turn for this Topic.
-        sess.queued.append(("t0", "queued in the topic", {}))
-        asyncio.run(
-            d._drain_queue(
-                forum_key,
-                7,
-                -1001234567890,
-                chat_type="supergroup",
-                thread="5",
+        # Simulate one message queued mid-turn for this Topic. The Topic rides on the
+        # ENTRY now, not on the drain call: the replay envelope comes from the queued
+        # message's own origin.
+        sess.queued.append(
+            (
+                "t0",
+                "queued in the topic",
+                _origin(7, -1001234567890, thread="5", chat_type="supergroup"),
             )
         )
+        asyncio.run(d._drain_queue(forum_key))
         # The drained turn resolved to the FORUM key (carried via chat_type +
         # thread on the synthetic message), NOT the DM key.
         assert sess.successes == [forum_key]
         assert "telegram:kirocrew:direct:7" not in sess.successes
 
     def test_dm_queue_drains_under_dm_key_regression(self) -> None:
-        # HARD INVARIANT: a DM drain still resolves to the DM key (param defaults).
+        # HARD INVARIANT: a DM drain still resolves to the DM key.
         d, cli, sess = _dispatcher({7})
-        sess.queued.append(("t0", "queued dm", {}))
-        asyncio.run(d._drain_queue("telegram:kirocrew:direct:7", 7, 7))
+        sess.queued.append(("t0", "queued dm", _origin()))
+        asyncio.run(d._drain_queue("telegram:kirocrew:direct:7"))
         assert sess.successes == ["telegram:kirocrew:direct:7"]
+
+
+class TestDrainSenderIdentity:
+    """A queue shared by two people must not be answered as one person.
+
+    Under ``messaging.dm_scope = "unified"`` every allow-listed person's direct chat
+    collapses into one session key -- ``build_dm_session_key`` reduces the bucket to
+    ``unified:{agent}``, dropping both channel and user -- so ONE queue holds messages
+    from several senders. A combined turn carries ONE envelope, so it may only combine
+    messages that share one.
+    """
+
+    _KEY = "unified:kirocrew"
+
+    @staticmethod
+    def _msg(user: int, chat: int, text: str = "", *, message_id: int = 0) -> Any:
+        return TelegramInboundMessage(
+            channel_type="telegram",
+            user_id=str(user),
+            conversation_id=str(chat),
+            text=text,
+            message_id=message_id,
+            chat_type="private",
+        )
+
+    def _queue(self, d: Any, sess: Any, *msgs: Any) -> None:
+        """Queue each message through the REAL enqueue, mid-turn.
+
+        End to end through the production writer, so the recorder and the reader are
+        covered together: an origin nothing reads back is not a fix, and an origin a
+        fixture spells by hand is not evidence production records one.
+        """
+
+        async def _go() -> None:
+            sess._busy = True
+            for msg in msgs:
+                assert await d._enqueue_with_receipt(
+                    self._KEY,
+                    int(msg.conversation_id),
+                    msg.text,
+                    origin=_inbound_origin(msg),
+                ), "the fake session must accept a mid-turn enqueue"
+            sess._busy = False  # the turn they queued behind has finished
+
+        asyncio.run(_go())
+
+    @staticmethod
+    def _drain(d: Any, key: str) -> list[Any]:
+        """Drain, returning the envelope every replayed turn ran under."""
+        seen: list[Any] = []
+        original = d.handle_message
+
+        async def _spy(msg: Any, **kw: Any) -> None:
+            seen.append(msg)
+
+        async def _go() -> None:
+            d.handle_message = _spy
+            try:
+                await d._drain_queue(key)
+            finally:
+                d.handle_message = original
+
+        asyncio.run(_go())
+        return seen
+
+    def test_the_receipt_counts_only_the_answered_senders_own_deferrals(self) -> None:
+        """ "+N deferred" is a promise TO ONE PERSON, so it may only count their messages.
+
+        ``len(remainder)`` also counts the other sender's entries and any entry another
+        TRANSPORT recorded. Each of those drains in its own turn, in its own chat, so
+        showing them here tells this person to expect a follow-up for text they never
+        wrote -- and when their own burst fit in one turn, their true count is zero.
+        """
+        d, _cli, sess = _dispatcher({7, 8}, dm_scope="unified")
+        deferred: list[int] = []
+
+        async def _flip(
+            session_key: str, chat_id: int, answered: list[str], n: int = 0, owner: str = ""
+        ) -> None:
+            deferred.append(n)
+
+        d._receipt_flip_locked = _flip
+        self._queue(
+            d,
+            sess,
+            self._msg(7, 70, "mine", message_id=11),
+            self._msg(8, 80, "theirs", message_id=12),
+        )
+
+        self._drain(d, self._KEY)
+
+        assert deferred == [0, 0], "neither sender has a deferral of their OWN"
+
+    def test_a_senders_own_surplus_is_still_counted(self) -> None:
+        """The guard against fixing the count by always reporting zero."""
+        from kiro_crew.telegram.transport_dispatch import _MAX_COLLAPSE
+
+        d, _cli, sess = _dispatcher({7}, dm_scope="unified")
+        deferred: list[int] = []
+
+        async def _flip(
+            session_key: str, chat_id: int, answered: list[str], n: int = 0, owner: str = ""
+        ) -> None:
+            deferred.append(n)
+
+        d._receipt_flip_locked = _flip
+        self._queue(
+            d,
+            sess,
+            *(self._msg(7, 70, f"m{i}", message_id=i) for i in range(_MAX_COLLAPSE + 2)),
+        )
+
+        self._drain(d, self._KEY)
+
+        assert deferred[0] == 2, "both of this sender's own surplus messages are theirs"
+
+    def test_two_senders_on_one_queue_drain_as_two_turns(self) -> None:
+        """Each drained turn names the sender who wrote its text, in its own chat."""
+        d, cli, sess = _dispatcher({7, 8}, dm_scope="unified")
+        self._queue(
+            d,
+            sess,
+            self._msg(7, 70, "mine", message_id=11),
+            self._msg(8, 80, "and mine", message_id=12),
+        )
+
+        seen = self._drain(d, self._KEY)
+
+        assert [m.text for m in seen] == ["mine", "and mine"], "one turn each, FIFO order"
+        assert [m.user_id for m in seen] == ["7", "8"], "the turn must name its own author"
+        assert [m.conversation_id for m in seen] == ["70", "80"], "and answer in their own chat"
+        assert sess.queued == [], "the pump must drain the deferred entry too, not strand it"
+
+    def test_one_senders_burst_with_distinct_message_ids_still_collapses(self) -> None:
+        """The ordinary case is unchanged: one person's burst is ONE turn.
+
+        The two messages carry DISTINCT ``message_id`` values, because Telegram mints
+        one per message and two real messages never share one. Grouping on a
+        per-message identifier is the trap: it makes one person's own burst compare
+        unequal, so the collapse stops firing and every burst drains as N turns.
+        """
+        d, cli, sess = _dispatcher({7}, dm_scope="unified")
+        first = self._msg(7, 70, "first", message_id=11)
+        second = self._msg(7, 70, "second", message_id=12)
+        assert first.message_id != second.message_id, "the point of this test"
+        self._queue(d, sess, first, second)
+
+        seen = self._drain(d, self._KEY)
+
+        assert [m.text for m in seen] == ["first\n\nsecond"], "the burst must still collapse"
+        assert [m.user_id for m in seen] == ["7"]
+        assert [m.conversation_id for m in seen] == ["70"]
+
+    def test_a_changed_handle_mid_burst_does_not_split_the_turn(self) -> None:
+        """``username`` is a mutable label for a sender ``user_id`` already pins.
+
+        It rides on the origin so the replay is faithful, and stays OUT of the collapse
+        key: a handle changed between two messages would otherwise split one person's
+        burst into two turns.
+        """
+        d, cli, sess = _dispatcher({7}, dm_scope="unified")
+        before = self._msg(7, 70, "first", message_id=11)
+        before.username = "ray"
+        after = self._msg(7, 70, "second", message_id=12)
+        after.username = "raymond"
+        self._queue(d, sess, before, after)
+
+        seen = self._drain(d, self._KEY)
+
+        assert [m.text for m in seen] == ["first\n\nsecond"], "a renamed sender is still one sender"
+        # The replay carries the FIRST entry's handle, which is the envelope it runs
+        # under -- not a merge of the two.
+        assert seen[0].username == "ray"
+
+    def test_a_third_sender_behind_two_does_not_jump_the_queue(self) -> None:
+        """A differing sender defers itself AND everything behind it, so FIFO is exact."""
+        d, cli, sess = _dispatcher({7, 8}, dm_scope="unified")
+        self._queue(
+            d,
+            sess,
+            self._msg(7, 70, "a", message_id=11),
+            self._msg(8, 80, "b", message_id=12),
+            self._msg(7, 70, "c", message_id=13),
+        )
+
+        seen = self._drain(d, self._KEY)
+
+        # "c" is the same sender as "a", but it arrived AFTER "b": collapsing it into
+        # the first turn would answer it ahead of a message that was queued earlier.
+        assert [(m.user_id, m.text) for m in seen] == [("7", "a"), ("8", "b"), ("7", "c")]
+
+    def test_a_deferred_entry_keeps_its_own_origin_when_requeued(self) -> None:
+        """The re-enqueue must carry the origin, or the bug returns one iteration later."""
+        d, cli, sess = _dispatcher({7, 8}, dm_scope="unified")
+        self._queue(
+            d,
+            sess,
+            self._msg(7, 70, "mine", message_id=11),
+            self._msg(8, 80, "theirs", message_id=12),
+        )
+        requeued: list[dict] = []
+        real_enqueue = sess.enqueue
+
+        def _spy(k: str, ts: str, text: str, **kw: Any) -> bool:
+            requeued.append(dict(kw))
+            return real_enqueue(k, ts, text, **kw)
+
+        sess.enqueue = _spy  # type: ignore[method-assign]
+
+        self._drain(d, self._KEY)
+
+        assert requeued, "the differing sender's entry must be re-enqueued, not dropped"
+        # Read back through the production reader rather than by spelling the storage
+        # keys, so renaming one cannot leave this test passing.
+        assert _queued_origin(requeued[0]) == _tg_origin(8, 80)
+
+    def test_the_receipt_is_flipped_in_the_chat_that_holds_its_bubble(self) -> None:
+        """The bubble belongs to whoever queued first, not to whoever opened the turn."""
+        d, cli, sess = _dispatcher({7, 8}, dm_scope="unified")
+        d.cfg.messaging.queue_mode = "queue"
+        _prime_live(d.cfg)
+        self._queue(d, sess, self._msg(8, 80, "held", message_id=12))
+        assert cli.send_chats and cli.send_chats[-1] == 80, "the receipt bubble lives in chat 80"
+
+        self._drain(d, self._KEY)
+
+        flips = [
+            chat
+            for chat, (_mid, text, _markup) in zip(cli.edit_chats, cli.edits)
+            if "Now answering" in text
+        ]
+        assert flips, "the drain must flip the receipt"
+        assert flips[0] == 80, "editing under another chat's address cannot land"
+
+    def test_a_queued_forum_message_replays_under_its_own_topic(self) -> None:
+        """The Topic rides on the entry, so a forum queue keeps its route.
+
+        A forum route never collapses into the unified bucket (``build_dm_session_key``
+        keeps its full ``{channel}:{agent}:{chat_type}:{user}`` bucket regardless of
+        ``dm_scope``), so this pins that recording the route per entry did not lose it.
+        """
+        d, cli, sess = _dispatcher({7}, dm_scope="unified")
+        forum = self._msg(7, -1001234567890, "in the topic", message_id=11)
+        forum.chat_type = "supergroup"
+        forum.thread_id = "5"
+        self._queue(d, sess, forum)
+
+        seen = self._drain(d, self._KEY)
+
+        assert [m.text for m in seen] == ["in the topic"]
+        assert seen[0].chat_type == "supergroup"
+        assert seen[0].thread_id == "5"
+        assert seen[0].conversation_id == "-1001234567890"
+
+    def test_the_collapse_key_drops_only_the_mutable_handle(self) -> None:
+        """The collapse key is every origin field except the ones that are not identity.
+
+        Derived from ``_fields`` rather than restated, so adding a field to
+        ``_QueuedOrigin`` joins the key by default: a WHO field left out would let two
+        people's messages collapse under one identity, while a surplus field only costs
+        a collapse. The exclusion set is pinned because widening it is how that
+        identity bug would return.
+        """
+        assert _NOT_A_SENDER == {"username"}
+        key_fields = tuple(n for n in _QueuedOrigin._fields if n not in _NOT_A_SENDER)
+        assert key_fields == ("user_id", "chat_id", "thread_id", "chat_type")
+        origin = _tg_origin(7, 70, username="ray")
+        assert origin.sender_key == tuple(getattr(origin, n) for n in key_fields)
+        # Same person and chat, renamed: equal keys, unequal origins.
+        renamed = origin._replace(username="raymond")
+        assert renamed.sender_key == origin.sender_key
+        assert renamed != origin
+        # Different person, and the same person in a different place: unequal keys.
+        assert origin._replace(user_id="8").sender_key != origin.sender_key
+        assert origin._replace(chat_id="80").sender_key != origin.sender_key
+        assert origin._replace(thread_id="5").sender_key != origin.sender_key
+        assert origin._replace(chat_type="supergroup").sender_key != origin.sender_key
+
+    def test_an_entry_another_transport_recorded_is_deferred_not_lost(self) -> None:
+        """One queue can hold two transports, and neither may answer the other's.
+
+        Every DM dispatcher is built with the orchestrator's single ``SessionManager``,
+        and ``build_dm_session_key(..., dm_scope="unified", chat_type="direct")``
+        returns ``unified:{agent}`` for EVERY channel -- it drops the channel as well
+        as the user -- so a Telegram DM and a Discord DM to the same agent share one
+        queue. A Discord-recorded entry carries no field Telegram can address, so
+        answering it here would post one transport's reply into another's conversation,
+        and raising on it would discard every message already dequeued this iteration.
+        """
+        d, cli, sess = _dispatcher({7}, dm_scope="unified")
+        foreign = {"discord_user_id": "u1", "discord_channel_id": "c1", "discord_thread_id": ""}
+        assert _queued_origin(foreign) is None, "not this channel's entry to read"
+        sess.queued = [("t0", "theirs", dict(foreign))]
+
+        seen = self._drain(d, self._KEY)
+
+        assert seen == [], "Telegram must not answer a Discord-recorded message"
+        assert [text for _ts, text, _kw in sess.queued] == ["theirs"], "and must not lose it"
+        assert sess.queued[0][2] == foreign, "re-enqueued verbatim, for its own drain"
+
+    def test_a_foreign_entry_does_not_block_this_channels_own_messages(self) -> None:
+        """It steps aside rather than holding the queue: order is per sender, not global.
+
+        Blocking this channel's queue behind a foreign entry would strand it whenever
+        the other transport sends nothing further, and FIFO between two transports is
+        not something either sender can observe -- they are in different apps.
+        """
+        d, cli, sess = _dispatcher({7}, dm_scope="unified")
+        self._queue(d, sess, self._msg(7, 70, "mine", message_id=11))
+        foreign = {"discord_user_id": "u1", "discord_channel_id": "c1", "discord_thread_id": ""}
+        sess.queued.insert(0, ("t-first", "theirs", dict(foreign)))
+
+        seen = self._drain(d, self._KEY)
+
+        assert [m.text for m in seen] == ["mine"], "the foreign entry ahead of it must not block"
+        assert [text for _ts, text, _kw in sess.queued] == ["theirs"], "and stays for its own drain"
+
+    def test_a_partly_recorded_own_entry_is_a_producer_bug_not_a_fallback(self) -> None:
+        """An incomplete origin from THIS channel raises instead of guessing an address.
+
+        Both producers are in this module -- ``_enqueue_with_receipt`` and the drain's
+        own re-enqueue, which passes the entry's payload straight back -- so a partial
+        record can only mean a change here dropped a field. Defaulting to empty strings
+        would address the reply to an empty chat id, a silent misdelivery.
+
+        Ownership is read off the NEUTRAL channel field, which is why an entry can be
+        "mine, and broken" at all: without it, a missing field would be indistinguishable
+        from another transport's entry and would be silently set aside forever.
+        """
+        with pytest.raises(KeyError) as caught:
+            _queued_origin({"queued_channel": "telegram", "telegram_user_id": "7"})
+        assert "telegram_chat_id" in str(caught.value), "the error must name what is missing"
+
+        # An entry naming no channel, or another one, is the OTHER case: not this
+        # dispatcher's, deferred rather than raised on.
+        assert _queued_origin({}) is None
+        assert _queued_origin({"queued_channel": "discord"}) is None
+
+    def test_the_enqueued_entry_records_the_senders_own_origin(self) -> None:
+        """Nothing downstream can recover an origin the entry never carried."""
+        d, cli, sess = _dispatcher({7}, dm_scope="unified")
+        self._queue(d, sess, self._msg(7, 70, "hello", message_id=11))
+
+        assert _queued_origin(sess.queued[0][2]) == _tg_origin(7, 70)
 
 
 class TestForumCallbackGate:
@@ -4750,6 +5580,62 @@ class TestForumCallbackGate:
 
         assert asyncio.run(_go()) is False
         assert cli.answered == []
+
+
+class TestLinkPreviewSuppression:
+    def test_send_message_disables_previews_on_initial_send_and_plain_retry(
+        self, monkeypatch
+    ) -> None:
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return None if len(calls) == 1 else {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        result = asyncio.run(client.send_message(1, "<b>hello</b>", parse_mode="HTML"))
+
+        assert result == 7
+        assert [method for method, _params in calls] == ["sendMessage", "sendMessage"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
+
+    def test_streaming_edit_disables_previews_on_both_attempts(self, monkeypatch) -> None:
+        """A URL appearing mid-stream must not gain a preview on the edit
+        path that the send path already denies (round-8 gpt finding)."""
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return None if len(calls) == 1 else {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        ok = asyncio.run(
+            client.edit_message(1, 7, "<b>https://evil.example</b>", parse_mode="HTML")
+        )
+
+        assert ok is True
+        assert [m for m, _p in calls] == ["editMessageText", "editMessageText"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
+
+    def test_draft_and_rich_paths_disable_previews(self, monkeypatch) -> None:
+        client = TelegramClient(token="12345:testtoken")
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _api(method, params, timeout=30, *, record=True, err_out=None):
+            calls.append((method, dict(params)))
+            return {"message_id": 7}
+
+        monkeypatch.setattr(client, "_api", _api)
+        asyncio.run(client.send_message_draft(1, "d1", "streaming…"))
+        asyncio.run(client.send_rich_message(1, "# heading"))
+
+        assert [m for m, _p in calls] == ["sendMessageDraft", "sendRichMessage"]
+        for _method, params in calls:
+            assert params["link_preview_options"] == {"is_disabled": True}
 
 
 class TestRichMessageAvailabilityLatch:
@@ -5378,3 +6264,340 @@ class TestClientClose:
             assert client._session is None
 
         asyncio.run(_run())
+
+
+class TestRedactionNotice:
+    """A rewritten answer is followed by one threaded notice; clean answers are not.
+
+    Telegram redacts at the seal against the rendered form, so a raw secret fed
+    to the renderer lands as a placeholder — the tally counts each landed frame.
+    Shared wording is pinned in ``test_credential_redaction_notice.py``.
+    """
+
+    _SECRET_URI = "postgresql://user:SuperSecret123@db.example.com:5432/prod"
+
+    def test_redacted_answer_is_followed_by_one_notice(self) -> None:
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            await r.on_text_chunk(f"Run: psql {self._SECRET_URI}")
+            await r.on_done()
+
+        asyncio.run(_go())
+        outbound = [t for t, _kb in cli.sent] + [t for _mid, t, _kb in cli.edits]
+        assert not any("SuperSecret123" in t for t in outbound)
+        notices = [t for t, _kb in cli.sent if "Security notice" in t]
+        assert len(notices) == 1
+        assert "SuperSecret123" not in notices[0]
+        assert cli.sent[-1][0] == notices[0], "the notice lands below the answer"
+
+    def test_clean_answer_sends_no_notice(self) -> None:
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            await r.on_text_chunk("All green, deploy finished.")
+            await r.on_done()
+
+        asyncio.run(_go())
+        assert not any("Security notice" in t for t, _kb in cli.sent)
+
+    def test_notice_send_failure_does_not_fail_a_delivered_turn(self) -> None:
+        class _NoticeFailsClient(FakeClient):
+            async def send_message(self, chat_id: int, text: str, **kw: Any) -> int:
+                if "Security notice" in text:
+                    raise RuntimeError("telegram down after the answer")
+                return await super().send_message(chat_id, text, **kw)
+
+        cli = _NoticeFailsClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+
+        async def _go() -> None:
+            await r.on_text_chunk(f"Run: psql {self._SECRET_URI}")
+            await r.on_done()  # must not raise: the answer above already landed
+
+        asyncio.run(_go())
+        delivered = [t for t, _kb in cli.sent] + [t for _mid, t, _kb in cli.edits]
+        assert any("[REDACTED: credential]" in t for t in delivered)
+
+
+class TestRotationSeamCredentialSafety:
+    """A rotation must not hand the reader a key by putting two bubbles in a row.
+
+    The length cut lands on the RAW buffer and every bubble is redacted ALONE, so a
+    credential the model wrote with markup across the cut matches nothing in either
+    bubble -- and the reader's client renders the markup away and reads the halves
+    as one key, one bubble under the other.
+
+    Telegram budgets the cut against the RENDERED HTML, not the source, so the cut
+    offset is MEASURED here rather than assumed: a fixture that places the key at
+    the source cap sees the splitter cut on its own budget somewhere else, the key
+    lands whole inside one bubble, and the test passes without ever exercising the
+    hazard.
+    """
+
+    _CAP = 400
+
+    def _renderer(self, monkeypatch: pytest.MonkeyPatch) -> tuple[TelegramRenderer, FakeClient]:
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: self._CAP)
+        monkeypatch.setattr(r, "_rendered_limit", lambda: self._CAP)
+        return r, cli
+
+    def _straddling_source(self, head: str, tail: str, filler: str = "a") -> str:
+        """A source whose first splitter boundary falls strictly inside the key.
+
+        One unbroken run of *filler*, so the splitter has no newline to prefer and
+        cuts on the budget. The placement is corrected against the boundary the
+        splitter actually chooses, which differs from the source offset by each
+        shape's own escape and link inflation.
+        """
+        key = head + tail
+        at = self._CAP - len(head)
+        for _ in range(6):
+            src = filler * at + key + filler * (self._CAP // 2)
+            boundary = len(_split_markdown_bounded(src, self._CAP)[0])
+            if at < boundary < at + len(key):
+                return src
+            at -= boundary - at - len(head)
+            assert at > 0, "the boundary cannot be placed inside this shape"
+        raise AssertionError(f"boundary never landed inside {key!r}")
+
+    @staticmethod
+    def _on_screen(frame: str) -> str:
+        """What the reader sees of one bubble: Telegram's HTML, rendered.
+
+        The seal ships HTML, so the raw frame keeps a key apart with the very tags
+        that vanish on screen -- ``AKIA</a>IOSFODNN7EXAMPLE`` matches nothing while
+        the reader reads one key straight through it.
+        """
+        return html.unescape(re.sub(r"<[^>]+>", "", frame))
+
+    def _assert_no_key_on_screen(self, frames: list[str]) -> None:
+        shown = [self._on_screen(f) for f in frames]
+        for reading in (
+            canonicalize_display("".join(shown)),
+            "".join(canonicalize_display(f) for f in shown),
+        ):
+            assert _default_redactor(reading) == reading, f"key readable across frames: {shown}"
+
+    @pytest.mark.parametrize(("head", "tail"), CREDENTIAL_STRADDLE_SHAPES)
+    def test_a_straddled_credential_never_reaches_two_bubbles(
+        self, monkeypatch: pytest.MonkeyPatch, head: str, tail: str
+    ) -> None:
+        rejoined = (
+            canonicalize_display(head + tail),
+            canonicalize_display(head) + canonicalize_display(tail),
+        )
+        assert any(_default_redactor(r) != r for r in rejoined), "fixture is not a straddle"
+
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [self._straddling_source(head, tail)]
+
+        async def _go() -> None:
+            await r._rotate_on_length()
+            await r._seal_current(extract_uploads=False)
+
+        asyncio.run(_go())
+        frames = [text for text, _kb in cli.sent]
+        assert frames, "nothing was delivered at all"
+        self._assert_no_key_on_screen(frames)
+
+    def test_an_innocent_body_still_rotates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Control: the grading refuses boundaries, it does not stop rotating."""
+        r, cli = self._renderer(monkeypatch)
+        r._buf = ["word " * 400]
+        asyncio.run(r._rotate_on_length())
+        assert cli.sent, "an innocent body was withheld"
+
+    def test_a_boundary_is_graded_on_the_text_the_seal_delivers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whitespace between the halves is gone by the time the reader sees them.
+
+        The seal delivers ``_segment_text().strip()``, and both ``_strip_steering``
+        and ``_strip_hr`` end in a strip of their own. Graded raw, these two chunks
+        are separated by a newline and an indent and no credential pattern matches --
+        none tolerates whitespace. Delivered, the indent is gone and the two bubbles
+        sit flush together.
+        """
+        r, cli = self._renderer(monkeypatch)
+        r._buf = ["a" * (self._CAP - 8) + "AKIAIOSF" + "\n    ODNN7EXAMPLE" + " tail" * 40]
+
+        async def _go() -> None:
+            await r._rotate_on_length()
+            await r._seal_current(extract_uploads=False)
+
+        asyncio.run(_go())
+        frames = [text for text, _kb in cli.sent]
+        assert len(frames) >= 2, f"fixture did not rotate into separate bubbles: {len(frames)}"
+        self._assert_no_key_on_screen(frames)
+
+    def test_the_fallback_offset_is_one_the_caller_can_take(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The search must grade the DELIVERED form, or the segment deadlocks.
+
+        Graded raw, the budget offset looks safe here -- a newline and an indent sit
+        between the halves and no credential pattern tolerates whitespace -- so the
+        exponential back-off never runs and the first sample is returned. A caller
+        that then re-graded in delivered form would reject it, and because the search
+        is deterministic it would get the same answer on every later rotation: the
+        segment would never go out at all.
+        """
+        raw = "a" * (self._CAP - 8) + "AKIAIOSF" + "\n    ODNN7EXAMPLE" + " tail" * 40
+        raw_offset = safe_split_offset(raw, self._CAP, _default_redactor)
+        assert not joins_to_a_credential(
+            raw[:raw_offset], raw[raw_offset:], _default_redactor
+        ), "fixture no longer exercises the raw-vs-delivered gap"
+        assert joins_to_a_credential(
+            _delivered_form(raw[:raw_offset]),
+            _delivered_form(raw[raw_offset:]),
+            _default_redactor,
+        ), "fixture no longer exercises the raw-vs-delivered gap"
+
+        shown = safe_split_offset(raw, self._CAP, _default_redactor, _delivered_form)
+        assert shown, "the delivered-form search withheld instead of stepping back"
+        assert shown != raw_offset, "the delivered-form search returned the raw answer"
+        assert not joins_to_a_credential(
+            _delivered_form(raw[:shown]), _delivered_form(raw[shown:]), _default_redactor
+        ), "the offset the search returned still severs a key once delivered"
+
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [raw]
+        asyncio.run(r._rotate_on_length())
+        assert cli.sent, "the rotation withheld on an offset it could have taken"
+
+    def _three_piece_rule_source(self) -> str:
+        """A prefix the splitter cuts into three pieces, raw-clean, shown-severing.
+
+        The rules are LONG on purpose. A short ``---`` leaves the middle fragment
+        packed into the same chunk as the last one, where the blank line between
+        them survives canonicalising and no key forms; a rule sized against the
+        budget is what puts the middle fragment in a chunk of its OWN, and
+        ``_strip_hr`` erases the rule on delivery so that chunk shows the fragment
+        alone. Measured, not assumed -- the precondition is asserted below.
+        """
+        bar = "-" * 120
+        pad = "a" * 330
+        return pad + "\nAKIAIOS\n\n" + bar + "\n\nFODNN7\n\n" + bar + "\n\nEXAMPLE\n" + "b" * 330
+
+    def test_the_held_image_prefix_is_graded_as_a_sequence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The upload-hold branch seals its whole prefix; it must grade it first.
+
+        That branch keeps the image reference and everything after it in the live
+        tail and seals every chunk before it, then returns -- ahead of the length
+        path's own delivered-form sequence grade. The two gradings that do run are
+        blind to this shape: the splitter reads the RAW pieces, where the rules
+        still stand between the fragments, and the seam repair reads the delivered
+        form but against ONE predecessor only. A key whose fragments sit across
+        three pieces separated by rules is clean in both, and flush on screen.
+        """
+        prefix = self._three_piece_rule_source()
+        chunks = _split_markdown_bounded(prefix, self._CAP)
+        assert len(chunks) >= 3, f"fixture did not reach three pieces: {len(chunks)}"
+        assert not severs_a_credential(
+            chunks, _default_redactor
+        ), "fixture no longer hides the key from the raw grade"
+        assert severs_a_credential(
+            chunks, _default_redactor, _delivered_form
+        ), "fixture no longer severs a key once delivered"
+
+        r, cli = self._renderer(monkeypatch)
+        monkeypatch.setattr(r, "_uploads_enabled", lambda: True)
+        r._buf = [prefix + "\n![shot](/tmp/shot.png)"]
+
+        asyncio.run(r._rotate_on_length())
+
+        assert r._buf and r._buf[0].lstrip().startswith(
+            "!["
+        ), f"the upload-hold branch was not taken: {r._buf!r}"
+        frames = [text for text, _kb in cli.sent]
+        self._assert_no_key_on_screen(frames)
+
+    def test_a_markup_span_covering_a_whole_piece_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Piece length is no defence: canonicalising DROPS a link's target.
+
+        No neighbouring PAIR of these three pieces reveals anything -- the link needs
+        its closing bracket, which is in the third -- while the full join collapses
+        the url to its label and puts that label against ``AKIA``.
+        """
+        r, cli = self._renderer(monkeypatch)
+        r._buf = [
+            "a" * (self._CAP - 4) + "AKIA[IOSFODNN7EXAMPLE](http://q/" + "b" * self._CAP + ") rest"
+        ]
+
+        async def _go() -> None:
+            await r._rotate_on_length()
+            await r._seal_current(extract_uploads=False)
+
+        asyncio.run(_go())
+        frames = [text for text, _kb in cli.sent]
+        assert frames, "nothing was delivered at all"
+        self._assert_no_key_on_screen(frames)
+
+    def test_a_safe_head_that_renders_over_the_cap_is_shrunk_not_abandoned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Escaping inflates, so the source-budget offset can still render too long.
+
+        The offset is bounded by the SOURCE budget while the cap applies to the
+        rendered HTML, so a head that severs nothing can still be over-cap. The
+        rotation shrinks the budget by the inflation it measured and looks again,
+        rather than holding the whole buffer -- a deferral delivers nothing at all.
+
+        Its own budgets, because the shared ``_CAP`` equals ``_MIN_SPLIT_LIMIT``:
+        with no room above the splitter's floor there is nowhere to shrink to, and a
+        buffer that inflates past the cap at the floor is genuinely indivisible.
+        """
+        limit, cap = 800, 2400  # 5x escape inflation leaves room above the 400 floor
+        cli = FakeClient()
+        r = TelegramRenderer(cli, 55, TELEGRAM_CAPABILITIES, session_key="telegram:1:0")  # type: ignore[arg-type]
+        monkeypatch.setattr(r, "_limit", lambda: limit)
+        monkeypatch.setattr(r, "_rendered_limit", lambda: cap)
+
+        # The key straddles a NEWLINE, which the splitter prefers as a break, so the
+        # severing boundary needs no arithmetic. The leading `&` run is what makes a
+        # head bounded by the source budget render past the cap.
+        src = "&" * 600 + "AKIAIOSF" + "\n" + "ODNN7EXAMPLE" + "a" * 2000
+        assert _rendered_len(src[:limit]) > cap, "fixture head does not inflate past the cap"
+        r._buf = [src]
+
+        asyncio.run(r._rotate_on_length())
+        rotated = [text for text, _kb in cli.sent]
+        assert rotated, "the rotation gave up instead of shrinking to a safe cut"
+        for frame in rotated:
+            assert len(frame) <= cap, f"a rotated frame rendered past the cap: {len(frame)}"
+
+        asyncio.run(r._seal_current(extract_uploads=False))
+        self._assert_no_key_on_screen([text for text, _kb in cli.sent])
+
+    def test_a_retained_buffer_holds_only_source_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whatever is kept live must be a SLICE of the source, never rejoined chunks.
+
+        ``_split_markdown`` closes an open fence at the seal and reopens it in the
+        next chunk, so rejoining chunks would leave literal backticks the model never
+        wrote in the buffer the user is eventually sent.
+        """
+        src = (
+            "a" * (self._CAP - 8)
+            + "AKIAIOSF"
+            + "ODNN7EXAMPLE"
+            + "\n\n```py\n"
+            + "x = 1\n" * 40
+            + "```\n\ntail "
+            + "c" * self._CAP
+        )
+        r, _cli = self._renderer(monkeypatch)
+        r._buf = [src]
+        asyncio.run(r._rotate_on_length())
+        retained = "".join(r._buf)
+        assert retained in src, "retained buffer is not a slice of the source"

@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 from kiro_crew import github_runner
 from kiro_crew.dashboard.urls import is_loopback
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.platform.governance_profiles import (
     GOVERNANCE_ERROR_REASON,
     governance_permits,
@@ -48,6 +49,7 @@ from kiro_crew.platform.governance_profiles import (
 )
 from kiro_crew.platform_compat import IS_POSIX
 from kiro_crew.sandbox import scrub_env
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 if TYPE_CHECKING:
     from aiohttp import web
@@ -200,7 +202,7 @@ def _run_json_detail(args: list[str]) -> tuple[Any | None, bool]:
         proc = subprocess.run(  # noqa: S603 - vetted absolute binary, fixed argv, no shell
             [cli, *args],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=_CLI_TIMEOUT_SECS,
             check=False,
             # Defence in depth behind the pinned binary above: even a legitimate
@@ -218,7 +220,9 @@ def _run_json_detail(args: list[str]) -> tuple[Any | None, bool]:
             "tailscale %s exited %d: %s",
             " ".join(args),
             proc.returncode,
-            (proc.stderr or "").strip()[:200],
+            # Whole stream redacted first (an auth-key URL can appear in
+            # tailscale's stderr), then the tail where the error is printed.
+            redact_log_via_context((proc.stderr or "").strip())[-200:],
         )
         return None, False
     try:

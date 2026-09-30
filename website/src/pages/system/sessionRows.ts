@@ -16,6 +16,7 @@
  */
 import { api } from '../../api/client'
 import { fmtDuration, fmtNumber, fmtPercent, fmtUnit, type FormatUnit } from '../../i18n/format'
+import { nestsUnder } from '../../lib/sessionLineage'
 
 type Payload = Awaited<ReturnType<typeof api.sessionsMemory>>
 export type SessionPayloadRow = Payload['sessions'][number]
@@ -40,6 +41,14 @@ export interface SessionRow {
   pid: number | null
   /** Runtime is multiplexed, so this row's numbers are an attributed share. */
   shared: boolean
+  /**
+   * How many live sessions share this row's runtime; 1 when exclusive.
+   *
+   * The de-duplication key for any column whose per-row value is the RUNTIME's
+   * figure rather than the session's (`procs`, `mcp`): a group total must add
+   * such a column once per runtime, not once per co-tenant.
+   */
+  sharers: number
   /** Route to the row's chat window, or null when it has none to open. */
   href: string | null
   /**
@@ -191,6 +200,10 @@ function taskRow(t: TaskPayloadRow): SessionRow {
     uptimeS: t.started_at ? Date.now() / 1000 - t.started_at : null,
     pid: t.pid,
     shared: t.shared,
+    // A shared task rides its parent's runtime, so it is one of at least two
+    // tenants. The exact count is not on the task payload; 2 is enough for the
+    // only thing this feeds, which is de-duplicating by pid.
+    sharers: t.shared ? 2 : 1,
     href: null,
     parent: null,
     nested: false,
@@ -213,7 +226,10 @@ function sessionRow(s: SessionPayloadRow): SessionRow {
     turns: s.turns ?? null,
     uptimeS: s.uptime_s,
     pid: s.pid,
-    shared: !s.owns_runtime,
+    // From the COUNT, not from `owns_runtime`: that flag is false only on the
+    // joiners, so it left the founder's row claiming an exclusive process.
+    shared: (s.sharers ?? 1) > 1,
+    sharers: s.sharers ?? 1,
     href: sessionChatPath(s.key),
     parent: s.parent ?? null,
     nested: false,
@@ -223,35 +239,13 @@ function sessionRow(s: SessionPayloadRow): SessionRow {
 /**
  * The session a row nests under, or null when it is a top-level row.
  *
- * The backend already resolved `parent.key` to a LIVE creator (null when the
- * creator is not running, or when the crew logs formed a cycle), so the edge is
- * followed as given. Two things are still refused here, because a table must
- * never fail to paint on a payload it did not produce: a key that names no row
- * in this payload, and a chain that returns to its own start. A member of such a
- * chain becomes a top-level row; a row that merely hangs off the chain keeps
- * its edge, since its parent is now a root.
+ * `nestsUnder` itself now lives in `../../lib/sessionLineage` and is shared with the
+ * chat sidebar's conductor lane, which nests on the same edge from a different payload
+ * (bare slot keys off the slots broadcast, rather than `dashboard:` session keys from
+ * `/api/sessions/memory`). Two copies would let the two views nest the same gateway
+ * differently, and a reader comparing them would have no way to tell which was right.
+ * See that module for the cycle and unknown-key rules.
  */
-function nestsUnder(
-  session: SessionPayloadRow,
-  byKey: Map<string, SessionPayloadRow>,
-): string | null {
-  const parentKey = session.parent?.key ?? null
-  if (parentKey == null || parentKey === session.key || !byKey.has(parentKey)) return null
-  const seen = new Set<string>()
-  let cursor: string | null = parentKey
-  while (cursor != null) {
-    if (cursor === session.key) return null
-    // Some OTHER key repeats: the chain leads into a cycle this row is not on.
-    // Its members detach themselves (each sees its own key come back), so this
-    // row's parent is, or hangs off, a root -- the edge is safe to keep.
-    if (seen.has(cursor)) break
-    seen.add(cursor)
-    const next: SessionPayloadRow | undefined = byKey.get(cursor)
-    const nextKey = next?.parent?.key ?? null
-    cursor = nextKey != null && nextKey !== next?.key && byKey.has(nextKey) ? nextKey : null
-  }
-  return parentKey
-}
 
 /**
  * Sessions + tasks -> the tree TanStack Table consumes.
@@ -307,4 +301,53 @@ export function columnMaxima(rows: SessionRow[]): { rssMb: number | null; cpuCor
   }
   for (const r of rows) visit(r)
   return { rssMb, cpuCores }
+}
+
+/**
+ * Sum of a RUNTIME-level count over grouped rows, adding each runtime once.
+ *
+ * `procs` and `mcp` are the runtime's own totals, reported whole on every
+ * co-tenant row (dividing a count of 3 processes between 3 sessions describes
+ * nothing). A plain sum therefore multiplies a shared runtime by its tenant
+ * count: 23 co-tenants of one 9-process runtime added to 207 processes that do
+ * not exist. De-duplicating on the pid makes the group total the number of real
+ * objects, which is what the column claims to be.
+ *
+ * Only for these two columns. `rssMb`/`cpuCores` arrive already divided by the
+ * sharer count, so their plain sum is correct and de-duplicating them would
+ * UNDER-count — it would keep one co-tenant's share and drop the rest.
+ * `credits`/`turns` are genuinely per session and additive.
+ *
+ * A row with no pid cannot be de-duplicated, so it is counted on its own: an
+ * unmeasured runtime is not evidence of a shared one. Returns null when no row
+ * carries a value, keeping "not measured" distinct from zero.
+ *
+ * Takes `(pid, value)` pairs rather than rows so the column's group aggregate
+ * and the table footer's own total share ONE implementation: both read the same
+ * figure, and a second copy of this rule is a second place to forget it.
+ */
+export function sumOncePerRuntime(
+  entries: Iterable<readonly [number | null | undefined, number | null | undefined]>,
+): number | null {
+  let total = 0
+  let measured = false
+  const countedPids = new Set<number>()
+  for (const [pid, value] of entries) {
+    if (value == null) continue
+    if (pid != null) {
+      if (countedPids.has(pid)) continue
+      countedPids.add(pid)
+    }
+    total += value
+    measured = true
+  }
+  return measured ? total : null
+}
+
+/** {@link sumOncePerRuntime} over grouped table rows, for a column aggregate. */
+export function aggregateOncePerRuntime(
+  columnId: 'procs' | 'mcp',
+  leafRows: { original: SessionRow }[],
+): number | null {
+  return sumOncePerRuntime(leafRows.map(r => [r.original.pid, r.original[columnId]] as const))
 }

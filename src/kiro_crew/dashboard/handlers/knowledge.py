@@ -18,16 +18,21 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew._sqlite_compat import fts5_segment_for_index, sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
 from kiro_crew.dashboard import part_stream
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.handlers._shared import (
+    read_bounded_json,
+    require_owner_dashboard_request,
+)
 from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
 )
+from kiro_crew.dashboard.origin import is_direct_local_request
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.knowledge.agent_fetch import fetch_url_content
 from kiro_crew.knowledge.agent_source import add_agent_document
@@ -61,6 +66,7 @@ from kiro_crew.knowledge.retrieval import HybridRetriever, vector_leg
 from kiro_crew.knowledge.spend import source_spend
 from kiro_crew.knowledge.store import (
     AUTO_REGISTRATION_RETIRED_PROP,
+    BUNDLE_STATE_KEY_COL,
     KnowledgeBundleError,
 )
 from kiro_crew.knowledge.sync import SyncScheduler
@@ -108,15 +114,45 @@ async def _audited_write(fn, *, event: str, fields=None):
     return await asyncio.to_thread(_write_and_audit)
 
 
-_BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations", "mentions")
+_BUNDLE_LIST_FIELDS = ("items", "entities", "relations", "sources", "source_locations",
+                       "mentions", *BUNDLE_STATE_KEY_COL)
 # The fields import_bundle's redaction loops pass to _redact(); each has to be
 # a string or null before it reaches _redact() -> redact_exfiltration_urls(),
 # whose regex .finditer() raises an unhandled TypeError on anything else.
+#
+# A state row's display name and document locator are text another instance wrote,
+# so they go through the same redaction as an item's title. ``file_path`` does not:
+# it is half of a PRIMARY KEY that the folder scan matches against a real path on
+# disk, and rewriting it would leave the row unable to match its own file, which is
+# how a file gets ingested a second time.
 _BUNDLE_REDACTED_FIELDS = {
     "items": ("title", "summary", "content"),
     "entities": ("name", "description"),
     "relations": ("relation_type", "description"),
+    "artifact_item_state": ("name",),
+    "agent_item_state": ("name", "source_uri"),
 }
+
+#: Per-document state columns the validator type-checks without redacting them.
+#: ``file_path`` and the key columns land in a PRIMARY KEY, so they have to be real
+#: text. ``mtime`` is absent on purpose: it is host-local and the importer writes a
+#: fixed value rather than reading the bundle's, so its shape does not matter.
+_BUNDLE_STATE_PLAIN_FIELDS = {
+    "folder_file_state": ("file_path", "content_hash", "text_hash", "last_seen"),
+    "artifact_item_state": ("slug", "content_hash", "updated_at", "kind"),
+    "agent_item_state": ("slug", "content_hash", "updated_at"),
+}
+
+#: Fields of an ``import_bundle`` ``withheld`` entry that carry BUNDLE-AUTHORED text,
+#: redacted on the way OUT rather than on the way in. Every one of them is a value the
+#: store has to keep byte-exact -- a document key lands in a PRIMARY KEY matched against
+#: a real slug or path, and the ids are matched against ``items.id`` -- which is why
+#: ``_BUNDLE_STATE_PLAIN_FIELDS`` deliberately exempts them from the inbound loop. That
+#: leaves the response as the one place bundle text reaches a reader unfiltered: a
+#: document key is unbounded, and the whole account is returned verbatim by
+#: ``web.json_response``. The SEL copy is already covered by ``_redact_and_clip``.
+#: ``reason`` and ``table`` are module constants, so neither is listed.
+_WITHHELD_REDACTED_FIELDS = ("key", "items", "item_id", "source_id")
 
 
 def _validate_knowledge_bundle(body: object) -> str | None:
@@ -176,7 +212,33 @@ def _validate_knowledge_bundle(body: object) -> str | None:
             return "'entities.aliases' must be valid JSON"
         if not isinstance(parsed, list) or not all(isinstance(a, str) for a in parsed):
             return "'entities.aliases' must be a JSON array of strings"
+    for field, keys in _BUNDLE_STATE_PLAIN_FIELDS.items():
+        for entry in body.get(field, []):
+            for key in keys:
+                value = entry.get(key)
+                if value is not None and not isinstance(value, str):
+                    return f"'{field}.{key}' must be a string or null"
     return None
+
+
+async def _require_knowledge_owner(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate for the mutating knowledge routes, or ``None`` to proceed.
+
+    Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    the class ``is_owner_dashboard_request`` can rule on at all, so only that
+    class is gated here. Every caller whose ``app`` is not ``""`` passes this
+    gate and stays under the control that already governs it:
+
+    - an app token (the Notes app declares ``/api/knowledge``) is confined to
+      its manifest's declared paths by ``_enforce_app_scope``;
+    - an ``X-Internal-Secret`` loopback caller is admitted on the secret
+      itself. ``token_auth`` leaves ``app`` absent for a caller acting as the
+      person, and sets ``app`` to the owning app's id for a caller it resolves
+      to an app; neither arm runs ``_enforce_app_scope``.
+    """
+    if request.get("app") != "":
+        return None
+    return await require_owner_dashboard_request(request, operation)
 
 
 def _store(request: web.Request):
@@ -634,6 +696,9 @@ async def get_item(request: web.Request) -> web.Response:
 
 async def update_item(request: web.Request) -> web.Response:
     """PATCH /api/knowledge/items/{id} -- update fields."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.item.update")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     item_id = request.match_info["id"]
     if not await asyncio.to_thread(store.get_item, item_id):
@@ -654,6 +719,9 @@ async def update_item(request: web.Request) -> web.Response:
 
 async def delete_item(request: web.Request) -> web.Response:
     """DELETE /api/knowledge/items/{id}."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.item.delete")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     item_id = request.match_info["id"]
     item = await asyncio.to_thread(store.get_item, item_id)
@@ -1168,16 +1236,43 @@ _FOLDER_DIALOG_TIMEOUT = 180  # seconds
 def _folder_picker_available(request: web.Request) -> bool:
     """The native folder picker is offered only on macOS (via osascript) and
     only when the dashboard is local -- a dialog on a remote gateway would open
-    on the wrong screen."""
-    return sys.platform == "darwin" and bool(request.app.get("local_only", False))
+    on the wrong screen.
+
+    It also requires osascript to resolve out of the fixed system directories.
+    A host where it does not hides the button rather than offering one whose
+    only possible answer is a refusal."""
+    if sys.platform != "darwin" or not bool(request.app.get("local_only", False)):
+        return False
+    if platform_compat.trusted_system_bin("osascript") is None:
+        return False
+    # `local_only` is necessary but not sufficient: it describes how the GATEWAY
+    # was started, not where THIS request came from. The gateway binds loopback
+    # and remote access is delivered by a same-host tunnel or reverse proxy, so a
+    # remote user's request arrives from a loopback peer with `local_only` still
+    # True. A host-side native dialog must never open for such a request -- it
+    # would appear on the gateway operator's screen, not the requester's, and
+    # block there for up to `_FOLDER_DIALOG_TIMEOUT`. Require a DIRECT local
+    # request too, so a proxied one fails the gate and falls back to the
+    # typed-path route. The sibling project picker in `handlers/files.py`
+    # gates on the same helper for the same reason.
+    return is_direct_local_request(request)
 
 
 def _run_folder_dialog() -> str | None:
     """Open the macOS native folder chooser (blocking) and return the selected
     absolute path, or None if the user cancelled or it failed to launch. Meant
-    to run off the event loop via an executor."""
+    to run off the event loop via an executor.
+
+    The binary is resolved from the fixed system directories rather than PATH: a
+    gateway's PATH can lead with an agent-writable directory, so a bare argv name
+    lets a planted shim run with the gateway's environment and outside the
+    sandbox. An unresolvable osascript reads as "failed to launch", which is what
+    it is -- the spawn does not happen at all."""
+    osascript = platform_compat.trusted_system_bin("osascript")
+    if osascript is None:
+        return None
     cmd = [
-        "osascript", "-e",
+        osascript, "-e",
         'POSIX path of (choose folder with prompt '
         '"Select a folder to add to your knowledge base")',
     ]
@@ -1199,6 +1294,9 @@ async def pick_folder(request: web.Request) -> web.Response:
     Offered only on a local macOS dashboard (see _folder_picker_available). The
     returned path is not trusted -- it is fed back into the folder path field and
     re-validated by add_source like any typed path."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.pick_folder")
+    if owner_denied is not None:
+        return owner_denied
     if not _folder_picker_available(request):
         return web.json_response(
             {"error": "Folder picker is not available on this system"},
@@ -1213,6 +1311,9 @@ async def pick_folder(request: web.Request) -> web.Response:
 
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.add")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
@@ -1529,6 +1630,9 @@ async def _hand_off_under_gate(  # type: ignore[no-untyped-def]
 
 async def sync_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/sync -- trigger sync for a source."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.sync")
+    if owner_denied is not None:
+        return owner_denied
     pipeline = _pipeline(request)
     if pipeline is None:
         return await _sync_source_body(request)
@@ -1592,8 +1696,16 @@ async def _sync_source_body(request: web.Request) -> web.Response:
         return web.json_response({"error": "pipeline not configured"}, status=503)
     pool = request.app.get("knowledge_fetch_pool")
     if pool is None:
-        # Compatibility for minimal callers that predate workload-isolated pools.
-        pool = request.app["knowledge_llm_pool"]
+        # Every production construction site sets knowledge_fetch_pool; a
+        # minimal/hand-built app missing it fails loudly rather than silently
+        # running URL sync through the extraction pool.
+        return web.json_response(
+            {
+                "error": "knowledge_fetch_pool is not configured on this application",
+                "code": "knowledge_fetch_pool_unavailable",
+            },
+            status=503,
+        )
     await _hand_off_under_gate(
         request, pipeline,
         lambda settled: _background_agent_sync(
@@ -1679,6 +1791,9 @@ async def _background_agent_sync(  # type: ignore[no-untyped-def]
 
 async def delete_source(request: web.Request) -> web.Response:
     """DELETE /api/knowledge/sources/{id} -- remove a source and its items."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.delete")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     row = await asyncio.to_thread(_source_row, store, source_id)
@@ -1702,6 +1817,9 @@ async def rename_source(request: web.Request) -> web.Response:
 
     Only ``name`` is editable; ``uri`` (the source identity) stays immutable.
     """
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.rename")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     if not await asyncio.to_thread(_source_row, store, source_id):
@@ -1817,6 +1935,9 @@ def _track_scan_task(app: web.Application, task: asyncio.Task) -> None:  # type:
 
 async def confirm_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/confirm -- confirm and start scanning."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.confirm")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     outcome, row, props = await asyncio.to_thread(
@@ -1841,6 +1962,9 @@ async def confirm_source(request: web.Request) -> web.Response:
 
 async def pause_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/pause -- pause active scan."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.pause")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     if not await asyncio.to_thread(_pause_source_row, store, source_id):
@@ -1850,6 +1974,9 @@ async def pause_source(request: web.Request) -> web.Response:
 
 async def resume_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/resume -- resume paused scan."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.resume")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     outcome, row, props = await asyncio.to_thread(
@@ -1901,6 +2028,9 @@ async def list_source_files(request: web.Request) -> web.Response:
 
 async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.file_retry")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     body, body_err = await read_bounded_json(request, max_bytes=None)
@@ -1921,6 +2051,9 @@ async def retry_file(request: web.Request) -> web.Response:
 
 async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.file_skip")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     source_id = request.match_info["id"]
     body, body_err = await read_bounded_json(request, max_bytes=None)
@@ -1941,6 +2074,9 @@ async def skip_file(request: web.Request) -> web.Response:
 
 async def ingest_text(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/ingest-text -- agent submits fetched text."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.source.ingest_text")
+    if owner_denied is not None:
+        return owner_denied
     source_id = request.match_info["id"]
     store = _store(request)
     pipeline = _pipeline(request)
@@ -2122,6 +2258,9 @@ def _inspect_zip_archive(path: str) -> str | None:
 
 async def ingest_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/ingest -- multipart file upload."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.ingest")
+    if owner_denied is not None:
+        return owner_denied
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "ingestion pipeline not configured"}, status=503)
@@ -2389,6 +2528,9 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
+    owner_denied = await _require_knowledge_owner(request, "knowledge.import")
+    if owner_denied is not None:
+        return owner_denied
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
@@ -2415,6 +2557,12 @@ async def import_bundle(request: web.Request) -> web.Response:
         redacted_type = _redact(rel.get("relation_type"))
         rel["relation_type"] = redacted_type if redacted_type is not None else ""
         rel["description"] = _redact(rel.get("description"))
+    for field, keys in _BUNDLE_REDACTED_FIELDS.items():
+        if field not in BUNDLE_STATE_KEY_COL:
+            continue
+        for row in body.get(field, []):
+            for key in keys:
+                row[key] = _redact(row.get(key))
     store = _store(request)
 
     # BEGIN IMMEDIATE takes the write lock eagerly (busy_timeout 10s) and a
@@ -2474,6 +2622,20 @@ async def import_bundle(request: web.Request) -> web.Response:
             {"error": "internal server error", "code": "knowledge_import_failed"},
             status=500,
         )
+    # The withheld account names the content that did not arrive, and it names it in the
+    # bundle's OWN words: a document key and the item ids it claimed. Those are the
+    # values the inbound loop leaves alone on purpose, because the store matches them
+    # against a PRIMARY KEY and against ``items.id`` and so needs them byte-exact --
+    # which makes this response the one path on which bundle-authored text reaches a
+    # reader unfiltered. Redacted HERE, after the store has used and stored the real
+    # values, so the rule the loop above applies to ``name`` and ``source_uri`` on those
+    # very rows holds for the account of them too.
+    for entry in result.get("withheld", []):
+        if not isinstance(entry, dict):
+            continue
+        for field in _WITHHELD_REDACTED_FIELDS:
+            if isinstance(entry.get(field), str):
+                entry[field] = _redact(entry[field])
     return web.json_response(result)
 
 
@@ -2665,6 +2827,9 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     ``GET /api/knowledge/jobs/{id}``. The default (fill-NULL) path stays synchronous
     since it only touches items missing an embedding at cold start.
     """
+    owner_denied = await _require_knowledge_owner(request, "knowledge.embedding.generate")
+    if owner_denied is not None:
+        return owner_denied
     store = _store(request)
     embedder = request.app.get("knowledge_embedder")
     if not embedder:
@@ -2824,6 +2989,9 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
     the MCP process because ingestion needs the pipeline (reader, chunker,
     extraction pool, embedder), which only the gateway holds.
     """
+    owner_denied = await _require_knowledge_owner(request, "knowledge.agent_document.add")
+    if owner_denied is not None:
+        return owner_denied
     cfg = KiroCrewConfig.load()
     if not cfg.knowledge.auto_add_documents:
         return web.json_response(
@@ -2860,7 +3028,6 @@ async def _shutdown_knowledge_pools(app: web.Application) -> None:
     for key in (
         "knowledge_extraction_pool",
         "knowledge_fetch_pool",
-        "knowledge_llm_pool",
     ):
         pool = app.get(key)
         if pool is None or id(pool) in seen:
@@ -2887,16 +3054,11 @@ def setup_knowledge_routes(app: web.Application) -> None:
         cfg = KiroCrewConfig.load()
         extraction_pool = LLMPool(
             pool_size=cfg.knowledge.extraction_pool_size,
-            effort=DEFAULT_EXTRACTION_EFFORT,
-            use_config_pool_size=False,
-            # Seeded from knowledge.extraction_pool_size above, so it follows a
-            # later write to that key (applied at the next idle boundary).
-            track_config_pool_size=True,
+            effort_key="extraction_effort",
+            fallback_effort=DEFAULT_EXTRACTION_EFFORT,
+            config_pool_size_key="extraction_pool_size",
         )
-        fetch_pool = LLMPool(
-            pool_size=1,
-            use_config_pool_size=False,
-        )
+        fetch_pool = LLMPool(pool_size=1)
         embedder = _create_embedder(app)
         pipeline = IngestionPipeline(
             store=store,
@@ -2907,9 +3069,6 @@ def setup_knowledge_routes(app: web.Application) -> None:
         )
         app["knowledge_extraction_pool"] = extraction_pool
         app["knowledge_fetch_pool"] = fetch_pool
-        # Keep the old key as an extraction-only compatibility alias. Production
-        # URL sync uses knowledge_fetch_pool above.
-        app["knowledge_llm_pool"] = extraction_pool
         app["knowledge_embedder"] = embedder
         connectors: dict[str, "BaseConnector"] = {}
         # Local folder connector (always available)

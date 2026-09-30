@@ -72,17 +72,35 @@ def _ensure_utf8_process_environment() -> None:
     os.environ.update(_UTF8_PROCESS_ENV)
 
 
+def _disarm_process_alarm_before_exec() -> None:
+    """Cancel any pending process alarm before ``execv`` replaces this image.
+
+    ``execve`` preserves interval timers (``ITIMER_REAL`` included) and resets
+    every caught signal to its default disposition.  A dump-then-exit deadline
+    the loop-stall watchdog armed in this image would therefore reach the
+    successor as a default-action ``SIGALRM`` it never armed -- during its own
+    boot, before its watchdog exists to replace the deadline -- and end it with
+    no dump and no log line.  No process-wide deadline may outlive the image
+    that armed it, so both exec seams cancel it here, with no await between the
+    cancel and the exec.  A no-op where the timer does not exist (Windows).
+    """
+    arm_process_alarm(0.0)
+
+
 def reexec_launcher(launcher: str, args: Sequence[str]) -> None:
     """Re-enter a validated stable launcher, preserving its dispatch pathname.
 
     The launcher, not the core, replaces version-specific environment values.
     Windows execv joins its arguments without quoting, so quote each token for
     the native CRT parser. POSIX receives the original argument vector directly.
+    The pending loop-stall alarm is cancelled immediately before the exec (see
+    :func:`_disarm_process_alarm_before_exec`).
     """
     _ensure_utf8_process_environment()
     argv = [launcher, *args]
     if IS_WINDOWS:
         argv = [subprocess.list2cmdline([arg]) for arg in argv]
+    _disarm_process_alarm_before_exec()
     os.execv(launcher, argv)
 
 
@@ -98,7 +116,9 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     it in the child.  A full ``argv[0]`` containing spaces is split before the
     module flag, so Python treats the path suffix as a script name.  The
     executable path passed separately to ``execv`` still selects the exact
-    interpreter; only its display name needs to be space-free.
+    interpreter; only its display name needs to be space-free.  The pending
+    loop-stall alarm is cancelled immediately before the exec (see
+    :func:`_disarm_process_alarm_before_exec`).
     """
     # Publish UTF-8 before exec so in-app gateway restarts (Tailnet, update,
     # stale-assets, explicit restart) cannot create a successor that inherits a
@@ -107,9 +127,138 @@ def reexec_python_module(module: str, args: Sequence[str], executable: str | Non
     _ensure_utf8_process_environment()
     resolved = executable or sys.executable
     argv0 = ntpath.basename(resolved) if IS_WINDOWS else resolved
-    argv = isolated_python_argv("-m", module, *args, executable=resolved)
+    # ``-P``: the successor inherits this process's cwd -- the home directory
+    # for a service-launched gateway -- and ``-m`` would put it first on
+    # sys.path, ahead of the standard library, so a stdlib-named directory
+    # there would shadow the stdlib in the restarted process.
+    argv = isolated_python_argv("-P", "-m", module, *args, executable=resolved)
     argv[0] = argv0
+    _disarm_process_alarm_before_exec()
     os.execv(resolved, argv)
+
+
+def execv_target_available(path: str) -> bool:
+    """Whether ``execv`` has a file here it may attempt. Two metadata syscalls.
+
+    Distinct from ``is_executable_file`` further down, which answers a different
+    question: that one decides whether to treat a file as a runnable HOOK, and on
+    Windows it accepts a regular file by extension because there is no execute bit
+    to read. A restart target is not a hook -- the process image itself depends on
+    the answer, and an extension decides nothing -- so this asks only the two things
+    the kernel will also ask, and reports on Windows whatever ``os.access`` does
+    there.
+
+    Kept beside the exec family because callers on the event loop must hand BOTH
+    syscalls to a worker thread in ONE hop: a pathname on a stalled network mount
+    blocks each of them, so offloading one and leaving the other inline still
+    freezes the loop.
+    """
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+#: Exit status for a process replacement that failed after the final drain. The
+#: generic failure code, matching the gateway's other unrecoverable exits; the
+#: distinguishing signal is the CRITICAL log line, not a private number a
+#: supervisor would have to be taught.
+_POST_DRAIN_EXEC_FAILURE_EXIT = 1
+
+# Ceiling on the event log's exit flush, covering the wait for a worker as well as the
+# work. ``eventlog_hooks.drain_for_shutdown`` bounds the work itself at
+# SHUTDOWN_DRAIN_SECONDS (5.0s); what no inner ceiling can bound is the queue wait for
+# a thread to run on. Derived as that inner bound plus one second, the same rule
+# ``cli.drain_log_queue_before_hard_exit`` applies to its own flush, so the two exit
+# drains do not drift apart on a number nobody chose.
+_EXIT_FLUSH_DEADLINE_SECS = 6.0
+
+
+async def exit_after_failed_restart_exec(target: str | None) -> None:
+    """Exit this process after a restart exec failed past the point of no return.
+
+    Lives beside the two ``reexec_*`` functions because it is their partner: it
+    answers the one outcome neither of them can, and a future reader editing
+    either exec sees it here.
+
+    Both update-restart paths reach their exec only after ``close_all()``, which
+    makes the exec the last reversible instruction they have. Every session is
+    already torn down, the final history save already ran, and the tree on disk
+    is already the NEW version while this process image is still the old one.
+
+    Callers validate the target BEFORE the drain, and that is what keeps the
+    ordinary failures out of here -- but validating cannot make an exec
+    infallible. The target can be replaced between the check and the call, and a
+    file that is present and carries the exec bit can still be the wrong
+    architecture, a truncated image, or a script whose interpreter is missing.
+    The kernel is the authority on every one of those and reports them as
+    ``OSError`` from ``execv`` itself, so the exec site is the only place they
+    can be answered -- and answering them by returning is what left a gateway
+    alive with nothing to serve.
+
+    Answer by exiting. A surviving process here serves nothing it can serve
+    honestly: its sessions are gone, and its code and the install on disk are
+    different versions.
+    It also holds the port, so the operator's own relaunch would fail to bind on
+    top of it. Exiting makes the failure visible to whatever started this
+    gateway, frees the port for that relaunch, and cannot serve the version skew.
+    Reopening admission instead would not substitute: the sessions closed by
+    ``close_all()`` do not come back, and the skew would then be served.
+
+    Exits through ``os._exit``, which runs no ``atexit`` handler -- so the two
+    bounded flushes the force-exit signal handler performs are repeated here for
+    the same reason: the CRITICAL line is the whole diagnosis, and it is queued,
+    not yet on disk. Both are best-effort; a wedged disk must delay this exit,
+    never hold it. Unlike that signal handler, which cannot await, both run on a
+    worker thread: waiting for a wedged log write on the event loop would hold every
+    remaining task -- and the port this exit exists to release -- for the length of
+    their own timeouts.
+
+    Off-loop alone does not make the wait bounded, so the event log's flush also
+    carries a deadline and runs on the dedicated subprocess pool rather than the
+    default executor. ``asyncio.to_thread`` queues against a pool every other
+    ``to_thread`` in the process shares: saturated, the await never resumes and the
+    exit this function exists to perform simply never happens -- the loop is free,
+    which is what the inner ceiling guarantees, but the process still serves nothing
+    on a port it never releases. A deadline around the flush, plus a pool kept
+    separate for calls that can block on a wedged kernel resource, is what makes "a
+    wedged disk must delay this exit, never hold it" true of the wait and not only of
+    the work.
+
+    The ``gateway.log`` tail is not spelled out again here.
+    :func:`kiro_crew.cli.drain_log_queue_before_hard_exit` is the shared async
+    hard-exit drain for that queue -- same pool, its own outer deadline, and it never
+    raises -- so every hard-exit path keeps one spelling and one ceiling for it.
+    """
+    logger.critical(
+        "Gateway restart could not replace this process (target %r); exiting instead of "
+        "serving with every session closed and an install this image does not match. "
+        "Repair the install and start the gateway again.",
+        target or sys.executable,
+        exc_info=True,
+    )
+    from kiro_crew.cli import drain_log_queue_before_hard_exit
+
+    try:
+        await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), _drain_event_log_for_exit
+            ),
+            timeout=_EXIT_FLUSH_DEADLINE_SECS,
+        )
+    except Exception:
+        # Also the deadline: TimeoutError is an Exception, and a fatal exit must never
+        # be blocked by bookkeeping or logging.
+        pass
+    # The gateway.log tail has its own async hard-exit drain, which already offloads to
+    # this pool under its own deadline and already never raises. Calling it keeps one
+    # spelling and one ceiling for that queue across every hard-exit path.
+    await drain_log_queue_before_hard_exit()
+    os._exit(_POST_DRAIN_EXEC_FAILURE_EXIT)
+
+
+def _drain_event_log_for_exit() -> None:
+    """Flush the member event log's queue. Off-loop; bounded inside the module."""
+    from kiro_crew import eventlog_hooks
+
+    eventlog_hooks.drain_for_shutdown()
 
 
 # Python's os.rename() replaces an existing empty directory on POSIX. Directory
@@ -692,18 +841,43 @@ _WIN_LOCK_POLL_SECS = _LOCK_POLL_SECS
 _WIN_LOCK_TIMEOUT_SECS = _LOCK_TIMEOUT_SECS
 
 
-def _lock_timeout_message(timeout: float, *, exclusive: bool = True) -> str:
-    """The one refusal string both platforms raise when the ceiling is hit.
+def _on_event_loop() -> bool:
+    """True when called on a thread that is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
-    Names the ceiling and the reason. A caller that catches this as best-effort
+
+def _lock_timeout_message(
+    waited: float,
+    *,
+    exclusive: bool = True,
+    ceiling: float | None = None,
+    on_loop: bool = False,
+) -> str:
+    """The one refusal string both platforms raise when an acquire gives up.
+
+    Names how long the acquire REALLY waited and what was observed: the lock was
+    still held. It deliberately names no cause. The acquire cannot tell a hung
+    holder from a busy one or from a queue of waiters, and naming one of them
+    sends an operator after the wrong fix. On the event-loop thread the acquire
+    makes one attempt and never waits, so the message says that instead of
+    naming a ceiling it never applied. A caller that catches this as best-effort
     work has nothing else to report, so this message is the only evidence of WHY
     the critical section was declined.
     """
     kind = "exclusive" if exclusive else "shared"
-    return (
-        f"could not acquire {kind} file lock within {timeout:g}s "
-        "(a holder is stuck); refusing to proceed unserialized"
-    )
+    if on_loop:
+        detail = (
+            f"still held after waiting {waited:.2f}s (one attempt: an acquire on "
+            "the event-loop thread never waits; take it from a worker thread to wait)"
+        )
+    else:
+        limit = waited if ceiling is None else ceiling
+        detail = f"still held after waiting {waited:.2f}s (limit {limit:g}s)"
+    return f"could not acquire {kind} file lock: {detail}; refusing to proceed unserialized"
 
 
 def _posix_acquire_blocking(
@@ -751,12 +925,7 @@ def _posix_acquire_blocking(
                 raise
             return False
 
-    try:
-        asyncio.get_running_loop()
-        on_loop = True
-    except RuntimeError:
-        on_loop = False
-    if on_loop:
+    if _on_event_loop():
         # Single attempt only -- a poll-sleep here blocks the event loop.
         return _try_once()
 
@@ -798,12 +967,7 @@ def _win_acquire_blocking(fd: int, *, timeout: float = _LOCK_TIMEOUT_SECS) -> bo
         except OSError:
             return False
 
-    try:
-        asyncio.get_running_loop()
-        on_loop = True
-    except RuntimeError:
-        on_loop = False
-    if on_loop:
+    if _on_event_loop():
         # Single attempt only — a spin-sleep here blocks the event loop.
         return _try_once()
 
@@ -846,7 +1010,11 @@ def file_lock(
     called on the asyncio event-loop thread: a poll-sleep there would freeze chat
     and heartbeat for the whole wait, and a freeze long enough to miss a heartbeat
     is a supervisor kill, so a contended on-loop caller is refused at once and
-    fails closed rather than stalling every other session. The timeout is a safety
+    fails closed rather than stalling every other session. ``flock`` counts a
+    second descriptor in this same process as a competing holder, so even a
+    sibling thread's brief critical section refuses an on-loop caller: a caller
+    that must wait for the lock calls this from a worker thread
+    (``asyncio.to_thread``), where the wait is a real one. The timeout is a safety
     ceiling against a stuck holder, not a normal wait. ``required`` is kept for
     call-site intent and does not change the outcome (both paths refuse to proceed
     without the lock).
@@ -883,19 +1051,22 @@ def file_lock(
             # BlockingIOError (an OSError) when held: same fail-closed contract
             # as the Windows branch, reported by the platform rather than by us.
             fcntl.flock(fd, mode | fcntl.LOCK_NB)
-        elif not _posix_acquire_blocking(fd, mode, timeout=timeout):
-            # Past the ceiling the holder is stuck, not busy. Refuse LOUDLY
-            # rather than wait on it without limit: an unbounded wait here leaves
-            # a boot with no port bound and no log line, while a raise is
-            # something the caller can report and recover from -- the gateway
-            # boot path logs it at ERROR, prints the repair command, and still
-            # binds its port.
-            raise OSError(
-                _lock_timeout_message(
-                    _LOCK_TIMEOUT_SECS if timeout is None else timeout,
-                    exclusive=exclusive,
+        else:
+            started = time.monotonic()
+            if not _posix_acquire_blocking(fd, mode, timeout=timeout):
+                # Refuse LOUDLY rather than wait without limit: an unbounded wait
+                # here leaves a boot with no port bound and no log line, while a
+                # raise is something the caller can report and recover from --
+                # the gateway boot path logs it at ERROR, prints the repair
+                # command, and still binds its port.
+                raise OSError(
+                    _lock_timeout_message(
+                        time.monotonic() - started,
+                        exclusive=exclusive,
+                        ceiling=_LOCK_TIMEOUT_SECS if timeout is None else timeout,
+                        on_loop=_on_event_loop(),
+                    )
                 )
-            )
         try:
             yield
         finally:
@@ -911,21 +1082,31 @@ def file_lock(
         # strictly safer, and callers already run under `with`, so the fd is
         # cleaned up. `required` is kept for call-site intent and does not
         # change the outcome — both paths refuse to proceed lock-less.
-        ceiling = 0.0 if not wait else (_LOCK_TIMEOUT_SECS if timeout is None else timeout)
         # The waiting path with no explicit ceiling is called with no keyword, so
         # the default-argument call shape existing tests stub out is preserved.
+        started = time.monotonic()
         if not wait:
+            ceiling = 0.0
             acquired = _win_acquire_blocking(fd, timeout=0.0)
         elif timeout is None:
+            ceiling = _LOCK_TIMEOUT_SECS
             acquired = _win_acquire_blocking(fd)
         else:
+            ceiling = timeout
             acquired = _win_acquire_blocking(fd, timeout=timeout)
         if not acquired:
             if not wait:
                 # Held right now. BlockingIOError so the caller can tell this
-                # from the stuck-holder ceiling below, matching POSIX LOCK_NB.
+                # from the timed-out wait below, matching POSIX LOCK_NB.
                 raise BlockingIOError("file lock is held; not waiting for it")
-            raise OSError(_lock_timeout_message(ceiling, exclusive=exclusive))
+            raise OSError(
+                _lock_timeout_message(
+                    time.monotonic() - started,
+                    exclusive=exclusive,
+                    ceiling=ceiling,
+                    on_loop=_on_event_loop(),
+                )
+            )
         try:
             yield
         finally:
@@ -979,13 +1160,27 @@ def acquire_lock(fd: int, *, exclusive: bool = True) -> None:
     proceeding lock-less is the fail-open that loses writes. Pair every call
     with :func:`release_lock` on the same ``fd``.
     """
+    started = time.monotonic()
     if IS_POSIX:
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         if not _posix_acquire_blocking(fd, mode):
-            raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS, exclusive=exclusive))
+            raise OSError(
+                _lock_timeout_message(
+                    time.monotonic() - started,
+                    exclusive=exclusive,
+                    ceiling=_LOCK_TIMEOUT_SECS,
+                    on_loop=_on_event_loop(),
+                )
+            )
         return
     if not _win_acquire_blocking(fd):
-        raise OSError(_lock_timeout_message(_LOCK_TIMEOUT_SECS))
+        raise OSError(
+            _lock_timeout_message(
+                time.monotonic() - started,
+                ceiling=_LOCK_TIMEOUT_SECS,
+                on_loop=_on_event_loop(),
+            )
+        )
 
 
 def release_lock(fd: int) -> None:
@@ -1463,6 +1658,15 @@ _DARWIN_CTL_KERN = 1
 _DARWIN_KERN_PROCARGS2 = 49
 _DARWIN_PROCARGS_BUFSIZE = 64 * 1024
 
+# The environment sits AFTER argv in that same record, so the environ probe
+# cannot share the argv probe's bound: the kernel truncates silently, and a
+# process with a long argv -- a recursively self-appending launcher is exactly
+# that shape -- would have its environment cut off and read as "no marker",
+# failing closed on the very process an identity gate most needs to place. Sized
+# at the kernel's own ``ARG_MAX`` ceiling on argv plus environment instead, so
+# truncation is impossible rather than merely unlikely.
+_DARWIN_PROCARGS_ENV_BUFSIZE = 1024 * 1024
+
 # ``sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)`` answers for a ZOMBIE where
 # ``proc_pidinfo`` refuses: the kernel walks its zombie list for this query as
 # well as the live one, and a zombie's ``proc`` still carries its start instant.
@@ -1601,6 +1805,136 @@ def darwin_process_path(pid: int) -> str | None:
         return None
 
 
+# ``proc_pidinfo(PROC_PIDLISTFDS)`` lists a process's open descriptors as
+# ``proc_fdinfo`` records: an int32 ``proc_fd`` and a uint32 ``proc_fdtype``
+# (8 bytes each). ``PROX_FDTYPE_SOCKET`` marks a socket.
+_DARWIN_PROC_PIDLISTFDS = 1
+_DARWIN_PROC_FDINFO_SIZE = 8
+_DARWIN_PROX_FDTYPE_SOCKET = 2
+# ``proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`` fills a ``socket_fdinfo``: a 24-byte
+# ``proc_fileinfo`` then a ``socket_info``. Inside ``socket_info`` the
+# 136-byte ``vinfo_stat`` is followed by the socket fields, putting ``soi_kind``
+# at 232 and the ``soi_proto`` union at 240; for ``SOCKINFO_TCP`` that union is
+# a ``tcp_sockinfo`` whose ``tcpsi_state`` follows the 80-byte ``in_sockinfo``.
+# The union is sized by ``un_sockinfo`` (528), so the whole record is 792 bytes;
+# the fill size doubles as the layout check, as for the probes above.
+_DARWIN_PROC_PIDFDSOCKETINFO = 3
+_DARWIN_SOCKET_FDINFO_SIZE = 792
+_DARWIN_SOI_KIND_OFFSET = 24 + 232
+_DARWIN_TCPSI_STATE_OFFSET = 24 + 240 + 80
+_DARWIN_SOCKINFO_TCP = 2
+_DARWIN_TSI_S_ESTABLISHED = 4
+# Inside ``in_sockinfo`` (which opens ``tcp_sockinfo``): ``insi_vflag`` at 24,
+# then ``insi_faddr`` at 32, a 16-byte union whose IPv4 form keeps the address
+# in its last four bytes. ``INI_IPV4`` / ``INI_IPV6`` are the vflag bits.
+_DARWIN_INSI_VFLAG_OFFSET = 24 + 240 + 24
+_DARWIN_INSI_FADDR_OFFSET = 24 + 240 + 32
+_DARWIN_INI_IPV4 = 0x1
+_DARWIN_INI_IPV6 = 0x2
+_DARWIN_IN6_LOOPBACK = bytes(15) + b"\x01"
+_DARWIN_IN6_V4MAPPED_PREFIX = bytes(10) + b"\xff\xff"
+# Descriptor-count bound for one listing. A process past it is not enumerated
+# rather than enumerated in part, so a partial answer never reads as "none".
+_DARWIN_MAX_FDS = 16384
+
+_darwin_libproc_fd_bound = False
+
+
+def _darwin_libproc_fd_handle() -> Any:
+    """The cached ``libproc`` handle with ``proc_pidfdinfo`` declared, or None.
+
+    Bound separately so a libproc without the symbol still serves every probe
+    that needs only ``proc_pidinfo``.
+    """
+    global _darwin_libproc_fd_bound
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    if _darwin_libproc_fd_bound:
+        return lib
+    try:
+        lib.proc_pidfdinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        lib.proc_pidfdinfo.restype = ctypes.c_int
+    except Exception:
+        return None
+    _darwin_libproc_fd_bound = True
+    return lib
+
+
+def _darwin_peer_is_loopback(record: bytes) -> bool:
+    """Whether a ``socket_fdinfo`` record's foreign address is loopback.
+
+    An unknown address family reads as loopback, so a record this parser does
+    not understand is never counted as a remote call.
+    """
+    vflag = record[_DARWIN_INSI_VFLAG_OFFSET]
+    faddr = record[_DARWIN_INSI_FADDR_OFFSET : _DARWIN_INSI_FADDR_OFFSET + 16]
+    if vflag & _DARWIN_INI_IPV4:
+        return faddr[12] == 127
+    if vflag & _DARWIN_INI_IPV6:
+        if faddr == _DARWIN_IN6_LOOPBACK:
+            return True
+        return faddr[:12] == _DARWIN_IN6_V4MAPPED_PREFIX and faddr[12] == 127
+    return True
+
+
+def darwin_established_tcp_count(pid: int) -> int | None:
+    """How many ESTABLISHED TCP sockets to a non-loopback peer *pid* holds.
+
+    None when unreadable. A loopback peer is a local service, not a remote call.
+
+    The macOS counterpart of reading ``/proc/<pid>/fd`` against
+    ``/proc/<pid>/net/tcp``: in-process, no entitlement for a same-uid process,
+    nothing exec'd. A socket whose record does not come back at the exact
+    ``socket_fdinfo`` size is skipped, and a listing that cannot be read at all
+    is None, so a caller never reads a layout mismatch as "no connections".
+    """
+    lib = _darwin_libproc_fd_handle()
+    if lib is None:
+        return None
+    try:
+        needed = lib.proc_pidinfo(pid, _DARWIN_PROC_PIDLISTFDS, 0, None, 0)
+        if needed <= 0:
+            return None
+        # Headroom for descriptors opened between the size query and the read.
+        size = min(
+            needed + 32 * _DARWIN_PROC_FDINFO_SIZE, _DARWIN_MAX_FDS * _DARWIN_PROC_FDINFO_SIZE
+        )
+        buf = ctypes.create_string_buffer(size)
+        filled = lib.proc_pidinfo(pid, _DARWIN_PROC_PIDLISTFDS, 0, buf, size)
+        if filled <= 0 or filled % _DARWIN_PROC_FDINFO_SIZE:
+            return None
+        if filled >= size:
+            # A full buffer may be a truncated one: refuse rather than undercount.
+            return None
+        info = ctypes.create_string_buffer(_DARWIN_SOCKET_FDINFO_SIZE)
+        count = 0
+        for off in range(0, filled, _DARWIN_PROC_FDINFO_SIZE):
+            fd, fdtype = struct.unpack_from("<iI", buf.raw, off)
+            if fdtype != _DARWIN_PROX_FDTYPE_SOCKET:
+                continue
+            got = lib.proc_pidfdinfo(
+                pid, fd, _DARWIN_PROC_PIDFDSOCKETINFO, info, _DARWIN_SOCKET_FDINFO_SIZE
+            )
+            if got != _DARWIN_SOCKET_FDINFO_SIZE:
+                continue
+            kind = struct.unpack_from("<i", info.raw, _DARWIN_SOI_KIND_OFFSET)[0]
+            if kind != _DARWIN_SOCKINFO_TCP:
+                continue
+            state = struct.unpack_from("<i", info.raw, _DARWIN_TCPSI_STATE_OFFSET)[0]
+            if state == _DARWIN_TSI_S_ESTABLISHED and not _darwin_peer_is_loopback(info.raw):
+                count += 1
+        return count
+    except Exception:
+        return None
+
+
 _darwin_libc_sysctl: Any = None
 _darwin_libc_sysctl_loaded = False
 
@@ -1669,6 +2003,60 @@ def darwin_process_argv(pid: int) -> list[str] | None:
         parts = rest.split(b"\0")[:argc]
         argv = [p.decode("utf-8", errors="replace") for p in parts if p]
         return argv or None
+    except Exception:
+        return None
+
+
+def darwin_process_environ(pid: int) -> list[bytes] | None:
+    """Exec-time environment of *pid* via ``sysctl KERN_PROCARGS2``, or None.
+
+    Returns the raw ``KEY=VALUE`` entries. ``None`` means the record could not
+    be read or parsed -- never an empty list for an unreadable process, so a
+    caller can tell "no such variable" apart from "could not look".
+
+    Same-uid processes only, and no entitlement or elevated privilege for our
+    own: the same kernel record and the same permission contract
+    :func:`darwin_process_argv` already reads. The environment here is the
+    kernel's copy fixed at exec, which is why it is ownership evidence a
+    process cannot forge for another, unlike anything on disk.
+
+    The ``argc`` argv entries are skipped BY COUNT, empty strings included, so
+    an *argument* that merely looks like an environment entry can never be read
+    as one -- the point of the read is that a user's own shell can reproduce any
+    argv.
+
+    An Apple PLATFORM binary (``/bin/sleep``, ``/usr/bin/env``) is one of the
+    ``None`` cases on macOS 26: the kernel answers with an argv-only record for
+    it even to a same-uid reader (``ps -E`` shows no environment either), so
+    the read fails closed and such a process is never identified as ours. The
+    launchers this oracle exists for (``node``, ``python``, an MCP CLI) are
+    never platform binaries; a test that needs a readable child must spawn one
+    of those, not ``sleep``.
+    """
+    libc = _darwin_sysctl_handle()
+    if libc is None:
+        return None
+    try:
+        mib = (ctypes.c_int * 3)(_DARWIN_CTL_KERN, _DARWIN_KERN_PROCARGS2, pid)
+        buf = ctypes.create_string_buffer(_DARWIN_PROCARGS_ENV_BUFSIZE)
+        size = ctypes.c_size_t(_DARWIN_PROCARGS_ENV_BUFSIZE)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        raw = buf.raw[: size.value]
+        if len(raw) < 4:
+            return None
+        argc = struct.unpack_from("<i", raw, 0)[0]
+        if argc <= 0:
+            return None
+        rest = raw[4:]
+        exe_end = rest.find(b"\0")
+        if exe_end < 0:
+            return None
+        rest = rest[exe_end:].lstrip(b"\0")
+        entries = [token for token in rest.split(b"\0")[argc:] if token]
+        # No entries past argv is a record whose environment is missing, not a
+        # process running with an empty one: every exec'd process has some.
+        return entries or None
     except Exception:
         return None
 
@@ -2764,7 +3152,7 @@ def _root_owned_entry(path: str) -> bool:
     Not to be confused with :func:`path_writable_by_current_user`, which answers
     the opposite question ("could this account write it") over two LEXICAL chains
     and rounds unknown to writable. That shape cannot see a mid-chain symlink hop,
-    which is why :func:`_is_root_owned_path` resolves component by component and
+    which is why :func:`_is_root_owned_path` walks :func:`traversed_components` and
     calls this per entry instead of delegating wholesale.
 
     ``os.stat`` rather than ``os.lstat`` on purpose: every caller has already
@@ -2786,48 +3174,57 @@ def _root_owned_entry(path: str) -> bool:
     return True
 
 
-def _is_root_owned_path(path: str) -> bool:
-    """True when nothing on the way to *path*'s target is another uid's to change.
+def traversed_components(path: str | os.PathLike[str]) -> list[Path] | None:
+    """Every directory a component-by-component walk to *path* passes through, then the target.
 
-    Resolves *path* one COMPONENT at a time and validates every directory the walk
-    actually passes through, expanding each symlink it meets — a component's as
-    much as the final name's — and then validating the directories on the target's
-    side too.
+    Resolves *path* one COMPONENT at a time, expanding each symlink it meets — a
+    directory component's as much as the final name's — and records every
+    directory the walk actually reads, on the original side and on each expanded
+    target's side alike, followed by the final resolved target. Visit order, each
+    entry once. No ownership or permission question is asked here: this is the
+    ENUMERATION that any executable-trust predicate must ask its question over,
+    kept separate so that callers with different questions ("root's alone to
+    change", "not another uid's", "not writable by this process") share the walk
+    rather than each spelling a weaker one.
 
-    Two weaker shapes were tried here first and both were bypassable, which is why
-    it is written this way rather than more briefly:
+    Two shorter shapes were tried for this enumeration and both were bypassable,
+    which is why every caller must use this one rather than either:
 
     * ``realpath`` and then walk the result collapses the chain, so
-      ``/usr/local/bin/aws -> /tmp/link -> /usr/bin/aws`` is accepted with ``/tmp``
-      — the one directory where the retarget happens — never looked at;
-    * walking ``os.path.dirname`` lexically misses a symlinked COMPONENT, because
-      ``os.stat`` follows symlinks while ``dirname`` does not: for
-      ``/usr/local/bin -> /opt/x/bin`` the target's own parent ``/opt/x``, which
-      can replace it wholesale, is never visited.
+      ``/usr/local/bin/aws -> /tmp/link -> /usr/bin/aws`` yields ``/usr/bin`` and
+      its ancestors with ``/tmp`` — the one directory where the retarget
+      happens — never named;
+    * walking ``os.path.dirname`` / ``Path.parents`` lexically misses a symlinked
+      COMPONENT, because ``os.stat`` follows symlinks while ``dirname`` does not:
+      for ``/usr/local/bin -> /opt/x/bin`` the target's own parent ``/opt/x``,
+      which can replace it wholesale, is never visited.
 
-    A directory has to be root-owned with no group or world write bit, because
-    replacing an entry needs write on its DIRECTORY rather than on the entry, and a
-    group-writable directory is writable by more than root whoever owns it. The
-    final target has to satisfy the same rule as a file, since a writable regular
-    file can be edited in place without touching any directory. Symlinks met on the
-    way are deliberately not checked themselves: their mode is meaningless (0777 on
+    Every lexical ancestor of the fully resolved target is in the result (the
+    walk builds the target's path one directory at a time, and each directory is
+    recorded before a name is joined onto it), so a question asked over this list
+    is asked over a superset of ``resolved.parents`` plus the target. Symlinks
+    met on the way are deliberately absent: their mode is meaningless (0777 on
     Linux) and they cannot be edited in place, only replaced, which the directory
-    holding them already governs.
+    holding them — present in the result — already governs.
 
-    POSIX semantics. Windows callers do not reach it (:func:`trusted_aws_bin`
-    answers ``None`` there before the gate).
+    POSIX path semantics (``os.sep``-rooted); Windows callers keep their own
+    ACL-driven chains and must not route through here.
 
-    Any ``OSError``, and any path needing more than :data:`_MAX_SYMLINK_HOPS`
-    expansions, answers ``False``. The fail direction is "decline", never "assume".
+    ``None`` on any ``OSError`` and on any path needing more than
+    :data:`_MAX_SYMLINK_HOPS` expansions. The fail direction is "could not
+    enumerate", never a shorter list: a caller that treats ``None`` as anything
+    but a refusal is answering a question it did not ask.
     """
-    if not os.path.isabs(path):
-        path = os.path.abspath(path)
+    text = os.fspath(path)
+    if not os.path.isabs(text):
+        text = os.path.abspath(text)
     # Reversed, so `pop()` yields the next component and a symlink's own components
     # can be pushed on to be consumed before the rest of the original path.
-    pending = path.split(os.sep)
+    pending = text.split(os.sep)
     pending.reverse()
     resolved = os.sep
     hops = 0
+    visited: dict[str, None] = {}
     while pending:
         name = pending.pop()
         if name in ("", os.curdir):
@@ -2835,30 +3232,53 @@ def _is_root_owned_path(path: str) -> bool:
         if name == os.pardir:
             resolved = os.path.dirname(resolved)
             continue
-        # About to read `resolved` as a directory, so it must be one nobody but
-        # root can change. Checked here rather than after descending, so the
-        # target side of an expanded symlink is covered by the same line.
-        if not _root_owned_entry(resolved):
-            return False
+        # About to read `resolved` as a directory, so it is one the walk depends
+        # on. Recorded here rather than after descending, so the target side of
+        # an expanded symlink is covered by the same line.
+        visited[resolved] = None
         candidate = os.path.join(resolved, name)
         try:
             is_link = os.path.islink(candidate)
         except OSError:
-            return False
+            return None
         if not is_link:
             resolved = candidate
             continue
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
-            return False
+            return None
         try:
             target = os.readlink(candidate)
         except OSError:
-            return False
+            return None
         if os.path.isabs(target):
             resolved = os.sep
         pending.extend(reversed(target.split(os.sep)))
-    return _root_owned_entry(resolved)
+    visited[resolved] = None
+    return [Path(component) for component in visited]
+
+
+def _is_root_owned_path(path: str) -> bool:
+    """True when nothing on the way to *path*'s target is another uid's to change.
+
+    :func:`_root_owned_entry` asked over :func:`traversed_components` — every
+    directory the walk reads and the final target. A directory has to be
+    root-owned with no group or world write bit, because replacing an entry needs
+    write on its DIRECTORY rather than on the entry, and a group-writable
+    directory is writable by more than root whoever owns it. The final target has
+    to satisfy the same rule as a file, since a writable regular file can be
+    edited in place without touching any directory.
+
+    POSIX semantics. Windows callers do not reach it (:func:`trusted_aws_bin`
+    answers ``None`` there before the gate).
+
+    A walk that cannot be enumerated (``None``) answers ``False``. The fail
+    direction is "decline", never "assume".
+    """
+    components = traversed_components(path)
+    if components is None:
+        return False
+    return all(_root_owned_entry(str(component)) for component in components)
 
 
 def _local_aws_bin_candidate() -> str | None:
@@ -4135,6 +4555,84 @@ def _windows_descendant_failure_details(
     )
 
 
+def _windows_process_query_creation(pid: int) -> int | None:
+    """Return *pid*'s creation FILETIME through a query-only handle, or ``None``.
+
+    Termination rights are not requested, so this answers for a process whose
+    termination handle is refused -- which is the only case that needs it.
+    ``None`` means the instant is unknown and nothing may be concluded from it.
+    """
+
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return None
+    try:
+        identity = _windows_process_handle_identity(handle)
+    finally:
+        _close_process_handle(handle)
+    if identity is None or identity[0] != pid:
+        return None
+    return identity[1]
+
+
+def _windows_foreign_descendant_pids(
+    candidates: set[int],
+    observed: set[int],
+    parent_map: dict[int, int],
+    pinned: Mapping[int, int],
+    root_pid: int,
+    root_created: int,
+) -> set[int]:
+    """Return observed PIDs whose numeric ancestry creation order disproves them.
+
+    A descendant is created after the root it descends from, so a chain node that
+    already existed before the root holds a recycled PID naming an unrelated
+    process. Every observed PID reaching the root only through such a node is
+    foreign as well: its claimed parent's PID was taken over by a process older
+    than the root, so that parent died before the root started and cannot have
+    belonged to this tree.
+
+    Only *candidates* seed the reads, so a scan that opened every handle pays
+    nothing. A node in *pinned* is read from its own handle, whose object cannot
+    have been recycled; the rest are read once each by PID. An unreadable instant
+    disproves nothing and leaves its chain intact.
+    """
+
+    creations: dict[int, int | None] = {}
+
+    def created(process_pid: int) -> int | None:
+        if process_pid not in creations:
+            handle = pinned.get(process_pid)
+            if handle is None:
+                creations[process_pid] = _windows_process_query_creation(process_pid)
+            else:
+                identity = _windows_process_handle_identity(handle)
+                creations[process_pid] = (
+                    identity[1] if identity is not None and identity[0] == process_pid else None
+                )
+        return creations[process_pid]
+
+    disproven: set[int] = set()
+    for candidate_pid in sorted(candidates):
+        chain = _windows_chain_to_root(candidate_pid, root_pid, parent_map)
+        if not chain:
+            continue
+        for process_pid in chain:
+            if process_pid == root_pid:
+                continue
+            instant = created(process_pid)
+            if instant is not None and instant < root_created:
+                disproven.add(process_pid)
+    if not disproven:
+        return set()
+    foreign: set[int] = set()
+    for process_pid in observed:
+        chain = _windows_chain_to_root(process_pid, root_pid, parent_map)
+        if chain and not disproven.isdisjoint(chain):
+            foreign.add(process_pid)
+    return foreign
+
+
 def descendant_termination_handles(
     pid: int,
     retained_handles: Mapping[int, int] | None = None,
@@ -4147,8 +4645,9 @@ def descendant_termination_handles(
     from exact root, retained-parent, and newly-opened child handles in two
     snapshots. This admits a genuine child created before an immediate launcher
     exit while rejecting a tree attached to a recycled root or intermediate PID.
-    An unopenable candidate requires fresh full-snapshot absence; unreadable
-    identities or incomplete ancestry raise OSError, never certify a subset.
+    An unopenable candidate requires fresh full-snapshot absence, or a creation
+    instant proving it predates the root; unreadable identities or incomplete
+    ancestry raise OSError, never certify a subset.
     On failure only newly opened handles are closed; retained/root handles
     stay caller-owned.
     """
@@ -4196,6 +4695,28 @@ def descendant_termination_handles(
             # Enumeration errors propagate; pid_exists(False) is ambiguous.
             fresh_map = _windows_process_parent_map()
             remaining = unopened.intersection(fresh_map)
+            if remaining:
+                # A process that already existed before the root cannot descend
+                # from it, and that instant is readable through a query-only
+                # handle where a termination handle is refused. Drop such a
+                # stranger together with everything whose only route to the root
+                # runs through it, so a PID it inherited cannot turn the owned
+                # tree into a fatal incomplete one. A chain implicating a pinned
+                # retained identity stays fail-closed: dropping it would discard
+                # authority an earlier scan already proved.
+                foreign = _windows_foreign_descendant_pids(
+                    remaining,
+                    first,
+                    first_map,
+                    {**retained, **opened, pid: root_handle},
+                    pid,
+                    root_identity[1],
+                )
+                if foreign and foreign.isdisjoint(retained):
+                    unopened -= foreign
+                    for child_pid in sorted(foreign.intersection(opened)):
+                        close_process_handle(opened.pop(child_pid))
+                    remaining = unopened.intersection(fresh_map)
             if remaining:
                 errors = {child: opening_errors[child] for child in sorted(remaining)[:3]}
                 details = f"diagnostic_only=unknown; open_errors={errors}"
@@ -5661,7 +6182,8 @@ def pid_liveness(pid: int) -> str:
     a PID we merely can't signal is wrong) branch on ``PID_UNSIGNALABLE``.
 
     POSIX: ``os.kill(pid, 0)`` — ``ProcessLookupError`` -> DEAD,
-    ``PermissionError`` -> UNSIGNALABLE, success -> ALIVE.
+    ``PermissionError`` or an out-of-range PID -> UNSIGNALABLE, success ->
+    ALIVE.
     Windows: no EPERM distinction for our processes; map ``pid_exists`` onto
     DEAD/ALIVE (UNSIGNALABLE never returned).
     """
@@ -5672,6 +6194,11 @@ def pid_liveness(pid: int) -> str:
         except ProcessLookupError:
             return PID_DEAD
         except PermissionError:
+            return PID_UNSIGNALABLE
+        except OverflowError:
+            # The PID may have come from corrupt persistent state.  It is not
+            # evidence that the named process is dead, so preserve fail-closed
+            # callers by classifying it as unknown/unsignalable.
             return PID_UNSIGNALABLE
         except OSError:
             # Unknown errno — be conservative and treat as unsignalable
@@ -5780,7 +6307,7 @@ def pid_exists(pid: int) -> bool:
             return True
         except ProcessLookupError:
             return False
-        except (PermissionError, OSError):
+        except (PermissionError, OSError, OverflowError):
             return True  # exists but we can't signal it
     try:
         _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000  # noqa: N806 — Windows API constant
@@ -5817,6 +6344,35 @@ def pid_exists(pid: int) -> bool:
         return getattr(ctypes, "get_last_error", lambda: 0)() == 5  # ERROR_ACCESS_DENIED → exists
     except Exception:
         return False
+
+
+def pid_is_zombie(pid: int) -> bool | None:
+    """Whether *pid* has exited and only waits to be reaped: True / False, None when unreadable.
+
+    ``pid_exists`` answers True for a zombie (``os.kill(pid, 0)`` reaches it),
+    so a caller asking "is this process still RUNNING" -- a survivor check
+    after a signal, where the signalled process sits in the zombie state until
+    its parent, or init, collects it -- needs this beside it. Linux reads the
+    state field of ``/proc/<pid>/stat`` (``Z``, or ``X`` for one being torn
+    down); macOS asks the kernel (:func:`darwin_pid_is_zombie`); elsewhere, and
+    for a process that cannot be read, None -- the caller decides what
+    "unknown" means for it. Never signals anything.
+    """
+    if pid <= 0:
+        return None
+    if sys.platform == "linux":
+        try:
+            stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        close_paren = stat_data.rfind(")")
+        fields = stat_data[close_paren + 2 :].split() if close_paren >= 0 else []
+        if not fields:
+            return None
+        return fields[0] in ("Z", "X", "x")
+    if sys.platform == "darwin":
+        return darwin_pid_is_zombie(pid)
+    return None
 
 
 #: Seconds before the ``ps`` start-time probe is abandoned. Only the BSD leg
@@ -6183,6 +6739,34 @@ def kill_pid(pid: int, sig: int = SIGTERM) -> bool:
         raise OSError(f"taskkill invocation failed: {exc}") from exc
     if r.returncode != 0:
         _raise_taskkill_error(pid, r.returncode, r.stderr or r.stdout)
+    return True
+
+
+def kill_process_group(pgid: int, sig: int = SIGTERM) -> bool:
+    """Signal the POSIX process group *pgid* -- an id the CALLER captured and verified.
+
+    The group-addressed sibling of :func:`kill_process_tree`, for a caller that
+    holds a group id it read while the group's leader was alive and identity-
+    checked (:func:`kiro_crew.process_identity.isolated_group_of`) and must not
+    resolve anything from a pid at signal time: ``os.getpgid(pid)`` of a pid the
+    kernel has since handed to another process names that process's group.
+    ``os.killpg(pgid, sig)`` in-process, **letting exceptions propagate**
+    (``ProcessLookupError`` when the group has emptied, ``PermissionError``
+    when a member is unsignalable).
+
+    Carries the same broadcast guard as :func:`kill_process_tree`, refusing
+    with ``ValueError`` instead of degrading: ``killpg(1, sig)`` is ``kill(-1,
+    sig)`` in libc -- a signal to every process this uid owns -- so a non-int
+    id, an id <= 1, or our own group is never signalled, and there is no pid to
+    fall back to here. POSIX only: Windows has no process groups in this sense
+    (``OSError``); its trees are terminated through pinned handles
+    (:func:`kill_process_tree_pinned`).
+    """
+    if not IS_POSIX:
+        raise OSError("kill_process_group: no POSIX process groups on this platform")
+    if type(pgid) is not int or pgid <= 1 or pgid == _OWN_PGID:
+        raise ValueError(f"kill_process_group: refusing broadcast/self process group {pgid!r}")
+    os.killpg(pgid, sig)
     return True
 
 
@@ -6784,10 +7368,7 @@ def pin_directory(path: str | os.PathLike) -> int:
     O_NOFOLLOW``. Release with ``os.close``.
     """
     if IS_POSIX:
-        return os.open(
-            os.fspath(path),
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
+        return os.open(os.fspath(path), pinned_dir_flags())
 
     fd = _win_open_without_following(path)
     try:
@@ -6798,6 +7379,325 @@ def pin_directory(path: str | os.PathLike) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def pinned_dir_flags() -> int:
+    """POSIX open flags for a pinned directory: read-only, a directory, never a link.
+
+    ``O_NOFOLLOW`` is part of the requirement rather than an extra: without it each
+    open would happily traverse whatever link sits at the name, which is the hole the
+    pin exists to close. Called rather than captured at import, because the
+    Windows-simulation tests delete ``os.O_NOFOLLOW`` at runtime and a frozen constant
+    would keep offering a flag the platform does not have.
+
+    This is the same triple ``pinned_fs.dir_flags()`` publishes, and it is spelled
+    again here because of the import direction, not by preference: ``pinned_fs``
+    imports THIS module for its own Windows no-reparse open, so this layer cannot
+    import it back. ``test_pinned_directory.py`` asserts the two are equal, so the
+    copy cannot drift silently -- a flag added on either side reddens that test.
+    """
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+# Levels a pin CHAIN may descend below the directory it was opened on. The
+# recursion this class invites is bounded here rather than at each call site,
+# because the hazard belongs to the chain: every level holds a descriptor for as
+# long as the level below it is in use, so a planted chain costs both stack frames
+# and file descriptors, and the inputs are untrusted content (an agent-writable
+# artifact store, a hand-built snapshot archive). Unbounded, a deep chain turns a
+# delete into a swallowed RecursionError/EMFILE whose only visible effect is the
+# root refusing to go with ENOTEMPTY, and an import into an unclassified crash.
+# The refusal is an OSError from :meth:`PinnedDirectory.child`, so each caller's
+# EXISTING error policy classifies it -- warn-and-continue where residue is
+# already reported, propagate where the operation must fail closed.
+#
+# 64 is ``skills._PROJECT_SKILL_MAX_DEPTH``'s number and its reasoning: past any
+# legitimate tree, far short of the interpreter's recursion limit and of any
+# descriptor soft limit. A caller whose domain is shallower states its own tighter
+# cap (``skills._PENDING_SCRIPT_MAX_DEPTH`` is 8) and reaches it first.
+PINNED_TREE_MAX_DEPTH = 64
+
+
+class PinnedDirectory:
+    """Act on the ENTRIES of the directory this was opened on, never on its name.
+
+    :func:`pin_directory` hands back a descriptor; this is the operations that go
+    with it, because holding the descriptor is only half of what a caller needs. A
+    screen and the act that follows it must reach the same object, and the two
+    platforms reach that property by OPPOSITE routes:
+
+    * POSIX: every call is ``dir_fd=``-relative, so the descriptor IS the
+      directory whatever its name now resolves to. It must be that way, because
+      the pin does NOT stop a rename here -- a name re-resolved after the screen
+      is exactly the hole.
+    * Windows: there are no ``dir_fd`` operations at all (``os.open``,
+      ``os.listdir``, ``os.unlink`` and ``os.rmdir`` are in neither
+      ``os.supports_fd`` nor ``os.supports_dir_fd``), so every call goes by path
+      -- and that is sound only because the pin makes the path stable: the handle
+      is opened without ``FILE_SHARE_DELETE``, so while it lives this directory
+      and every ancestor refuse a rename and a delete.
+
+    So neither route works on the other platform, and a caller written in terms of
+    one of them is broken on the other. That asymmetry is the whole reason this
+    exists rather than each site branching on ``IS_POSIX`` itself.
+
+    A child is opened THROUGH the parent, and the parent stays pinned while the
+    child is in use, so a chain of these pins the whole path. :meth:`child`
+    refuses a link at the name on both platforms, which is what makes a
+    screen-then-descend sequence safe: the refusal happens in the open, not in a
+    check before it.
+
+    Use it as a context manager; the descriptor is closed on exit. Removing the
+    directory ITSELF is the parent's job (``parent.rmdir(name)``), both because a
+    pinned directory on Windows cannot be removed while the handle lives and
+    because a by-name removal is the thing this class exists to avoid.
+
+    A chain is bounded: :meth:`child` refuses past ``PINNED_TREE_MAX_DEPTH`` levels
+    below the directory the chain started on. See that constant for why the bound
+    lives here and not in each caller.
+    """
+
+    __slots__ = ("_depth", "_fd", "_path")
+
+    def __init__(self, fd: int, path: str, depth: int = 0) -> None:
+        self._fd = fd
+        self._path = path
+        self._depth = depth
+
+    @property
+    def path(self) -> str:
+        """The path this was opened on -- for MESSAGES, not for operations."""
+        return self._path
+
+    def __enter__(self) -> PinnedDirectory:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        os.close(self._fd)
+
+    def names(self) -> list[str]:
+        """The entry names, read through the pin."""
+        if IS_POSIX:
+            return os.listdir(self._fd)
+        return os.listdir(self._path)
+
+    def names_bounded(self, limit: int) -> list[str] | None:
+        """Up to *limit* entry names, or None when the directory holds more than that.
+
+        The counterpart to :meth:`names` for a directory whose contents are written by
+        an agent. Scanning stops at ``limit + 1``, so an attacker-sized directory is
+        never materialized in one allocation the way ``sorted(os.listdir(...))`` would:
+        that eager list is itself the exhaustion, spent BEFORE any budget the caller
+        applies afterwards could refuse it.
+
+        None means "over budget", deliberately not a truncated list -- a caller handed
+        the first *limit* names would act on a partial view of the directory while
+        believing it saw all of it. Refusing is the only honest answer.
+        """
+        out: list[str] = []
+        with os.scandir(self._fd if IS_POSIX else self._path) as scanner:
+            for entry in scanner:
+                out.append(entry.name)
+                if len(out) > limit:
+                    return None
+        return out
+
+    def _lstat(self, name: str) -> os.stat_result | None:
+        """``lstat`` of *name* in this directory, or None if it cannot be read."""
+        try:
+            if IS_POSIX:
+                return os.stat(name, dir_fd=self._fd, follow_symlinks=False)
+            return os.lstat(os.path.join(self._path, name))
+        except OSError:
+            return None
+
+    def is_link(self, name: str) -> bool:
+        """Whether *name* is a symlink or (on Windows) a directory junction."""
+        if IS_POSIX:
+            info = self._lstat(name)
+            return info is not None and stat.S_ISLNK(info.st_mode)
+        return is_link_or_junction(os.path.join(self._path, name))
+
+    def is_dir(self, name: str) -> bool:
+        """Whether *name* is a real directory -- a link answers False, not its target's shape."""
+        if self.is_link(name):
+            return False
+        info = self._lstat(name)
+        return info is not None and stat.S_ISDIR(info.st_mode)
+
+    def unlink(self, name: str) -> None:
+        """Remove the non-directory *name*. A link is removed, never its target."""
+        if IS_POSIX:
+            os.unlink(name, dir_fd=self._fd)
+            return
+        unlink_link_or_junction(os.path.join(self._path, name))
+
+    def rmdir(self, name: str) -> None:
+        """Remove the EMPTY directory *name* in this directory."""
+        if IS_POSIX:
+            os.rmdir(name, dir_fd=self._fd)
+            return
+        os.rmdir(os.path.join(self._path, name))
+
+    def child(self, name: str) -> PinnedDirectory:
+        """Pin the child directory *name*, reached through this pin.
+
+        Raises ``NotADirectoryError`` for a link or a non-directory at the name --
+        the refusal is the open itself, so there is no window between deciding the
+        name is a real directory and having it open.
+
+        Raises ``OSError`` with ``ENAMETOOLONG`` past ``PINNED_TREE_MAX_DEPTH``
+        levels below where the chain started, BEFORE opening anything, so a planted
+        chain cannot spend another frame or another descriptor. A caller that
+        dispatches on what is at the name -- the shape every consumer here uses --
+        re-raises this for a real directory, which is the intended outcome: too deep
+        is a refusal to be classified by the caller, never a link to be removed.
+        """
+        depth = self._depth + 1
+        if depth > PINNED_TREE_MAX_DEPTH:
+            raise OSError(
+                errno.ENAMETOOLONG,
+                f"pinned traversal deeper than {PINNED_TREE_MAX_DEPTH} levels",
+                os.path.join(self._path, name),
+            )
+        if IS_POSIX:
+            fd = os.open(name, pinned_dir_flags(), dir_fd=self._fd)
+            return PinnedDirectory(fd, os.path.join(self._path, name), depth)
+        child_path = os.path.join(self._path, name)
+        return PinnedDirectory(pin_directory(child_path), child_path, depth)
+
+    def child_if_real_dir(self, name: str) -> PinnedDirectory | None:
+        """Pin the child directory *name*, or None when *name* is not a real directory.
+
+        The screen-then-descend fallback, in one place. Three callers need it and each
+        one does something DIFFERENT with the answer, so what is shared is the
+        question, not the action: two of them remove the entry, one deliberately
+        leaves it alone. Hoisting the question and leaving the action at the call site
+        is what keeps the difference visible.
+
+        The subtle part is here rather than copied: when :meth:`child` refuses, the
+        dispatch asks what is at the name NOW and never keys on the exception class.
+        Linux answers ENOTDIR for ``O_DIRECTORY | O_NOFOLLOW`` on a symlink but ELOOP
+        is equally permitted, and the Windows open raises ``NotADirectoryError`` for a
+        reparse point; a caller keying on one class silently takes the wrong branch
+        wherever the kernel picks another.
+
+        A real directory that still refuses to open RE-RAISES, which is also how the
+        ``ENAMETOOLONG`` refusal :meth:`child` makes past ``PINNED_TREE_MAX_DEPTH``
+        reaches the caller: a tree nested past the bound fails the operation instead of
+        being treated as an entry to delete.
+        """
+        try:
+            return self.child(name)
+        except OSError:
+            if self.is_link(name) or not self.is_dir(name):
+                return None
+            raise
+
+    def _open_file(self, name: str) -> int:
+        """Open the regular file *name* in this directory for reading.
+
+        The leaf counterpart to :meth:`child`, and the reason a caller can both
+        JUDGE and READ an entry in one traversal instead of screening names and
+        re-resolving them afterwards. A link at the name is refused by the open
+        itself, so there is no check-to-read window for an adversary to aim at.
+
+        ``O_NONBLOCK`` is set so the OPEN cannot block: a FIFO at the name would
+        otherwise wait for a writer, and a hung read is a lost test RUN rather than
+        a failed one. It has no effect on a regular file. What was opened is then a
+        question for ``fstat`` on the descriptor, which is why :meth:`_read_bytes`
+        asserts there rather than predicting here.
+
+        Raises ``OSError``/``NotADirectoryError`` for a link, ``IsADirectoryError``
+        for a directory. Release the descriptor with ``os.close``.
+        """
+        if IS_POSIX:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            return os.open(name, flags, dir_fd=self._fd)
+        return open_file_no_reparse(os.path.join(self._path, name), nonblocking=True)
+
+    def _read_bytes(self, name: str, max_bytes: int | None = None) -> bytes:
+        """The bytes of the regular file *name*, read through this pin.
+
+        Refuses a link at the name, as :meth:`_open_file` does, so the bytes come
+        from the entry that was inspected rather than from wherever its name points
+        by the time the read happens. Every further question is asked of the
+        DESCRIPTOR, which is a fact about what was opened rather than a prediction
+        about what a later open would find:
+
+        * not a REGULAR file -- a directory, a device, a FIFO -- is refused.
+        * ``st_nlink > 1`` is refused. A hardlink is invisible to every
+          path-based guard because it shares its target's inode while carrying its
+          own name, so a sensitive file hardlinked into a tree the caller believes
+          it owns would otherwise be read out through it. This is the refusal
+          ``pinned_fs.refuse_hardlink_alias`` makes for that module's write and copy
+          paths, applied to a READ because what this serves is an agent-written tree
+          going out through an API.
+        * over *max_bytes*, when given, is refused with ``EFBIG`` -- and refused from
+          that same ``fstat`` rather than from a stat taken before the open, so the
+          size belongs to the file actually being read. The READ is bounded too, not
+          just the size check: a file that grows between the two stops at the cap
+          instead of being followed upward.
+        """
+        fd = self._open_file(name)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+                raise OSError(
+                    errno.EINVAL,
+                    "not a private regular file",
+                    os.path.join(self._path, name),
+                )
+            if max_bytes is not None and info.st_size > max_bytes:
+                raise OSError(
+                    errno.EFBIG,
+                    f"larger than the {max_bytes}-byte cap",
+                    os.path.join(self._path, name),
+                )
+            chunks: list[bytes] = []
+            held = 0
+            while True:
+                block = os.read(fd, 1 << 16)
+                if not block:
+                    return b"".join(chunks)
+                held += len(block)
+                if max_bytes is not None and held > max_bytes:
+                    raise OSError(
+                        errno.EFBIG,
+                        f"grew past the {max_bytes}-byte cap while being read",
+                        os.path.join(self._path, name),
+                    )
+                chunks.append(block)
+        finally:
+            os.close(fd)
+
+    def read_text(self, name: str, encoding: str = "utf-8", max_bytes: int | None = None) -> str:
+        """The text of the regular file *name*, read through this pin.
+
+        The whole read surface: a link at the name is refused by the open, and the
+        descriptor's own ``fstat`` rejects a non-regular entry, a hardlink, and
+        anything over *max_bytes* when the caller sets one, so the bytes come from the
+        entry that was inspected and cannot exceed what the caller agreed to hold. The
+        layers under this one are private because nothing outside needs them -- a
+        caller reaching for a raw descriptor here would be operating outside the pin
+        this class exists to hold.
+
+        Newlines are translated exactly as ``Path.read_text`` translates them. That
+        is not cosmetic: a caller swapping a by-path ``read_text`` for this must not
+        begin serving ``\\r\\n`` to its own consumers on Windows, where the bytes on
+        disk carry it and the old read silently normalised it away.
+        """
+        text = self._read_bytes(name, max_bytes).decode(encoding)
+        return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def pinned_directory(path: str | os.PathLike) -> PinnedDirectory:
+    """Open *path* as a :class:`PinnedDirectory`. Refuses a link at the name."""
+    target = os.fspath(path)
+    return PinnedDirectory(pin_directory(target), target)
 
 
 def _win_open_without_following(path: str | os.PathLike) -> int:
@@ -7776,13 +8676,83 @@ def _scale_ru_maxrss(ru_maxrss: int) -> int:
 def _ru_maxrss_bytes() -> int | None:
     """Peak (high-water) RSS in bytes from ``getrusage``, or None on failure.
 
-    POSIX only. This is a **peak**, not a live reading: ``ru_maxrss`` never
-    decreases for the life of the process.
+    POSIX only, and NOT the Linux reader: there ``execve`` folds the pre-exec
+    image's high-water mark into the new process's ``ru_maxrss`` (``fs/exec.c``
+    ``exec_mmap`` -> ``setmax_mm_hiwater_rss``), so a gateway started from a
+    large parent -- a launcher, a test runner, a bloated shell -- reports that
+    parent's peak as its own for life. :func:`_linux_peak_rss_bytes` is the
+    Linux source; :func:`_posix_peak_rss_bytes` picks. This is a **peak**, not
+    a live reading: ``ru_maxrss`` never decreases for the life of the process.
     """
     try:
         return _scale_ru_maxrss(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     except (ImportError, OSError, ValueError, AttributeError):
         return None
+
+
+#: Where Linux reports THIS process's own peak resident size: ``VmHWM`` in
+#: ``/proc/self/status`` is the current ``mm``'s high-water mark, which a fresh
+#: image starts from zero, unlike ``ru_maxrss`` (see :func:`_ru_maxrss_bytes`).
+_LINUX_STATUS_PATH = Path("/proc/self/status")
+_LINUX_PEAK_RSS_FIELD = "VmHWM:"
+#: The highest ``VmHWM`` this process has read. The kernel answers ``VmHWM``
+#: with ``max(hiwater_rss, live RSS)`` but folds the live figure into
+#: ``hiwater_rss`` only at unmap/exit, from per-thread counters it syncs in
+#: batches, so a reading taken while a mapping is live can sit a few hundred KiB
+#: above what the next reading, after the unmap, reports (measured 136-376 KiB
+#: on a 128 MiB mapping). A peak that never decreases is the contract, so the
+#: reader keeps its own floor.
+_LINUX_PEAK_RSS_FLOOR = 0
+
+
+def _peak_rss_from_status(status: str) -> int | None:
+    """Parse ``VmHWM`` out of a ``/proc/<pid>/status`` text, in bytes.
+
+    The kernel prints the field as ``VmHWM:\\t   11432 kB`` -- always kB, so any
+    other shape (a missing field, a unit that is not kB, a non-numeric value) is
+    unreadable rather than a guess. ``kiro_crew.pdf_extract_child`` carries the
+    same parser by design: that module keeps its imports minimal because it runs
+    under a capped address space, so it does not import this one.
+    """
+    for line in status.splitlines():
+        if not line.startswith(_LINUX_PEAK_RSS_FIELD):
+            continue
+        parts = line.split()
+        if len(parts) == 3 and parts[2] == "kB" and parts[1].isdigit():
+            return int(parts[1]) * 1024
+        return None
+    return None
+
+
+def _linux_peak_rss_bytes() -> int | None:
+    """This process's OWN peak RSS in bytes from ``VmHWM``, or None if unreadable.
+
+    Monotonic across calls (see :data:`_LINUX_PEAK_RSS_FLOOR`); an unreadable
+    status file is None even when a floor exists, so a failure reads as one.
+    """
+    global _LINUX_PEAK_RSS_FLOOR
+    try:
+        peak = _peak_rss_from_status(_LINUX_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if peak is None:
+        return None
+    if peak > _LINUX_PEAK_RSS_FLOOR:
+        _LINUX_PEAK_RSS_FLOOR = peak
+    return _LINUX_PEAK_RSS_FLOOR
+
+
+def _posix_peak_rss_bytes() -> int | None:
+    """Peak RSS in bytes for THIS process, or None where it cannot be read.
+
+    Linux reads its own ``VmHWM``; an unreadable ``/proc`` is None, never the
+    inherited ``ru_maxrss`` -- a wrong number is worse than a missing one in a
+    figure an operator uses to size a host. Every other POSIX platform reads
+    ``ru_maxrss`` in its unit.
+    """
+    if sys.platform.startswith("linux"):
+        return _linux_peak_rss_bytes()
+    return _ru_maxrss_bytes()
 
 
 def _linux_current_rss_bytes() -> int | None:
@@ -7883,11 +8853,12 @@ def proc_rss_bytes() -> int:
     - Linux: ``/proc/self/statm`` resident pages.
     - macOS: Mach ``task_info(MACH_TASK_BASIC_INFO).resident_size``.
     - Windows: ``GetProcessMemoryInfo().WorkingSetSize``.
-    - Last resort on POSIX only: ``getrusage(RUSAGE_SELF).ru_maxrss``, which is
-      a **peak** that never decreases. It is here so an unreadable ``/proc`` or
-      an unavailable ``libSystem`` still yields an order-of-magnitude number
-      rather than 0, and it over-reports by construction — see
-      :func:`proc_peak_rss_bytes` for the peak as a deliberate reading.
+    - Last resort on POSIX only: the process's own peak (``VmHWM`` on Linux,
+      ``getrusage(RUSAGE_SELF).ru_maxrss`` elsewhere), which never decreases.
+      It is here so an unavailable ``libSystem`` or a ``statm`` that will not
+      parse still yields an order-of-magnitude number rather than 0, and it
+      over-reports by construction — see :func:`proc_peak_rss_bytes` for the
+      peak as a deliberate reading.
     """
     if IS_POSIX:
         current = (
@@ -7895,7 +8866,7 @@ def proc_rss_bytes() -> int:
         )
         if current is not None:
             return current
-        return _ru_maxrss_bytes() or 0
+        return _posix_peak_rss_bytes() or 0
     counters = _windows_memory_counters()
     return 0 if counters is None else int(counters.WorkingSetSize)
 
@@ -8010,12 +8981,14 @@ def proc_peak_rss_bytes() -> int:
 
     The high-water mark since the process started: it never decreases, which is
     what makes it useful for diagnosing a transient spike that a live reading
-    has already forgotten — and useless as the live reading itself. POSIX reads
-    ``getrusage(RUSAGE_SELF).ru_maxrss``; Windows reads
+    has already forgotten — and useless as the live reading itself. Linux reads
+    this process's own ``/proc/self/status`` ``VmHWM`` (``ru_maxrss`` there is
+    inherited across ``execve`` from the parent, see :func:`_ru_maxrss_bytes`);
+    other POSIX reads ``getrusage(RUSAGE_SELF).ru_maxrss``; Windows reads
     ``GetProcessMemoryInfo().PeakWorkingSetSize``.
     """
     if IS_POSIX:
-        return _ru_maxrss_bytes() or 0
+        return _posix_peak_rss_bytes() or 0
     counters = _windows_memory_counters()
     return 0 if counters is None else int(counters.PeakWorkingSetSize)
 
@@ -8144,6 +9117,13 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
 #: Upper bound on processes walked in one subtree sample. A real tree is tiny
 #: (a launcher plus a handful of workers); the cap only guards against a
 #: pathological or looping ``/proc`` graph.
+#:
+#: It bounds THIS WALK's work; it is not a display ceiling for a count, and a
+#: surface that already enumerates its own tree does not adopt it. Truncating a
+#: displayed count at this number would hand the card a plain integer no
+#: consumer can tell from a complete one, where ``procs``/``matched`` reserve
+#: ``None`` for "unmeasurable". A walk that needs bounding elsewhere wants a
+#: budget that yields ``None``, not a silent truncation.
 _SUBTREE_MAX_PROCS = 256
 
 
@@ -8892,6 +9872,69 @@ def host_available_mib() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Process alarm and the suspend-inclusive clock
+# ---------------------------------------------------------------------------
+
+
+def process_alarm_available() -> bool:
+    """Whether :func:`arm_process_alarm` can arm anything on this platform."""
+    return hasattr(signal, "setitimer") and hasattr(signal, "ITIMER_REAL")
+
+
+def arm_process_alarm(seconds: float) -> bool:
+    """Deliver ``SIGALRM`` to this process after *seconds*; ``0`` cancels.
+
+    ``setitimer(ITIMER_REAL)`` is the kernel's per-process countdown: it
+    needs no thread, no GIL and no root, and re-arming replaces the pending
+    deadline.  On Linux the kernel runs it on ``CLOCK_MONOTONIC``, which
+    stands still through a suspend, so a deadline armed before a sleep keeps
+    its remaining time on resume instead of firing the instant the host wakes
+    (``copy_signal`` initialises the process's ``real_timer`` on that clock).
+    macOS schedules it on the absolute mach timebase, which also stops during
+    sleep.  Returns ``False`` on a platform without the timer (Windows), where
+    the caller must do without a deadline of this kind.
+    """
+    if not process_alarm_available():
+        return False
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    return True
+
+
+def boottime_now() -> float | None:
+    """Now, on the clock this host dates process starts against.
+
+    Linux: ``CLOCK_BOOTTIME`` counts time spent suspended, exactly as
+    ``/proc/uptime`` and the ``starttime`` field of ``/proc/<pid>/stat`` do.
+    ``time.monotonic()`` (``CLOCK_MONOTONIC``) does not, so the two MUST NOT be
+    mixed in one comparison: after a suspend of S seconds, a boot-clock age minus
+    a monotonic stamp places a process S seconds EARLIER than it really started,
+    which is how a live shell child comes to look like it predates its own
+    dispatch.  Read beside ``time.monotonic()`` across one interval, the
+    difference in their advance is the time the host spent suspended — the
+    reading the loop watchdog uses to name a resume.
+
+    macOS: ``libproc`` reports a process's start as an absolute wall-clock
+    instant (``pbi_start_tvsec``), so the stamp is ``time.time()`` — the same
+    clock, suspend included. That clock can STEP (NTP correction after a VM
+    resume, an admin reset), and a backward step between the stamp and the
+    runtime's fork dates a live child before its own dispatch. The liveness
+    oracle pairs this stamp with :func:`kiro_crew.acp.liveness.steady_now` and
+    refuses to attribute by start time once the two disagree (see
+    :meth:`kiro_crew.acp.liveness.LivenessOracle._started_after_dispatch`);
+    the stamp alone cannot tell a step from a slow spawn.
+
+    Returns None where no such clock is available, which every caller must read
+    as "cannot attribute" rather than as a time.
+    """
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):  # pragma: no cover - platform dependent
+        if sys.platform == "darwin":
+            return time.time()
+        return None
+
+
+# ---------------------------------------------------------------------------
 # strftime portability
 # ---------------------------------------------------------------------------
 
@@ -8959,6 +10002,44 @@ def nofile_soft_limit() -> int:
     if soft == resource.RLIM_INFINITY:
         return 0
     return max(0, int(soft))
+
+
+def python_launcher_hops() -> int:
+    """How many EXTRA processes a Python child spawned from ``sys.executable`` occupies.
+
+    On Windows a virtual environment's ``Scripts\\python.exe`` is not an
+    interpreter: it is the venv redirector, which reads ``pyvenv.cfg``,
+    ``CreateProcess``-es the base interpreter as its own child, and stays alive
+    as that child's parent until it exits. A ``-m`` child launched through
+    ``sys.executable`` from a venv-hosted gateway is therefore TWO live processes
+    in the child's Job, not one. A caller sizing an ``ActiveProcessLimit`` for
+    "this child and nothing else" has to count that hop, or the redirector's own
+    ``CreateProcess`` is what the limit refuses (``ERROR_NOT_ENOUGH_QUOTA``, which
+    the redirector reports as ``Unable to create process using ...`` and exit
+    101) and the child never runs at all.
+
+    Returns ``1`` when ``sys.executable`` is such a redirector -- the interpreter
+    Python actually runs is ``sys._base_executable`` and it is a different file --
+    and ``0`` everywhere else: on POSIX a venv's
+    ``bin/python`` is a symlink or a copy of the real interpreter and spawns
+    nothing. Over-counting is harmless (a ceiling of two instead of one still
+    bounds a fork bomb); under-counting is the defect this exists to remove.
+    """
+    if not IS_WINDOWS:
+        return 0
+    base = getattr(sys, "_base_executable", None)
+    if not base:
+        return 0
+    try:
+        same = os.path.normcase(os.path.realpath(sys.executable)) == os.path.normcase(
+            os.path.realpath(base)
+        )
+    except OSError:
+        # Cannot resolve either path: fall back to the unresolved spellings and
+        # fail toward the hop, since over-counting is harmless and under-counting
+        # is the defect this exists to remove.
+        same = os.path.normcase(sys.executable) == os.path.normcase(base)
+    return 0 if same else 1
 
 
 # ---------------------------------------------------------------------------

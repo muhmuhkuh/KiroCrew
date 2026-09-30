@@ -46,7 +46,6 @@ vi.mock('../pages/chat/SidePanel', () => ({
   SIDE_PANEL_MIN_W: 320,
   SIDE_PANEL_RESERVED_W: 560,
   CHAT_PANE_MIN_W: 320,
-  measureSidePanelReservedW: () => 560,
   // Real arithmetic (the gate under test lives here); only the component is stubbed.
   sidePanelFillWidth: ({ winW, railW, sidebarW, isMobile }: { winW: number; railW: number; sidebarW: number; isMobile: boolean }) => {
     if (isMobile) return Math.max(320, winW)
@@ -56,7 +55,6 @@ vi.mock('../pages/chat/SidePanel', () => ({
 }))
 
 // --- Stub hooks ---
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
 vi.mock('../hooks/useFilteredDropdown', () => ({ useFilteredDropdown: () => ({ filtered: [], query: '', setQuery: vi.fn(), selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn() }) }))

@@ -88,10 +88,8 @@ vi.mock('../pages/chat/SidePanel', () => ({
   SIDE_PANEL_MIN_W: 320,
   SIDE_PANEL_RESERVED_W: 560,
   CHAT_PANE_MIN_W: 320,
-  measureSidePanelReservedW: () => 560,
   sidePanelFillWidth: () => undefined,
 }))
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 // A stable object: the real hook holds `agents` in `useState`, so a mock that
 // rebuilt `[]` per render would fail this file for a reason production does not

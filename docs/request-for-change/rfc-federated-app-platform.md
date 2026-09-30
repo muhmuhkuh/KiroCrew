@@ -14,13 +14,12 @@ superseded-by: []
 # RFC: Federated App Platform — Dynamic ESM Loading with Import Maps
 
 > **Current behaviour: see [`../system-specs/modules/app-kit-platform.md`](../system-specs/modules/app-kit-platform.md) §18.**
-> The shipped half of Phase 1 — an app UI as a dynamically imported ESM module
-> through `AppHost` and the manifest's `ui.entry`, with `@kirocrew/app-sdk`
-> provided by the host — is specified there. The host-declared import map over
-> vendored `/vendor/` ESM shims described below is **not** on main: the only import
-> map that ships is the CDN one inside MCP App `srcdoc` iframes, which is a
-> different mechanism. Read the phases below as the proposal, not as a
-> description.
+> The shipped Phase 1 path dynamically imports an app's ESM module through
+> `AppHost` and the manifest's `ui.entry`, with `@kirocrew/app-sdk` provided by
+> the host. The host-declared import map and vendored `/vendor/` ESM shims now
+> ship from `website/vite.config.ts` and `website/public/vendor/`; the CDN import
+> map inside MCP App `srcdoc` iframes is a separate mechanism. Read the remaining
+> phases below as proposals, not descriptions of current behaviour.
 
 **Author:** KiroCrew contributors  
 **Date:** 2026-04-18  
@@ -331,7 +330,7 @@ These components consume CSS custom properties (`--bg`, `--text`, `--accent`, et
 
 ### 3.7 Registry
 
-The registry is a JSON index file hosted on a CDN (or internal S3 bucket). The existing `registry.py` already supports fetching and caching a remote index. We extend `RegistryEntry` with bundle-related fields:
+The registry is a JSON index file hosted on a CDN (or internal S3 bucket). The existing registry (`apps/registry_pipeline/indexes.py` and `caches.py`) already supports fetching and caching a remote index. We extend `RegistryEntry` with bundle-related fields:
 
 ```json
 {
@@ -562,7 +561,7 @@ The following modules are **kept** and enhanced:
 | Module | Current Purpose | Enhancement |
 |--------|----------------|-------------|
 | `apps/manager.py` | Install/uninstall/enable/disable | Add bundle download + hash verification |
-| `apps/registry.py` | Registry fetch + cache | Add `bundleUrl`, `bundleHash` fields |
+| `apps/registry_pipeline/indexes.py`, `caches.py` | Registry fetch + cache | Add `bundleUrl`, `bundleHash` fields |
 | `apps/bridges.py` | Register agents/skills/crons | No change needed |
 | `apps/scaffold.py` | `kirocrew app init` | Add `--with-ui` flag, Vite config generation |
 | `apps/routes.py` | REST API for app management | Add bundle serving endpoint |

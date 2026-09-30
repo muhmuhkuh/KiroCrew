@@ -7,7 +7,9 @@ import functools
 import importlib.util
 import json
 import logging
+import math
 import os
+import platform
 import re
 import time
 from pathlib import Path
@@ -52,10 +54,13 @@ from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
     _remove_queued_by_id,
     dashboard_slot_key,
+    drained_to_thread,
     effective_session_key,
     mint_options_token,
     remember_slack_options,
+    run_to_completion,
     slack_options_owner_key,
+    subagent_event_slot,
 )
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
@@ -64,14 +69,25 @@ from kiro_crew.dashboard.handlers._shared import (
     pip_extra_install_command,
     read_bounded_json,
 )
+from kiro_crew.dashboard.handlers.browser_view_relay import ROUTE_PREFIX
 from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
 from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_request
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_END,
     CRON_NOTIFY_PREFIX,
+    PERSISTED_SUBAGENT_REPLAY_KEEP,
+    PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
+    stage_boundary_for,
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
+from kiro_crew.dashboard.ws_event_scope import (
+    _audit_allow,
+    _audit_deny,
+    persisted_replay_denial_reason,
+    persisted_snapshot_denial_reason,
+    slot_owner_snapshot,
+)
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
 from kiro_crew.messaging.renderer import (
@@ -80,7 +96,11 @@ from kiro_crew.messaging.renderer import (
     display_safe_for,
     format_overflow,
 )
-from kiro_crew.messaging.transport import delivery_confirmed
+from kiro_crew.messaging.transport import (
+    DM_TARGET_PREFIX,
+    delivery_confirmed,
+    sole_direct_target,
+)
 from kiro_crew.notifications.bus import (
     NotificationPayload,
     NotificationValidationError,
@@ -88,18 +108,28 @@ from kiro_crew.notifications.bus import (
 from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
 from kiro_crew.platform_compat import IS_MACOS
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.slack.client import BLOCKS_REMOTE_MEDIA_ERROR, blocks_request_remote_media
 from kiro_crew.slack.format import build_options_blocks, extract_options
 from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
-from kiro_crew.solo_spawn import (
-    SOLO_SPAWN_REFUSED_CODE,
-    delegation_refusal,
-    parent_work_supported,
-    solo_spawn_difference,
-    solo_spawn_question,
-)
 from kiro_crew.spawn_warm import warm_project_agents_for_spawn
-from kiro_crew.subagent import effort_applied_note, effort_drop_reason
-from kiro_crew.subagent_persistence import _agent_dir, read_state
+from kiro_crew.subagent import (
+    DEFERRED_QUEUED_REASONS,
+    effort_applied_note,
+    effort_drop_reason,
+    parent_spawn_allowlists,
+    stage_boundary_owner_for_run,
+)
+from kiro_crew.subagent_persistence import (
+    DISMISSAL_FAILED,
+    DISMISSAL_NO_FOLDER,
+    PanelRecords,
+    _agent_dir,
+    classify_persisted_ending,
+    read_panel_records,
+    read_state,
+    read_tombstone,
+    record_panel_dismissal_outcome,
+)
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
@@ -155,15 +185,207 @@ _SEND_MESSAGE_CHANNEL_TYPES: frozenset[str] = frozenset(CHANNEL_SEND_NAMESPACES)
 logger = logging.getLogger(__name__)
 
 
-def _read_text_or_none(path: Path) -> str | None:
-    """Read ``path`` as UTF-8, or return None if it does not exist.
+class _ThresholdPairInverted(Exception):
+    """Raised from a ``_LockedSectionWrite`` finalizer: the merged section would
+    store a soft threshold above its hard one. Aborts the write."""
 
-    Pure synchronous filesystem I/O — call via ``asyncio.to_thread`` from an
-    async handler so the stat + read never block the gateway event loop. Used to
-    snapshot config.json before a credential write so a failed .env commit can
-    roll the metadata back to a consistent pair.
+
+class _CredentialTupleChanged(Exception):
+    """Raised from the Teams finalizer: the (app id, password, tenant) about to be
+    STORED is not the tuple Azure verified. Aborts the write."""
+
+
+#: ``_LockedSectionWrite._prior`` when the section key was not in the document
+#: at all -- distinct from a present ``null`` or other non-object value, which
+#: a rollback has to put back rather than delete.
+_ABSENT: Any = object()
+
+
+class _LockedSectionWrite:
+    """One channel's ``config.json`` write, through ``update_config_locked``.
+
+    Every per-channel settings saver in this module merges a staged dict into
+    its own top-level section and, when the paired ``.env`` write then fails,
+    undoes that merge. This is that step, written once, because each saver is a
+    hand-copied credential-write skeleton and the copy is how an unlocked write
+    arrives (see ``TestTheAtomicJsonWriteConfigFamilyIsRatcheted``).
+
+    ``apply`` merges ``changes`` into -- and drops ``drop_keys`` from -- the named
+    section of the config as re-read INSIDE the sidecar lock, so a concurrent
+    edit to an unrelated key is preserved instead of being replaced by the
+    caller's older snapshot. The advisory lock on ``<path>.lock`` is what keeps
+    another PROCESS (``kirocrew config set``) from landing between the read and
+    the write; the in-process ``_get_config_lock()`` the caller holds only
+    serializes writers inside this one.
+
+    ``restore`` undoes only the keys this write touched, and only where the
+    stored value is still the one it wrote. Rewriting the file from a whole-file
+    snapshot would revert whatever a concurrent writer landed; restoring the
+    whole section would still discard a concurrent ``kirocrew config set
+    <channel>.*`` that arrived between our write and the rollback. A key whose
+    stored value differs from what we wrote has been changed by someone else
+    since, and reverting it would destroy their edit to undo ours.
+
+    ``seed_from`` names a legacy section (WeCom's ``wechat``) whose COPY becomes
+    the starting point when the target section is absent, so an install still on
+    the old key keeps its allow-list and thresholds across its first save instead
+    of having them shadowed by a bare new section.
+
+    ``drop_keys`` and ``blank_keys`` are the legacy plaintext-credential purge
+    (``bot_token`` / ``app_password`` stored in ``config.json`` before the
+    ``.env`` slot existed). They are decided against the document the write
+    lands on, not the snapshot: a copy a concurrent writer landed after the
+    handler's read is purged too, so clearing the ``.env`` credential cannot
+    leave a fallback behind that a restart would authenticate with. ``drop``
+    removes the key; ``blank`` sets it to ``""`` where present. Both are undone
+    by ``restore``.
+
+    ``finalize`` runs on the MERGED section, inside the lock, for a rule that
+    couples the written keys to their stored counterparts (a soft/hard threshold
+    pair): the pre-lock snapshot the handler validated against may not be the
+    document the write lands on, so the coupled check has to be re-decided
+    against the fresh one. It may adjust the section or raise; a raise aborts
+    the write and propagates to the caller.
+
+    Both run off the event loop through ``drained_to_thread``: the locked
+    read-modify-write does file IO and may block on another process holding the
+    lock, neither of which belongs on the loop, and a thread cannot be
+    cancelled, so a cancelled request must not unwind (releasing
+    ``_get_config_lock()`` and skipping its paired ``.env`` write) while the
+    worker is still rewriting the file.
     """
-    return path.read_text(encoding="utf-8") if path.exists() else None
+
+    def __init__(
+        self,
+        path: Path,
+        section: str,
+        changes: dict[str, object],
+        *,
+        drop_keys: tuple[str, ...] = (),
+        blank_keys: tuple[str, ...] = (),
+        seed_from: str | None = None,
+        finalize: Callable[[dict], None] | None = None,
+    ) -> None:
+        self._path = path
+        self._section = section
+        self._changes = dict(changes)
+        self._drop_keys = drop_keys
+        self._blank_keys = blank_keys
+        self._seed_from = seed_from
+        self._finalize = finalize
+        # The values actually stored under the keys this write moved -- the
+        # requested keys as ``finalize`` may have adjusted them, plus any other
+        # key ``finalize`` changed; ``restore`` compares against these.
+        self._written: dict[str, object] = dict(changes)
+        # The pre-mutation section, captured inside ``apply`` because that is the
+        # only point at which the pre-mutation state is known to be current: a
+        # copy of the object, the raw non-object value that was stored under the
+        # key, or ``_ABSENT`` when the key was not there.
+        self._prior: Any = _ABSENT
+        # What ``apply`` started a MISSING section from: the legacy copy, or ``{}``.
+        # ``restore`` uses it to recognise a section that exists only because this
+        # write created it, seeded contents included.
+        self._created_from: dict | None = None
+
+    def apply(self, fresh: dict) -> dict | None:
+        """Merge into *fresh*; ``None`` when the section would be unchanged.
+
+        ``None`` tells ``update_config_locked`` to skip the write, so a save
+        whose every key already holds the requested value (or whose purge finds
+        nothing to purge) rewrites nothing and wakes no watcher.
+        """
+        section = fresh.get(self._section)
+        if self._section not in fresh:
+            self._prior = _ABSENT
+        else:
+            self._prior = dict(section) if isinstance(section, dict) else section
+        if not isinstance(section, dict):
+            legacy = fresh.get(self._seed_from) if self._seed_from else None
+            # A COPY: the legacy block is never mutated in place.
+            section = dict(legacy) if isinstance(legacy, dict) else {}
+            self._created_from = dict(section)
+            fresh[self._section] = section
+        for key in self._drop_keys:
+            section.pop(key, None)
+        for key in self._blank_keys:
+            if key in section:
+                section[key] = ""
+        section.update(self._changes)
+        touched = set(self._changes)
+        if self._finalize is not None:
+            pre = dict(section)
+            self._finalize(section)
+            # Every key ``finalize`` moved is ours to undo as well -- a soft
+            # threshold it pulled down to a lowered hard one was never requested,
+            # and a rollback that left it lowered would lose it silently.
+            touched |= {
+                k for k in set(pre) | set(section) if pre.get(k, _ABSENT) != section.get(k, _ABSENT)
+            }
+        self._written = {k: section[k] for k in touched if k in section}
+        if isinstance(self._prior, dict) and section == self._prior:
+            return None
+        return fresh
+
+    def restore(self, fresh: dict) -> dict:
+        section = fresh.get(self._section)
+        if not isinstance(section, dict):
+            # Nothing of ours left to undo (the section is gone or was replaced
+            # wholesale by another writer).
+            return fresh
+        # What each key held before we wrote it: the stored object, or -- for a
+        # section we created -- the seed it was created from, so a key we wrote
+        # OVER a seeded legacy value goes back to that value rather than away.
+        if isinstance(self._prior, dict):
+            before = self._prior
+        else:
+            before = self._created_from if self._created_from is not None else {}
+        for key, written in self._written.items():
+            if section.get(key) != written:
+                continue  # not ours any more
+            if key in before:
+                section[key] = before[key]
+            else:
+                section.pop(key, None)
+        for key in self._drop_keys:
+            if key in section:
+                continue  # someone re-set it since; theirs
+            if key in before:
+                section[key] = before[key]
+        for key in self._blank_keys:
+            if section.get(key) == "" and key in before:
+                section[key] = before[key]
+        # A section that only exists because we created it -- once our keys are
+        # undone it is back to exactly what we seeded it with -- goes back to what
+        # was there: nothing, or the non-object value (a hand-edited ``null``)
+        # that was stored under the key. So a failed first-time save leaves
+        # neither an empty scaffold, nor a copy of the legacy section shadowing
+        # the original, nor a deleted value. A key someone else added to the
+        # section since makes it theirs, and it stays.
+        if not isinstance(self._prior, dict) and section == self._created_from:
+            if self._prior is _ABSENT:
+                fresh.pop(self._section, None)
+            else:
+                fresh[self._section] = self._prior
+        return fresh
+
+    async def commit(self) -> None:
+        """Merge ``changes`` into the file. Raises ``ConfigReadError`` on a corrupt file."""
+        # Looked up on the module at call time, not bound at import: the loader is
+        # what tests patch to observe or interleave with this write.
+        await drained_to_thread(
+            functools.partial(_loader.update_config_locked, self._path, mutate=self.apply)
+        )
+
+    async def rollback(self, channel: str) -> None:
+        """Undo ``commit`` after the paired ``.env`` write failed. Never raises."""
+        try:
+            await drained_to_thread(
+                functools.partial(_loader.update_config_locked, self._path, mutate=self.restore)
+            )
+        except Exception:
+            # A rollback that cannot run must not mask the original failure the
+            # caller is already raising; the mismatch is logged instead.
+            logger.exception("%s config rollback failed; config may lead .env", channel)
 
 
 def _sel():
@@ -182,34 +404,102 @@ def _sel():
 #: ``subagent.AGENT_NOT_FOUND_CODE``.
 _SPAWN_REJECTED_CODE = "spawn_rejected"
 
+#: Wire text for a run control that reached the gateway with no session identity.
+#: Actionable on purpose: the MCP wrapper hands this string to the model verbatim,
+#: and "not found" alone would send the caller looking for a typo in the run id.
+_IDENTITY_LESS_RUN_CONTROL = (
+    "not found: run controls are scoped to the session that started the run, and "
+    "this call carried no session identity (X-Session-Key). A kiro-cli process that "
+    "multiplexes sessions cannot name one; see the strict-identity diagnosis in "
+    "`kirocrew doctor` (mcp_gateway.stub_servers)."
+)
+
+
+def _run_belongs_to_caller(caller: str, run_id: str, parent: object) -> bool:
+    """Whether *caller* may control run *run_id* whose originating session is *parent*.
+
+    Ownership is the ONLY admission: the run's parent session, or the run itself.
+    A caller with no identity owns nothing that a session started -- it is admitted
+    to a run with no parent (one the host operator started from the CLI, which
+    carries the internal secret and no session) and to nothing else. Neither the
+    caller's memory store nor the transport it arrived on widens this.
+    """
+    if caller == f"subagent:{run_id}":
+        return True
+    if parent is None:
+        # No record of this run at all: nothing vouches for who started it, so
+        # nobody owns it. Reading "unknown" as "parentless" would let a caller
+        # with no identity act on any id it can name.
+        return False
+    parent_key = parent if isinstance(parent, str) else ""
+    return parent_key == caller
+
 
 async def _spawn_scope_refusal(
     request: web.Request, *, claimed_session: str | None = None
 ) -> web.Response | None:
-    """Keep run controls with their originating session, regardless of target member."""
+    """Keep run controls with their originating session, regardless of target member.
+
+    Every INTERNAL caller (kiro-cli's MCP servers, the CLI) takes the ownership
+    check, whatever memory store its identity resolved to and whether it resolved
+    one at all: a verified Global-memory session is still only the owner of its
+    own runs, and a caller that presented no ``X-Session-Key`` owns no run a
+    session started. Only the dashboard owner (cookie auth, no ``internal_auth``)
+    is admitted without it, because that surface IS the owner. Refusals answer
+    404 ``task_scope_denied`` so a run id is never confirmed to a caller that may
+    not see it; the identity-less refusal says why, since a wrong run id and a
+    missing identity are indistinguishable from the caller's side otherwise.
+    """
     scope, refusal = await internal_memory_scope(
         request, "spawn.access", claimed_session=claimed_session
     )
-    if refusal is not None or scope is None:
+    if refusal is not None:
         return refusal
+    if request.get("internal_auth") is not True:
+        return None  # the dashboard owner's own surface
     caller = request.headers.get("X-Session-Key", "")
     state = request.app["state"]
     run_id = request.match_info["agent_id"]
     info = state.subagents.get(run_id) if state.subagents else None
     record = None if info is not None else await asyncio.to_thread(read_state, run_id)
-    parent = (
-        info.parent_session_key if info is not None else (record or {}).get("parent_session_key")
-    )
-    if parent == caller or caller == f"subagent:{run_id}":
+    parent: object
+    if info is not None:
+        parent = info.parent_session_key
+    elif record is not None:
+        # The persisted record spells the field ``parent_session``
+        # (``subagent_persistence.write_state``). A record that lacks it is an
+        # unknown owner, not a parentless run: ``None`` stays ``None``.
+        parent = record.get("parent_session")
+    else:
+        # A harness-native child has no managed run and no persisted record; its
+        # ownership is the dashboard slot that tracks its card. Anything else
+        # unknown stays ``None`` and is refused.
+        card = (getattr(state, "_native_cards", None) or {}).get(run_id)
+        # The card stores the bare slot key (``_register_native_card``); the
+        # caller's identity is that slot's session key, ``dashboard:<slot>``.
+        slot = card.get("slot") if isinstance(card, dict) else None
+        parent = f"dashboard:{slot}" if isinstance(slot, str) and slot else None
+    if _run_belongs_to_caller(caller, run_id, parent):
         return None
     _sel().log_api_access(
-        caller="internal",
+        caller=caller or "internal",
         operation="spawn.access",
         outcome="denied",
         source="subagent",
-        error="The run belongs to another originating session.",
+        error=(
+            "The run belongs to another originating session."
+            if caller
+            else "The caller presented no session identity."
+        ),
+        resources=f"run={run_id} scope={'private' if scope else 'global'}",
     )
-    return web.json_response({"error": "not found", "code": "task_scope_denied"}, status=404)
+    return web.json_response(
+        {
+            "error": "not found" if caller else _IDENTITY_LESS_RUN_CONTROL,
+            "code": "task_scope_denied",
+        },
+        status=404,
+    )
 
 
 async def _spawn_request_memory_mode(
@@ -226,6 +516,80 @@ async def _spawn_request_memory_mode(
     return strictest((parent_mode, caller_mode)) or "persistent"
 
 
+def _stage_boundary_slot_for_parent(
+    state: DashboardState,
+    parent: str,
+    boundary_owner: str = "",
+) -> Any | None:
+    """Return an exact tagged owner, or legacy parent/latest fallback."""
+    slots = getattr(state, "_slots", None)
+    if not isinstance(slots, dict):
+        return None
+    slot_name = dashboard_slot_key(parent)
+    if not slot_name and parent.startswith("dashboard:"):
+        slot_name = parent.removeprefix("dashboard:")
+    canonical = slots.get(slot_name) if slot_name else None
+    same_parent = tuple(
+        candidate
+        for candidate in slots.values()
+        if candidate is canonical or effective_session_key(candidate) == parent
+    )
+    if boundary_owner:
+        return next(
+            (
+                candidate
+                for candidate in same_parent
+                if stage_boundary_for(candidate).owner == boundary_owner
+            ),
+            None,
+        )
+    aliases = tuple(candidate for candidate in same_parent if candidate is not canonical)
+    active_aliases = tuple(
+        candidate for candidate in aliases if stage_boundary_for(candidate).owner
+    )
+    if active_aliases:
+        parent_matches = tuple(
+            candidate
+            for candidate in active_aliases
+            if parent in stage_boundary_for(candidate).parent_session_keys
+        )
+        eligible = parent_matches or active_aliases
+        return max(
+            eligible,
+            key=lambda candidate: (
+                stage_boundary_for(candidate).armed_at,
+                str(getattr(candidate, "key", "")),
+            ),
+        )
+    return canonical or (same_parent[0] if same_parent else None)
+
+
+def _stage_boundary_owner_for_parent(state: DashboardState, parent: str) -> str:
+    """Return the active stage token for *parent*, or explicit unowned ``""``."""
+    slot = _stage_boundary_slot_for_parent(state, parent)
+    if slot is None:
+        return ""
+    owner = stage_boundary_for(slot).owner
+    return owner if isinstance(owner, str) else ""
+
+
+def parent_work_supported(state: Any, parent_session: str) -> bool:
+    """Only dashboard-owned turns have the verified busy-turn completion queue.
+
+    The spawn receipt tells the parent whether it may do a short, bounded step
+    of its own non-overlapping work before ending its turn, or must yield at
+    once. Channel-only, nested and background callers retain their yield
+    boundary. A channel linked to a dashboard slot uses the same queue as
+    dashboard chat.
+    """
+    if not parent_session or parent_session.startswith(("subagent:", "cron:", "hook:")):
+        return False
+    slots = getattr(state, "_slots", None)
+    return isinstance(slots, dict) and any(
+        effective_session_key(slot) == parent_session for slot in slots.values()
+    )
+
+
 async def api_spawn(request: web.Request) -> web.Response:
     """POST /api/spawn — spawn a subagent.
 
@@ -234,6 +598,22 @@ async def api_spawn(request: web.Request) -> web.Response:
     omitting the flag would make ``spawn_run`` reconcile the member again and
     could close a batch wave early.
     """
+    # Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    # the class ``is_owner_dashboard_request`` can rule on at all. The other two
+    # caller classes keep the control that already governs them -- an
+    # ``X-Internal-Secret`` loopback process is admitted by the constant-time
+    # secret match and reaches here with ``app`` ABSENT, and an app token is
+    # confined to its manifest's declared paths by ``_enforce_app_scope``.
+    if request.get("internal_auth") is not True and request.get("app") == "":
+        # Body-scope import, like the sibling gates in this package
+        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
+        # reaches back into sibling handler modules, so importing the helper at
+        # module scope from here would close a cycle.
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, "spawn.create")
+        if owner_denied is not None:
+            return owner_denied
     state: DashboardState = request.app["state"]
     if not state.subagents:
         return web.json_response({"error": "subagents not available"}, status=503)
@@ -259,10 +639,6 @@ async def api_spawn(request: web.Request) -> web.Response:
                 # below unreachable: the block, its unknown_crew refusal and its
                 # store resolution all ran off a value that was always None.
                 "crew": body.get("crew", ""),
-                # Why one task is spawned alone (solo gate). Listed for the same
-                # reason as ``crew``: an unlisted field is dropped, not refused.
-                "solo_reason": body.get("solo_reason", ""),
-                "solo_details": body.get("solo_details", ""),
                 "target_member": body.get("target_member", ""),
             },
             SPAWN_RUN_SCHEMA,
@@ -337,6 +713,19 @@ async def api_spawn(request: web.Request) -> web.Response:
         parent_execution = caller.execution
         if parent_execution is None and parent_session:
             parent_execution = await asyncio.to_thread(read_session_execution, parent_session)
+        # The parent agent spec's ``availableAgents`` declaration, read off-loop
+        # from the template the record named, so the gate needs neither a second
+        # record read nor a directory scan on the loop. A parentless request has
+        # no declaration to honour: the synthesized context below carries the
+        # CHILD's template, which must not be mistaken for a parent.
+        parent_spawn_policy = (
+            (
+                parent_execution.template_id,
+                await asyncio.to_thread(parent_spawn_allowlists, parent_execution.template_id),
+            )
+            if parent_execution is not None
+            else ("", ())
+        )
         if parent_execution is None:
             parent_execution = ExecutionContext(
                 None, MemoryStoreRef("default"), "template", agent or "kirocrew"
@@ -370,69 +759,7 @@ async def api_spawn(request: web.Request) -> web.Response:
     cwd = cleaned.get("cwd") or ""
     model = cleaned.get("model") or ""
     reasoning_effort = cleaned.get("reasoning_effort") or ""
-    # SOLO GATE, gateway half. ``solo`` is a transport-layer marker only the
-    # MCP spawn tools send for a one-task call (the SDK and apps never do, so
-    # they are never gated). The tool side already refused a solo call that
-    # named nothing; this half catches the one that named the parent's OWN
-    # agent / model / crew to get past it. Pre-spawn, so never ``counted``.
-    solo = body.get("solo", False)
-    if not isinstance(solo, bool):
-        solo = str(solo).lower() in ("true", "1", "yes")
-    solo_reason = cleaned.get("solo_reason") or ""
-    solo_details = cleaned.get("solo_details") or ""
     can_work = parent_work_supported(state, parent_session)
-    reason_error = delegation_refusal(solo_reason, solo_details)
-    if solo_reason == "parent_parallel" and not can_work:
-        reason_error = (
-            "Error: parent_parallel requires a dashboard-owned parent turn. "
-            "This caller must yield immediately; do the work directly instead."
-        )
-    if reason_error:
-        _sel().log_api_access(
-            caller="internal",
-            operation="spawn.solo",
-            outcome="denied",
-            source="solo_gate",
-            resources=parent_session,
-            error=reason_error,
-        )
-        return web.json_response(
-            {"error": reason_error, "code": SOLO_SPAWN_REFUSED_CODE}, status=400
-        )
-    if solo and not solo_reason:
-        ground = solo_spawn_difference(state, parent_session, agent=agent, model=model, crew=crew)
-        if not ground:
-            _sel().log_api_access(
-                caller="internal",
-                operation="spawn.solo",
-                outcome="denied",
-                source="solo_gate",
-                resources=parent_session,
-                error="names only the parent's own agent/model/crew",
-            )
-            return web.json_response(
-                {"error": solo_spawn_question(), "code": SOLO_SPAWN_REFUSED_CODE},
-                status=400,
-            )
-        # Let through on a difference: audited like the reason arm, with the
-        # ground, so no gate outcome is invisible after the fact.
-        _sel().log_api_access(
-            caller="internal",
-            operation="spawn.solo",
-            outcome="allowed",
-            source="solo_gate",
-            resources=f"{parent_session} differs={ground}",
-        )
-    elif solo:
-        # The reason is the caller's own claim; recording it is what makes a
-        # habit of lone spawns visible after the fact.
-        _sel().log_api_access(
-            caller="internal",
-            operation="spawn.solo",
-            outcome="allowed",
-            source="solo_gate",
-            resources=f"{parent_session} reason={solo_reason} source=model_claim",
-        )
     # Batch/wave identity (transport-layer params from spawn_run MCP, like
     # approval_mode/silent above): validated inline, bounded, never LLM-schema.
     batch_id = str(body.get("batch_id", "") or "")[:32]
@@ -459,11 +786,6 @@ async def api_spawn(request: web.Request) -> web.Response:
         silent=silent,
         batch_id=batch_id,
         batch_total=batch_total,
-        delegation=(
-            {"reason": solo_reason, "details": solo_details, "source": "model_claim"}
-            if solo_reason or solo_details
-            else None
-        ),
         keep=keep,
         include_memory=cleaned.get("include_memory", True) is not False,
         include_lessons=cleaned.get("include_lessons", True) is not False,
@@ -472,6 +794,8 @@ async def api_spawn(request: web.Request) -> web.Response:
         crew=crew,
         _memory_mode=admitted_mode,
         _execution_context=admitted_execution.to_record(),
+        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
+        _parent_spawn_policy=parent_spawn_policy,
     )
     if not info:
         # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
@@ -508,6 +832,20 @@ async def api_spawn(request: web.Request) -> web.Response:
         "status": "spawned",
         "parent_work_supported": can_work,
     }
+    # A row the gate DEFERRED (memory floor, critical posture, adaptive cap at
+    # 0) is accepted and keyed like any other -- same ``id``, counted in its
+    # wave -- but it is not running and may not run for a long time: the pump
+    # re-checks it every admit wait for as long as the host stays below the
+    # bar. Saying ``spawned`` for it left the caller waiting on a completion
+    # event that was not coming. ``queued`` names the wait; ``reason`` is the
+    # kind, ``reason_detail`` the gate's own sentence. A row waiting only for a
+    # slot or the stagger tick (``concurrency_limit``) keeps ``spawned``: that
+    # wait is the ordinary wave shape and clears within seconds.
+    queued_reason = str(getattr(info, "queued_reason", "") or "")
+    if queued_reason in DEFERRED_QUEUED_REASONS:
+        resp["status"] = "queued"
+        resp["reason"] = queued_reason
+        resp["reason_detail"] = _redact(str(getattr(info, "queued_reason_detail", "") or ""))
     # Server-side effort verdict: only this side knows the model the factory's
     # effort gate will see (explicit per-call value, else the subagent role
     # pin, else the session chain for the effective agent — a crew's pin, else
@@ -518,19 +856,14 @@ async def api_spawn(request: web.Request) -> web.Response:
         # cannot undo the submission or turn an unknown selection into "auto".
         selection: tuple[str, str] | None
         try:
-            selection = (
-                ("template", agent)
-                if agent
-                else (
-                    ("member", crew)
-                    if crew
-                    else (
-                        state.sessions.get_agent_selection(parent_session)
-                        if parent_session
-                        else ("template", "")
-                    )
-                )
-            )
+            if agent:
+                selection = ("template", agent)
+            elif crew:
+                selection = ("member", crew)
+            elif parent_session:
+                selection = state.sessions.get_agent_selection(parent_session)
+            else:
+                selection = ("template", "")
         except Exception:
             selection = None
 
@@ -669,6 +1002,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
         max_turns=max_turns,
         cwd=resumed_cwd,
         _memory_mode=admitted_mode,
+        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
     )
     if not info:
         return web.json_response(
@@ -930,7 +1264,21 @@ async def api_spawn_status(request: web.Request) -> web.Response:
                     "done": True,
                     "started": disk_state.get("started"),
                 }
-                result_path = _agent_dir(agent_id) / "result.txt"
+                tombstone = await asyncio.to_thread(read_tombstone, agent_id) or {}
+                # Legacy persisted records do not carry terminal usage. Keep
+                # those fields absent rather than presenting invented zeros.
+                for field in ("elapsed", "credits"):
+                    if field in tombstone:
+                        value = tombstone[field]
+                        if (
+                            not isinstance(value, bool)
+                            and isinstance(value, (int, float))
+                            and math.isfinite(value)
+                            and value >= 0
+                        ):
+                            disk_data[field] = float(value)
+                agent_dir = _agent_dir(agent_id)
+                result_path = agent_dir / "result.txt"
                 result = ""
                 if result_path.exists() and not is_sensitive_path(str(result_path)):
                     try:
@@ -945,17 +1293,25 @@ async def api_spawn_status(request: web.Request) -> web.Response:
                 if view_meta:
                     disk_data["result_meta"] = view_meta
                 disk_data["result"] = _redact(view) if view else "_No result._"
-                # Check for tombstone
-                tombstone_path = _agent_dir(agent_id) / "tombstone.json"
-                if tombstone_path.exists() and not is_sensitive_path(str(tombstone_path)):
-                    try:
-                        raw = await asyncio.to_thread(tombstone_path.read_text, encoding="utf-8")
-                        ts = json.loads(raw)
-                        disk_data["error"] = _redact(f"Orphaned: {ts.get('cause', 'unknown')}")
-                    except (OSError, ValueError):
-                        disk_data["error"] = "Orphaned (unknown cause)"
-                else:
+                # One classifier, shared with the panel list. Reading the
+                # tombstone here as well let the same folder answer "completed"
+                # in a list and "Orphaned: delivered" when opened, and flattened
+                # a recorded user stop into a failure.
+                outcome, error, stopped = await asyncio.to_thread(
+                    classify_persisted_ending, agent_dir
+                )
+                if not outcome:
+                    # Nothing recorded an ending, so this run has no outcome to
+                    # report. The caller asked for this id by name, so the card
+                    # is served with what IS known and the outcome field is left
+                    # out rather than filled with a guess.
+                    disk_data.pop("outcome", None)
+                    disk_data["stopped"] = False
                     disk_data["error"] = ""
+                    return web.json_response(disk_data)
+                disk_data["outcome"] = outcome
+                disk_data["stopped"] = stopped
+                disk_data["error"] = _redact(error) if error else ""
                 return web.json_response(disk_data)
         except Exception:
             logger.debug("Persistence fallback failed for %s", agent_id, exc_info=True)
@@ -963,6 +1319,8 @@ async def api_spawn_status(request: web.Request) -> web.Response:
     data = {"id": info.id, "task": _redact(info.task), "done": info.done}  # type: dict[str, object]
     data["started"] = info.started
     if info.done:
+        data["elapsed"] = info.elapsed
+        data["credits"] = info.credits
         # Read full result from disk (info.result is truncated to 3000 chars)
         result = info.result
         if info.result_path and not is_sensitive_path(info.result_path):
@@ -983,6 +1341,11 @@ async def api_spawn_status(request: web.Request) -> web.Response:
         data["turns"] = info.turns
         data["last_tool"] = _redact(info.last_tool)
         data["elapsed"] = round(time.time() - info.started)
+        partial = _redact(getattr(info, "streaming_text", ""))
+        view, view_meta = await _apply_result_view(request, partial)
+        data["result"] = view
+        if view_meta:
+            data["result_meta"] = view_meta
         # Same predicate, same present-only-while-true convention as
         # api_spawn_list. This endpoint is the one a blocking `kirocrew spawn
         # run` polls every 2s (cli_commands.py), so leaving it out would keep the
@@ -1032,17 +1395,27 @@ async def api_spawn_list(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.subagents:
         return web.json_response({"agents": []})
-    scope, refusal = await internal_memory_scope(request, "spawn.list")
+    # Called for its REFUSAL: it rejects an internal caller whose execution
+    # identity cannot be verified. The store it resolves is deliberately not kept
+    # as the ownership gate -- a verified internal caller on the default store
+    # answers an empty store, which is indistinguishable from the dashboard
+    # owner's absent one, so gating on it admits the very callers the bound is
+    # for. ``_admit`` gates on ``internal_auth`` instead, the signal the live
+    # branch below already uses on the same field.
+    _store, refusal = await internal_memory_scope(request, "spawn.list")
     if refusal is not None:
         return refusal
     agents = []
     caller = request.headers.get("X-Session-Key", "")
+    # An internal caller lists only the runs it may control, by the same
+    # ownership rule the per-run routes apply: its own runs, or -- with no
+    # identity at all -- only runs no session started. Listing is a read, but a
+    # run id, its task text and its parent key are exactly what a later steer
+    # needs, so the list must not hand out what the control route would refuse.
+    # The dashboard owner (no ``internal_auth``) still sees everything.
+    internal = request.get("internal_auth") is True
     for info in state.subagents.all_agents:
-        if (
-            scope is not None
-            and info.parent_session_key != caller
-            and caller != f"subagent:{info.id}"
-        ):
+        if internal and not _run_belongs_to_caller(caller, info.id, info.parent_session_key):
             continue
         entry: dict[str, object] = {
             "id": info.id,
@@ -1082,7 +1455,155 @@ async def api_spawn_list(request: web.Request) -> web.Response:
         if withheld:
             entry["context_withheld"] = withheld
         agents.append(entry)
-    return web.json_response({"agents": agents})
+    # Durable half of the inventory: the runs this process never tracked, which
+    # a memory-only listing cannot name at all. Live entries win -- an id listed
+    # above is excluded rather than merged -- and the caller's own scope gate is
+    # re-applied here on the record's parent, the same field the live branch
+    # compares.
+    listed = {str(entry["id"]) for entry in agents}
+    # The audit identity is the APP, never the caller-supplied session key. The
+    # dedup registry behind ``_audit_deny`` is keyed on it and is not evicted, so a
+    # per-run session id would leave one permanent entry per subagent run. Every
+    # other call site in the tree passes a bounded app id for the same reason.
+    auditee = str(request.get("app") or "<owner>")
+
+    # An app-authenticated caller and the dashboard owner BOTH reach this route
+    # with `scope is None` -- `internal_memory_scope` answers that for a
+    # non-internal caller and for a verified session whose execution record is
+    # empty -- so scope alone cannot tell them apart. The app claim can, and it
+    # is the instrument the rest of the tree uses: `derive_caller_app` states
+    # that app-ownership checks gate on `request["app"]`. Publication is
+    # narrowing-only -- every transport sets the claim ONLY for a positively
+    # resolved app and leaves it absent for the person -- so a present non-empty
+    # claim is itself the positive signal, the same one the middleware inverts
+    # into `is_dashboard_user`. A transport flag is the wrong question here: it
+    # answers which credential arrived, and three arms publish a validated app
+    # claim without it.
+    caller_app = str(request.get("app") or "")
+    caller_is_app = bool(caller_app)
+
+    # Slot ownership is read on the LOOP, twice, and never from the worker
+    # thread. Once here as a snapshot, so the row cap is sized over the records
+    # this caller may actually see; then again after the thread returns, which is
+    # the authoritative check. A slot's owner can flip while the scan runs --
+    # keys are caller-supplied and not app-namespaced, so another app can reclaim
+    # one -- and a decision taken off-loop would be read from state the caller
+    # does not describe. The WS replay reads the same pair for the same reason.
+    owner_now = slot_owner_snapshot(state)
+
+    def _admit(record: dict) -> bool:
+        """This caller's own visibility, applied before the cap.
+
+        Two bounds with different reach. The app bound is unconditional, because
+        an app token must never read another app's run text no matter how its
+        session scope resolved. The session bound is conditional on
+        ``internal_auth`` -- the same condition the live branch above applies to
+        the same field -- so the durable half of one listing is neither wider nor
+        narrower than the live half a caller sees beside it. It is deliberately
+        NOT conditional on the resolved memory store: that answers empty for a
+        verified internal caller on the default store exactly as it does for the
+        dashboard owner, so it would lift the bound for nearly every attested
+        caller it exists to bind.
+
+        Both read only the request's own values and the record, so they are sound
+        on a worker thread. The ownership dimension is not: it answers from live
+        slot state, so here it consults the loop-taken snapshot and sizes the cap
+        only, and the record is decided again on the loop before it is listed.
+
+        Every refusal is a permission decision and leaves a SEL record under the
+        reason it actually had -- a lazily hydrated slot is `slot_missing`, not an
+        ownership breach.
+        """
+        if caller_is_app and str(record["app"] or "") != caller_app:
+            _audit_deny(auditee, "api_spawn_list", "persisted_app_mismatch")
+            return False
+        if not internal:
+            return True
+        parent = str(record["parent_session"])
+        agent_id = str(record["id"])
+        if parent != caller and caller != f"subagent:{agent_id}":
+            _audit_deny(auditee, "api_spawn_list", "persisted_scope_mismatch")
+            return False
+        # The ownership dimension, sized off the loop snapshot. Withholding is
+        # itself the permission decision, so it audits here under the reason it
+        # had; the surviving records are decided again on the loop, and the two
+        # sets are disjoint, so no record is audited twice.
+        denial = persisted_snapshot_denial_reason(owner_now, subagent_event_slot(parent), record)
+        if denial:
+            _audit_deny(auditee, "api_spawn_list", denial)
+            return False
+        return True
+
+    try:
+        persisted = await asyncio.to_thread(
+            read_panel_records,
+            keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+            max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+            exclude_ids=listed,
+            include_result=True,
+            admit=_admit,
+        )
+    except Exception:
+        logger.debug("Persisted spawn listing failed", exc_info=True)
+        persisted = PanelRecords([], 0, False)
+    for record in persisted.records:
+        parent = str(record["parent_session"])
+        agent_id = str(record["id"])
+        if internal:
+            # The authoritative gate, on the loop, against state as it is NOW
+            # rather than as the snapshot found it. A record the snapshot
+            # admitted and this rejects had its slot reclaimed mid-scan. Same
+            # reused-slot-key exposure the replay guards, reached here through the
+            # parent session rather than a frame.
+            denial = persisted_replay_denial_reason(state, subagent_event_slot(parent), record)
+            if denial:
+                _audit_deny(auditee, "api_spawn_list", denial)
+                continue
+        # The GRANT is a permission decision too, and the one an operator needs to
+        # reconstruct who was handed a persisted run's text. Recording only the
+        # refusals leaves the admissions invisible, so a review of this stream can
+        # show what was blocked and never what was released.
+        _audit_allow(auditee, "api_spawn_list")
+        error = str(record["error"])
+        agents.append(
+            {
+                "id": agent_id,
+                "task": _redact(str(record["task"])),
+                "done": True,
+                "parent": parent,
+                "agent": _redact(str(record["agent"])),
+                "started": record["started"],
+                "result": _redact(str(record.get("result") or "")),
+                "error": _redact(error) if error else "",
+                # The tombstone records the run's own outcome, so a user stop
+                # stays a stop here rather than being flattened into a failure.
+                "stopped": bool(record.get("stopped")),
+                "outcome": record["outcome"],
+            }
+        )
+    payload: dict[str, object] = {"agents": agents}
+    if persisted.overflow or persisted.overflow_is_lower_bound:
+        # Said out loud once per listing, to the operator rather than the client:
+        # a listing of 50 of 51 eligible runs otherwise reads exactly like a
+        # listing of all 50 there were. The WARNING carries the count, and it is
+        # the whole report: a truncation refuses nobody, so it is not a permission
+        # decision and does not belong in the SEL deny stream beside the ownership
+        # refusals an operator has to be able to see there. No client reads a
+        # count it cannot act on, so it stays out of the payload too.
+        # A saturated scan window reports even at a count of zero, because that
+        # is the case where the count itself cannot see what was left out.
+        logger.warning(
+            "persisted spawn listing truncated: %s%d eligible run(s) past the %d cap%s",
+            "at least " if persisted.overflow_is_lower_bound else "",
+            persisted.overflow,
+            PERSISTED_SUBAGENT_REPLAY_KEEP,
+            (
+                " (scan window saturated, older admissible runs may be uninspected)"
+                if persisted.overflow_is_lower_bound
+                else ""
+            ),
+        )
+    return web.json_response(payload)
 
 
 async def api_spawn_retry(request: web.Request) -> web.Response:
@@ -1131,6 +1652,25 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
     # current config before any discovery read.
     if old.agent:
         await warm_project_agents_for_spawn(state, old.cwd or "")
+    # Keep the failed run's captured owner only while that exact boundary is
+    # still active. After release, current parent routing wins; an empty owner
+    # lets completion select the canonical slot at delivery time instead of
+    # carrying a stale token that exact lookup must reject.
+    previous_boundary_owner = stage_boundary_owner_for_run(old)
+    exact_boundary = (
+        _stage_boundary_slot_for_parent(
+            state,
+            old.parent_session_key,
+            boundary_owner=previous_boundary_owner,
+        )
+        if previous_boundary_owner
+        else None
+    )
+    retry_boundary_owner = (
+        previous_boundary_owner
+        if exact_boundary is not None
+        else _stage_boundary_owner_for_parent(state, old.parent_session_key)
+    )
     info = await _spawn_on_loop(
         state,
         old._raw_task or old.task,
@@ -1158,6 +1698,7 @@ async def api_spawn_retry(request: web.Request) -> web.Response:
         app=execution.app,
         _memory_mode=execution.memory_mode,
         _execution_context=execution.to_record(),
+        _stage_boundary_owner=retry_boundary_owner,
     )
     if not info:
         return web.json_response(
@@ -1226,13 +1767,84 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
             )
             return web.json_response({"ok": True, "cancelled": True})
         return web.json_response({"error": "not found"}, status=404)
-    if not state.subagents or agent_id not in state.subagents._agents:
-        return web.json_response({"error": "not found"}, status=404)
-    cancelled = await state.subagents.cancel(agent_id)
+    manager = state.subagents
+    info = manager.get(agent_id) if manager is not None else None
+    if manager is None or info is None:
+        # A card the durable replay rebuilt has no manager entry -- after a
+        # gateway restart that is every finished run -- so a flat 404 made those
+        # cards undismissable: the delete failed, the banner showed, and the next
+        # reconnect sent the card again. The dismissal is recorded against the
+        # folder instead, which is the same record the live path writes.
+        #
+        # Dashboard owner only. That is exactly as wide as what the owner can
+        # already see -- their sockets short-circuit visibility to every live slot
+        # -- so no caller gains reach over a run it could not list. An app token
+        # is refused rather than handed a route into another app's runs, and an
+        # absent claim means the request never passed the auth middleware.
+        request_app = request.get("app", "")
+        if "app" not in request or request_app:
+            _sel().log_api_access(
+                caller=request_app or "unknown",
+                operation="spawn.dismiss",
+                outcome="denied",
+                source="app_isolation",
+                resources="dashboard-only dismissal of a persisted run",
+                error="app tokens cannot dismiss persisted subagent runs",
+            )
+            return web.json_response(
+                {"error": "app token not allowed", "code": "app_token_forbidden"}, status=403
+            )
+        outcome = await asyncio.to_thread(record_panel_dismissal_outcome, agent_id)
+        if outcome == DISMISSAL_NO_FOLDER:
+            # No folder, so nothing durable can rebuild this card and there is no
+            # run here to speak of. Same answer as before for a truly unknown id.
+            return web.json_response({"error": "not found"}, status=404)
+        if outcome == DISMISSAL_FAILED:
+            # The store is unwritable, so this card returns on the next rebuild.
+            # Answering 404 would say the run does not exist, and answering ok
+            # would claim a dismissal that did not happen; both leave the user
+            # watching a dismissed card come back with nothing to explain it.
+            _sel().log_api_access(
+                caller="internal",
+                operation="spawn.dismiss",
+                outcome="denied",
+                source="subagent",
+                resources=f"persisted run {agent_id}",
+                error="the dismissal record could not be written",
+            )
+            return web.json_response(
+                {"error": "dismissal not recorded", "code": "dismissal_unwritable"}, status=503
+            )
+        _sel().log_api_access(
+            caller="internal",
+            operation="spawn.dismiss",
+            outcome="allowed",
+            source="subagent",
+            resources=f"persisted run {agent_id}",
+        )
+        return web.json_response({"ok": True, "cancelled": False, "dismissed": True})
+    cancelled = await manager.cancel(agent_id)
     if not cancelled:
-        # Already done — just remove from list
-        state.subagents._agents.pop(agent_id, None)
-        state.subagents._tasks.pop(agent_id, None)
+        deleted_owner = stage_boundary_owner_for_run(info)
+        deleted_boundary_slot = (
+            _stage_boundary_slot_for_parent(
+                state,
+                info.parent_session_key,
+                boundary_owner=deleted_owner,
+            )
+            if deleted_owner
+            else None
+        )
+        active_owner = deleted_owner if deleted_boundary_slot is not None else ""
+        settlement = await manager.settle_before_delete(agent_id, active_owner)
+        if settlement == "pending":
+            return web.json_response(
+                {
+                    "error": "completion delivery is still pending",
+                    "code": "completion_delivery_pending",
+                },
+                status=409,
+            )
     return web.json_response({"ok": True, "cancelled": cancelled})
 
 
@@ -1598,6 +2210,12 @@ async def api_notification_agent_push(request: web.Request) -> web.Response:
 _MAX_BLOCKS = 50  # Slack Block Kit limit
 _MAX_WALK_DEPTH = 10  # defense-in-depth against deeply nested LLM output
 
+#: The Block Kit media boundary is defined and enforced at the Slack client seam
+#: (``slack/client.py``), which every outbound tree passes through. This entry
+#: keeps its own 400 with a machine-readable code for agent callers, so it asks
+#: that one predicate instead of restating the rule in a second place.
+_blocks_request_remote_media = blocks_request_remote_media
+
 
 def _redact_all(value: str) -> str:
     """Both outbound redactors as one callable, in the canonical order.
@@ -1704,8 +2322,9 @@ _CHANNEL_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 
 #: The ``configured_targets()`` prefix every transport gives a DIRECT
 #: conversation (``user:<identity>``). A ``thread:`` or room target is a
-#: different audience and is never the owner's DM.
-_DM_TARGET_PREFIX = "user:"
+#: different audience and is never the owner's DM. The one spelling lives in
+#: ``messaging.transport``, beside the owner inference that reads it.
+_DM_TARGET_PREFIX = DM_TARGET_PREFIX
 
 #: Request fields that only exist in Slack's protocol. Combined with a channel
 #: ``session`` they are refused rather than dropped: a caller that asked for a
@@ -1740,25 +2359,31 @@ def _owner_dm_target(transport: Any) -> str:
     would deliver a message the agent decided to send once N times. With no single
     answer the caller degrades to the dashboard notification, which reaches the
     operator without guessing who they are.
+
+    The inference itself is :func:`~kiro_crew.messaging.transport.sole_direct_target`,
+    shared with session control's owner-DM audience predicate so the two surfaces
+    name the same human as the owner; this wrapper adds only the enumeration guard
+    and the send-path logging.
     """
     try:
         targets = list(transport.configured_targets())
     except Exception:
         logger.warning("send_message: could not enumerate channel targets", exc_info=True)
         return ""
-    direct = [
-        str(getattr(target, "target_id", "") or "")
-        for target in targets
-        if str(getattr(target, "target_id", "") or "").startswith(_DM_TARGET_PREFIX)
-        and getattr(target, "available", False)
-    ]
-    if len(direct) == 1:
-        return direct[0]
-    if direct:
+    target = sole_direct_target(targets)
+    if target:
+        return target
+    direct_count = sum(
+        1
+        for candidate in targets
+        if str(getattr(candidate, "target_id", "") or "").startswith(_DM_TARGET_PREFIX)
+        and getattr(candidate, "available", False)
+    )
+    if direct_count:
         logger.info(
             "send_message: %d configured DM targets and no owner field, so no single "
             "recipient can be inferred; degrading to the dashboard notification",
-            len(direct),
+            direct_count,
         )
     return ""
 
@@ -1853,8 +2478,15 @@ async def _deliver_channel_dm(
     # that a future caller of this helper cannot reach a channel without it. The
     # neutral sink rather than a bare redactor pair, because the leg is
     # channel-NEUTRAL and Slack/Discord both parse broadcast-mention grammars.
-    units = chunk_for_transport(
-        display_safe_for(text, live_transport.capabilities), live_transport.capabilities
+    # Offloaded: the display sink threads the credential-aware splitter's whole-text
+    # budget search (up to 128 dense probes plus span-repair passes) onto the call,
+    # and this leg runs on the gateway's single loop thread with model-authored,
+    # length-unchecked text -- a large body would stall the loop past the watchdog's
+    # 25s dump-then-exit alarm. Offloaded like the renderer's own send legs.
+    units = await asyncio.to_thread(
+        chunk_for_transport,
+        display_safe_for(text, live_transport.capabilities),
+        live_transport.capabilities,
     )
     try:
         for unit in units:
@@ -2145,8 +2777,14 @@ async def _send_to_channel_target(
     # displayed form before scanning, and defangs broadcast-mention grammars —
     # correct here because this leg is channel-NEUTRAL and Slack/Discord do have
     # them.
-    parts = chunk_for_transport(
-        display_safe_for(text, transport.capabilities), transport.capabilities
+    # Offloaded for the same reason as the live-transport leg above: the display
+    # sink runs the credential-aware splitter's whole-text budget search on the
+    # gateway's single loop thread with model-authored, length-unchecked text, and
+    # a large body would stall the loop past the watchdog's 25s dump-then-exit alarm.
+    parts = await asyncio.to_thread(
+        chunk_for_transport,
+        display_safe_for(text, transport.capabilities),
+        transport.capabilities,
     )
     try:
         for index, part in enumerate(parts):
@@ -2243,6 +2881,18 @@ async def api_send_message(request: web.Request) -> web.Response:
     blocks = body.get("blocks")
     if blocks and not isinstance(blocks, list):
         return web.json_response({"error": "blocks must be an array"}, status=400)
+    if isinstance(blocks, list) and _blocks_request_remote_media(blocks):
+        return web.json_response(
+            {
+                "error": (
+                    "agent-supplied Block Kit cannot contain image/video blocks "
+                    "or image_url/thumbnail_url/video_url fields because Slack "
+                    "fetches that media without a recipient click"
+                ),
+                "code": BLOCKS_REMOTE_MEDIA_ERROR,
+            },
+            status=400,
+        )
 
     # ── Channel-addressed leg ──
     # Handled before the Slack-shaped validation below, because a Webex room id is
@@ -2321,6 +2971,25 @@ async def api_send_message(request: web.Request) -> web.Response:
     ):
         return web.json_response(
             {"error": "unfurl_links and unfurl_media must be booleans"}, status=400
+        )
+    # Refused, not silently dropped (same posture as _SLACK_ONLY_BODY_FIELDS):
+    # this endpoint is reachable from agent-authored tool calls, and a Slack
+    # unfurl is a zero-click fetch of a possibly agent-written URL, so an
+    # explicit ``true`` is the one bit a prompt-injected agent needs to
+    # re-enable the exfiltration channel. ``false``/absent are accepted for
+    # backward compatibility — they ask for what is now always the case.
+    # See docs/request-for-change/rfc-redaction-explain-and-reveal.md §5.
+    if unfurl_links or unfurl_media:
+        return web.json_response(
+            {
+                "error": (
+                    "unfurl_links/unfurl_media cannot be enabled: bot posts "
+                    "never fetch link or media previews (a preview is a "
+                    "zero-click request of a possibly agent-written URL)"
+                ),
+                "code": "unfurl_disabled",
+            },
+            status=400,
         )
 
     thread_ts = body.get("thread_ts")
@@ -2624,7 +3293,9 @@ async def api_send_message(request: web.Request) -> web.Response:
                     # clobbers the plan. _in_stage_execution closes it — same predicate
                     # the user-typed path uses (chat_handlers._api_chat).
                     if slot.running or slot._in_stage_execution:
-                        if len(slot._queue) >= 50:
+                        from kiro_crew.dashboard.slot_queue_repository import MAX_LIVE_QUEUE_ENTRIES
+
+                        if len(slot._queue) >= MAX_LIVE_QUEUE_ENTRIES:
                             evicted = slot.queue_pop(0)
                             logger.warning(
                                 "Queue full for slot %s — evicting oldest message", slot_key
@@ -2749,8 +3420,6 @@ async def api_send_message(request: web.Request) -> web.Response:
                                 blocks,
                                 text,
                                 thread_ts=thread_ts,
-                                unfurl_links=unfurl_links,
-                                unfurl_media=unfurl_media,
                                 reply_broadcast=reply_broadcast,
                             )
                         else:
@@ -2758,8 +3427,6 @@ async def api_send_message(request: web.Request) -> web.Response:
                                 channel,
                                 text,
                                 thread_ts=thread_ts,
-                                unfurl_links=unfurl_links,
-                                unfurl_media=unfurl_media,
                                 reply_broadcast=reply_broadcast,
                             )
                             if options:
@@ -3199,6 +3866,22 @@ async def api_update_message(request: web.Request) -> web.Response:
     if blocks is not None and not isinstance(blocks, list):
         return web.json_response(
             {"error": "blocks must be a list", "code": "invalid_blocks"}, status=400
+        )
+    # The edit path publishes replacement content, so it carries the SAME
+    # server-fetched-media boundary as api_send_message: without this, an
+    # agent could send clean blocks and then EDIT remote media into the
+    # message — Slack fetches Block Kit media regardless of unfurl flags.
+    if isinstance(blocks, list) and _blocks_request_remote_media(blocks):
+        return web.json_response(
+            {
+                "error": (
+                    "agent-supplied Block Kit cannot contain image/video blocks "
+                    "or image_url/thumbnail_url/video_url fields because Slack "
+                    "fetches that media without a recipient click"
+                ),
+                "code": BLOCKS_REMOTE_MEDIA_ERROR,
+            },
+            status=400,
         )
     if not text and not blocks:
         return web.json_response(
@@ -3858,6 +4541,40 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
     return await api_browser_install_get(request)
 
 
+def _browser_view_payload() -> dict[str, Any]:
+    """``browser_cli_view.status()`` plus where the panel should FRAME it.
+
+    ``path`` is the dashboard-origin relay (``/browser-view/<token>/``): same
+    origin as the dashboard, so it is reachable wherever the dashboard is — an
+    SSH forward, a tunnel — with no second port. The embedded per-instance
+    capability token IS the relay's authentication (the panel frames it in an
+    opaque-origin sandbox that sends no cookies), and THIS payload — served
+    only through the cookie-authed, owner-gated view endpoints — is its sole
+    disclosure point, so possession proves the holder passed the owner gate.
+    Null unless the view is running, so the field can never frame a dead
+    relay. The absolute ``url`` stays in the payload for direct loopback use
+    and older frontends — but it is only ever published alongside a target
+    the ownership proof vouched for: when ``relay_target()`` refuses (the
+    child exited between the two lock holds, or the proof was inconclusive),
+    the whole payload degrades to ``stopped`` rather than offering the stale
+    direct ``url`` as a frameable fallback for whatever wins the freed port.
+    The panel polls, so a live view is re-reported on the next cycle.
+    """
+    payload = browser_cli_view.status()
+    if payload.get("status") != "running":
+        payload["path"] = None
+        return payload
+    target = browser_cli_view.relay_target()
+    if target is None:
+        payload["status"] = "stopped"
+        payload["url"] = None
+        payload["port"] = None
+        payload["path"] = None
+        return payload
+    payload["path"] = f"{ROUTE_PREFIX}/{target[1]}/"
+    return payload
+
+
 async def api_browser_view_get(request: web.Request) -> web.Response:
     """GET /api/browser/view -- where the Playwright CLI dashboard is served.
 
@@ -3867,12 +4584,15 @@ async def api_browser_view_get(request: web.Request) -> web.Response:
     App-token denied like the install and token routes: the reply carries the
     dashboard URL, and that URL is served WITHOUT authentication, so handing it
     to an app is handing over control of a logged-in browser. Read-only on this
-    gateway is not read-only on the browser.
+    gateway is not read-only on the browser. (The ``path`` field embeds the
+    relay's capability token — this owner-gated endpoint is that token's only
+    disclosure point, so it stays denied to apps for the same reason as the
+    raw URL.)
     """
     denied = _deny_non_owner_browser_request(request, "browser_view_status")
     if denied is not None:
         return denied
-    return web.json_response(await asyncio.to_thread(browser_cli_view.status))
+    return web.json_response(await asyncio.to_thread(_browser_view_payload))
 
 
 async def api_browser_view_start(request: web.Request) -> web.Response:
@@ -3899,7 +4619,7 @@ async def api_browser_view_start(request: web.Request) -> web.Response:
         browser_cli_view.ensure_running(pinned or None)
 
     await asyncio.to_thread(_start_view)
-    return web.json_response(await asyncio.to_thread(browser_cli_view.status))
+    return web.json_response(await asyncio.to_thread(_browser_view_payload))
 
 
 async def api_browser_open(request: web.Request) -> web.Response:
@@ -3977,7 +4697,7 @@ async def api_browser_open(request: web.Request) -> web.Response:
         browser_cli_view.ensure_running(pinned or None)
         result = browser_cli_launcher.open_url(url, session_key.strip())
         payload = result.as_dict()
-        payload["view"] = browser_cli_view.status()
+        payload["view"] = _browser_view_payload()
         return payload
 
     return web.json_response(await asyncio.to_thread(_launch))
@@ -4225,10 +4945,33 @@ async def api_channel_folder_backfill(request: web.Request) -> web.Response:
         # It is also a whole sentence naming the remedy, not a fragment: a
         # reader who does not already know what "the local machine" is has
         # nothing to act on, which is a dead end rather than a refusal.
+        #
+        # And it NAMES that machine. "The computer that hosts this dashboard"
+        # tells a remote reader what kind of computer to look for, not which
+        # one: a blind read of that sentence recorded "I have no idea how I'd
+        # find out which computer that is". The host's first DNS label is the
+        # same stand-in `session_transfer.local_instance_label` uses for the
+        # same reader, and the same fallback shape: a host with no name keeps
+        # the description alone, never a blank or an exception on a refusal path.
         # The `code` is unchanged, so nothing machine-readable moves with this.
+        try:
+            host = platform.node().split(".")[0]
+        except Exception:
+            host = ""
+        # It also states the reader's own situation first. A remote viewer IS
+        # looking at a dashboard, so "open the dashboard there" read as circular
+        # to a blind reader who then stopped; "this same page on <host>" tells
+        # them what to do with the name.
+        where = (
+            f"{host}, the computer that hosts this dashboard"
+            if host
+            else "the computer that hosts this dashboard"
+        )
+        there = f"on {host}" if host else "there"
         return _deny(
-            "Filing runs only on the computer that hosts this dashboard. "
-            "Open the dashboard there and click again.",
+            "You are viewing this page from another computer. "
+            f"Filing runs only on {where}. "
+            f"Open this same page {there} and click again.",
             "read_only_remote",
             status=403,
         )
@@ -4328,14 +5071,17 @@ async def api_slack_config_save(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _get_config_lock():
-        return await _slack_config_save_locked(request)
+        # A save is a config.json + credential transaction: a cancelled request
+        # (client gone, gateway shutting down) must not abandon it between its
+        # phases -- see ``run_to_completion``.
+        return await run_to_completion(_slack_config_save_locked(request))
 
 
 async def _slack_config_save_locked(request: web.Request) -> web.Response:
     """Body of the Slack save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
     from kiro_crew.config.loader import (  # noqa: F811
         CRED_OWNER_ID,
+        ConfigReadError,
         config_path,
     )
     from kiro_crew.validation import USER_ID_RE  # noqa: F811
@@ -4476,35 +5222,55 @@ async def _slack_config_save_locked(request: web.Request) -> web.Response:
         if slack_err:
             return _deny(f"{field_name} rejected by Slack ({slack_err})")
 
-    # ── Phase 2: commit. All validation passed, so writes are safe. ──
-    if env_updates:
-        # Off-loop: the .env write is blocking file IO (lock, temp write,
-        # owner-only lockdown, replace) and must not block the event loop.
-        await _write_env_off_loop(env_updates)
-        # Keep the live process environment in sync with the new .env state.
-        # load_credentials() lets os.environ win over .env, so without this a
-        # replaced/cleared token would keep being reported as installed by GET
-        # until restart, and spawned children would inherit the stale value.
-        # The Slack socket connection itself still reconnects only on restart,
-        # which restart_required below surfaces to the UI.
-        for key, new_val in env_updates.items():
-            if new_val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = new_val
-    if staged:
-        slack_cfg.update(staged)
-        # Shield + drain so a cancellation arriving mid-write cannot release
-        # the config lock while the worker thread is still replacing the file.
-        # Without this a later save can interleave writes under the lock.
-        _cfg_write_task_sl: asyncio.Task[None] = asyncio.ensure_future(
-            asyncio.to_thread(_atomic_json_write, path, data)
-        )
-        try:
-            await asyncio.shield(_cfg_write_task_sl)
-        except asyncio.CancelledError:
-            await asyncio.gather(_cfg_write_task_sl, return_exceptions=True)
-            raise
+    # ── Phase 2: commit. All validation passed, so writes are safe. Config
+    # first, then .env, with the config rolled back if the .env write fails --
+    # the same two-file transaction as the Teams, Webex and WeCom saves. The
+    # config write is the one that can still be refused after validation (the
+    # file may have gone corrupt between the snapshot and the locked reread),
+    # and a refusal must not leave a credential already committed to .env
+    # beside config the caller was told did not save. ──
+    _cfg_write = _LockedSectionWrite(path, "slack", staged)
+    # Hold the live-config watcher for the whole config+credential transaction:
+    # the two files commit separately and a failed .env write rolls the config
+    # back, so nothing between here and the end of the block may be applied to
+    # the running gateway (a widened allow-list must never go live on a save
+    # that then fails). The release wakes the watcher on the committed state.
+    with live.hold():
+        if staged:
+            slack_cfg.update(staged)
+            # Through ``update_config_locked``: it holds the advisory lock on the
+            # sidecar ``<path>.lock`` across the whole read-modify-write, so a
+            # writer in ANOTHER PROCESS cannot land between our read and our
+            # write, and the staged keys are merged into the file as re-read
+            # inside that lock. The helper drains its worker, so a cancellation
+            # arriving mid-write cannot release the config lock while the thread
+            # is still replacing the file.
+            try:
+                await _cfg_write.commit()
+            except ConfigReadError:
+                return _deny("config.json is corrupt", status=500)
+        if env_updates:
+            # Off-loop: the .env write is blocking file IO (lock, temp write,
+            # owner-only lockdown, replace) and must not block the event loop.
+            try:
+                await _write_env_off_loop(env_updates)
+            except BaseException:
+                # Roll config back so a failed .env write cannot leave the NEW
+                # settings paired with the OLD credentials on disk.
+                if staged:
+                    await _cfg_write.rollback("Slack")
+                raise
+            # Keep the live process environment in sync with the new .env state.
+            # load_credentials() lets os.environ win over .env, so without this a
+            # replaced/cleared token would keep being reported as installed by
+            # GET until restart, and spawned children would inherit the stale
+            # value. The Slack socket connection itself still reconnects only on
+            # restart, which restart_required below surfaces to the UI.
+            for key, new_val in env_updates.items():
+                if new_val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = new_val
 
     # Create the configured session folder now, on this user-initiated save,
     # so the reconcile path never has to write the folder store. Best-effort:
@@ -4669,14 +5435,17 @@ async def api_discord_config_save(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _get_config_lock():
-        return await _discord_config_save_locked(request)
+        # A save is a config.json + credential transaction: a cancelled request
+        # (client gone, gateway shutting down) must not abandon it between its
+        # phases -- see ``run_to_completion``.
+        return await run_to_completion(_discord_config_save_locked(request))
 
 
 async def _discord_config_save_locked(request: web.Request) -> web.Response:
     """Body of the Discord save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
     from kiro_crew.config.loader import (  # noqa: F811
         CRED_DISCORD_BOT_TOKEN,
+        ConfigReadError,
         config_path,
     )
 
@@ -4859,10 +5628,8 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
     # old token. It also sits in agent-readable ``config.json``, so the copy is
     # worth strictly less than the .env one it shadows. Staged here (write
     # happens only in Phase 2), matching the Telegram and Webex saves.
-    legacy_token_removed = False
     if CRED_DISCORD_BOT_TOKEN in env_updates and dc_cfg.get("bot_token"):
         dc_cfg.pop("bot_token", None)
-        legacy_token_removed = True
         applied.append("legacy_bot_token_removed")
 
     # ── Phase 1.5: verify a newly pasted token against Discord before storing.
@@ -4888,11 +5655,26 @@ async def _discord_config_save_locked(request: web.Request) -> web.Response:
     # inverse failure mode (config written, then a crash before the .env
     # update) is benign and visible: the .env token remains exactly as GET
     # reports it, and re-running the save completes the operation. ──
-    if staged or legacy_token_removed:
+    # The purge is decided against the document the write lands on, not the
+    # snapshot: whenever this save updates the credential, a legacy ``bot_token``
+    # a concurrent writer landed after our read is dropped too, so the cleared
+    # ``.env`` slot cannot leave a fallback behind. Absent, the drop is a no-op
+    # and the write is skipped.
+    purge_legacy_token = CRED_DISCORD_BOT_TOKEN in env_updates
+    if staged or purge_legacy_token:
         dc_cfg.update(staged)
-        # Off-loop: the atomic write (temp file + fsync + replace) must not
-        # block the gateway event loop.
-        await asyncio.to_thread(_atomic_json_write, path, data)
+        # Through ``update_config_locked``: it holds the advisory lock on the
+        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
+        # in ANOTHER PROCESS cannot land between our read and our write, and the
+        # staged keys (plus the legacy ``bot_token`` purge) are merged into the
+        # file as re-read inside that lock. Off-loop: file IO, and it may wait on
+        # another holder of the lock.
+        try:
+            await _LockedSectionWrite(
+                path, "discord", staged, drop_keys=("bot_token",) if purge_legacy_token else ()
+            ).commit()
+        except ConfigReadError:
+            return _deny("config.json is corrupt", status=500)
 
     # Create the configured session folder now, on this user-initiated save,
     # so the reconcile path never has to write the folder store. Best-effort:
@@ -5040,14 +5822,17 @@ async def api_telegram_config_save(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _get_config_lock():
-        return await _telegram_config_save_locked(request)
+        # A save is a config.json + credential transaction: a cancelled request
+        # (client gone, gateway shutting down) must not abandon it between its
+        # phases -- see ``run_to_completion``.
+        return await run_to_completion(_telegram_config_save_locked(request))
 
 
 async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     """Body of the Telegram save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
     from kiro_crew.config.loader import (  # noqa: F811
         CRED_TELEGRAM_BOT_TOKEN,
+        ConfigReadError,
         config_path,
     )
 
@@ -5244,10 +6029,8 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     # resurrect a removed credential on the next restart — an explicit clear
     # must actually revoke access, and a replacement must not shadow-keep the
     # old token. Staged here (write happens only in Phase 2).
-    legacy_token_removed = False
     if CRED_TELEGRAM_BOT_TOKEN in env_updates and tg_cfg.get("bot_token"):
         tg_cfg.pop("bot_token", None)
-        legacy_token_removed = True
         applied.append("legacy_bot_token_removed")
 
     # ── Phase 1.5: verify a newly pasted token against Telegram before storing.
@@ -5275,11 +6058,26 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     # restart. The inverse failure mode (config written, then a crash before
     # the .env update) is benign and visible: the .env token remains exactly
     # as GET reports it, and re-running the save completes the operation. ──
-    if staged or legacy_token_removed:
+    # The purge is decided against the document the write lands on, not the
+    # snapshot: whenever this save updates the credential, a legacy ``bot_token``
+    # a concurrent writer landed after our read is dropped too, so the cleared
+    # ``.env`` slot cannot leave a fallback behind. Absent, the drop is a no-op
+    # and the write is skipped.
+    purge_legacy_token = CRED_TELEGRAM_BOT_TOKEN in env_updates
+    if staged or purge_legacy_token:
         tg_cfg.update(staged)
-        # Off-loop: the atomic write (temp file + fsync + replace) must not
-        # block the gateway event loop.
-        await asyncio.to_thread(_atomic_json_write, path, data)
+        # Through ``update_config_locked``: it holds the advisory lock on the
+        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
+        # in ANOTHER PROCESS cannot land between our read and our write, and the
+        # staged keys (plus the legacy ``bot_token`` purge) are merged into the
+        # file as re-read inside that lock. Off-loop: file IO, and it may wait on
+        # another holder of the lock.
+        try:
+            await _LockedSectionWrite(
+                path, "telegram", staged, drop_keys=("bot_token",) if purge_legacy_token else ()
+            ).commit()
+        except ConfigReadError:
+            return _deny("config.json is corrupt", status=500)
 
     # Create the configured session folder now, on this user-initiated save,
     # so the reconcile path never has to write the folder store. Best-effort:
@@ -5455,7 +6253,23 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     # no-dashboard-imports property. ``on_activity`` reads the parsed dict from
     # the request mapping, so the body is parsed exactly once and never past the
     # cap.
-    body, cap_error = await read_bounded_json(request, max_bytes=TEAMS_MAX_ACTIVITY_BYTES)
+    #
+    # ``require_json_content_type=False`` is what KEEPS that true here, and is not
+    # a relaxation of this route's perimeter. The shared helper's 415 returns
+    # before a single byte is read; the ``status == 413`` filter below then drops
+    # it, because a verdict derived from body CONTENT must not precede the JWT
+    # check. The body would therefore reach ``on_activity`` unstashed and be
+    # re-parsed by its bare ``request.json()`` fallback on a stream nobody has
+    # read -- bounded only by the app-wide ``client_max_size``, not by
+    # ``TEAMS_MAX_ACTIVITY_BYTES``. Opting out means the capped read runs, so an
+    # over-cap activity is still refused 413 whatever media type it declared.
+    # Whether to REFUSE a non-JSON media type from the Connector is a separate
+    # decision about an external contract; see ``read_bounded_json``.
+    body, cap_error = await read_bounded_json(
+        request,
+        max_bytes=TEAMS_MAX_ACTIVITY_BYTES,
+        require_json_content_type=False,
+    )
     if cap_error is not None and cap_error.status == 413:
         return cap_error
     if body is not None:
@@ -5614,11 +6428,19 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
     key. Remote sessions are read-only. Every field except ``session_folder`` is
     read at gateway startup, so an actual change returns ``restart_required``.
     """
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
+    # A save is a config.json + credential transaction: a cancelled request
+    # (client gone, gateway shutting down) must not abandon it between its
+    # phases -- see ``run_to_completion``.
+    return await run_to_completion(_teams_config_save(request))
+
+
+async def _teams_config_save(request: web.Request) -> web.Response:
+    """Body of the Teams save; runs to completion once started."""
     from kiro_crew.config.loader import (  # noqa: F811
         CRED_MICROSOFT_APP_ID,
         CRED_MICROSOFT_APP_PASSWORD,
         CRED_MICROSOFT_APP_TENANT_ID,
+        ConfigReadError,
         _threshold_pct,
         config_path,
         read_env_file_credential,
@@ -5815,6 +6637,9 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
             data["teams"] = {}
         teams_cfg = data["teams"]
 
+        _f_app_id: str | None = ""
+        _f_tenant: str | None = ""
+        now_password: str | None = ""
         if verified_triple is not None:
             # Re-derive the effective triple under the lock and refuse if what is about
             # to be STORED is not what Azure accepted. Optimistic, deliberately: the
@@ -5851,6 +6676,11 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
                     "the Teams credentials changed while these were being verified; "
                     "nothing was saved — reload and try again",
                 )
+            # The same comparison runs once more INSIDE the sidecar lock, against
+            # the merged section (``_finalize_teams`` below): the snapshot this
+            # block read cannot see an ``app_id`` / ``tenant_id`` another PROCESS
+            # lands before the write, and the .env-first fallback here would let
+            # that value be stored under the verified password.
 
         # Threshold ordering is checked against the EFFECTIVE pair (the staged
         # value, else what is stored, else the shipped default), because a request
@@ -5913,23 +6743,59 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
             or _pw_in_env_or_environ  # already in .env / os.environ
         )
         if teams_cfg.get("app_password") and _pw_safe_in_env:
-            changes["app_password"] = ""
             applied.append("app_password_purged")
+        # Blanked against the document the write lands on (see
+        # ``_LockedSectionWrite``): a legacy copy a concurrent writer landed after
+        # the snapshot is purged too, whenever the credential is safely in .env.
+        blank_keys = ("app_password",) if _pw_safe_in_env else ()
 
-        _cfg_snapshot: str | None = None
+        # Through ``update_config_locked``: it holds the advisory lock on the
+        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
+        # in ANOTHER PROCESS cannot land between our read and our write, and the
+        # changes are merged into the file as re-read inside that lock. The same
+        # object undoes exactly those keys if the .env write below fails.
+        def _finalize_teams(section: dict) -> None:
+            # Both rules re-decided against the document the write lands on: a
+            # concurrent writer may have moved a counterpart threshold or the
+            # app id / tenant since the snapshot was taken, and a pair that is
+            # inverted -- or a credential tuple Azure never saw -- only in the
+            # merged result would otherwise be stored.
+            if verified_triple is not None:
+                fresh_app_id = _f_app_id or str(section.get("app_id", ""))
+                fresh_tenant = _f_tenant or str(section.get("tenant_id", ""))
+                if (fresh_app_id, now_password, fresh_tenant) != verified_triple:
+                    raise _CredentialTupleChanged()
+            if _threshold_pct(section.get("hard_threshold_pct"), 95) < _threshold_pct(
+                section.get("soft_threshold_pct"), 80
+            ):
+                raise _ThresholdPairInverted()
+
+        _cfg_write = _LockedSectionWrite(
+            path, "teams", changes, blank_keys=blank_keys, finalize=_finalize_teams
+        )
         # Hold the live-config watcher for the whole config+credential transaction:
         # the two files commit separately and a failed .env write rolls the config
         # back, so nothing between here and the end of the block may be applied to
         # the running gateway. The release wakes the watcher on the committed state.
         with live.hold():
-            if changes:
+            if changes or blank_keys:
                 teams_cfg.update(changes)
-                # Snapshot the on-disk config BEFORE writing the new metadata, so
-                # that if the subsequent .env credential write fails we can roll
-                # the metadata back.  Restoring config on .env failure keeps the
-                # pair consistent (old credential + old meta).
-                _cfg_snapshot = await asyncio.to_thread(_read_text_or_none, path)
-                _atomic_json_write(path, data)
+                # Off-loop: file IO, and it may wait on another holder of the lock.
+                try:
+                    await _cfg_write.commit()
+                except ConfigReadError:
+                    return _deny("config.json is corrupt", status=500)
+                except _ThresholdPairInverted:
+                    return _reject(
+                        "threshold_pct_inverted",
+                        "hard_threshold_pct must be >= soft_threshold_pct",
+                    )
+                except _CredentialTupleChanged:
+                    return _reject(
+                        "config_changed",
+                        "the Teams credentials changed while these were being verified; "
+                        "nothing was saved — reload and try again",
+                    )
 
             # Create the configured session folder now, on this user-initiated save,
             # so the reconcile path never has to write the folder store. Best-effort:
@@ -5969,29 +6835,15 @@ async def api_teams_config_save(request: web.Request) -> web.Response:
                     )
                     if _env_exc is not None:
                         # .env write failed — roll config back for consistency.
-                        if changes:
-                            if _cfg_snapshot is None:
-                                await asyncio.to_thread(path.unlink, missing_ok=True)
-                            else:
-                                await asyncio.to_thread(
-                                    _atomic_json_write,
-                                    path,
-                                    json.loads(_cfg_snapshot),
-                                )
+                        if changes or blank_keys:
+                            await _cfg_write.rollback("Teams")
                     raise
                 except BaseException:
                     # Genuine .env write failure — roll the config metadata back so
                     # a failed write cannot leave the NEW metadata paired with the
                     # OLD credential on disk.
-                    if changes:
-                        if _cfg_snapshot is None:
-                            await asyncio.to_thread(path.unlink, missing_ok=True)
-                        else:
-                            await asyncio.to_thread(
-                                _atomic_json_write,
-                                path,
-                                json.loads(_cfg_snapshot),
-                            )
+                    if changes or blank_keys:
+                        await _cfg_write.rollback("Teams")
                     raise
                 for key, new_val in env_updates.items():
                     if new_val is None:
@@ -6063,11 +6915,20 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
     The whole Webex channel config is read at gateway startup, so every
     change returns ``restart_required`` for the UI hint.
     """
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
+    # A save is a config.json + credential transaction: a cancelled request
+    # (client gone, gateway shutting down) must not abandon it between its
+    # phases -- see ``run_to_completion``.
+    return await run_to_completion(_webex_config_save(request))
+
+
+async def _webex_config_save(request: web.Request) -> web.Response:
+    """Body of the Webex save; runs to completion once started."""
     from kiro_crew.config.loader import (  # noqa: F811
         CRED_WEBEX_BOT_TOKEN,
+        ConfigReadError,
         WebexConfig,
         _normalize_threshold_pair,
+        _threshold_pct,
         config_path,
     )
 
@@ -6261,23 +7122,45 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
         # the .env write — if we crash between the two, the legacy copy is
         # already gone rather than resurrected.
         if CRED_WEBEX_BOT_TOKEN in env_updates and webex_cfg.get("bot_token"):
-            changes["bot_token"] = ""
             applied.append("bot_token_purged")
+        # Blanked against the document the write lands on (see
+        # ``_LockedSectionWrite``): a legacy copy a concurrent writer landed after
+        # the snapshot is purged too, whenever this save updates the credential.
+        blank_keys = ("bot_token",) if CRED_WEBEX_BOT_TOKEN in env_updates else ()
 
-        _cfg_snapshot: str | None = None
+        # Through ``update_config_locked``: it holds the advisory lock on the
+        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
+        # in ANOTHER PROCESS cannot land between our read and our write, and the
+        # changes are merged into the file as re-read inside that lock. The same
+        # object undoes exactly those keys if the .env write below fails.
+        def _normalize_pair(section: dict) -> None:
+            # The pair was normalized against the snapshot above; a concurrent
+            # writer may have moved the counterpart since, so normalize once more
+            # against the merged section -- exactly what the loader does on read,
+            # so the file stores the pair the runtime will use.
+            if "soft_threshold_pct" in changes or "hard_threshold_pct" in changes:
+                soft, hard = _normalize_threshold_pair(
+                    _threshold_pct(section.get("soft_threshold_pct"), defaults.soft_threshold_pct),
+                    _threshold_pct(section.get("hard_threshold_pct"), defaults.hard_threshold_pct),
+                )
+                section["soft_threshold_pct"] = soft
+                section["hard_threshold_pct"] = hard
+
+        _cfg_write = _LockedSectionWrite(
+            path, "webex", changes, blank_keys=blank_keys, finalize=_normalize_pair
+        )
         # Hold the live-config watcher for the whole config+credential transaction:
         # the two files commit separately and a failed .env write rolls the config
         # back, so nothing between here and the end of the block may be applied to
         # the running gateway. The release wakes the watcher on the committed state.
         with live.hold():
-            if changes:
+            if changes or blank_keys:
                 webex_cfg.update(changes)
-                # Snapshot the on-disk config BEFORE writing the new metadata, so
-                # that if the subsequent .env credential write fails we can roll
-                # the metadata back.  Restoring config on .env failure keeps the
-                # pair consistent (old token + old meta).
-                _cfg_snapshot = await asyncio.to_thread(_read_text_or_none, path)
-                _atomic_json_write(path, data)
+                # Off-loop: file IO, and it may wait on another holder of the lock.
+                try:
+                    await _cfg_write.commit()
+                except ConfigReadError:
+                    return _deny("config.json is corrupt", status=500)
 
             # Create the configured session folder now, on this user-initiated save,
             # so the reconcile path never has to write the folder store. Best-effort:
@@ -6312,24 +7195,14 @@ async def api_webex_config_save(request: web.Request) -> web.Response:
                         else None
                     )
                     if _env_exc_wx is not None:
-                        if changes:
-                            if _cfg_snapshot is None:
-                                await asyncio.to_thread(path.unlink, missing_ok=True)
-                            else:
-                                await asyncio.to_thread(
-                                    _atomic_json_write, path, json.loads(_cfg_snapshot)
-                                )
+                        if changes or blank_keys:
+                            await _cfg_write.rollback("Webex")
                     raise
                 except BaseException:
                     # Roll config back so a failed .env write cannot leave the
                     # NEW metadata paired with the OLD token on disk.
-                    if changes:
-                        if _cfg_snapshot is None:
-                            await asyncio.to_thread(path.unlink, missing_ok=True)
-                        else:
-                            await asyncio.to_thread(
-                                _atomic_json_write, path, json.loads(_cfg_snapshot)
-                            )
+                    if changes or blank_keys:
+                        await _cfg_write.rollback("Webex")
                     raise
                 # Keep the live process environment in sync (see the Slack save path).
                 for key, new_val in env_updates.items():
@@ -6442,6 +7315,14 @@ async def api_imessage_config_get(request: web.Request) -> web.Response:
 
 async def api_imessage_config_save(request: web.Request) -> web.Response:
     """PUT /api/imessage/config — persist the iMessage config (config.json)."""
+    # A save is a config.json + credential transaction: a cancelled request
+    # (client gone, gateway shutting down) must not abandon it between its
+    # phases -- see ``run_to_completion``.
+    return await run_to_completion(_imessage_config_save(request))
+
+
+async def _imessage_config_save(request: web.Request) -> web.Response:
+    """Body of the iMessage save; runs to completion once started."""
     from kiro_crew.config.loader import (  # noqa: F811
         ConfigReadError,
         update_config_locked,
@@ -6723,15 +7604,18 @@ async def api_wecom_config_save(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _get_config_lock():
-        return await _wecom_config_save_locked(request)
+        # A save is a config.json + credential transaction: a cancelled request
+        # (client gone, gateway shutting down) must not abandon it between its
+        # phases -- see ``run_to_completion``.
+        return await run_to_completion(_wecom_config_save_locked(request))
 
 
 async def _wecom_config_save_locked(request: web.Request) -> web.Response:
     """Body of the WeCom save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.agent import _atomic_json_write  # noqa: F811
     from kiro_crew.config.loader import (  # noqa: F811
         CRED_WECOM_BOT_ID,
         CRED_WECOM_SECRET,
+        ConfigReadError,
         config_path,
     )
 
@@ -6887,7 +7771,12 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
     # the status badge reports the truth after the next gateway restart.
 
     # ── Phase 2: commit. All validation passed, so writes are safe. ──
-    _cfg_snapshot: str | None = None
+    # Through ``update_config_locked``: it holds the advisory lock on the sidecar
+    # ``<path>.lock`` across the whole read-modify-write, so a writer in ANOTHER
+    # PROCESS cannot land between our read and our write, and the staged keys are
+    # merged into the file as re-read inside that lock. The same object undoes
+    # exactly those keys if the .env write below fails.
+    _cfg_write = _LockedSectionWrite(path, "wecom", staged, seed_from="wechat")
     # Hold the live-config watcher for the whole config+credential transaction:
     # the two files commit separately and a failed .env write rolls the config
     # back, so nothing between here and the end of the block may be applied to
@@ -6896,14 +7785,11 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
     with live.hold():
         if staged:
             wc_cfg.update(staged)
-            # Snapshot the on-disk config BEFORE writing the new metadata, so
-            # that if the subsequent .env credential write fails we can roll
-            # the metadata back.  Restoring config on .env failure keeps the
-            # pair consistent (old credentials + old meta).
-            _cfg_snapshot = await asyncio.to_thread(_read_text_or_none, path)
-            # Off-loop: the atomic write (temp file + fsync + replace) must not
-            # block the gateway event loop.
-            await asyncio.to_thread(_atomic_json_write, path, data)
+            # Off-loop: file IO, and it may wait on another holder of the lock.
+            try:
+                await _cfg_write.commit()
+            except ConfigReadError:
+                return _deny("config.json is corrupt", status=500)
 
         # Create the configured session folder now, on this user-initiated save,
         # so the reconcile path never has to write the folder store. Best-effort:
@@ -6937,21 +7823,13 @@ async def _wecom_config_save_locked(request: web.Request) -> web.Response:
                 )
                 if _env_exc_wc is not None:
                     if staged:
-                        if _cfg_snapshot is None:
-                            await asyncio.to_thread(path.unlink, missing_ok=True)
-                        else:
-                            await asyncio.to_thread(
-                                _atomic_json_write, path, json.loads(_cfg_snapshot)
-                            )
+                        await _cfg_write.rollback("WeCom")
                 raise
             except BaseException:
                 # Roll config back so a failed .env write cannot leave the NEW
                 # metadata paired with the OLD credentials on disk.
                 if staged:
-                    if _cfg_snapshot is None:
-                        await asyncio.to_thread(path.unlink, missing_ok=True)
-                    else:
-                        await asyncio.to_thread(_atomic_json_write, path, json.loads(_cfg_snapshot))
+                    await _cfg_write.rollback("WeCom")
                 raise
             # Keep the live process environment in sync with the new .env state
             # (load_credentials() lets os.environ win over .env — see the Slack
@@ -7150,7 +8028,10 @@ async def api_feishu_config_save(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
     async with _get_config_lock():
-        return await _feishu_config_save_locked(request)
+        # A save is a config.json + credential transaction: a cancelled request
+        # (client gone, gateway shutting down) must not abandon it between its
+        # phases -- see ``run_to_completion``.
+        return await run_to_completion(_feishu_config_save_locked(request))
 
 
 async def _feishu_config_save_locked(request: web.Request) -> web.Response:

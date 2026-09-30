@@ -27,10 +27,11 @@ from kiro_crew.cloud import ssm as cloud_ssm
 # cannot drift from the mint path's on the inner/outer timeout pair -- the same
 # reason `_build_ssh_argv` is shared with the SSH rung rather than rebuilt here.
 from kiro_crew.instances.ssm_token_mint import _send_over_ssm
-from kiro_crew.instances.token_mint import _build_ssh_argv
+from kiro_crew.instances.token_mint import _build_ssh_argv, ssh_spawn_argv_env
 from kiro_crew.instances.validation import (
     SshValidationError,
     SsmValidationError,
+    split_ecs_target,
     validate_aws_profile,
     validate_aws_region,
     validate_ssh_host,
@@ -89,6 +90,16 @@ _SSM_REASONS = {
     "reachable (tunnel down — reconnect).",
     NOT_CONNECTED: "SSM and the remote dashboard are up. This instance isn't connected yet "
     "(no local tunnel) — click Connect.",
+}
+
+# Fargate variants: the ladder has no dashboard rung, and the first rung's reason
+# comes from the exec-readiness preflight itself, which already names the cause.
+_FARGATE_REASONS = {
+    OK: "All checks passed -- the task's exec channel and the local forward are healthy.",
+    TUNNEL_DOWN: "The task is ready for a forward, but the local forward isn't reachable "
+    "(tunnel down -- reconnect).",
+    NOT_CONNECTED: "The task is ready for a forward. This instance isn't connected yet "
+    "(no local tunnel) -- click Connect.",
 }
 
 
@@ -192,12 +203,20 @@ async def _probe_local_forward(local_port: int) -> bool:
 
 
 async def _run_ok(argv: list[str], timeout: float) -> bool:
-    """Run *argv*, return True iff it exits 0 within *timeout*."""
+    """Run the ssh *argv*, return True iff it exits 0 within *timeout*.
+
+    Spawned through :func:`ssh_spawn_argv_env` like every other ssh child, so a
+    ``ProxyCommand`` host probes the same under a GUI-launched gateway as the
+    tunnel it is diagnosing.
+    """
+    argv, env = await asyncio.to_thread(ssh_spawn_argv_env, argv)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except OSError:
         return False
@@ -211,12 +230,18 @@ async def _run_ok(argv: list[str], timeout: float) -> bool:
 
 
 async def _run_stdout(argv: list[str], timeout: float) -> str | None:
-    """Run *argv*, return decoded stdout on exit 0, else None."""
+    """Run the ssh *argv*, return decoded stdout on exit 0, else None.
+
+    Same spawn env as :func:`_run_ok`.
+    """
+    argv, env = await asyncio.to_thread(ssh_spawn_argv_env, argv)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except OSError:
         return None
@@ -379,3 +404,72 @@ async def diagnose_instance_ssm(
         return DiagnosisResult(TUNNEL_DOWN, _SSM_REASONS[TUNNEL_DOWN], probes)
 
     return DiagnosisResult(OK, _SSM_REASONS[OK], probes)
+
+
+async def _probe_task_exec_ready(
+    cluster: str, task_id: str, profile: str, region: str
+) -> tuple[bool, str]:
+    """``(ready, reason)`` from the shared exec-readiness preflight, off the loop.
+
+    The preflight is a synchronous ``aws ecs describe-tasks``, and this ladder is
+    where its answer reaches an operator: the ``fargate`` forward opens without
+    consulting it, so a task whose execute-command channel was never enabled, or
+    whose in-task agent cannot reach ``ssmmessages``, surfaces here as the broken
+    link rather than as a forward that just does not come up.
+    """
+    readiness = await asyncio.to_thread(
+        cloud_ssm.task_exec_readiness, cluster, task_id, profile, region
+    )
+    return readiness.ready, readiness.reason
+
+
+async def diagnose_instance_fargate(
+    ssm_target: str,
+    local_port: int,
+    *,
+    aws_profile: str = "",
+    aws_region: str = "",
+) -> DiagnosisResult:
+    """Fargate diagnosis ladder -- the ECS-task sibling of :func:`diagnose_instance_ssm`.
+
+        1. Task ready for a forward? ``describe-tasks`` exec readiness -> no => ssm_unreachable
+        2. Local forward reachable?  TCP connect 127.0.0.1:LP              -> no => tunnel_down
+        else                                                                   => ok
+
+    There is no remote-dashboard rung: the task serves a turn API and runs no
+    ``kirocrew``, so nothing could be sent over SSM to ask it. The first rung's
+    reason is the preflight's own, which already distinguishes a channel that was
+    never enabled (relaunch) from an agent still starting (retry). All probes are
+    read-only.
+    """
+    try:
+        target = validate_ssm_target(ssm_target)
+        profile = validate_aws_profile(aws_profile)
+        region = validate_aws_region(aws_region)
+    except SsmValidationError as e:
+        return DiagnosisResult(code=UNKNOWN, reason=f"invalid fargate settings: {e}", probes=[])
+    parts = split_ecs_target(target)
+    if parts is None:
+        return DiagnosisResult(
+            code=UNKNOWN,
+            reason=f"invalid fargate settings: {target!r} is not an ECS task target",
+            probes=[],
+        )
+    cluster, task_id, _runtime_id = parts
+
+    probes: list[dict] = []
+
+    ready, reason = await _probe_task_exec_ready(cluster, task_id, profile, region)
+    probes.append({"name": "task_exec_ready", "ok": ready})
+    if not ready:
+        return DiagnosisResult(SSM_UNREACHABLE, reason, probes)
+
+    if not local_port:
+        return DiagnosisResult(NOT_CONNECTED, _FARGATE_REASONS[NOT_CONNECTED], probes)
+
+    forward_ok = await _probe_local_forward(local_port)
+    probes.append({"name": "local_forward", "ok": forward_ok})
+    if not forward_ok:
+        return DiagnosisResult(TUNNEL_DOWN, _FARGATE_REASONS[TUNNEL_DOWN], probes)
+
+    return DiagnosisResult(OK, _FARGATE_REASONS[OK], probes)

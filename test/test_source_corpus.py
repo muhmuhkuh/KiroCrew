@@ -33,7 +33,9 @@ here is a ratchet: no test may enumerate the checkout from the filesystem.
 from __future__ import annotations
 
 import ast
+import shutil
 import subprocess
+import tempfile
 import types
 from collections.abc import Sequence
 from pathlib import Path
@@ -45,10 +47,11 @@ import test_sandbox_off_loop as sandbox
 import test_session_map_locking as session_map
 from source_corpus import (
     candidate_sources,
+    iter_candidate_sources,
+    iter_source_texts,
     repo_files,
     repo_files_named,
     repo_root,
-    source_texts,
     src_root,
     unreadable_files,
 )
@@ -338,19 +341,26 @@ def _unencodable_docstrings(sources: Sequence[tuple[Path, str]]) -> list[tuple[P
 
 
 class TestCorpusHealth:
-    """A stale or empty corpus is the one failure that makes every gate green."""
+    """A stale or empty corpus is the one failure that makes every gate green.
+
+    Streamed, not materialised. ``source_texts()`` holds ~130 MB of ``str`` for as
+    long as its tuple lives, and one comparison written as two of them at once
+    measured at +264 MiB of resident memory -- the very high-water mark the corpus
+    module exists to keep off every gate. So each pin below walks the iterator
+    the gates walk and keeps a count, a path set or two texts, never the tree.
+    """
 
     def test_the_corpus_is_not_empty_or_stale(self):
-        texts = source_texts()
-        assert len(texts) >= _MIN_FILES, (
-            f"source_corpus returned {len(texts)} files; every whole-tree ratchet "
+        count = sum(1 for _pair in iter_source_texts())
+        assert count >= _MIN_FILES, (
+            f"source_corpus returned {count} files; every whole-tree ratchet "
             "reads this, so a short corpus makes all of them pass while blind."
         )
 
     def test_every_file_is_python_under_the_package(self):
         root = src_root()
         assert (root / "security" / "__init__.py").is_file(), f"{root} is not the kiro_crew package"
-        for path, _text in source_texts():
+        for path, _text in iter_source_texts():
             assert path.suffix == ".py"
             assert path.is_relative_to(root)
 
@@ -383,14 +393,40 @@ class TestCorpusHealth:
 
     def test_sources_are_the_real_file_contents(self):
         """Pins the read, not just the count: a corpus of empty strings is worse."""
-        by_name = {path.name: text for path, text in source_texts()}
-        by_rel = {path.relative_to(src_root()).as_posix(): text for path, text in source_texts()}
-        assert "def redact" in by_rel["security/__init__.py"]
-        assert "def batched_save" in by_name["session_map.py"]
+        root = src_root()
+        wanted = {"security/__init__.py": "def redact", "session_map.py": "def batched_save"}
+        seen: dict[str, str] = {}
+        for path, text in iter_source_texts():
+            for key in (path.relative_to(root).as_posix(), path.name):
+                if key in wanted:
+                    seen[key] = text
+        assert set(seen) == set(wanted), f"corpus is missing {set(wanted) - set(seen)}"
+        for key, marker in wanted.items():
+            assert marker in seen[key], f"{key} did not read as the real file"
 
     def test_a_filter_returns_a_subset_and_no_filter_returns_everything(self):
-        assert set(candidate_sources(blocking._REQUIRE_ALL)) <= set(source_texts())
-        assert candidate_sources() == source_texts()
+        """The filter is a subset of the corpus; an empty filter is the corpus.
+
+        Both halves stream in lockstep with the corpus. A candidate's ``text`` is
+        checked against the file itself, so the subset claim covers the pair and
+        not only the path; ``strict`` makes a filter that drops or invents a file
+        fail on length, not just on content.
+        """
+        corpus_paths = set()
+        for path, _text in iter_source_texts():
+            corpus_paths.add(path)
+        kept = 0
+        for path, text in iter_candidate_sources(blocking._REQUIRE_ALL):
+            assert path in corpus_paths, f"{path} is not in the corpus"
+            assert text == path.read_text(encoding="utf-8"), f"{path} was not read verbatim"
+            kept += 1
+        assert 0 < kept < len(corpus_paths), "the filter admitted nothing, or everything"
+
+        everything = 0
+        for candidate, whole in zip(iter_candidate_sources(), iter_source_texts(), strict=True):
+            assert candidate == whole
+            everything += 1
+        assert everything == len(corpus_paths)
 
 
 class TestFilterLiteralsStillMatchWhatTheGatesReject:
@@ -473,11 +509,13 @@ class TestFiltersStillNarrowTheTree:
         ],
     )
     def test_the_filter_narrows_the_tree(self, label, require_all, require_any, ceiling):
-        kept = candidate_sources(require_all, require_any)
+        # Counted off the stream: the broad filters keep up to half the tree, and
+        # a tuple of those texts is most of the corpus resident again.
+        kept = sum(1 for _pair in iter_candidate_sources(require_all, require_any))
         assert kept, f"{label}: matched nothing, so that gate now scans an empty tree"
-        assert len(kept) < ceiling, (
-            f"{label}: kept {len(kept)} of {len(source_texts())} files, so the filter "
-            "is no longer buying anything -- either the tree or the literal moved."
+        assert kept < ceiling, (
+            f"{label}: kept {kept} of {sum(1 for _pair in iter_source_texts())} files, so "
+            "the filter is no longer buying anything -- either the tree or the literal moved."
         )
 
 
@@ -609,6 +647,68 @@ class TestTheCheckoutEnumeration:
                 repo_files()
         finally:
             repo_files.cache_clear()
+
+    def test_the_runs_own_temp_files_are_not_the_checkout(self, tmp_path, monkeypatch):
+        """A temp root under the checkout is the HOST's layout, not the tree.
+
+        A harness that pins ``TMPDIR`` inside the repository makes git's
+        ``--others`` list every fixture the suite writes -- a copy of a shipped
+        script under a fake home, a nested repository, a file another worker deletes
+        a moment later -- and the gates then police the run's own scratch. On a host
+        whose temp dir is elsewhere none of it is ever listed, so it is what the
+        enumeration must answer identically on both. Real git, so the rule is pinned
+        on the path a checkout takes and not on the walk.
+        """
+        _git = shutil.which("git")
+        if _git is None:
+            pytest.skip("git is required to build the checkout")
+
+        def git(*args: str) -> None:
+            # ``cwd`` as well as ``-C``: the child must not inherit pytest's own working
+            # directory (the checkout), so a relative operand can only ever resolve inside
+            # this test's tmp_path.
+            subprocess.run(
+                [_git, "-C", str(tmp_path), *args],
+                check=True,
+                capture_output=True,
+                timeout=60,
+                cwd=tmp_path,
+            )
+
+        git("init", "-q")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "shipped.py").write_text("", encoding="utf-8")
+        git("add", "src/shipped.py")
+        # An untracked source file stays in scope: that is what ``--others`` is for.
+        (tmp_path / "src" / "unstaged.py").write_text("", encoding="utf-8")
+
+        def plant(rel: str) -> None:
+            (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / rel).write_text("", encoding="utf-8")
+
+        # The platform temp dir the process started with, pinned under the checkout
+        # by a harness -- another run's ``--basetemp`` lands under it too...
+        plant("var/tmp/other-run/bt/test_x0/wt-feature/.git")
+        plant("var/tmp/other-run/bt/test_x0/copy.py")
+        monkeypatch.setattr(source_corpus, "_TEMP_ROOT_AT_IMPORT", str(tmp_path / "var" / "tmp"))
+        # ...the per-run root the root conftest redirects ``tempfile`` to, which need
+        # not be under the first when a test redirected it again...
+        plant("run/kc-pytest-u-1-abcd/fake-home/scripts/_common.sh")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "run" / "kc-pytest-u-1-abcd"))
+        # ...and pytest's own basetemp, found by pytest's marker where neither root
+        # covers it (a lazy first import after the redirect).
+        plant("elsewhere/pytest-of-u/pytest-3/popen-gw0/test_x0/copy.py")
+        # A directory that merely LOOKS like scratch to a human is not excluded:
+        # only the process's temp dirs and pytest's marker are.
+        plant("tmp/kept.py")
+
+        monkeypatch.setattr(source_corpus, "repo_root", lambda: tmp_path)
+        repo_files.cache_clear()
+        try:
+            found = [p.relative_to(tmp_path).as_posix() for p in repo_files()]
+        finally:
+            repo_files.cache_clear()
+        assert found == ["src/shipped.py", "src/unstaged.py", "tmp/kept.py"]
 
 
 class TestNoGateEnumeratesTheCheckoutByWalking:

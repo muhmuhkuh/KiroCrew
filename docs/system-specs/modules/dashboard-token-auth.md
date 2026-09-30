@@ -2,7 +2,7 @@
 
 ## Overview
 
-Token authentication for the Kiro Crew dashboard. The owner mints a time-limited, HMAC-SHA256 signed URL from the CLI (`kirocrew token`) or via the `!dashboard` Slack command (currently the only chat channel that mints links). An aiohttp middleware validates the token on every GATED request (query param or cookie fallback) and sets a session cookie on first use. A bypass route returns before validation, and that set is wider than static assets — see the bypass inventory below. The token is pinned to a peer key: the client address by default, or a `ts:node:` / `ts:login:` identity on a Tailscale path (`token_auth.TokenStateManager.bind_peer()`), so the pin is not always an IP. Ordinary loopback requests require token authentication (`token_auth.token_auth_middleware()`; `test_loopback_requires_token`). Internal routes have separate loopback-plus-`X-Internal-Secret` and mixed-route cookie-authentication branches. SEL coverage of token GENERATION is per caller, not intrinsic to minting: `generate_token()` itself logs only `nonce_evicted`, an eviction side effect, so a caller that does not log leaves its mint unaudited. The gateway's `--json-ready` startup path is that case — it calls `generate_token()` directly with no accompanying generation event.
+Token authentication for the Kiro Crew dashboard. The owner mints a time-limited, HMAC-SHA256 signed URL from the CLI (`kirocrew token`) or via direct-message commands on Slack (`!dashboard` or `/kirocrew dashboard`), Telegram and Webex (`/kirocrew dashboard`), and Teams (`/dashboard`). An aiohttp middleware validates the token on every GATED request (query param or cookie fallback) and sets a session cookie on first use. A bypass route returns before validation, and that set is wider than static assets — see the bypass inventory below. The token is pinned to a peer key: the client address by default, or a `ts:node:` / `ts:login:` identity on a Tailscale path (`token_auth.TokenStateManager.bind_peer()`), so the pin is not always an IP. Ordinary loopback requests require token authentication (`token_auth.token_auth_middleware()`; `test_loopback_requires_token`). Internal routes have separate loopback-plus-`X-Internal-Secret` and mixed-route cookie-authentication branches. SEL coverage of token GENERATION is per caller, not intrinsic to minting: `generate_token()` itself logs only `nonce_evicted`, an eviction side effect, so a caller that does not log leaves its mint unaudited. The gateway's `--json-ready` startup path is that case — it calls `generate_token()` directly with no accompanying generation event.
 
 `TokenStateManager` bounds concurrently valid link nonces with FIFO eviction, allowing multiple browser tabs and CLI sessions without unbounded link-state growth (`token_auth.TokenStateManager`). All in-memory link-session state is managed by that thread-safe component. Auth is **not** purely in memory: the persistent HMAC signing key `token_signing.key` and persisted revoked access-cookie nonces in `token_revoked_nonces.json` let signed cookies and per-session logouts survive a gateway restart. `POST /api/auth/logout` revokes one access cookie and its refresh chain; `kirocrew logout` advances the persisted revocation generation embedded in both token kinds, ending all established browser sessions and refresh chains (`token_secret`, `RevokedNonceStore`, `revocation_gen.py`).
 
@@ -34,7 +34,26 @@ Rotation-on-use races when a refresh POST is duplicated (network retry / double-
 
 `POST /api/auth/refresh` is rate-limited per source IP. The per-IP bucket map is bounded two ways: a periodic sweep reclaims stale or empty buckets without evicting a live bucket, and a hard cap fails closed so a previously unseen source IP is denied rather than admitted by evicting a live bucket (`test_tr_u_15g_rate_buckets_hard_capped`). Under a sustained flood or heavy IP churn, a legitimate previously unseen source can be denied refresh; an unconditional sweep runs when insertion is refused to reclaim dead buckets without dropping a live one. Any change to the cap, eviction or sweep behavior, or this availability trade changes this security contract and must update this section in the same commit.
 
+### Dashboard client: who owns browser-side recovery
+
+The browser half of refresh and re-authentication is split by responsibility
+across a few frontend owners. None of them authorizes anything: authorization
+stays on the gateway, in the token middleware and in the handler-level owner
+gate whose `owner_only` and `stale_session_reauth` refusals the client only
+surfaces, and `X-Session-Key: dashboard:ui` stays correlation metadata.
+
+| Responsibility | Owner |
+|---|---|
+| Proactive rotation before the access cookie expires, and the cold-start `GET /api/auth/me` → `POST /api/auth/refresh` recovery | `website/src/hooks/useRefreshScheduler.ts`, mounted by `DashboardBootstrap` outside the prerequisite gate |
+| The one in-flight `POST /api/auth/refresh` that every trigger shares | `website/src/api/refreshOnce.ts` |
+| The `X-Session-Key` default, the request helpers and the `j`/`jNullable` parsers; the warm-path silent refresh on a 403 `X-Auth-Required`; the embedded-pane hand-off; the re-auth banner with its in-place `GET /api/auth/me?token=` exchange; the 401 `stale_session_reauth` prompt; and the sign-in instruction shown in place of the gateway's own refusal reason | `website/src/api/client.ts` |
+| The `api` object's endpoint methods, grouped by domain under `website/src/api/client/`, each module built on the transport above rather than its own; the mobile sign-in mint `POST /api/auth/mobile-link` is `mobileLoginLink` in `website/src/api/client/remoteAccess.ts`. Four methods stay defined in `client.ts`: three that other docs or the i18n gate pin there, and `wakatimeExportDownload`, which reads a sibling through `api` at call time | the domain endpoint modules |
+| The words for an interposed proxy's sign-in page, and the generic error text other failures render with | `website/src/api/edgeAuthChallenge.ts` and `website/src/api/apiError.ts` |
+
 ## Architecture
+
+The sequence below is the Slack implementation. Telegram, Teams and Webex call
+`generate_token()` directly and keep the credential in a direct conversation.
 
 ```mermaid
 sequenceDiagram
@@ -276,7 +295,7 @@ The `local_only` parameter is accepted for backward compatibility but does not c
 
 Request flow:
 1. Internal-path handling is separate: a loopback caller with a valid `X-Internal-Secret` is admitted, a mixed internal path can validate a cookie, and a strict internal path denies non-loopback callers; ordinary loopback requests continue to the token gate (`token_auth_middleware`; `test_loopback_requires_token`).
-2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, and `/sandbox-doc/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, and `/api/ready`; anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, and `POST /api/auth/logout` (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`).
+2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, `/sandbox-doc/`, and `/browser-view/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, `/api/ready`, and `/browser-view` (the bare form, which the trailing-slash prefix misses — bypassed so the relay's uniform 404 answers instead of the middleware's distinguishable 403); anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, and `POST /api/auth/logout` (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`). `/browser-view/` is unlike every other bypass on this list: it is the one route that **proxies foreign content** (the Playwright CLI browser view) rather than serving gateway-owned assets. It carries its own authentication — a per-instance capability token embedded in the path, minted by the view supervisor and disclosed only through the cookie-authed, owner-gated `/api/browser/view` payload, constant-time-compared before any per-request ownership probe runs — and every tokenless or wrong-token request answers a uniform 404. The full model (post-connect ownership re-proof, CSP sandbox stamp, SEL audit of every allow/deny) is specified in `dashboard/handlers/browser_view_relay.py` and the [browser module spec](browser.md).
 3. Extract token from `?token=` query param or `mc_token_{port}` cookie
 4. Validate signature + expiry (link window for query param, session_exp for cookie)
 5. Check IP binding
@@ -571,6 +590,56 @@ either auth flavor can grant (see `_verify_unix_peer`):
    Unresolvable (warm-pool runtime before claim, cron scripts, pooled MCP
    backends — no pidfile in the ancestry; or a mapping published unsigned) →
    proceed under today's semantics.
+5. Peer pid hosts **several** sessions (the mapping's tenant section records a
+   count above one; see the sidecar contract in `session.md`) → the resolved
+   key cannot be compared, because step 3 answers per PROCESS and the question
+   is which of that process's sessions is calling. Membership in the roster is
+   necessary but NOT sufficient: the `.txt` is agent-readable, so a co-tenant
+   could read a sibling's key out of it and declare that. Such a request
+   additionally requires an `X-Session-Token` that
+   `session_token_sig.verify_session_token` resolves to exactly the declared
+   key — the token's MAC is keyed by the agent-unreadable SEL trust root and
+   names ONE session, which peer credentials cannot distinguish on a shared
+   runtime. No token, or a token naming another session → **403**
+   `peer_session_unattested`. A truncated roster does not weaken this: a
+   recorded count above one is the evidence the token is required, so a
+   declared key absent from a SHORT membership is still challenged rather than
+   admitted as "membership unknown". Both outcomes are SEL-recorded, including
+   the admitted one, and each names the roster shape it judged so the trail
+   distinguishes a full membership from a short one. A 1:1 pid is unchanged and
+   requires no token.
+6. A mapping exists in the ancestry and its **MAC does not verify** → the same
+   token demand as step 5, `peer_session_unattested` on failure. The pair is two
+   files replaced separately, so a body-changing republication is briefly visible
+   as a new `.txt` beside the previous `.sig`; that reads as a mismatch for a
+   body nobody forged, and it is indistinguishable from forgery. Because a
+   tenancy-changing claim is exactly when the body changes, treating it as step 7
+   would make the window a BYPASS rather than a degradation — a same-uid
+   co-tenant can read both files, watch `.txt` move ahead of `.sig`, and drive
+   its declaration into the gap to skip the demand the resolved mapping would
+   have made. Attestation rather than denial, because the caller that owns the
+   declared key holds a token naming it and a routine republication must not take
+   its calls down. A proven RECYCLE is explicitly NOT this case: it is reported
+   only after the signature verifies, so it is the publisher's attested statement
+   that the pid moved on rather than ambiguity about who is calling, an agent
+   cannot plant a signed one, and the orphan sweep leaves one for every live
+   recycled pid — so it goes to step 7.
+7. Nothing resolved on disk, but the **live session manager** reports the peer's
+   ancestry hosting several sessions → the same token demand as step 5. Disk
+   absence is not evidence here: the pair lives in the data-home root, which is
+   writable inside the agent sandbox, so a co-tenant reaches this arm with one
+   `unlink` — and the roster it read before deleting tells it which sibling key to
+   declare. Per-turn republication bounds that window without closing it, because
+   the deleter picks its moment. The manager answers from memory, in this process,
+   about runtimes it owns, so it is the one account of a pid's tenancy an agent
+   cannot edit. Its rows are filtered to sessions (`sid` present) for the same
+   reason the publisher filters them, and the demand is keyed on a count ABOVE
+   ONE: one session is not evidence of sharing, and an unreachable manager answers
+   zero, which is no evidence rather than a verdict.
+8. Nothing resolved and no evidence of sharing from either source — no mapping in
+   the ancestry, or only a proven recycle, and a manager that knows of none or
+   cannot answer → proceed under today's semantics (a warm-pool runtime before
+   claim, a cron script, a pooled MCP backend outside this manager).
 
 CSRF interplay: `check_origin`'s no-Origin branch trusts the unix transport
 (`origin.request_is_unix_socket`) exactly as it trusts loopback TCP — a
@@ -593,6 +662,20 @@ at connect time (`FileNotFoundError` / `ConnectionRefusedError` — cases that
 provably never delivered the request, so the retry cannot double-send). HTTP
 error statuses and read timeouts propagate unchanged, keeping every caller's
 error shape identical.
+
+**A declaration on a shared pid passes when it carries a token**, so every
+internal sender that sets `X-Session-Key` also attaches `X-Session-Token`
+(`mcp_core._session_token_header`, empty when the environment holds no token).
+The two agree by construction rather than by discipline: on such a pid the
+identity ladder resolves the key FROM that token, so the header it declares and
+the session the token attests to are the same value. The pair must not be
+separated in either direction — a key without its token is refused on a shared
+pid, and a token without a key would offer the gateway an identity the caller
+deliberately withheld (the `unresolved:` placeholder rides in the request BODY
+only). On a 1:1 pid the helper contributes no header and the request is
+byte-identical to the pre-token scheme. The senders are `mcp_core`'s own
+`_send` family, `mcp_tools/browser.py`'s panel command, and
+`mcp_computer.py`'s tool invoke.
 
 ### 6. `gateway.py` Integration
 
@@ -681,13 +764,23 @@ HTML 403 page directs users to create a mobile sign-in link from an existing
 dashboard session; if no other device is signed in, it restores the
 `kirocrew token` CLI recovery path. The middleware never raises unhandled exceptions.
 
+The dashboard client reads a refusal by its shape. A 403 carrying
+`X-Auth-Required: true` is this middleware's own denial (JSON with `error` and
+`code` on `/api/*`): `website/src/api/client.ts` tries one silent refresh and
+raises the re-auth banner only when that refresh is terminal; an embedded pane
+tries the same refresh and, when it fails, hands recovery to its hub instead of
+raising the banner. A 401 or 403 without the header whose
+body is an HTML document came from a proxy in front of the gateway; the client
+words it through `website/src/api/edgeAuthChallenge.ts` and never offers the
+token flow, which could not clear it.
+
 > **Note:** the *No token* / *Expired token* / *Invalid HMAC signature* rows above apply to `/api/*`, `/apps/*`, and non-`GET`/`HEAD` requests. A non-API `GET`/`HEAD` navigation in those same states is instead served the public SPA shell (200) so the app can cold-start its refresh flow — see *SPA Shell Bypass (cold-start recovery)*. `IP mismatch` is **not** relaxed: it remains a hard 403 (theft signal).
 
 ## SEL Audit Events
 
 | Event | Operation | Outcome | Metadata |
 |-------|-----------|---------|----------|
-| Token generated | `slack.dashboard_token` | `ok` | `ttl=<seconds>` |
+| Messaging link generated | `slack.dashboard_token`, `telegram.dashboard_token`, `teams.dashboard_token`, or `webex.dashboard_token` | `ok` | `ttl=<seconds>` |
 | Request accepted | `dashboard.token_auth` | `ok` | request path |
 | Request denied | `dashboard.token_auth` | `denied` | rejection reason |
 | SPA shell served on cold-start nav | `dashboard.token_auth` | `shell_unauth` (no token) / `shell_unauth_invalid_token` (expired/forged token) | request path. **These replace `denied`/403 for non-API `GET`/`HEAD` navigations** — any volume-based scanning/brute-force alert keyed on `denied` or 403 counts for nav paths MUST also watch these two outcomes, or credential-less probing of a remote-exposed dashboard goes invisible. A forged token on a nav serves the secret-free shell but keeps the distinct `shell_unauth_invalid_token` signal (not `ok`). |

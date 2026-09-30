@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from conftest import requires_symlinks
-from kiro_crew import cli_doctor, cron
+from kiro_crew import cli_doctor, cron, extras
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_PI
 
 
@@ -211,7 +211,7 @@ class TestPodSessionBus:
     """
 
     @staticmethod
-    def _linux(monkeypatch, tmp_path: Path, *, bus: bool) -> Path:
+    def _linux(monkeypatch, tmp_path: Path, *, bus: bool, template: bool = True) -> Path:
         from kiro_crew.pod import runtime as rt
 
         monkeypatch.setattr(cli_doctor.sys, "platform", "linux")
@@ -219,6 +219,20 @@ class TestPodSessionBus:
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
         monkeypatch.setenv("USER", "tester")
+        # Pin the per-user manager probe. Without this the outcome depends on
+        # whether the RUNNER ships user@.service, which would make every test
+        # below environment-dependent: a container without the template would
+        # take the not-applicable branch and never reach the case under test.
+        # Patched on the runtime module because the doctor imports the name
+        # locally at call time, which keeps the pod package out of the CLI's
+        # import graph for every other command.
+        from kiro_crew.pod import runtime as _rt
+
+        monkeypatch.setattr(
+            _rt,
+            "user_manager_unit",
+            lambda uid=None: "/usr/lib/systemd/system/user@.service" if template else None,
+        )
         sock = tmp_path / "bus"
         if bus:
             sock.touch()
@@ -343,6 +357,56 @@ class TestPodSessionBus:
         assert "not applicable" in out and "systemctl" in out
         assert issues == []
 
+    def test_no_per_user_manager_is_not_applicable_not_a_dead_end_fix(
+        self, monkeypatch, tmp_path: Path, capsys
+    ) -> None:
+        """An EL7 host can never run a pod, so enable-linger must not be offered.
+
+        systemd is present and the platform is Linux, so the two gates above both
+        pass and the old code fell through to `❌ ... Fix: loginctl enable-linger`.
+        On a host with no `user@.service` that fix cannot work: linger only tells
+        logind to instantiate a template that is not installed, so the reader sets
+        a flag, nothing starts, and the report still says the setup is broken.
+        """
+        self._linux(monkeypatch, tmp_path, bus=False, template=False)
+        issues: list[str] = ["pre-existing"]
+
+        cli_doctor._doctor_pod_session_bus(issues)
+
+        out = capsys.readouterr().out
+        assert "not applicable" in out
+        assert "dev-backend.sh" in out
+        # The dead-end remedy must NOT be recommended on this host.
+        assert "Fix: loginctl enable-linger" not in out
+        # Advisory like every other branch: it reports a limit, it never blocks.
+        assert issues == ["pre-existing"]
+
+    def test_a_live_socket_does_not_make_a_manager_less_host_look_supported(
+        self, monkeypatch, tmp_path: Path, capsys
+    ) -> None:
+        """The socket alone is a false positive, so the doctor outranks it.
+
+        Observed on Amazon Linux 2: `has_session_bus()` returns True because a stray
+        session `dbus-daemon` created `/run/user/<uid>/bus`, while no per-user manager
+        exists at all. Testing the socket first would print `✅ session bus` on a host
+        where `kirocrew pod` provably cannot work, which is the misdirection this
+        change exists to remove.
+
+        This is intentionally stricter than `require_systemd()`, which passes on a live
+        socket. The doctor only prints, so a false ⏹ costs a sentence; refusing in the
+        runtime gate on a probe that cannot enumerate every unit location would break a
+        working host.
+        """
+        self._linux(monkeypatch, tmp_path, bus=True, template=False)
+
+        cli_doctor._doctor_pod_session_bus([])
+
+        out = capsys.readouterr().out
+        assert "not applicable" in out
+        assert "dev-backend.sh" in out
+        assert "✅" not in out
+        assert "Fix: loginctl enable-linger" not in out
+
 
 class TestLingerProbe:
     """`loginctl show-user <u> -p Linger --value` → tri-state."""
@@ -437,14 +501,12 @@ class TestUnresolvedMcpRefs:
         imports it inside the function (doctor keeps its import graph lazy). That
         the row asks ONE boundary-clean question rather than assembling the answer
         from the spec, the backend registry and the mirror seam is the reason this
-        fixture is a single return value -- and is what keeps `cli_doctor` off the
-        agent-sdk-boundary baseline.
+        fixture is a single return value -- and is what keeps `doctor_checks/mcp.py`, the
+        row's home, off the agent-sdk-boundary baseline.
         """
         from kiro_crew.agent_sdk.drivers import acp as acp_driver
 
-        monkeypatch.setattr(
-            acp_driver, "agent_spec_mcp_refs", lambda _agent: (spec_found, rows)
-        )
+        monkeypatch.setattr(acp_driver, "agent_spec_mcp_refs", lambda _agent: (spec_found, rows))
 
     def test_a_backend_with_no_projection_names_the_unprojected_refs(self, monkeypatch, capsys):
         self._arrange(monkeypatch, [("codex", ["@kirocrew-core"], False)])
@@ -452,6 +514,31 @@ class TestUnresolvedMcpRefs:
         out = capsys.readouterr().out
         assert "codex has no mirror" in out
         assert "@kirocrew-core" in out
+
+    def test_the_no_mirror_verdict_claims_only_what_the_wire_proves(self, monkeypatch, capsys):
+        """The static half hedges exactly as the runtime line does, on every backend.
+
+        The row is the same detector before a session exists, so it may not assert
+        what the runtime line stopped asserting: the harness may mount a same-named
+        server from its own configuration, which neither half reads, so the row
+        says a listed ref may still be served and never that the tools are absent.
+        One sentence, no backend condition; the broker-stub caveat and the registry
+        pointer stay. Called at the row's own home in ``doctor_checks.mcp`` (the
+        ``cli_doctor`` name is the facade's re-export of the same function).
+        """
+        from kiro_crew.doctor_checks import mcp as doctor_mcp
+
+        for backend in ("goose", ""):
+            self._arrange(monkeypatch, [(backend, ["@ghost"], False)])
+            doctor_mcp._doctor_unresolved_mcp_refs()
+            # ``_print_wrapped`` folds the paragraph, so compare on collapsed whitespace.
+            out = " ".join(capsys.readouterr().out.split())
+            assert "may mount a same-named server from its own configuration" in out
+            assert "this row cannot tell which" in out
+            assert "absent from its sessions" not in out
+            assert "nothing to say so" not in out
+            assert "broker stub, which this row does not model" in out
+            assert "providers/mirrors/registry.py" in out
 
     def test_a_healthy_projection_prints_a_clean_row(self, monkeypatch, capsys):
         self._arrange(monkeypatch, [("claude", [], True)])
@@ -629,9 +716,9 @@ class TestBackendAbilityCardRows:
         from kiro_crew.providers.mirrors import PROJECTIONS
 
         for backend, declared in PROJECTIONS.items():
-            if backend not in set(__import__(
-                "kiro_crew.acp_backends", fromlist=["x"]
-            ).selectable_backend_values()):
+            if backend not in set(
+                __import__("kiro_crew.acp_backends", fromlist=["x"]).selectable_backend_values()
+            ):
                 continue
             cli_doctor._doctor_backend_ability_cards(self._cfg(backend))
             out = capsys.readouterr().out
@@ -690,9 +777,7 @@ class TestBackendAbilityCardRows:
         assert spared, "no harness keeps a tool-off per tool any more"
         cli_doctor._doctor_backend_ability_cards(self._cfg("claude"))
         out = capsys.readouterr().out
-        named = _re.search(
-            r"On (.+?), switching a single MCP tool off", " ".join(out.split())
-        )
+        named = _re.search(r"On (.+?), switching a single MCP tool off", " ".join(out.split()))
         assert named, out
         for backend in spared:
             assert cli_doctor._backend_policy_label(backend) not in named.group(1), backend
@@ -1011,9 +1096,7 @@ class TestOomKillerProbe:
     def test_absent_systemctl_is_unknown(self, monkeypatch) -> None:
         # Resolution goes through the trusted-bin pin (fixed system dirs), so a
         # PATH-planted shim can never be executed; a miss degrades to unknown.
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None
-        )
+        monkeypatch.setattr(cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None)
         assert cli_doctor._detect_userspace_oom_killer() is None
 
 
@@ -1077,9 +1160,7 @@ class TestMemoryPressure:
         assert "⚠️" not in out
         assert issues == ["pre-existing"]
 
-    def test_no_swap_unknown_killer_is_informational_not_warning(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_no_swap_unknown_killer_is_informational_not_warning(self, monkeypatch, capsys) -> None:
         # Inconclusive detection (no systemctl / probe failure) must not warn —
         # a container or non-systemd host may run a killer doctor cannot see.
         issues = self._arrange(monkeypatch, swap_kib=0, killer=None)
@@ -1125,9 +1206,7 @@ class TestMemoryPressure:
         cli_doctor._doctor_memory_pressure(issues)
 
         out = capsys.readouterr().out
-        assert out.index("session ceiling") < out.index("gateway rss") < out.index(
-            "not applicable"
-        )
+        assert out.index("session ceiling") < out.index("gateway rss") < out.index("not applicable")
         assert issues == []
 
 
@@ -1292,7 +1371,9 @@ class TestGatewayMemoryLines:
         monkeypatch.setattr(cli_doctor, "_read_gateway_pid", lambda: 4242)
         monkeypatch.setattr(cli_doctor.platform_compat, "proc_rss_bytes_for_pid", lambda pid: None)
         monkeypatch.setattr(cli_doctor.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(cli_doctor.platform_compat, "trusted_system_bin", lambda name: "/bin/ps")
+        monkeypatch.setattr(
+            cli_doctor.platform_compat, "trusted_system_bin", lambda name: "/bin/ps"
+        )
         calls: list[list[str]] = []
 
         def _ps(argv, timeout):
@@ -1335,9 +1416,7 @@ class TestDoctorAgentAuth:
         if vault_import_fails:
             monkeypatch.setitem(sys.modules, "kiro_crew.auth.bridge", None)
         else:
-            monkeypatch.setattr(
-                "kiro_crew.auth.bridge.vault_holds_identity", lambda: vault_holds
-            )
+            monkeypatch.setattr("kiro_crew.auth.bridge.vault_holds_identity", lambda: vault_holds)
             monkeypatch.setattr(
                 "kiro_crew.auth.bridge.describe_vault_identity", lambda: vault_detail
             )
@@ -1400,17 +1479,13 @@ class TestDoctorAgentAuth:
         # The kiro row is untouched: it still reports the host store's own state.
         assert "✅ kiro-cli's own sign-in" in out
 
-    def test_a_vault_owned_row_alone_consumes_no_kiro_cli_probe(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_a_vault_owned_row_alone_consumes_no_kiro_cli_probe(self, monkeypatch, capsys) -> None:
         """The vault verdict is the row's whole answer, so with no other host-store
         row on the board the kiro-cli probe never runs at all -- and a store that
         was never measured must not be claimed present, so the secondary-detail
         line stays absent too. With no detail line to affirm health the glyph is
         the row's "could not check" marker, never a green asserted from silence."""
-        out, probes = self._run(
-            monkeypatch, capsys, ["kas"], signed_in=True, vault_holds=True
-        )
+        out, probes = self._run(monkeypatch, capsys, ["kas"], signed_in=True, vault_holds=True)
         assert probes == 0
         assert "⚠️  Kiro Crew vault (signed in through Kiro Crew)" in out
         assert "✅ Kiro Crew vault" not in out
@@ -1418,9 +1493,7 @@ class TestDoctorAgentAuth:
         # kiro-cli's store here, so nothing may be asserted about it.
         assert "also present" not in out
 
-    def test_a_rejected_refresh_vault_owner_is_not_a_green_row(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_a_rejected_refresh_vault_owner_is_not_a_green_row(self, monkeypatch, capsys) -> None:
         """The vault still OWNS the spawn when the issuer has rejected its refresh
         token (``is_usable`` cannot know that without a network call), but the
         glyph column is what an operator scans -- a ✅ above a detail line whose
@@ -1446,9 +1519,7 @@ class TestDoctorAgentAuth:
         for word in detail.split():
             assert word in out, word
 
-    def test_both_stores_holding_reports_the_second_store_too(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_both_stores_holding_reports_the_second_store_too(self, monkeypatch, capsys) -> None:
         """The two stores can hold DIFFERENT accounts. The vault owns the spawn,
         but a row that silently dropped kiro-cli's own sign-in would trade one
         wrong report for another -- so it is reported as secondary detail, and
@@ -1465,14 +1536,10 @@ class TestDoctorAgentAuth:
         assert "also present and may be a different account" in out
         assert "the relay uses the vault" in out
 
-    def test_vault_not_holding_falls_back_to_the_kiro_cli_row(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_vault_not_holding_falls_back_to_the_kiro_cli_row(self, monkeypatch, capsys) -> None:
         """An empty vault leaves the row exactly as it was: kiro-cli's store is
         the runtime's fallback owner, probed once."""
-        out, probes = self._run(
-            monkeypatch, capsys, ["kas"], signed_in=True, vault_holds=False
-        )
+        out, probes = self._run(monkeypatch, capsys, ["kas"], signed_in=True, vault_holds=False)
         assert probes == 1
         assert "✅ kiro-cli's own sign-in" in out
         assert "Kiro Crew vault" not in out
@@ -1531,6 +1598,21 @@ class TestDoctorKas:
     def _patch_cfg(self, monkeypatch, backend: str) -> None:
         monkeypatch.setattr(
             cli_doctor.KiroCrewConfig, "load", classmethod(lambda cls: self._Cfg(backend))
+        )
+
+    @pytest.fixture(autouse=True)
+    def _accepting_cli(self, monkeypatch):
+        """Pin the installed kiro-cli to one that accepts the spec ``permissions``
+        field, so the cases here stay about the relay and the engine.
+
+        Unpinned, the new auto-approve row would spawn the test host's own
+        kiro-cli -- absent on CI, which reads as refusing and appends an issue the
+        engine cases do not expect.
+        """
+        monkeypatch.setattr(
+            cli_doctor,
+            "installed_kiro_cli_version",
+            lambda: cli_doctor.SPEC_PERMISSIONS_MIN_VERSION,
         )
 
     def _patch_vault(self, monkeypatch, holds: bool = False, detail: str | None = None) -> None:
@@ -1649,9 +1731,7 @@ class TestDoctorKas:
         assert "does not offer engine v3" in out
         assert any("does not support the KAS engine" in i for i in issues)
 
-    def test_help_without_the_flag_is_a_failure_not_unknown(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_help_without_the_flag_is_a_failure_not_unknown(self, monkeypatch, capsys) -> None:
         """A kiro-cli predating engine selection must FAIL the check.
 
         Reporting it as "unknown" would let a configuration that cannot work
@@ -1672,9 +1752,7 @@ class TestDoctorKas:
         assert "engine support unknown" not in out
         assert any("too old to select the KAS engine" in i for i in issues)
 
-    def test_unreadable_help_is_reported_unknown_not_failed(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_unreadable_help_is_reported_unknown_not_failed(self, monkeypatch, capsys) -> None:
         """Only a FAILED probe is unknown; a diagnostic must not invent a verdict.
 
         ``None`` now means the subprocess did not run, which is the one case
@@ -1690,9 +1768,7 @@ class TestDoctorKas:
         assert "engine support unknown" in out
         assert issues == []
 
-    def test_probe_returns_help_text_even_without_the_flag(
-        self, monkeypatch
-    ) -> None:
+    def test_probe_returns_help_text_even_without_the_flag(self, monkeypatch) -> None:
         """The probe must not swallow ran-but-lacks-the-flag into None.
 
         Pins the split directly: the previous implementation returned None for
@@ -1747,6 +1823,101 @@ class TestDoctorKas:
         assert host_auth.entitlement_label("kas") in out
         assert host_auth.ENTITLEMENT_HOST_IDENTITY_STORE not in out
         assert not hasattr(cli_doctor, "_kas_version_label")
+
+
+class TestTheKasBlockReportsAWithheldPermissionsField:
+    """The one place a withheld KAS auto-approve is visible.
+
+    The spec ``permissions`` block is how Crew's auto-approve list reaches KAS's
+    policy engine, and ``agent.py`` writes it only when the installed kiro-cli
+    accepts the field: an older release validates specs with
+    ``deny_unknown_fields``, so the key would make the whole spec unreadable and
+    drop every Crew MCP server. Withholding it is the smaller loss but still a
+    loss, so it is reported -- and only here, because it costs nothing until KAS
+    is the selected backend.
+    """
+
+    def _run(
+        self, monkeypatch, capsys, version, *, help_probe_fails: bool = False
+    ) -> tuple[str, list[str]]:
+        monkeypatch.setattr(
+            cli_doctor.KiroCrewConfig,
+            "load",
+            classmethod(
+                lambda cls: type("C", (), {"agent": type("A", (), {"acp_backend": "kas"})()})()
+            ),
+        )
+        monkeypatch.setattr(cli_doctor, "resolve_kiro_cli", lambda: "/x/kiro-cli")
+        # A help text the engine probe is satisfied by, so the only issue any case
+        # here can append is the one the auto-approve row is responsible for.
+        # ``help_probe_fails`` swaps in the FAILED probe (``None``) instead.
+        help_text = (
+            None if help_probe_fails else f"--agent-engine <ENGINE>  {cli_doctor.KAS_RELAY_ENGINE}"
+        )
+        monkeypatch.setattr(cli_doctor, "_kas_relay_help", lambda _binary: help_text)
+        monkeypatch.setattr("kiro_crew.auth.bridge.vault_holds_identity", lambda: False)
+        monkeypatch.setattr("kiro_crew.auth.bridge.describe_vault_identity", lambda: None)
+        monkeypatch.setattr(cli_doctor, "installed_kiro_cli_version", lambda: version)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        return capsys.readouterr().out, issues
+
+    def test_an_accepting_cli_reports_the_block_as_written(self, monkeypatch, capsys) -> None:
+        out, issues = self._run(monkeypatch, capsys, cli_doctor.SPEC_PERMISSIONS_MIN_VERSION)
+        assert "auto-approve: ✅" in out
+        assert issues == []
+
+    def test_a_refusing_cli_names_the_version_and_the_floor(self, monkeypatch, capsys) -> None:
+        """Both numbers, because the fix is "update past this floor"."""
+        floor = cli_doctor.SPEC_PERMISSIONS_MIN_VERSION
+        out, issues = self._run(monkeypatch, capsys, (floor[0], floor[1] - 1, 0))
+        assert "auto-approve: ❌" in out
+        assert f"{floor[0]}.{floor[1] - 1}.0" in out
+        assert ".".join(str(part) for part in floor) in out
+        assert "kiro-cli is too old to carry the KAS `permissions` block" in issues
+
+    def test_an_unknown_version_is_its_own_row_and_names_the_pin_remedy(
+        self, monkeypatch, capsys
+    ) -> None:
+        """Unknown is not "too old": the writer withholds a NEW block but keeps one
+        already on disk, and the remedy is a probeable binary, not an update."""
+        out, issues = self._run(monkeypatch, capsys, None)
+        assert "auto-approve: ⚠️" in out
+        assert "version unknown" in out
+        assert cli_doctor.PATH_ONLY_INSTALL_NOTE in out
+        assert "already on disk is kept" in out
+        assert "update kiro-cli" not in out
+        assert issues == ["kiro-cli version unknown, so the KAS `permissions` block is not seeded"]
+
+    def test_a_failed_help_probe_does_not_swallow_the_row(self, monkeypatch, capsys) -> None:
+        """``acp --help`` failing says nothing about ``--version``.
+
+        The engine rows return early when their probe fails; this row must not
+        ride on that return, or a withheld auto-approve is hidden on exactly the
+        host where kiro-cli is misbehaving.
+        """
+        floor = cli_doctor.SPEC_PERMISSIONS_MIN_VERSION
+        out, issues = self._run(
+            monkeypatch, capsys, (floor[0], floor[1] - 1, 0), help_probe_fails=True
+        )
+        assert "engine support unknown" in out
+        assert "auto-approve: ❌" in out
+        assert issues == ["kiro-cli is too old to carry the KAS `permissions` block"]
+
+    def test_the_row_is_silent_when_kas_is_not_the_backend(self, monkeypatch, capsys) -> None:
+        """A kiro-cli or Claude Code install loses nothing, so it hears nothing."""
+        monkeypatch.setattr(
+            cli_doctor.KiroCrewConfig,
+            "load",
+            classmethod(
+                lambda cls: type("C", (), {"agent": type("A", (), {"acp_backend": ""})()})()
+            ),
+        )
+        monkeypatch.setattr(cli_doctor, "installed_kiro_cli_version", lambda: None)
+        issues: list[str] = []
+        cli_doctor._doctor_kas(issues)
+        assert "auto-approve:" not in capsys.readouterr().out
+        assert issues == []
 
 
 class TestPathLauncherOwnership:
@@ -2058,11 +2229,7 @@ class TestSourceCheckout:
 
         def fake_run(argv, *a, **k):
             errors = k.get("errors")
-            stdout = (
-                raw.decode("utf-8", errors=errors)
-                if errors
-                else raw.decode("utf-8")
-            )
+            stdout = raw.decode("utf-8", errors=errors) if errors else raw.decode("utf-8")
             return _sp.CompletedProcess(argv, 0, stdout=stdout, stderr="")
 
         monkeypatch.setattr(
@@ -2072,9 +2239,7 @@ class TestSourceCheckout:
         line = cli_doctor._git_line(tmp_path, "rev-parse", "--abbrev-ref", "HEAD")
         assert line == "exp\ufffdrimental"
 
-    def test_git_line_pins_git_and_returns_none_when_untrusted(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_git_line_pins_git_and_returns_none_when_untrusted(self, monkeypatch, tmp_path) -> None:
         """git resolves via trusted_git_bin; a miss means no subprocess at all.
 
         Doctor runs with operator privileges, so a ``git`` shim planted in an
@@ -2103,9 +2268,7 @@ class TestSourceCheckout:
         assert calls == []
 
         # Hit: the resolved absolute path is argv[0], never the bare "git".
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_git_bin", lambda: "/usr/bin/git"
-        )
+        monkeypatch.setattr(cli_doctor.platform_compat, "trusted_git_bin", lambda: "/usr/bin/git")
         assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") == "main"
         assert calls and calls[0][0] == "/usr/bin/git"
 
@@ -2252,9 +2415,7 @@ class TestCliInstallerResidue:
     def test_uncapped_size_is_not_marked_as_a_floor(self, monkeypatch, capsys) -> None:
         # Below the cap the scan saw everything, so the figure is exact and must
         # NOT be hedged -- otherwise every host reads as approximate.
-        monkeypatch.setattr(
-            cli_doctor, "_scan_cli_installer_residue", lambda _d: (4, 4 * 1048576)
-        )
+        monkeypatch.setattr(cli_doctor, "_scan_cli_installer_residue", lambda _d: (4, 4 * 1048576))
         issues: list[str] = []
         cli_doctor._doctor_cli_installer_residue(issues)
         out = capsys.readouterr().out
@@ -2291,9 +2452,9 @@ class TestEffectiveModelSection:
 
         agents_dir = kiro_agents_dir()
         # Fail loudly rather than write into a real home if the override lapses.
-        assert self._tmp in agents_dir.parents or agents_dir.is_relative_to(self._tmp), (
-            f"KIRO_HOME isolation failed: {agents_dir} is outside {self._tmp}"
-        )
+        assert self._tmp in agents_dir.parents or agents_dir.is_relative_to(
+            self._tmp
+        ), f"KIRO_HOME isolation failed: {agents_dir} is outside {self._tmp}"
         agents_dir.mkdir(parents=True, exist_ok=True)
         return agents_dir
 
@@ -2424,21 +2585,21 @@ class TestEffectiveModelSection:
         and printed a reset command for the wrong agent."""
         self._install_spec(None)
         agents_dir = self._agents_dir()
-        (agents_dir / "custom-agent.json").write_text(
-            json.dumps({"name": "custom-agent", "model": "claude-opus-4.8"}), encoding="utf-8"
+        (agents_dir / "custom.agent.json").write_text(
+            json.dumps({"name": "custom.agent", "model": "claude-opus-4.8"}), encoding="utf-8"
         )
-        cfg = self._bind_custom_agent(self._cfg("auto"), "custom-agent")
+        cfg = self._bind_custom_agent(self._cfg("auto"), "custom.agent")
         issues: list[str] = []
 
         cli_doctor._doctor_effective_model(cfg, "", issues)
 
         out = capsys.readouterr().out
         assert "effective:   'claude-opus-4.8'" in out
-        assert "decided by:  bound agent pin ('custom-agent')" in out
+        assert "decided by:  bound agent pin ('custom.agent')" in out
         # The repair must name the agent that actually holds the pin.
-        assert "kirocrew agent reset-model --agent 'custom-agent'" in out
+        assert "kirocrew agent reset-model --agent 'custom.agent'" in out
         # And the tier the resolver skipped for the built-in agent is shown here.
-        assert "bound agent pin ('custom-agent'):" in out
+        assert "bound agent pin ('custom.agent'):" in out
         assert "out of date" not in out, "report must agree with the resolver"
         assert issues == []
 
@@ -2581,7 +2742,12 @@ class TestEffectiveModelSection:
         target = self._tmp / "protected.json"
         target.write_text(json.dumps({"model": "leaked-value"}), encoding="utf-8")
         (agents_dir / AGENT_FILENAME).symlink_to(target)
-        monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+        # The reader asks is_sensitive_canonical_path about the RESOLVED target
+        # (is_sensitive_path in agent_discovery gates only the project dir and
+        # the list_agents cache key), so the refusal is injected at that name.
+        monkeypatch.setattr(
+            agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+        )
         issues: list[str] = []
 
         cli_doctor._doctor_effective_model(self._cfg("auto"), "", issues)
@@ -2652,11 +2818,11 @@ class TestEffectiveModelSection:
         hostile = Path("/tmp/proj/.kiro/agents/kirocrew\x1b[2J.json")
         self._install_spec(None)
         real_reader = cli_doctor._read_agent_spec
-        monkeypatch.setattr(cli_doctor, "project_agent_files", lambda d: [hostile])
+        monkeypatch.setattr(cli_doctor, "project_agent_files", lambda d, **kw: [hostile])
         monkeypatch.setattr(cli_doctor, "project_agent_name", lambda p: "kirocrew")
         # Only the injected path is faked; the user-level spec still goes through
         # the real reader so the report's own self-check is not disturbed. The
-        # stub forwards **kw because the reader takes keyword-only SEL
+        # scan and reader stubs forward **kw because both take keyword-only SEL
         # attribution labels that this test does not care about.
         monkeypatch.setattr(
             cli_doctor,
@@ -2743,9 +2909,7 @@ class TestWhatsAppSection:
 
     @staticmethod
     def _extra(monkeypatch, present: bool) -> None:
-        monkeypatch.setattr(
-            "kiro_crew.whatsapp.client.neonize_available", lambda: present
-        )
+        monkeypatch.setattr("kiro_crew.whatsapp.client.neonize_available", lambda: present)
 
     @staticmethod
     def _pair(home: Path) -> Path:
@@ -2820,7 +2984,7 @@ class TestWhatsAppSection:
 
         out = capsys.readouterr().out
         assert "not paired yet" in out
-        assert "Settings → Channels" in out
+        assert "Settings → Messaging Channels" in out
         assert issues == [], "an unpaired channel must not fail the preflight"
 
     def test_the_reported_store_is_the_path_the_gateway_opens(
@@ -2837,9 +3001,7 @@ class TestWhatsAppSection:
 
         assert str(default_db_path(home)) in capsys.readouterr().out
 
-    def test_the_check_never_imports_neonize(
-        self, home: Path, monkeypatch, capsys
-    ) -> None:
+    def test_the_check_never_imports_neonize(self, home: Path, monkeypatch, capsys) -> None:
         """The whole point of the ``find_spec`` probe: importing neonize loads a
         ~19 MB ctypes CDLL plus protobuf descriptors, and a health check must not
         pay that (or construct a client as a side effect of asking a question).
@@ -2897,6 +3059,189 @@ class TestWhatsAppSection:
 
         source = inspect.getsource(cli_doctor._doctor)
         assert "_doctor_whatsapp(cfg, issues)" in source
+
+
+def _report_source() -> str:
+    """The source of every function that prints a row of the doctor report.
+
+    The orchestrator plus each ``kiro_crew.doctor_checks`` family, so an invariant
+    asserted over the report holds wherever a section lives.
+    """
+    import importlib
+    import inspect
+    import pkgutil
+
+    from kiro_crew import doctor_checks
+
+    families = [
+        importlib.import_module(f"{doctor_checks.__name__}.{info.name}")
+        for info in pkgutil.iter_modules(doctor_checks.__path__)
+    ]
+    return "\n".join(
+        [inspect.getsource(cli_doctor._doctor)] + [inspect.getsource(m) for m in families]
+    )
+
+
+#: The install-channel guard, spelled bare in the orchestrator and through the
+#: facade in a family module.
+_CHANNEL_GUARD = re.compile(r"if (cli_doctor\.)?pip_install_channel_available\(\):")
+
+
+def _line_above(lines: list[str], index: int) -> str:
+    """The statement line above *index*, stepping over a wrapped ``print(`` opener."""
+    above = index - 1
+    while lines[above].strip() == "print(":
+        above -= 1
+    return lines[above]
+
+
+class TestFaissHint:
+    """The absent-faiss advice has to name the interpreter that would import it.
+
+    A bare ``pip install faiss-cpu`` resolves to whatever ``pip`` the user's
+    PATH offers, which on a packaged or minimal install is not the gateway's
+    python -- so the wheel lands where this process never imports from, and the
+    next doctor run prints the identical line with nothing saying the install
+    missed. The command itself is rendered by
+    ``extras.pip_install_command_for``, tested directly in ``test_extras.py``;
+    what is guarded here is that doctor calls it instead of embedding a literal.
+    ``_doctor()`` spawns subprocesses, probes the network and calls ``sys.exit``,
+    so its source is read rather than run -- the same approach the WhatsApp
+    call-site guard above takes.
+    """
+
+    def _source(self) -> str:
+        return _report_source()
+
+    def test_the_hint_is_rendered_for_this_interpreter(self) -> None:
+        assert "pip_install_command_for('faiss-cpu')" in self._source()
+
+    def test_no_bare_pip_command_is_printed(self) -> None:
+        """The literal this section replaced. Kept as its own assertion because a
+        re-added bare form would sit happily beside the correct call."""
+        assert "`pip install faiss-cpu`" not in self._source()
+
+    def test_the_renderer_names_the_running_interpreter(self) -> None:
+        """Ties the call site to real output: whatever doctor prints for that
+        call carries this process's own interpreter."""
+        assert sys.executable in extras.pip_install_command_for("faiss-cpu")
+
+    def test_the_command_is_printed_only_where_it_can_run(self) -> None:
+        """The command names the gateway's own interpreter, so on the bundled
+        desktop build running it would write into the code-signed bundle, break
+        later launches and be discarded on the next app update. Naming it there
+        is worse than naming nothing, which is what the dashboard's own install
+        card does in the same state."""
+        source = self._source()
+        call = source.index("pip_install_command_for('faiss-cpu')")
+        guards = [m.start() for m in _CHANNEL_GUARD.finditer(source)]
+
+        assert guards, "the render must sit inside the guard, not beside it"
+        assert min(guards) < call, "the render must sit inside the guard, not beside it"
+
+    def test_the_bundled_interpreter_yields_no_install_channel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The behavioural half of the guard above, so the two cannot drift."""
+        monkeypatch.setattr(extras.platform_compat, "is_bundled_interpreter", lambda: True)
+
+        assert cli_doctor.pip_install_channel_available() is False
+
+
+class TestVoiceAwsHint:
+    """The optional AWS voice packages need the same treatment as faiss.
+
+    ``_doctor`` imports ``amazon_transcribe`` and ``boto3`` in this process, so a
+    bare ``pip install`` on those two lines misses for exactly the reason it
+    missed for faiss: it resolves to whatever ``pip`` the user's PATH offers, and
+    the wheel lands where this process never imports from. ``install_hint``'s own
+    docstring reserves the bare form for output "where the surrounding text
+    already says which environment is meant" and routes the copied-blind case to
+    ``pip_install_command`` -- which is what a doctor ``Install:`` line is.
+    """
+
+    def _source(self) -> str:
+        return _report_source()
+
+    def test_both_voice_aws_lines_name_this_interpreter(self) -> None:
+        assert self._source().count("pip_install_command('voice-aws')") == 2
+
+    def test_no_bare_install_hint_remains_in_doctor(self) -> None:
+        """The form these two lines replaced. Asserted across the whole function,
+        so a re-added bare hint anywhere in doctor fails here rather than only at
+        the two sites this change touched."""
+        assert "install_hint(" not in self._source()
+
+    def test_the_renderer_names_the_running_interpreter(self) -> None:
+        """Ties the call sites to real output: voice-aws is a declared extra, so
+        the existing ``pip_install_command`` renders it."""
+        assert sys.executable in extras.pip_install_command("voice-aws")
+
+    def test_each_line_is_printed_only_where_it_can_run(self) -> None:
+        """Same bundled-interpreter hazard as the faiss line: naming the gateway's
+        interpreter there would write into the code-signed bundle. Both renders
+        must sit inside the guard, not beside it."""
+        lines = self._source().splitlines()
+        renders = [i for i, ln in enumerate(lines) if "pip_install_command('voice-aws')" in ln]
+
+        assert len(renders) == 2
+        for index in renders:
+            assert _CHANNEL_GUARD.search(_line_above(lines, index))
+
+
+class TestDoctorPrintsNoBareInstallCommand:
+    """The invariant, asserted once over the whole function.
+
+    Every install command ``_doctor`` prints is for a module THIS process
+    imports, so a bare ``pip`` can resolve to an interpreter the gateway never
+    imports from, and the wheel lands out of reach. A per-site guard says
+    nothing about a site that does not exist yet, so the property is asserted
+    over the whole function instead: any printed line carrying a bare
+    ``pip install`` fails here.
+    """
+
+    def _source(self) -> str:
+        return _report_source()
+
+    def test_no_printed_line_carries_a_bare_pip_install(self) -> None:
+        """Scoped to printed lines, so the surrounding code comments that mention
+        ``pip install -e`` in prose stay legal."""
+        offenders = [
+            line.strip()
+            for line in self._source().splitlines()
+            if "print(" in line and "pip install" in line
+        ]
+
+        assert offenders == []
+
+    def test_the_editable_install_fix_names_this_interpreter_and_is_gated(self) -> None:
+        lines = self._source().splitlines()
+        renders = [i for i, ln in enumerate(lines) if "pip_install_command_for('-e', '.')" in ln]
+
+        assert len(renders) == 1
+        assert _CHANNEL_GUARD.search(_line_above(lines, renders[0]))
+
+    def test_the_fts5_fix_names_this_interpreter_and_is_gated(self) -> None:
+        lines = self._source().splitlines()
+        renders = [
+            i for i, ln in enumerate(lines) if "pip_install_command_for('pysqlite3-binary')" in ln
+        ]
+
+        assert len(renders) == 1
+        assert _CHANNEL_GUARD.search(_line_above(lines, renders[0]))
+
+    def test_the_fts5_alternative_survives_the_gate(self) -> None:
+        """The one place gating must NOT hide the whole message. Where pip cannot
+        run, using a different Python is the only remaining fix, so that sentence
+        has to print in exactly the case the command is withheld. Checked by
+        indentation: the alternative sits outside the ``if``, not inside it."""
+        alternatives = [
+            ln
+            for ln in self._source().splitlines()
+            if "Or use a Python whose SQLite" in ln and ln.startswith(" " * 12 + "print(")
+        ]
+
+        assert len(alternatives) == 1, "the fts5 alternative must print unconditionally"
 
 
 class TestVenvDepsProbe:
@@ -3029,7 +3374,7 @@ class TestCronHealth:
         return path
 
     def _run(self, monkeypatch, tmp_path: Path) -> list[str]:
-        # The scan lives in cron.py (single owner of the pause predicates), so
+        # The scan lives in cron.py (pause predicates: cron_service/store.py), so
         # the data home is patched THERE; doctor is only the presentation half.
         monkeypatch.setattr(cron, "config_dir", lambda: tmp_path)
         issues: list[str] = []
@@ -3336,9 +3681,7 @@ class TestCronHealth:
         # loadability puts it in the auto-paused bucket, so doctor advises
         # `cron resume` for a job that does not exist and the unloadable-store
         # report never fires. The store is the fault; the phantom job is not.
-        (tmp_path / "crons.json").write_text(
-            '{"jobs": [{"auto_paused": true}]}', encoding="utf-8"
-        )
+        (tmp_path / "crons.json").write_text('{"jobs": [{"auto_paused": true}]}', encoding="utf-8")
 
         issues = self._run(monkeypatch, tmp_path)
 
@@ -3504,7 +3847,10 @@ class TestProjectSectionAndAuthRow:
         out = self._run_doctor(tmp_path, monkeypatch, capsys, project_dir="")
         assert "no token required" not in out
         assert "loopback trusted" not in out
-        assert "auth:        token required — loopback is not exempt (CLI/MCP use the local secret)" in out
+        assert (
+            "auth:        token required — loopback is not exempt (CLI/MCP use the local secret)"
+            in out
+        )
 
     def test_auth_row_claim_is_grounded_in_the_middleware(self) -> None:
         # The row's claim is prose; this pins it to production code so a
@@ -3531,7 +3877,9 @@ class TestNameGrantPlatformScopeRow:
         from kiro_crew import name_grant
 
         monkeypatch.setattr(name_grant.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(name_grant.platform_compat, "windows_powershell_profile_paths", lambda: None)
+        monkeypatch.setattr(
+            name_grant.platform_compat, "windows_powershell_profile_paths", lambda: None
+        )
         cli_doctor._doctor_name_grant_platform_scope()
         out = capsys.readouterr().out
         # The code is what a reader greps `gateway.log` for.
@@ -3624,3 +3972,365 @@ class TestNameGrantPlatformScopeRow:
 
         params = inspect.signature(cli_doctor._doctor_name_grant_platform_scope).parameters
         assert not params
+
+
+class TestDoctorSkillViewCensus:
+    """The Agents Directory section counts the ``kirocrew-skill-view-*`` aliases.
+
+    The projection publishes one alias per distinct agent view into the shared
+    kiro agents directory -- spawns of the same agent share one file -- and
+    kiro-cli reads every file there on startup. Before
+    the lease-based reclaim the directory grew without bound (28k files / 580 MB
+    on one host; ``EMFILE`` on another), and the only way to see it was ``ls``.
+    Doctor reports the census read-only: how many aliases exist, how many a
+    lease record names, which share this gateway's reclaim covers, and a
+    warning once the count is past the point where startup cost is measurable.
+    """
+
+    PREFIX = "kirocrew-skill-view-"
+
+    @staticmethod
+    def _home(tmp_path: Path) -> Path:
+        # Spelled through ``.absolute().as_posix()`` like the publisher does, so
+        # the test does not depend on how the platform absolutises a bare "/x".
+        return tmp_path / "crew-home"
+
+    @classmethod
+    def _alias(cls, directory: Path, index: int, *, home: str | None) -> str:
+        stem = f"{cls.PREFIX}{index:024x}"
+        (directory / f"{stem}.json").write_text('{"name": "%s"}' % stem)
+        if home is not None:
+            metadata_dir = directory / ".kirocrew-skill-projection-metadata"
+            metadata_dir.mkdir(exist_ok=True)
+            (metadata_dir / f"{stem}.json").write_text(
+                json.dumps({"x-kirocrew-managed": "skill-view", "x-kirocrew-home": home})
+            )
+        return stem
+
+    def _own(self, tmp_path: Path, index: int) -> str:
+        return self._alias(tmp_path, index, home=self._home(tmp_path).absolute().as_posix())
+
+    @staticmethod
+    def _lease(directory: Path, stems: list[str], name: str = "1-abc") -> None:
+        lease_dir = directory / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir(exist_ok=True)
+        (lease_dir / f"{name}.json").write_text(json.dumps({"aliases": stems}))
+        (lease_dir / f"{name}.hold").write_text("")
+
+    def _run(self, tmp_path: Path, monkeypatch, capsys) -> str:
+        from kiro_crew.acp import skill_projection
+
+        monkeypatch.setattr(cli_doctor, "KIRO_AGENTS_DIR", tmp_path)
+        # The census resolves the data home itself, spelled as the publisher
+        # spells it, so the doctor cannot hand it a differently normalised id.
+        monkeypatch.setattr(skill_projection, "data_home", lambda: self._home(tmp_path))
+        cli_doctor._doctor_agents_janitor([], sweep_backups=False)
+        return capsys.readouterr().out
+
+    @staticmethod
+    def _line(out: str) -> str:
+        return out.split("skill views:", 1)[1]
+
+    def test_an_empty_directory_reports_zero_aliases(self, tmp_path, monkeypatch, capsys):
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ✅ 0 kirocrew-skill-view-*.json alias(es)" in out
+
+    def test_live_and_unreferenced_aliases_are_counted_separately(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        live = [self._own(tmp_path, i) for i in range(3)]
+        for i in range(3, 8):
+            self._own(tmp_path, i)
+        self._lease(tmp_path, live)
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ✅ 8 kirocrew-skill-view-*.json alias(es)" in out
+        assert "(3 named by a lease record, 5 not)" in out
+        assert "⚠️" not in self._line(out)
+
+    def test_the_threshold_is_the_real_one_and_exclusive(self, tmp_path, monkeypatch, capsys):
+        # Exactly the production threshold is still green; one more warns. No
+        # monkeypatched constant, so the 2,000 the docs claim is what is measured.
+        limit = cli_doctor._SKILL_VIEW_BACKLOG_WARN
+        assert limit == 2000
+        for i in range(limit):
+            self._alias(tmp_path, i, home=None)
+        assert "skill views: ✅" in self._run(tmp_path, monkeypatch, capsys)
+        self._alias(tmp_path, limit, home=None)
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ⚠️" in out
+        assert f"{limit + 1} kirocrew-skill-view-*.json alias(es)" in out
+
+    def test_a_backlog_this_home_owns_names_its_share_and_the_remedy_is_a_move(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 5)
+        for i in range(6):
+            self._own(tmp_path, i)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "⚠️" in line
+        assert "reclaims a bounded number of the 6 this home owns" in line
+        assert "gateway stopped" in line
+        assert "move" in line
+        # Advice the doctor prints is text an operator acts on: it must never
+        # suggest deleting a file whose author the doctor cannot prove.
+        assert "delete them" not in line
+        assert "removed" not in line
+        # No lease, no foreign home: neither caveat is printed.
+        assert "Lease-named" not in line
+        assert "another Kiro Crew home" not in line
+
+    def test_a_backlog_another_home_owns_is_named_as_not_draining_here(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 3)
+        for i in range(4):
+            self._alias(tmp_path, i, home="/some/other/home")
+        self._own(tmp_path, 4)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "(0 named by a lease record, 5 not, 4 owned by another Kiro Crew home)" in line
+        assert "reclaims a bounded number of the 1 this home owns" in line
+        assert "The 4 another Kiro Crew home owns never drain here" in line
+        # A second home shares this directory, so the remedy must stop BOTH
+        # gateways, not only the one this doctor speaks for.
+        assert "with every gateway that uses this agents directory stopped" in line
+        assert "with the gateway stopped" not in line
+
+    def test_another_homes_leased_aliases_are_not_called_held_or_crash_stale(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # The other home's live sessions hold leases in this shared directory.
+        # This gateway's reclaim refuses those aliases unconditionally, so they
+        # are neither "kept while held" nor "reclaimed on the next spawn" here.
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 2)
+        theirs = [self._alias(tmp_path, i, home="/some/other/home") for i in range(3)]
+        self._lease(tmp_path, theirs)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "(3 named by a lease record, 0 not, 3 owned by another Kiro Crew home)" in line
+        assert "crash-stale" not in line
+        assert "The 3 another Kiro Crew home owns never drain here" in line
+
+    def test_lease_named_aliases_are_described_as_held_not_as_never_draining(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # A crash-stale but readable lease names aliases the next spawn will
+        # reclaim; the census cannot tell it from a held one without probing
+        # the lock, so the text says "while held", never "will not drain".
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 2)
+        stems = [self._own(tmp_path, i) for i in range(3)]
+        self._lease(tmp_path, stems)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "(3 named by a lease record, 0 not)" in line
+        assert "This home's lease-named aliases are kept while their lease is held" in line
+        assert "a crash-stale lease is reclaimed on the next spawn" in line
+        assert "will not drain" not in line
+
+    def test_an_unreadable_lease_record_withdraws_the_drain_promise(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # The reclaim reads a malformed record as uncertainty and keeps EVERY
+        # alias while it exists, so the census must say so even below the
+        # backlog threshold -- and, below it, say nothing about startup cost.
+        self._own(tmp_path, 1)
+        self._own(tmp_path, 2)
+        lease_dir = tmp_path / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir()
+        (lease_dir / "1-bad.json").write_text("{not json")
+        (lease_dir / "1-big.json").write_text(json.dumps({"aliases": ["x" * 70000]}))
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "⚠️  2 kirocrew-skill-view-*.json alias(es)" in line
+        assert "(0 named by a lease record, 2 not)" in line
+        assert "2 lease record(s)" in line and "cannot be read" in line
+        assert "slows every session start" not in line
+        assert "reclaims a bounded number" not in line
+
+    def test_an_unreadable_lease_above_the_threshold_denies_the_drain(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 1)
+        for i in range(3):
+            self._own(tmp_path, i)
+        lease_dir = tmp_path / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir()
+        (lease_dir / "1-bad.json").write_text("?")
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "Nothing is reclaimed until the unreadable lease record(s) above are gone." in line
+        assert "reclaims a bounded number" not in line
+        assert "gateway stopped" in line
+
+    def test_a_truncated_census_is_reported_as_floors_without_derived_counts(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from kiro_crew.acp import skill_projection
+
+        monkeypatch.setattr(skill_projection, "_CENSUS_MAX_ALIASES", 3)
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 2)
+        for i in range(5):
+            self._own(tmp_path, i)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "3+ kirocrew-skill-view-*.json alias(es) (0+ named by a lease record)" in line
+        assert "floors: the census stopped at its retention bound" in line
+        # `total - leased` is neither a floor nor a ceiling once a bound was hit,
+        # so no derived number is printed or promised.
+        assert " not" not in line.split(")", 1)[0]
+        assert "Unscanned lease records leave reclaimability unknown" in line
+        assert "of the 3" not in line
+        assert "On every spawn the gateway reclaims" not in line
+
+    def test_a_pathologically_nested_sidecar_or_lease_does_not_abort_the_doctor(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        # json.loads raises RecursionError (a RuntimeError) on nesting past the
+        # interpreter limit; a hand-authored file in Kiro Crew's own hidden
+        # directories must read as unreadable, never take the diagnostic down.
+        deep = "[" * 100000 + "]" * 100000
+        self._own(tmp_path, 1)
+        stem = self._own(tmp_path, 2)
+        (tmp_path / ".kirocrew-skill-projection-metadata" / f"{stem}.json").write_text(deep)
+        lease_dir = tmp_path / ".kirocrew-skill-projection-leases"
+        lease_dir.mkdir()
+        (lease_dir / "1-deep.json").write_text(deep)
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert "2 kirocrew-skill-view-*.json alias(es)" in line
+        assert "1 lease record(s)" in line and "cannot be read" in line
+
+    def test_authored_specs_and_foreign_files_are_not_counted(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / "kirocrew.json").write_text('{"name": "kirocrew"}')
+        (tmp_path / "kirocrew-skill-view-notes.txt").write_text("x")
+        (tmp_path / "kirocrew-skill-view-dir.json").mkdir()
+        self._own(tmp_path, 1)
+        out = self._run(tmp_path, monkeypatch, capsys)
+        assert "skill views: ✅ 1 kirocrew-skill-view-*.json alias(es)" in out
+
+    def test_the_census_never_deletes_anything(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 1)
+        stems = [self._own(tmp_path, i) for i in range(4)]
+        self._lease(tmp_path, stems[:1])
+        (tmp_path / ".kirocrew-skill-projection-leases" / "2-bad.json").write_text("?")
+        before = sorted(p.name for p in tmp_path.rglob("*"))
+        self._run(tmp_path, monkeypatch, capsys)
+        assert sorted(p.name for p in tmp_path.rglob("*")) == before
+
+    def test_the_remedy_names_the_projection_directories_it_means(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from kiro_crew.acp import skill_projection
+
+        monkeypatch.setattr(cli_doctor, "_SKILL_VIEW_BACKLOG_WARN", 1)
+        for i in range(2):
+            self._own(tmp_path, i)
+        (tmp_path / ".kirocrew-skill-projection-leases").mkdir()
+        (tmp_path / ".kirocrew-skill-projection-leases" / "1-bad.json").write_text("?")
+        line = self._line(self._run(tmp_path, monkeypatch, capsys))
+        assert f"{skill_projection._PROJECTION_METADATA_DIR_NAME}/ directory" in line
+        assert f"in {skill_projection._PROJECTION_LEASE_DIR_NAME}/ cannot be read" in line
+
+
+class TestRunDirCensus:
+    """The run-directory census is read-only, down to the workspace root itself.
+
+    ``workspace_root()`` creates the tree it resolves, which is right for a
+    gateway about to spawn into it and wrong for a doctor on a host where no
+    gateway ever ran: the report would leave a workspace behind as its only
+    trace. The doctor resolves without creating and says there is nothing yet.
+    Its two figures come from the sweep's own rule over this home's pid ledger;
+    no pid's liveness is probed.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, capsys, root: Path, retained=frozenset()) -> str:
+        from kiro_crew import session_pid
+
+        monkeypatch.setenv("KIROCREW_WORKSPACE", str(root))
+        monkeypatch.setattr(session_pid, "retained_gateway_pids", lambda: frozenset(retained))
+        cli_doctor._doctor_run_dirs()
+        return capsys.readouterr().out
+
+    @staticmethod
+    def _marked(root: Path, name: str, marker: str) -> Path:
+        from kiro_crew.session_work_dir import RUN_DIR_MARKER
+
+        work_dir = root / name
+        (work_dir / ".kiro" / "settings").mkdir(parents=True)
+        (work_dir / ".kiro" / "settings" / "cli.json").write_text("{}", encoding="utf-8")
+        (work_dir / RUN_DIR_MARKER).write_text(marker, encoding="ascii")
+        return work_dir
+
+    def test_a_workspace_root_that_does_not_exist_is_not_created(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        root = tmp_path / "never-ran" / "kirocrew-workspace"
+        out = self._run(monkeypatch, capsys, root)
+        assert not root.exists(), "the doctor created the workspace tree"
+        assert not root.parent.exists()
+        assert "run dirs:" in out and "no workspace root yet" in out
+
+    def test_both_figures_print_on_one_line_and_nothing_is_removed(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew.session_work_dir import RUN_DIR_MARKER, data_home_id
+
+        root = tmp_path / "ws"
+        legacy = root / "subagent_deadbeef" / ".kiro" / "settings"
+        legacy.mkdir(parents=True)
+        (legacy / "cli.json").write_text("{}", encoding="utf-8")
+        self._marked(root, "subagent_00000001", "f" * 24 + "\n12345")
+        self._marked(root, "subagent_00000002", "garbled")
+        self._marked(root, "subagent_00000003", f"{data_home_id()}\n12345")
+        self._marked(root, "subagent_00000004", f"{data_home_id()}\n23456")
+        before = sorted(p.name for p in root.rglob("*"))
+        out = self._run(monkeypatch, capsys, root, retained={12345})
+        shown = os.path.realpath(root)
+        (line,) = [ln for ln in out.splitlines() if "run dirs:" in ln]
+        assert line.startswith("  run dirs:    ⚠️ ")
+        assert f"under {shown}: 1 run director(ies) carry no {RUN_DIR_MARKER} marker" in line
+        assert "3 marked director(ies) this data home cannot reclaim" in line
+        assert "no workspace root yet" not in out
+        assert sorted(p.name for p in root.rglob("*")) == before
+
+    def test_an_unmarked_backlog_names_the_remedy_and_the_cap_makes_a_floor(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew import session_work_dir
+
+        root = tmp_path / "ws"
+        for n in range(1, 4):
+            (root / f"subagent_{n:08x}" / ".kiro" / "settings").mkdir(parents=True)
+        out = self._run(monkeypatch, capsys, root)
+        assert "✅ under" in out and "3 run director(ies) carry no" in out
+        assert "With the gateway stopped" not in out
+        monkeypatch.setattr(cli_doctor, "_RUN_DIR_BACKLOG_WARN", 2)
+        out = self._run(monkeypatch, capsys, root)
+        assert "⚠️ " in out and "With the gateway stopped, move directories matching" in out
+        original = session_work_dir.count_run_dirs
+        monkeypatch.setattr(
+            session_work_dir,
+            "count_run_dirs",
+            lambda path, **kw: original(path, max_entries=2, **kw),
+        )
+        out = self._run(monkeypatch, capsys, root)
+        assert "2+ run director(ies) carry no" in out and "0+ marked" in out
+
+    def test_a_root_with_nothing_the_sweep_cannot_reclaim_is_clean(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew.session_work_dir import data_home_id
+
+        root = tmp_path / "ws"
+        self._marked(root, "subagent_00000001", f"{data_home_id()}\n12345")
+        out = self._run(monkeypatch, capsys, root)
+        assert "✅ no run directories left behind that the sweep cannot reclaim" in out
+
+    def test_an_unreadable_ledger_skips_the_census(self, tmp_path: Path, monkeypatch, capsys):
+        from kiro_crew import session_pid
+
+        root = tmp_path / "ws"
+        self._marked(root, "subagent_00000001", "garbled")
+        monkeypatch.setenv("KIROCREW_WORKSPACE", str(root))
+        monkeypatch.setattr(
+            session_pid,
+            "retained_gateway_pids",
+            lambda: (_ for _ in ()).throw(OSError("io")),
+        )
+        cli_doctor._doctor_run_dirs()
+        out = capsys.readouterr().out
+        assert "⚠️  the session pid ledger cannot be read; census skipped" in out

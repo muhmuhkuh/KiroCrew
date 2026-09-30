@@ -5,7 +5,8 @@ what can fail a PR, what only reports, and the rule that governs relaxing a
 ratchet. The authoring rules (how to add a catalog key, the `src/i18n/format.ts`
 seam, the glossary) live in the frontend docs under `website/`.
 
-Run the whole chain locally before pushing:
+Run the static and catalog chain locally before pushing (the Vitest-only guards
+and browser render gate run separately, as shown below):
 
 ```bash
 cd website && npm run i18n:check
@@ -17,7 +18,7 @@ cd website && npm run i18n:check
 |---|---|---|
 | `frontend-lint` | Check i18n extraction, key references and plurals | `npm run i18n:check` (the runner below) |
 | `frontend-test` | Unit tests | `npx vitest run --coverage`, which includes the diff-scoped `localeFormatting.test.ts` gates and the catalog duplicate-key guard `duplicateKeys.test.ts` (see below) |
-| `e2e` | i18n render-time gate | `npm run i18n:render` (`scripts/check-i18n-render.mjs --build`) |
+| `e2e` | Run E2E and dedicated memory UI evidence in parallel | `python scripts/ci_e2e_parallel.py`; its `i18n` lane runs `npm --prefix website run i18n:render` (`scripts/check-i18n-render.mjs --build`) |
 
 The render gate lives in the `e2e` job to reuse the Chromium install that job
 already pays for. It needs no gateway, no token and no backend: it serves the
@@ -238,6 +239,28 @@ replace an AST-counted site: improving one of those requires lowering its number
 the same change. Being exact, they break on unrelated drift in main, so expect to
 re-measure when you rebase. If you add a diff-scoped gate covering one of them, it
 may be relaxed.
+
+### The rule covers an inline ceiling too, not just the generated ledger
+
+A `toBeLessThanOrEqual(N)` written straight into a style test is the same shape as a
+ledger entry and is bound by the same rule: it needs a diff-scoped companion over the
+same defect. Without one it is strictly worse than the ledger, because nothing
+re-snapshots it, so the violations pile up silently until the count crosses — and the
+run that finally reds is some unrelated branch's, whose own diff contains nothing to
+fix.
+
+`bnStyle.test.ts`'s numerals ceiling was exactly that, and it collected the bill:
+two values carrying Bengali digits landed in separate PRs, the second crossed the
+ceiling of 8, and the next CI round took **every open pull request's Frontend Tests
+shard red at once**, naming a key none of their authors had touched. The register
+check (§5) in the same file already had the right shape, so the fix was to give the
+numerals rule the same one: the count keeps guarding the inherited catalog, while the
+values the branch itself wrote are held at zero and the failure names the key and its
+owner.
+
+So when you add or relax an inline ceiling, add the `[changed-values]` half in the
+same change. A ceiling with no diff-scoped companion is not a lenient gate, it is a
+gate that bills a stranger.
 
 ## The render-time gate: what a source scan structurally cannot see
 

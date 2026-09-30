@@ -11,6 +11,95 @@ conventions around them (a11y, data fetching, typography) live in
 
 ## Page skeleton
 
+### Dashboard in chat and Crew
+
+Long-run status uses the existing side-panel dock, expansion and narrow-screen
+overlay, not another drawer. In chat, a one-time hint card above the composer
+opens the **Dashboard** tab. It sits in the chat content column like the other
+status bars and carries the Running/Blocked/Approvals summary plus one line
+naming the outcome (“Opens the Dashboard panel. This hint won't show again.”,
+also the button's accessible description); it has no collapse toggle. Once
+clicked it fades out (cut, under reduced motion) and stays dismissed for that
+session (`mc-task-dashboard-dismissed:<slot>`, collected by `storageGc`); the
+panel tab and its + menu are the way back in. Crew reuses its single permanent **Dashboard** tab instead: its compact
+entrance focuses that tab, and its + menu withholds the parallel chat view.
+The existing member publication and task artifacts share a Published view selector, with
+human-readable titles, while retaining their separate renderer sandboxes. A
+pipeline board is one publication, not another product. Visited Crew dashboards
+stay mounted across Notes/Work log switches and panel hiding; a pending member
+thread revalidation hides controls without discarding the last confirmed body.
+The task
+page itself is model-authored HTML and may choose any appropriate responsive
+layout. Host chrome owns scope, current activity, questions and one-shot tool
+approvals. Keep native answer drafts mounted when hiding the panel or switching
+tabs, but unload model-authored iframe documents while inactive to cap resources.
+This does not change the existing Crew protected-template renderer's lifecycle.
+Approval counts and exact session identity stay outside the
+sandboxed page, so a model redesign cannot hide or impersonate those controls.
+The panel keeps its approval count on the Approvals tab; the hint card shows the
+Needs you count until it is dismissed, after which the panel's Questions and
+Approvals tabs carry it.
+
+The Sessions header's three-dot menu offers **All Dashboards**, a standalone
+`/session-dashboards` page with currently open sessions' saved summaries and authored
+dashboards. Native pending questions and approvals appear in a central **Needs
+you** inbox above the summary gallery, with each request labeled by its exact
+session. Approval headings name the requested action, with the secondary session
+name explicitly labeled “From session”. Both the fleet inbox and task panel show
+recorded session context when available, never an invented approval reason.
+Dashboard questions use “Send answer”;
+the shared chat control retains its default label. Unverified requests explain
+that this view cannot verify the request and offer
+Open session, without in-page approval or submission guidance. Native approvals
+carry the host permission-row identity bound to the current request, not just a
+reusable connection ID. Replacements get separate card keys and cannot inherit
+a previous card's submitted or expired state. Snapshots missing this identity
+use the same Open session fallback. Verified approvals
+share a per-request rejection explanation without changing permission mode.
+Successfully responding resolves the same shared request; other views show the result when
+refreshed, not necessarily immediately.
+Summary cards do not repeat these controls. Unavailable inventory shows
+a stale notice rather than an empty-inbox claim. Input-needed sessions appear
+first in the gallery, then blocked and running ones.
+Search and Needs you filter the cards and inbox without discarding answer drafts.
+The filter and inbox count pending requests, not distinct sessions. The
+current page of at most 12 active summaries reads summary/dashboard contents;
+Next sessions and Previous sessions move between pages. Wrappers remain mounted for
+the bounded live inventory (`MAX_LIVE_SLOTS`, 500), preserving published-view
+selection. There are at most 24 iframe documents, including both frame types.
+Each session can have one automatic status frame and one selected saved view.
+The task panel mounts at most twelve status frames. Needs you precedes status
+cards in both surfaces. The explicit **Automatic cards for all sessions** opt-in
+leads with summaries of recent work and next steps. Secondary copy retains the
+default-off state, background model use and shared attempt limits, including
+failures; merely opening the page never starts generation. Each
+frame shows its successful content publication time, separate from host runtime
+state and inventory read freshness. The model may reuse HTML and update only
+text data; host-native answer and approval controls are never inside the frame.
+Automatic-card CSS is parsed in detached CSSOM, never attached to the host.
+Parsed `content`, `list-style`, `list-style-type`, `quotes` and
+`hyphenate-character` declarations are removed,
+including nested rules and keyframes; custom counter styles and rules that
+cannot be inspected are omitted. Inline styles use the same generated-text
+boundary; native quotation and hyphenation cannot consume model-authored strings.
+Ordinary browser quotation and hyphenation defaults remain available.
+Safe layout styles and literal text bindings remain available. If
+isolated parsing fails, the affected model style is omitted, not passed through.
+Saved published views retain their existing CSS behavior. This is a rendering
+restriction, not a claim that the backend cache contains no encoded text.
+This is an explicit fleet view, never a fallback for an unresolved task scope.
+It uses the standard page header and scroll container, with one column narrow
+and two wide, and never generates a summary merely because the page opened.
+Verify at both 320px and 390px: keep native approval targets at least 44px tall
+and the page free of horizontal overflow. Main labels use meaningful names or
+localized numbered session/task labels; opaque IDs remain routing data, not
+headings. The artifact authoring contract asks models for the same readable,
+phone-friendly treatment without prescribing their layout.
+The Crew entry remains **Dashboard**. The agent-authored publication's collapsed
+and expanded chrome says **published view**, including loading and error states.
+
+### Standard page composition
+
 ```tsx
 <>
   <PageHeader title="PageName" subtitle="Short description" />
@@ -217,6 +306,38 @@ arguing with the rule.
 | The nav-drawer swipe contract and `data-owns-swipe` | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
 | Binding a panel's gesture live to its offset | [narrow-viewport.md](narrow-viewport.md#a-panel-that-gains-a-gesture-must-be-bound-live-to-its-offset) |
 | Horizontal insets below the breakpoint, and `Card`'s measured budget | [narrow-viewport.md](narrow-viewport.md#horizontal-insets-below-the-breakpoint) |
+| The phone chat page's single top bar (`topbar-single`), its portal slots and the drawer rail | [narrow-viewport.md](narrow-viewport.md#the-phone-chat-page-has-one-top-bar) |
+
+### The chat transcript scroller and who moves it
+
+The chat transcript is a page's scrolling region like any other, with one
+difference: it is windowed. Only the rows near the viewport are real DOM, and
+spacers stand in for the rest. The hook that does this,
+`website/src/hooks/virtualizer/useVirtualChat.ts`, keeps the reader's position
+through every change to that window, so a host wires it rather than working
+around it.
+
+A host provides the scroller (`scrollerRef`), one `measureRef(index)` element
+per mounted row, the two sentinels at the list ends, and the `offsetBefore` /
+`offsetAfter` spacers. Chrome it renders inside the scroller above the rows (a
+paging bar, a header band) needs nothing extra: the hook measures that leading
+offset itself and carries a bottom-parked reader through it. A host that steers
+toward a row that may not be mounted (the pinned-prompt glide) asks the hook
+through `mountIndex` and `estimateRowTop`. The page keeps `overflow-anchor: auto`
+on the scroller as the browser's own stabiliser. WebKit ships none, so the hook
+carries its own anchors as well.
+
+| What moves the scroller | Owner (`website/src/hooks/virtualizer/`) |
+|---|---|
+| Following the live turn, the jump-to-latest pill, scrolling to a row | `followPolicy.ts` (every write goes through its `writeScrollTop`) |
+| Holding a scrolled-up reader still when rows or heights change above them | `shiftCompensation.ts` |
+| Reopening a session where the reader left it, and re-placing after a hidden tab returns | `readingPosition.ts` |
+| Which rows are mounted as the reader scrolls, and the spacer heights around them | `windowRange.ts` over `measurement.ts` |
+| When a new row height is allowed to move the page | `geometryScheduling.ts` |
+| Listening to the scroller, its rows and its own box | `observers.ts` |
+
+The full owner map is in
+[history](../../docs/system-specs/modules/history.md#the-dashboard-transcript-window-frontend).
 
 ## Stat cards
 
@@ -323,11 +444,14 @@ Inline within a `Card`, built from the shared primitives:
 
 ## Errors
 
-A dismissible banner above the content:
+Render through the shared notice instead of hand-rolling a banner:
 
 ```tsx
-<div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
+<ErrorNotice message={error} onDismiss={() => setError(null)} askAgent />
 ```
+
+Enable `askAgent` only when navigating away cannot discard an unsaved draft; otherwise
+leave it off and document what must stay in place.
 
 ## Animations
 

@@ -6,6 +6,17 @@ import json
 
 from kiro_crew.cloud import aws, iam
 
+# The interactive Session Manager documents AWS ships today. These are the concrete
+# sample DenyStartSessionOutsideTheLane's inversion is measured against: none of them
+# is exempt from that Deny, and no Allow grants any of them. The list lives in the
+# test rather than in cloud/iam.py because no production code reads it.
+KNOWN_INTERACTIVE_DOCUMENTS = (
+    "SSM-SessionManagerRunShell",
+    "AWS-StartInteractiveCommand",
+    "AWS-StartSSHSession",
+    "AWS-StartNonInteractiveCommand",
+)
+
 
 class TestPolicyDocument:
     def test_is_valid_policy_shape(self):
@@ -14,24 +25,31 @@ class TestPolicyDocument:
         assert isinstance(doc["Statement"], list)
         for st in doc["Statement"]:
             assert st["Effect"] in {"Allow", "Deny"}
-            assert "Action" in st and "Resource" in st and "Sid" in st
+            assert "Action" in st and "Sid" in st
+            # Exactly one of the two resource forms, never both (IAM rejects a
+            # statement carrying both) and never neither. NotResource is spelled
+            # here rather than assumed absent because DenyStartSessionOutsideTheLane
+            # is inverted; which statements may invert is pinned separately by
+            # test_no_allow_statement_inverts_its_resource_list.
+            assert ("Resource" in st) ^ ("NotResource" in st), st["Sid"]
 
-    def test_the_only_deny_statement_is_the_interactive_document_block(self):
+    def test_the_only_deny_statement_is_the_start_session_lane_block(self):
         """This policy is Allow-only except for one deliberate Deny.
 
         The shape check above accepts the two legal effects rather than asserting
-        every statement is an Allow, because the interactive session documents are
-        denied explicitly: an explicit Deny cannot be overridden by a later Allow,
-        and that is the only construct keeping the container shell closed against an
-        additive edit.
+        every statement is an Allow, because StartSession outside this lane's own
+        resources is denied explicitly: an explicit Deny cannot be overridden by a
+        later Allow, and that is the only construct keeping the container shell
+        closed against an additive edit.
 
         The property that check would otherwise carry is stated here instead -- the
         Deny set is exactly one known Sid. A new Deny has to be argued for, and an
         Allow silently flipped to Deny (which would break the launcher rather than
-        secure it) fails here.
+        secure it) fails here. The Sid names the lane rather than a document set
+        because the statement denies by exemption rather than by enumeration.
         """
         denies = {st["Sid"] for st in iam.policy_document()["Statement"] if st["Effect"] == "Deny"}
-        assert denies == {"DenyInteractiveSessionDocuments"}, denies
+        assert denies == {"DenyStartSessionOutsideTheLane"}, denies
 
     def test_covers_core_launch_actions(self):
         actions = {a for st in iam.policy_document()["Statement"] for a in st["Action"]}
@@ -76,13 +94,15 @@ class TestPolicyDocument:
         # addition to the role-ARN prefix) so a leaked launcher credential can't
         # inline a policy onto a PRE-EXISTING, out-of-band, unbounded
         # kirocrew-ec2-* role. The role is tagged atomically at CreateRole, so the
-        # legitimate CFN deploy still satisfies it.
+        # legitimate CFN deploy still satisfies it. PutRolePolicy + TagRole are
+        # MERGED into one statement (same Effect + role ARN + managed-tag
+        # Condition), so the action list holds exactly those two.
         st = next(
             s
             for s in iam.policy_document()["Statement"]
-            if s["Sid"] == "IamPutRolePolicyForInstance"
+            if s["Sid"] == "IamPutRolePolicyAndTagRoleOnManaged"
         )
-        assert st["Action"] == ["iam:PutRolePolicy"]
+        assert set(st["Action"]) == {"iam:PutRolePolicy", "iam:TagRole"}
         assert iam.ROLE_NAME_PREFIX in st["Resource"]
         assert st["Condition"]["StringEquals"][f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         # No dead iam:PermissionsBoundary condition (that key isn't in
@@ -92,8 +112,9 @@ class TestPolicyDocument:
     def test_put_role_policy_and_passrole_not_tag_scoped_regression(self):
         # Guard: both PutRolePolicy and PassRole on a kirocrew-ec2-* role ARN must
         # carry the managed-tag condition — a regression that drops it re-opens
-        # the pre-existing-unbounded-role escalation.
-        for sid in ("IamPutRolePolicyForInstance", "IamPassRoleToEc2"):
+        # the pre-existing-unbounded-role escalation. PutRolePolicy now lives in
+        # the merged IamPutRolePolicyAndTagRoleOnManaged statement.
+        for sid in ("IamPutRolePolicyAndTagRoleOnManaged", "IamPassRoleToEc2"):
             st = next(s for s in iam.policy_document()["Statement"] if s["Sid"] == sid)
             se = st.get("Condition", {}).get("StringEquals", {})
             assert (
@@ -101,20 +122,24 @@ class TestPolicyDocument:
             ), f"{sid} lost its aws:ResourceTag/kirocrew:managed gate"
 
     def test_tag_role_gated_on_existing_managed_tag(self):
-        # iam:TagRole must be a SEPARATE statement gated on aws:ResourceTag/
-        # kirocrew:managed=true — NOT unconditioned, and NOT in IamRoleForInstance.
-        # If it were unconditioned, a leaked launcher credential could tag a
-        # pre-existing UNBOUNDED kirocrew-ec2-* role kirocrew:managed=true and
-        # thereby satisfy the PutRolePolicy/PassRole tag gate, defeating it. The
-        # aws:ResourceTag gate means the launcher can only tag a role that is
-        # ALREADY managed — which, at CreateRole, AWS evaluates against the tags
-        # being applied (so the boundary-gated create still works), but a standalone
-        # re-tag of an unmanaged role is denied. (Both validated live with a
-        # least-privilege assumed-role principal.)
+        # iam:TagRole must be gated on aws:ResourceTag/kirocrew:managed=true —
+        # NOT unconditioned, and NOT in IamRoleForInstance. If it were
+        # unconditioned, a leaked launcher credential could tag a pre-existing
+        # UNBOUNDED kirocrew-ec2-* role kirocrew:managed=true and thereby satisfy
+        # the PutRolePolicy/PassRole tag gate, defeating it. The aws:ResourceTag
+        # gate means the launcher can only tag a role that is ALREADY managed —
+        # which, at CreateRole, AWS evaluates against the tags being applied (so
+        # the boundary-gated create still works), but a standalone re-tag of an
+        # unmanaged role is denied. (Both validated live with a least-privilege
+        # assumed-role principal.) TagRole now shares the merged
+        # IamPutRolePolicyAndTagRoleOnManaged statement with PutRolePolicy — same
+        # Effect + role ARN + Condition, so the merge is permission-neutral.
         st = next(
-            s for s in iam.policy_document()["Statement"] if s["Sid"] == "IamTagRoleOnManaged"
+            s
+            for s in iam.policy_document()["Statement"]
+            if s["Sid"] == "IamPutRolePolicyAndTagRoleOnManaged"
         )
-        assert st["Action"] == ["iam:TagRole"]
+        assert set(st["Action"]) == {"iam:PutRolePolicy", "iam:TagRole"}
         assert iam.ROLE_NAME_PREFIX in st["Resource"]
         assert st["Condition"]["StringEquals"][f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         # It must NOT use iam:PermissionsBoundary — validated live that AWS does
@@ -146,9 +171,12 @@ class TestPolicyDocument:
         assert "cloudformation:DeleteStack" in st["Action"]
         # scoped to kirocrew-* stacks, not "*"
         assert st["Resource"] == f"arn:aws:cloudformation:*:*:stack/{iam.STACK_PREFIX}*/*"
-        # read-only enumerate/validate stays account-wide (can't be stack-scoped)
+        # read-only enumerate/validate stays account-wide (can't be stack-scoped);
+        # it now lives in the merged CloudFormationAndResourceDiscovery statement.
         read = next(
-            s for s in iam.policy_document()["Statement"] if s["Sid"] == "CloudFormationRead"
+            s
+            for s in iam.policy_document()["Statement"]
+            if s["Sid"] == "CloudFormationAndResourceDiscovery"
         )
         assert "cloudformation:ListStacks" in read["Action"]
 
@@ -205,9 +233,9 @@ class TestPolicyDocument:
         st = next(
             s
             for s in iam.policy_document()["Statement"]
-            if s["Sid"] == "IamPutRolePolicyForInstance"
+            if s["Sid"] == "IamPutRolePolicyAndTagRoleOnManaged"
         )
-        assert st["Action"] == ["iam:PutRolePolicy"]
+        assert set(st["Action"]) == {"iam:PutRolePolicy", "iam:TagRole"}
         assert iam.ROLE_NAME_PREFIX in st["Resource"]
         assert "iam:PermissionsBoundary" not in str(st.get("Condition", {}))  # no dead key
         # CreateRole/PutRolePolicy must not appear in the plain role statement.
@@ -307,15 +335,29 @@ class TestPolicyDocument:
 
     def test_authorize_security_group_is_tag_gated(self):
         # SG rule mutation must be gated to kirocrew:managed=true SGs so a leaked
-        # credential can't open ingress on unrelated security groups.
+        # credential can't open ingress on unrelated security groups. It lives in
+        # the merged Ec2ManagedResourceMutateTagged statement (same Effect +
+        # Resource "*" + managed-tag Condition as the destructive/lifecycle verbs).
         st = next(
             s
             for s in iam.policy_document()["Statement"]
-            if s["Sid"] == "Ec2SecurityGroupRulesTagged"
+            if s["Sid"] == "Ec2ManagedResourceMutateTagged"
         )
+        # EXACT set-equality pin on the whole merged action list — the only
+        # statement here with Resource "*" and a mutating verb set, so a later
+        # change that appends a new mutating verb (e.g. ec2:ModifyInstanceAttribute)
+        # to this "*"-scoped statement must land red here, not green. A subset
+        # check would let action creep onto the wildcard resource unreviewed.
         assert set(st["Action"]) == {
             "ec2:AuthorizeSecurityGroupEgress",
             "ec2:AuthorizeSecurityGroupIngress",
+            "ec2:RevokeSecurityGroupIngress",
+            "ec2:DeleteSecurityGroup",
+            "ec2:DeleteTags",
+            "ec2:StopInstances",
+            "ec2:StartInstances",
+            "ec2:TerminateInstances",
+            "ec2:RebootInstances",
         }
         assert st["Condition"]["StringEquals"][f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         # ...and they're not in any of the provision (create) statements.
@@ -377,6 +419,10 @@ class TestPolicyDocument:
         # ec2:CreateSecurityGroup on security-group/* WITHOUT the managed
         # request-tag condition — that would re-open untagged-resource creation.
         for st in iam.policy_document()["Statement"]:
+            # Allow only: this guard is about what the policy GRANTS, and the one Deny
+            # carries NotResource rather than Resource.
+            if st["Effect"] != "Allow":
+                continue
             acts = set(st.get("Action", []))
             res_list = st["Resource"] if isinstance(st["Resource"], list) else [st["Resource"]]
             cond_tag = (
@@ -392,7 +438,11 @@ class TestPolicyDocument:
                 assert cond_tag == "true", f"{st['Sid']} creates SG on security-group/* untagged"
 
     def test_lifecycle_is_tag_scoped(self):
-        st = next(s for s in iam.policy_document()["Statement"] if s["Sid"] == "Ec2LifecycleTagged")
+        st = next(
+            s
+            for s in iam.policy_document()["Statement"]
+            if s["Sid"] == "Ec2ManagedResourceMutateTagged"
+        )
         cond = st["Condition"]["StringEquals"]
         assert cond[f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         assert "ec2:TerminateInstances" in st["Action"]
@@ -412,6 +462,10 @@ class TestPolicyDocument:
         # Guard against a regression that re-adds account-wide SendCommand/
         # StartSession on instance resources without the tag condition.
         for st in iam.policy_document()["Statement"]:
+            # Allow only, for the same reason as the untagged-creation guard above: a
+            # Deny grants nothing, and the one Deny here carries NotResource.
+            if st["Effect"] != "Allow":
+                continue
             acts = set(st.get("Action", []))
             if acts & {"ssm:SendCommand", "ssm:StartSession"}:
                 res = st["Resource"]
@@ -422,7 +476,7 @@ class TestPolicyDocument:
                     "without a tag condition"
 
     def test_destructive_ec2_verbs_tag_scoped(self):
-        st = self._stmt("Ec2DestructiveTagged")
+        st = self._stmt("Ec2ManagedResourceMutateTagged")
         cond = st["Condition"]["StringEquals"]
         assert cond[f"aws:ResourceTag/{iam.MANAGED_TAG_KEY}"] == "true"
         for verb in ("ec2:DeleteSecurityGroup", "ec2:RevokeSecurityGroupIngress", "ec2:DeleteTags"):
@@ -502,6 +556,81 @@ class TestPolicyDocument:
         actions = {a for st in iam.policy_document()["Statement"] for a in st["Action"]}
         assert "s3:HeadBucket" not in actions
         assert "s3:ListBucket" in actions
+
+    def test_policy_fits_iam_managed_policy_limit(self):
+        # A customer managed policy is capped at 6,144 characters with WHITESPACE
+        # NOT COUNTED (AWS IAM quota "Managed policy size", non-adjustable — see
+        # docs.aws.amazon.com/IAM/latest/UserGuide/reference_iam-quotas.html).
+        # Over that, `aws iam create-policy` fails with LimitExceeded and the
+        # printed policy is unusable for every operator who isn't already an admin.
+        # The headroom target sits BELOW the hard cap so the next feature (EC2
+        # Spot, ~+152 chars) still fits without another shrink; merge equivalent
+        # statements (see Ec2ManagedResourceMutateTagged /
+        # IamPutRolePolicyAndTagRoleOnManaged / CloudFormationAndResourceDiscovery)
+        # rather than letting the policy creep back over.
+        compact = json.dumps(iam.policy_document(), separators=(",", ":"))
+        assert len(compact) <= 6144, (
+            f"launcher policy is {len(compact)} chars — over IAM's 6,144 managed-policy "
+            "limit; merge equivalent statements or split the policy"
+        )
+        # Headroom gate BELOW the hard cap so growth is caught well before it hits
+        # the platform limit. Sized to sit above where the next feature (EC2 Spot,
+        # ~+152 chars -> ~5,970) lands so that feature is not tripped by the very
+        # reserve meant to admit it, while still leaving ~100 chars of margin under
+        # the 6,144 cap. If a feature legitimately needs more, raise this in the
+        # same change and say why — do not let the policy drift up to the cap.
+        assert len(compact) <= 6044, (
+            f"launcher policy is {len(compact)} chars — over the 6,044 headroom gate "
+            "(100 chars under IAM's 6,144 cap). Merge equivalent statements or, if a "
+            "feature genuinely needs the room, raise this gate deliberately."
+        )
+
+    def test_shrink_preserved_the_permission_set_byte_for_byte(self):
+        # Merging statements that share Effect + Resource + Condition to stay under
+        # the cap MUST NOT change the effective permission set. Flatten the
+        # pre-merge fixture and the current policy into canonical (Effect, Action,
+        # Resource-form, Resource, Condition) tuple sets and assert equality — this
+        # is the guarantee that the merges are permission-neutral.
+        import pathlib
+
+        fixture = (
+            pathlib.Path(__file__).resolve().parent
+            / "fixtures"
+            / "cloud_iam_policy_pre_shrink.json"
+        )
+        old = json.loads(fixture.read_text(encoding="utf-8"))
+        new = iam.policy_document()
+
+        def flatten(doc):
+            tuples = set()
+            for st in doc["Statement"]:
+                effect = st["Effect"]
+                actions = st.get("Action", [])
+                if isinstance(actions, str):
+                    actions = [actions]
+                if "Resource" in st:
+                    form = "Resource"
+                    resources = st["Resource"]
+                else:
+                    form = "NotResource"
+                    resources = st["NotResource"]
+                if isinstance(resources, str):
+                    resources = [resources]
+                cond = json.dumps(st.get("Condition"), sort_keys=True)
+                for action in actions:
+                    for resource in resources:
+                        tuples.add((effect, action, form, resource, cond))
+            return tuples
+
+        old_tuples = flatten(old)
+        new_tuples = flatten(new)
+        assert new_tuples == old_tuples, {
+            "only_in_old": sorted(old_tuples - new_tuples),
+            "only_in_new": sorted(new_tuples - old_tuples),
+        }
+        # The old policy really was over the hard cap (the reason for this PR),
+        # so the fixture is the genuine pre-shrink state, not a copy of the new one.
+        assert len(json.dumps(old, separators=(",", ":"))) > 6144
 
     def test_policy_json_roundtrips(self):
         assert json.loads(iam.policy_json()) == iam.policy_document()
@@ -732,44 +861,111 @@ class TestFargateSessionGrants:
         """
         assert self._by_sid("SsmSessionOnCrewTasks")["Action"] == ["ssm:StartSession"]
 
-    def test_the_interactive_documents_are_explicitly_denied(self):
-        """A Deny, not an omission, on every interactive document AWS ships today.
+    def test_the_inverted_deny_names_only_this_lane_resources(self):
+        """ALLOW direction: a legitimate port-forward cannot be caught by this Deny.
 
-        An explicit Deny cannot be overridden by any Allow, which is why this is a
-        statement rather than the absence of these documents from the Allow lists.
-        Its LIMIT is asserted rather than implied: the Deny reaches the four names
-        below and nothing else, so it is defense in depth and not the barrier. The
-        barrier is the test beneath this one.
+        The statement denies ``ssm:StartSession`` against everything it does NOT
+        name, so what has to be asserted is the exemption list, not a list of
+        forbidden documents. Every resource a real port-forward presents -- the
+        port-forward document, the EC2 or Fargate target, the session itself -- is
+        named here, which is why the Deny cannot match the call. That argument holds
+        whichever subset of those resources IAM evaluates, and it is the property
+        making the inversion safe to ship.
         """
-        statement = self._by_sid("DenyInteractiveSessionDocuments")
+        statement = self._by_sid("DenyStartSessionOutsideTheLane")
         assert statement["Effect"] == "Deny"
         assert statement["Action"] == ["ssm:StartSession"]
-        assert set(statement["Resource"]) == {
-            "arn:aws:ssm:*::document/SSM-SessionManagerRunShell",
-            "arn:aws:ssm:*::document/AWS-StartInteractiveCommand",
-            "arn:aws:ssm:*::document/AWS-StartSSHSession",
-            "arn:aws:ssm:*::document/AWS-StartNonInteractiveCommand",
-        }
-        assert len(statement["Resource"]) == 4, "a duplicate would pass the set check"
+        assert "Resource" not in statement, "an inverted statement carries NotResource only"
+        assert set(statement["NotResource"]) == {
+            "arn:aws:ssm:*::document/AWS-StartPortForwardingSession",
+            "arn:aws:ec2:*:*:instance/*",
+            "arn:aws:ecs:*:*:task/kirocrew-crew-*/*",
+            "arn:aws:ssm:*:*:session/*",
+        }, statement["NotResource"]
+        assert len(statement["NotResource"]) == 4, "a duplicate would pass the set check"
+
+    def test_every_start_session_allow_resource_is_exempt_from_the_deny(self):
+        """The lane cannot be broken by an Allow the Deny does not exempt.
+
+        This is the drift the inversion introduces, and the direction it fails in is
+        the reason it needs pinning: an Allow added for a new StartSession target
+        whose resource is not also added to ``NotResource`` is denied, so the lane
+        stops working rather than opening. Fail-closed, but a silent outage, so it
+        fails here instead.
+
+        ``AWS-RunShellScript`` is the one deliberate exception -- a SendCommand
+        document that no StartSession call ever names, so the inversion retiring its
+        StartSession half is the intended narrowing rather than drift.
+        """
+        exempt = set(self._by_sid("DenyStartSessionOutsideTheLane")["NotResource"])
+        deliberately_not_exempt = {"arn:aws:ssm:*::document/AWS-RunShellScript"}
+        granted: set[str] = set()
+        for statement in self._statements():
+            if statement["Effect"] != "Allow":
+                continue
+            if "ssm:StartSession" not in statement["Action"]:
+                continue
+            resources = statement["Resource"]
+            granted.update(resources if isinstance(resources, list) else [resources])
+        assert granted, "no Allow grants StartSession; this test would be vacuous"
+        unexempt = granted - exempt - deliberately_not_exempt
+        assert not unexempt, f"StartSession allowed on {sorted(unexempt)}, denied by the lane"
+
+    def test_no_interactive_document_is_exempt_from_the_deny(self):
+        """DENY direction: every interactive document falls outside the exemption.
+
+        Each name below is denied because it is ABSENT from ``NotResource``, which is
+        the same reason a document AWS ships tomorrow is denied. A list of forbidden
+        names can only ever reach the names on it; an exemption list reaches the class.
+
+        The last two assertions are what keep that true: the only document exempted
+        is the port-forward one, and no entry is a wildcard broad enough to exempt
+        documents as a class. Without them a later ``document/*`` entry would silently
+        re-open everything while the name checks above still passed.
+        """
+        exempt = self._by_sid("DenyStartSessionOutsideTheLane")["NotResource"]
+        rendered = " ".join(exempt)
+        for name in KNOWN_INTERACTIVE_DOCUMENTS:
+            assert name not in rendered, f"{name} is exempt from the lane Deny"
+        documents = {arn.split("document/", 1)[1] for arn in exempt if "document/" in arn}
+        assert documents == {"AWS-StartPortForwardingSession"}, documents
+        for arn in exempt:
+            assert arn != "*", "a bare wildcard would exempt everything"
+            assert not arn.endswith("document/*"), f"{arn} exempts every document"
 
     def test_no_interactive_document_is_allowed_anywhere(self):
-        """The actual barrier: no Allow reaches any of them, so default deny refuses.
+        """The other barrier: no Allow reaches any of them.
 
-        The names are read OFF the Deny statement rather than restated here, so a
-        document added there is checked against every Allow without anyone
-        remembering to extend a second list. That drift is how the enumerated Deny
-        would come to look broader than it is.
+        Default deny refuses an interactive document even without the Deny above, so
+        this property holds independently of it. The names come from the module
+        constant because an inverted statement carries no enumerated resource list to
+        read them off.
         """
-        denied = self._by_sid("DenyInteractiveSessionDocuments")["Resource"]
-        names = [arn.rsplit("/", 1)[-1] for arn in denied]
-        assert len(names) >= 4, names
         for statement in self._statements():
             if statement["Effect"] != "Allow":
                 continue
             resources = statement["Resource"]
             rendered = " ".join(resources) if isinstance(resources, list) else resources
-            for name in names:
+            for name in KNOWN_INTERACTIVE_DOCUMENTS:
                 assert name not in rendered, f"{statement.get('Sid')} allows {name}"
+
+    def test_no_allow_statement_inverts_its_resource_list(self):
+        """Inversion is safe in a Deny and unsafe in an Allow, so only the Deny may.
+
+        ``NotResource`` on a Deny narrows: it denies everything unnamed. The same
+        keyword on an Allow would GRANT everything unnamed, which is the reach the
+        Fargate templates forbid outright in
+        test_no_statement_inverts_the_enumeration. This policy needs the inverted
+        form for its one Deny, so the ban is expressed as a direction rather than as
+        an absence -- and ``NotAction`` stays banned outright, in either effect.
+        """
+        for statement in self._statements():
+            assert "NotAction" not in statement, f"{statement['Sid']} inverts its action list"
+            if statement["Effect"] == "Allow":
+                assert "NotResource" not in statement, (
+                    f"{statement['Sid']} is an Allow with NotResource, which grants "
+                    "every resource it does not name"
+                )
 
     def test_no_policy_grants_ecs_execute_command(self):
         """R1. This is the permission that would hand out a root shell in the task.
@@ -785,8 +981,14 @@ class TestFargateSessionGrants:
         assert not any(a.startswith("ecs:Execute") for a in actions), actions
 
     def test_no_start_session_statement_is_unscoped(self):
-        """R2. No ``Resource: "*"`` on anything that can open a session."""
+        """R2. No ``Resource: "*"`` on anything that can GRANT a session.
+
+        Allow only. The one Deny carries ``NotResource``, and a broad Deny is the
+        point of it rather than a finding against it.
+        """
         for statement in self._statements():
+            if statement["Effect"] != "Allow":
+                continue
             if "ssm:StartSession" not in statement["Action"]:
                 continue
             resources = statement["Resource"]

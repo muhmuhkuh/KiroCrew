@@ -76,10 +76,6 @@ DEFAULT_MAX_COST_USD = 5.0
 #: after at most one gate+measure — bounded, but not instant.
 STOP_JOIN_TIMEOUT_S = 30.0
 
-# The unattended provider session must hide credential directories even when the
-# interactive gateway uses its less restrictive default sandbox mode.
-_AUTO_IMPROVEMENT_SANDBOX_MODE = "strict"
-
 STATUS_IDLE = "idle"
 STATUS_RUNNING = "running"
 STATUS_CALIBRATING = "calibrating"
@@ -177,53 +173,32 @@ class RunState:
 _UNSCANNED = "[withheld: redaction unavailable]"
 
 
-def _credentials_are_unconfined(*, sandbox_mode: str | None = None) -> str:
-    """A REASON string when a provider-driven agent would run without credential masking.
+def _credentials_are_unconfined() -> str:
+    """Return a refusal reason unless effective strict isolation or risk consent permits a run.
 
-    Empty string means "confined, safe to run". The app's subprocess path forces
-    ``sandboxed_spawn_argv(mode="strict")`` + ``strip_credential_env``. The provider path
-    normally inherits the gateway setting, but the unattended loop passes its own strict
-    in-memory provider config. Only ``"cc"`` and ``"strict"`` hide credential stores
-    (``~/.aws``, ``~/.ssh``, ``~/.config/gh``, ``~/.kube``); the default ``"auto"``/``"standard"``
-    intentionally exposes ``.aws/.ssh`` for interactive workflow use — safe for human-driven
-    chat, but NOT for unattended repository-controlled execution.
+    The provider inherits ``agent.sandbox``, clamped by the governance floor. Only
+    ``strict`` hides all required credential stores: ``cc`` leaves SSH and GitHub CLI
+    credentials visible, while ``auto`` and ``standard`` also expose AWS credentials.
+    Repository-controlled instructions must not reach those credentials unattended.
 
-    FAIL CLOSED on an unreadable config: a state we cannot verify is treated as unconfined,
-    because the alternative is running an agent over repository-controlled text with the
-    operator's credentials visible.
-
-    The operator can ACKNOWLEDGE the residual risk with ``acceptUnsandboxedAgentRisk``
-    (default OFF, compared with ``is True`` so only the explicit boolean opts in) — the same
-    one-time-consent shape as the watcher's ``watcherAcceptEgressRisk`` (D-118). That escape
-    hatch exists so a hard refusal doesn't silently take the loop offline rather than
-    telling the operator what to decide. Raised by the GPT review.
+    An unreadable config fails closed. The operator can acknowledge the residual risk
+    with ``acceptUnsandboxedAgentRisk`` (default OFF, only the explicit boolean ``True``
+    opts in). An empty result therefore means either strict isolation or explicit consent.
     """
     if _unsandboxed_agent_accepted():
         return ""
-    if sandbox_mode is not None:
-        mode = sandbox_mode.strip().lower()
-    else:
-        try:
-            from kiro_crew.config import KiroCrewConfig
+    try:
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.sandbox import effective_sandbox_mode
 
-            config = KiroCrewConfig.load()
-            configured = getattr(config, "sandbox", None)
-            if not configured:
-                configured = getattr(getattr(config, "agent", None), "sandbox", "")
-            mode = str(configured or "").strip().lower()
-        except Exception as exc:  # noqa: BLE001 — an unverifiable sandbox is unconfined
-            return f"the gateway sandbox setting could not be read ({type(exc).__name__})"
-    # The provider path runs repository-controlled text through an agent with
-    # auto-approved shell, so it requires a sandbox level that HIDES credential
-    # stores (~/.aws, ~/.ssh, ~/.config/gh, ~/.kube). Only 'cc' and 'strict'
-    # do this; 'auto'/'standard' intentionally EXPOSE .aws/.ssh for interactive
-    # workflow use — safe for human-driven chat, but not for unattended
-    # repo-controlled execution.
-    _CREDENTIAL_HIDING_MODES = {"cc", "strict"}
-    if mode not in _CREDENTIAL_HIDING_MODES:
+        mode = effective_sandbox_mode(KiroCrewConfig.load().agent.sandbox)
+    except Exception as exc:  # noqa: BLE001 — an unverifiable sandbox is an unconfined one
+        return f"the gateway sandbox setting could not be read ({type(exc).__name__})"
+    if mode != "strict":
         return (
             f"the gateway sandbox is {mode or 'unset'!r} — the auto-improvement "
-            f"provider path requires 'cc' or 'strict' (credential-hiding profiles) "
+            f"provider path requires a sandbox.min_level governance floor of 'strict' "
+            f"(credential-hiding profile) "
             f"or the explicit acceptUnsandboxedAgentRisk opt-in"
         )
     return ""
@@ -451,8 +426,7 @@ class RunSupervisor:
     # ── construction (blocking; called from the route's worker thread) ────────
 
     def _build_runner(self, *, stop_check) -> Any:
-        """Pick the agent runner: the in-process provider when one is configured,
-        else the ``claude -p`` subprocess, else None (offline spine — no fabricated fixes).
+        """Build the app's member team on the gateway, or return None (offline).
 
         ``import kiro_crew.acp`` FIRST: there is a known circular import that only
         resolves when the acp package is imported before ``create_provider_factory()``
@@ -464,21 +438,16 @@ class RunSupervisor:
         from ..spine.agent_runner import SessionAgentRunner
 
         if SessionAgentRunner.available():
-            # CREDENTIAL CONFINEMENT PRECONDITION. Both runner paths use strict credential
-            # hiding. The provider path receives a private in-memory config below instead of
-            # inheriting the interactive gateway's `auto` mode, which intentionally exposes
-            # `~/.aws`/`~/.ssh` for human-driven workflows. An injected repository instruction
-            # reaching the agent's auto-approved Bash could otherwise read those stores and
-            # exfiltrate over an unrestricted network. Refuse rather than run unconfined:
-            # `None` means OFFLINE (no fabricated fixes). The watcher path is gated separately
-            # because it genuinely needs `gh` network access.
-            unconfined = _credentials_are_unconfined(sandbox_mode=_AUTO_IMPROVEMENT_SANDBOX_MODE)
+            # Unattended repository execution requires effective strict isolation or
+            # explicit risk consent before constructing the member team. Lesser profiles
+            # expose credentials. Watchers retain their separate egress acknowledgement.
+            unconfined = _credentials_are_unconfined()
             if unconfined:
                 logger.warning(
                     "%s: refusing the provider-backed agent runner — %s, so an agent-run "
                     "command could read credential stores and exfiltrate. Running OFFLINE. "
-                    "The app's strict provider sandbox could not be enabled; set "
-                    "`acceptUnsandboxedAgentRisk` to acknowledge the residual risk.",
+                    "Set the governance `sandbox.min_level` floor to 'strict', "
+                    "or set `acceptUnsandboxedAgentRisk` to acknowledge the residual risk.",
                     store.APP_NAME,
                     unconfined,
                 )
@@ -486,20 +455,15 @@ class RunSupervisor:
                     f"the provider-backed agent runner was refused because {unconfined}"
                 )
                 return None
-            from kiro_crew.config import KiroCrewConfig
+            from .crew import build_runner
 
-            # Build a private in-memory config for this unattended session. The interactive
-            # gateway may use `auto` for git/AWS workflows, but this agent receives
-            # repository-controlled text and must use strict credential hiding without
-            # changing the operator's global chat setting.
-            provider_config = KiroCrewConfig.load()
-            provider_config.agent.sandbox = _AUTO_IMPROVEMENT_SANDBOX_MODE
-            runner = SessionAgentRunner(
-                stop_check=stop_check,
-                on_activity=self._on_agent_activity,
-                provider_factory=provider_config.create_provider_factory(),
-            )
-            # Register the tool-restricted discovery agent so kiro-cli resolves it by name.
+            try:
+                runner = build_runner(stop_check=stop_check, on_activity=self._on_agent_activity)
+            except Exception as exc:
+                self._offline_reason = f"member team unavailable: {exc}"
+                logger.warning("%s: %s", store.APP_NAME, self._offline_reason)
+                return None
+            # Verify both app-owned role templates before dispatching any assignment.
             # FAIL CLOSED on the returned bool: an unknown agent name does not error, it
             # silently activates the DEFAULT agent — which carries the full kirocrew-core
             # toolset including `spawn_sub_agents`. Ignoring this result lets an unwritable
@@ -520,7 +484,7 @@ class RunSupervisor:
                     store.APP_NAME,
                 )
                 self._offline_reason = (
-                    "the tool-restricted discovery agent could not be registered, and falling "
+                    "the tool-restricted member templates could not be registered, and falling "
                     "back to the subprocess agent would bypass the configured provider's "
                     "permission gate"
                 )

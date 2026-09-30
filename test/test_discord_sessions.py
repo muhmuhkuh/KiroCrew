@@ -36,6 +36,7 @@ class _Client(MultipartFake):
         self.sent: list[tuple[str, Any]] = []
         self.edits: list[tuple[str, str, Any]] = []
         self.acked: list[str] = []
+        self.dm_pairings: dict[str, str] = {}
         self._mid = 100
         self.send_fails = False
 
@@ -72,7 +73,12 @@ class _Client(MultipartFake):
     ) -> bool:
         return True
 
-    async def ack_component_interaction(self, interaction_id: str, token: str) -> None:
+    def remember_dm_recipient(self, channel_id: str, user_id: str) -> None:
+        self.dm_pairings[channel_id] = user_id
+
+    async def ack_component_interaction(
+        self, interaction_id: str, token: str, *, destination: str = ""
+    ) -> None:
         self.acked.append(interaction_id)
 
     async def send_typing(self, channel_id: str) -> None:
@@ -243,7 +249,7 @@ class _Sessions:
         self.targeted.append(("try_acquire", key))
         return False
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.targeted.append(("clear_queue", key))
 
     async def get_or_create(self, key: str, **kwargs: Any) -> tuple[Any, bool, bool]:
@@ -1183,7 +1189,7 @@ async def test_resume_replay_bounds_and_offloads_the_splitter_probe(
     probes: list[str] = []
     offloads: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
 
-    def _capture(probe: str, limit: int, *, reserve: int = 0) -> list[str]:
+    def _capture(probe: str, limit: int, *, reserve: int = 0, redactor: Any = None) -> list[str]:
         probes.append(probe)
         return ["safe preview"]
 
@@ -1206,10 +1212,39 @@ async def test_resume_replay_bounds_and_offloads_the_splitter_probe(
         (
             _capture,
             (probes[0], session_resume._REPLAY_TEXT_LIMIT),
-            {"reserve": session_resume._REPLAY_RESERVE},
+            {
+                "reserve": session_resume._REPLAY_RESERVE,
+                "redactor": session_resume._default_redactor,
+            },
         )
     ]
     assert preview == "safe preview" + session_resume._REPLAY_TRUNCATED
+
+
+@pytest.mark.asyncio
+async def test_a_long_at_bearing_transcript_preview_keeps_its_content() -> None:
+    """A replayed transcript with an ``@`` is not emptied to the truncation marker.
+
+    The splitter's credential predicate must be idempotent: the mention-defuser
+    (``@`` -> ``@\u200b``) is not, so handing it to the splitter made
+    ``canonical_shows_a_key`` permanently true on any ``@``-bearing body over the
+    probe size and collapsed the preview to a whitespace-free blob or the bare
+    truncation marker. The predicate is the real credential redactor; the probe
+    is mention-defused before the split, once.
+    """
+    body = (
+        "Here is some ordinary transcript text with an email me@example.com "
+        "and an @property reference. " * 40
+    )
+    assert len(body) > session_resume._REPLAY_TEXT_LIMIT
+    assert "@" in body
+    preview = await session_resume._replay_preview(
+        body,
+        session_resume._REPLAY_TEXT_LIMIT,
+        reserve=session_resume._REPLAY_RESERVE,
+    )
+    assert preview.strip() != session_resume._REPLAY_TRUNCATED.strip(), "the preview was emptied"
+    assert "ordinary transcript text" in preview, "real content was stripped out"
 
 
 @pytest.mark.asyncio

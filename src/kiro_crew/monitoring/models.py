@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Protocol
 
+from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS
 from kiro_crew.monitoring.registry import PULL_REQUEST_MONITOR_KINDS
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 MONITOR_STOP_INVALID_RECORD = "invalid_monitor_record"
 MIN_MONITOR_CADENCE_SECS = 15
 MAX_MONITOR_CADENCE_SECS = 86_400
-MAX_MONITOR_RUNTIME_SECS = 604_800
+MAX_MONITOR_RUNTIME_SECS = MAX_RUNTIME_CEILING_SECS
 MAX_MONITOR_AGENT_TURNS = 8
 MAX_MONITOR_TOKENS = 1_000_000
 MAX_MONITOR_PROVIDER_ERRORS = 20
@@ -39,8 +40,6 @@ MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS = 1_000
 MAX_MONITOR_STOP_REASON_CHARS = 500
 MAX_MONITOR_CHECK_NAMES = 8
 MAX_MONITOR_PROVIDER_CONCURRENCY = 4
-MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET = 100
-MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 # The normal turn ceiling is two hours. One extra minute lets the raw completion
 # callback win the timeout race while keeping missing evidence restart-durable
 # and bounded.
@@ -119,6 +118,23 @@ PULL_REQUEST_OBSERVATION_FIELDS = (
     "unresolved_review_threads",
 )
 PULL_REQUEST_CHECK_FIELDS = ("failed", "passed", "pending", "unknown")
+#: The one canonical check bucket that is OPTIONAL. A row lands here when a newer
+#: run of its own identity displaced it, so the row is retained and reported while
+#: carrying no verdict: it is terminal and non-blocking, which means the readiness
+#: classifier must leave it out of BOTH actionable and pending, and the overflow
+#: marker must not count it -- a board whose live rows are all measured stays
+#: complete however many displaced rows sit beside them. The bucket is written only
+#: when it holds something, so a subject without displaced rows keeps the exact
+#: canonical shape every provider shares, which full-dict equality tests pin and
+#: the fingerprint hashes. Every other bucket name is required and always present.
+PULL_REQUEST_SUPERSEDED_CHECK_FIELD = "superseded"
+#: The identity that replaces the last entry when the displaced bucket is cut. It is
+#: spent inside the bucket rather than on ``checks_complete`` because a displaced row
+#: carries no verdict, so a cut there leaves the board fully measured. It is named here
+#: because two readers depend on the same spelling: the projection writes it, and the
+#: compact inspection reads it to keep its count off the sentinel and to say the cut
+#: out loud -- a compact reader never sees the list itself.
+PULL_REQUEST_SUPERSEDED_INCOMPLETE_IDENTITY = f"{PULL_REQUEST_SUPERSEDED_CHECK_FIELD}:incomplete"
 PULL_REQUEST_BLOCKING_REVIEWS = {
     "unknown",
     "changes_requested",
@@ -400,6 +416,8 @@ class MonitorBudgets:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_runtime_secs > MAX_MONITOR_RUNTIME_SECS:
+            raise ValueError(f"max_runtime_secs must be at most {MAX_MONITOR_RUNTIME_SECS}")
         if self.max_agent_turns > DEFAULT_MONITOR_AGENT_TURNS:
             raise ValueError(f"max_agent_turns must be at most {DEFAULT_MONITOR_AGENT_TURNS}")
 
@@ -488,10 +506,14 @@ MAX_MONITOR_CONDITION_KEY_CHARS = 200
 #: blockers, silently, exactly when a subject has the most wrong with it. The
 #: check expansion is the only unbounded input and the canonical projection
 #: already bounds each check bucket, so the honest cap is that bound plus the
-#: fixed keys an adapter adds beside it (a review verdict, unresolved threads,
-#: and one mergeability condition). Derived rather than written out, so widening
-#: either half cannot leave the other behind.
-MAX_MONITOR_FIXED_CONDITIONS = 4
+#: fixed keys an adapter adds beside it: a review verdict, the unresolved-thread
+#: count, one mergeability condition, and the PR-level-comment-body digest --
+#: which wakes on an in-place comment edit a count cannot see. Four fixed keys
+#: can co-occur (conflict and behind are mutually exclusive), and the cap keeps
+#: the same one-key margin over that population the original carried. Derived
+#: rather than written out, so widening either half cannot leave the other
+#: behind.
+MAX_MONITOR_FIXED_CONDITIONS = 5
 MAX_MONITOR_CONDITIONS = MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET + MAX_MONITOR_FIXED_CONDITIONS
 
 
@@ -939,6 +961,26 @@ class MonitorState:
     #: anything was observed. Counted apart from wakes so the metering does not
     #: report a periodic delivery as a real signal.
     floor_ticks: int = 0
+    #: True from the tick that DECIDES a floor delivery until that delivery is
+    #: CONFIRMED.
+    #:
+    #: The decision publishes a reset ``quiet_streak`` durably, so the only record
+    #: that a turn was due is gone the moment the decision lands -- while the
+    #: in-process claim carrying the debt lives in memory. A gateway death in
+    #: between therefore keeps the half that suppresses and loses the half that
+    #: delivers: the next tick reads a subject that has not changed against a
+    #: baseline written for a turn nobody received, answers quiet, and the forced
+    #: delivery moves a whole floor away with nothing saying one was owed.
+    #: ``followup_ticks`` is not the backstop, because it answers a fire the slot
+    #: REFUSED and a process that stopped refuses nothing.
+    #:
+    #: So the debt is durable and outlives the fire. Finding it set on a later tick
+    #: means a floor delivery is still owed, and that tick fires WITHOUT observing:
+    #: re-observing would read the same unchanged subject and answer quiet again.
+    #: It is discharged at the one point delivery is confirmed -- the same point
+    #: that charges ``floor_ticks`` -- so a refusal and a death both leave it owed,
+    #: and a retried delivery is charged exactly once.
+    floor_fire_pending: bool = False
     #: True from just before a probe runs until its verdict has been consumed.
     #:
     #: The kernel commits its dedupe state BEFORE raising a wake, which is right
@@ -1031,6 +1073,12 @@ class MonitorState:
         # unreadable value becomes True and costs at most one turn.
         if not isinstance(self.poll_in_flight, bool):
             self.poll_in_flight = True
+        # Normalised toward doubt for the same reason, and the fail-safe runs the
+        # same way: an unreadable value here means a forced turn may be owed, and
+        # ``bool("")`` would clear that and suppress it. One turn spent beats one
+        # lost, and the flag clears itself on the delivery it asks for.
+        if not isinstance(self.floor_fire_pending, bool):
+            self.floor_fire_pending = True
         # The marker carries an outcome name, so an unreadable value cannot be
         # guessed. Keep it PENDING and record the cautious classification: a
         # delivery still happens, and a subject wrongly called blocked prompts a
@@ -1267,6 +1315,9 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
         target=_identity("target"),
         objective=_identity("objective"),
         created_ts=created_ts,
+        # An inert quarantine must be constructible even below the ordinary
+        # default runtime. The original invalid budget remains in _raw_payload.
+        budgets=MonitorBudgets(max_runtime_secs=1),
         outcome=MonitorOutcome.BLOCKED,
         stopped_reason=MONITOR_STOP_INVALID_RECORD,
         _raw_payload=raw_payload,
@@ -1284,6 +1335,18 @@ def monitor_state_to_dict(state: MonitorState) -> dict[str, object]:
         for key, value in extra.items():
             payload.setdefault(key, value)
     return payload
+
+
+def _bounded_check_identities(values: object) -> bool:
+    """Whether one canonical check bucket is a bounded list of bounded identities."""
+    return (
+        isinstance(values, list)
+        and len(values) <= MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET
+        and all(
+            isinstance(value, str) and value and len(value) <= MAX_MONITOR_CHECK_IDENTITY_CHARS
+            for value in values
+        )
+    )
 
 
 def _public_pull_request_observation(
@@ -1306,18 +1369,15 @@ def _public_pull_request_observation(
         if field_name not in projected:
             return {}
     for field_name in PULL_REQUEST_CHECK_FIELDS:
-        values = checks.get(field_name)
-        if (
-            not isinstance(values, list)
-            or any(
-                not isinstance(value, str)
-                or not value
-                or len(value) > MAX_MONITOR_CHECK_IDENTITY_CHARS
-                for value in values
-            )
-            or len(values) > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET
-        ):
+        if not _bounded_check_identities(checks.get(field_name)):
             return {}
+    # The superseded bucket is the only projected one that may be absent, so it is
+    # validated exactly when it is there. A key outside the projected names is not
+    # copied at all, which is how provider diagnostics stay on the private side.
+    if PULL_REQUEST_SUPERSEDED_CHECK_FIELD in checks and not _bounded_check_identities(
+        checks[PULL_REQUEST_SUPERSEDED_CHECK_FIELD]
+    ):
+        return {}
     unresolved = projected.get("unresolved_review_threads")
     blocking_review = projected.get("blocking_review")
     mergeability = projected.get("mergeability")
@@ -1346,7 +1406,11 @@ def _public_pull_request_observation(
     ):
         return {}
     public = {key: deepcopy(projected[key]) for key in PULL_REQUEST_OBSERVATION_FIELDS}
-    public["checks"] = {key: deepcopy(checks[key]) for key in PULL_REQUEST_CHECK_FIELDS}
+    public["checks"] = {
+        key: deepcopy(checks[key])
+        for key in (*PULL_REQUEST_CHECK_FIELDS, PULL_REQUEST_SUPERSEDED_CHECK_FIELD)
+        if key in checks
+    }
     return public
 
 

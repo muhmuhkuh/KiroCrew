@@ -55,7 +55,8 @@ IFS=',' read -r -a members <<< "$GUI_MEMBERS"
 for m in "${members[@]}"; do
   [ -n "$m" ] && member_args+=(--member "$m")
 done
-KIROCREW_HOME="$HOME_DIR" python3 "$(dirname "$0")/seed_home.py" --fixture "$GUI_SEED" "${member_args[@]}"
+# The seed itself runs after 2c: the pinned starter session is seeded with
+# the sample project staged there as its project directory.
 
 # ---- 2b. sample notes folder for the Knowledge scenarios -------------------
 # The Knowledge "Add Source > Local Folder" form takes a typed absolute path
@@ -87,6 +88,21 @@ mkdir -m 0700 -- "$notes_root"
 mkdir -m 0700 -- "$GUI_NOTES_DIR"
 cp -- "$(dirname "$0")/knowledge-notes/"*.md "$GUI_NOTES_DIR/"
 echo "notes=$notes_root" >> "$GUI_OUT/target.paths"
+
+# ---- 2c. sample project for the Files scenario -----------------------------
+# The chat's Files view lists a session's project directory, and the fixture's
+# sessions carry none (a fixture cannot spell a path that only exists on the
+# machine it is seeded on). A small project tree -- a README beside a docs/
+# folder holding the same three notes -- is staged under the owned root above
+# (same marker, same teardown), and seed_home.py writes it into the metadata of
+# the pinned starter session (dashboard_starter.jsonl). Only that one gets it: the
+# other seeded chats keep reading as project-less conversations.
+GUI_PROJECT_DIR="$notes_root/sample-project"
+mkdir -m 0700 -- "$GUI_PROJECT_DIR" "$GUI_PROJECT_DIR/docs"
+cp -- "$(dirname "$0")/knowledge-notes/"*.md "$GUI_PROJECT_DIR/docs/"
+printf '# Sample project\n\nA small tree the GUI user test browses from the chat Files view.\n' > "$GUI_PROJECT_DIR/README.md"
+
+KIROCREW_HOME="$HOME_DIR" python3 "$(dirname "$0")/seed_home.py" --fixture "$GUI_SEED" "${member_args[@]}" --project "$GUI_PROJECT_DIR"
 
 # ---- 3. gateway ------------------------------------------------------------
 # Same shape as kiro_crew.testing.harness.spawn_feature_gateway (the E2E job's
@@ -225,16 +241,38 @@ DISPLAY="$GUI_DISPLAY" setsid "$CHROME" \
   --force-device-scale-factor=1 --lang=en-US \
   "${GUI_BASE_URL}/?token=${GUI_DASHBOARD_TOKEN}" \
   > "$GUI_OUT/chrome.log" 2>&1 &
-echo "$!" >> "$PIDS"
+BROWSER_PID="$!"
+echo "$BROWSER_PID" >> "$PIDS"
 
 # Wait for a visible browser window, focus it, and give the SPA a moment.
+# The wait is bounded by the browser process, not by a stopwatch: on the same
+# hosted-runner image Chromium's cold start to its first window has measured
+# anywhere from under 2 s to over 30 s between nights with nothing else
+# different, so a short fixed cap turns a slow start into a boot failure
+# seconds before the window would have appeared. A browser that has EXITED is
+# reported at once (a crash is a real boot failure; waiting on it only delays
+# the report); one that is still alive gets the full budget.
+BROWSER_WINDOW_WAIT_SECS=120
 win=""
-for _ in $(seq 1 60); do
+window_wait_started="$SECONDS"
+while :; do
   win="$(DISPLAY="$GUI_DISPLAY" xdotool search --onlyvisible --class 'chrom' 2> /dev/null | head -n 1 || true)"
   [ -n "$win" ] && break
+  if ! kill -0 "$BROWSER_PID" 2> /dev/null; then
+    echo "::error::browser exited after $((SECONDS - window_wait_started))s without showing a window; see chrome.log" >&2
+    tail -n 40 "$GUI_OUT/chrome.log" >&2 || true
+    exit 1
+  fi
+  if [ "$((SECONDS - window_wait_started))" -ge "$BROWSER_WINDOW_WAIT_SECS" ]; then
+    # Distinguish "no window yet" from "a window that never mapped": the
+    # unmapped count is the one fact chrome.log cannot tell a reader.
+    unmapped="$(DISPLAY="$GUI_DISPLAY" xdotool search --class 'chrom' 2> /dev/null | wc -l || true)"
+    echo "::error::browser window never appeared within ${BROWSER_WINDOW_WAIT_SECS}s (browser pid $BROWSER_PID still alive, ${unmapped:-0} unmapped browser window(s)); see chrome.log" >&2
+    tail -n 40 "$GUI_OUT/chrome.log" >&2 || true
+    exit 1
+  fi
   sleep 0.5
 done
-[ -n "$win" ] || { echo "::error::browser window never appeared; see chrome.log" >&2; tail -n 40 "$GUI_OUT/chrome.log" >&2 || true; exit 1; }
 DISPLAY="$GUI_DISPLAY" xdotool windowactivate --sync "$win" > /dev/null 2>&1 || true
 DISPLAY="$GUI_DISPLAY" xdotool windowsize "$win" "$screen_w" "$screen_h" > /dev/null 2>&1 || true
 DISPLAY="$GUI_DISPLAY" xdotool windowmove "$win" 0 0 > /dev/null 2>&1 || true

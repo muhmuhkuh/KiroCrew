@@ -197,7 +197,9 @@ async def _pod_checkout_guard(name: str) -> str | None:
     return None
 
 
-def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, str]:
+def _reclaim_pod_locked(
+    cfg, name: str, expected_checkout: str, *, require_missing_checkout: bool = False
+) -> tuple[str, str]:
     """Attribute pod *name* and tear it down as ONE locked transaction.
 
     Runs entirely inside ``rt.pod_name_mutex``, which is the cross-process flock
@@ -215,12 +217,13 @@ def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, st
     submitted to the executor as one callable, so ``stop_pod``'s own acquisition
     nests instead of deadlocking.
 
-    *expected_checkout* is this repo's worktree path for *name*, resolved by the
-    caller before the lock -- it is not the racy half, since a foreign ``up``
-    moves the PIN, never our own worktree.
+    *expected_checkout* identifies this repository's checkout for *name*. The
+    missing-checkout teardown passes git's retained worktree record. When
+    *require_missing_checkout* is true, the locked transaction refuses if that
+    path is back on disk because a new pod may own the name.
 
-    Mirrors :func:`_pod_checkout_guard`'s attribution rules, and the CLI's
-    post-teardown env-file clear, so behaviour matches the paths it replaces.
+    Mirrors :func:`_pod_checkout_guard`'s attribution rules and clears the
+    checkout pin after a successful reclaim.
 
     Returns ``(outcome, detail)`` with outcome one of:
       ``reclaimed``  -- ours, torn down, HOME verified gone
@@ -265,6 +268,11 @@ def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, st
             return "foreign", (
                 f"pod {name!r} is pinned to a different checkout " "(basename collision)"
             )
+        if require_missing_checkout and Path(expected_checkout).exists():
+            return "handed_over", (
+                f"pod {name!r}: its checkout {expected_checkout!r} is back on disk, "
+                "so a new pod may own the name"
+            )
         cp = runtime.rt.stop_pod(cfg, name)
         if cp.returncode != 0:
             # Redacted like every other detail this helper returns: it reaches the
@@ -282,6 +290,54 @@ def _reclaim_pod_locked(cfg, name: str, expected_checkout: str) -> tuple[str, st
         return "reclaimed", ""
 
 
+def _mint_pod_token_locked(cfg, name: str, expected_checkout: str) -> dict:
+    """Revalidate the boot's checkout and mint under one pod-name lock off-loop."""
+    outcome, audit_error = "failure", "mint failed"
+    resources = f"name={name} ttl=2h"
+    try:
+        with runtime.rt.pod_name_mutex(cfg, name):
+            env_exists, pinned = _read_pin_strict(cfg, name)
+            if not env_exists or not pinned:
+                error = f"pod {name!r} has no verifiable checkout pin — token withheld"
+            elif Path(pinned).resolve() != Path(expected_checkout).resolve():
+                error = f"pod {name!r} is pinned to a different checkout — token withheld"
+            else:
+                error = ""
+            if error:
+                outcome, audit_error = "denied", "checkout pin mismatch; credential withheld"
+                return {"ok": False, "code": "pod_checkout_mismatch", "error": error}
+            port = runtime.rt.derive_port(cfg, name)
+            resources = f"name={name} port={port} ttl=2h"
+            token = runtime.rt.mint_token(cfg, name, "2h")
+            outcome, audit_error = "allowed", ""
+            return {"ok": True, "token": token}
+    except runtime.rt.PodOwnershipUnproven as exc:
+        outcome, audit_error = "denied", "ownership unprovable; credential withheld"
+        return {
+            "ok": True,
+            "token": "",
+            "warning": f"pod is up but token withheld: {runtime._redact(str(exc))}",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "code": "pod_token_mint_failed",
+            "error": f"pod is up but token mint failed: {runtime._redact(str(exc))}",
+        }
+    finally:
+        try:
+            runtime._sel().log_api_access(
+                caller="dev_fleet",
+                operation="pod.token",
+                outcome=outcome,
+                source="app",
+                resources=resources,
+                error=audit_error,
+            )
+        except Exception as exc:  # noqa: BLE001
+            runtime.logger.warning("SEL audit failed for pod.token: %s", runtime._redact(str(exc)))
+
+
 async def _pod_up(name: str) -> dict:
     guard = await _pod_checkout_guard(name)
     if guard:
@@ -289,7 +345,18 @@ async def _pod_up(name: str) -> dict:
     # Resolve the node toolchain off the loop before building the pod env:
     # `pod up` runs the provision chain (npm ci + vite) when asked to.
     await runtime._warm_build_path()
+    cfg = runtime._load_cfg()
     cmd = runtime._find_cli() + ["pod", "up", name, "--json"]
+    # A sandboxed child has its own user namespace, which the pod refuses to
+    # certify as the local owner. Let the gateway mint only when it has config;
+    # otherwise the CLI owns the whole operation (including Windows pods).
+    expected_checkout = ""
+    if cfg is not None:
+        target, ferr = await repository._find_worktree(name)
+        if target is None:
+            return {"ok": False, "error": ferr or f"unknown worktree: {name!r}"}
+        expected_checkout = target["path"]
+        cmd.append("--no-token")
     rc, stdout, stderr = await runtime._run_cmd(
         cmd, cwd=repository._repo(), env=_pod_env(), timeout=180
     )
@@ -299,7 +366,6 @@ async def _pod_up(name: str) -> dict:
     # pod is up. Confirm the unit is actually active, else fail closed rather
     # than flash a false "started" — the same false-success class as a false
     # "stopped", in the opposite direction.
-    cfg = runtime._load_cfg()
     if runtime._POD_AVAILABLE and cfg:
         try:
             loop = asyncio.get_running_loop()
@@ -312,40 +378,78 @@ async def _pod_up(name: str) -> dict:
                 "error": f"cannot verify pod start: {runtime._redact(str(exc))}",
             }
     try:
-        return {"ok": True, **json.loads(stdout)}
+        handle = json.loads(stdout)
     except ValueError:
-        return {"ok": True, "output": stdout}
+        handle = {"output": stdout}
+    # Use the same config that selects --no-token, so boot and mint cannot
+    # disagree about which process supplies the credential.
+    if cfg is not None:
+        minted = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _mint_pod_token_locked, cfg, name, expected_checkout
+        )
+        if not minted["ok"]:
+            return minted
+        handle.update(minted)
+    handle["ok"] = True
+    return handle
 
 
 async def _pod_down(name: str) -> dict:
-    guard = await _pod_checkout_guard(name)
-    if guard:
-        return {"ok": False, "error": guard}
-    await runtime._warm_build_path()
-    cmd = runtime._find_cli() + ["pod", "down", name]
-    rc, stdout, stderr = await runtime._run_cmd(
-        cmd, cwd=repository._repo(), env=_pod_env(), timeout=30
-    )
-    if rc != 0:
-        return {"ok": False, "error": runtime._redact(stderr or stdout)}
-    # Post-stop verification: a CLI exit 0 is NOT proof the unit stopped (a
-    # broken `-m` entry point can no-op with rc 0, and a real stop
-    # can still fail or time out). Re-check the live unit state and fail CLOSED
-    # if the pod is still active — mirrors the post-shutdown recheck in
-    # _worktree_remove so "Stopped" is never reported for a pod still running.
+    target, ferr = await repository._find_worktree(name)
+    if target is not None:
+        guard = await _pod_checkout_guard(name)
+        if guard:
+            return {"ok": False, "error": guard}
+        await runtime._warm_build_path()
+        cmd = runtime._find_cli() + ["pod", "down", name]
+        rc, stdout, stderr = await runtime._run_cmd(
+            cmd, cwd=repository._repo(), env=_pod_env(), timeout=30
+        )
+        if rc != 0:
+            return {"ok": False, "error": runtime._redact(stderr or stdout)}
+        # Post-stop verification: a CLI exit 0 is NOT proof the unit stopped (a
+        # broken `-m` entry point can no-op with rc 0, and a real stop
+        # can still fail or time out). Re-check the live unit state and fail CLOSED
+        # if the pod is still active -- mirrors the post-shutdown recheck in
+        # _worktree_remove so "Stopped" is never reported for a pod still running.
+        cfg = runtime._load_cfg()
+        if runtime._POD_AVAILABLE and cfg:
+            try:
+                loop = asyncio.get_running_loop()
+                active = await loop.run_in_executor(
+                    subprocess_executor(), runtime.rt.active_names, cfg
+                )
+                if name in active:
+                    return {"ok": False, "error": "pod still active after shutdown"}
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "error": f"cannot verify pod shutdown: {runtime._redact(str(exc))}",
+                }
+        return {"ok": True, "error": None}
+
+    recorded, rerr = await repository._find_retained_worktree_path(name)
+    if recorded is None:
+        return {"ok": False, "error": ferr or rerr or f"worktree not found: {name!r}"}
     cfg = runtime._load_cfg()
-    if runtime._POD_AVAILABLE and cfg:
-        try:
-            loop = asyncio.get_running_loop()
-            active = await loop.run_in_executor(subprocess_executor(), runtime.rt.active_names, cfg)
-            if name in active:
-                return {"ok": False, "error": "pod still active after shutdown"}
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "ok": False,
-                "error": f"cannot verify pod shutdown: {runtime._redact(str(exc))}",
-            }
-    return {"ok": True, "error": None}
+    if cfg is None or not runtime._POD_AVAILABLE:
+        return {"ok": False, "error": ferr or f"worktree not found: {name!r}"}
+    try:
+        outcome, detail = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            functools.partial(
+                _reclaim_pod_locked,
+                cfg,
+                name,
+                recorded,
+                require_missing_checkout=True,
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"cannot reclaim pod: {runtime._redact(str(exc))}"}
+    if outcome == "reclaimed":
+        return {"ok": True, "error": None}
+    return {"ok": False, "error": detail}
 
 
 async def _pod_restart(name: str) -> dict:
@@ -2250,11 +2354,41 @@ async def _rebase_locked(target: dict) -> dict:
             **_fields,
             "error": "worktree has uncommitted changes" + _detail,
         }
-    remote = await repository._upstream_remote()
-    if await repository._git(path, "fetch", remote, repository.BASE_BRANCH, timeout=90) is None:
-        return {"ok": False, "error": f"git fetch {remote} {repository.BASE_BRANCH} failed"}
+    # Re-resolved HERE, not inherited from discovery. Discovery latches once per
+    # process (`_DISCOVERY_DONE`), so a base resolved at startup is the only answer the
+    # process would ever hold -- and a refusal would then not clear until a restart. A
+    # few short git reads on an operation that already fetches is what makes that
+    # promise true.
+    #
+    # Resolved into LOCALS, never into the shared `repository.BASE_BRANCH` global.
+    # `_sync_start_locked` checks `HEAD == BASE_BRANCH` and then re-reads that global
+    # across several awaits before it fetches and merges; a rebase mutating the global
+    # in that window (default main->trunk) would make the sync fetch and merge a base
+    # it never validated, holding only `_wt_lock` and never `_SYNC_LOCK`. Keeping the
+    # answer local removes the shared mutable state the two operations contended over,
+    # rather than serializing two unrelated subsystems under one lock: this rebase acts
+    # only on the base it itself resolved, and the sync's global is left untouched.
+    base_branch, base_positive, base_remote = await repository._resolve_base_snapshot()
+    if base_branch is None:
+        base_branch = repository.BASE_BRANCH
+    # Before the fetch, and before anything is rewritten: a base branch nobody stated
+    # is a guess, and this is the one operation here that cannot be undone from its own
+    # result -- a clean replay onto the wrong base returns ok and names no rollback.
+    # The dirt gate above already refuses on the cheaper hazard. Checked against the
+    # LOCAL snapshot, so the verdict is about the base this rebase will act on.
+    base_refusal = repository.base_branch_mutation_refusal(base_branch, base_positive)
+    if base_refusal is not None:
+        return {"ok": False, "error": base_refusal}
+    # The SAME remote the snapshot verified the base against -- not a remote re-derived
+    # from `branch.<base>.remote`, which can name a different one (`origin` advertises
+    # `main` while `branch.main.remote = upstream`) and let a clean replay rewrite the
+    # worktree onto a base the positive verdict never checked. Base and remote are one
+    # snapshot; the fetch and the rebase use its remote.
+    remote = base_remote
+    if await repository._git(path, "fetch", remote, base_branch, timeout=90) is None:
+        return {"ok": False, "error": f"git fetch {remote} {base_branch} failed"}
     rc, stdout, stderr = await runtime._run_cmd(
-        ["git", "-C", path, "rebase", f"{remote}/{repository.BASE_BRANCH}"],
+        ["git", "-C", path, "rebase", f"{remote}/{base_branch}"],
         timeout=180,
         mode="strict",
     )
@@ -2697,8 +2831,9 @@ async def _status_refresher() -> None:
     except repository.RepoUnavailable as exc:
         # No usable checkout to fetch or cache — nothing found, or the configured
         # path is not one. Returning ends the task instead of logging a traceback
-        # every cycle forever; the resolved value only changes on restart, so
-        # there is nothing to wait for.
+        # every cycle forever. A checkout found LATER restarts it from
+        # ``_ensure_repo_resolved``, which is the only thing that can change this
+        # answer inside one process.
         runtime.logger.info("dev-fleet: status refresher idle — %s", exc)
         return
     while True:
@@ -2712,6 +2847,45 @@ async def _status_refresher() -> None:
         except Exception:
             runtime.logger.exception("dev-fleet status refresher failed")
         await asyncio.sleep(_NET_REFRESH_S)
+
+
+async def _ensure_repo_resolved() -> None:
+    """Re-run main-checkout discovery while no VALID checkout is resolved, and start the
+    status refresher when an attempt resolves one.
+
+    ``/api/fleet`` calls this per poll. A resolved and valid install returns at the
+    first guard before any await, so the cost is paid only in the two states that have
+    no fleet to serve -- nothing found, and a configured path carrying no markers --
+    and the setup card or banner the user is looking at stops being a lie within one
+    poll instead of at the next gateway restart.
+
+    The refresher start lives here rather than in ``repository`` because the loop
+    and its task handle are owned at this level and ``repository`` sits below it in
+    the component DAG. Starting it is not optional bookkeeping: ``_status_refresher``
+    RETURNS when there is no usable checkout rather than idling, so a late resolution
+    that left it stopped would serve a fleet whose rows never refresh again — the setup
+    card disappears, the page looks alive, and nothing fetches. That is a worse
+    state than the honest "restart the gateway" this replaces.
+    """
+    global _refresher_task
+    # A resolved and VALID checkout returns here before any await. A resolved-but-invalid
+    # one falls through, because the operator can still correct the path its banner names
+    # and `repository` reopens that latch once the configured string changes.
+    if repository.MAIN_REPO and not repository._REPO_INVALID_MSG:
+        return
+    await repository.ensure_main_repo_discovered()
+    try:
+        repository._repo()
+    except repository.RepoUnavailable:
+        # Nothing found, or the path found carries no markers. Asked through the
+        # accessor rather than by testing `MAIN_REPO` for truthiness: an invalid path is
+        # truthy, and `_status_refresher` returns on its first line for one, so starting
+        # it would mint a task per poll that dies immediately.
+        return
+    if _background_tasks_disabled():
+        return
+    if _refresher_task is None or _refresher_task.done():
+        _refresher_task = asyncio.create_task(_status_refresher())
 
 
 # --- auto-prune reaper (opt-in) ---------------------------------------------
@@ -2852,6 +3026,7 @@ __all__ = (
     "_auto_prune_once",
     "_auto_prune_reaper",
     "_background_tasks_disabled",
+    "_ensure_repo_resolved",
     "_pod_checkout_guard",
     "_pod_down",
     "_pod_env",

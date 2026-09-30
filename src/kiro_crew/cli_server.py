@@ -33,7 +33,6 @@ from kiro_crew.config.loader import (
     config_path,
     read_local_secret,
 )
-from kiro_crew.constants import DATA_WARNING
 from kiro_crew.context import ContextBuilder
 from kiro_crew.dashboard import tailnet_serve
 from kiro_crew.dashboard.handlers.core import DASHBOARD_HTML_NOT_FOUND_MARKER
@@ -59,7 +58,7 @@ from kiro_crew.git_divergence import (
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, hooks_config_from_config_dict
 from kiro_crew.instances import run_marker
-from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, pin_kiro_cli
+from kiro_crew.kiro_cli import PATH_ONLY_INSTALL_NOTE, is_bundled_kiro_cli, pin_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen, unix_socket_urlopen
 from kiro_crew.memory import MemoryStore
@@ -94,7 +93,14 @@ from kiro_crew.sel import sel
 from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as svc_linux
 from kiro_crew.service import macos as svc_macos
-from kiro_crew.service.common import SERVICE_NAME, Platform, current_platform
+from kiro_crew.service.common import (
+    RESTART_NOT_UP,
+    RESTART_REFUSED,
+    RESTART_UNCONFIRMED,
+    SERVICE_NAME,
+    Platform,
+    current_platform,
+)
 from kiro_crew.session import SessionManager
 from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import SkillsLoader
@@ -171,7 +177,7 @@ def _token(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     port = resolve_client_port(args.port)
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
     if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway", file=sys.stderr)
         sys.exit(1)
@@ -310,7 +316,7 @@ def _emit_session_urls(port: int, token: str) -> None:
 
 def _logout(port: int) -> None:
     """Revoke all dashboard sessions by calling the gateway's /api/logout endpoint."""
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
     if not secret:
         print("❌ Gateway not running — start it with: kirocrew gateway")
         sys.exit(1)
@@ -357,7 +363,7 @@ def _request_gateway_shutdown(port: int) -> bool:
     refusal, malformed response, or transport failure returns ``False`` so the
     caller retains the existing no-target diagnostic.
     """
-    secret = run_marker.read_secret(port)
+    secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
     if not secret:
         return False
     request = urllib.request.Request(
@@ -1004,8 +1010,12 @@ def _spawn_detached_gateway(port: int | None = None) -> subprocess.Popen[bytes]:
     else:
         # Source-tree/editable-install fallback: run the module directly.
         # This also covers the case where the wrapper script is not on PATH
-        # (e.g. running from an unactivated checkout).
-        argv = platform_compat.isolated_python_argv("-m", "kiro_crew", "gateway")
+        # (e.g. running from an unactivated checkout). ``-P`` because this
+        # child is spawned with ``cwd=Path.home()`` below and ``-m`` would put
+        # that directory first on sys.path, ahead of the standard library --
+        # the launch shape under which a stray ``~/concurrent/`` replaced the
+        # stdlib package in the field.
+        argv = platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", "gateway")
     if port is not None:
         argv += ["--port", str(int(port))]
 
@@ -1180,7 +1190,7 @@ def _print_token_url(port: int) -> None:
     deadline = time.monotonic() + _RESTART_READY_TIMEOUT
     while time.monotonic() < deadline:
         try:
-            secret = read_local_secret(port)
+            secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
             if not secret:
                 time.sleep(_RESTART_READY_POLL_INTERVAL)
                 continue
@@ -1209,6 +1219,22 @@ def _print_token_url(port: int) -> None:
     print("\n⚠️  Could not generate token (gateway still starting?). Run: kirocrew token")
 
 
+# How `kirocrew restart` labels the remedy for each kind of failed scope restart
+# (the command itself comes from the report), and the word the SEL audit row
+# carries for it: `reason=service_restart_denied` is the refusal the privileged
+# path has always recorded; the other two are new kinds, not new spellings.
+_RESTART_REMEDY_LABEL = {
+    RESTART_REFUSED: "Run the restart yourself",
+    RESTART_NOT_UP: "Read why it exits",
+    RESTART_UNCONFIRMED: "Check its state",
+}
+_RESTART_AUDIT_KIND = {
+    RESTART_REFUSED: "denied",
+    RESTART_NOT_UP: "not_up",
+    RESTART_UNCONFIRMED: "unconfirmed",
+}
+
+
 def _restart(cli_port: int | None = None) -> None:
     """Restart a running KiroCrew gateway.
 
@@ -1216,12 +1242,20 @@ def _restart(cli_port: int | None = None) -> None:
 
     1. If a systemd/launchd service is active AND the caller did not
        explicitly request a specific port, ask the platform to restart
-       it (``systemctl restart`` / ``launchctl kickstart -k``). When the
-       service manager REFUSES that restart while the unit is still active
-       (system-scope unit, unprivileged caller / polkit denial), fail loudly
-       naming the privileged command the operator must run — never fall
-       through to the listener path, which cannot see a service gateway
-       bound to a unix socket and would misreport the outcome.
+       it (``systemctl restart`` / ``launchctl kickstart -k``). When that
+       restart was attempted and did not take everywhere, fail loudly with one
+       line per scope: a scope that restarted reads ``restarted``, and a scope
+       that did not names the remedy for its kind: the manager REFUSED the verb
+       (system-scope unit, unprivileged caller / polkit denial) → the restart
+       command for THAT scope to run by hand; the manager ran it and the unit
+       is NOT UP (``activating (auto-restart)``, ``failed``) → that scope's
+       journal; the manager stopped answering → ``kirocrew service status``.
+       The headline never says the gateway was not restarted when a scope's
+       was — with a unit in both scopes, the working per-user gateway restarts
+       while the stale system unit beside it does not.
+       An attempted restart never falls through to the listener path, which
+       cannot see a service gateway bound to a unix socket, would misreport the
+       outcome, and would spawn an unmanaged gateway beside an installed unit.
     2. Otherwise, SIGTERM the foreground gateway via the existing
        lsof+SIGTERM path used by ``kirocrew stop``, then spawn a
        detached replacement and **verify it is serving** before reporting
@@ -1236,7 +1270,8 @@ def _restart(cli_port: int | None = None) -> None:
     """
     port = resolve_client_port(cli_port)
     if cli_port is None:
-        if service_controller.restart_service():
+        report = service_controller.restart_service()
+        if report:
             sel().log_api_access(
                 caller="cli",
                 operation="gateway_restart",
@@ -1247,34 +1282,81 @@ def _restart(cli_port: int | None = None) -> None:
             print("✅ Restarted kirocrew service.")
             _print_token_url(port)
             return
-        if service_controller.is_service_active():
-            # The service manager refused the restart while the unit is active
-            # RIGHT NOW — the system-scope unit needs root/polkit privileges
-            # this process does not have ("Interactive authentication
-            # required"). Falling through to the listener path would be worse
-            # than failing: on a unix-socket deployment nothing listens on TCP,
+        if report.attempted or service_controller.is_service_active():
+            # A managed unit was there and the restart did not take. An ATTEMPTED
+            # restart never falls through, whatever the unit reads now: a unit
+            # that landed `failed` (start limit hit) or `inactive` is still an
+            # installed, enabled unit, and the listener path below would spawn an
+            # unmanaged gateway beside it. Falling through is worse than failing
+            # in every shape: on a unix-socket deployment nothing listens on TCP,
             # so the fallback finds nothing to stop, spawns a competitor the
-            # KIROCREW_HOME lock refuses, and the original gateway keeps
-            # running while the command's outcome reads like a restart. Name
-            # the privileged command the operator must run instead. The
-            # active-check runs AFTER the refused restart so a service that
-            # merely stopped in between still falls through below.
-            hint = service_controller.manual_restart_hint()
+            # KIROCREW_HOME lock refuses, and the original unit keeps running (or
+            # flapping) while the command's outcome reads like a restart. The
+            # report tells the shapes apart per scope and each gets ITS remedy:
+            # the manager REFUSED the verb (a system-scope unit needs root/polkit
+            # this process lacks — "Interactive authentication required") → the
+            # restart command for that scope with the privilege it needs,
+            # `systemctl --user restart` for the user unit and never `sudo
+            # systemctl restart`, which answers "Unit kirocrew.service not found"
+            # on a host whose only unit is the user one; the manager ran it and
+            # the unit is NOT UP (a `Type=simple` start job succeeds the moment
+            # the process is forked, so a gateway that exits on start lands in
+            # `activating (auto-restart)` with `systemctl restart` having exited
+            # 0; or the job itself failed) → that scope's journal, since a
+            # hand-run restart would fail the same way; the manager stopped
+            # answering while the unit was re-read → its health is UNKNOWN, check
+            # `kirocrew service status`. The live active-check is only for a
+            # restart that attempted nothing: a unit that came up in between
+            # must not be replaced either, while a service that merely stopped
+            # falls through below.
+            #
+            # Per scope, never as one verdict: with a unit running in BOTH
+            # scopes (a stale crash-looping system unit beside the working
+            # per-user one) `restart()` restarts one and not the other, and "the
+            # gateway was NOT restarted" would be false for the gateway the
+            # operator uses. The headline names the scope that restarted, the
+            # scope that did not carries its reason and remedy, and the exit code
+            # says something still needs a hand — the same shape `service
+            # uninstall` gives a two-scope teardown that finished in one scope.
+            failures = report.failures
+            restarted = report.restarted
+            kinds = sorted({_RESTART_AUDIT_KIND.get(f.kind, f.kind) for f in failures})
             sel().log_api_access(
                 caller="cli",
                 operation="gateway_restart",
-                outcome="denied",
+                outcome="partial" if restarted else "denied",
                 source="cli",
-                resources=f"port={port} via=service reason=service_restart_denied",
+                resources=(
+                    f"port={port} via=service"
+                    + (f" restarted={','.join(o.scope for o in restarted)}" if restarted else "")
+                    + f" reason=service_restart_{'+'.join(kinds) if kinds else 'nothing_attempted'}"
+                ),
             )
-            print(
-                "❌ A kirocrew service is installed and running, but the service "
-                "manager refused to restart it.\n"
-                "   This process lacks the privileges the service's scope "
-                "requires — the gateway was NOT restarted.\n"
-                "   Run the restart yourself:\n"
-                f"       {hint}"
-            )
+            if restarted:
+                lines = [
+                    "⚠️ Restarted kirocrew service in the "
+                    f"{' and '.join(o.scope for o in restarted)} scope; the restart did "
+                    f"not take in the {' and '.join(f.scope for f in failures)} scope:"
+                ]
+                for outcome in restarted:
+                    lines.append(f"   {outcome.scope} scope: restarted.")
+            else:
+                lines = [
+                    "❌ A kirocrew service is installed and running, but the restart did "
+                    "not take — the gateway was NOT restarted."
+                ]
+            for failure in failures:
+                lines.append(f"   ⚠️ {failure.scope} scope: {failure.reason}")
+                lines.append(
+                    f"       {_RESTART_REMEDY_LABEL.get(failure.kind, 'Then')}:  {failure.hint}"
+                )
+            if not failures:
+                # The unit came up between the restart's own scope selection
+                # and the check above; nothing was issued at it.
+                lines.append(
+                    "   The service manager restarted nothing; run `kirocrew restart` again."
+                )
+            print("\n".join(lines))
             sys.exit(1)
 
     # No service active — bounce the foreground gateway and detach a fresh one.
@@ -1853,6 +1935,11 @@ def _update(force: bool = False) -> None:
     kiro_cli_bin, unpinned_kiro_cli = pin_kiro_cli()
     if kiro_cli_bin is None and unpinned_kiro_cli:
         print(f"  ⚠️  kiro-cli update skipped: {PATH_ONLY_INSTALL_NOTE}")
+    if kiro_cli_bin is not None and is_bundled_kiro_cli(kiro_cli_bin, os.environ):
+        # The desktop app's bundled copy lives inside the signed bundle and is
+        # replaced by the app update, never in place.
+        print("  ℹ️  kiro-cli is the desktop app's bundled copy; it updates with the app")
+        kiro_cli_bin = None
     if kiro_cli_bin is not None:
         print("  🔄 kiro-cli update")
         try:
@@ -1893,9 +1980,67 @@ def _update(force: bool = False) -> None:
         sys.exit(1)
 
     print("\n✅ Kiro Crew updated!")
-    print(f"\n{DATA_WARNING}\n")
 
     _refresh_agent_config(proj)
+
+    # Reconcile the running gateway's update badge. The reset above moved the
+    # tree, but a long-lived gateway keeps serving the pre-update verdict from
+    # its cache until the next 12-hourly poll, a manual check, or a restart --
+    # so the About panel shows "Update available" for a checkout that is now
+    # current. Poke it to drop the cache and re-check. Best-effort: the update
+    # has already succeeded, so a gateway that is not running or a call that
+    # fails must not change the outcome or the exit code.
+    _revalidate_gateway_update_check()
+
+
+def _revalidate_gateway_update_check() -> None:
+    """Best-effort: tell the running gateway to re-check for updates now.
+
+    Called at the end of a successful git-checkout update so the About panel's
+    "Update available" badge reconciles immediately instead of waiting for the
+    next scheduled poll. Reuses the CLI's own loopback transport and the
+    per-generation local secret, the same pair `kirocrew token` and
+    `kirocrew logout` use to reach the gateway.
+
+    No gateway (no secret to reach one) returns silently — the next boot
+    re-checks anyway. A reachable gateway that refuses or errors prints one
+    fallback line. Nothing here raises, and nothing changes the exit code: the
+    update has already succeeded.
+    """
+    try:
+        port = resolve_client_port(None)
+        # Verify the port is held by THIS install's gateway before reading or
+        # sending the secret. Without this, a stale configured port bound by a
+        # co-resident local user would receive the shared local secret -- the
+        # live gateway's own accepted credential -- which they could replay to
+        # mint owner tokens. _gateway_owns_port closes exactly that escalation.
+        if not _gateway_owns_port(port):
+            return
+        secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
+        if not secret:
+            # No gateway running (or no secret to reach one) -- the next boot
+            # re-checks anyway, so there is nothing to reconcile.
+            return
+        req = urllib.request.Request(
+            f"http://{_CLI_LOOPBACK}:{port}/api/update/revalidate",
+            method="POST",
+            headers={"X-Local-Secret": secret, "Content-Type": "application/json"},
+            data=b"{}",
+        )
+        with loopback_urlopen(req, timeout=5) as resp:
+            if int(resp.status) == 200:
+                print("  🔄 Update badge refreshed on the running gateway")
+                return
+        print("  ℹ️  Could not refresh the update badge; it reconciles on next check")
+    except (
+        http.client.HTTPException,
+        OSError,
+        ValueError,
+        urllib.error.URLError,
+    ):
+        # Includes a gateway that is not up (connection refused) and any
+        # malformed response. The update stands regardless.
+        print("  ℹ️  Could not refresh the update badge; it reconciles on next check")
 
 
 def _refresh_agent_config(proj: str) -> None:
@@ -1922,7 +2067,7 @@ def _refresh_agent_config(proj: str) -> None:
     print("  🔒 Refreshing agent config…")
     try:
         r = subprocess.run(
-            platform_compat.isolated_python_argv("-m", "kiro_crew", "setup", "--agent-only"),
+            platform_compat.isolated_python_argv("-P", "-m", "kiro_crew", "setup", "--agent-only"),
             cwd=proj,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -2175,7 +2320,7 @@ def _update_approve() -> None:
     # by /api/token/local). Reading the secret is itself host-local evidence,
     # the same class as the nonce file. An absent secret still works on a
     # default loopback install where no token auth runs.
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host="127.0.0.1")
     if secret:
         headers["X-Internal-Secret"] = secret
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
@@ -2235,7 +2380,7 @@ def _file_delivery_approve() -> None:
     # Same local-secret / unix-socket authentication as _update_approve: reading
     # the secret is itself host-local evidence, and an absent secret still works
     # on a default loopback install where no token auth runs.
-    secret = read_local_secret(port)
+    secret = read_local_secret(port, dial_host="127.0.0.1")
     if secret:
         headers["X-Internal-Secret"] = secret
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
@@ -2480,14 +2625,7 @@ async def _run_task(args: argparse.Namespace) -> None:
 
     # Vector memory (structured semantic store)
 
-    vector_memory = VectorMemoryStore(
-        confidence_threshold=cfg.memory.semantic_confidence_threshold,
-        extra_prefixes=cfg.memory.semantic_keys or None,
-        episodic_limit=cfg.memory.episodic_max_results,
-        embedding_dim=cfg.memory.embedding_dim,
-        decay_rates=cfg.memory.decay_rates or None,
-        dedup_threshold=cfg.memory.episodic_dedup_threshold,
-    )
+    vector_memory = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
     # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
     # blocking file IO end to end (sqlite connect, migrations, lockdown pass)
     # and would stall the loop.
@@ -2694,9 +2832,11 @@ def _logs_cmd(args: argparse.Namespace) -> None:
     """Tail gateway logs from the most appropriate source.
 
     Order of preference:
-      1. systemd journal (if the system service is installed on Linux)
-      2. launchd stdout file (macOS)
-      3. ``~/.kiro/crew/gateway.log`` (foreground gateway)
+      1. the USER journal (``journalctl --user``) when the per-user unit — the
+         SELinux remedy's gateway — is the one running, or the only one installed
+      2. systemd journal (if the system service is installed on Linux)
+      3. launchd stdout file (macOS)
+      4. ``~/.kiro/crew/gateway.log`` (foreground gateway)
     """
     follow = bool(getattr(args, "follow", False))
     lines = int(getattr(args, "lines", 100) or 100)
@@ -2713,7 +2853,35 @@ def _logs_cmd(args: argparse.Namespace) -> None:
         resources=f"follow={follow} lines={lines} platform={plat.value}",
     )
 
-    if plat == Platform.SYSTEMD and svc_linux.UNIT_PATH.exists():
+    system_unit = plat == Platform.SYSTEMD and svc_linux.UNIT_PATH.exists()
+    user_unit = plat == Platform.SYSTEMD and svc_linux.user_unit_installed()
+    # A gateway running as the per-user unit (what the SELinux refusal hands the
+    # operator) logs to the account's OWN journal, which the system-scope arm
+    # below never opens — and that arm always execs or exits once the system unit
+    # file exists, so on a host where a stopped system unit was left beside the
+    # running user unit it would tail the dead unit's journal. The user journal
+    # therefore goes first whenever its unit is the running one (or the only
+    # one). `journalctl --user` reads it without privilege, so there is no sudo
+    # rung here: an empty probe means the user journal holds nothing readable
+    # (no persistent journal, or none for this unit yet), and the next source is
+    # the honest fallback rather than a password prompt. `--quiet` matters: a
+    # journal with no matching entries prints `-- No entries --` on STDOUT with
+    # exit 0 (systemd 252), which would pass the emptiness check and exec a tail
+    # of nothing; quiet suppresses that notice so an empty journal reads empty.
+    if user_unit and (not system_unit or svc_linux.user_unit_active()):
+        base = ["journalctl", "--user", "--no-pager", "-u", unit, "-n", str(lines)]
+        probe = subprocess.run(
+            ["journalctl", "--user", "--quiet", "-u", unit, "-n", "1", "--no-pager"],
+            capture_output=True,
+            check=False,
+            **UTF8_TEXT,
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            if follow:
+                base.append("-f")
+            os.execvp("journalctl", base)
+
+    if system_unit:
         # Try journalctl unprivileged first — it works if the user is in
         # the `systemd-journal` or `adm` group. Only fall back to sudo
         # journalctl if the unprivileged probe returns no rows. Without

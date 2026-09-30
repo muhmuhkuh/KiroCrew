@@ -11,17 +11,21 @@ import json
 import logging
 import math
 import os
+import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import unittest.mock
 from pathlib import Path
 
 import pytest
 
 from kiro_crew import crew_log as lg
-from kiro_crew import executors
+from kiro_crew import executors, session_map
 from kiro_crew.crew_log import crew_log_path, crew_log_root, emit
+from kiro_crew.crew_log import projection as crew_log_projection
 from kiro_crew.crew_log.lease import LEASE_FILE
 from kiro_crew.dashboard import server as server_module
 from kiro_crew.platform_compat import file_lock
@@ -1533,6 +1537,23 @@ def test_a_rerun_immediately_after_a_resume_does_not_reuse_the_attempt():
     ), f"the rerun reused the attempt: {starts[1]['data']}"
 
 
+def test_the_attempt_seed_keeps_readable_counts_before_a_backward_tail():
+    _open_session()
+    emit.on_turn_started(SESSION, 7, "user", attempt=2)
+    emit.on_turn_completed(SESSION, 7, stop_reason="end_turn")
+    assert emit.flush()
+    emit.reset_caches()
+
+    path = _log_path()
+    started = path.read_bytes().splitlines(keepends=True)[2]
+    with open(path, "ab") as damaged:
+        damaged.write(started)
+
+    emit.on_session_opened(SESSION, agent="kirocrew", slot="chat-7")
+    assert emit.flush()
+    assert emit._next_attempt(SESSION, 7) == 3
+
+
 def test_the_turn_closer_is_the_last_entry_of_its_turn():
     # `turn/completed` is the one entry whose POSITION carries meaning. A reader
     # folding in order treats it as the turn's boundary, so a `message/sent`
@@ -1897,7 +1918,7 @@ def test_an_empty_body_writes_no_sent_entry_at_all():
 
 def test_every_new_family_is_silent_with_the_flag_off(monkeypatch):
     _open_session()
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     before = len(_body())
     emit.on_message_received(SESSION, 1, text="x")
     emit.on_message_sent(SESSION, 1, text="y")
@@ -1914,11 +1935,11 @@ def test_a_disabled_emitter_does_no_payload_work_at_all(monkeypatch):
 
     Hashing a tool result is proportional to its size and redaction walks a whole
     body, both once per frame on the event loop. An emitter that did that work and
-    then discarded it inside the writer would charge every user for a feature that
-    is off by default.
+    then discarded it inside the writer would charge a user who switched the log
+    off for work it then throws away.
     """
     _open_session()
-    monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "0")
     worked: list[str] = []
     monkeypatch.setattr(
         emit, "_payload_digest", lambda payload: worked.append("digest") or ("", -1)
@@ -2373,6 +2394,93 @@ def test_a_resume_leaves_a_child_the_registry_still_lists_alone():
         assert [e for e in _body() if e["type"] == "subagent/failed"] == []
     finally:
         emit.set_child_liveness(None)
+
+
+def _closer(kind: str) -> dict:
+    """The one closer of *kind* in the log, so a test reads its data directly."""
+    closers = [e for e in _body() if e["type"] == kind]
+    assert len(closers) == 1, f"expected exactly one {kind}, saw {len(closers)}"
+    return closers[0]["data"]
+
+
+def test_a_completed_child_records_the_credits_it_billed():
+    """A child's spend is measured, so the parent's log carries it.
+
+    ``SubagentInfo.credits`` accumulates the charge across every attempted turn, and
+    the parent's log is the durable record of it: the runtime's own copy dies with
+    the process.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+    emit.on_subagent_completed(SESSION, agent_id="sub-1", duration_ms=7, credits=1.5)
+    assert emit.flush()
+    assert _closer("subagent/completed")["credits"] == 1.5
+
+
+def test_a_child_billed_nothing_writes_no_credits_key_at_all():
+    """Absent means unmetered, and zero would claim a measurement of zero.
+
+    A provider that does not bill in credits reports 0.0 through the shared
+    ``TurnUsage`` contract, which is indistinguishable at this seam from a run that
+    was genuinely free. Writing the zero would present one as the other, so the key
+    is dropped -- the same posture ``background/completed`` takes.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+    emit.on_subagent_completed(SESSION, agent_id="sub-1", duration_ms=7, credits=0.0)
+    assert emit.flush()
+    assert "credits" not in _closer("subagent/completed")
+
+
+@pytest.mark.parametrize("outcome", ["failed", "stopped"])
+def test_a_child_that_did_not_finish_still_records_what_it_spent(outcome):
+    """A failed or stopped run billed for the turns it did attempt.
+
+    The credits are cumulative across attempts, including billed retries that failed
+    before the last one, so the non-success closer is exactly where the charge would
+    otherwise be lost.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+    emit.on_subagent_failed(
+        SESSION, agent_id="sub-1", reason="boom", outcome=outcome, duration_ms=3, credits=0.75
+    )
+    assert emit.flush()
+    data = _closer("subagent/failed")
+    assert data["outcome"] == outcome
+    assert data["credits"] == 0.75
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_charge_is_not_written_at_all(bad):
+    """``inf > 0`` is True, so the positive-only gate alone would write it.
+
+    The charge arrives from a provider usage report. A non-finite one is not a
+    measurement, and a reader that sums it has no way back: every later total is
+    non-finite too. The writer refuses it rather than handing the fold a value the
+    fold must then defend against.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+    emit.on_subagent_completed(SESSION, agent_id="sub-1", duration_ms=7, credits=bad)
+    assert emit.flush()
+    assert "credits" not in _closer("subagent/completed")
+
+
+@pytest.mark.parametrize("outcome", ["failed", "stopped"])
+def test_a_child_that_did_not_finish_and_billed_nothing_writes_no_credits(outcome):
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+    emit.on_subagent_failed(
+        SESSION, agent_id="sub-1", reason="boom", outcome=outcome, duration_ms=3, credits=0.0
+    )
+    assert emit.flush()
+    assert "credits" not in _closer("subagent/failed")
 
 
 def test_the_child_probe_reports_present_while_this_session_owes_an_entry():
@@ -3140,11 +3248,11 @@ def test_flag_off_writes_no_file_at_all(monkeypatch):
     assert not _store_root().exists()
 
 
-def test_flag_unset_writes_no_file_at_all(monkeypatch):
+def test_flag_unset_records_by_default(monkeypatch):
     monkeypatch.delenv(emit.CREW_LOG_ENV, raising=False)
-    assert emit.enabled() is False
+    assert emit.enabled() is True
     _open_session()
-    assert not _store_root().exists()
+    assert _log_path().is_file()
 
 
 def test_flag_off_allocates_no_state_either(monkeypatch):
@@ -3185,14 +3293,16 @@ def test_a_flag_turned_off_mid_turn_still_releases_what_it_allocated(monkeypatch
     assert SESSION not in emit._pinned
 
 
-@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on"])
-def test_the_flag_accepts_the_repo_truthy_spellings(monkeypatch, value):
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", " yes ", "on", "", "  "])
+def test_the_flag_is_on_when_empty_or_truthy(monkeypatch, value):
     monkeypatch.setenv(emit.CREW_LOG_ENV, value)
     assert emit.enabled() is True
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "2"])
-def test_the_flag_rejects_everything_else(monkeypatch, value):
+@pytest.mark.parametrize(
+    "value", ["0", "false", "FALSE", " no ", "off", "Off", "2", "disable", "fasle"]
+)
+def test_the_flag_is_off_for_a_falsy_or_unrecognised_spelling(monkeypatch, value):
     monkeypatch.setenv(emit.CREW_LOG_ENV, value)
     assert emit.enabled() is False
 
@@ -4810,7 +4920,7 @@ print(
 
 
 def _boot_probe(tmp_path: Path) -> dict:
-    """Import a boot-path module in a CLEAN interpreter with the flag unset.
+    """Import a boot-path module in a CLEAN interpreter with the flag off.
 
     A clean process is the only place this is observable: the suite has already
     imported both the emitter and its storage package, so an in-process check
@@ -4821,6 +4931,7 @@ def _boot_probe(tmp_path: Path) -> dict:
         "PATH": os.environ.get("PATH", ""),
         "TMPDIR": str(tmp_path),
         "KIROCREW_HOME": str(tmp_path / "home"),
+        "KIROCREW_CREW_LOG": "0",
     }
     if sys.platform == "win32":  # pragma: no cover - parity with the lease suite
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
@@ -4858,10 +4969,7 @@ def test_a_flag_off_launch_does_not_load_the_storage_subsystem(tmp_path: Path) -
     """
     seen = _boot_probe(tmp_path)
     assert seen["glue"], "the probe did not reach the emitter at all, so it proves nothing"
-    assert seen["storage"] == [], (
-        "a launch with KIROCREW_CREW_LOG unset imported the storage subsystem: "
-        f"{seen['storage']}"
-    )
+    assert seen["storage"] == [], f"a flag-off launch imported storage: {seen['storage']}"
 
 
 def test_a_flag_off_launch_registers_no_shutdown_hook(tmp_path: Path) -> None:
@@ -5015,6 +5123,40 @@ def test_a_closed_session_does_not_leave_its_creation_failure_flagged():
     ), "a closed session left its creation-failure flag behind"
 
 
+def test_a_closed_session_does_not_leave_its_overflow_count_behind(monkeypatch):
+    """The per-session overflow count dies with the session, not at the next reset.
+
+    ``overflow_writes(session_id)`` answers "did an append for this session overflow",
+    which a writer reads to tell a landed append from a dropped one. It is therefore
+    per SESSION and read only while that session is writing -- so, like every other
+    per-session map, it is released in the close path's terminal cleanup. Left to
+    ``reset_caches`` a gateway that runs for weeks keeps one ``str -> int`` entry for
+    every session that ever overflowed, and a successor reusing the id would read a
+    count it did not earn.
+
+    Its sibling ``_overflow_reported`` is deliberately NOT touched here: that one is a
+    report-once latch cleared on recovery in ``_note_progress``, it predates this
+    change, and its own lifetime is main's to decide.
+    """
+    _open_session()
+    assert emit.flush()
+
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 0)
+    emit._buffer(
+        SESSION,
+        emit._PendingJob(job=lambda: None, what="overflowed append", nbytes=31),
+    )
+    assert emit.overflow_writes(SESSION) == 1, "the fixture did not record an overflow"
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 100_000)
+
+    emit.on_session_closed(SESSION, reason="test")
+    assert emit.flush(timeout=20.0)
+
+    assert (
+        SESSION not in emit._overflow_by_session
+    ), "a closed session left its overflow count behind"
+
+
 # --- loss debt survives until its marker lands -----------------------------
 
 
@@ -5137,3 +5279,1734 @@ def test_the_live_turn_cap_overage_is_reported_once_not_per_event(monkeypatch, c
         "the live-turn cap overage was reported "
         f"{len(overage_lines)} times, not once: {[r.getMessage() for r in overage_lines]}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# A superseded crew log: the `previous` edge that names it
+# --------------------------------------------------------------------------- #
+
+#: The successor id a superseded-session test opens after ``SESSION``. A restart
+#: cold-starts the slot's ACP session under a new id, which is why the successor
+#: gets a crew log of its own rather than re-attaching to this one.
+SUCCESSOR = "acp-sess-0002"
+
+
+def _open_successor(**kwargs) -> None:
+    """Open ``SUCCESSOR`` on the same slot ``_open_session`` uses."""
+    emit.on_session_opened(
+        SUCCESSOR,
+        agent="kirocrew",
+        slot="chat-7",
+        model="claude-opus-5",
+        cwd="/home/dev/project",
+        owner="default",
+        **kwargs,
+    )
+
+
+def test_a_new_store_for_a_slot_that_had_one_names_it_as_previous():
+    """The edge `resumed` cannot express, because the successor is a different unit.
+
+    A slot outlives its ACP session. When the session is torn down and the
+    successor cold-starts under a new id, `CrewLog.exists` is false for that id,
+    so the emitter CREATES a second crew log for one slot. `resumed` is correctly
+    false there -- nothing re-attached -- and without this edge no field in either
+    file says the two belong to the same slot.
+    """
+    _open_session()
+    assert emit.flush()
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+
+    opened = [e for e in _body(SUCCESSOR) if e["type"] == "session/opened"]
+    assert len(opened) == 1
+    assert opened[0]["data"]["previous"] == {"sid": SESSION}
+    # Not redefined: the successor did not re-attach to anything.
+    assert opened[0]["data"]["resumed"] is False
+    # The edge is written on the SUCCESSOR only. The superseded log was written by
+    # a session that never learns its successor's id, the same asymmetry `parent`
+    # is recorded on the child for.
+    assert "previous" not in _body(SESSION)[0]["data"]
+
+
+def test_a_slots_first_store_names_no_previous():
+    """Absent, not empty: "first crew log" has to be readable as its own case.
+
+    A `previous` carrying an empty sid would read as an earlier crew log with an
+    empty name, and a chain walker would try to open it.
+    """
+    _open_session()
+    assert emit.flush()
+    assert "previous" not in _body(SESSION)[0]["data"]
+
+
+def test_a_resume_of_the_same_store_writes_no_previous_edge():
+    """A store cannot be its own predecessor, and the emitter decides that here.
+
+    The caller passes the id the slot was MAPPED to, which on the resume path is
+    this session itself. Normally that is harmless because a resume re-attaches
+    and never creates. The case that needs the comparison is a resumed session
+    whose crew log is GONE: retention removes whole crew logs, so `session/load`
+    can succeed while `CrewLog.exists` is false, and the emitter then creates a
+    second crew log under the SAME id it was handed as the predecessor. Taking the
+    caller's value on trust writes `previous {sid: <self>}` there, and a chain
+    walker revisits the store it started from.
+
+    Mutation guard: dropping the `previous_sid != session_id` comparison writes a
+    self-edge here.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    assert emit.flush()
+
+    # Retention's effect on this unit, without waiting for retention.
+    _log_path(SESSION).unlink()
+    emit.reset_caches()
+    assert not lg.CrewLog.exists(lg.KIND_SESSION, SESSION)
+
+    emit.on_session_opened(
+        SESSION, agent="kirocrew", slot="chat-7", resumed=True, previous_sid=SESSION
+    )
+    assert emit.flush()
+
+    opened = [e for e in _body(SESSION) if e["type"] == "session/opened"]
+    assert len(opened) == 1, "the re-created crew log carries exactly one opener"
+    assert "previous" not in opened[0]["data"]
+    # And a reader stepping back from it is not sent to itself.
+    assert crew_log_projection.read_projection(SESSION, "status").value["previous"] is None
+
+
+def test_a_warm_reuse_of_a_live_store_writes_nothing_at_all():
+    """The silent case is still silent, edge or no edge.
+
+    Every turn calls this, and a warm reuse of a crew log this process already
+    holds has nothing new to say. A `previous_sid` arriving on such a turn (the
+    map names this same session, which is the ordinary steady state) must not turn
+    a silent claim into a second opener.
+    """
+    _open_session()
+    assert emit.flush()
+    before = len(_body(SESSION))
+
+    emit.on_session_opened(SESSION, agent="kirocrew", slot="chat-7", previous_sid=SESSION)
+    assert emit.flush()
+    assert len(_body(SESSION)) == before, "a warm reuse appended something"
+
+
+def test_a_re_attach_names_no_predecessor():
+    """Only a CREATE may name a predecessor, because only a create superseded one.
+
+    A re-attach already has its store, so a unit the caller names alongside it is
+    either that same store or an unrelated one. Writing the edge there would claim
+    a supersede that did not happen, and point a chain walker at a store this slot
+    never wrote.
+
+    Mutation guard: dropping `created` from the latch condition writes the edge
+    here.
+    """
+    # A bystander with work in flight, on a different slot.
+    bystander = "acp-sess-bystander"
+    emit.on_session_opened(bystander, agent="kirocrew", slot="chat-9")
+    emit.on_turn_started(bystander, 1, "user")
+    assert emit.flush()
+
+    _open_session()
+    assert emit.flush()
+    emit.reset_caches()
+    # A re-attach to a store that EXISTS, handed an unrelated unit as predecessor.
+    emit.on_session_opened(
+        SESSION, agent="kirocrew", slot="chat-7", resumed=True, previous_sid=bystander
+    )
+    assert emit.flush()
+
+    for entry in [e for e in _body(SESSION) if e["type"] == "session/opened"]:
+        assert "previous" not in entry["data"]
+    assert [
+        e for e in _body(bystander) if e["type"] == "turn/completed"
+    ] == [], "the bystander's live turn was closed by another session's re-attach"
+
+
+def test_a_candidate_from_another_slot_is_not_linked():
+    """`previous` means the SAME slot, so the candidate's own header must say so.
+
+    The id arrives from the slot-to-session mapping, a persisted file whose entry
+    can be stale or recycled by the time a successor cold-starts. Comparing that
+    mapping against itself proves nothing, so the check reads the candidate crew
+    log's own header -- written once at create, never rewritten -- and links only a
+    candidate that names this slot. Otherwise a reader following the edge lands in
+    a crew log this slot never wrote.
+
+    Mutation guard: removing the check links the other slot's crew log here.
+    """
+    # A crew log belonging to a DIFFERENT slot, fully written.
+    other = "acp-sess-other-slot"
+    emit.on_session_opened(other, agent="kirocrew", slot="chat-9", cwd="/home/dev/project")
+    assert emit.flush()
+
+    _open_successor(previous_sid=other)
+    assert emit.flush()
+
+    opened = [e for e in _body(SUCCESSOR) if e["type"] == "session/opened"]
+    assert len(opened) == 1
+    assert "previous" not in opened[0]["data"], "a crew log from another slot was linked"
+
+
+def test_a_candidate_whose_crew_log_is_gone_is_not_linked_and_costs_no_entry():
+    """Unverifiable is not the same as verified, and the entry still lands.
+
+    Retention removes whole crew logs, so a successor can name a predecessor whose
+    header is unreadable. That candidate is not KNOWN to be this slot's, so
+    no edge is written -- ending the walk one link early beats sending a reader
+    somewhere unverified. The successor's own record is what this job owes, and the
+    refusal must not take it down too.
+    """
+    _open_successor(previous_sid="acp-sess-never-existed")
+    assert emit.flush()
+
+    opened = [e for e in _body(SUCCESSOR) if e["type"] == "session/opened"]
+    assert len(opened) == 1
+    assert "previous" not in opened[0]["data"]
+
+
+def test_the_previous_edge_survives_a_retry_that_finds_the_header_already_written():
+    """Latched with the create decision, for the same reason that one is.
+
+    A retry after the header landed but the entry did not reads `exists` true and
+    `created` false. An unlatched edge would be dropped exactly there, silently
+    and permanently, while the entry it belongs to still gets written.
+
+    Mutation guard: reading `created` instead of the latch drops `previous` here.
+    """
+    _open_session()
+    assert emit.flush()
+
+    calls = {"n": 0}
+    real_append = lg.CrewLog.append
+
+    def _fail_the_first_append(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1 and self.id == SUCCESSOR:
+            raise OSError("the entry did not land, the header did")
+        return real_append(self, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(lg.CrewLog, "append", _fail_the_first_append)
+        _open_successor(previous_sid=SESSION)
+        assert emit.flush()
+        assert emit.flush()
+
+    opened = [e for e in _body(SUCCESSOR) if e["type"] == "session/opened"]
+    assert len(opened) == 1, "the retried entry landed more or less than once"
+    assert opened[0]["data"]["previous"] == {"sid": SESSION}
+
+
+def test_a_reader_joins_both_stores_of_one_slot_through_the_status_fold():
+    """The read side: one slot's history, joined across the supersede boundary.
+
+    Each fold reads ONE crew log, which is what the routes and the crew-log MCP
+    server address. `previous` is what lets a reader that wants the SLOT rather
+    than the session step from the newest crew log to the one before it, one fold
+    at a time, through the projection route that already exists.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    assert emit.flush()
+    # The predecessor's ACP session is gone before the successor opens, so this
+    # process holds none of its live state -- a gateway restart's shape. A live
+    # record left standing would mean a turn still RUNNING, which the repair
+    # correctly declines to close.
+    emit.reset_caches()
+    _open_successor(previous_sid=SESSION)
+    emit.on_turn_started(SUCCESSOR, 1, "user")
+    emit.on_turn_completed(SUCCESSOR, 1, stop_reason="end_turn")
+    assert emit.flush()
+
+    newest = crew_log_projection.read_projection(SUCCESSOR, "status").value
+    assert newest["slot"] == "chat-7"
+    assert newest["turn_open"] is False
+    # The edge a reader follows to reach the rest of this slot's history.
+    assert newest["previous"] == SESSION
+
+    older = crew_log_projection.read_projection(newest["previous"], "status").value
+    assert older["slot"] == "chat-7", "one slot, two crew logs"
+    assert older["previous"] is None, "the oldest crew log ends the walk"
+    # The superseded turn is CLOSED. The edge is a citation and the repair is a
+    # separate job, queued into the predecessor's own write order -- so a reader
+    # joining the slot sees both crew logs and an ended turn in each, and can tell
+    # the older one's last turn was interrupted rather than still running.
+    assert older["turn_open"] is False
+
+
+# --------------------------------------------------------------------------- #
+# A superseded crew log: closing its interrupted tail
+# --------------------------------------------------------------------------- #
+
+
+def _dangling_predecessor() -> None:
+    """Leave ``SESSION`` with an open turn and an open tool call, then flush.
+
+    The exact shape a torn-down ACP session leaves behind: a ``turn/started`` with
+    no ``turn/completed`` and a ``tool/called`` with no result. Both are what a
+    fold cannot tell from a turn still running.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_tool_called(SESSION, 1, name="fs_read", call_id="tc-1")
+    assert emit.flush()
+
+
+def _closers(session_id: str) -> list[dict]:
+    return [e for e in _body(session_id) if e["type"] == "turn/completed"]
+
+
+def test_a_supersede_closes_the_predecessors_interrupted_tail():
+    """The repair half: the successor names the crew log AND closes its open tail.
+
+    A slot outlives its ACP session, so every gateway restart creates a second crew
+    log for one slot and leaves the first with a `turn/started` that has no
+    `turn/completed` and a `tool/called` that has no result. Any fold over that file
+    then reports a turn that never ended and a call that never returned, so the
+    turn's cost, duration and outcome are permanently absent and a reader cannot
+    tell an interrupted turn from one still running.
+
+    Mutation guard: dropping the `_submit(_repair_superseded...)` call from the
+    `session/opened` job leaves both entries below open and reddens this test.
+    """
+    _dangling_predecessor()
+    # The predecessor's ACP session is GONE, so this process holds none of its
+    # in-memory state -- the shape a gateway restart guarantees, and the one the
+    # issue reports. Without this the fixture would leave turn 1's live record
+    # standing, which in production means a turn still RUNNING, and the repair
+    # would correctly stand down on a state no superseded session is ever in.
+    emit.reset_caches()
+    assert _closers(SESSION) == [], "the predecessor's turn is open before the supersede"
+
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+
+    closers = _closers(SESSION)
+    assert len(closers) == 1, "the superseded turn was not closed exactly once"
+    assert closers[0]["data"] == {"turn": 1, "stop_reason": "interrupted"}
+    results = [e for e in _body(SESSION) if e["type"] == "tool/completed"]
+    assert len(results) == 1
+    assert results[0]["data"]["status"] == "unknown"
+    assert results[0]["data"]["call_id"] == "tc-1"
+    # The repair writes into the PREDECESSOR only. The successor's own turn was
+    # never started, so a closer there would be an outcome for a turn that is not
+    # in the file at all.
+    assert _closers(SUCCESSOR) == []
+
+
+def test_the_repair_refuses_a_candidate_whose_header_names_another_slot():
+    """The one place an outcome is authored into a unit that is not this session's.
+
+    The edge already refuses to NAME a crew log whose own header does not name this
+    slot, so this is the guarantee stated where the WRITE happens rather than
+    inherited from a caller two decisions away: whatever reaches this function, a
+    store belonging to another slot is never written into. Driven directly because
+    the edge is what makes it unreachable through `on_session_opened` -- which is
+    the point, not a gap.
+
+    Mutation guard: removing the `_candidate_is_same_slot` branch from
+    `_repair_superseded` closes the bystander's turn and reddens the count below.
+    """
+    bystander = "acp-sess-other-slot"
+    emit.on_session_opened(bystander, agent="kirocrew", slot="chat-99")
+    emit.on_turn_started(bystander, 1, "user")
+    assert emit.flush()
+    # Nothing is live for it any more: a stale pin would stand the repair down for
+    # a reason other than the one under test, and the assertion would pass without
+    # the check it exists to pin.
+    emit._release_session_live(bystander)
+    assert emit.live_turn(bystander) == 0
+
+    emit._repair_superseded(bystander, "chat-7")
+
+    assert _closers(bystander) == [], "a crew log from another slot was written into"
+
+
+def test_the_repair_stands_down_for_a_turn_still_running_in_this_process(caplog):
+    """A running turn closes its own tail truthfully; a synthesised one would lie.
+
+    Same rule as the resume path. Closing a turn that is still producing entries
+    records an outcome it never had and is then followed by the rest of that turn,
+    so the file states two outcomes for one turn with nothing able to say which
+    happened.
+
+    Mutation guard: removing the `live_turn` branch writes the interrupted closer
+    here and reddens the count below.
+    """
+    _dangling_predecessor()
+    # A closer IS owed for turn 2, the other half of the live population: its
+    # terminal is already queued in this same bucket, ahead of this job, so the tail
+    # it closes is closed truthfully and this repair has nothing to add.
+    emit._pin(SESSION, 2)
+    with emit._lock:
+        emit._live[(SESSION, 2)].closer_owed = True
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.crew_log.emit"):
+        emit._repair_superseded(SESSION, "chat-7")
+
+    assert _closers(SESSION) == [], "a turn still running in this process was closed"
+    assert any("still running for it in this process" in r.message for r in caplog.records)
+
+
+def test_a_live_record_with_no_closer_owed_stands_the_repair_down():
+    """A turn mid-flight looks exactly like a leaked record, so neither is touched.
+
+    `closer_owed` is set where a terminal is HANDED OVER, so a turn that is still
+    running has not set it. A forced reset -- the model-switch route with
+    `skip_running` false -- tears a session down in that state and lets the turn go
+    on; its closer is queued later, by its own `finally`. Reading liveness after
+    releasing records on `closer_owed` would drop exactly that turn's record, report
+    0 running, and let this job write `interrupted` ahead of the real
+    `turn/completed` still to come: two outcomes for one turn, in a file nothing
+    rewrites.
+
+    `on_session_closed` preserves those records for this reason, and this asserts the
+    repair does not undo that.
+
+    Mutation guard: restoring a `_release_session_live(previous_sid)` call ahead of
+    the `live_turn` read releases turn 1 (its `closer_owed` is False), the stand-down
+    stops firing, and the closer count below goes from 0 to 1.
+    """
+    _dangling_predecessor()
+    # Turn 1 is pinned with NO closer owed -- the state a reset-mid-turn leaves, and
+    # the state a release keyed on `closer_owed` alone reads as certainly dead.
+    with emit._lock:
+        assert emit._live[(SESSION, 1)].closer_owed is False, "the fixture set up the wrong state"
+    assert emit.live_turn(SESSION) == 1
+
+    emit._repair_superseded(SESSION, "chat-7")
+
+    assert _closers(SESSION) == [], "a turn that may still be running was closed"
+
+
+def test_the_standdown_arms_the_debt_atomically_with_the_liveness_check(monkeypatch):
+    """Liveness read and debt write share ONE lock hold, so no snapshot slips between.
+
+    The producer-thread ceiling path snapshots `_repair_owed` and, finding it empty,
+    re-queues nothing before releasing the terminal's pin. If the stand-down read
+    liveness under one lock acquisition and then wrote the debt under a SECOND, that
+    snapshot could land in the gap -- see an empty slot, re-queue nothing -- and the
+    debt written afterwards would have no consumer, leaving the predecessor's tail
+    open for the life of the file (`residual/crash-data-loss-corruption`).
+
+    The fix reads `_live` inline and sets `_repair_owed` without dropping the lock, so
+    the whole stand-down decision-and-record is ONE acquisition. This counts the
+    acquisitions `_repair_superseded` makes for a live-turn predecessor: the atomic
+    form takes the lock exactly once for the read+write; the split form (`live_turn`
+    then a separate `with _lock`) takes it twice, opening the very window a concurrent
+    ceiling rejection exploits.
+
+    Mutation guard: splitting the read and write back into `running = live_turn(...)`
+    plus a separate `with _lock: _repair_owed[...] = slot` raises the count to 2 and
+    fails the assertion.
+    """
+    _dangling_predecessor()  # turn 1 pinned, closer not owed -> a genuine live turn
+
+    real_lock = emit._lock
+    acquisitions = {"n": 0}
+    counting = {"on": False}
+
+    class _CountLock:
+        def __enter__(self):
+            if counting["on"]:
+                acquisitions["n"] += 1
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            real_lock.release()
+
+        def acquire(self, *a, **k):
+            if counting["on"]:
+                acquisitions["n"] += 1
+            return real_lock.acquire(*a, **k)
+
+        def release(self, *a, **k):
+            return real_lock.release(*a, **k)
+
+    monkeypatch.setattr(emit, "_lock", _CountLock())
+
+    counting["on"] = True
+    emit._repair_superseded(SESSION, "chat-7")
+    counting["on"] = False
+
+    assert SESSION in emit._repair_owed, "the stand-down did not arm the debt"
+    assert _closers(SESSION) == [], "a live turn was closed instead of stood down"
+    assert acquisitions["n"] == 1, (
+        "the stand-down's liveness read and debt write must share ONE lock "
+        f"acquisition; took {acquisitions['n']} -- a gap between them lets a "
+        "concurrent ceiling rejection consume the empty debt slot"
+    )
+
+
+def test_the_repair_leaves_an_unmatched_child_open():
+    """A repairing process cannot answer for another session's children.
+
+    A child outlives the turn that asked for it and can still file its own real
+    terminal. A synthesised `unknown` ahead of that would leave two outcomes for one
+    `agent_id` in a file nothing rewrites, so no `child_gone` predicate is passed
+    and the opener stands: a reader is left one fact short rather than wrong.
+
+    Mutation guard: passing `child_gone=_child_gone_probe(previous_sid)` writes a
+    `subagent/failed` here. The probe below is what makes that mutation observable:
+    with no probe registered -- the default every test gets -- the store closes no
+    child whatever the caller passes, so the assertion would hold against the
+    mutation and pin nothing.
+    """
+    emit.set_child_liveness(lambda agent_id: False)
+    try:
+        _open_session()
+        emit.on_turn_started(SESSION, 1, "user")
+        emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1")
+        assert emit.flush()
+        # The predecessor's ACP session is gone, so this process holds none of its
+        # live state. Left standing, turn 1's record means a turn still RUNNING and
+        # the repair correctly stands down, which is a state no superseded session
+        # is in. This does not clear the child-liveness probe set above.
+        emit.reset_caches()
+
+        _open_successor(previous_sid=SESSION)
+        assert emit.flush()
+    finally:
+        emit.set_child_liveness(None)
+
+    assert [e for e in _body(SESSION) if e["type"] == "subagent/failed"] == []
+    # The turn itself IS closed, so this is not a repair that did nothing.
+    assert len(_closers(SESSION)) == 1
+
+
+def test_a_predecessor_collected_during_the_deferral_costs_no_dropped_write():
+    """Retention can collect the unit while the repair waits behind its writes.
+
+    The window is as long as the predecessor's outstanding writes, and a crew log
+    can be collected inside it. Opening a unit that is gone raises `no_ledger`,
+    which is a permanent refusal: the writer drops the job and counts it in
+    `dropped_writes`, reporting a hole in a file that is gone.
+
+    Queued directly rather than through `on_session_opened`, because the EDGE
+    refuses a candidate that is already gone -- so a collected unit reaches this
+    branch only through the race the branch exists for: collected AFTER the edge
+    decision and BEFORE this job runs. Reaching it any other way would be a
+    different test wearing this name.
+
+    Mutation guard: removing the `_candidate_is_same_slot` branch lets the open
+    raise, which drops the append and reddens the count below. A separate `exists`
+    check ahead of that branch can change no outcome, because the branch returns
+    before the open.
+    """
+    _dangling_predecessor()
+    emit.reset_caches()
+    before = emit.dropped_writes()
+    shutil.rmtree(_log_path(SESSION).parent)
+
+    emit._submit(
+        lambda: emit._repair_superseded(SESSION, "chat-7"),
+        "closing a superseded crew log's interrupted tail",
+        SESSION,
+    )
+    assert emit.flush()
+
+    assert emit.dropped_writes() == before, "a collected predecessor was counted as a loss"
+
+
+def test_the_repair_runs_after_an_abandoned_outcome_and_closes_the_tail():
+    """Finding 1: a debt abandoned AFTER the supersede must still end closed.
+
+    The repair must not append a synthesised `interrupted` while a real
+    `turn/completed` for the same turn is still queued or retrying, or the file
+    carries two contradictory outcomes for one turn. Deciding that once at create
+    time -- standing down while the process still owed the predecessor an outcome --
+    left nothing to re-run it: a superseded id is never resumed and nothing maps to
+    it once the successor takes over, so an owed append that then exhausted its
+    retries left the tail open for good, for precisely the crew log that most
+    needed repairing.
+
+    The deferral here is the WRITE QUEUE: the repair is submitted into the
+    predecessor's own bucket, so it runs after that unit's outstanding writes have
+    been attempted, whether they landed or were abandoned. This drives the
+    abandoned half -- the predecessor's real `turn/completed` fails transiently
+    until its attempt budget is spent, so it is dropped and admitted in a
+    `write/dropped` marker, and the tail still ends closed.
+
+    Mutation guard: deciding at create time and standing down on
+    `_owes_entries(previous_sid)` leaves the turn below open.
+    """
+    _dangling_predecessor()
+    emit.reset_caches()
+
+    # The predecessor's real outcome, queued and then abandoned: a TRANSIENT failure
+    # is retained and retried, and the batch is dropped once its attempt budget is
+    # spent -- the exact path finding 1 names. The fixture flattens the backoff to
+    # zero, so the budget is spent without waiting on a clock.
+    attempts = 0
+
+    def _doomed() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("the filesystem stopped answering")
+
+    emit._submit(_doomed, "the predecessor's real turn/completed", SESSION)
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+
+    assert attempts == emit._MAX_WRITE_ATTEMPTS, "the append did not spend its whole budget"
+    # The abandoned outcome is admitted as a loss, and the tail is closed anyway.
+    assert emit.dropped_writes() >= 1, "the doomed append was not given up on"
+    closers = _closers(SESSION)
+    assert len(closers) == 1, "the tail stayed open after its real outcome was abandoned"
+    assert closers[0]["data"] == {"turn": 1, "stop_reason": "interrupted"}
+
+
+def test_a_real_outcome_that_lands_leaves_the_repair_nothing_to_close():
+    """The other half of the same ordering: no second outcome for one turn.
+
+    A real `turn/completed` queued at supersede time is written BEFORE the repair
+    runs, because both sit in the predecessor's bucket and the writer keeps a
+    session's jobs in submission order. The repair then finds no open turn and
+    writes nothing, so the file carries exactly one outcome -- the true one.
+
+    This pins an ASSUMPTION rather than a branch of this change: the repair appends
+    closers only for entries still open, which `_close_interrupted_tail` decides.
+    The day that stops holding, a supersede starts writing a second outcome over a
+    real one, and this reddens instead of a reader discovering it. Deliberately NOT
+    claimed as a mutation guard for the queueing: swapping the repair onto the
+    successor's bucket leaves this green, because the predecessor's bucket was
+    filled first and drains first regardless. The queueing is pinned on its own
+    axis by `test_the_repair_is_queued_under_the_predecessor_not_the_successor`.
+    """
+    _dangling_predecessor()
+    emit.on_tool_completed(SESSION, 1, call_id="tc-1", status="completed")
+    emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
+
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+
+    closers = _closers(SESSION)
+    assert len(closers) == 1, "the repair added a second outcome for one turn"
+    assert closers[0]["data"]["stop_reason"] == "end_turn", "the real outcome was overwritten"
+    statuses = [e["data"]["status"] for e in _body(SESSION) if e["type"] == "tool/completed"]
+    assert statuses == ["completed"], "the repair added a second result for one call"
+
+
+def test_the_repair_is_queued_under_the_predecessor_not_the_successor():
+    """The deferral IS the queue, so which bucket the job enters is the mechanism.
+
+    The writer runs a session's jobs in submission order and orders nothing across
+    sessions, so the repair waits for the predecessor's outstanding writes only
+    while it sits in the predecessor's own bucket. Queued anywhere else it races
+    them, and a synthesised `interrupted` can land ahead of a real
+    `turn/completed` that was already on its way -- two outcomes for one turn, in a
+    file nothing rewrites.
+
+    Asserted on the submission rather than on a written file because that is where
+    the invariant lives: an outcome-level test cannot tell the two readings apart
+    whenever the predecessor's bucket happens to drain first, which in a fixture
+    that fills it first is always.
+
+    Mutation guard: submitting under `session_id` instead of `superseded` reddens
+    the identity below.
+    """
+    _dangling_predecessor()
+    submitted: list[tuple[str, str]] = []
+    real_submit = emit._submit
+
+    def _record(job, what, session_id, *args, **kwargs):
+        submitted.append((what, session_id))
+        return real_submit(job, what, session_id, *args, **kwargs)
+
+    with unittest.mock.patch.object(emit, "_submit", _record):
+        _open_successor(previous_sid=SESSION)
+        assert emit.flush()
+
+    repairs = [entry for entry in submitted if "interrupted tail" in entry[0]]
+    assert len(repairs) == 1, "the repair was queued more or less than once"
+    assert repairs[0][1] == SESSION, "the repair was queued outside the predecessor's bucket"
+    assert repairs[0][1] != SUCCESSOR
+
+
+def test_a_reattach_recovers_the_durable_edge_after_a_crash_lost_the_repair():
+    """The edge is durable, the repair job is not, so a re-attach re-queues it.
+
+    The window the recovery closes: the opening entry carrying `previous.sid` is an
+    append, while the repair rides the in-memory buffer, so a crash between the two
+    loses the repair and a superseded id is never resumed to re-queue it. The
+    predecessor's tail would then read as open for the life of the file.
+
+    The crash is modelled as what a crash actually costs -- the queued repair never
+    runs and the process's memory is gone -- rather than by faking a file state: the
+    supersede is driven for real with the repair job swallowed, then `reset_caches`
+    drops the in-memory state a restart would not have, and the successor re-attaches
+    with `resumed=True`, which is what a later process does to a conversation an
+    earlier one was writing.
+
+    Mutation guard: dropping the `announce.setdefault("recovered_previous", ...)`
+    recovery, or reading the caller's `previous_sid` instead of this log's own entry,
+    leaves the closer count at 0.
+    """
+    _dangling_predecessor()
+    emit.reset_caches()
+
+    # The supersede, with the repair job LOST exactly as a crash loses it: the
+    # opening entry lands durably, the follow-on job never runs.
+    real_submit = emit._submit
+
+    def _swallow_the_repair(job, what, session_id, *args, **kwargs):
+        if "interrupted tail" in what:
+            return None
+        return real_submit(job, what, session_id, *args, **kwargs)
+
+    with unittest.mock.patch.object(emit, "_submit", _swallow_the_repair):
+        _open_successor(previous_sid=SESSION)
+        assert emit.flush()
+
+    assert _closers(SESSION) == [], "the repair was not actually lost, so this proves nothing"
+    # The edge IS durable, which is what makes recovery possible at all.
+    opened = [e for e in _body(SUCCESSOR) if e["type"] == "session/opened"]
+    assert opened and opened[0]["data"]["previous"] == {"sid": SESSION}
+
+    # The restart: no in-memory state survives it.
+    emit.reset_caches()
+    emit.on_session_opened(SUCCESSOR, agent="kirocrew", slot="chat-7", resumed=True)
+    assert emit.flush()
+
+    closers = _closers(SESSION)
+    assert len(closers) == 1, "the re-attach did not recover the lost repair"
+    assert closers[0]["data"] == {"turn": 1, "stop_reason": "interrupted"}
+
+
+def test_the_recovery_reads_this_logs_own_edge_not_the_callers(caplog):
+    """A re-attach must not repair the unit the CALLER names -- it may still be live.
+
+    The latch refuses the caller's `previous_sid` on a re-attach for a stated reason:
+    the unit it names is either this same one or an unrelated one that may still be
+    running, and repairing that is how a live turn gets an outcome it never had. The
+    recovery does not weaken it, because it reads the predecessor from THIS log's own
+    opening entry -- a value an earlier attempt verified against the slot before
+    writing it.
+
+    Here the successor's file carries NO `previous`, and the caller names a live
+    third session on the re-attach. Nothing may be closed.
+
+    Mutation guard: recovering from `previous_sid` rather than from the file closes
+    the third session's open turn and reddens the count below.
+    """
+    third = "sid-a-live-third-session"
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    assert emit.flush()
+    # A successor opened with NO predecessor, so its file records no edge.
+    emit.on_session_opened(SUCCESSOR, agent="kirocrew", slot="chat-7")
+    assert emit.flush()
+    opened = [e for e in _body(SUCCESSOR) if e["type"] == "session/opened"]
+    assert opened and "previous" not in opened[0]["data"], "the fixture wrote an edge"
+
+    emit.reset_caches()
+    with caplog.at_level(logging.INFO, logger="kiro_crew.crew_log.emit"):
+        emit.on_session_opened(
+            SUCCESSOR, agent="kirocrew", slot="chat-7", resumed=True, previous_sid=third
+        )
+        assert emit.flush()
+
+    assert _closers(third) == [], "the caller's named unit was repaired on a re-attach"
+    assert _closers(SESSION) == [], "a unit this log never names was repaired"
+    assert not any("recovered the superseded crew log" in r.message for r in caplog.records)
+
+
+def test_a_superseded_repair_survives_the_pending_ceiling(monkeypatch):
+    """Refusing only the FOLLOW-ON leaves the tail open with nothing to re-queue it.
+
+    The opening entry that queues this repair is itself exempt from the ceiling, so
+    under pressure the successor's crew log is created while a non-exempt follow-on
+    is refused. Nothing re-queues a one-shot job for an id that is never resumed, so
+    the predecessor's `turn/started` and `tool/called` would stay open for the life
+    of a file nothing rewrites -- the exact state this job exists to remove.
+
+    The ceiling has to be in force at the moment the repair is SUBMITTED, which is
+    inside the opener's job body on the writer thread -- not when `_open_successor`
+    returns. So it is held at zero across the release AND the drain, and restored
+    only afterwards. `repair_interrupted_turn` writes through the store handle
+    rather than this queue, so the closers themselves are never ceiling-gated.
+
+    Mutation guard: dropping `exempt_ceiling=True` from the repair's `_submit`
+    leaves the closer count below at 0.
+    """
+    _dangling_predecessor()
+    emit.reset_caches()
+
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+
+    def _occupy_writer() -> None:
+        writer_entered.set()
+        assert release_writer.wait(20.0)
+
+    try:
+        emit._buffer("blocked-writer", _pending(_occupy_writer, "holding the writer"))
+        assert writer_entered.wait(20.0), "the writer was never occupied"
+
+        monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 0)
+        # Positive control that the ceiling is IN FORCE right now, independent of
+        # anything the repair does: a non-exempt probe submitted here is refused.
+        # Without it a ceiling that silently stopped applying would read as a pass.
+        before = emit.overflow_writes()
+        emit._buffer("ceiling-probe", _pending(lambda: None, "a non-exempt probe"))
+        assert emit.overflow_writes() == before + 1, "the ceiling did not reject a non-exempt job"
+
+        _open_successor(previous_sid=SESSION)
+    finally:
+        release_writer.set()
+
+    # Still at zero while the writer drains, because the opener's body -- where the
+    # repair is submitted -- runs on the writer thread.
+    assert emit.flush(timeout=20.0)
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 100_000)
+
+    closers = _closers(SESSION)
+    assert len(closers) == 1, "the ceiling refused the repair and the tail stayed open"
+    assert closers[0]["data"] == {"turn": 1, "stop_reason": "interrupted"}
+
+
+def test_the_ceiling_docstring_names_every_exempt_submission():
+    """The exempt set is enumerated in prose, so the count is DERIVED from the code.
+
+    A hand-copied membership list goes stale silently: a fourth exempt submission
+    would leave the ceiling's docstring saying "Three jobs", which reads as a
+    complete list and is not. This counts the production call sites that pass
+    `exempt_ceiling=True` and asserts the docstring's number word agrees, so adding
+    one reddens here instead of being discovered by a reader.
+
+    Mutation guard: changing the docstring's number word, or adding a fourth
+    `exempt_ceiling=True` submission without updating it, reddens this.
+    """
+    src = Path(emit.__file__).read_text(encoding="utf-8")
+    # The call sites, not the parameter's own declaration or its forwarding inside
+    # `_submit`: those spell it `exempt_ceiling: bool = False` and
+    # `exempt_ceiling=exempt_ceiling`.
+    sites = re.findall(r"^\s*exempt_ceiling=True,$", src, re.MULTILINE)
+    assert len(sites) >= 2, f"the call-site scan found {len(sites)}, so it is not measuring"
+
+    words = {1: "One", 2: "Two", 3: "Three", 4: "Four", 5: "Five"}
+    expected = words[len(sites)]
+    stated = re.search(r"^    (One|Two|Three|Four|Five) jobs? (?:is|are) EXEMPT", src, re.MULTILINE)
+    assert stated is not None, "the ceiling docstring no longer enumerates the exempt set"
+    assert stated.group(1) == expected, (
+        f"{len(sites)} submissions pass exempt_ceiling=True but the ceiling docstring "
+        f"says {stated.group(1)!r}; update it to {expected!r}"
+    )
+
+
+def test_a_dropped_repair_is_requeued_and_the_marker_counts_only_the_real_loss():
+    """A spent retry budget drops the whole retained batch, this job included.
+
+    The deferral that makes this job correct is also how it is lost: it waits in the
+    predecessor's bucket BEHIND entries that crew log already owes, and a filesystem
+    that keeps refusing that session's writes until ``_MAX_WRITE_ATTEMPTS`` is spent
+    drops the entire retained batch -- the owed append and this job with it. Nothing
+    re-queues a one-shot job for an id that is never resumed, so the predecessor's
+    ``turn/started`` would stay open for the life of a file nothing rewrites.
+
+    Two things are asserted, because the fix has two halves. The repair comes back,
+    and it lands BEHIND the ``write/dropped`` marker, so the file states both that
+    entries are missing and that the turn did not finish. And the marker counts ONE
+    loss rather than two: the repair is not missing, it is being submitted again, and
+    counting it would overstate the damage in the one record a reader trusts to say
+    what is gone.
+
+    The wedged disk is driven the way this suite's own retry-loss helper drives it,
+    a job that raises ``OSError`` with the budget spent by hand, rather than by
+    faking a dropped state, and the batch is asserted to have really dropped before
+    anything about recovery is asserted.
+
+    Mutation guard: dropping ``on_permanent_drop`` from the repair's submission
+    leaves the closer count at 0; dropping the ``_uncount_one_requeued_drop`` call
+    leaves the marker claiming 2.
+    """
+    _dangling_predecessor()
+    # A restart leaves no live record behind, and this repair only ever runs for a
+    # predecessor no process is still writing. Dropped BEFORE the loss state exists,
+    # because `reset_caches` clears `_pending_loss` too.
+    emit.reset_caches()
+
+    def _fail() -> None:
+        raise OSError("the predecessor's disk is wedged")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(emit, "_start_drain", lambda: None)
+        # The append that crew log already owes, which the repair waits behind.
+        emit._buffer(
+            SESSION,
+            emit._PendingJob(job=_fail, what="the predecessor's owed append", nbytes=23),
+        )
+        emit.on_session_opened(SUCCESSOR, agent="kirocrew", slot="chat-7", previous_sid=SESSION)
+        for _ in range(emit._MAX_WRITE_ATTEMPTS):
+            with emit._lock:
+                emit._draining = False
+                emit._drain_future = None
+                retry = emit._retry.get(SESSION)
+                if retry is not None:
+                    retry.not_before = 0.0
+            emit._drain_once()
+
+    # The drop really happened, so what follows is about recovery rather than about a
+    # batch that was quietly written after all.
+    assert emit.dropped_writes() >= 1, "the retry budget was never spent"
+    with emit._lock:
+        assert SESSION in emit._pending_loss, "no marker is owed, so nothing was dropped"
+
+    # Driving `_drain_once` by hand above left the writer with nothing scheduled to
+    # drain it, because `_start_drain` was stubbed out for the budget spend, and
+    # `flush` only WAITS for a pass -- it never starts one. So the pass is claimed and
+    # started exactly as a producer does it, which puts the marker and the re-queued
+    # repair through the REAL drain loop. That loop is also why the re-submission
+    # needs no trigger of its own in production: it re-checks `_pending` after every
+    # pass, and the hook runs inside a pass.
+    with emit._lock:
+        retry = emit._retry.get(SESSION)
+        if retry is not None:
+            retry.not_before = 0.0
+        emit._mark_draining_locked()
+    emit._start_drain()
+
+    assert emit.flush(timeout=20.0)
+
+    closers = _closers(SESSION)
+    assert len(closers) == 1, "the dropped repair was not re-queued, so the tail stayed open"
+    assert closers[0]["data"] == {"turn": 1, "stop_reason": "interrupted"}
+
+    body = _body(SESSION)
+    kinds = [entry["type"] for entry in body]
+    markers = [entry for entry in body if entry["type"] == "write/dropped"]
+    assert len(markers) == 1, f"expected exactly one marker, saw {kinds}"
+    assert (
+        markers[0]["data"]["dropped_count"] == 1
+    ), f"the marker counted the re-queued repair as a missing append: {markers[0]['data']}"
+    assert kinds.index("write/dropped") < kinds.index(
+        "turn/completed"
+    ), f"the closer landed ahead of the marker that explains it: {kinds}"
+
+
+def test_a_dropped_terminal_requeues_the_repair_that_stood_down_for_it():
+    """The stand-down is right only while that terminal is still COMING.
+
+    A forced reset tears a session down mid-turn, so its closer is handed over later
+    from the turn's own `finally`, and until then the repair must not write
+    `interrupted` ahead of it. But a terminal that spends its attempt budget is
+    dropped, and then no outcome is coming at all: the predecessor's `turn/started`
+    would stay open for the life of a file nothing rewrites, because the queue orders
+    this job behind entries ALREADY queued, not behind one handed over after it drained.
+
+    The terminal carries a permanent-drop hook for exactly that outcome. `after` cannot
+    serve here: it runs when the append RESOLVES, written or given up on alike, so it
+    cannot tell the two apart, while a permanent-drop hook fires only on the giving up.
+
+    `reset_caches` is deliberately NOT called: the standing live record IS the state a
+    forced reset mid-turn leaves behind, and it is what makes the repair stand down.
+
+    Mutation guard: dropping `on_permanent_drop=_terminal_dropped(...)` from the
+    terminal sites, or the `_repair_owed` write at the stand-down, leaves the closer
+    count at 0.
+    """
+    _dangling_predecessor()
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+
+    assert _closers(SESSION) == [], "the repair did not stand down for the live turn"
+    with emit._lock:
+        assert SESSION in emit._repair_owed, "the stand-down recorded no debt to pay"
+
+    real_append = lg.CrewLog.append
+
+    def _lose_the_terminal(self, entry_type, *args, **kwargs):
+        if entry_type == "turn/completed":
+            raise OSError("the terminal cannot be written")
+        return real_append(self, entry_type, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(lg.CrewLog, "append", _lose_the_terminal)
+        patch.setattr(emit, "_start_drain", lambda: None)
+        emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
+        for _ in range(emit._MAX_WRITE_ATTEMPTS):
+            with emit._lock:
+                emit._draining = False
+                emit._drain_future = None
+                retry = emit._retry.get(SESSION)
+                if retry is not None:
+                    retry.not_before = 0.0
+            emit._drain_once()
+
+    # The terminal really is gone, so what follows is about the re-queue rather than
+    # about a closer that landed after all.
+    assert emit.dropped_writes() >= 1, "the terminal's attempt budget was never spent"
+    with emit._lock:
+        assert SESSION not in emit._repair_owed, "the drop did not consume the debt"
+        retry = emit._retry.get(SESSION)
+        if retry is not None:
+            retry.not_before = 0.0
+        emit._mark_draining_locked()
+    emit._start_drain()
+    assert emit.flush(timeout=20.0)
+
+    closers = _closers(SESSION)
+    assert len(closers) == 1, "the dropped terminal left the predecessor's tail open"
+    assert closers[0]["data"] == {"turn": 1, "stop_reason": "interrupted"}
+
+
+def test_a_terminal_rejected_at_the_ceiling_still_requeues_the_repair(monkeypatch):
+    """A ceiling REJECTION runs a job's permanent-drop hook, just as ``_drop`` does.
+
+    A terminal that stood a repair down carries a permanent-drop hook so its loss
+    re-queues the tail repair. There are TWO ways that terminal is permanently
+    lost, not one: the retry budget spends out in ``_drop`` (covered by the sibling
+    test), or the pending buffer is at its ceiling and the entry is REJECTED at the
+    tail in ``_buffer``'s overflow arm. That arm finishes the rejected entry, and if
+    it finishes it WITHOUT firing ``on_permanent_drop`` the hook never runs -- so a
+    terminal carrying ``_terminal_dropped`` leaves ``_repair_owed`` set with nothing
+    left to consume it, a superseded id is never resumed to re-queue anything, and
+    the predecessor's ``turn/started`` stays open for the life of a file nothing
+    rewrites: the exact ``residual/crash-data-loss-corruption`` this repair closes.
+
+    Driven at the ``_buffer`` seam the finding names, the way this suite's other
+    ceiling tests drive it, because the hazard is a property of the overflow arm
+    itself: the wedged-disk state the ceiling is documented for co-occurs naturally
+    with a forced mid-turn supersede, so the residual is reachable, not extreme.
+
+    Mutation guard: removing the ``on_permanent_drop`` block from ``_buffer``'s
+    overflow arm leaves ``fired`` False.
+    """
+    emit.reset_caches()
+
+    fired: list[str] = []
+    job = emit._PendingJob(
+        job=lambda: None,
+        what="a terminal that overflows the ceiling",
+        nbytes=31,
+        on_permanent_drop=lambda: fired.append("hook"),
+    )
+
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 0)
+    before = emit.overflow_writes()
+    emit._buffer(SESSION, job)
+
+    assert emit.overflow_writes() == before + 1, "the ceiling did not reject the entry"
+    assert fired == ["hook"], (
+        "a ceiling-rejected entry did not fire its permanent-drop hook, so a "
+        "superseded terminal's loss would never re-queue the tail repair"
+    )
+    # Cleared after firing, mirroring `_drop`, so a re-submitting hook cannot see it
+    # a second time.
+    assert job.on_permanent_drop is None, "the hook was fired but not cleared"
+
+
+def test_a_ceiling_rejected_terminal_finishes_before_it_requeues(monkeypatch):
+    """The overflow arm releases the pin BEFORE the re-queue hook runs.
+
+    This arm runs on the PRODUCER thread, and its permanent-drop hook
+    (``_terminal_dropped``) re-submits the tail repair, which the WRITER thread then
+    runs and which stands down while any live turn of the session remains. If the
+    hook fired before ``_finish`` -- ``_finish`` being where this terminal's
+    ``after`` releases the turn's pin via ``_closing`` -> ``_forget_turn`` -- the
+    writer could observe the pin still live, re-record ``_repair_owed``, and then
+    ``_finish`` -> ``_forget_turn`` would erase that freshly-renewed debt with
+    nothing left to re-trigger it, leaving the predecessor's tail open for the life
+    of the file. So the contract is: FINISH first, THEN queue the repair. Unlike
+    ``_drop`` (writer thread, hook-then-finish is safe there because it is
+    serialized ahead of the repair), this call site must reverse the order.
+
+    Mutation guard: moving the ``_finish(pending)`` call back AFTER the hook block
+    in ``_buffer``'s overflow arm records ``order == ["hook", "finish"]`` and fails.
+    """
+    emit.reset_caches()
+
+    order: list[str] = []
+    real_finish = emit._finish
+
+    def _spy_finish(job):
+        order.append("finish")
+        return real_finish(job)
+
+    monkeypatch.setattr(emit, "_finish", _spy_finish)
+
+    job = emit._PendingJob(
+        job=lambda: None,
+        what="a terminal that overflows the ceiling",
+        nbytes=31,
+        on_permanent_drop=lambda: order.append("hook"),
+    )
+
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 0)
+    emit._buffer(SESSION, job)
+
+    assert order == ["finish", "hook"], (
+        "the overflow arm must finish the terminal (release its pin) BEFORE the "
+        f"re-queue hook runs, else the renewed repair debt is erased; saw {order}"
+    )
+
+
+def test_a_ceiling_rejected_terminal_with_a_real_debt_still_closes_the_tail(monkeypatch):
+    """The reviewer's finding: `_finish` clears the debt, so the STALE hook no-ops.
+
+    The overflow arm releases the live-turn pin by running `_finish`, whose `after`
+    (`_closing` -> `_forget_turn`) also pops `_repair_owed` once the session has no
+    live turn left. If the arm then relied on `_terminal_dropped` re-reading the map,
+    that read would find an empty slot and re-queue NOTHING -- the predecessor's tail
+    would stay open for the life of the file (`residual/crash-data-loss-corruption`).
+    But firing the hook BEFORE `_finish` instead re-introduces the cross-thread race
+    where the re-queued repair sees the still-live pin and its renewed debt is erased.
+    The arm must therefore SNAPSHOT the debt before `_finish` and re-queue from the
+    snapshot after the pin is released -- which is what this test pins.
+
+    Driven at the `_buffer` seam the finding names (the way the sibling ceiling test
+    drives it), with the REAL `_terminal_dropped` hook and a REAL debt armed by the
+    stand-down, so the failure mode is the actual map-clear/hook-no-op interaction
+    rather than a synthetic hook. After the rejection the debt must be consumed AND a
+    tail-repair job must be queued into the predecessor's bucket.
+
+    Mutation guard: reverting the arm to fire `_terminal_dropped` AFTER `_finish`
+    (reading the already-popped `_repair_owed`) leaves no repair queued -- `queued`
+    stays empty.
+    """
+    _dangling_predecessor()
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+
+    assert _closers(SESSION) == [], "the repair did not stand down for the live turn"
+    with emit._lock:
+        assert SESSION in emit._repair_owed, "the stand-down recorded no debt to pay"
+        owed_slot = emit._repair_owed[SESSION]
+        # The stand-down pinned a live turn for SESSION; that pin is what `_finish`
+        # releases. Release it here is the job of `_finish` under test -- leave it.
+
+    # Capture what gets submitted to the writer, so we can prove a repair was queued
+    # rather than silently dropped.
+    queued: list = []
+    real_queue = emit._queue_tail_repair
+
+    def _spy_queue(previous_sid, slot, **kwargs):
+        queued.append((previous_sid, slot))
+        return real_queue(previous_sid, slot, **kwargs)
+
+    monkeypatch.setattr(emit, "_queue_tail_repair", _spy_queue)
+
+    # A terminal for SESSION carrying the real drop hook, rejected at the ceiling.
+    job = emit._PendingJob(
+        job=lambda: None,
+        what="SESSION's terminal that overflows the ceiling",
+        nbytes=31,
+        on_permanent_drop=emit._terminal_dropped(SESSION),
+        after=emit._closing(SESSION, 1),
+    )
+    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 0)
+    before = emit.overflow_writes()
+    emit._buffer(SESSION, job)
+
+    assert emit.overflow_writes() == before + 1, "the ceiling did not reject the terminal"
+    with emit._lock:
+        assert SESSION not in emit._repair_owed, "the debt was neither re-queued nor cleared"
+    assert queued == [(SESSION, owed_slot)], (
+        "a ceiling-rejected terminal with a real debt did not re-queue the tail "
+        f"repair from the snapshot -- the predecessor's tail stays open; saw {queued}"
+    )
+
+
+def test_a_landed_terminal_pays_the_debt_and_the_repair_writes_nothing():
+    """The other half: a terminal that LANDS closes the tail truthfully.
+
+    The stand-down deferred to this turn's real outcome, and here it arrives, so the
+    debt is simply paid and nothing may be re-queued or synthesised. The turn must end
+    with its OWN `end_turn`, not with an `interrupted` written beside it -- two outcomes
+    for one turn is the corruption the stand-down exists to avoid, and a debt that is
+    never cleared would also grow the record once per supersede for the life of the
+    process.
+
+    Mutation guard: dropping the `_repair_owed.pop` from `_forget_turn` leaves the debt
+    standing and reddens the emptiness assertion below.
+    """
+    _dangling_predecessor()
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+    with emit._lock:
+        assert SESSION in emit._repair_owed, "the stand-down recorded no debt to pay"
+
+    emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
+    assert emit.flush(timeout=20.0)
+
+    with emit._lock:
+        assert SESSION not in emit._repair_owed, "a landed terminal left the debt standing"
+
+    closers = _closers(SESSION)
+    assert len(closers) == 1, f"the turn got {len(closers)} outcomes, not one"
+    assert closers[0]["data"]["stop_reason"] == "end_turn", (
+        "the real outcome was replaced or shadowed by a synthesised one: " f"{closers[0]['data']}"
+    )
+
+
+def test_a_nested_turn_landing_first_does_not_pay_a_sibling_turns_debt():
+    """The debt is keyed by SESSION, so a nested turn must not clear it early.
+
+    A session can hold several live turns at once -- a nested turn pins its own
+    record while its parent's is still open. The repair stood down because SOME
+    live turn made closing the predecessor's tail unsafe, and it stays unsafe while
+    ANY live turn of the session remains. If the FIRST terminal to land cleared the
+    per-session debt, a later live turn whose own terminal then DROPS would have
+    nothing left to re-queue the repair, and the predecessor's `turn/started` would
+    stay open for the life of a file nothing rewrites -- the
+    `residual/crash-data-loss-corruption` this repair exists to close.
+
+    Driven at the `_forget_turn` seam with two live turns pinned and a debt owed:
+    resolving the inner turn must leave the debt standing, and only resolving the
+    last live turn may pay it.
+
+    Mutation guard: reverting `_forget_turn` to pop `_repair_owed` unconditionally
+    reddens the first assertion below.
+    """
+    emit.reset_caches()
+    # Two live turns for one session -- a parent and a nested child.
+    emit._pin(SESSION, 1)
+    emit._pin(SESSION, 2)
+    with emit._lock:
+        _live_sessions = {sid for (sid, _) in emit._live}
+        assert SESSION in _live_sessions, "the fixture did not pin the live turns"
+        # The stand-down recorded a debt because a live turn made the repair unsafe.
+        emit._repair_owed[SESSION] = "chat-7"
+
+    # The inner turn's terminal lands first. Its sibling (turn 1) is still live, so
+    # the debt must NOT be paid yet.
+    emit._forget_turn(SESSION, 2)
+    with emit._lock:
+        assert SESSION in emit._repair_owed, (
+            "a nested turn landing first paid the debt while a sibling turn was "
+            "still live -- a later dropped terminal would then never re-queue the repair"
+        )
+
+    # The last live turn resolves. Now the debt is genuinely paid.
+    emit._forget_turn(SESSION, 1)
+    with emit._lock:
+        assert (
+            SESSION not in emit._repair_owed
+        ), "the debt survived after the session's last live turn resolved"
+
+
+def test_a_cleared_sid_still_names_the_predecessor():
+    """`clear_sid` drops the POINTER, not the history, so the edge survives it.
+
+    A provider switch and the poisoned-conversation discard both empty `sid` and
+    stash it as `discarded_sid`, saying so in the method's own docstring: the
+    native conversation is still on disk. For the RESUME question the clear is the
+    answer, which is why `get` must not see the stashed id. For the history
+    question it is not: the cleared id is exactly "the id this key was last
+    serving". Reading `sid` alone made a key that had served a session all day
+    report having served none, so the successor spawned after the clear cited no
+    predecessor and the slot's history was truncated with nothing recording it.
+
+    Mutation guard: dropping the `discarded_sid` fallback answers "" here.
+    """
+    mapping = session_map.SessionMap()
+    mapping.set("dashboard:chat-9", SESSION, provider="", cwd="")
+    assert mapping.mapped_sid("dashboard:chat-9") == SESSION
+
+    mapping.clear_sid("dashboard:chat-9")
+
+    # The resume answer and the history answer diverge here, which is the point.
+    assert mapping.get("dashboard:chat-9") in (None, "")
+    assert mapping.mapped_sid("dashboard:chat-9") == SESSION
+
+
+def test_an_oversized_id_in_the_mapping_answers_as_no_predecessor():
+    """This map is agent-writable JSON, so a value read back is input, not a fact.
+
+    An id longer than the bound every other consumer applies would ride into
+    `session/opened.previous`, and an entry over the maximum size is DROPPED rather
+    than truncated -- so one oversized value in this file would cost a record that
+    had nothing to do with it. Answering "" keeps the failure at the size of "no
+    predecessor", which every caller already handles.
+
+    Mutation guard: removing the bound returns the oversized id here.
+    """
+    mapping = session_map.SessionMap()
+    mapping.set("dashboard:chat-big", "x" * 4096, provider="", cwd="")
+
+    assert mapping.mapped_sid("dashboard:chat-big") == ""
+
+    # At the bound it still answers: the rule is a ceiling, not a narrowing.
+    mapping.set("dashboard:chat-fits", "y" * 128, provider="", cwd="")
+    assert mapping.mapped_sid("dashboard:chat-fits") == "y" * 128
+
+
+def test_a_key_that_never_served_a_session_names_no_predecessor():
+    """The fallback must not invent one: absent is still "nothing to follow"."""
+    mapping = session_map.SessionMap()
+    assert mapping.mapped_sid("dashboard:chat-never") == ""
+
+
+def test_a_stale_prune_records_the_id_it_dropped_as_the_keys_latest_store():
+    """Clearing A then pruning B must not leave A standing as the last store.
+
+    Three paths empty ``sid`` in place: the provider switch, the startup prune,
+    and the per-read stale repair. All three must record what they dropped. When
+    only one does, a prune leaves an OLDER id in ``discarded_sid`` and the history
+    reader answers that -- naming a predecessor two links back and orphaning the store
+    between them. Which path emptied the field is not a distinction any reader of
+    it can use, so it cannot be written by only some of them.
+
+    Mutation guard: returning the prune's clear to a bare ``sid = ""`` answers
+    ``acp-sess-A`` here.
+    """
+    mapping = session_map.SessionMap()
+    key = "dashboard:chat-42"
+
+    mapping.set(key, "acp-sess-A", provider="", cwd="")
+    mapping.clear_sid(key)
+    mapping.set(key, "acp-sess-B", provider="", cwd="")
+    assert mapping.mapped_sid(key) == "acp-sess-B"
+
+    # A binding makes the entry outlive its session, so the stale path empties the
+    # pointer in place instead of removing the whole entry.
+    mapping._data[session_map.canonical_key(key)]["slack_thread_ts"] = "1700000000.1"
+
+    # B's transcript does not exist here, which is what prune calls stale.
+    mapping.prune()
+
+    assert mapping.mapped_sid(key) == "acp-sess-B", (
+        "the reader named the older cleared id, so a successor would cite a "
+        "predecessor two links back and skip the store between them"
+    )
+
+
+def test_three_stores_of_one_slot_form_a_chain_with_no_store_skipped():
+    """A to B to C, each citing the one before it rather than the one before that.
+
+    What a reader needs from the edge: following it from the newest store reaches
+    every earlier one exactly once. Each predecessor is handed in directly here,
+    which is what the caller does -- it reads the slot's mapping and latches the
+    answer -- so this pins the chain shape the emitter writes rather than where
+    the caller found the id.
+    """
+    first, second, third = SESSION, SUCCESSOR, "acp-sess-0003"
+
+    emit.on_session_opened(first, agent="kirocrew", slot="chat-7", cwd="/home/dev/project")
+    assert emit.flush()
+
+    emit.on_session_opened(
+        second,
+        agent="kirocrew",
+        slot="chat-7",
+        cwd="/home/dev/project",
+        previous_sid=first,
+    )
+    assert emit.flush()
+
+    emit.on_session_opened(
+        third,
+        agent="kirocrew",
+        slot="chat-7",
+        cwd="/home/dev/project",
+        previous_sid=second,
+    )
+    assert emit.flush()
+
+    def _previous(session_id: str) -> dict | None:
+        opened = [e for e in _body(session_id) if e["type"] == "session/opened"]
+        assert len(opened) == 1
+        return opened[0]["data"].get("previous")
+
+    assert _previous(first) is None
+    assert _previous(second) == {"sid": first}
+    assert _previous(third) == {"sid": second}, "the chain skipped the store between"
+
+
+def test_every_slot_allocation_site_latches_the_predecessor_first():
+    """Site COVERAGE, which the spelling ratchet above cannot give.
+
+    That ratchet pins how the two known sites read the predecessor. It says nothing
+    about a THIRD allocation site added later: such a site publishes its own id over
+    the slot without ever latching, so the store it supersedes is cited by nobody
+    and the chain has a gap a walker cannot see -- the same loss this edge exists to
+    remove, reintroduced by addition rather than by edit, and silently.
+
+    So this reads the allocation calls instead of the latch calls, and requires each
+    one to be preceded by a latch. A new site reds this on the day it is written,
+    which is the only moment anyone is in a position to know whether it should
+    latch.
+
+    The window is generous (the prefetch's latch sits nine lines above its call, the
+    turn's two) and deliberately bounded: a latch hundreds of lines away is not
+    evidence about this call.
+
+    The exact count is asserted too, so a third site cannot arrive unnoticed even if
+    it happens to sit below an unrelated latch.
+
+    Mutation guard: deleting either latch call, or moving it below its allocation,
+    reds this.
+    """
+    runner = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_runner.py"
+    lines = runner.read_text(encoding="utf-8").splitlines()
+    allocations = [i for i, line in enumerate(lines) if "get_or_create(" in line]
+    assert len(allocations) == 2, (
+        "chat_runner now allocates a slot's session at a different number of sites; "
+        f"each one must latch the predecessor first: lines {[i + 1 for i in allocations]}"
+    )
+    window = 30
+    for index in allocations:
+        preceding = lines[max(0, index - window) : index]
+        assert any("latch_crew_log_previous(" in line for line in preceding), (
+            f"the allocation at line {index + 1} publishes a session id for the slot "
+            "without latching the store it supersedes, so that store is left cited "
+            "by nobody and a chain walker steps over it"
+        )
+
+
+def test_the_turn_path_reads_the_predecessor_through_the_non_pruning_accessor():
+    """A source ratchet, because the sources are one identifier apart.
+
+    Three spellings type-check here and only one is right. `mapped_sid` and
+    `resumable_sid` differ by a filesystem stat and a prune, and at this call site
+    that difference is a sync store read on the gateway loop plus the loss of the
+    very edge being recorded. Feeding the latch from the mapping ALONE type-checks
+    too, and is the defect this edge was moved off: the mapping is deliberately a
+    generation behind while an allocation's replay is pending, so a gateway that
+    restarts inside that window cites a generation back and the store between is
+    cited by nobody. Every behavioural test of the emitter passes on any of the
+    three, because the emitter is handed the value rather than choosing it. So the
+    choice is pinned where it is made.
+
+    It is pinned at EVERY site, not one: the slot has two allocation sites -- the
+    eager prefetch and the first real turn -- and a spelling that is right at one
+    and wrong at the other leaves the prefetched half of the fleet recording no
+    edge, which is the shape that shipped broken once already. A site added later
+    that feeds the latch from anything else reds this.
+
+    Mutation guard: feeding either latch from `mapped_sid` directly, or swapping the
+    resolver's own fallback to `resumable_sid`, reds this.
+    """
+    runner = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_runner.py"
+    source = runner.read_text(encoding="utf-8")
+    # Joined because the call can be wrapped across lines; the whole expression is
+    # what this pins, so a line-at-a-time read could not see it.
+    flat = " ".join(source.split())
+    found = re.findall(r"slot\.latch_crew_log_previous\([^)]*\)", flat)
+    # Paren-adjacent spaces dropped, because whether a call fits on one line is the
+    # formatter's business and this ratchet is about what feeds the latch.
+    latches = [call.replace("( ", "(").replace(" )", ")") for call in found]
+    # Both allocation sites, each latching ALL THREE parts of what the one resolver
+    # answered. A site that passed only the sid would latch a slot with an
+    # undetermined predecessor as one that has none; a site that dropped
+    # `from_mapping` would cite the mapping inside the window where it is knowingly a
+    # generation behind, because the slot cannot otherwise tell a mapped id from its
+    # own record.
+    assert latches == [
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided, "
+        "from_mapping=_previous.from_mapping,)",
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided, "
+        "from_mapping=_previous.from_mapping,)",
+    ], f"the predecessor is latched somewhere unexpected: {latches}"
+    # Each of those reads its pair from the one helper that consults the store first.
+    # The `sessions` receiver differs because the prefetch is handed the boundary
+    # directly and the turn reaches it through `state`.
+    resolutions = re.findall(r"_previous = await _slot_predecessor_store\([^)]*\)", flat)
+    assert resolutions == [
+        "_previous = await _slot_predecessor_store(sessions, slot, session_key)",
+        "_previous = await _slot_predecessor_store(state.sessions, slot, session_key)",
+    ], f"the predecessor is resolved somewhere unexpected: {resolutions}"
+    # The store is the authority and the mapping is the fallback, read non-pruning,
+    # inside that one helper -- so this ratchet pins one resolution rather than one
+    # per call site.
+    resolver = source[source.index("async def _slot_predecessor_store(") :]
+    resolver = resolver[: resolver.index("\ndef ")]
+    assert "await asyncio.to_thread( crew_log_emit.slot_previous_store, slot.key )" in " ".join(
+        resolver.split()
+    )
+    # The mapping serves a DECIDED empty only, and comes back FLAGGED rather than
+    # cited: whether allocation is holding the prior resumable id back cannot be read
+    # here, because the marker belongs to a session this runs before. The undecided
+    # case names no store while SAYING so, rather than citing the source the store read
+    # was preferred over or passing for a log that has no predecessor at all. And the
+    # absence is STATED only when the store's answer is complete -- units it could not
+    # rank make an empty mapping no finding about this slot.
+    assert "undecided=False if complete else None," in resolver
+    assert 'return CrewLogPrevious(sid="", undecided=True)' in resolver
+    assert "provider_switch_replay_pending" not in resolver, (
+        "the replay window is decided in the resolver again, which runs before this "
+        "turn's session exists -- so a cold start reads 'no replay owed' from there "
+        "being nobody to ask, and cites the generation the mapping is holding"
+    )
+    # Spent exactly once, at the emitter call, which is also where the slot is told
+    # which store it is now on. A second consumer would hand the same edge to two
+    # entries; none would leave it for the slot's next store. The record is what names
+    # a store whose unit is still queued to the writer thread, so dropping it here
+    # reopens that window.
+    #
+    # Read off the FLATTENED source for the same reason the latches are: whether the
+    # call fits on one line is the formatter's business.
+    takes = [
+        call.replace("( ", "(").replace(" )", ")")
+        for call in re.findall(r"slot\.take_crew_log_previous\([^)]*\)", flat)
+    ]
+    assert takes == [
+        "slot.take_crew_log_previous(now_writing=_crew_log_sid, "
+        "replay_pending=_crew_log_replay_owed)"
+    ], f"the predecessor edge is consumed somewhere unexpected: {takes}"
+    # The window is asked about HERE, where a session exists to answer. Asked at the
+    # latch instead, a cold start is told "no replay owed" by the absence of anybody to
+    # ask, and that is the case where the mapping is most likely a generation behind.
+    assert (
+        "_crew_log_replay_owed = state.sessions.provider_switch_replay_pending(session_key) "
+        "is True" in flat
+    )
+    # BOTH halves reach the entry from that one handover. Feeding the emitter the sid
+    # alone would write a log that claims to start the slot's chain while its
+    # predecessor was merely undetermined.
+    assert "previous_sid=_crew_log_edge.sid," in source
+    assert "previous_undecided=_crew_log_edge.undecided," in source
+
+
+def test_the_predecessor_is_read_without_pruning_the_mapping():
+    """The turn path reads the mapped id, not the resumable one.
+
+    `SessionMap.get` answers "can this id still be resumed", so it stats the ACP
+    transcript and PRUNES the entry when that file is gone or empty. Both are
+    wrong for a history citation: the stat is synchronous store work on the
+    gateway loop, and the prune erases the id exactly when the two stores
+    disagree -- a crew log unit can outlive a truncated ACP transcript, and that
+    unit is the one whose tail most needs closing.
+
+    Mutation guard: routing the turn path back through `resumable_sid` answers
+    None here, so the successor records no edge and the predecessor's tail is
+    never closed.
+    """
+    mapping = session_map.SessionMap()
+    mapping.set("dashboard:chat-7", SESSION, provider="", cwd="")
+
+    # The history read answers, and it is read FIRST because that is the order the
+    # turn path uses -- nothing has pruned the entry yet.
+    assert mapping.mapped_sid("dashboard:chat-7") == SESSION
+
+    # The resumable read, on the same live entry, answers None AND removes it:
+    # there is no ACP transcript on disk for that id.
+    assert mapping.get("dashboard:chat-7") is None
+    assert (
+        mapping.has_hint("dashboard:chat-7") is False
+    ), "get() pruned the entry, which is why the history read must not go through it"
+
+
+def test_the_mapped_read_touches_no_file():
+    """Safe on the gateway loop because it reads memory, not the store.
+
+    An unmapped key answers "" rather than raising, since the emitter turns that
+    into an absent edge: a slot's first ever session has nothing to name.
+    """
+    mapping = session_map.SessionMap()
+    mapping.set("dashboard:chat-7", SESSION, provider="", cwd="")
+
+    def _no_disk(*_args, **_kwargs):
+        raise AssertionError("mapped_sid touched the filesystem")
+
+    # Patched AFTER construction, which loads the map from disk by design.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "exists", _no_disk)
+        patch.setattr(Path, "stat", _no_disk)
+        assert mapping.mapped_sid("dashboard:chat-7") == SESSION
+        assert mapping.mapped_sid("dashboard:never-seen") == ""
+
+
+def test_a_store_whose_front_retention_removed_reports_no_edge():
+    """`null` is "no edge to follow", never "there was no earlier crew log".
+
+    The edge rides on the creating `session/opened`, which lives at the front of
+    the file, and retention deletes whole segments off the front. A reader that
+    read a missing edge as "this is the slot's first crew log" would silently
+    claim a slot's history began at the oldest segment that survived.
+    """
+    _open_session()
+    assert emit.flush()
+    _open_successor(previous_sid=SESSION)
+    assert emit.flush()
+    assert crew_log_projection.read_projection(SUCCESSOR, "status").value["previous"] == SESSION
+
+    _log_path(SUCCESSOR).unlink()
+    folded = crew_log_projection.read_projection(SUCCESSOR, "status").value
+    assert folded["previous"] is None
+    assert folded["lifecycle"] == "unknown", "and the fold says it could not read an opener"
+
+
+# --- the failure warning budget -------------------------------------------
+
+
+def _warnings(caplog) -> list[str]:
+    """The messages a DEFAULT-level operator actually sees."""
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def _age_budget(seconds: float) -> None:
+    """Move every held budget *seconds* into the past.
+
+    Drives the re-arm without a sleep and without patching the clock: the window
+    is state, so the test states it.
+    """
+    with emit._lock:
+        for key, (warned_at, swallowed) in list(emit._warn_budget.items()):
+            emit._warn_budget[key] = (warned_at - seconds, swallowed)
+
+
+def test_a_second_kind_of_failure_is_named_even_after_an_earlier_one(caplog):
+    """A spent slot must not hide a DIFFERENT failure.
+
+    The budget exists so a failing store cannot flood the log, and that intent is
+    sound; the granularity is what has to distinguish "the same failure repeating"
+    from "a different failure happening once". A disk refusing an append for
+    ENOSPC, the same disk then failing for EIO, and a lost write lease are three
+    different facts about the host, and an operator who is told only the first
+    learns nothing about the two that follow.
+    """
+    full = OSError(28, "No space left on device")
+    broken = OSError(5, "Input/output error")
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        emit._report("growth listener", RuntimeError("listener blew up"), op="growth-listener")
+        emit._report("appending an entry", full, op="crew-append")
+        emit._report("appending an entry", broken, op="crew-append")
+        emit._report("opening the crew log", RuntimeError("lease lost"), op="crew-log-open")
+    seen = _warnings(caplog)
+    assert len(seen) == 4, f"four distinct failures, {len(seen)} named: {seen}"
+    # Each one names its own operation, so the lines are told apart by a reader.
+    assert any("growth listener" in m for m in seen)
+    assert any("No space left" in m for m in seen)
+    assert any("Input/output error" in m for m in seen)
+    assert any("lease lost" in m for m in seen)
+
+
+def test_one_kind_repeating_is_named_once_not_once_per_failure(caplog):
+    """The reverse direction: the flood the budget exists to prevent.
+
+    Without this, an implementation that simply deleted the budget would satisfy
+    the test above and log a line per failed append -- which is the behaviour the
+    suppression was written for in the first place.
+    """
+    full = OSError(28, "No space left on device")
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for _ in range(25):
+            emit._report("appending an entry", full, op="crew-append")
+    seen = _warnings(caplog)
+    assert len(seen) == 1, f"25 failures of one kind named {len(seen)} times: {seen}"
+
+
+def test_many_units_failing_at_once_are_named_once_not_once_per_unit(caplog):
+    """The other flood: one cause reaching many stores is still one cause.
+
+    A disk that fills up fails every store on it. The key holds the operation and
+    the error, never the unit, so a full disk is one warning rather than one per
+    crew log -- the unit is in the message for the reader, not in the budget.
+    """
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for n in range(40):
+            emit._report(
+                f"appending crew_report for crew 'store-{n}'",
+                OSError(28, "No space left on device"),
+                op="crew-report-append",
+            )
+    seen = _warnings(caplog)
+    assert len(seen) == 1, f"one cause across 40 stores named {len(seen)} times: {seen}"
+
+
+def test_a_spent_budget_says_how_many_failures_it_swallowed(caplog):
+    """A budget that ran out has to say so.
+
+    A slot that is spent and then never speaks again is the original defect scoped
+    down: an ongoing failure stays invisible at default level. So the swallowed
+    failures are counted, and the count rides on the next warning for that kind
+    once the window has passed.
+    """
+    full = OSError(28, "No space left on device")
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for _ in range(7):
+            emit._report("appending an entry", full, op="crew-append")
+        assert len(_warnings(caplog)) == 1, "the window had not passed yet"
+        _age_budget(emit._WARN_REARM_SECONDS + 1.0)
+        emit._report("appending an entry", full, op="crew-append")
+    seen = _warnings(caplog)
+    assert len(seen) == 2, f"the re-armed window did not report: {seen}"
+    assert (
+        "6 more went unreported" in seen[1]
+    ), f"the spent budget did not say how many it swallowed: {seen[1]}"
+
+
+def test_the_first_warning_scopes_its_own_promise_to_this_kind(caplog):
+    """The disclosure has to match what actually happens next.
+
+    The line is the only thing telling an operator what the log will and will not
+    carry from here, so it may not promise silence for failures that are in fact
+    still reported.
+    """
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        emit._report("appending an entry", OSError(28, "full"), op="crew-append")
+    (line,) = _warnings(caplog)
+    assert "of this kind" in line, f"the promise is not scoped to the kind: {line}"
+
+
+def test_the_budget_map_is_bounded(caplog):
+    """Keys are program constants, and the map is capped even so."""
+    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
+        for n in range(emit._MAX_WARN_KINDS * 3):
+            emit._report("appending an entry", OSError(n, f"errno {n}"), op="crew-append")
+    assert (
+        len(emit._warn_budget) <= emit._MAX_WARN_KINDS
+    ), f"budget map grew to {len(emit._warn_budget)}, cap is {emit._MAX_WARN_KINDS}"
+
+
+def test_every_report_call_site_names_a_literal_operation():
+    """Enumerated from the source, so a new call site is covered by existing.
+
+    ``op`` is the only part of a call that reaches the budget key, which is what
+    keeps the map bounded and keeps one cause across many stores to one warning. A
+    site passing an f-string or a variable there would put a store name, a session
+    id or an entry type into the key and hand every unit its own warning. The
+    population is read out of the module rather than listed here, because a listed
+    set of sites goes stale the moment someone adds one.
+    """
+    import ast
+
+    tree = ast.parse(Path(emit.__file__).read_text(encoding="utf-8"))
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_report"
+    ]
+    assert sites, "no _report call sites found -- the check would pass vacuously"
+    offenders = []
+    for node in sites:
+        passed = {kw.arg: kw.value for kw in node.keywords}
+        op = passed.get("op")
+        if not isinstance(op, ast.Constant) or not isinstance(op.value, str) or not op.value:
+            offenders.append((node.lineno, ast.unparse(node)[:90]))
+    assert (
+        not offenders
+    ), f"{len(offenders)} of {len(sites)} _report sites do not name a literal op: {offenders}"
+
+
+def test_the_budget_is_keyed_and_not_a_single_process_flag():
+    """The structural pin: no one module-level boolean governs the reports.
+
+    A budget that is one flag cannot tell which failure it already named, so it
+    downgrades every later one whatever it was about. Reverting any part of the key
+    to a process-wide flag has to fail here as well as behaviourally.
+    """
+    assert isinstance(
+        emit._warn_budget, dict
+    ), f"the budget is not a keyed map but a {type(emit._warn_budget).__name__}"
+    assert not isinstance(emit._warn_budget, bool)
+    key = emit._failure_kind("crew-append", OSError(28, "full"))
+    other = emit._failure_kind("crew-log-open", OSError(28, "full"))
+    same = emit._failure_kind("crew-append", OSError(28, "full"))
+    assert key != other, "the operation does not reach the key"
+    assert key == same, "the key is not stable for one kind"
+    assert (
+        emit._failure_kind("crew-append", OSError(5, "io")) != key
+    ), "the error code does not reach the key"
+    assert emit._failure_kind("crew-append", RuntimeError("x")) != emit._failure_kind(
+        "crew-append", ValueError("x")
+    ), "the exception class does not reach the key"
+    # And the unit is deliberately absent: it lives in `what`, never in the key.
+    assert "store-1" not in "".join(map(str, key)), key
