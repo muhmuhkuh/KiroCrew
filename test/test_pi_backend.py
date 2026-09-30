@@ -655,7 +655,7 @@ async def test_pi_catalog_uses_selected_backend():
         patch.object(KiroCrewConfig, "load", return_value=cfg),
         patch.object(agents, "_pi_models_from_cli", new_callable=AsyncMock, return_value=rows),
     ):
-        response = await agents.api_models(SimpleNamespace(app={}))
+        response = await agents.api_models(SimpleNamespace(app={}, query={}))
     assert response.status == 200
     assert json.loads(response.text) == rows
 

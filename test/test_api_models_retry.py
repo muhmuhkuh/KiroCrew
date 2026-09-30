@@ -121,6 +121,19 @@ def test_pi_model_list_uses_standalone_catalog(tmp_path):
     assert _body(resp) == models
 
 
+def test_pi_model_list_failure_returns_error_code(tmp_path):
+    with (
+        patch.object(agents.KiroCrewConfig, "load", return_value=_pi_cfg()),
+        patch.object(
+            agents, "_pi_models_from_cli", new=AsyncMock(side_effect=RuntimeError("unavailable"))
+        ),
+    ):
+        resp = _run(agents.api_models(_kiro_request(tmp_path)))
+
+    assert resp.status == 503
+    assert _body(resp)["code"] == "pi_models_unavailable"
+
+
 def test_kiro_binary_unresolved_returns_503(tmp_path):
     with (
         patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),

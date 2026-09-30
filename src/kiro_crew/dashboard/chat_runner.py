@@ -8794,7 +8794,8 @@ async def _run_chat(
 
     # ── Slash commands: detect early, before session acquisition ──
     first_word = message.split()[0] if message.strip() else ""
-    _agent_config = KiroCrewConfig.load().agent
+    _config = KiroCrewConfig.load()
+    _agent_config = _config.agent
     _is_cc_provider = is_claude_code(_agent_config.provider)
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
@@ -8802,7 +8803,7 @@ async def _run_chat(
     is_slash = is_harness_slash_command(
         first_word,
         cc_provider=_is_cc_provider,
-        pi_backend=effective_chat_backend(slot, KiroCrewConfig.load()) == ACP_BACKEND_PI,
+        pi_backend=effective_chat_backend(slot, _config) == ACP_BACKEND_PI,
     )
 
     # Block dangerous/local-only commands before acquiring a session

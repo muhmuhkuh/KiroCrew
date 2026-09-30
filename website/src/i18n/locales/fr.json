@@ -312,7 +312,7 @@
         "staygreen": "STAYGREEN"
       },
       "manifest": {
-        "description": "Mesure un dépôt GitHub ou GitLab avant de le modifier. Conçoit une métrique de performance calibrée (la règle), prouve que la métrique est fiable face à un gain connu, puis exécute des cycles conserver-ou-annuler : chaque correctif candidat est écrit dans un worktree isolé, filtré par une liste d’autorisation d’édition et les tests du dépôt, et conservé uniquement si le gain mesuré dépasse la bande de bruit. Les survivants sont proposés en pull requests GitHub / merge requests GitLab à l’état de brouillon, que vous relisez et publiez vous-même.",
+        "description": "Mesure un dépôt GitHub ou GitLab avant de le modifier. Conçoit une métrique de performance calibrée (la règle), prouve que la métrique est fiable face à un gain connu, puis exécute des cycles conserver-ou-annuler : chaque correctif candidat est écrit dans un worktree isolé, filtré par une liste d’autorisation d’édition et les tests du dépôt, et conservé uniquement si le gain mesuré dépasse la bande de bruit. Les survivants sont proposés en pull requests GitHub / merge requests GitLab à l’état de brouillon, que tu relis et publies toi-même.",
         "display_name": "Auto-Improvement",
         "highlight_1": "Prouve d’abord sa propre métrique — une exécution refuse de démarrer sur une règle peu fiable",
         "highlight_2": "Chaque candidat est mesuré en A/B, ou RED/GREEN pour les corrections de bugs, jamais un simple « ça a l’air bon »",
@@ -2489,7 +2489,7 @@
         "highlight_6": "Chaque écriture exige un accès triage ou push sur le dépôt ; une connexion en lecture seule se limite aux suggestions",
         "highlight_7": "Fait remonter les dépôts auxquels tu as contribué récemment, pour en connecter un en un clic",
         "highlight_8": "Met en cache localement les tickets, les étiquettes et les membres, actualisés à la demande",
-        "highlight_9": "Fonctionne avec GitHub, GitLab, Azure DevOps et Jira; nécessite sur l’hôte la CLI authentifiée du fournisseur ou des identifiants du gateway (`gh`, `glab`, `az` ou JIRA_EMAIL + JIRA_API_TOKEN) — aucune CLI particulière n’est requise pour l’installation",
+        "highlight_9": "Fonctionne avec GitHub, GitLab, Azure DevOps et Jira ; nécessite sur l’hôte la CLI authentifiée du fournisseur ou des identifiants du gateway (`gh`, `glab`, `az` ou JIRA_EMAIL + JIRA_API_TOKEN) — aucune CLI particulière n’est requise pour l’installation",
         "page_label": "Issue Radar",
         "use_case_1": "Trie les issues et les pull requests de plusieurs fournisseurs connectés tout en conservant les résumés, les labels suggérés et l'historique des enquêtes.",
         "configuration_1": "Connecte un dépôt et authentifie la CLI de son fournisseur sur l'hôte de la passerelle : gh pour GitHub, glab pour GitLab, ou az avec l'extension Azure DevOps sous macOS, Linux ou WSL."

@@ -2332,7 +2332,10 @@ async def api_models(request: web.Request) -> web.Response:
             return web.json_response(await _pi_models_from_cli())
         except Exception as exc:
             logger.warning("api_models: Pi model list unavailable: %s", exc)
-            return web.json_response({"error": "Pi model list unavailable"}, status=503)
+            return web.json_response(
+                {"error": "Pi model list unavailable", "code": "pi_models_unavailable"},
+                status=503,
+            )
     if backend == ACP_BACKEND_CLAUDE:
         return web.json_response(
             _cc_models(request, configured_default=_scoped_default(cfg, backend))

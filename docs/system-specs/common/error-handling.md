@@ -66,7 +66,8 @@ before putting them in a transparent response dictionary. A computed status is
 compliant when that dictionary carries an explicit code; an uncoded or opaque
 body remains debt in `test/test_error_code_contract.py`. That guard also checks
 literal code values on computed-status responses and refuses dictionary spreads
-that could replace the code.
+that could replace the code. A Pi catalog fetch failure from `GET /api/models`
+returns HTTP 503 with `code="pi_models_unavailable"`.
 
 ## Backend Error Classification
 

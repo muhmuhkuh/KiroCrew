@@ -21,6 +21,8 @@ _TO_DICT_KEYS = (
     "agent_kind",
     "effective_agent",
     "model",
+    "acp_backend",
+    "backend_selection_supported",
     "model_withheld",
     "served_model",
     "reasoning_effort",
