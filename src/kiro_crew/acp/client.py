@@ -202,7 +202,6 @@ from kiro_crew.acp.types import (
     METHOD_METADATA,
     METHOD_PROMPT,
     METHOD_REQUEST_PERMISSION,
-    METHOD_SESSION_DELETE,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
     METHOD_SESSION_RESUME,
@@ -288,15 +287,6 @@ from kiro_crew.mcp_gateway.session_servers import (
     pooled_session_servers,
 )
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
-from kiro_crew.pi_support import (
-    PI_EFFORT_ENV,
-    PI_STATE_ENV,
-    _clear_pi_requested_effort,
-    _pi_thinking_levels,
-    _read_pi_state,
-    _set_pi_requested_effort,
-    prepare_pi_environment,
-)
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.mirrors import MIRRORS, mirror_for
 from kiro_crew.recovery.ladder import L3_ACP_RUNTIME as _L3_ACP_RUNTIME
@@ -3764,11 +3754,6 @@ class AcpClient:
         self._sandbox_cleanup: str | None = None
         self._bound_workspace_fd: int | None = None
         self._spawn_work_dir = str(self._work_dir)
-        self._pi_mcp_config_path: Path | None = None
-        self._pi_state_path: Path | None = None
-        self._pi_effort_path: Path | None = None
-        self._pi_startup_info = ""
-        self._pi_permission_tool_calls: set[str] = set()
         self._process: asyncio.subprocess.Process | None = None
         self._pid: int | None = None
         # The root's process-start identity, read once at spawn and handed to
@@ -7469,34 +7454,11 @@ class AcpClient:
         """Set a session config option (e.g. effort level) via session/set_config_option."""
         if not self._session_id:
             raise AcpError("Cannot set config option before session is initialized")
-        wire_value = value
-        pi_effort = self._is_pi and config_id == "thought_level"
-        if pi_effort:
-            # pi-acp 0.0.33 accepts only through xhigh, while current Pi can
-            # serve a distinct max level. The inner launcher proxy translates
-            # this compatibility value back to max using Pi's own model map.
-            _set_pi_requested_effort(self._pi_effort_path, value)
-            if value == "max":
-                wire_value = "xhigh"
-        try:
-            req_id = await self._send_request(
-                "session/set_config_option",
-                {
-                    "sessionId": self._session_id,
-                    "configId": config_id,
-                    "value": wire_value,
-                },
-            )
-            await self._wait_for_response(req_id, timeout=10.0)
-        except BaseException:
-            if pi_effort:
-                _clear_pi_requested_effort(self._pi_effort_path)
-            raise
-
-    async def delete_session(self, session_id: str) -> None:
-        """Delete an opaque Pi transcript through the adapter's ACP endpoint."""
-        request_id = await self._send_request(METHOD_SESSION_DELETE, {"sessionId": session_id})
-        await self._wait_for_response(request_id, timeout=10.0)
+        req_id = await self._send_request(
+            "session/set_config_option",
+            {"sessionId": self._session_id, "configId": config_id, "value": value},
+        )
+        await self._wait_for_response(req_id, timeout=10.0)
 
     # ── Dynamic Config from ACP ──
 
@@ -7566,11 +7528,6 @@ class AcpClient:
         selector is consumed here.
         """
         logger.debug("_store_session_config keys: %s", list(resp.keys()))
-        if self._is_pi:
-            meta = resp.get("_meta")
-            pi_meta = meta.get("piAcp") if isinstance(meta, dict) else None
-            startup = pi_meta.get("startupInfo") if isinstance(pi_meta, dict) else None
-            self._pi_startup_info = startup if isinstance(startup, str) else ""
         config_options = resp.get("configOptions")
         if isinstance(config_options, list):
             self._acp_config_options = config_options
@@ -7692,11 +7649,7 @@ class AcpClient:
         it differently; a hard-coded spelling returns an empty list there, which
         every caller reads as "this model has no effort levels".
         """
-        if self._is_pi:
-            levels = _pi_thinking_levels(_read_pi_state(self._pi_state_path), self._model)
-            if levels is not None:
-                return levels
-        effort_option = "thought_level" if self._is_pi else effort_config_option_id(self.backend)
+        effort_option = effort_config_option_id(self.backend)
         for opt in self._acp_config_options:
             if not isinstance(opt, dict):
                 continue
@@ -8153,22 +8106,6 @@ class AcpClient:
                 _sandbox_preflight, self.backend, self._sandbox_mode
             )
             adapter_expose = acp_tool_gate.adapter_expose_files(self.backend, adapter_hidden_dirs)
-            native_env: dict[str, str] = {}
-            try:
-                await asyncio.to_thread(
-                    prepare_pi_environment,
-                    native_env,
-                    agent=self._agent,
-                    session_key=self._session_key or "",
-                    work_dir=self._work_dir,
-                )
-            except (OSError, RuntimeError) as exc:
-                raise AcpError(str(exc)) from exc
-            native_env["KIROCREW_PI_BIN"] = pi_bin
-            self._extra_env = {**self._extra_env, **native_env}
-            self._pi_mcp_config_path = Path(native_env["KIROCREW_PI_MCP_CONFIG"])
-            self._pi_state_path = Path(native_env[PI_STATE_ENV])
-            self._pi_effort_path = Path(native_env[PI_EFFORT_ENV])
             # The gate, and the READ-BACK that is what this harness's Routing member
             # promises. pi runs no gate of its own, so Crew's extension is loaded
             # into it through a launcher the adapter is told to run in place of
@@ -8179,10 +8116,8 @@ class AcpClient:
             # here rather than loaded. Off-loop: a file read and possibly a write.
             extension_path = await asyncio.to_thread(_seal_pi_gate_extension)
             self._pi_gate_nonce = uuid.uuid4().hex
-            self._extra_env["KIROCREW_PI_GATE_EXTENSION"] = extension_path
-            self._extra_env[_ENV_PI_GATE_SESSION] = self._pi_gate_nonce
             self._pi_gate_launcher = await asyncio.to_thread(
-                _ensure_pi_gate_launcher, native_env["PI_ACP_PI_COMMAND"], extension_path
+                _ensure_pi_gate_launcher, pi_bin, extension_path
             )
             # Wrapped in the SAME sandbox with the SAME credential mask as the
             # session spawn below, for the same reason the opencode read-back is:
@@ -9485,11 +9420,6 @@ class AcpClient:
                         pipe.close()  # type: ignore[union-attr]
         # Clean up sandbox temp files (macOS seatbelt profile)
         self._discard_sandbox_cleanup()
-        pi_mcp_config_path = getattr(self, "_pi_mcp_config_path", None)
-        if pi_mcp_config_path is not None:
-            with suppress(OSError):
-                pi_mcp_config_path.unlink()
-            self._pi_mcp_config_path = None
         # The settings.local.json THIS session seeded is removed by
         # _discard_claude_settings_seed, which every caller awaits in the `try` of
         # the `finally` that reaches here -- it is async because the ownership hash,
@@ -9540,15 +9470,6 @@ class AcpClient:
         # lets installing or toggling a server take effect on the next session, so
         # a replacement process must not inherit this one's snapshot.
         self._session_mcp_cache = None
-        for pi_path in (
-            getattr(self, "_pi_state_path", None),
-            getattr(self, "_pi_effort_path", None),
-        ):
-            if pi_path is not None:
-                with suppress(OSError):
-                    pi_path.unlink()
-        self._pi_state_path = None
-        self._pi_effort_path = None
         self._session_mcp_snapshot = None
         # Same per-spawn freshness rule as the array above: an edited spec must be
         # what the next session's guard judges, not this one's.
@@ -13221,8 +13142,6 @@ class AcpClient:
             text = content.get("text")
             content_type = content.get("type", "text")
             is_thinking = content_type in ("thinking", "reasoning")
-            if self._is_pi and text == self._pi_startup_info:
-                return None, False
             return text, is_thinking
         if kind == UPDATE_AGENT_THOUGHT_CHUNK:
             content = update.get("content", {})
@@ -14143,23 +14062,6 @@ class AcpClient:
         if msg.id is not None:
             self._pi_gate_request_tool[str(msg.id)] = tool_call_id
 
-    def _permission_tool_call_id(self, tool_call: dict) -> str:
-        """Return a trusted Pi tool id, refusing synthetic UI confirmations."""
-        raw_id = tool_call.get("toolCallId", "")
-        if not self._is_pi:
-            return raw_id if isinstance(raw_id, str) else ""
-        raw_input = tool_call.get("rawInput")
-        message = raw_input.get("message", "") if isinstance(raw_input, dict) else ""
-        prefix = "kirocrew-tool-call:"
-        if not isinstance(message, str) or not message.startswith(prefix):
-            raise AcpError("Pi permission request has no trusted tool-call correlation")
-        candidate = message.removeprefix(prefix)
-        known = candidate in self._observed_tool_calls or candidate in self._tool_call_params
-        if not known or candidate in self._pi_permission_tool_calls:
-            raise AcpError("Pi permission request has an unknown or reused tool-call correlation")
-        self._pi_permission_tool_calls.add(candidate)
-        return candidate
-
     def _placed_mcp_server_names(self) -> tuple[str, ...]:
         """The server names Crew placed on this session's ``mcpServers`` array.
 
@@ -14191,35 +14093,11 @@ class AcpClient:
         classification distinguishable from a cache miss and preserves cached
         raw parameters across repeated permission frames for the same tool call.
         """
-        permission_msg = msg
-        observed: tuple[str, str] | None = None
-        if self._is_pi and not getattr(self, "_pi_gate_nonce", ""):
-            params = msg.params if isinstance(msg.params, dict) else {}
-            tool_call = params.get("toolCall", {})
-            tool_call = tool_call if isinstance(tool_call, dict) else {}
-            tool_call_id = self._permission_tool_call_id(tool_call)
-            observed = self._observed_tool_calls.get(tool_call_id)
-            if observed is not None and tool_call_id not in self._tool_call_params:
-                raw_params = {"command": observed[0]}
-                rendered_input = json.dumps(raw_params, indent=2)
-                safe_input = redact_text(rendered_input)
-                self._tool_call_params[tool_call_id] = raw_params
-                self._tool_call_inputs[tool_call_id] = safe_input
-                self._tool_call_input_redacted[tool_call_id] = safe_input != rendered_input
-                self._tool_call_is_shell[tool_call_id] = observed[1] == "execute"
-            permission_msg = JsonRpcMessage(
-                id=msg.id,
-                method=msg.method,
-                result=msg.result,
-                error=msg.error,
-                params={**params, "toolCall": {**tool_call, "toolCallId": tool_call_id}},
-                fanout_no_owner=msg.fanout_no_owner,
-            )
         # Compat-shaped like the caches below: an instance built without ``__init__``
         # has no nonce, and no nonce means no dialog is ever read as a gate envelope.
         _gate_nonce = getattr(self, "_pi_gate_nonce", "")
         event, recorded = build_permission_event(
-            permission_msg,
+            msg,
             tool_input_cache=self._tool_call_inputs,
             # ``AcpClient`` predates this same-key provenance cache.  Normal
             # instances initialize it in __init__, while legacy/minimal
@@ -14247,8 +14125,6 @@ class AcpClient:
         )
         if event is None:
             return None
-        if observed is not None:
-            event.title = redact_text(observed[0])[:120]
         if recorded is not None:
             self._permission_options[event.request_id] = recorded
         # Created here when absent, so a client allocated without ``__init__``

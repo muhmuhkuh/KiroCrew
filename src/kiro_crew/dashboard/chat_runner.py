@@ -46,7 +46,6 @@ from kiro_crew.acp.client import (
     resolve_pin_spelling,
 )
 from kiro_crew.acp.types import (
-    ACP_BACKEND_PI,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -9296,11 +9295,7 @@ async def _run_chat(
     # Named rather than inlined so the quick-prompt exception is one testable rule
     # instead of a condition only reachable by driving this whole function: a macro
     # must NOT be forwarded to the harness as a command.
-    is_slash = is_harness_slash_command(
-        first_word,
-        cc_provider=_is_cc_provider,
-        pi_backend=effective_chat_backend(slot, _config) == ACP_BACKEND_PI,
-    )
+    is_slash = is_harness_slash_command(first_word, cc_provider=_is_cc_provider)
     _this_turn_is_clear = is_slash and first_word.lower() == "/clear"
 
     # Block dangerous/local-only commands before acquiring a session. The

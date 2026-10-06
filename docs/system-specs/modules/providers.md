@@ -14,6 +14,10 @@ Several are selectable on a plain public build, so "one provider" never meant
 
 ### Architecture
 
+Pi retains the upstream ACP provider path. There is no fork-specific Pi transcript
+cleanup RPC or auxiliary launcher/state-file lifecycle; upstream capability tables
+and the sealed Pi tool gate remain authoritative.
+
 Member execution carries one immutable member/store selection into provider
 allocation. `member_context` controls native instruction deduplication; it is not
 a security capability and does not choose a database. Memory access uses the

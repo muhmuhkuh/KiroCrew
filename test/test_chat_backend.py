@@ -326,7 +326,9 @@ async def test_api_models_uses_requested_chat_backend(cfg, monkeypatch):
     request = MagicMock()
     request.query = {"backend": "pi"}
     models = [{"model_name": "anthropic/model", "display_name": "Model"}]
-    monkeypatch.setattr(agents, "_advertised_pi_models", lambda _request: models)
+    monkeypatch.setattr(
+        agents, "_advertised_backend_models", lambda _request, _backend, **_kwargs: models
+    )
 
     response = await agents.api_models(request)
 

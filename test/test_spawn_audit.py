@@ -371,15 +371,6 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # ``pdfplumber`` commits a page's whole character list before any caller
         # can measure it, so the memory bound has to sit one process down.
         "pdf_extract.py::extract_pdf_segments",
-        # Pi's RPC bridge runs inside the sandboxed pi-acp subprocess. Its child
-        # is the operator-resolved Pi executable with adapter-generated fixed
-        # RPC flags; the inherited sandbox and scrubbed parent environment cover
-        # the untrusted agent process, while the bridge only forwards JSONL.
-        "pi_support.py::_run_pi_rpc_proxy",
-        # The no-sidecar fallback launches the same operator-resolved Pi command
-        # directly from the already sandboxed adapter process. Its argv consists
-        # of KiroCrew's fixed extensions/config paths plus pi-acp's fixed flags.
-        "pi_support.py::main",
         # The shadow-venv update engine's one spawn seam. Nothing it runs is
         # agent-influenced, and none of it can route through sandboxed_spawn_argv,
         # because the engine's whole job is to build the NEXT gateway install

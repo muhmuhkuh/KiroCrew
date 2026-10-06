@@ -20,11 +20,10 @@ rather than a pool of per-worker ``AcpClient`` processes. Design:
     tool permission is auto-approved; and because the runtime layer has no
     ``audit_source``, the pool emits its own per-tool SEL audit.
 
-Kiro reviews use sessions created directly on one runtime — NOT via the
+These sessions are created directly on the runtime — NOT via the gateway's
 ``/api/spawn`` / ``SubagentManager`` path — so they never produce an agent card,
-a ``:lock:`` approval prompt, a Slack relay, or a 30-minute reaper slot. When
-KiroCrew is configured for Pi, reviews use the configured Pi ACP adapter instead
-of accidentally starting a Kiro runtime with a foreign model pin.
+a ``:lock:`` approval prompt, a Slack relay, or a 30-minute reaper slot. The
+review runs silently.
 
 The executor is async; the (synchronous, threaded) review driver bridges to it
 via ``asyncio.run_coroutine_threadsafe`` on the gateway event loop, and brackets
@@ -49,10 +48,8 @@ if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
 
 try:
-    from kiro_crew.acp.client import AcpClient
     from kiro_crew.acp.runtime import AcpRuntime
     from kiro_crew.acp.types import (
-        ACP_BACKEND_PI,
         EVENT_COMPLETE,
         EVENT_PERMISSION_REQUEST,
         EVENT_TEXT_CHUNK,
@@ -62,9 +59,7 @@ try:
     )
     from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR, refusal_for
 except ImportError:  # pragma: no cover - standalone / test fallback
-    AcpClient = None  # type: ignore[assignment,misc]
     AcpRuntime = None  # type: ignore[assignment,misc]
-    ACP_BACKEND_PI = ""  # harness-ok: standalone fallback
     OUTCOME_REJECTED_TRANSPORT_FLOOR = "rejected_transport_floor"
 
     def refusal_for(
@@ -281,17 +276,6 @@ except Exception:  # pragma: no cover - defensive
     VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
-def _configured_provider() -> str:
-    """Return the configured chat provider without making review startup depend on it."""
-    try:
-        from kiro_crew.acp_backends import ACP_BACKEND_PI
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        return "pi" if KiroCrewConfig.load().agent.acp_backend == ACP_BACKEND_PI else "acp"
-    except Exception:
-        return "acp"
-
-
 def _get_review_settings() -> dict:
     """Read user-configured model and effort from config.json → review section.
     Returns {"model": str|None, "effort": str}. None model = use agent default;
@@ -368,16 +352,7 @@ def _reviewer_model(agent: str) -> str:
     keyed on the model the agent actually runs."""
     cfg_model = _get_review_settings().get("model")
     if isinstance(cfg_model, str) and cfg_model:
-        # Review settings historically contain Kiro's bare ids. Pi's catalog is
-        # provider-qualified, so an old bare override must not cross backends.
-        if _configured_provider() != "pi" or "/" in cfg_model or cfg_model == "auto":
-            return cfg_model
-        return "auto"
-    # Code Review Sage owns its worker lifecycle instead of going through the
-    # normal SessionManager provider factory. On Pi, the agent JSON may still
-    # contain a Kiro-only model pin, so never carry that pin across backends.
-    if _configured_provider() == "pi":
-        return "auto"
+        return cfg_model
     if kiro_agents_dir is None:  # pragma: no cover - standalone fallback
         return _DEFAULT_REVIEW_MODEL
     try:
@@ -604,10 +579,6 @@ class ReviewPool:
     ) -> None:
         self._agent = _resolve_review_agent(agent or REVIEW_AGENT)
         self._work_dir = work_dir if work_dir is not None else _review_work_dir()
-        # The Kiro runtime cannot run a Pi-configured account. Pi's ACP adapter
-        # is process-per-session, so it uses the same semaphore but not the shared
-        # AcpRuntime holder below.
-        self._pi_backend = _configured_provider() == "pi"
         # Auto mode = no explicit max_workers -> the semaphore tracks the live
         # review.max_concurrent config (resized per batch). An explicit value
         # (tests / standalone) is honored verbatim and never resized.
@@ -634,83 +605,11 @@ class ReviewPool:
             if eff != self._max:
                 self._max = eff
                 self._sema = asyncio.Semaphore(eff)
-        if self._pi_backend:
-            return
         await self._holder.begin_batch()
 
     async def end_batch(self) -> None:
         """Close a review batch — kills the runtime once the last batch drains."""
-        if self._pi_backend:
-            return
         await self._holder.end_batch()
-
-    async def _send_pi(
-        self, task: str, timeout: float, on_activity: Callable[[str, int], None] | None = None
-    ) -> str:
-        """Run one isolated review turn through the configured Pi ACP backend."""
-        if AcpClient is None:  # pragma: no cover - standalone fallback
-            raise RuntimeError("Pi ACP client unavailable")
-        client = AcpClient(
-            work_dir=self._work_dir,
-            model=_reviewer_model(self._agent),
-            agent=self._agent,
-            sandbox_mode="auto",
-            acp_backend=ACP_BACKEND_PI,
-        )
-        parts: list[str] = []
-        steps = 0
-        try:
-            async for ev in client.stream_events(task, timeout=timeout):
-                kind = getattr(ev, "kind", None)
-                if kind == EVENT_TEXT_CHUNK:
-                    parts.append(getattr(ev, "text", "") or "")
-                elif kind == EVENT_TOOL_CALL:
-                    await self._audit_tool(client, ev)
-                    steps += 1
-                    if on_activity is not None:
-                        try:
-                            on_activity(str(getattr(ev, "title", "") or ""), steps)
-                        except Exception:
-                            logger.debug("activity callback failed", exc_info=True)
-                elif kind == EVENT_PERMISSION_REQUEST:
-                    req_id = getattr(ev, "request_id", "")
-                    reason = await asyncio.to_thread(
-                        refusal_for,
-                        ev,
-                        session_key=client._session_id or "",
-                        agent=self._agent,
-                        app="code-review-sage",
-                        security_only=False,
-                    )
-                    if reason is not None:
-                        await self._audit_tool(
-                            client, ev, request_id=req_id, outcome="rejected_hook_deny"
-                        )
-                        await client.reject_tool(req_id)
-                        continue
-                    try:
-                        approval_sent = await client.approve_tool(req_id)
-                    except Exception:
-                        logger.debug("Pi tool approve failed", exc_info=True)
-                    else:
-                        await self._audit_tool(
-                            client,
-                            ev,
-                            request_id=req_id,
-                            outcome=(
-                                "auto_approved"
-                                if approval_sent is not False
-                                else OUTCOME_REJECTED_TRANSPORT_FLOOR
-                            ),
-                        )
-                elif kind == EVENT_COMPLETE:
-                    reason = getattr(ev, "stop_reason", "") or ""
-                    if _is_abnormal_stop(reason):
-                        raise RuntimeError(f"review turn ended abnormally (stop_reason={reason!r})")
-                    break
-            return "".join(parts)
-        finally:
-            await client.shutdown()
 
     async def send(
         self,
@@ -735,8 +634,6 @@ class ReviewPool:
         if self._closed:
             raise RuntimeError("ReviewPool is shut down")
         async with self._sema:
-            if self._pi_backend:
-                return await self._send_pi(task, timeout, on_activity)
             runtime = await self._holder.acquire()
             handle = None
             try:
@@ -909,17 +806,6 @@ class ReviewPool:
         """Live occupancy for the dashboard. Keeps the legacy key names
         (``workers``/``idle``/``busy``/``max``/``starting_max``) so the existing UI
         keeps working, and adds the runtime-model keys."""
-        if self._pi_backend:
-            return {
-                "workers": 0,
-                "idle": 0,
-                "busy": 0,
-                "max": self._max,
-                "starting_max": MAX_STARTING,
-                "runtime_alive": False,
-                "active_sessions": 0,
-                "batches": 0,
-            }
         h = self._holder.stats()
         active = h["active_sessions"]
         return {
@@ -936,8 +822,7 @@ class ReviewPool:
     async def shutdown(self) -> None:
         """Force-tear-down the runtime (app disable / gateway shutdown / standalone)."""
         self._closed = True
-        if not self._pi_backend:
-            await self._holder.force_shutdown()
+        await self._holder.force_shutdown()
 
 
 # ── Process-wide singleton (owned by the gateway backend) ──

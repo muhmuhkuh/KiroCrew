@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -100,9 +100,6 @@ async def test_api_models_routes_advertised_backends_without_spawning_kiro(
         raise AssertionError("Advertised model discovery must never launch kiro-cli")
 
     monkeypatch.setattr(agents, "reject_if_kiro_unverified", _never_spawn)
-    monkeypatch.setattr(
-        agents, "_pi_models_from_cli", AsyncMock(return_value=[{"model_name": "auto"}])
-    )
     namespace = model_registry_namespace(backend)
     providers = []
     for other_backend in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION | {ACP_BACKEND_KIRO}:
