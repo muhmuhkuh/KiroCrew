@@ -29,6 +29,9 @@ import * as composerCards from '../hooks/websocket/composerCards'
 import * as retiredIds from '../hooks/websocket/retiredIds'
 import * as bundleReload from '../hooks/websocket/bundleReload'
 import * as attention from '../hooks/websocket/attention'
+import * as slotProjection from '../hooks/websocket/slotProjection'
+import * as sessionProjection from '../hooks/websocket/sessionProjection'
+import * as contextTraceRefresh from '../hooks/websocket/contextTraceRefresh'
 
 const SRC = join(__dirname, '..')
 const WEBSITE = join(SRC, '..')
@@ -48,11 +51,15 @@ const OWNER_MODULES = [
   'chatStream.ts',
   'composerCards.ts',
   'connection.ts',
+  'contextTraceRefresh.ts',
   'frames.ts',
   'reconnectCatchUp.ts',
   'retiredIds.ts',
+  'rowDeliveryWatchdog.ts',
   'serverState.ts',
+  'sessionProjection.ts',
   'slotList.ts',
+  'slotProjection.ts',
   'streamBuffers.ts',
   'turnCompletion.ts',
   'voicePlayback.ts',
@@ -82,20 +89,39 @@ describe('the websocket owner directory is fully classified', () => {
 describe('one public surface', () => {
   it('the facade exports exactly its original names', () => {
     expect(Object.keys(facade).sort()).toEqual([
+      'CONTEXT_TRACE_COALESCE_MS',
+      'ROW_STALL_MS',
+      'ROW_STALL_TICK_MS',
       'UPDATE_RESTART_LATCH_KEY',
       'UPDATE_RESTART_LATCH_TTL_MS',
       'WS_SILENCE_CHECK_MS',
       'WS_SILENCE_MAX_MS',
       'WS_SILENCE_MS',
       '__resetRedactionHealForTests',
+      'applySessionProjection',
       'askIdsOf',
+      'baselineOrHeld',
       'consumeUpdateRestartLatch',
+      'contextTraceKey',
+      'crewLogProjectionsKey',
       'emitSlotFocused',
+      'fetchingAnyFoldQuery',
       'healRedactionSwitchAfterReconnect',
       'identityOf',
+      'invalidateBelowFloor',
+      'onUsageFrame',
+      'readSessionProjectionFrame',
       'reconcileQuestions',
+      'recordSlotProjectionFloor',
+      'refetchSessionProjections',
+      'rereadAllContextTraces',
+      'resetContextTraceRefresh',
+      'resetSlotProjectionRevisions',
       'resolvedSince',
+      'seedFoldedProjection',
+      'slotProjectionFloor',
       'staleAskIds',
+      'takeFoldedSlotProjection',
       'useWebSocket',
     ])
   })
@@ -114,6 +140,19 @@ describe('one public surface', () => {
     expect(facade.UPDATE_RESTART_LATCH_TTL_MS).toBe(bundleReload.UPDATE_RESTART_LATCH_TTL_MS)
     expect(facade.consumeUpdateRestartLatch).toBe(bundleReload.consumeUpdateRestartLatch)
     expect(facade.emitSlotFocused).toBe(attention.emitSlotFocused)
+    expect(facade.crewLogProjectionsKey).toBe(sessionProjection.crewLogProjectionsKey)
+    // The usage-frame refresh keeps its seen revisions and pending reads in module state.
+    expect(facade.onUsageFrame).toBe(contextTraceRefresh.onUsageFrame)
+    expect(facade.resetContextTraceRefresh).toBe(contextTraceRefresh.resetContextTraceRefresh)
+    expect(facade.rereadAllContextTraces).toBe(contextTraceRefresh.rereadAllContextTraces)
+    expect(facade.contextTraceKey).toBe(contextTraceRefresh.contextTraceKey)
+    expect(facade.applySessionProjection).toBe(sessionProjection.applySessionProjection)
+    expect(facade.readSessionProjectionFrame).toBe(sessionProjection.readSessionProjectionFrame)
+    // The accepted-revision ledger is module state too: a second copy would let a
+    // reset reach a different Map from the gate that reads it.
+    expect(facade.resetSlotProjectionRevisions).toBe(slotProjection.resetSlotProjectionRevisions)
+    expect(facade.takeFoldedSlotProjection).toBe(slotProjection.takeFoldedSlotProjection)
+    expect(facade.seedFoldedProjection).toBe(slotProjection.seedFoldedProjection)
   })
 
   it('no owner imports the facade', () => {
@@ -146,9 +185,9 @@ describe('one public surface', () => {
 })
 
 describe('effect order', () => {
-  it('only the workflow heal and the chunk-drain owners declare an effect', () => {
+  it('only the workflow heal, the chunk-drain and the row-watchdog owners declare an effect', () => {
     const withEffects = OWNER_MODULES.filter((file) => /\buse(Layout)?Effect\(/.test(code(join(DIR, file))))
-    expect(withEffects).toEqual(['streamBuffers.ts', 'workflowRuns.ts'])
+    expect(withEffects).toEqual(['rowDeliveryWatchdog.ts', 'streamBuffers.ts', 'workflowRuns.ts'])
   })
 
   it('the facade composes them before its own watchdog and mount effects', () => {

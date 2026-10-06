@@ -175,6 +175,9 @@ code.
      makes the next RC a promotion candidate**; the 0.4.0 promotion was nearly
      tagged before it existed because this step lived only in the policy
      section, not here. The checklist in step 2 below verifies it landed.
+     This PR has no tracking issue, so the maintainer opening it applies the
+     `issue-gate: waived` label; `Issue Gate` (see
+     [CI and reviews](../ci/ci-and-reviews.md)) is otherwise red on it.
    - *CHANGELOG*: the release branch already carries `## [X.Y.Z] - <date>` (no
      `[Unreleased]`, enforced by the changelog gate). Confirm at cut time.
    - *Version display*: keep the base-version fold above on `main` and
@@ -804,6 +807,25 @@ Rules for setting the floor:
   never affected. `cli-manifest.py` refuses a floor above the manifest's own
   version and any non-bare-release value at publish time.
 
+### Raising the Python floor
+
+A managed-venv install updates with the engine of the version it already runs
+(`platform/wheel_engine.py`), which builds the new tree on its current
+interpreter and cannot provision another. That engine refuses, before any
+download, a release whose signed `python_requires` its interpreter fails, and
+the gateway then sends one notice per release instead of retrying a build that
+cannot succeed. Builds without that precheck fail late, after downloading and
+building, on every update cycle. The installer is the only way such a host moves
+onto a newer Python, and it provisions the one series its own pin names
+(`UV_PYTHON_SERIES` and the `python3.X` candidate order in `cli.sh`). So a floor
+is raised in a fixed order:
+
+1. Ship the precheck in a release first.
+2. Bump `cli.sh`'s `UV_PYTHON_SERIES` and its candidate order to a series that
+   satisfies the new floor, on `main`. `cli.sh` is one root object every channel
+   reads (`publish-installer.yml`), so this reaches every channel at once.
+3. Only then raise `requires-python` in a later release.
+
 ### Installing and switching channels
 
 The user-facing install commands, channel persistence, exact-version pinning,
@@ -943,6 +965,12 @@ user just declined does not land on their next quit; a stage they explicitly
 downloaded stays armed, because the preference is not what put it there. The
 stage itself is never discarded, so an explicit Install still applies it with
 nothing to re-download.
+
+**This preference and the gateway's `auto_update` are independent.** Neither
+reads or writes the other: `autoDownloadUpdates` lives in the app's
+electron-store, `auto_update` in the gateway's `config.json`. Which gateways
+defer to this updater is in
+[desktop-app.md → Updates](desktop-app.md#updates-two-updaters-two-switches).
 
 **Which channel a build follows is a default plus an opt-in, not a property of
 the bytes.** `channelForVersion()` classifies the version stamp and `nightly`

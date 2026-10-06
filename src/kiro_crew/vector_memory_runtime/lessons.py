@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import re
+import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -35,14 +36,12 @@ from kiro_crew.project_scope import (
     scope_is_admissible,
     scope_selector_is_inadmissible,
 )
-from kiro_crew.vector_memory_runtime.embedding import _RecallQuery
-from kiro_crew.vector_memory_runtime.text_scoring import (
-    _hybrid_score,
-    _keyword_score,
-    _row_stem_tokens_for_scan,
-    _stem_one,
-    _stem_words,
-)
+from kiro_crew.vector_memory_runtime import text_scoring as _text_scoring
+from kiro_crew.vector_memory_runtime.embedding import _RecallQuery, _RecallSpaceChanged
+
+# A by-name copy on purpose: the keyword-ranking tests patch ``lessons._stem_one``
+# apart from ``text_scoring._stem_one``.
+from kiro_crew.vector_memory_runtime.text_scoring import _stem_one
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -751,11 +750,21 @@ def get_lessons(store: VectorMemoryStore, limit: int | None = None, offset: int 
     can walk back through the population one bounded window at a time
     without materializing the rows it skips. The unbounded read has nothing
     to page and ignores it.
+
+    Rows sharing one ``updated_at`` -- two writes inside one clock tick, which
+    a coarse Windows clock makes routine -- are ordered by ``key``. Without it
+    their order is whatever the query plan scans, so the newest-first input
+    :func:`rank_lessons` keeps for its final ties is not defined, and a paged
+    ``LIMIT/OFFSET`` walk is not over a total order and can skip or repeat a
+    row at a page boundary. ``key`` is unique and present in both lineages
+    (``rowid`` is not readable through the crew ``semantic_memory`` view). Key
+    order is an md5 digest order and carries no recency: within one stamp,
+    "newest first" is not defined, only "the same order on every read".
     """
     sql = (
         "SELECT * FROM semantic_memory "
         "WHERE is_deleted = 0 AND key LIKE 'lesson.%' "
-        "ORDER BY updated_at DESC"
+        "ORDER BY updated_at DESC, key"
     )
     # On the same concurrent context-injection path as get_semantic_context
     # (get_lessons_context runs on executor threads while lesson writes are
@@ -903,9 +912,9 @@ def get_lessons_context(
 ) -> str:
     """Format lessons for prompt injection, most relevant first.
 
-    Lessons are ranked against *query_text* using the same hybrid
-    vector + keyword score as :meth:`get_semantic_context` when the query has a
-    vector, and by rarity-weighted word overlap when it has none (see
+    Lessons are ranked against *query_text* by rarity-weighted word overlap:
+    on the same 0.6/0.4 hybrid scale as :meth:`get_semantic_context` when the
+    query has a vector, and on that overlap alone when it has none (see
     ``rank_lessons``), then emitted until *cap* characters are used. Ranking is
     relevance-only — neither ``source`` nor ``confidence`` contributes — so an
     unrelated user-taught rule cannot displace a relevant inferred one.
@@ -913,8 +922,10 @@ def get_lessons_context(
     Args:
         query_text: Request to rank against. Empty keeps recency order for
             explicit recall, never as filler in background admission.
-        background: Preserve all eligible in-scope rules, without query
-            ranking beyond a lexical pass. Below the ``hard_cap`` ceiling the
+        background: Preserve all eligible in-scope rules. Ranking is hybrid when
+            *recall_query* carries a vector (``startup_lesson_query``) and
+            lexical otherwise; a space change since that vector was embedded
+            ranks lexically instead of raising. Below the ``hard_cap`` ceiling the
             block is returned complete; only when the full set exceeds that
             ceiling does admission fall back to the ordinary lessons budget
             ``cap``. Extraction source does not establish optionality.
@@ -935,25 +946,19 @@ def get_lessons_context(
     # out-of-scope is not reported as "omitted" -- omitted means "did not fit
     # the budget", and conflating the two would tell the model that rules it
     # should never see are being kept from it for space.
-    entries: list[tuple[dict, str]] = []
     with store._db_lock:
-        store._check_recall_query(recall_query)
-        lesson_rows = store._eligible_rows(store.get_lessons(), "directive")
-    for row in lesson_rows:
         try:
-            decoded = json.loads(row["value_json"])
-        except (TypeError, ValueError, RecursionError):
-            # One unreadable row must not fail every context build; the key
-            # names the row to repair, the value is left out of the log.
-            logger.warning("Skipping lesson %r: stored value_json does not decode", row["key"])
-            continue
-        text = _renderable_lesson_text(decoded, row["key"])
-        if not text:
-            continue
-        scope = _lesson_scope(decoded)
-        if scope and not project_scope_satisfied(scope, project_dir):
-            continue
-        entries.append((row, text))
+            store._check_recall_query(recall_query)
+        except _RecallSpaceChanged:
+            if not background:
+                raise
+            # The embedding space moved between the startup embed and this read.
+            # Rank keyword-only rather than compare vectors from two spaces; the
+            # check and the read share this lock, so no row read below is scored
+            # against the stale vector. Explicit recall retries in ``recall``.
+            recall_query = _RecallQuery(None, None, None)
+        lesson_rows = store._eligible_rows(store.get_lessons(), "directive")
+    entries = _renderable_entries(lesson_rows, project_dir)
     if not entries:
         return ""
     if background:
@@ -970,8 +975,9 @@ def get_lessons_context(
         # startup injection scale with the window, so moving from a 200K to a
         # 1M model multiplies it about fivefold for a user who changed nothing.
         #
-        # Ranking still puts rules relevant to this request first, lexically
-        # only: startup never spends an embedding inference.
+        # Ranking puts rules relevant to this request first. A caller that
+        # hands in a startup query vector (``startup_lesson_query``) gets the
+        # hybrid score; with none, ranking is lexical and embeds nothing here.
         ranked = (
             store._rank_lessons(
                 entries,
@@ -1130,26 +1136,192 @@ def get_lessons_context(
                 f"{total - len(rows)} omitted."
             )
         body = "\n".join(f"- {text}" for _, text in rows)
-        return f"{header}]\n{body}\n[End of learned corrections]\n"
+        return f"{header}]\n{body}\n{_EXPLICIT_LESSONS_FOOTER}"
 
     if not cap:
         return render(ranked)
+    whole = render(ranked)
+    if len(whole) <= cap:
+        return whole
 
+    # Each entry is judged against the RENDERED block, frame included, so an
+    # admitted entry never has to be trimmed back out. Skip rather than stop,
+    # and apply the skip to the first entry too: one long lesson anywhere in
+    # the ranking, top included, must not discard every shorter one behind it
+    # that still fits.
     selected: list[tuple[dict, str]] = []
-    used = 0
     for entry in ranked:
-        size = len(entry[1]) + 3  # "- " prefix and newline
-        if selected and used + size > cap:
-            # Skip rather than stop: one long lesson high in the ranking
-            # must not discard every shorter one behind it that still fits.
-            continue
-        selected.append(entry)
-        used += size
-    # The header grows with the counts it reports, so trim to fit rather
-    # than reserving a guessed margin. At least one lesson is always kept.
-    while len(selected) > 1 and len(render(selected)) > cap:
-        selected.pop()
+        if len(render([*selected, entry])) <= cap:
+            selected.append(entry)
+    if not selected:
+        # No entry fits: keep the top-ranked one so the block never goes
+        # silent. It exceeds *cap*; ``truncate_explicit_lessons`` shortens it
+        # for a caller that needs the block to fit.
+        selected = ranked[:1]
     return render(selected)
+
+
+def _renderable_entries(
+    lesson_rows: list[dict], project_dir: str | Path | None
+) -> list[tuple[dict, str]]:
+    """``(row, text)`` for every row that renders and is in scope for *project_dir*."""
+    entries: list[tuple[dict, str]] = []
+    for row in lesson_rows:
+        try:
+            decoded = json.loads(row["value_json"])
+        except (TypeError, ValueError, RecursionError):
+            # One unreadable row must not fail every context build; the key
+            # names the row to repair, the value is left out of the log.
+            logger.warning("Skipping lesson %r: stored value_json does not decode", row["key"])
+            continue
+        text = _renderable_lesson_text(decoded, row["key"])
+        if not text:
+            continue
+        scope = _lesson_scope(decoded)
+        if scope and not project_scope_satisfied(scope, project_dir):
+            continue
+        entries.append((row, text))
+    return entries
+
+
+#: Request words in ``lesson_keywords``' stop list and words of two letters or
+#: fewer are ignored. Each remaining request word is matched once through its
+#: stem. A follow-up message earns a lesson only when they share at least
+#: ``_TURN_LESSON_TERMS`` distinct stems that are each rare: found in at most
+#: ``_TURN_LESSON_RARITY`` of the N stored lessons, and never fewer than one, so
+#: a small store still admits a lesson through words no other lesson carries.
+#: Rarity is a count of distinct stems, not a sum of their weights: a sum lets
+#: one word found in a single lesson admit it alone, and lets a store of a few
+#: hundred lessons count an ordinary word as rare.
+_TURN_LESSON_TERMS = 2
+_TURN_LESSON_RARITY = 0.01
+
+
+def turn_lessons(
+    store: VectorMemoryStore,
+    query_text: str,
+    *,
+    shown: Callable[[str], bool],
+    project_dir: str | Path | None = None,
+    max_rows: int,
+    max_chars: int,
+    render_lesson: Callable[[str], str] | None = None,
+) -> list[tuple[str, str]]:
+    """``(key, text)`` of the lessons a follow-up message should add, best first.
+
+    Every eligible, in-scope lesson is a candidate, rules and findings alike,
+    except those *shown* reports as already in the session. Request words in
+    ``lesson_keywords``' stop list and words of two letters or fewer are ignored.
+    Each remaining request word is matched once, through its stem. A lesson is
+    admitted only when it shares at least ``_TURN_LESSON_TERMS`` distinct stems
+    with the message, each found in at most ``_TURN_LESSON_RARITY`` of the stored
+    lessons (and never fewer than one lesson); admitted lessons are ordered by
+    the summed rarity weight of every shared stem over the square root of their
+    length, the startup order, and taken while their rendered forms fit
+    *max_rows* and *max_chars*. A lesson too long for the room left is skipped,
+    not a stop. No embedding is spent.
+    """
+    if not query_text.strip() or max_rows <= 0:
+        return []
+    with store._db_lock:
+        lesson_rows = store._eligible_rows(store.get_lessons(), "directive")
+    entries = _renderable_entries(lesson_rows, project_dir)
+    if not entries:
+        return []
+    query_stems = {_stem_one(word) for word in store._lesson_keywords(query_text.lower())}
+    row_tokens = _text_scoring._row_stem_tokens_for_scan(len(entries))
+    shared_by_row, sizes, document_frequency = _shared_lesson_stems(
+        entries, query_stems, row_tokens
+    )
+    rows = len(entries)
+    rare_stems = {
+        stem
+        for stem, count in document_frequency.items()
+        if count <= max(1, _TURN_LESSON_RARITY * rows)
+    }
+    weight = _rarity_weights(rows, document_frequency)
+    admitted = [
+        (sum(weight[stem] for stem in shared) / math.sqrt(sizes[index]), index)
+        for index, shared in enumerate(shared_by_row)
+        if len(shared & rare_stems) >= _TURN_LESSON_TERMS and not shown(entries[index][1])
+    ]
+    # Stable, so equal scores keep the stored newest-first order.
+    admitted.sort(key=lambda pair: -pair[0])
+    chosen: list[tuple[str, str]] = []
+    used = 0
+    for _, index in admitted:
+        if len(chosen) == max_rows:
+            break
+        row, text = entries[index]
+        rendered = render_lesson(text) if render_lesson is not None else text
+        size = len(rendered) + 3  # "- " prefix and newline
+        if used + size > max_chars:
+            continue
+        chosen.append((row["key"], text))
+        used += size
+    return chosen
+
+
+_EXPLICIT_LESSONS_FOOTER = "[End of learned corrections]\n"
+LESSON_TRUNCATION_MARKER = "… [truncated]"
+
+
+def truncate_explicit_lessons(block: str, cap: int) -> str:
+    """Shorten an over-cap explicit lessons block so it fits *cap*.
+
+    The explicit renderer exceeds its cap only when no entry fits, and then it
+    carries exactly one lesson, so the body is a single ``- `` line between the
+    header and the footer. That lesson's text is cut and marked; the header and
+    its shown/omitted counts stay as rendered. Returns ``""`` when the frame and
+    marker alone leave no room for any of the text.
+    """
+    if len(block) <= cap:
+        return block
+    body_start = block.index("]\n- ") + len("]\n- ")
+    tail = "\n" + _EXPLICIT_LESSONS_FOOTER
+    room = cap - body_start - len(tail) - len(LESSON_TRUNCATION_MARKER)
+    if room < 1:
+        return ""
+    text = block[body_start : len(block) - len(tail)]
+    return block[:body_start] + text[:room] + LESSON_TRUNCATION_MARKER + tail
+
+
+def startup_lesson_query(store: VectorMemoryStore, query_text: str) -> _RecallQuery:
+    """Embed a session's first message once, for ranking its startup lessons.
+
+    The prompt builder calls this only when the same build already embeds that
+    message for the activity block, so the shared embed cache normally answers
+    it without a second inference; an entry evicted in between is embedded
+    again under the same build deadline. The prompt builder hands the result to
+    every render of the lessons block, so a render repeated to fit the
+    protected ceiling reuses it too. The query carries the space it was
+    embedded in, as ``recall`` does, so ``get_lessons_context`` can tell a
+    vector from a different space than the stored rows and rank keyword-only
+    instead.
+
+    No text, no embedder, a missed deadline, or a store read failure returns a
+    query with no vector, which ranks lexically: a failed embed never fails the
+    prompt build, and a store that cannot be read still fails where the render
+    reads it.
+    """
+    from kiro_crew import vector_memory  # circular import: sqlite3 is a facade seam
+
+    if not query_text.strip() or not store.embed_fn:
+        # No embedder bound: the activity block embedded nothing either (it
+        # checks ``embed_fn`` the same way), and ``_try_embed``'s lazy rebind
+        # would load a model on the first turn. Rank lexically instead.
+        return _RecallQuery(None, None, None)
+    try:
+        with store._db_lock:
+            generation = store._space_generation
+            signature = store.recorded_embedding_space()
+        vector = store._try_embed(query_text, PRIORITY_INTERACTIVE)
+    except (OSError, ValueError, RuntimeError, vector_memory.sqlite3.Error):
+        logger.debug("startup lesson query embed skipped", exc_info=True)
+        return _RecallQuery(None, None, None)
+    if not vector:
+        return _RecallQuery(None, None, None)
+    return _RecallQuery(vector, generation, signature)
 
 
 def rank_lessons(
@@ -1166,9 +1338,33 @@ def rank_lessons(
     arrives newest-first, so equal scores keep recency order and a query
     that matches nothing degrades to plain recency.
 
-    A query with no vector -- every startup render, and any recall whose embed
-    is unavailable -- is scored by :func:`_lexical_lesson_scores` instead of the
-    capped overlap count the hybrid score takes as its keyword half.
+    One keyword measure serves both cases: the rarity-weighted overlap of
+    :func:`_lexical_lesson_scores`. A query with no vector -- a startup render
+    whose first message was not embedded, and any recall whose embed is
+    unavailable -- is ordered by that score alone.
+
+    With a query vector, every row takes that same score, scaled by
+    :func:`_keyword_half_scale` and capped at 1.0, as its keyword
+    half, and its vector term is the cosine clamped at 0: a row with no stored
+    vector comparable with the query's, or at a cosine at or below 0, has a
+    vector term of 0. Two consequences follow from one measure. Within one
+    ranking a row's keyword half does not depend on its own cosine, so a row
+    whose cosine rises above 0 can only score higher than it did at 0; across
+    the two branches only the ORDER is comparable, since the no-vector branch
+    ranks on the unscaled overlap and this one on the 0.6/0.4 hybrid of its
+    scaled form. And the rows the vector cannot rank keep exactly the order
+    they have with no vector, including where two of them saturate the keyword
+    half, since the tie-break below is that same score -- so the first row an
+    embedding backfill reaches does not reshuffle the rows behind it.
+
+    The capped overlap count the semantic scan uses as its keyword half is not
+    used here: it reaches 1.0 at ten shared tokens, which a long first message
+    clears against most stored rules, so it would leave the keyword half a
+    near-constant offset for them and rank them on the vector term alone.
+
+    Rows whose hybrid scores tie exactly are ordered by the rarity-weighted
+    lexical score before recency; rows still tied after it keep the caller's
+    newest-first order.
     """
     request_words = set(re.findall(r"\w+", query_text.lower()))
     if recall_query is not None:
@@ -1180,72 +1376,163 @@ def rank_lessons(
     # Same row-side derivation, and the same width rule, as the semantic scan:
     # a lesson's tokens depend only on its own rendered text, and only a pass
     # that fits the cache can hit it.
-    row_tokens = _row_stem_tokens_for_scan(len(entries))
-    if not query_emb:
-        lexical_query_words = {_stem_one(word) for word in request_words}
-        lexical = _lexical_lesson_scores(entries, lexical_query_words, row_tokens)
+    row_tokens = _text_scoring._row_stem_tokens_for_scan(len(entries))
+    lexical_query_words = {_stem_one(word) for word in request_words}
+    lexical, row_words = _lexical_lesson_scores(entries, lexical_query_words, row_tokens)
+    # The scorer answers 0.0 for a row with no stored vector or one of another
+    # width, and a negative cosine is no signal, so the clamp leaves every row
+    # the vector cannot rank at 0.0.
+    vectors: list[float] = []
+    if query_emb:
+        similarity = store._stored_similarity_scorer(query_emb)
+        vectors = [max(0.0, similarity(row)) for row, _ in entries]
+    if not any(vectors):
+        # No query vector, or a vector that favours no row: the lexical order.
         # ``sorted`` is stable, so equal scores -- including every zero-overlap
         # row -- keep the caller's newest-first order.
         order = sorted(range(len(entries)), key=lambda index: -lexical[index])
         return [entries[index] for index in order]
-    query_words = _stem_words(request_words)
-    similarity = store._stored_similarity_scorer(query_emb)
-    scored: list[tuple[float, tuple[dict, str]]] = []
-    for entry in entries:
-        row, text = entry
-        # Only the rendered text is matched. A lesson key is
-        # ``lesson.<md5hash>``, which carries no words, so there is no key
-        # term to weight here the way get_semantic_context() weights its own.
-        overlap = len(query_words & row_tokens(text.lower()))
-        score = _hybrid_score(_keyword_score(overlap), similarity(row))
-        scored.append((score, entry))
-    scored.sort(key=lambda pair: -pair[0])
-    return [entry for _, entry in scored]
+    # One keyword measure for every row, with a vector or without one: the
+    # rarity-weighted overlap above, scaled by _keyword_half_scale so one
+    # maximally rare shared word in a row of the store's median length adds 0.1
+    # to the keyword half, and capped at 1.0. The capped overlap count cannot
+    # serve here: it saturates at ten shared tokens, which a long first message
+    # clears against most rows (measured on an 897-rule store with each rule's
+    # own text as the request: the median row with any overlap sat AT the cap
+    # and 64% of them did; a six-word request put none there), leaving the
+    # keyword half a near-constant 0.4 offset rather than a measure. Only the
+    # rendered text is matched: a lesson key is ``lesson.<md5hash>``, which
+    # carries no words, so there is no key term to weight here the way
+    # get_semantic_context() weights its own.
+    keyword_scale = _keyword_half_scale(len(entries), row_words)
+    scored = [
+        _text_scoring._hybrid_score(
+            min(1.0, lexical[index] * keyword_scale),
+            vectors[index],
+            query_has_vector=True,
+        )
+        for index in range(len(entries))
+    ]
+    # An exact tie on the hybrid score is broken by the rarity-weighted lexical
+    # score before recency. ``sorted`` is stable: rows tied on both keep the
+    # caller's newest-first order.
+    order = sorted(range(len(entries)), key=lambda index: (-scored[index], -lexical[index]))
+    return [entries[index] for index in order]
 
 
 def _lexical_lesson_scores(
     entries: list[tuple[dict, str]],
     query_words: set[str],
     row_tokens: Callable[[str], frozenset[str]],
-) -> list[float]:
-    """Score each entry's words against the request's, one float per entry.
+) -> tuple[list[float], list[int]]:
+    """Score each entry's words against the request's: one float per entry, and its length.
 
     Each shared token is weighted by how rare it is among *entries*
     (``log((N + 1) / (df + 0.5))``), and the sum is divided by the square root
-    of the row's token count.
+    of the row's number of distinct words. That number is returned beside the
+    scores, one per entry, for :func:`_keyword_half_scale`.
 
-    The hybrid score's keyword half, ``_keyword_score``, saturates at ten shared
-    tokens, so a long first message would tie nearly every stored rule at the top
-    and the stable sort would return newest-first. A distinctive term counts for
-    far more than a common one; a token carried by nearly every row weighs close
-    to nothing (about ``0.5 / N``). The length factor discounts incidental overlap
-    in a long row, the same correction ``history_search.search_sessions`` makes
-    for long sessions.
+    The capped overlap count the semantic scan uses as its keyword half,
+    ``_keyword_score``, is not used here: it saturates at ten shared tokens, which
+    a long first message clears against most stored rules, so it would tie them at
+    the top and the stable sort would return newest-first. A distinctive term
+    counts for far more than a common one; a token carried by nearly every row
+    weighs close to nothing (about ``0.5 / N``). The length factor discounts
+    incidental overlap in a long row, the same correction
+    ``history_search.search_sessions`` makes for long sessions.
 
     Every weight is positive, since ``df <= N``, so any overlap still outranks
     none: ordering is unchanged for a zero-overlap row, and the findings tier's
     admission test (``any_lesson_overlap``) still agrees with this ranking.
-    Document frequency is counted only for tokens the request carries, over row
-    token sets ``row_tokens`` already memoises, so no row is re-stemmed.
     """
+    masses, sizes = _lexical_lesson_weights(entries, query_words, row_tokens)
+    scores = [mass / math.sqrt(size) if mass else 0.0 for mass, size in zip(masses, sizes)]
+    return scores, sizes
+
+
+def _lexical_lesson_weights(
+    entries: list[tuple[dict, str]],
+    query_words: set[str],
+    row_tokens: Callable[[str], frozenset[str]],
+) -> tuple[list[float], list[int]]:
+    """Per entry, the summed rarity weight of its tokens in *query_words*, and its length.
+
+    Rarity is ``log((N + 1) / (df + 0.5))`` over *entries*. Document frequency
+    is counted only for tokens the request carries, over row token sets
+    ``row_tokens`` already memoises, so no row is re-stemmed. A row's length is
+    its number of distinct words, so an inflection does not make it look longer.
+    """
+    shared_by_row, sizes, document_frequency = _shared_lesson_stems(
+        entries, query_words, row_tokens
+    )
+    weight = _rarity_weights(len(entries), document_frequency)
+    return [sum(weight[token] for token in shared) for shared in shared_by_row], sizes
+
+
+def _shared_lesson_stems(
+    entries: list[tuple[dict, str]],
+    query_words: set[str],
+    row_tokens: Callable[[str], frozenset[str]],
+) -> tuple[list[frozenset[str]], list[int], dict[str, int]]:
+    """Per entry, its tokens in *query_words* and its number of distinct words; and,
+    for each such token, the number of entries carrying it."""
     shared_by_row: list[frozenset[str]] = []
     sizes: list[int] = []
     document_frequency: dict[str, int] = {}
     for _, text in entries:
-        tokens = row_tokens(text.lower())
+        normalized_text = text.lower()
+        tokens = row_tokens(normalized_text)
         shared = tokens & query_words
         shared_by_row.append(shared)
-        sizes.append(len(tokens))
+        sizes.append(len(set(re.findall(r"\w+", normalized_text))))
         for token in shared:
             document_frequency[token] = document_frequency.get(token, 0) + 1
-    rows = len(entries)
-    weight = {
-        token: math.log((rows + 1) / (count + 0.5)) for token, count in document_frequency.items()
-    }
-    return [
-        sum(weight[token] for token in shared) / math.sqrt(size) if shared else 0.0
-        for shared, size in zip(shared_by_row, sizes)
-    ]
+    return shared_by_row, sizes, document_frequency
+
+
+def _rarity_weight(rows: int, count: int) -> float:
+    """``log((rows + 1) / (count + 0.5))``: one token's weight at document frequency *count*.
+
+    ``count=1`` is the heaviest a token can weigh -- carried by one of *rows*
+    rows -- which is the reference :func:`_keyword_half_scale` divides by, so the
+    keyword half's scale does not grow with the number of rows ranked.
+    """
+    return math.log((rows + 1) / (count + 0.5))
+
+
+#: What one maximally rare shared word adds to the keyword half of a row of the
+#: store's median length: the 0.1 one shared token adds under the capped count.
+_RARE_WORD_KEYWORD_HALF = 0.1
+
+
+def _keyword_half_scale(rows: int, row_words: list[int]) -> float:
+    """The factor that turns a row's rarity-weighted overlap into its keyword half.
+
+    The overlap divides a row's summed weight by the square root of its number
+    of distinct words, so one shared word counts for more in a short row than in
+    a long one. Scaled by the heaviest weight alone, it would count for more in a
+    store of short rules than in a store of long ones too: one maximally rare
+    word would fill ``1 / sqrt(size)`` of the half, 0.28 of it in a 13-word row
+    and 0.12 in a 65-word one. In a small store of short rules a function word
+    such as ``use`` is carried by one or two rows and weighs as a rare word, so
+    that share would let one incidental match outrank a rule with a clearly
+    closer cosine (measured on a real store's rules cut to their first sentence,
+    40 rows at a time: for requests sharing no word with the right rule, it ranks
+    first 17.8% of the time scaled that way and 29.4% with this scale).
+
+    Measuring length against the store's median row makes one maximally rare
+    word in a median-length row worth ``_RARE_WORD_KEYWORD_HALF`` in any store; a
+    longer row still takes less per word and a shorter one more. The factor is
+    the same for every row of one ranking, so it never reorders the rows the
+    vector cannot rank.
+    """
+    median_words = statistics.median(row_words)
+    return _RARE_WORD_KEYWORD_HALF * math.sqrt(median_words) / _rarity_weight(rows, 1)
+
+
+def _rarity_weights(rows: int, document_frequency: dict[str, int]) -> dict[str, float]:
+    """``log((N + 1) / (df + 0.5))`` per token: the fewer of the *rows* carry it, the heavier."""
+    return {token: _rarity_weight(rows, count) for token, count in document_frequency.items()}
 
 
 def any_lesson_overlap(
@@ -1260,14 +1547,17 @@ def any_lesson_overlap(
     helper the JSONL store uses: stemming matches strictly more, so borrowing that
     answer would discard this store's stem-only hits.
 
-    Only the KEYWORD half is consulted, which is exactly right on the startup
-    path: it passes a recall query whose vector is ``None``, so the similarity
-    term contributes nothing there and the keyword overlap IS the whole score.
+    Only the KEYWORD half is consulted, even when the startup path hands
+    ``_rank_lessons`` a query vector: the vector then orders the findings, but
+    a vector scores every row against every request, so admitting on it would
+    need a similarity floor this store has not calibrated. When no finding
+    shares a word with the request the tier stays withheld, even if the vector
+    favours one, and its notice says how to reach them.
     """
     if not entries or not query_text.strip():
         return False
-    query_words = _stem_words(set(re.findall(r"\w+", query_text.lower())))
+    query_words = _text_scoring._stem_words(set(re.findall(r"\w+", query_text.lower())))
     if not query_words:
         return False
-    row_tokens = _row_stem_tokens_for_scan(len(entries))
+    row_tokens = _text_scoring._row_stem_tokens_for_scan(len(entries))
     return any(query_words & row_tokens(text.lower()) for _, text in entries)

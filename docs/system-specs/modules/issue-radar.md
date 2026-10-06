@@ -61,7 +61,9 @@ Jira accepts `*.atlassian.net` automatically; self-hosted Jira requires an exact
 entry in `dashboard.jira_hosts`, and the host is rechecked before every API call.
 A Jira connection may carry an optional manual repo mapping for repo-centric UI
 identity, but requests route by project key. Pull requests, reviews, checks and
-workflow runs are refused rather than approximated.
+workflow runs are refused rather than approximated. Its shared vocabulary includes
+both `tracked_item` (`issue`) and `tracked_item_plural` (`issues`), so upstream
+triage prompts can read the same complete provider vocabulary.
 
 **Every provider is reached by shelling out to its vendor CLI as a raw REST
 passthrough, and Kiro Crew stores NO credential of its own.** `gh api`, `glab api`
@@ -232,8 +234,9 @@ module, such as `_pr_action_preamble` from the PR handlers, is bound there, so
 patching it on the facade reaches only the callers that read it through the
 facade. `test/test_issue_radar_http_routes_surface.py` fails an owner module that
 binds a gate or a seam itself. The import is function-local because the facade
-imports the owners, so a module-scope import back would be a cycle. The same test
-extends the per-repo store-scoping guard over every owner module.
+imports the owners, so a module-scope import back would be a cycle.
+`tests/test_gitlab.py` holds the facade and every `http_routes` module to the
+per-repo store-scoping rule.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -265,7 +268,7 @@ extends the per-repo store-scoping guard over every owner module.
 | POST | `/pull/state` | Close or reopen a PR. Routed through the provider's PULL endpoint, not the issue endpoint — a merged PR's un-reopenability then comes from the provider instead of silently succeeding against the issue shadow |
 | POST | `/pull/review` | Submit a review (`approve` / `request_changes` / `comment`). Requires `head_sha` — a review is a verdict on a REVISION, so it rides as GitHub's `commit_id` / GitLab's `sha` and a force-push between render and click is refused rather than recorded. A body is required for the latter two (the provider rejects them bodyless). GitLab has no "request changes" verb, and Azure DevOps can bind NEITHER verdict to a revision, so each client REFUSES rather than degrading a verdict to a comment |
 | POST | `/pull/comment` | Post a conversation comment on a PR |
-| POST | `/pull/merge` | Merge a PR now. Per-PR only — never bulk. Requires `head_sha`, sent as the provider's `sha` precondition so the merge is pinned to the reviewed commit. Cannot bypass a gate: the provider enforces branch protection on its own endpoint, and a 405 refusal is mapped to a readable message |
+| POST | `/pull/merge` | Merge a PR now. Per-PR only — never bulk. Requires `head_sha`, sent as the provider's `sha` precondition so the merge is pinned to the reviewed commit. Cannot bypass a gate: the provider enforces branch protection on its own endpoint, and a refusal is mapped to a readable `merge_not_allowed` message. On GitHub it goes through the asynchronous merge API and answers only once the merge has landed; a merge still running after the wait is a 409 `merge_pending` |
 | POST | `/pull/auto-merge` | Arm or disarm the PROVIDER's own auto-merge, for a PR that is not mergeable yet. **GitHub and Azure DevOps only** — REFUSED on GitLab, where `merge_when_pipeline_succeeds` is a deferral modifier on the merge endpoint rather than an arm verb (see "GitLab auto-merge is REFUSED outright" below); the UI hides both controls there. Callers must send only rows that are not landable yet — the provider refuses an already-clean or already-merged PR, and the list row carries `mergeable_state` so the bulk bar can tell (see "Merge readiness is on the LIST row") |
 | GET | `/pull/runs` | The CI runs on a PR's head commit, each with its id plus server-computed `cancellable`/`rerunnable`, so the UI never offers an action the provider will refuse |
 | POST | `/pull/run` | Cancel or re-run one CI run (`failed_only` re-runs just the failed jobs) |
@@ -425,6 +428,27 @@ JSON/owner/connected/permission checks, so the gate is not re-implemented per ha
 `GET /pull/runs` is a READ and is gated on the connected-repo check only, like the
 other reads — it returns run metadata the PR's own `checks` already imply.
 
+A second layer sits in front of the first: the **owner gate**. Every write route
+calls `require_owner_dashboard_request` before it reads its body, and a caller that
+is not the dashboard owner gets 403 `owner_only`. That refuses a non-owner dashboard
+subject and every app token, this app's own included. The gate covers the forge
+writes above and the local-state writes too:
+
+| Route | Owner gate in |
+|---|---|
+| `POST /crews`, `PUT /crew`, `DELETE /crew`, `POST /crew/pause`, `PUT /crews/settings` | `crew_routes._body_preamble` |
+| `PUT /crew/work` (dashboard caller) | `crew_routes._body_preamble` |
+| `POST /connect` | `routes._handle_connect` |
+| `DELETE /repos`, `PUT /settings`, `POST /settings/role` | their handlers in `http_routes/repositories.py` |
+| `PUT /investigation` (dashboard caller) | `http_routes/investigation.py` |
+| `POST /tagging`, `POST /recommendations` | their handlers in `http_routes/tagging.py` and `http_routes/recommendations.py` |
+
+Two internal-secret callers pass without the owner gate, each by its exact path in
+the server's internal allowlist: the agent leg of `PUT /crew/work`
+(`issue_radar_crew_record`) and `PUT /investigation`
+(`issue_radar_record_investigation`). A crew route other than `GET /crew` and
+`PUT /crew/work` refuses an internal-secret caller outright (`_agent_gate`).
+
 ## Pull-Request Actions
 
 The write half of the PR pane — approve / request changes, comment, close / reopen,
@@ -472,6 +496,19 @@ deliberate narrowing:
    `auto_merge`, which lets the provider decide once the checks finish. A provider 405 is
    still mapped to a readable refusal, since *Method Not Allowed* on a merge button reads
    like an app bug.
+   **On GitHub the merge is asynchronous.** `github_client.merge_pull_request` calls
+   `PUT .../pulls/{n}/merge-async` with `merge_action: direct_merge` and
+   `bypass_rules: false`, then polls `GET .../merge-async/{uuid}` for up to
+   `MERGE_ASYNC_WAIT_SEC`. GitHub recommends this endpoint over the synchronous one: its
+   background job retries transient errors on a busy repository. `bypass_rules: false`
+   means even an account allowed to bypass rules does not do so from here. A `failed`
+   result or an immediate 400 raises `GhMergeRefusedError`, which the route maps to
+   `merge_not_allowed`, carrying GitHub's reason when the background job reports one. A request still running when the wait
+   ends, or one already pending (409, which GitHub uses only for "a merge request already
+   exists"; a stale pinned sha is a 400), is a **409 `merge_pending`**, never a success:
+   the sequential merge stops on it rather than merging the next PR onto a base this one
+   has not reached. `direct_merge` keeps "Merge" meaning "merge now"; a branch that
+   requires a merge queue is reached through auto-merge.
    **The merge is PINNED to the reviewed head commit.** `head_sha` is required by the
    route (400 `head_sha_required`) and by both clients, and rides as the provider's own
    `sha` precondition — so a push landing between the read and the click answers 409

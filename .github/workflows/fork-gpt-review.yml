@@ -1,6 +1,6 @@
-name: Fork GPT 5.6 Review
+name: Fork GPT 6.1 Review
 
-# STAGE 2 (privileged) of the fork AI-review pipeline — the GPT 5.6 reviewer.
+# STAGE 2 (privileged) of the fork AI-review pipeline — the GPT 6.1 reviewer.
 # Triggered by the completion of "Fork AI Review (collect)" (Stage 1). Runs from
 # the DEFAULT branch with secrets + OIDC. It NEVER checks out or executes the
 # fork's code.
@@ -23,7 +23,7 @@ name: Fork GPT 5.6 Review
 # Mirrors codex-review.yml's contract (model, [GPT-REVIEWED]/[BLOCK-MERGE]
 # markers, fail-closed gate) and its two-pass design (discovery + falsification).
 # codex-review.yml is UNCHANGED and owns same-repo PRs. The fork check-run is
-# named exactly "GPT 5.6 Review" so branch protection is satisfied on either
+# named exactly "GPT 6.1 Review" so branch protection is satisfied on either
 # path. The prompt blocks shared with codex-review.yml live in
 # .github/review-prompts/gpt-*.md so the two lanes cannot drift apart; this
 # lane reads them from the checked-out tree, which is the trusted BASE.
@@ -51,12 +51,15 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: fork-gpt-review-${{ github.event.workflow_run.head_sha }}
+  # The upstream run id is immutable across attempts and unique per trigger.
+  # Unlike repository/ref text, it cannot collide under GitHub's
+  # case-insensitive concurrency comparison or exceed the group length limit.
+  group: fork-gpt-review-${{ github.event.workflow_run.id }}
   cancel-in-progress: true
 
 jobs:
   fork-gpt-review:
-    name: Fork GPT 5.6 Review
+    name: Fork GPT 6.1 Review
     runs-on: ubuntu-latest
     # Must stay above the sum of the two PASS_WALLs plus setup, or this wall --
     # not the named pass timeout -- kills pass 2 and the job ends with no
@@ -130,6 +133,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WR_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          WR_HEAD_REF: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -uo pipefail
           # head_sha from the triggering run is set by GitHub and is authoritative.
@@ -162,29 +167,36 @@ jobs:
             return "$rc"
           }
 
-          # Resolve the PR by matching the open PR whose head SHA equals the
-          # trigger head_sha (workflow_run.pull_requests is empty for forks).
-          #
-          # An empty result has TWO causes that need OPPOSITE reporting, and
-          # collapsing them into one message made this abort unfalsifiable: the
-          # same text and the same exit 1 were emitted whether the query FAILED
-          # or whether it SUCCEEDED and matched nothing, while `2>/dev/null`
-          # discarded the only evidence of which.
-          #   * query FAILED -> nothing is known about this head. Retried above;
-          #     if it still fails, say the QUERY failed and fail closed.
-          #   * query SUCCEEDED with no match -> the push was superseded, or its
-          #     PR closed, while CI was queued. There is nothing to review.
-          # Both still exit 1, so the fail-closed finalize step is unchanged and
-          # no verdict is withheld; what changes is that the log names the cause.
-          if ! pr="$(gh_read gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
-            --jq "[.[] | select(.head.sha == \"$head_sha\")][0].number // empty")"; then
+          # workflow_run.pull_requests is empty for forks, so all open-PR pages
+          # are aggregated before matching the trigger's repository, ref and SHA.
+          # Every coordinate is required and reaches jq through --arg. Zero
+          # candidates means the head was superseded or closed; multiple exact
+          # candidates are ambiguous. This blocking lane fails closed on both.
+          if [ -z "$WR_HEAD_REPO" ] || [ -z "$WR_HEAD_REF" ]; then
+            echo "::error::empty workflow_run head identity (repository/ref); failing closed"
+            exit 1
+          fi
+          if ! candidates="$(gh_read gh api "repos/$REPO/pulls?state=open&per_page=100" --paginate \
+            | jq -rs --arg sha "$head_sha" --arg repo "$WR_HEAD_REPO" --arg ref "$WR_HEAD_REF" '
+                [.[][]
+                  | select(.state == "open"
+                           and .head.repo.full_name == $repo
+                           and .head.ref == $ref
+                           and .head.sha == $sha)]
+              ')"; then
             echo "::error::could not query open PRs while resolving $head_sha - the query itself failed on all 3 attempts; see the errors above"
             exit 1
           fi
-          if [ -z "$pr" ]; then
-            echo "::error::no open PR has head $head_sha - superseded or closed while CI was queued; nothing to review"
+          candidate_count="$(printf '%s' "$candidates" | jq -r 'length')"
+          if [ "$candidate_count" -eq 0 ]; then
+            echo "::error::no open PR has head $head_sha on $WR_HEAD_REPO:$WR_HEAD_REF - superseded or closed while CI was queued; nothing to review"
             exit 1
           fi
+          if [ "$candidate_count" -ne 1 ]; then
+            echo "::error::more than one open PR matches head $head_sha on $WR_HEAD_REPO:$WR_HEAD_REF; refusing to select one"
+            exit 1
+          fi
+          pr="$(printf '%s' "$candidates" | jq -r '.[0].number')"
 
           # Authoritative base SHA straight from the PR (NOT from the artifact).
           if ! base_sha="$(gh_read gh api "repos/$REPO/pulls/$pr" --jq '.base.sha')"; then
@@ -221,11 +233,15 @@ jobs:
       # verdict can only ever answer for the run this pull request created at
       # this attempt.
       #
-      # `details_url` carries this run's URL: a workflow_run-triggered run is
-      # keyed to the DEFAULT branch context, so this stamp is the only link
-      # from the PR head back to the lane run — the human-override handler
-      # reads it to re-run the lane, and a human clicking the check lands on
-      # the run logs instead of a bare check-run page.
+      # `output.text` carries this run's id as the lane-run marker
+      # (`<!-- ai-review-fork-lane run=<id> -->`), on this write and on every
+      # later write of this check-run. A workflow_run-triggered run is keyed to
+      # the DEFAULT branch context, so that marker is the only link from the PR
+      # head back to the lane run: the human-override handler reads it to re-run
+      # the lane, and its `Lane run:` line takes a human to the run logs.
+      # `details_url` cannot carry the link. GitHub stores an Actions-created
+      # check-run's details_url as the check-run's own page, whatever the POST
+      # passes.
       - name: Open check-run (in progress)
         id: check
         env:
@@ -238,11 +254,87 @@ jobs:
         run: |
           set -uo pipefail
           id="$(gh api --method POST "repos/$REPO/check-runs" \
-            -f name="GPT 5.6 Review" -f head_sha="$HEAD" -f status="in_progress" \
+            -f name="GPT 6.1 Review" -f head_sha="$HEAD" -f status="in_progress" \
             -f external_id="gpt-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT" \
             -f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" \
+            -f "output[title]=GPT 6.1 Review — in progress" \
+            -f "output[summary]=Fork review running for $HEAD." \
+            -f "output[text]=$(printf 'Lane run: %s/%s/actions/runs/%s\n\n<!-- ai-review-fork-lane run=%s -->' \
+              "${GITHUB_SERVER_URL:-}" "$REPO" "${GITHUB_RUN_ID:-}" "${GITHUB_RUN_ID:-}")" \
             --jq '.id')"
           echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      # The writer's accepted `/ai-review override` record for THIS lane at THIS
+      # head, read before anything calls the model. An accepted record skips the
+      # review, and the lane publishes the human decision instead -- a `success`
+      # check-run and the "human override accepted" slot note -- the same outcome
+      # the same-repo lane's override arm produces. Each condition fails closed:
+      # the comment must be authored by `github-actions[bot]` (the handler posts
+      # it only after checking the commenter's write permission), the marker must
+      # be its LEADING bytes, and it must name this lane (or `all`) and this exact
+      # head. A marker for another head or another lane, or one any other account
+      # wrote, is not a record. Neither is a comment feed this step could not
+      # read: the step warns and the lane reviews normally, so a read failure can
+      # cost a model call but never clears a block.
+      #
+      # It runs AFTER this lane's check-run is open. The handler posts the record
+      # and only then reads this lane's row, and this step opens the row and only
+      # then reads the record, so a record this read misses is one the handler
+      # finds a row for, and the handler cancels and re-runs that run.
+      - name: Resolve human override
+        id: human_override
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.pr.outputs.pr }}
+          HEAD: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -uo pipefail
+          exact="<!-- ai-review-human-override target=gpt head=$HEAD "
+          all="<!-- ai-review-human-override target=all head=$HEAD "
+          active=false
+          actor=""
+          source=""
+          read_ok=""
+          if [[ ! "${HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || [[ ! "${PR:-}" =~ ^[0-9]+$ ]]; then
+            echo "::warning::No resolved pull request and head to read an override record for; reviewing normally."
+          else
+            for attempt in 1 2 3; do
+              if comments="$(gh api "repos/$REPO/issues/$PR/comments" --paginate)"; then
+                read_ok=1
+                break
+              fi
+              echo "Reading the PR comments failed on attempt $attempt."
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$attempt"
+              fi
+            done
+            if [ -z "$read_ok" ]; then
+              echo "::warning::Could not read this PR's comments after 3 attempts, so whether a human override is recorded for $HEAD is unknown. Reviewing normally: an unread record is never an accepted one."
+            elif ! record="$(printf '%s' "$comments" \
+              | jq -sr --arg exact "$exact" --arg all "$all" \
+                'add // [] | [.[] | select(.user.login == "github-actions[bot]")
+                | select((.body | startswith($exact)) or (.body | startswith($all)))]
+                | (last.body // "")')"; then
+              echo "::warning::This PR's comments could not be parsed, so whether a human override is recorded for $HEAD is unknown. Reviewing normally: an unread record is never an accepted one."
+            else
+              actor="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\1/p')"
+              source="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\2/p')"
+              if [ -n "$actor" ] && [ -n "$source" ]; then
+                active=true
+                echo "Human override by @$actor (comment $source) accepted for $HEAD."
+              fi
+            fi
+          fi
+          if [ "$active" != "true" ]; then
+            actor=""
+            source=""
+          fi
+          {
+            echo "active=$active"
+            echo "actor=$actor"
+            echo "source=$source"
+          } >> "$GITHUB_OUTPUT"
 
       # Trusted BASE tree for review CONTEXT only. NEVER the fork head.
       - name: Checkout base (trusted)
@@ -321,6 +413,7 @@ jobs:
       # highest-value signal: the primary supply-chain attack on an open-source
       # project is a diff that quietly does MORE than its description admits.
       - name: Fetch PR intent (stated purpose — data only, for the scope check)
+        if: steps.human_override.outputs.active != 'true'
         id: intent
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -363,6 +456,7 @@ jobs:
           echo "Captured PR intent ($(wc -c < "$INTENT_FILE") bytes) for the scope check."
 
       - name: Install review CLI
+        if: steps.human_override.outputs.active != 'true'
         env:
           BASE_SHA: ${{ steps.pr.outputs.base_sha }}
           CLI_DIR: ${{ runner.temp }}/review-cli
@@ -409,11 +503,12 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - name: Configure the review CLI for Amazon Bedrock
+        if: steps.human_override.outputs.active != 'true'
         run: |
           mkdir -p "$HOME/.codex"
           cat > "$HOME/.codex/config.toml" <<'EOF'
           model_provider = "amazon-bedrock"
-          model = "openai.gpt-5.6-sol"
+          model = "openai.gpt-6.1-sol"
           model_reasoning_effort = "medium"
 
           # Pin the sandbox mode HERE rather than on the `codex exec` command
@@ -455,6 +550,7 @@ jobs:
       # Mint short-lived, Bedrock-only creds immediately before the model call,
       # via the SAME dedicated least-privilege role the same-repo GPT reviewer uses.
       - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        if: steps.human_override.outputs.active != 'true'
         with:
           role-to-assume: ${{ secrets.AWS_CODEX_BEDROCK_ROLE_ARN }}
           aws-region: us-east-1
@@ -487,7 +583,8 @@ jobs:
           done
           echo "truncated $n persisted set_env_* file(s)"
 
-      - name: GPT 5.6 review (discovery pass)
+      - name: GPT 6.1 review (discovery pass)
+        if: steps.human_override.outputs.active != 'true'
         id: review
         env:
           AWS_REGION: us-east-1
@@ -717,7 +814,7 @@ jobs:
             --output-last-message "codex-pass-1.md" \
             "$PROMPT" || rc=$?
           if [ "$rc" -ne 0 ] || [ ! -s codex-pass-1.md ]; then
-            echo "::warning::GPT 5.6 fork review pass 1 did not complete (exit ${rc}); the verdict will fail closed."
+            echo "::warning::GPT 6.1 fork review pass 1 did not complete (exit ${rc}); the verdict will fail closed."
             printf ' 1' >> codex-failed-passes
           fi
 
@@ -726,6 +823,7 @@ jobs:
       # mid-call on an expired security token, failing the gate closed with no
       # verdict. Keep in sync with codex-review.yml.
       - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        if: steps.human_override.outputs.active != 'true'
         with:
           role-to-assume: ${{ secrets.AWS_CODEX_BEDROCK_ROLE_ARN }}
           aws-region: us-east-1
@@ -749,7 +847,8 @@ jobs:
           done
           echo "truncated $n persisted set_env_* file(s)"
 
-      - name: GPT 5.6 review (falsification pass)
+      - name: GPT 6.1 review (falsification pass)
+        if: steps.human_override.outputs.active != 'true'
         id: gpt_pass2
         env:
           AWS_REGION: us-east-1
@@ -807,7 +906,7 @@ jobs:
             --output-last-message "codex-pass-2.md" \
             "$PROMPT" || rc=$?
           if [ "$rc" -ne 0 ] || [ ! -s codex-pass-2.md ]; then
-            echo "::warning::GPT 5.6 fork review pass 2 did not complete (exit ${rc}); the verdict will fail closed."
+            echo "::warning::GPT 6.1 fork review pass 2 did not complete (exit ${rc}); the verdict will fail closed."
             failed_passes="${failed_passes} 2"
           fi
 
@@ -1022,8 +1121,11 @@ jobs:
       # after the codex CLI has finished.
       - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
         if: >-
+          steps.human_override.outputs.active != 'true'
+          && (
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
           || (steps.adj_input.outputs.fenced != '' && steps.adj_input.outputs.fenced != '0')
+          )
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: us-west-2
@@ -1036,15 +1138,19 @@ jobs:
       - name: Assert the adjudicator's Claude Code version floor
         id: adj_cli
         if: >-
+          steps.human_override.outputs.active != 'true'
+          && (
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
           || (steps.adj_input.outputs.fenced != '' && steps.adj_input.outputs.fenced != '0')
+          )
         env:
           # The minimum Claude Code the selected adjudicator model accepts.
           # Bump alongside any adjudicator model bump, with the
           # @anthropic-ai/claude-code pin in .github/review-cli/package.json
           # raised to satisfy it. The floor must cover both the primary and the
-          # overload fallback model; 2.1.255 is the Opus 4.8 fallback's minimum.
-          ADJ_CLAUDE_CODE_FLOOR: "2.1.255"
+          # overload fallback model; Opus 5.5 needs 2.1.280 and the Sonnet 5.5
+          # fallback 2.1.284.
+          ADJ_CLAUDE_CODE_FLOOR: "2.1.284"
         run: |
           set -euo pipefail
           bin="$RUNNER_TEMP/review-cli/node_modules/.bin/claude"
@@ -1086,12 +1192,15 @@ jobs:
           done
           echo "truncated $n persisted set_env_* file(s)"
 
-      - name: Opus 5 adjudication (blocking findings only)
+      - name: Opus 5.5 adjudication (blocking findings only)
         id: adjudicate
         if: >-
+          steps.human_override.outputs.active != 'true'
+          && (
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
           || (steps.adj_input.outputs.fenced != '' && steps.adj_input.outputs.fenced != '0')
-        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
+          )
+        uses: anthropics/claude-code-action@97c53473391bff1901034d4b454b5bac7ab7a029 # v1.0.239
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -1112,8 +1221,8 @@ jobs:
           # is posted by the SAME comment step that surfaces an unstamped
           # review. Deny the read path, as the fork Opus lane's model steps do.
           claude_args: |
-            --model us.anthropic.claude-opus-5
-            --fallback-model us.anthropic.claude-opus-4-8
+            --model us.anthropic.claude-opus-5-5
+            --fallback-model us.anthropic.claude-sonnet-5-5
             --max-turns 60
             --allowedTools "Read,Grep,Glob"
             --disallowedTools "Read(//proc/**),Read(//sys/**)"
@@ -1196,7 +1305,7 @@ jobs:
             # (#9216). Sits ABOVE the fenced wording so a stage that produced
             # no ruling is never reported in words that read like one.
             note="Adjudication produced no [GPT-ADJUDICATED] marker for $HEAD: the adjudication stage FAILED TO RUN (its raw output is in the Adjudication details block -- typically an API or setup error), so no proportionality review took place and GPT's blocking verdict stands unreviewed."
-            echo "::error::the Opus 5 adjudication stage produced no verdict for $HEAD -- inspect the 'Opus 5 adjudication' step output; GPT's blocking verdict stands unreviewed."
+            echo "::error::the Opus 5.5 adjudication stage produced no verdict for $HEAD -- inspect the 'Opus 5.5 adjudication' step output; GPT's blocking verdict stands unreviewed."
           elif [ "$fenced" -gt 0 ]; then
             note="$fenced of $count blocking finding(s) are security-class and were withheld from adjudication, so the blocking verdict stands."
           elif [ "$adjudicable" -eq 0 ]; then
@@ -1284,6 +1393,9 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ steps.pr.outputs.pr }}
           HEAD: ${{ steps.pr.outputs.head_sha }}
+          HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
+          OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
+          OVERRIDE_SOURCE: ${{ steps.human_override.outputs.source }}
           ADJ_DECISION: ${{ steps.adj.outputs.decision }}
           ADJ_NOTE: ${{ steps.adj.outputs.note }}
         run: |
@@ -1297,7 +1409,7 @@ jobs:
               # never from the adjudication prose.
               if [ "${ADJ_DECISION:-}" = "cleared" ]; then
                 kind="clear"; verdict="✅ no blocking findings (all downgraded on adjudication)"
-                note="Opus 5 adjudication downgraded every blocking finding to advisory. ${ADJ_NOTE:-} Read them as advice, not as merge conditions."
+                note="Opus 5.5 adjudication downgraded every blocking finding to advisory. ${ADJ_NOTE:-} Read them as advice, not as merge conditions."
               else
                 kind="blocked"; verdict="🔴 changes requested (blocking)"
                 note="${ADJ_NOTE:-}"
@@ -1308,7 +1420,7 @@ jobs:
           fi
           {
             echo "$MARKER"
-            echo "## GPT 5.6 Review (fork) — $verdict"
+            echo "## GPT 6.1 Review (fork) — $verdict"
             echo
             echo "_Reviewed \`$HEAD\` via the fork AI-review pipeline; updated in place on each push._"
             echo
@@ -1330,7 +1442,7 @@ jobs:
               echo
               echo "</details>"
             else
-              echo "_No completed GPT verdict for this commit; see the Fork GPT 5.6 Review job logs._"
+              echo "_No completed GPT verdict for this commit; see the Fork GPT 6.1 Review job logs._"
               # REPORTING ONLY. Without this, a review that ran to completion but
               # whose `[GPT-REVIEWED] <sha>` stamp is absent or SHA-corrupted put
               # its entire body in the job logs and posted only the line above --
@@ -1385,7 +1497,7 @@ jobs:
                 # session token has no distinctive prefix.
                 if grep -Eq '(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(AKIA|ASIA)[A-Z2-7]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[A-Za-z0-9/+=]{200,})' codex-review-output.md; then
                   echo
-                  echo "_The captured output matched a credential shape after redaction, so it is withheld; read it in the Fork GPT 5.6 Review job logs._"
+                  echo "_The captured output matched a credential shape after redaction, so it is withheld; read it in the Fork GPT 6.1 Review job logs._"
                 else
                   echo
                   echo "<details>"
@@ -1403,7 +1515,7 @@ jobs:
             if [ -s codex-adjudication.md ]; then
               echo
               echo "<details>"
-              echo "<summary>Adjudication (Opus 5) — is blocking on each finding proportionate?</summary>"
+              echo "<summary>Adjudication (Opus 5.5) — is blocking on each finding proportionate?</summary>"
               echo
               cat codex-adjudication.md
               echo
@@ -1430,7 +1542,7 @@ jobs:
           #
           # A marker comment is the ONLY thing a freshness verifier reads. A
           # write that does not land therefore leaves the PR indistinguishable
-          # from one no lane ever reviewed: prepare-pr's pr_status.py refuses a
+          # from one no lane ever reviewed: kirocrew-prepare-pr's pr_status.py refuses a
           # PR whose check-runs, readiness status and mergeable state all pass,
           # and the only way out is manufacturing a new head -- which re-rolls
           # the non-deterministic review lanes and discards the verdicts they
@@ -1686,7 +1798,7 @@ jobs:
             # would invent a BLOCK nobody judged out of an infrastructure fault.
             # The annotation is what says so: the required readiness status reads
             # check-run CONCLUSIONS and has no stamp-freshness read, so the reader
-            # that catches a head with no verdict is prepare-pr's own marker
+            # that catches a head with no verdict is kirocrew-prepare-pr's own marker
             # evaluation, run before a PR is called ready.
             if [ -n "$slot" ]; then
               occupied=""
@@ -2054,9 +2166,28 @@ jobs:
               fi
             fi
           }
-          guarded_comment_upsert "$MARKER" "[GPT-REVIEWED]" "Fork GPT 5.6 Review" "${RUNNER_TEMP:-/tmp}/fork-codex-comment.md"
+          # An accepted human override replaces whatever body the review steps
+          # left (they were skipped for it) with the override note, through the
+          # same guarded upsert a verdict takes, so the note replaces a BLOCK this
+          # head already shows. The note carries no review stamp, because no model
+          # ran: `[GPT-OVERRIDE] <head>` is what lets the upsert recognise its
+          # own write, and no freshness reader counts it as a review.
+          if [ "${HUMAN_OVERRIDE:-}" = "true" ]; then
+            {
+              echo "$MARKER"
+              echo "## GPT 6.1 Review (fork) — ✅ human override accepted"
+              echo
+              echo "_@$OVERRIDE_ACTOR overrode this lane for \`$HEAD\` ([the recorded decision](https://github.com/$REPO/pull/$PR#issuecomment-$OVERRIDE_SOURCE), this commit only); the model review was skipped._"
+              echo
+              echo "[GPT-OVERRIDE] $HEAD"
+            } > "${RUNNER_TEMP:-/tmp}/fork-codex-comment.md"
+            echo "verdict=OVERRIDE" >> "$GITHUB_OUTPUT"
+            guarded_comment_upsert "$MARKER" "[GPT-OVERRIDE]" "Fork GPT 6.1 Review" "${RUNNER_TEMP:-/tmp}/fork-codex-comment.md"
+            exit 0
+          fi
+          guarded_comment_upsert "$MARKER" "[GPT-REVIEWED]" "Fork GPT 6.1 Review" "${RUNNER_TEMP:-/tmp}/fork-codex-comment.md"
 
-      # Fail-CLOSED finalize of the required "GPT 5.6 Review" check-run, keyed to
+      # Fail-CLOSED finalize of the required "GPT 6.1 Review" check-run, keyed to
       # head_sha; posts a failing check-run if the job died before opening one.
       # Where a withheld verdict goes, so that it outlives the job that computed
       # it. The step above reports a withheld verdict in an annotation, and an
@@ -2108,10 +2239,14 @@ jobs:
           PR: ${{ steps.pr.outputs.pr }}
           WR_RUN_ID: ${{ github.event.workflow_run.id }}
           WR_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
+          OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           ADJ_DECISION: ${{ steps.adj.outputs.decision }}
           ADJ_NOTE: ${{ steps.adj.outputs.note }}
         run: |
           set -uo pipefail
+          lane_text="$(printf 'Lane run: %s/%s/actions/runs/%s\n\n<!-- ai-review-fork-lane run=%s -->' \
+            "${GITHUB_SERVER_URL:-}" "$REPO" "${GITHUB_RUN_ID:-}" "${GITHUB_RUN_ID:-}")"
           conclusion="failure"; title="review incomplete"; extra=""
           if [ -s codex-review-output.md ] && grep -Fq "[GPT-REVIEWED] $HEAD" codex-review-output.md; then
             if grep -Fq "[BLOCK-MERGE] $HEAD" codex-review-output.md; then
@@ -2132,6 +2267,14 @@ jobs:
             fi
           fi
           summary="Fork AI review for $HEAD. See the PR comment for details. $extra"
+          # An accepted human override is this run's verdict, whatever the review
+          # steps left behind: they were skipped for it. VERDICT is reassigned so
+          # no verdict-specific summary below applies to a review that never ran.
+          if [ "${HUMAN_OVERRIDE:-}" = "true" ]; then
+            VERDICT="OVERRIDE"
+            conclusion="success"; title="human override accepted"
+            summary="Human judgment by @${OVERRIDE_ACTOR:-} overrides this lane for $HEAD via \`/ai-review override\` (this commit only), so the model review was skipped."
+          fi
           # complete <check-run id> <conclusion> <title> — one retry, because a
           # single transient 5xx here is what strands the run: the check-run stays
           # `in_progress` forever, and pr-readiness counts ANY non-completed run of
@@ -2141,8 +2284,9 @@ jobs:
             for attempt in 1 2; do
               if gh api --method PATCH "repos/$REPO/check-runs/$1" \
                 -f status="completed" -f conclusion="$2" \
-                -f "output[title]=GPT 5.6 Review — $3" \
-                -f "output[summary]=$summary" >/dev/null; then
+                -f "output[title]=GPT 6.1 Review — $3" \
+                -f "output[summary]=$summary" \
+                -f "output[text]=$lane_text" >/dev/null; then
                 return 0
               fi
               sleep 5
@@ -2165,12 +2309,25 @@ jobs:
             if [ -n "${PR:-}" ]; then
               ext_args=(-f external_id="gpt-pr-$PR-$WR_RUN_ID-$WR_RUN_ATTEMPT")
             fi
+            # The conclusion THIS run's verdict earned, never a fixed one. This row
+            # is what PR Readiness reads, so a constant here publishes a verdict
+            # nobody reached whenever the opening POST was lost: a pass for a
+            # BLOCK, or a red for an accepted override. Only a run that reached no
+            # verdict keeps the could-not-run wording.
+            fb_title="$title"
+            fb_summary="$summary"
+            if [ "$title" = "review incomplete" ]; then
+              fb_title="could not run"
+              fb_summary="The fork GPT review job failed before producing a verdict; re-run it."
+            fi
             gh api --method POST "repos/$REPO/check-runs" \
-              -f name="GPT 5.6 Review" -f head_sha="$HEAD" \
-              -f status="completed" -f conclusion="failure" ${ext_args[@]+"${ext_args[@]}"} \
+              -f name="GPT 6.1 Review" -f head_sha="$HEAD" \
+              -f status="completed" -f conclusion="$conclusion" ${ext_args[@]+"${ext_args[@]}"} \
               -f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" \
-              -f "output[title]=GPT 5.6 Review — could not run" \
-              -f "output[summary]=The fork GPT review job failed before producing a verdict; re-run it." >/dev/null || true
+              -f "output[title]=GPT 6.1 Review — $fb_title" \
+              -f "output[summary]=$fb_summary" \
+              -f "output[text]=$lane_text" >/dev/null \
+              || echo "::warning::could not post the GPT 6.1 Review check-run for $HEAD"
           fi
           # Sweep any still-incomplete run of this name that THIS pull request
           # created (ours, if the PATCH above lost both attempts, or one stranded
@@ -2189,17 +2346,39 @@ jobs:
           # not posted yet and would wrongly outrank it. Fail-closed posture is
           # preserved: with no verdict, $conclusion is already failure/"review
           # incomplete".
+          #
+          # NEWEST-RUN-WINS GUARD. The concurrency group is keyed to
+          # workflow_run.id, so a close/reopen (or any same-sha retrigger) now
+          # yields two lane runs on one head that do NOT cancel each other. The
+          # PR-dim prefix above spans BOTH, so without this guard the run that
+          # finalizes LATER in wall-clock -- which may be the OLDER trigger --
+          # would overwrite the newer run's row with its own stale verdict. The
+          # external_id's run-id dimension (gpt-pr-$PR-<run>-<attempt>) is the
+          # tiebreaker: a row whose run id is NEWER than this run's belongs to a
+          # later trigger and is left alone; rows from this run or an older one
+          # are still swept, so stranded-run cleanup is unchanged.
           if [ -n "${HEAD:-}" ] && [ -n "${PR:-}" ]; then
-            enc="$(jq -rn '"GPT 5.6 Review" | @uri')"
+            enc="$(jq -rn '"GPT 6.1 Review" | @uri')"
             stranded="$(gh api --method GET \
               "repos/$REPO/commits/$HEAD/check-runs?check_name=$enc&per_page=100" \
               --jq ".check_runs[]
                     | select(.status != \"completed\")
                     | select(.external_id != null)
                     | select(.external_id | startswith(\"gpt-pr-$PR-\"))
-                    | .id" 2>/dev/null || true)"
-            for id in $stranded; do
+                    | \"\(.id) \(.external_id)\"" 2>/dev/null || true)"
+            while IFS=' ' read -r id ext; do
+              [ -n "$id" ] || continue
+              # Parse the run-id dimension: strip the gpt-pr-$PR- prefix, then
+              # drop the attempt suffix. A row we cannot parse is swept
+              # (fail-closed), never skipped.
+              rest="${ext#gpt-pr-$PR-}"
+              row_run="${rest%-*}"
+              if printf '%s' "$row_run" | grep -qE '^[0-9]+$' \
+                 && [ "$row_run" -gt "$WR_RUN_ID" ]; then
+                echo "skipping check-run $id for $HEAD (PR #$PR): row run $row_run is newer than $WR_RUN_ID"
+                continue
+              fi
               echo "completing stranded check-run $id for $HEAD (PR #$PR)"
               complete "$id" "$conclusion" "$title" || true
-            done
+            done <<< "$stranded"
           fi

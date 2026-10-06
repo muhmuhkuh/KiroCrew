@@ -104,6 +104,12 @@ grant audits retain their audit-or-deny contract.
   `_FLUSH_TIMEOUT_SECS` so a wedged writer can't hang a read.
 - **Fallback**: if the writer can't be started, `log()` writes synchronously so
   an event is never silently dropped.
+- **Write failures**: when an append or the chain lock raises `OSError`, the
+  writer retries the batch up to `_WRITE_RETRIES` times with a capped backoff.
+  It does not retry an errno that cannot heal, or an append that may have left
+  bytes on disk (the live log changed, or a stat could not tell). A batch it
+  gives up on adds to `dropped_events`, a per-process counter that
+  `GET /api/sel/verify` reports, and logs one ERROR per streak of failures.
 - **`sync=True`**: `SecurityEventLog(base_dir=..., sync=True)` writes each event
   inline (no thread) — used by tests that read the raw JSONL immediately after
   logging.
@@ -125,7 +131,7 @@ Default 365 days. Pruned daily by heartbeat service (`_PRUNE_TICKS`).
 | MCP core tools | `spawn_run`, `learn_add`, `task_run` calls and outcomes | `mcp_core.py` |
 | MCP cron tools | `cron_add`, `cron_remove`, etc. calls and outcomes | `mcp_cron.py` |
 | Session directives | Structured monitor create/update/stop application outcomes; every refusal records `denied` rather than `success` | `dashboard/session_directive_apply.py` |
-| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust, app-slot, saved-workflow, strict session-monitor read authorization, and in-app update authorization decisions (`update.arm` / `update.approve`; denial audits are best-effort, while a granted approval fails closed when its audit is unwritable) | `dashboard/server.py`, `dashboard/handlers/prompts.py`, `dashboard/handlers/workflows.py`, `dashboard/handlers/autonudge.py`, `dashboard/handlers/updates.py` |
+| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust, app-slot, saved-workflow, strict session-monitor read authorization, and in-app update authorization decisions (`update.arm` / `update.approve`; denial audits are best-effort, while a granted approval fails closed when its audit is unwritable) | `dashboard/server_runtime/middleware_chain.py`, `dashboard/server_runtime/security_middleware.py`, `dashboard/handlers/prompts.py`, `dashboard/handlers/workflows.py`, `dashboard/handlers/autonudge.py`, `dashboard/handlers/updates.py` |
 | ACP worker-pool audit | Per-`tool_call` `auto_approved` `tool_invocation` (`source=subagent`), bounded by `_SEL_AUDIT_TIMEOUT_SECONDS` (5.0s) and offloaded off the event loop so a wedged SEL backend never gates dispatch. Two emitters: the knowledge LLMPool via `AcpClient._maybe_audit_tool_call` (gated on the `audit_source` ctor param, offloaded to `subprocess_executor()`); and **code-review-sage's ReviewPool**, which migrated to the shared `AcpRuntime` (no `audit_source`) and re-emits the same per-tool record itself | `acp/client.py`, `apps/builtins/code_review_sage/sage_lib/review_pool.py` |
 | Structured monitor mutation audit | Critical `monitor_update` / `monitor_stop` invocation records are audit-before-mutation. Both singleton resolution and the synchronous write run in a worker thread, so SEL initialization or disk latency cannot block the gateway event loop | `autonudge_authz.py` |
 | Structured provider probes | Credential-free invocation and completion/failure events; protected-binary resolution failures, revoked GitLab hosts, and incomplete Bitbucket credentials also record `denied`. Denial audit failure never allows the rejected request | `monitoring/provider_cli.py`, `monitoring/gitlab_merge_request.py`, `monitoring/bitbucket_pull_request.py` |
@@ -139,7 +145,7 @@ Default 365 days. Pruned daily by heartbeat service (`_PRUNE_TICKS`).
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/api/sel/events?limit=N` | Recent security events (max 1000). **Owner only** — the rows name the resources a security decision was about, and a dashboard session is not by itself the owner, so every other caller gets `403 owner_only` from the shared owner gate and the refusal is itself audited. A session signed before an owner was configured keeps its bootstrap subject and is refused too, but that caller IS the owner, so it gets `401 stale_session_reauth` instead: re-signing in is the remedy, and a token refresh preserves the subject. A read that succeeds is audited as well, so the trail distinguishes an untouched log from one the owner has read. |
-| GET | `/api/sel/verify` | HMAC chain integrity check |
+| GET | `/api/sel/verify` | HMAC chain integrity check, plus this process's `dropped_events` |
 
 ## CLI
 

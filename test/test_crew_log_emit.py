@@ -18,13 +18,14 @@ import sys
 import threading
 import time
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from kiro_crew import crew_log as lg
 from kiro_crew import executors, session_map
-from kiro_crew.crew_log import crew_log_path, crew_log_root, emit
+from kiro_crew.crew_log import crew_log_path, crew_log_root, eager, emit
 from kiro_crew.crew_log import projection as crew_log_projection
 from kiro_crew.crew_log.lease import LEASE_FILE
 from kiro_crew.dashboard import server as server_module
@@ -95,6 +96,22 @@ def test_the_retry_schedule_doubles_from_its_floor_to_its_ceiling():
 def _log_path(session_id: str = SESSION) -> Path:
     """Ask the storage library where it puts things; never pin its layout."""
     return crew_log_path("session", session_id)
+
+
+def _remove_as_retention_does(remove: Callable[[], object]) -> None:
+    """Run *remove* with the eager folder settled and held between batches.
+
+    Retention removes a unit inside ``eager.paused()``, so no fold has the unit
+    open while its files go. A test that removes a crew log's files itself must do
+    the same: the folder reads the unit on its own thread after every entry, and a
+    fold that listed the segments before a bare removal then recreates the unit's
+    lock file inside the directory being removed (``Directory not empty`` on POSIX,
+    ``WinError 32`` on Windows for a segment it holds open).
+    """
+    assert eager.drain(timeout=10.0), "the eager folder never settled"
+    with eager.paused() as held:
+        assert held, "the eager folder could not be held between batches"
+        remove()
 
 
 def _store_root() -> Path:
@@ -508,6 +525,102 @@ def test_turn_completed_carries_the_four_token_counts_and_cost():
     assert data["credits"] == 1.5
     assert data["duration_ms"] == 99
     assert data["stop_reason"] == "end_turn"
+
+
+def test_turn_completed_omits_tokens_the_provider_never_reported():
+    """An unreported count is ABSENT, not a block of four zeros.
+
+    ``TurnUsage`` zero-fills every dimension a provider does not report, so at this
+    seam four zeros mean "nothing was reported". Written as a block they are a
+    measurement the fold then counts as a reporting turn, and the panel shows a
+    measured ``0 tokens`` beside a real bill. ``credits`` stays: it was billed.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_turn_completed(SESSION, 1, credits=1.49, duration_ms=99, stop_reason="end_turn")
+    data = _body()[-1]["data"]
+    assert "tokens" not in data
+    assert data["credits"] == 1.49
+    assert data["stop_reason"] == "end_turn"
+
+
+def test_turn_completed_keeps_all_four_dimensions_once_any_is_measured():
+    """A reported block answers every billed dimension, zeros included.
+
+    Unlike ``background/completed``, which drops its zero members, the
+    ``turn/completed`` schema requires all four inside a present ``tokens`` -- so
+    a provider that reported cache reads alone still writes the other three as
+    real zeros rather than as a sparse mapping a strict reader would refuse.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_turn_completed(SESSION, 1, cache_read_tokens=7, stop_reason="end_turn")
+    data = _body()[-1]["data"]
+    assert data["tokens"] == {"input": 0, "output": 0, "cache_read": 7, "cache_write": 0}
+
+
+def test_turn_completed_omits_an_unbilled_credits_charge():
+    """The same writer, the same fault, the other field: a zero charge is absent.
+
+    A provider that does not bill in credits reports 0.0 through the shared
+    ``TurnUsage`` contract, indistinguishable at this seam from a free turn -- the
+    posture ``background/completed`` and both subagent closers already take. The
+    token counts beside it are untouched: the two fields are guarded one by one.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_turn_completed(
+        SESSION, 1, input_tokens=11, output_tokens=22, duration_ms=99, stop_reason="end_turn"
+    )
+    data = _body()[-1]["data"]
+    assert "credits" not in data
+    assert data["tokens"] == {"input": 11, "output": 22, "cache_read": 0, "cache_write": 0}
+
+
+def test_turn_completed_drops_a_charge_that_is_not_a_finite_positive_number():
+    """NaN, infinity and a negative are not charges; none of them is written."""
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    for turn, charge in enumerate((float("nan"), float("inf"), -0.5), start=1):
+        emit.on_turn_completed(SESSION, turn, credits=charge, stop_reason="end_turn")
+    closers = [e["data"] for e in _body() if e["type"] == "turn/completed"]
+    assert len(closers) == 3
+    assert all("credits" not in data for data in closers)
+
+
+def test_a_provider_that_bills_in_tokens_alone_folds_as_credits_unreported():
+    """Writer to fold, for the provider shape the credits guard is for.
+
+    ``TurnUsage`` leaves ``credits`` at 0.0 for a provider that bills in tokens
+    (``claude_code``, ``bedrock``: token counts plus ``cost_usd``), and the runner
+    hands that 0.0 to the closer as-is. Written as a charge, the ``usage`` fold
+    counts every such turn in ``credits_reported`` and the panel's credits tile
+    prints a measured ``0`` beside real token counts -- the same shape as the token
+    defect, on the other field. The fold is given the writer's own output, so this
+    holds the writer to what the panel will show.
+    """
+    _open_session()
+    for turn in (1, 2, 3):
+        emit.on_turn_started(SESSION, turn, "user")
+        emit.on_turn_completed(
+            SESSION,
+            turn,
+            input_tokens=400,
+            output_tokens=90,
+            credits=0.0,
+            duration_ms=800,
+            stop_reason="end_turn",
+            model="claude",
+            provider="claude_code",
+        )
+    assert emit.flush()
+    usage = crew_log_projection.read_projection(SESSION, "usage").value
+    assert usage["turns"]["completed"] == 3
+    assert usage["turns"]["tokens_reported"] == 3
+    assert usage["tokens"]["total"] == 3 * 490
+    assert usage["turns"]["credits_reported"] == 0
+    assert usage["credits_by_source"]["turn"] == {"credits": 0.0, "reported": 0}
+    assert usage["by_model"]["claude"]["credits_reported"] == 0
 
 
 def test_an_aborted_turn_leaves_a_started_with_no_completion():
@@ -1133,12 +1246,24 @@ def test_the_token_count_says_that_it_is_an_estimate():
     assert _body()[-1]["data"]["tokens_estimated"] is True
 
 
-def test_unclassified_characters_are_reported_as_one_other_source():
+def test_the_named_remainder_keeps_its_own_label():
     # Steering, tool specs and injected ledger context have no marker, so their
-    # characters are genuinely a remainder. Three zeroed sources would claim a
-    # measurement nobody took.
+    # characters are genuinely a remainder -- and `unclassified` is what the splitter
+    # calls it. The label passes through: its readers carry a translated string for
+    # that name and none for a catch-all, so renaming it here makes a named remainder
+    # render as an untranslated word in every shipped locale.
     _open_session()
     emit.on_context_composed(SESSION, 1, blocks={"unclassified": 100, "lessons": 40})
+    assert emit.flush()
+    kinds = [s["kind"] for s in _body()[-1]["data"]["sources"]]
+    assert kinds == ["unclassified", "lessons"]
+
+
+def test_a_source_with_no_label_at_all_is_reported_as_other():
+    # An empty label names nothing, so no reader can be given a translation for it.
+    # This is the ONLY label the emitter renames.
+    _open_session()
+    emit.on_context_composed(SESSION, 1, blocks={"": 100, "lessons": 40})
     assert emit.flush()
     kinds = [s["kind"] for s in _body()[-1]["data"]["sources"]]
     assert kinds == ["other", "lessons"]
@@ -2401,6 +2526,70 @@ def _closer(kind: str) -> dict:
     closers = [e for e in _body() if e["type"] == kind]
     assert len(closers) == 1, f"expected exactly one {kind}, saw {len(closers)}"
     return closers[0]["data"]
+
+
+def _opener(kind: str) -> dict:
+    """The one opener of *kind* in the log, so a test reads its data directly."""
+    openers = [e for e in _body() if e["type"] == kind]
+    assert len(openers) == 1, f"expected exactly one {kind}, saw {len(openers)}"
+    return openers[0]["data"]
+
+
+def test_a_dispatch_records_the_task_the_child_was_asked_to_do():
+    """The one field a card cannot rebuild from anything else in the entry.
+
+    A surface drawing a finished child after the dispatching process is gone reads
+    the task from the log or from nowhere.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1", task="audit the retry path")
+    assert emit.flush()
+    assert _opener("subagent/spawned")["task"] == "audit the retry path"
+
+
+def test_a_dispatch_with_no_task_text_writes_no_task_key_at_all():
+    """Absent means "this log does not say", and an empty string would not.
+
+    It is also how every log written before the field reads, so the two are the
+    same case to a reader: a card draws no task line rather than a blank one.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1", task="")
+    assert emit.flush()
+    assert "task" not in _opener("subagent/spawned")
+
+
+def test_the_task_text_is_clipped_on_the_same_terms_as_a_plan_item():
+    """A person's words, bounded so one field cannot dominate the line.
+
+    Same helper and same cap ``plan/updated``'s item text uses -- the other place
+    this module records text a person wrote -- and the ellipsis is part of the
+    value, so a reader can tell a task that ends there from one that was cut.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(SESSION, 1, agent_id="sub-1", task="t" * (emit._MAX_SHORT_TEXT + 50))
+    assert emit.flush()
+    written = _opener("subagent/spawned")["task"]
+    assert len(written) == emit._MAX_SHORT_TEXT
+    assert written.endswith("\u2026")
+
+
+def test_a_credential_in_the_task_text_never_reaches_the_log():
+    """Redacted at this boundary, not trusted from the call site.
+
+    The task is raw input a person just typed, so the rule has to hold here: a
+    site added later cannot forget it.
+    """
+    _open_session()
+    emit.on_turn_started(SESSION, 1, "user")
+    emit.on_subagent_spawned(
+        SESSION, 1, agent_id="sub-1", task="deploy with AKIAIOSFODNN7EXAMPLE now"
+    )
+    assert emit.flush()
+    assert "AKIAIOSFODNN7EXAMPLE" not in _opener("subagent/spawned")["task"]
 
 
 def test_a_completed_child_records_the_credits_it_billed():
@@ -4404,7 +4593,9 @@ def test_every_emitted_type_matches_the_documented_shape():
     emit.on_subagent_completed(SESSION, agent_id="ab12", duration_ms=7)
     emit.on_subagent_failed(SESSION, agent_id="cd34", reason="boom", outcome="failed")
     emit.on_background_completed(SESSION, kind="title", model="m", credits=0.1)
-    emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
+    # A MEASURED close: credits and tokens are written only when the provider
+    # reported them, so the shape table's row is exercised with a usage to report.
+    emit.on_turn_completed(SESSION, 1, stop_reason="end_turn", credits=0.2, input_tokens=5)
     emit.on_message_queued(SESSION, source="slack", size_bytes=3, queued_seq="q1")
     emit.on_turn_refused(SESSION, 2, "not_authorized")
     emit.on_session_closed(SESSION, "reset")
@@ -5360,7 +5551,7 @@ def test_a_resume_of_the_same_store_writes_no_previous_edge():
     assert emit.flush()
 
     # Retention's effect on this unit, without waiting for retention.
-    _log_path(SESSION).unlink()
+    _remove_as_retention_does(_log_path(SESSION).unlink)
     emit.reset_caches()
     assert not lg.CrewLog.exists(lg.KIND_SESSION, SESSION)
 
@@ -5800,7 +5991,7 @@ def test_a_predecessor_collected_during_the_deferral_costs_no_dropped_write():
     _dangling_predecessor()
     emit.reset_caches()
     before = emit.dropped_writes()
-    shutil.rmtree(_log_path(SESSION).parent)
+    _remove_as_retention_does(lambda: shutil.rmtree(_log_path(SESSION).parent))
 
     emit._submit(
         lambda: emit._repair_superseded(SESSION, "chat-7"),
@@ -6825,7 +7016,7 @@ def test_a_store_whose_front_retention_removed_reports_no_edge():
     assert emit.flush()
     assert crew_log_projection.read_projection(SUCCESSOR, "status").value["previous"] == SESSION
 
-    _log_path(SUCCESSOR).unlink()
+    _remove_as_retention_does(_log_path(SUCCESSOR).unlink)
     folded = crew_log_projection.read_projection(SUCCESSOR, "status").value
     assert folded["previous"] is None
     assert folded["lifecycle"] == "unknown", "and the fold says it could not read an opener"

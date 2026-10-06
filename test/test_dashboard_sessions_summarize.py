@@ -32,7 +32,7 @@ class _FakeBgSession:
     async def set_model(self, model):  # noqa: D401 — best-effort no-op
         return None
 
-    async def prompt(self, _prompt):
+    async def prompt(self, _prompt, *, allow_image=True):
         yield SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=self._reply)
         yield SimpleNamespace(kind=EVENT_COMPLETE, text="")
 
@@ -44,7 +44,7 @@ class _FakeBgSession:
 
 
 def _make_app(log: ConversationLog, reply: str, created: list) -> web.Application:
-    async def _get_bg_session():
+    async def _get_bg_session(start_priority=None):
         s = _FakeBgSession(reply)
         created.append(s)
         return s

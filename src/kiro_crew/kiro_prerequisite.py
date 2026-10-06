@@ -52,7 +52,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import _process_group_supervisor, hooks, identity_stores, platform_compat
+from kiro_crew import _process_group_supervisor, hooks, identity_stores, platform_compat, sandbox
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_files import AGENT_FILENAME, LITE_AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
@@ -442,6 +442,13 @@ _IDENTITY_CLAIM_FIELDS = frozenset(
         "start_url",
     }
 )
+# Claims whose value is a label rather than an identifier, compared without case.
+# kiro-cli has more than one token refresher, and they serialise the same flow with
+# different casing (`PKCE` and `Pkce` observed minutes apart on one login). Hashing
+# the raw spelling turns every such refresh into an "account change" and retires
+# healthy sessions. Case-folding keeps a real flow change (PKCE to device
+# code) visible while ignoring spelling.
+_CASE_INSENSITIVE_CLAIM_FIELDS = frozenset({"oauth_flow"})
 # How long a computed fingerprint may be reused. Bounds both the SQLite reads and
 # the SEL audit events a poll storm can produce (N dashboard tabs poll status every
 # few seconds), so the store is observed per action rather than per poll. Read off
@@ -616,7 +623,7 @@ class PrerequisiteStatus:
     # their own fields, and asserting "too old" off a probe that never ran would
     # push the user to update a CLI that is fine. Only a CLEAN "unknown
     # subcommand" verdict from ``acp --help`` sets it False — at which point the
-    # CLI runs and is signed in, but cannot start a single session, so it narrows
+    # CLI runs but cannot start a session, regardless of sign-in, so it narrows
     # ``ready`` exactly like a rejected spec. The remedy is an UPDATE, not a
     # reinstall: the binary is present and only out of date.
     acp_supported: bool = True
@@ -637,6 +644,24 @@ class PrerequisiteStatus:
     # fields the two collapse into ``installed=False`` and the dashboard tells
     # the user to install a CLI that is already there and authenticated.
     sandbox_unavailable: bool = False
+    # Host capability independent of Kiro candidate probes. Kiro can delegate
+    # to its own sandbox on Windows; other harnesses need a Crew OS backend.
+    # This stays "the host has an OS sandbox backend" (the setup screen's copy
+    # keys on that exact meaning); whether a session could nonetheless START
+    # without one is the separate ``unsandboxed_exec_permitted`` below.
+    sandbox_backend_available: bool = False
+    # Whether execution is permitted on this host even with NO OS sandbox
+    # backend — the platform default (native Windows) or an operator opt-in,
+    # the same verdict ``wrap_argv`` gates a backend-less spawn on. A
+    # non-enforced harness (Claude Code, KAS) needs no Crew OS mask, so on such
+    # a host it can start and finish first-run setup even though
+    # ``sandbox_backend_available`` is false; an enforced harness is still held
+    # back by ``sandbox_blocked_backends``. False when the host has a backend
+    # and does not permit unsandboxed exec, or when the field cannot be read.
+    unsandboxed_exec_permitted: bool = False
+    # Runtime-enforced harnesses whose credential mask cannot apply at the
+    # effective configured tier, even when an OS backend exists.
+    sandbox_blocked_backends: list[str] = field(default_factory=list)
     # Machine-readable: "transient" | "foreign_sandbox" | "no_backend". The
     # presentation layer maps this to its own translated remedy copy instead of
     # parsing English prose out of ``sandbox_detail``.
@@ -1215,7 +1240,7 @@ def identity_store_is_relocated(
     return False
 
 
-def identity_fingerprint(path: Path) -> str:
+def identity_fingerprint(path: Path, *, definitive: list[bool] | None = None) -> str:
     """Return a digest naming WHICH account an identity store is signed in as.
 
     Two rules shape what participates.
@@ -1225,7 +1250,8 @@ def identity_fingerprint(path: Path) -> str:
     rotating field would report an account change roughly hourly and retire
     healthy sessions, so the rotating and secret ones -- ``access_token``,
     ``refresh_token``, ``expires_at``, ``client_secret`` -- are excluded and the
-    identifying ones are kept: the SSO ``start_url``, ``region``, ``oauth_flow``,
+    identifying ones are kept: the SSO ``start_url``, ``region``, ``oauth_flow``
+    (compared without case, see :data:`_CASE_INSENSITIVE_CLAIM_FIELDS`),
     ``scopes`` and the OIDC registration's ``client_id``. Key NAMES also
     participate, so a change of credential kind counts even when no value moved.
 
@@ -1241,18 +1267,37 @@ def identity_fingerprint(path: Path) -> str:
     than an unaudited answer. "Absent" is also what a logout leaves behind, and
     the caller treats it as "cannot confirm the running children" -- which errs
     toward retiring them, never toward trusting them.
+
+    ``definitive``, when given, receives ONE bool: whether this answer fully
+    describes the store. True only when the store was read and audited and
+    every credential row in it was identified, or when there is no store file
+    at all. Every failure returns the same ``""`` as a genuine sign-out, and a
+    store holding a credential row with no stable claim (a social login) can
+    also come out ``""`` or omit that row; a caller that must not mistake
+    either for "nobody is signed in here" reads this flag.
     """
+
+    def _done(is_definitive: bool, value: str = _AUTH_FINGERPRINT_ABSENT) -> str:
+        if definitive is not None:
+            definitive.append(is_definitive)
+        return value
 
     audit_ok = hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "invoked")
     if not audit_ok:
         # A logger line is not an SEL audit. Refuse rather than read.
         logger.warning("Kiro identity fingerprint read denied: audit unavailable")
-        return _AUTH_FINGERPRINT_ABSENT
+        return _done(False)
     connection = _open_identity_db_readonly(path)
     if connection is None:
         hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "unreadable")
-        return _AUTH_FINGERPRINT_ABSENT
+        # A store that does not exist at all is a definitive "nobody signed in
+        # here"; one that exists but will not open is merely unknowable.
+        return _done(not os.path.lexists(str(path)))
     parts: list[str] = []
+    # Whether some credential row carried no stable claim and was skipped: the
+    # store then holds a login this reader cannot identify, so its answer is
+    # never definitive, whatever else it contains.
+    unidentified = False
     try:
         with contextlib.closing(connection):
             present = {
@@ -1278,6 +1323,7 @@ def identity_fingerprint(path: Path) -> str:
                         # ABSENT, which is never reconciled (see the caller) and so
                         # re-sweeps every turn. "Cannot distinguish" is reported as
                         # "cannot confirm" rather than as "unchanged".
+                        unidentified = True
                         continue
                     parts.append(f"k:{key}")
                     parts.extend(claims)
@@ -1291,26 +1337,31 @@ def identity_fingerprint(path: Path) -> str:
                     parts.append(f"s:{key}={_claim_digest(value)}")
     except sqlite3.Error:
         hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "error")
-        return _AUTH_FINGERPRINT_ABSENT
+        return _done(False)
     if not parts:
         # Schema present but zero identity rows reads as signed out, not as an
         # identity whose fingerprint happens to be the digest of nothing.
         hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "signed_out")
-        return _AUTH_FINGERPRINT_ABSENT
+        return _done(not unidentified)
     if not hooks.emit_internal_read_audit(_IDENTITY_FINGERPRINT_READ_ID, "success"):
         # The read HAPPENED and its terminal audit could not be written, so the
         # answer is unaudited. Discard it rather than let unaudited identity data
         # drive retirement. The failure-shaped outcomes above need no such guard:
         # they already return "absent" whatever their audit does.
         logger.warning("Kiro identity fingerprint discarded: terminal audit unavailable")
-        return _AUTH_FINGERPRINT_ABSENT
-    return hashlib.sha256("\n".join(sorted(parts)).encode()).hexdigest()
+        return _done(False)
+    return _done(not unidentified, hashlib.sha256("\n".join(sorted(parts)).encode()).hexdigest())
 
 
 #: Separator between the kiro-cli store's fingerprint and the Crew vault's in the
 #: combined identity string. Only present when the vault holds an identity, so a
 #: host with no Crew sign-in fingerprints exactly as before.
 _CREW_VAULT_FINGERPRINT_SEP = "+crew:"
+
+#: Separator in front of Kiro CLI's own API-key component (see
+#: :func:`_api_key_identity_claim`). Only present when a key is configured, so a
+#: host without one fingerprints exactly as before.
+_API_KEY_FINGERPRINT_SEP = "+key:"
 
 
 def _crew_vault_fingerprint() -> str:
@@ -1327,21 +1378,71 @@ def _crew_vault_fingerprint() -> str:
     return vault_identity_fingerprint()
 
 
-def _combine_identity_fingerprints(cli: str, crew_vault: str) -> str:
-    """One fingerprint over BOTH credential sources a running child may have loaded.
+def _api_key_identity_claim(environ: Mapping[str, str], env_file: Path) -> str:
+    """The hashed identity claim of Kiro CLI's own API-key credential, or ``""``.
+
+    A host authenticated by :data:`CRED_KIRO_API_KEY` keeps NOTHING about that
+    identity in the kiro-cli store -- ``auth_kv`` holds only SSO/social blobs --
+    so :func:`identity_fingerprint` reads such a store as signed out. Absent is
+    never reconciled as a baseline, so without this component every turn on an
+    API-key host re-sweeps and retires idle sessions along with their running
+    children, although the CLI stays authenticated the whole time.
+
+    The key is a STABLE claim (it does not rotate on a token refresh), so it
+    participates like the store's claims do: hashed, never returned. The lookup
+    mirrors the ``whoami`` probe's
+    (:meth:`KiroPrerequisiteService._audited_identity_probe`): the process
+    environment first, then the data home's ``.env`` -- where a post-scrub
+    Docker entrypoint moves the credential -- so the fingerprint and the
+    readiness probe agree on whether a key exists. Blocking file IO; the caller
+    runs on a worker thread.
+    """
+
+    value = str(environ.get(CRED_KIRO_API_KEY, "") or "").strip()
+    if not value:
+        value = read_env_file_credential(CRED_KIRO_API_KEY, env_file)
+    if not value:
+        return _AUTH_FINGERPRINT_ABSENT
+    return _claim_digest(value)
+
+
+def _combine_identity_fingerprints(cli: str, crew_vault: str, api_key: str = "") -> str:
+    """One fingerprint over EVERY credential source a running child may have loaded.
 
     kiro-cli's store answers for the kiro backend and for a KAS relay spawned
     cli-owned; the Crew vault answers for a KAS relay spawned Crew-owned
-    (:mod:`kiro_crew.acp.kas_host_auth`). A sign-out in EITHER must read as an
-    identity change, so the per-turn sweep retires -- and keeps re-sweeping until
-    it completes -- children that loaded the previous identity, whichever source
-    it came from. The vault component is appended only when present, so a host
-    with no Crew sign-in keeps the kiro-cli-only fingerprint byte-for-byte and
-    ``""`` still means "no identity anywhere".
+    (:mod:`kiro_crew.acp.kas_host_auth`); Kiro CLI's own ``KIRO_API_KEY``
+    answers for a child that is handed the key (a harness that strips it, like
+    KAS, authenticates from the store instead). A change in ANY of them must
+    read as an identity change, so the per-turn sweep retires -- and keeps
+    re-sweeping until it completes -- children that loaded the previous
+    identity, whichever source it came from.
+
+    Each source is its OWN component, never folded into another's digest: a
+    read can LOSE a component under failure (a locked store, an unwritable
+    audit) and the latch and :func:`identity_stamp_mismatch` rely on a lost
+    component dropping out rather than turning into a different nonempty value.
+    Keeping the store and the key separate also means no precedence between
+    them has to be assumed -- whichever one a child consumed, a change to it is
+    seen. The key and vault components are appended only when present, so a
+    host with neither keeps the store-only fingerprint byte-for-byte and ``""``
+    still means "no identity anywhere".
     """
-    if not crew_vault:
-        return cli
-    return f"{cli}{_CREW_VAULT_FINGERPRINT_SEP}{crew_vault}"
+
+    combined = cli
+    if api_key:
+        combined = f"{combined}{_API_KEY_FINGERPRINT_SEP}{api_key}"
+    if crew_vault:
+        combined = f"{combined}{_CREW_VAULT_FINGERPRINT_SEP}{crew_vault}"
+    return combined
+
+
+def _identity_components(fingerprint: str) -> tuple[str, str, str]:
+    """Split a combined fingerprint into its (store, api_key, vault) components."""
+
+    head, _, vault = fingerprint.partition(_CREW_VAULT_FINGERPRINT_SEP)
+    store, _, api_key = head.partition(_API_KEY_FINGERPRINT_SEP)
+    return store, api_key, vault
 
 
 def identity_stamp_mismatch(stamp: str, live: str) -> bool:
@@ -1363,15 +1464,21 @@ def identity_stamp_mismatch(stamp: str, live: str) -> bool:
     An empty ``stamp`` means the spawn-time read failed or the stamping is
     unwired, and an empty ``live`` means the store cannot be read right now;
     both fall back to the existing baseline/latch machinery unchanged.
+
+    Only the store and vault components can PROVE a mismatch. The API-key
+    component cannot: a harness that strips the key (KAS) authenticates from the
+    store or vault, so a key rotation changes the stamp of a child whose actual
+    credential never changed. A key change is still seen by the ordinary
+    baseline comparison, which retires idle sessions but spares busy children.
     """
 
     if not stamp or not live or stamp == live:
         return False
-    stamp_cli, _, stamp_vault = stamp.partition(_CREW_VAULT_FINGERPRINT_SEP)
-    live_cli, _, live_vault = live.partition(_CREW_VAULT_FINGERPRINT_SEP)
-    if stamp_cli and live_cli and stamp_cli != live_cli:
-        return True
-    return bool(stamp_vault and live_vault and stamp_vault != live_vault)
+    was_store, _, was_vault = _identity_components(stamp)
+    now_store, _, now_vault = _identity_components(live)
+    return any(
+        was and now and was != now for was, now in ((was_store, now_store), (was_vault, now_vault))
+    )
 
 
 def spawn_identity_of(holder: Any) -> str:
@@ -1403,11 +1510,71 @@ def spawned_under(holder: Any, live: str) -> bool:
     keeps exactly the pre-stamping treatment (retired by the sweep) -- and an
     unreadable store (empty *live*) spares nothing, so a host whose store
     cannot be fingerprinted keeps the fail-safe retire-everything sweep.
+    The one exception to whole-string equality is the API-key component of a
+    child that never received the key (a Crew-owned KAS relay, every foreign backend,
+    :func:`receives_kiro_cli_api_key`): it is left out of the comparison,
+    because a key rotation cannot have changed that child's credential.
     """
 
     if not live:
         return False
-    return spawn_identity_of(holder) == live
+    if overlay_sets_api_key(holder):
+        return False
+    stamp = spawn_identity_of(holder)
+    if not stamp:
+        return False
+    if stamp == live:
+        return True
+    if receives_kiro_cli_api_key(holder):
+        return False
+    # A harness that strips the key (Crew-owned KAS, every foreign backend) authenticated
+    # from the store or vault, so the key component says nothing about its
+    # credential: a key rotation alone must not un-spare it and cancel its
+    # running children. Compare the components it can actually have loaded.
+    keyless = _without_api_key_component(live)
+    return bool(keyless) and _without_api_key_component(stamp) == keyless
+
+
+def _without_api_key_component(fingerprint: str) -> str:
+    """*fingerprint* with its ``+key:`` component removed."""
+
+    store, _, vault = _identity_components(fingerprint)
+    return _combine_identity_fingerprints(store, vault)
+
+
+def receives_kiro_cli_api_key(holder: Any) -> bool:
+    """Whether *holder*'s child is handed Kiro CLI's own ``KIRO_API_KEY``.
+
+    The kiro-cli backend (:data:`ACP_BACKEND_KIRO`, the empty id) is, and so is
+    a KAS relay spawned cli-owned; a KAS relay whose credential Crew's vault
+    answers (the runtime's ``_kas_host_auth``) and every foreign backend have it
+    stripped at spawn. Read off the shared runtime first -- once a provider swaps
+    its placeholder client for a session provider the runtime is the only object
+    that still knows the backend -- then the holder and its client. A holder
+    whose backend cannot be read, and a KAS holder whose auth owner is not
+    positively Crew, counts as receiving the key: that keeps the stricter
+    whole-fingerprint spare, never a looser one.
+    """
+
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+
+    client = getattr(holder, "client", None) or getattr(holder, "_client", None)
+    owners = (
+        getattr(holder, "_runtime", None),
+        getattr(client, "_runtime", None),
+        holder,
+        client,
+    )
+    for attribute in ("acp_backend", "backend"):
+        for owner in owners:
+            if owner is None:
+                continue
+            backend = getattr(owner, attribute, None)
+            if isinstance(backend, str):
+                if backend == ACP_BACKEND_KAS:
+                    return getattr(owner, "_kas_host_auth", None) is not True
+                return backend == ACP_BACKEND_KIRO
+    return True
 
 
 async def pre_spawn_identity(reader: Any) -> str:
@@ -1429,6 +1596,39 @@ async def pre_spawn_identity(reader: Any) -> str:
     except Exception:
         logger.warning("Pre-spawn identity read failed; the stamp will be refused", exc_info=True)
         return ""
+
+
+def overlay_sets_api_key(holder: Any) -> bool:
+    """Whether *holder*'s per-session env overlay names :data:`CRED_KIRO_API_KEY`.
+
+    The overlay (``extra_env``) is merged over the gateway's environment at
+    spawn, so a key named there can decide which credential the child loads,
+    and the gateway-side identity read cannot see it. An EMPTY value counts
+    too: the child may then be refilled from the data home's ``.env`` or fall
+    back to the store, and either way the gateway read cannot vouch for it.
+    Every place the overlay can live is checked: the holder itself, the
+    ACP client a provider wraps (``client`` / ``_client``), and the shared
+    runtime either of them rides (``_runtime``) -- a cold-started provider keeps
+    its overlay on its client, not on itself. Matched case-insensitively, since
+    a Windows child resolves both spellings as one variable.
+    """
+
+    client = getattr(holder, "client", None) or getattr(holder, "_client", None)
+    owners = (
+        holder,
+        getattr(holder, "_runtime", None),
+        client,
+        getattr(client, "_runtime", None),
+    )
+    for owner in owners:
+        if owner is None:
+            continue
+        overlay = getattr(owner, "_extra_env", None)
+        if isinstance(overlay, Mapping) and any(
+            str(key).upper() == CRED_KIRO_API_KEY for key in overlay
+        ):
+            return True
+    return False
 
 
 async def stamp_spawn_identity(reader: Any, provider: Any, *, pre_spawn: str = "") -> None:
@@ -1463,6 +1663,13 @@ async def stamp_spawn_identity(reader: Any, provider: Any, *, pre_spawn: str = "
     """
 
     if reader is None:
+        return
+    if overlay_sets_api_key(provider):
+        # The reader fingerprints the GATEWAY's credentials, and this child was
+        # handed its own ``KIRO_API_KEY`` (a cron job's ``env`` block, say), so
+        # it may be a different account entirely. Leave it unstamped: it is
+        # never spared by the sweep, exactly as before stamping existed.
+        logger.info("Child carries a per-session %s; left unstamped", CRED_KIRO_API_KEY)
         return
     if getattr(provider, "spawn_identity", ""):
         # First stamp wins: a warm-pool provider authenticated at FILL time,
@@ -1605,6 +1812,8 @@ def _identity_claims(key: str, value: object) -> list[str]:
             rendered = ",".join(sorted(str(item) for item in raw))
         else:
             rendered = str(raw)
+        if claim in _CASE_INSENSITIVE_CLAIM_FIELDS:
+            rendered = rendered.casefold()
         claims.append(f"c:{key}:{claim}={_claim_digest(rendered)}")
     return claims
 
@@ -2534,6 +2743,41 @@ def _unlaunchable_mcp_servers(spec_path: Path) -> str:
     return ""
 
 
+def _kas_spec_load_failures(specs: list[tuple[str, Path]]) -> tuple[list[str], str]:
+    """Return the required specs KAS session creation could not load, plus a reason.
+
+    This is KAS's LOADING contract, not full Kiro CLI schema acceptance.
+    ``KasHarness.session_extras`` loads the active spec with
+    ``kas_agents.load_agent_spec`` and then resolves its prompt through
+    ``build_kas_custom_agents`` -> ``resolve_prompt``; either raising
+    ``KasAgentTranslationError`` refuses the session. This runs those same two
+    steps and nothing else. It stops before ``to_client_custom_agent``, which
+    consults the governance ceiling and writes SEL records, and it does not apply
+    ``_unlaunchable_mcp_servers``, which KAS does not enforce while loading.
+
+    It exists because ``kiro-cli agent validate`` refuses to run while signed out,
+    and a signed-out Kiro CLI is the normal state for KAS. Any other exception is
+    treated as acceptance, matching this module's rule not to invent a repair card.
+    """
+    # circular import: the SDK's spec seam loads the ACP layer, which pulls in
+    # agent discovery, governance and SEL.
+    from kiro_crew.agent_sdk.spec_hooks import kas_spec_load_error
+
+    rejected: list[str] = []
+    detail = ""
+    for filename, spec_path in specs:
+        try:
+            error = kas_spec_load_error(spec_path.parent, Path(filename).stem)
+        except Exception:
+            logger.debug("Could not check KAS loading for %s", filename, exc_info=True)
+            continue
+        if error is not None:
+            rejected.append(filename)
+            if not detail:
+                detail = _sanitize_detail(error)
+    return rejected, detail
+
+
 class KiroPrerequisiteService:
     """Single-gateway coordinator for prerequisite probes and setup operations."""
 
@@ -2692,10 +2936,130 @@ class KiroPrerequisiteService:
 
         return self._initial_setup_complete
 
+    async def record_independent_backend_setup(self, backend: str) -> bool:
+        """Persist first-run completion after the configured harness is usable.
+
+        A browser-local completion bit cannot admit a later browser or a
+        non-owner dashboard user.  Re-check the server's selectable backend,
+        installation, and sandbox facts before writing the owner-only marker.
+        A probe marked UNKNOWN is not proof of installation or sign-in.
+
+        KAS is the one backend that completes here without being an independent
+        harness: it is kiro-cli's relay, so it needs a kiro-cli that speaks ACP
+        (``acp_supported``) rather than the independent-setup bypass, and it does
+        NOT need a kiro-cli login (its own account gate replaces that). This is
+        the SAME rule the onboarding gate admits KAS on, kept in lock-step here
+        so a KAS first run actually records the marker instead of leaving
+        ``initial_setup_complete`` false forever.
+        """
+        from kiro_crew.acp_backends import selectable_backend_values
+        from kiro_crew.agent_sdk.backend_install import INSTALLED, probe_backend
+        from kiro_crew.agent_sdk.backends import (
+            ACP_BACKEND_KAS,
+            ACP_BACKENDS_INDEPENDENT_SETUP,
+        )
+
+        if backend == ACP_BACKEND_KAS:
+            # KAS runs ON kiro-cli, so it is deliberately absent from
+            # ACP_BACKENDS_INDEPENDENT_SETUP. Its prerequisite is a kiro-cli new
+            # enough to expose the ``acp`` subcommand; only a clean "too old"
+            # verdict (acp_supported False) blocks it, matching the client.
+            if self._status.acp_supported is False:
+                return False
+            # The marker is permanent, so ask the binary again rather than trust
+            # a verdict from an earlier probe: kiro-cli may have been replaced by
+            # an older build since. A too-old answer also updates the served
+            # status, so the gate shows its update card.
+            if not self._viable_binary and not self._assume_ready:
+                # No candidate is resolved yet: the boot probe may still be in its
+                # warm-up delay, and ``acp_supported`` reads True until a probe
+                # answers. Run the probe now so the version check covers the binary
+                # a KAS session launches; with no runnable kiro-cli, KAS cannot start.
+                await self._probe(force=True)
+                if not self._viable_binary or self._status.acp_supported is False:
+                    return False
+            elif self._viable_binary and not await self._probe_acp_support(self._viable_binary):
+                self._status = replace(self._status, acp_supported=False, ready=False)
+                return False
+        elif backend not in ACP_BACKENDS_INDEPENDENT_SETUP:
+            return False
+        if backend not in selectable_backend_values():
+            return False
+        state = await asyncio.to_thread(probe_backend, backend)
+        if state.installed != INSTALLED or state.restart_required:
+            return False
+        status = await self._dashboard_snapshot()
+        kas_load_rejected: list[str] = []
+        if backend == ACP_BACKEND_KAS and not status.get("authenticated"):
+            # No Kiro CLI validation ran, so re-check KAS's local loading contract
+            # now: the probe's answer may predate an edit to the spec.
+            kas_load_rejected, _ = await self._probe_kas_spec_loading()
+        if backend == ACP_BACKEND_KAS and (
+            status.get("missing_agent_specs")
+            or status.get("rejected_agent_specs")
+            or kas_load_rejected
+        ):
+            # KAS loads Kiro Crew's agent specs from kiro-cli's agents dir, so a
+            # missing or rejected spec must stay on the repair card, not finish.
+            return False
+        if (
+            status["sandbox_unavailable"]
+            or not (status["sandbox_backend_available"] or status.get("unsandboxed_exec_permitted"))
+            or backend in status["sandbox_blocked_backends"]
+        ):
+            return False
+        await asyncio.to_thread(self._mark_setup_complete)
+        # Snapshots are served from ``_status``, and this path (unlike the probe,
+        # which rebuilds ``_status`` right after its own marker write) runs no
+        # probe. Without this a non-owner, whose poll cannot force a probe, keeps
+        # reading ``initial_setup_complete: false`` until a restart.
+        self._status = replace(self._status, initial_setup_complete=True)
+        return True
+
     def _snapshot_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = asdict(self._status)
         # See _LEGACY_IDLE_OPERATION: a pre-upgrade tab crashes without this key.
         result["operation"] = legacy_idle_operation()
+        return result
+
+    async def _dashboard_snapshot(self) -> dict[str, Any]:
+        """Apply host facts to every dashboard response, including repair/update."""
+        result = await self._agent_spec_overlay(self._snapshot_dict())
+        # A missing Kiro candidate cannot produce a sandbox_unavailable verdict,
+        # and Kiro's delegated sandbox does not establish a Crew OS backend for
+        # other harnesses. Use the runtime detector independently, off-loop because
+        # its cold/transient path can probe the host. Test mode never probes it.
+        if self._assume_ready:
+            result["sandbox_backend_available"] = True
+            return result
+
+        def sandbox_facts() -> tuple[bool, bool, list[str]]:
+            from kiro_crew.agent_sdk.backends import registered_backends
+            from kiro_crew.agent_sdk.tool_gate import is_enforced
+
+            available = sandbox.detect_backend() != "none"
+            # Whether a session could START with no OS backend: the platform
+            # default (native Windows) or an operator opt-in, the same verdict
+            # wrap_argv gates a backend-less spawn on. A non-enforced harness
+            # needs no Crew OS mask, so this lets it finish setup on such a host.
+            # A governed isolation floor overrides either grant, just as it
+            # does in wrap_argv's no-backend branch.
+            unsandboxed_permitted = bool(
+                sandbox.unsandboxed_exec_permitted_by()
+            ) and not sandbox._floor_mandates_sandbox(sandbox._governance_sandbox_floor())
+            mask_applies = sandbox.credential_mask_applies(sandbox.configured_sandbox_mode())
+            blocked = (
+                []
+                if mask_applies
+                else sorted(backend for backend in registered_backends() if is_enforced(backend))
+            )
+            return available, unsandboxed_permitted, blocked
+
+        (
+            result["sandbox_backend_available"],
+            result["unsandboxed_exec_permitted"],
+            result["sandbox_blocked_backends"],
+        ) = await asyncio.to_thread(sandbox_facts)
         return result
 
     @staticmethod
@@ -2842,10 +3206,10 @@ class KiroPrerequisiteService:
         # the spec missing, both rebuild, and the second one regenerates the file
         # the first just wrote. Re-reading inside the lock makes the loser a no-op.
         async with self._repair_lock:
-            before = await self._agent_spec_overlay(self._snapshot_dict())
+            before = await self._dashboard_snapshot()
             missing_before = before.get("missing_agent_specs") or []
             # Read off the latched probe result because acceptance costs a
-            # subprocess and the overlay above is deliberately stat-only.
+            # subprocess and the spec overlay only checks file presence.
             rejected_before = before.get("rejected_agent_specs") or []
             # A REJECTED spec is deliberately NOT rebuilt. The file exists, so a
             # regenerate would drop a concurrent api_mcp_toggle edit to the
@@ -2887,7 +3251,7 @@ class KiroPrerequisiteService:
                         await self._probe(force=True)
                     except Exception:  # noqa: BLE001 — stale state beats a 500
                         logger.warning("Re-probe of rejected agent specs failed", exc_info=True)
-                result = await self._agent_spec_overlay(self._snapshot_dict())
+                result = await self._dashboard_snapshot()
                 if not error and auxiliary_missing and (result.get("missing_agent_specs") or []):
                     error = _SPECS_STILL_MISSING_ERROR
                 result["agent_spec_repair_error"] = error
@@ -2903,7 +3267,7 @@ class KiroPrerequisiteService:
                     await self._probe(force=True)
                 except Exception:  # noqa: BLE001 — a failed re-probe keeps stale state, not a 500
                     logger.warning("Re-probe after agent-spec repair failed", exc_info=True)
-            result = await self._agent_spec_overlay(self._snapshot_dict())
+            result = await self._dashboard_snapshot()
             if not error and (result.get("missing_agent_specs") or []):
                 error = _SPECS_STILL_MISSING_ERROR
             result["agent_spec_repair_error"] = error
@@ -2951,7 +3315,8 @@ class KiroPrerequisiteService:
         """Return the latched status, probing only on an explicit ``force``.
 
         Probing is boot-and-explicit-action only (see :meth:`session_ready`), so
-        an ordinary poll reads latched state and spawns nothing. ``force=True``
+        an ordinary poll reads latched CLI state. The independent OS sandbox
+        capability check uses the shared detector/cache. ``force=True``
         (the gate's Check again, and its blocking-state auto-poll) is the
         supported way to re-probe on demand.
 
@@ -3007,7 +3372,7 @@ class KiroPrerequisiteService:
             # cannot loop -- the probe stamps the new identity, so the next poll
             # compares equal.
             await self._probe(force=True)
-        result = await self._agent_spec_overlay(self._snapshot_dict())
+        result = await self._dashboard_snapshot()
 
         # The repair arm deliberately does NOT live here. This is an ``add_get``
         # route, and both dashboard barriers are method-scoped (csrf_middleware
@@ -3071,11 +3436,12 @@ class KiroPrerequisiteService:
         ):
             return self._identity_cache
 
-        def _read() -> tuple[str, str]:
+        def _read() -> str:
             # Both the relocation guard and the win32 path resolver stat the
             # filesystem, so the whole resolve-and-read runs in this worker
             # thread and stats stay off the event loop.
-            if identity_store_is_relocated(self._platform, self._home, self._environ):
+            relocated = identity_store_is_relocated(self._platform, self._home, self._environ)
+            if relocated:
                 # Do not read the default path: with the CLI pointed elsewhere, a
                 # leftover database there would fingerprint an account nobody is
                 # signed into, and a logout in the real store would change nothing
@@ -3092,31 +3458,45 @@ class KiroPrerequisiteService:
                         "identity as absent instead of reading the fixed anchor",
                         self._platform,
                     )
-                cli = _AUTH_FINGERPRINT_ABSENT
-            else:
-                cli = identity_fingerprint(
-                    kiro_identity_store_path(self._platform, self._home, self._environ)
+                store = _AUTH_FINGERPRINT_ABSENT
+            store_definitive: list[bool] = []
+            if not relocated:
+                store = identity_fingerprint(
+                    kiro_identity_store_path(self._platform, self._home, self._environ),
+                    definitive=store_definitive,
                 )
-            # The CLI component is returned alongside the combined digest so the
-            # interim-identity latch can tell "a different account" from "the
-            # same account with a component that failed to read" -- the combined
-            # string alone cannot (an absent CLI plus a present vault is truthy).
-            return cli, _combine_identity_fingerprints(cli, _crew_vault_fingerprint())
+            # An API-key host keeps no identity row in the store, so without the
+            # key component it reads as signed out on every turn -- see
+            # _api_key_identity_claim. But the key may join ONLY a definitive
+            # store answer: a child can still authenticate from the store (a
+            # harness that strips the key, like KAS), so a key standing in for a
+            # store that was unauditable, unreadable or relocated -- or that holds
+            # a login no stable claim identifies (a social login) -- would seed a
+            # key-only baseline under which a real store account switch compares
+            # equal. Such a read withholds ONLY the key component, so the
+            # fingerprint is exactly what it was before the key was counted: the
+            # store and vault components as read (possibly all absent).
+            api_key = _AUTH_FINGERPRINT_ABSENT
+            if store_definitive and store_definitive[-1]:
+                api_key = _api_key_identity_claim(self._environ, self._data_home / ".env")
+            # The latch judges every component from the combined string (see
+            # _identity_components), so only the combined value is returned.
+            return _combine_identity_fingerprints(store, _crew_vault_fingerprint(), api_key)
 
         try:
-            cli, fingerprint = await asyncio.to_thread(_read)
+            fingerprint = await asyncio.to_thread(_read)
         except Exception:
             # An unreadable store reports "no identity", matching
             # identity_fingerprint's own contract, rather than "unchanged" --
             # guessing "unchanged" is what keeps a stale account alive.
             logger.warning("Kiro identity fingerprint could not be read", exc_info=True)
-            cli = fingerprint = _AUTH_FINGERPRINT_ABSENT
-        self._maybe_latch_interim_identity(cli, fingerprint)
+            fingerprint = _AUTH_FINGERPRINT_ABSENT
+        self._maybe_latch_interim_identity(fingerprint)
         self._identity_cache = fingerprint
         self._identity_cache_at = now
         return fingerprint
 
-    def _maybe_latch_interim_identity(self, cli: str, fingerprint: str) -> None:
+    def _maybe_latch_interim_identity(self, fingerprint: str) -> None:
         """Latch when a fresh read observes a DIFFERENT account than the baseline.
 
         The retirement gate compares the live fingerprint to a baseline, which
@@ -3136,15 +3516,14 @@ class KiroPrerequisiteService:
 
         - no baseline recorded: nothing to differ from (the unset baseline
           already reports changed on its own);
-        - the CLI component is absent AND the vault component does not
-          independently prove a change: an unreadable/relocated store or a
-          sign-out, indistinguishable from a blip. Real sign-outs are still
-          caught by the ordinary (non-sticky) baseline comparison. A nonempty
-          vault that appears or differs from the baseline's DOES latch even
-          with the CLI absent -- a vault-only gateway has no CLI component to
-          offer, and a changed vault cannot be a read failure;
-        - the vault component vanished while the CLI component matches the
-          baseline's: an unreadable vault reads as empty, same reasoning.
+        - every component that differs from the baseline's is ABSENT now: an
+          unreadable/relocated store, a vault that failed to read, or a
+          sign-out, each indistinguishable from a blip. Real sign-outs are
+          still caught by the ordinary (non-sticky) baseline comparison. The
+          components -- kiro-cli store, API key, Crew vault -- are judged
+          separately, so a key-only or vault-only gateway can still latch, and
+          a store blip on a host that also carries a key cannot latch through
+          the key's unchanged component.
 
         A component that APPEARS or CHANGES is never a blip -- reads lose
         components under failure, they do not gain them -- so those latch.
@@ -3153,23 +3532,19 @@ class KiroPrerequisiteService:
         baseline = self._session_identity
         if baseline is None or fingerprint == baseline:
             return
-        base_cli, _, base_vault = baseline.partition(_CREW_VAULT_FINGERPRINT_SEP)
-        _, _, vault = fingerprint.partition(_CREW_VAULT_FINGERPRINT_SEP)
-        if not cli:
-            # The CLI component is absent: on its own this is indistinguishable
-            # from a transient store read failure, so it never latches. But the
-            # VAULT component can still prove a real change -- a nonempty vault
-            # that appears or differs from the baseline's cannot be a blip
-            # (reads lose components under failure; they do not gain or alter
-            # them). Without this arm, a vault-only gateway (no CLI store at
-            # all) could never latch, and a vault A->B->A round trip there
-            # would leave B-authenticated children alive.
-            if not (vault and vault != base_vault):
-                return
-        elif cli == base_cli and base_vault and not vault:
-            # Same CLI account, vault component lost: indistinguishable from a
-            # transient vault read failure. The non-sticky baseline comparison
-            # still reports this as changed for as long as it persists.
+        # Latch only when some component is PRESENT and differs from the
+        # baseline's: reads lose components under failure, they do not gain or
+        # alter them, so an appearing or changed component cannot be a blip. A
+        # component that is merely ABSENT (an unreadable store, a vault that
+        # failed to read) never latches on its own -- the non-sticky baseline
+        # comparison still reports it as changed for as long as it persists.
+        # Judged per component (store, API key, Crew vault), so a vault-only or
+        # key-only gateway can still latch, and a store blip on a host that also
+        # carries a key cannot arm the latch through the key's unchanged half.
+        if not any(
+            now and now != was
+            for now, was in zip(_identity_components(fingerprint), _identity_components(baseline))
+        ):
             return
         # Bump the generation on EVERY qualifying observation, not only the
         # arming one: an observation landing while the latch is already armed
@@ -3679,18 +4054,22 @@ class KiroPrerequisiteService:
             whoami = await self._audited_identity_probe(self._viable_binary, isolate_home=False)
             if whoami.ok:
                 await asyncio.to_thread(self._mark_setup_complete)
-            # Acceptance is checked here, on the probe path, because it costs a
-            # spawn per spec — the every-read overlay stays stat-only. Gated on a
-            # successful identity probe so a broken or signed-out CLI is reported
-            # as exactly that: asking a CLI that cannot authenticate whether it
-            # likes our specs adds spawns and a second card for one fault, and its
-            # answer would not be actionable until sign-in is fixed anyway.
+            # Kiro CLI acceptance is checked here, on the probe path, because it
+            # costs a spawn per spec — the every-read overlay stays stat-only. It
+            # needs a successful identity probe: ``agent validate`` refuses to run
+            # signed out (measured on kiro-cli 2.21.1), so asking would only fail.
             rejected: list[str] = []
             rejection_detail = ""
-            acp_supported = True
             if whoami.ok:
                 rejected, rejection_detail = await self._probe_spec_acceptance(self._viable_binary)
-                acp_supported = await self._probe_acp_support(self._viable_binary)
+            else:
+                # Kiro CLI validation needs sign-in, but KAS runs signed out. Apply
+                # KAS's local loading contract instead so a present spec KAS cannot
+                # load still reaches repair_required and the KAS setup gate.
+                rejected, rejection_detail = await self._probe_kas_spec_loading()
+            # KAS needs ACP support but not a kiro-cli login, so the probe must
+            # check for a too-old relay binary even when signed out.
+            acp_supported = await self._probe_acp_support(self._viable_binary)
             login_cmd, sso_cmd, bundled = login_commands_for(self._viable_binary, self._environ)
             self._status = PrerequisiteStatus(
                 platform=_platform_label(self._platform),
@@ -3776,6 +4155,19 @@ class KiroPrerequisiteService:
                 detail = _sanitize_detail((result.output or "").strip())
         return rejected, detail
 
+    async def _probe_kas_spec_loading(self) -> tuple[list[str], str]:
+        """Check the present required specs against KAS's local loading contract.
+
+        Spawns nothing. Used when Kiro CLI validation did not run; see
+        :func:`_kas_spec_load_failures` for what this does and does not accept.
+        """
+        try:
+            specs = await asyncio.to_thread(self._spec_lister)
+        except Exception:
+            logger.debug("Could not enumerate Kiro Crew agent specs", exc_info=True)
+            return [], ""
+        return await asyncio.to_thread(_kas_spec_load_failures, specs)
+
     async def _probe_acp_support(self, executable: str) -> bool:
         """Ask kiro-cli whether it exposes the ``acp`` subcommand Kiro Crew uses.
 
@@ -3801,9 +4193,9 @@ class KiroPrerequisiteService:
         session-create with the pre-existing error, i.e. no worse than before this
         check existed, whereas a false positive would strand a healthy install.
 
-        A spawn, so it belongs to the probe's boot-and-explicit-action budget and
-        is gated on a successful ``whoami`` by the caller, matching the spec
-        acceptance probe.
+        A spawn, so it belongs to the probe's boot-and-explicit-action budget.
+        The caller probes every viable binary independently of ``whoami``:
+        KAS needs ACP support without requiring a kiro-cli login.
         """
 
         result = await self._audited_probe(
@@ -3843,7 +4235,7 @@ class KiroPrerequisiteService:
         if self._assume_ready:
             # A test / offline gateway asserts its own readiness and has no real
             # CLI to update; running an update there is meaningless.
-            result = await self._agent_spec_overlay(self._snapshot_dict())
+            result = await self._dashboard_snapshot()
             result["cli_update_error"] = ""
             return result
         # Resolve the binary the way the probe does, off-loop.
@@ -3930,7 +4322,7 @@ class KiroPrerequisiteService:
                 await self._probe(force=True)
             except Exception:  # noqa: BLE001 — stale state beats a 500
                 logger.warning("Re-probe after kiro-cli update failed", exc_info=True)
-        result = await self._agent_spec_overlay(self._snapshot_dict())
+        result = await self._dashboard_snapshot()
         if not error and not result.get("acp_supported", True):
             error = (
                 "The update ran but this kiro-cli still has no `acp` command. "

@@ -240,19 +240,21 @@ class TestWindowsRssPrimitives:
     HEALTHY session, which is worse than not recycling at all.
     """
 
-    def test_build_child_map_has_no_windows_branch_by_design(self) -> None:
+    def test_the_child_map_has_no_windows_branch_by_design(self) -> None:
         """A raw Toolhelp parent map is deliberately NOT used here.
 
         ``th32ParentProcessID`` is never cleared when a parent exits, so pairing
         it with an aggressively recycled PID would sum an unrelated subtree and
         recycle a healthy session. Windows gets its own lineage-validated route
-        in ``get_session_rss_mb`` instead of a shareable snapshot.
+        in ``get_session_rss_mb`` instead of a shareable snapshot. The map
+        ``_build_child_map`` wraps is where such a branch would land.
         """
         import inspect
 
-        assert "_windows_process_parent_map" not in inspect.getsource(
-            session_pid._build_child_map
-        )
+        from kiro_crew import platform_compat
+
+        for function in (session_pid._build_child_map, platform_compat.proc_child_map):
+            assert "_windows_process_parent_map" not in inspect.getsource(function)
 
 
 class TestRssThresholdCheck:
@@ -269,13 +271,13 @@ class TestRssThresholdCheck:
         monkeypatch.setattr(session.platform_compat, "IS_WINDOWS", False)
 
     def test_shipped_default_reaches_the_enforcement_point(self) -> None:
-        """The ceiling is on by default: a manager built from the shipped
-        SessionConfig default arms ``_rss_threshold_check`` at 1536 MiB, so the
-        watchdog bounds a runaway tree without any config.json edit."""
+        """The ceiling is off by default: a manager built from the shipped
+        SessionConfig default holds 0, so ``_rss_threshold_check`` never
+        recycles a session until an operator sets a ceiling."""
         from kiro_crew.config.sections import DEFAULT_WATCHDOG_RSS_MAX_MB, SessionConfig
 
         manager = _make_manager(rss_max_mb=SessionConfig().watchdog_rss_max_mb)
-        assert manager._rss_max_mb == DEFAULT_WATCHDOG_RSS_MAX_MB == 1536
+        assert manager._rss_max_mb == DEFAULT_WATCHDOG_RSS_MAX_MB == 0
 
     @pytest.mark.asyncio
     async def test_explicit_zero_disables(self) -> None:
@@ -642,6 +644,101 @@ class TestRssThresholdCheck:
         ):
             await manager._rss_threshold_check()
         manager.reset.assert_awaited_once()
+
+    @staticmethod
+    def _clocked(manager, clock: list[float]):
+        from dataclasses import replace
+
+        cleanup = manager._cleanup_boundary()
+        cleanup._deps = replace(cleanup._deps, monotonic=lambda: clock[0])
+        return cleanup
+
+    @pytest.mark.asyncio
+    async def test_crossing_again_after_a_recycle_warns_once_per_cycle(self, caplog) -> None:
+        """A replacement that climbs straight back over the ceiling is named once,
+        with the ceiling, the pre-recycle figure and the elapsed time -- not on
+        every later tick that still reads over the ceiling."""
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:x"] = _session_stub(busy=False)
+        manager.get_pid = MagicMock(return_value=4242)
+        clock = [5000.0]
+        self._clocked(manager, clock)
+        # The first recycle succeeds; the next two crossings are declined, so
+        # the session stays over the ceiling across ticks.
+        manager.reset = AsyncMock(side_effect=[True, False, False])
+        rss = [2048]
+        with patch("kiro_crew.session._build_child_map", return_value={}), patch(
+            "kiro_crew.session._rss_mb_from_tree", side_effect=lambda *_: rss[0]
+        ), caplog.at_level("WARNING"):
+            await manager._rss_threshold_check()
+            assert "rebound" not in caplog.text
+            clock[0] += 120.0
+            rss[0] = 1900
+            await manager._rss_threshold_check()
+            clock[0] += 120.0
+            await manager._rss_threshold_check()
+        rebounds = [r.getMessage() for r in caplog.records if "rebound" in r.getMessage()]
+        assert rebounds == [
+            "RSS recycle rebound: session dashboard:x tree rss=1900MB is back above "
+            "1000MB 120s after a recycle at 2048MB; "
+            "session.watchdog_rss_max_mb may be set too low for this workload"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_each_recycle_cycle_gets_its_own_warning(self, caplog) -> None:
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:x"] = _session_stub(busy=False)
+        manager.get_pid = MagicMock(return_value=4242)
+        clock = [5000.0]
+        self._clocked(manager, clock)
+        manager.reset = AsyncMock(return_value=True)
+        with patch("kiro_crew.session._build_child_map", return_value={}), patch(
+            "kiro_crew.session._rss_mb_from_tree", return_value=2048
+        ), caplog.at_level("WARNING"):
+            for _ in range(3):
+                await manager._rss_threshold_check()
+                clock[0] += 60.0
+        assert sum("rebound" in r.getMessage() for r in caplog.records) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_rebound_warning_without_a_successful_recycle(self, caplog) -> None:
+        """A crossing the guards declined reclaimed nothing, so the next crossing
+        is not a replacement climbing back."""
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:x"] = _session_stub(busy=False)
+        manager.get_pid = MagicMock(return_value=4242)
+        self._clocked(manager, [5000.0])
+        manager.reset = AsyncMock(return_value=False)
+        with patch("kiro_crew.session._build_child_map", return_value={}), patch(
+            "kiro_crew.session._rss_mb_from_tree", return_value=2048
+        ), caplog.at_level("WARNING"):
+            await manager._rss_threshold_check()
+            await manager._rss_threshold_check()
+        assert "rebound" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_crossing_after_the_window_is_not_a_rebound(self, caplog) -> None:
+        from kiro_crew.session_cleanup import RSS_REBOUND_WINDOW_SECS
+
+        manager = _make_manager(rss_max_mb=1000)
+        manager._sessions["dashboard:x"] = _session_stub(busy=False)
+        manager.get_pid = MagicMock(return_value=4242)
+        clock = [5000.0]
+        cleanup = self._clocked(manager, clock)
+        manager.reset = AsyncMock(return_value=True)
+        rss = [2048]
+        with patch("kiro_crew.session._build_child_map", return_value={}), patch(
+            "kiro_crew.session._rss_mb_from_tree", side_effect=lambda *_: rss[0]
+        ), caplog.at_level("WARNING"):
+            await manager._rss_threshold_check()
+            # Under the ceiling past the window: the record is pruned anyway.
+            clock[0] += RSS_REBOUND_WINDOW_SECS + 1.0
+            rss[0] = 500
+            await manager._rss_threshold_check()
+            assert cleanup.state.rss_recycled == {}
+            rss[0] = 2048
+            await manager._rss_threshold_check()
+        assert "rebound" not in caplog.text
 
 
 class TestResetGuards:

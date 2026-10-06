@@ -18,6 +18,7 @@ back to normal dashboard-token + CSRF auth. They must NOT be added to the strict
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import json
 import logging
@@ -40,6 +41,7 @@ from kiro_crew.dashboard.chat_runner import (
 )
 from kiro_crew.dashboard.chat_slack import api_chat_slot_slack_unlink, list_slack_channels
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.slot_ownership import checkpoint_slot_replaced, slot_not_found
 from kiro_crew.dashboard.state import (
     DashboardState,
     _expected_binding,
@@ -52,6 +54,7 @@ from kiro_crew.messaging.link import (
     is_channel_session_key,
 )
 from kiro_crew.messaging.split import bounded_for_delivery, split_markdown_safe
+from kiro_crew.mirror_admission import restorable_link, sign_mirror_admission
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform.governance_profiles import vet_and_audit
 from kiro_crew.sel import sel
@@ -344,11 +347,28 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             {"error": "channel is not permitted", "code": "channel_not_permitted"}, status=403
         )
 
+    # The link records the peer it was just authorized for. A ``chat-*`` key
+    # names no principal, so on every later dashboard-driven delivery into a DM
+    # whose conversation id cannot be tested against a user roster -- Discord's
+    # -- the per-send ladder (``chat_runner._recipient_principal``) reads this
+    # record instead. This handler is one of the two paths that may MINT its
+    # admission: a MAC only the gateway can compute, over this session and this
+    # whole location, signed HERE right after the admission above and in the same
+    # object as the conversation id, so it can only ever describe this
+    # conversation; the map stores it verbatim and never re-signs, so a row
+    # rewritten by in-sandbox code (the session map is writable there) fails to
+    # verify and is refused. The transport's own record of the DM -- the pairing
+    # the ``resolve_configured_target`` call above just left when it opened it --
+    # must agree whenever it exists. Empty for a room or thread target, which
+    # names nobody and is not signed.
     link = ChannelLink(
         channel_type=channel_type,
         channel_id=conversation_id,
         thread_id=thread_id,
+        principal=recipient_principal or None,
     )
+    if link.principal:
+        link = dataclasses.replace(link, admission=sign_mirror_admission(session_key, link))
     accepts_inbound = _resumes_inbound(transport, conversation_id, thread_id)
 
     # Refuse an occupied conversation BEFORE anything is posted into it. The
@@ -473,7 +493,12 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             # between the claim and this failure, and it takes no lock of ours. Undo
             # only while the binding is still THIS request's claim; anything newer is
             # deliberate state and outranks a stale restore, the opt-out included.
-            if state.sessions.get_mirror_link(session_key) != link:
+            # Whole-row identity, not location: a re-link of this session to the same
+            # conversation under a refreshed admission (after a signing-key rotation)
+            # is exactly such newer state, and a location match would clear it and
+            # put the obsolete row back.
+            current = state.sessions.get_mirror_link(session_key)
+            if current is None or not current.same_row(link):
                 logger.info(
                     "mirror-link: leaving a newer binding for %s in place after a failed link",
                     session_key,
@@ -484,9 +509,14 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             if previous_link is None:
                 state.sessions.clear_mirror_link(session_key, reason=UNBIND_REASON_DASHBOARD_UNLINK)
             else:
+                # The prior row came back from the store, which in-sandbox code can
+                # write, so it is restored as a rollback may restore it: its peer
+                # rides along only under an admission that still verifies for this
+                # session; otherwise the binding goes back without one and the
+                # recipient check refuses it until the session is re-linked.
                 state.sessions.set_mirror_link(
                     session_key,
-                    previous_link,
+                    restorable_link(session_key, previous_link),
                     accepts_inbound=previous_inbound,
                     reason=UNBIND_REASON_DASHBOARD_UNLINK,
                 )
@@ -547,7 +577,10 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
 
     try:
         # Recheck at the actual send boundary as well: target resolution can
-        # yield while governance is updated.
+        # yield while governance is updated. ``link`` is what the map stored -- this
+        # handler signed its admission above, and the map stores bytes verbatim --
+        # so the recipient leg judges the same record it will judge on every later
+        # delivery.
         governed = await asyncio.to_thread(_resolve_channel_target, state, session_key, link)
         if governed is None:
             await _release_after_failure()
@@ -680,7 +713,15 @@ async def api_chat_slot_mirror_link(request: web.Request) -> web.Response:
             # Offloaded for the same reason as the transcript read: config load
             # is blocking file I/O and must not run on the event loop.
             cfg = await asyncio.to_thread(KiroCrewConfig.load)
-            deep_link = session_deep_link(cfg.dashboard.url, slot.key)
+            # Same origin choice as send_message's session-link button: this
+            # link lands in Slack, so honor slack.use_tunnel_url — a local-only
+            # origin is unreachable from a phone. No click token: mirror links
+            # can reach shared channels. The tunnel-vs-not decision lives in one
+            # shared helper (tunnel_origin_if_opted_in).
+            from kiro_crew.dashboard.urls import tunnel_origin_if_opted_in
+
+            tunnel_url = tunnel_origin_if_opted_in(cfg.slack.use_tunnel_url)
+            deep_link = session_deep_link(cfg.dashboard.url, slot.key, tunnel_url=tunnel_url)
         except Exception:
             logger.debug("mirror-link: could not build session link", exc_info=True)
         units.append(f"… {summary} — {deep_link}" if deep_link else f"… {summary}")
@@ -890,8 +931,10 @@ async def api_chat_slot_mirror_unlink(request: web.Request) -> web.Response:
         return await api_chat_slot_slack_unlink(request)
     name = request.match_info.get("name") or request.match_info.get("slot", "")
     slot = state.get_slot(name)
-    if not slot:
-        return web.json_response({"error": "not found"}, status=404)
+    # The body read above can outlast a close and a same-name create; the slot the
+    # per-slot checkpoint judged is the only one this may unlink.
+    if not slot or checkpoint_slot_replaced(request, slot):
+        return slot_not_found()
 
     session_key = effective_session_key(slot)
     if expected is not None:

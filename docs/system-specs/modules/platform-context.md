@@ -7,7 +7,7 @@ enterprise-specific code.
 
 > Authoring note: Kiro Crew is the public edition of this seam. The daily
 > de-branding content sync from the upstream authoring home strips the
-> enterprise-tinted Defaults (e.g. the internal git host, `.midway` sandbox dirs)
+> enterprise-tinted Defaults (e.g. the internal git host, SSO sandbox dirs)
 > down to the public baseline; the enterprise companion re-adds them via overrides.
 > The contract (interfaces + consumption-site wiring) is generic core
 > infrastructure and survives the sync.
@@ -23,6 +23,17 @@ adapters for the same interfaces.
 The dependency runs one way: **the companion depends on the core; the core never
 depends on the companion.** Because the core ships a default for every
 interface, the public edition is complete standalone.
+
+The execution catalog reads `ProviderRegistry.agent_runtime_policy(engine_identity)`
+through `current_context()` and `safe_context_call` for owner-visible member rows.
+The lookup key is the agent the member runs: its `kiro_agent` through
+`dispatch_kiro_agent`, so a row that recorded an agent's file name keys on the
+name that file declares, falling back to its roster alias when the binding is
+empty. Redacted requests neither query nor emit this metadata; template
+rows never carry it. The public adapter returns `None`; companion policy is
+advisory metadata, not an enforcement boundary or a public picker behavior.
+Composition failures propagate, while other lookup failures log at debug and
+omit the policy.
 
 ## PlatformContext
 
@@ -178,9 +189,9 @@ installs the context. `bootstrap_context`:
 `resolve_profile(cfg, *, entry_points)` precedence (first match wins):
 1. `KIROCREW_PROFILE` env (`standalone` | `enterprise`; unknown → standalone).
 2. Non-empty `kirocrew.plugins` entry-point group (companion installed).
-3. Identity signal: a present `~/.midway` directory (a cheap stat, no
+3. Identity signal: a present SSO-marker directory (a cheap stat, no
    subprocess) — **only when the opt-in `KIROCREW_MIDWAY_PROFILE_PROBE` env var
-   is truthy**. OFF by default so a stray `~/.midway` left by some other tool
+   is truthy**. OFF by default so a stray marker directory left by some other tool
    cannot force the public edition into the `enterprise` profile (which has no
    companion to compose and would fail-closed at boot, bricking every command).
    The companion's managed launcher sets `KIROCREW_MIDWAY_PROFILE_PROBE=1`.
@@ -189,7 +200,7 @@ installs the context. `bootstrap_context`:
 The profile is a **load trigger, not a security decision**: capability comes
 from the installed companion, so a spoofed signal at worst loads a stricter
 posture on a host that has nothing to enforce it. The core does NOT spawn a
-`whoami` subprocess — entry-point presence + the opt-in `~/.midway` stat cover
+`whoami` subprocess — entry-point presence + the opt-in marker stat cover
 the trigger cases; the companion's own identity provider refines the principal
 once loaded.
 
@@ -398,6 +409,18 @@ kirocrew-enterprise = "kirocrew_enterprise.cli:main"
 The `kirocrew-enterprise` binary sets `KIROCREW_PROFILE=enterprise` and delegates to the
 core `main` — the explicit composition-root path that a security review reads.
 
+**The companion's top-level module MUST be named `kirocrew_<edition>`** — lowercase
+letters, digits and underscores only, no dots or hyphens. Two matchers identify a
+running gateway from its command line and neither can read the companion's entry
+points: `port_resolution._gateway_module_roots()` derives the Python side's set
+from the installed `kirocrew.plugins` entry points, while the desktop launcher's
+`isKirocrewCommand` (`website/electron/gateway-stop.js`) runs in a process with no
+view of that Python environment and matches the name against `KIROCREW_MODULE_RE`
+instead. Both also require a server subcommand (`gateway`, `dashboard`, `start`)
+as the first positional after the module. A companion named outside the
+convention classifies as ours on the Python side but as a foreign port holder on
+the desktop side, and the app refuses to start on its own gateway's port.
+
 ### Distribution build version
 
 A distribution that repackages one core release as several builds of its own
@@ -588,11 +611,13 @@ Wired sites:
   `test_gateway_first_run_setup_routes_through_the_seam`). Best-effort: the
   gateway's surrounding `except` keeps a failure non-fatal to startup, and
   `PlatformCompositionError` still propagates fail-closed.
-- `sandbox.py` — `_build_launcher_script` / `_build_seatbelt_profile` source the
-  sensitive-dir lists from `current_context().sandbox` (the `.aws`-exclusion at
-  the cc branch is preserved). `namespace_argv` / `sandbox_exec_argv` resolve
-  argv[0] through `current_context().agent_executable` before applying the core
-  sandbox. The public Default is identity; a companion may return the direct
+- `sandbox_launcher.py` / `sandbox_seatbelt.py` — `_build_launcher_script` /
+  `_build_seatbelt_profile` source the sensitive-dir lists from
+  `current_context().sandbox` through `sandbox._sandbox_policy` (the
+  `.aws`-exclusion at the cc branch is preserved). `sandbox.py`'s
+  `namespace_argv` / `sandbox_exec_argv` resolve argv[0] through
+  `current_context().agent_executable` before applying the core sandbox. The
+  public Default is identity; a companion may return the direct
   executable behind an edition-managed launcher to avoid nested isolation, but
   cannot disable or weaken the outer sandbox. A transient adapter error falls
   back to the original executable (outer sandbox still applies); a
@@ -605,8 +630,9 @@ Wired sites:
   fail-closed-aware shim; modules import it as `redact`). Covers: `agent.py`
   SEL-audit callers, `mcp_core.py` chat-history/spawn output, `mcp_cron.py`
   deny-reason + script-vet + timezone messages, and `dashboard/handlers/files.py`
-  file-content egress (slot append, file-watch, file_read, download gate) as well
-  as the filename/path/description gates. Standalone is byte-for-byte the prior
+  file-content egress (slot append, file_read; file-watch and the download gate in
+  `dashboard/file_api/transfer.py`) as well as the filename/path/description gates.
+  Standalone is byte-for-byte the prior
   exfil-then-credential two-pass (the Default `CredentialPolicy.redact` delegates
   to `security.redact`); a loaded companion adds its internal-token regexes
   uniformly across every egress surface.
@@ -732,7 +758,7 @@ Wired sites:
   `current_context().apps_loader` sources.
 - `apps/registry_pipeline/sources.py` / `apps/routes.py` — clone-sandbox-mode decision routes
   through `current_context().registry` (`_context_clone_sandbox_mode`).
-- Telemetry `record_event` sites — `dashboard/server.py` records `gateway_start`
+- Telemetry `record_event` sites — `dashboard/server_runtime/diagnostics.py` records `gateway_start`
   at boot; `dashboard/chat_runner.py` and `slack/handler.py` record one
   `interaction` event per successful chat turn (immediately after the
   `record_success` call, non-cancelled / non-retrying branch only; cancelled
@@ -799,7 +825,7 @@ Wired sites:
   `start()` reached, so a companion tunnel cannot start without dashboard token
   auth; the connect/disconnect callbacks and `/api/tunnel/status` stay wrapped
   AROUND the provider. **Teardown is wired at
-  `dashboard/server.py::_wire_tunnel_shutdown`** — an `app.on_cleanup` hook that
+  `dashboard/server_runtime/tunnel.py::_wire_tunnel_shutdown`** — an `app.on_cleanup` hook that
   reads `state.tunnel_manager` lazily (the manager is assigned later, by
   `setup_tunnel`). It covers BOTH start paths, because a live tunnel does not
   imply a manager: with a manager it calls `TunnelManager.stop()`; with
@@ -826,7 +852,7 @@ Wired sites:
   `setup_tunnel`, so it needs no hook.
   Import direction: `tunnel/` imports
   `kiro_crew.platform.context`; `platform/` keeps zero imports of `kiro_crew.tunnel`.
-- `dashboard/server.py` — tunnel enable-gate
+- `dashboard/server.py` (the gate in `dashboard/server_runtime/tunnel.py`) — tunnel enable-gate
   ORs in `current_context().tunnel.enabled()`. **Dashboard contributor (wave 3):**
   in `start_dashboard` only, the `/api/sso-login` route binds
   `dashboard.sso_login_handler()` (or the built-in stub when `None`),
@@ -839,7 +865,7 @@ Wired sites:
   contract, centralized so the fail-closed policy cannot diverge). `stop_services`
   takes the same `app` handle as `start_services` (symmetric) so a companion need
   not stash services in process-global state.
-- `dashboard/server.py` `_mixed_internal_api_paths()` — unions
+- `dashboard/server_runtime/security_middleware.py` `_mixed_internal_api_paths()` — unions
   `dashboard.mixed_internal_api_paths()` into the module-level
   `_MIXED_INTERNAL_API_PATHS` at BOTH `token_auth_middleware` construction sites
   (the dashboard chain and the headless `--slack-only` one), so the two cannot
@@ -934,8 +960,8 @@ the public fork dropped without the core importing it. All are v1 additions (a
 is byte-identical) with no `CONTRACT_VERSION` bump.
 
 - `SlackEnterpriseGate.heartbeat_safe_tools() -> frozenset[str]` — unioned into
-  `slack/gateway.py::_is_heartbeat_safe_tool` after the core `HEARTBEAT_SAFE_TOOLS`
-  exact-match. Default `frozenset()`. ADD-only; never sourced from config.
+  `slack/gateway_runtime/tool_policy.py::_is_heartbeat_safe_tool` after the core
+  `HEARTBEAT_SAFE_TOOLS` exact-match. Default `frozenset()`. ADD-only; never sourced from config.
 - `AppsLoader.registry_rows() -> List[Dict]` — ADD-only merged by
   `apps/registry_pipeline/sources.py::_load_registry_file` after bundled `app-registry.json`
   (same-`name` core row wins). Default `[]`.
@@ -1289,8 +1315,8 @@ representative rather than exhaustive.
 - `hooks.register_internal_read_path(read_id, rel_path)` — guarded seam adding a
   fixed-path entry to `_INTERNAL_READ_ALLOWLIST` (rejects `..`/absolute/
   non-sensitive/repoint).
-- `security._SENSITIVE_HOME_DIRS` gains `.midway` (live SSO bearer cookie;
-  inert on a host without `~/.midway`).
+- `security._SENSITIVE_HOME_DIRS` gains the SSO cookie directory (live SSO
+  bearer cookie; inert on a host without it).
 - `config.knowledge.doc_ingest_hosts` (list) — SSRF-safe allowlist for the
   server-side fetch path only; empty = deny-by-default. The agent-driven
   `auto_add_documents` path is NOT gated

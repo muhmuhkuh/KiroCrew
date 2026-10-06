@@ -29,7 +29,7 @@ this spec states the target and that one states the present.
 
 | Layer | Status | Where it lives today |
 |---|---|---|
-| Subject and registry | `partial` | `monitoring/registry.py` owns kind/objective/capability data for four public pull-request kinds plus internal `gh-pr` and `github_workflow_run`; `probes/__init__.py` still has its separate dispatch branch |
+| Subject and registry | `partial` | `monitoring/registry.py` owns kind/objective/capability data for four public pull-request kinds plus internal `gh-pr` and `github_workflow_run`; `probes/__init__.py` still has its separate dispatch branch, now for two cron-path kinds (`gh-pr`, `work-ledger`), and `work-ledger` has no registry row at all |
 | Probe | `partial` | `monitoring.models.MonitorProbe` and `MonitorProbeResult` are provider-neutral and plural, and `monitoring/github_pull_request.py` batches its subjects into one GraphQL document per evidence kind; the other adapters loop internally and no driver assembles a batch, and the `irq.Probe` path remains separate |
 | Observation | `partial` | the `MonitorCondition` type and the `MonitorSeverity` / `MonitorResetsOn` vocabulary live in `monitoring/models.py`, all four pull-request kinds derive their named conditions in `monitoring/pull_request.py`, and `monitoring/decision.py` masks, ages and resets per condition; `irq.py` keeps its own copy of the vocabulary while the cron driver lives, and a subject's fingerprint is still derived from the canonical facts rather than from the conditions |
 | Decision | `partial` | `decide_monitor` is IO-free but state-mutating: it coalesces successive changes to one subject over time through a window on `MonitorState` (a floor and a head-change reset) and derives its dedup comparison so an unresolved change re-asserts on a re-alert interval. It writes the window fields on the staged state and READS the alert map; the caller stamps the alert map on a wake and persists the same staged state, so decide-and-persist is a required pairing. `irq.py` keeps its own multi-signal coalescing for the cron path |
@@ -112,6 +112,20 @@ raise `NotImplementedError`, and `tuning()` and `wake_suffix()` are optional
 overrides. `PrWatchProbe` in `probes/gh_pr.py` conforms, and a second cron-path
 kind still subclasses `irq.Probe` and adds its branch to `build` in
 `probes/__init__.py`.
+
+That second cron-path kind now exists: `WorkLedgerProbe` in
+`probes/work_ledger.py`, kind `work-ledger`, whose subject is a conductor's own
+work ledger rather than a pull request. It conforms as described -- the two
+required hooks plus both optional overrides, and one branch in `build`. It is
+reachable from an arming surface: `monitor_start` and `monitor_update` accept
+`watch: "work-ledger"`, which `subject.infer_monitor` turns into a monitor of
+this kind on the conductor's own session. The kind still has no
+`monitoring/registry.py` row and therefore no objective of its own, which is the
+integration the paragraph below calls paying for two contracts; until that row
+lands, `infer_monitor` stamps it with the borrowed pull-request `review_ready`
+objective, and the authorization audit record names that borrowed objective.
+Giving the kind its own objective (a registry row plus a per-kind stamp) is the
+next step and is not part of the change that made it reachable.
 
 The `monitoring/` package now has a different extension point:
 `models.MonitorProbe`, a structural Protocol with no behaviour inheritance, plus
@@ -547,8 +561,20 @@ Four things the shape decides, each for a reason worth keeping:
 Every stop, whichever writer decided it, is also reported once more after the
 store commits: `autonudge_stop_log` compares the loops active in the previous
 committed store with the new one, logs each loop that stopped at WARNING with its
-`stopped_reason`. That line in `gateway.log` is the kept record; grep it for
-`AutoNudge:`.
+`stopped_reason`, and appends the same record as one JSON line to
+`<data home>/logs/autonudge_stops.jsonl`. The log line is for reading live; grep
+`gateway.log` for `AutoNudge:`. Each gateway boot moves `gateway.log` to
+`gateway.log.prev`, keeping one copy, so the line is gone after two restarts. The JSONL file is the record that stays: it holds
+the same scrubbed fields, is size-rotated to one `.1` generation (about 2 MiB in
+total), and a failure to append costs that one record, never the store write.
+To see the last stops, newest last:
+
+```bash
+tail -n 20 ~/.kiro/crew/logs/autonudge_stops.jsonl
+```
+
+Each line carries `ts`, `loop_id`, `slot_key`, `kind`, `target`, `reason`,
+`detail`, `cycle_count`/`max_cycles` and `ran_secs`/`max_runtime_secs`.
 A removed legacy loop has no row to carry a reason, so `remove()` takes a
 `stop_reason` for that record alone. A new stop path needs nothing extra to be
 recorded; a new REMOVAL path should pass its reason.
@@ -727,14 +753,14 @@ enforced nowhere:
   `_mark_superseded_rows`, which runs before `_normalize_checks` groups rows and before
   the row cap is spent -- capping first can cut a successor while keeping the row it
   replaced, and that kept row then wins its own key and is reported live. The
-  skill's status tool collapses in `collapse_superseded`, and the two **diverge on both
-  halves of the rule**. On identity, that one keys CheckRuns on
-  `("run", workflowName, name)`, so it groups two workflow files sharing a single
-  `name:` and ignores the run's trigger. On ordering, it takes the newest by the check
-  row's `startedAt`, which is when the JOB got a runner, so a queue can invert it. Both
-  drop a live row rather than over-report, and its displaced row is overwritten instead
-  of joining its `undecidable` list. Tracked as issue #11832; this module's rule is what
-  the provider enforces, not what that tool does.
+  skill's status tool applies the same rule in `collapse_superseded`, by removal rather
+  than by flag, and reads the rollup through the same GraphQL selection for the same
+  reason: `gh pr view --json statusCheckRollup` exposes only the workflow's display name,
+  none of the run fields the rule keys on. It differs in one bound only: a board past
+  its page cap reads UNKNOWN rather than incomplete, because a partial read could keep a
+  displaced row whose successor sits on the page never fetched. (Issue #11832 recorded
+  the divergence this replaced: a label-keyed, `startedAt`-ordered collapse that
+  overwrote a live row of the same run.)
   Identity is the workflow DEFINITION plus the check name
   (`checkSuite.workflowRun.workflow.databaseId`) and the RUN's triggering
   `checkSuite.workflowRun.event`, because one workflow file can declare several
@@ -848,6 +874,29 @@ tree.
 
 A kind that cannot be added without editing layer 4 is a design defect in this
 spec, and should be reported as one rather than worked around with a branch.
+
+#### Reported: the second cron-path kind could not be added without a shared edit
+
+`work-ledger` was added under the current-tree procedure above and did NOT satisfy
+criterion 1 of the acceptance test, so it is reported here rather than worked
+around. The shared rule that had to change is how a terminal watch records its
+outcome. It read success as `"merged" in verdict.keys` -- the pull-request
+probe's own vocabulary -- so any kind that finishes some other way was persisted
+as blocked. That is not a work-ledger quirk: it is layer 4 holding one kind's
+terminal word as though it were every kind's.
+
+The fix keeps the decision engine free of kind names by moving the vocabulary to
+the probes: `probes.terminal_succeeded` tests a verdict's keys against the set of
+terminal keys that mean "finished well", and each probe contributes its own. The
+engine still asks one question and no kind appears in it.
+
+Two lessons for the consolidation target. A terminal key is part of a kind's
+vocabulary and belongs in the registry row beside its objective, not in a shared
+set that every new kind must be added to by hand. And membership is per OUTCOME,
+not per kind: this kind reports `all-accepted` when every work item's bar was met
+and `all-closed` when at least one was rejected or abandoned, and only the first
+counts as finishing well -- so a kind may own several terminal keys that do not
+agree with each other.
 
 ### The acceptance test
 

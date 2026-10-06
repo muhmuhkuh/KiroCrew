@@ -110,6 +110,7 @@ def fake_sel(monkeypatch) -> MagicMock:
     package attribute is what the handler observes.
     """
     recorder = MagicMock()
+    recorder.dropped_events = 0
     monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: recorder)
     return recorder
 
@@ -648,7 +649,13 @@ class TestSttConfigEndpoint:
     @pytest.fixture(autouse=True)
     def _quiet_probes(self, monkeypatch):
         monkeypatch.setattr(core_mod, "_stt_prereq_commands", lambda _p: [])
-        monkeypatch.setattr(core_mod, "is_available", lambda _cfg: False)
+        # api_stt_config derives BOTH `available` and `code` from availability_detail
+        # (the same probe api_stt_status uses), so the two fields cannot disagree.
+        monkeypatch.setattr(
+            core_mod,
+            "availability_detail",
+            lambda _cfg: core_mod.stt.Availability(False),
+        )
 
     @pytest.mark.asyncio
     async def test_put_rejects_malformed_body(self, seeded_config) -> None:
@@ -914,6 +921,47 @@ class TestSttConfigEndpoint:
         # Served independently of `available` so the UI can flag the .webm
         # decode gap even when the provider reads ready.
         assert isinstance(body["ffmpeg_missing"], bool)
+        # The availability code rides this same query so the chat modal can render
+        # the precise per-code reason without a second request. Empty here because
+        # the fixture's detail is `Availability(False)` with the default CODE_OK.
+        assert body["code"] == ""
+
+    @pytest.mark.asyncio
+    async def test_get_carries_the_availability_code_from_the_same_detail(
+        self, seeded_config, monkeypatch
+    ) -> None:
+        """The chat modal keys off a machine-readable code to explain WHY voice is
+        unavailable, and it reads that code from this one query the composer
+        already makes. `available` and `code` are derived from the SAME detail so
+        a "not available" answer can never carry an empty/OK code."""
+        monkeypatch.setattr(
+            core_mod,
+            "availability_detail",
+            lambda _cfg: core_mod.stt.Availability(
+                False, core_mod.stt.CODE_EXTRA_MISSING, "needs the voice extra"
+            ),
+        )
+        async with TestClient(TestServer(_stt_app())) as client:
+            body = await (await client.get("/api/config/stt")).json()
+        assert body["available"] is False
+        assert body["code"] == core_mod.stt.CODE_EXTRA_MISSING
+        assert body["code"] == "stt_extra_missing"
+
+    @pytest.mark.asyncio
+    async def test_get_carries_an_empty_code_when_available(
+        self, seeded_config, monkeypatch
+    ) -> None:
+        """When recognition can run the code is the empty string (CODE_OK), and
+        `available` is True: the two fields are read from one detail."""
+        monkeypatch.setattr(
+            core_mod,
+            "availability_detail",
+            lambda _cfg: core_mod.stt.Availability(True),
+        )
+        async with TestClient(TestServer(_stt_app())) as client:
+            body = await (await client.get("/api/config/stt")).json()
+        assert body["available"] is True
+        assert body["code"] == ""
 
     @pytest.mark.asyncio
     async def test_get_defaults_to_the_local_provider_with_streaming_on(
@@ -1836,6 +1884,7 @@ class TestSelEndpoints:
             "integrity": "ok",
             "tampered": 0,
             "detail": "",
+            "dropped_events": 0,
         }
 
     @pytest.mark.asyncio
@@ -1854,6 +1903,14 @@ class TestSelEndpoints:
         body = json.loads((await core_mod.api_sel_verify(_req())).body)
         assert body["integrity"] == "unverifiable"
         assert "refused" in body["detail"]
+
+    @pytest.mark.asyncio
+    async def test_verify_reports_dropped_events(self, fake_sel) -> None:
+        """The writer's lost-batch counter is surfaced next to the chain verdict."""
+        fake_sel.verify_integrity.return_value = _SelVerification(7, 7, True, "")
+        fake_sel.dropped_events = 4
+        body = json.loads((await core_mod.api_sel_verify(_req())).body)
+        assert body["dropped_events"] == 4
 
 
 class TestSecurityStats:
@@ -2260,6 +2317,97 @@ class TestFallbackModelPatch:
             )
             assert resp.status == 400
             assert "invalid value" in (await resp.json())["error"]
+
+    def _app_with_session(self, provider: object) -> web.Application:
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(
+            owner_id="", sessions=SimpleNamespace(active_providers=lambda: [provider])
+        )
+        app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_pin_denied_by_a_stale_snapshot_is_revalidated_first(
+        self, seeded_config, fake_sel
+    ) -> None:
+        """The PATCH revalidates the live snapshot before the synchronous
+        validator reads it, so a startup-race answer cannot deny an entitled pin."""
+        rows = [{"modelId": "auto"}]
+
+        class _Healing:
+            client = SimpleNamespace(backend="")  # the default harness the pin runs on
+
+            async def maybe_refresh_available_models(self, catalog_ids):
+                assert catalog_ids[0] == "claude-opus-5"
+                rows.append({"modelId": "claude-opus-5"})
+                return list(rows)
+
+            def available_models(self):
+                return list(rows)
+
+        async with TestClient(TestServer(self._app_with_session(_Healing()))) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "claude-opus-5"},
+            )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_pin_is_refused_while_its_revalidation_is_in_flight(
+        self, seeded_config, fake_sel
+    ) -> None:
+        from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating
+
+        class _Pending:
+            client = SimpleNamespace(backend="")
+
+            async def maybe_refresh_available_models(self, _catalog_ids):
+                raise EntitlementRevalidating
+
+            def available_models(self):
+                return [{"modelId": "auto"}]
+
+        async with TestClient(TestServer(self._app_with_session(_Pending()))) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "claude-opus-5"},
+            )
+            assert resp.status == 400
+            assert (await resp.json())["error"] == core_mod._ROLE_PIN_REVALIDATING
+
+    @pytest.mark.asyncio
+    async def test_newer_session_on_another_harness_never_judges_the_pin(
+        self, seeded_config, fake_sel
+    ) -> None:
+        """Newest-first evidence is scoped to the harness the pin runs on (the
+        default backend, kiro): a Claude member DM created later is the newest
+        live session, but its catalog cannot reject a kiro id the account has."""
+
+        class _Session:
+            def __init__(self, backend: str, ids: list[str]) -> None:
+                self.client = SimpleNamespace(backend=backend)
+                self._rows = [{"modelId": m} for m in ids]
+
+            def available_models(self):
+                return list(self._rows)
+
+            async def maybe_refresh_available_models(self, _catalog_ids):
+                return list(self._rows)
+
+        kiro = _Session("", ["auto", "claude-opus-5"])
+        claude_member = _Session("claude", ["claude-opus-4-1", "claude-sonnet-4-5"])
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = SimpleNamespace(
+            owner_id="",
+            sessions=SimpleNamespace(active_providers=lambda: [kiro, claude_member]),
+        )
+        app.router.add_patch("/api/config/kirocrew", core_mod.api_kirocrew_config_patch)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.patch(
+                "/api/config/kirocrew",
+                json={"path": "agent.fallback_model", "value": "claude-opus-5"},
+            )
+            assert resp.status == 200, await resp.text()
 
 
 class TestAdvertisedModelGuards:
@@ -2915,3 +3063,27 @@ class TestSessionAgentPathIdValidation:
         monkeypatch.setattr("kiro_crew.session_workspace.list_results", lambda _s: [])
         resp = await core_mod.api_session_agents_list(_req(match_info={"id": good}))
         assert resp.status == 200
+
+
+class TestNonAsciiLocalSecret:
+    """A non-ASCII ``X-Local-Secret`` is a wrong secret, never a crash.
+
+    ``hmac.compare_digest`` raises TypeError on a str holding a non-ASCII
+    character, so each of the three local-secret gates answered 500 and never
+    wrote its denial record. A raw non-UTF-8 header byte decodes to a lone
+    surrogate, which is the second parameter.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler", ["api_token_local", "api_logout", "api_shutdown"])
+    @pytest.mark.parametrize("bad", ["é", "\udcff", "\ud800"])
+    async def test_refused_like_a_wrong_secret(
+        self, monkeypatch, fake_sel, handler: str, bad: str
+    ) -> None:
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.is_loopback", lambda _r: True)
+        resp = await getattr(core_mod, handler)(
+            _req(app={"local_secret": "right"}, headers={"X-Local-Secret": bad})
+        )
+        assert resp.status == 403
+        assert json.loads(resp.body)["error"] == "invalid secret"
+        assert fake_sel.log_api_access.call_args.kwargs["resources"] == "invalid-secret"

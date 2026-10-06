@@ -9,6 +9,18 @@ for the helper, not the stdlib call, even in code you believe only runs on POSIX
 import alone is enough to break a Windows install, and the failure lands at import time
 in a module a Windows user cannot avoid.
 
+`platform_compat` is the import and patch surface for every helper below. Two families
+are defined in their own modules and forwarded from it: the cross-process file locks
+(`file_lock`, `flock_exclusive`, `acquire_lock` / `release_lock`, `try_acquire_lock`,
+`open_lock_file`, `open_create_or_existing`, `probe_file_persistence`) in
+`platform_lock_compat`, and the owner-only access helpers (`current_user_sid`,
+`process_owner_sid`, `local_user_id`, the two writability checks, `restrict_to_owner` /
+`restrict_dir_to_owner`, `make_owner_only_dir`) in `platform_owner_compat`. Import and
+patch them as `platform_compat.<name>`: a patch there lands on the owner. The owners read
+the platform flag, the lock modules, the clock, `ctypes`, the Win32 struct layouts and
+two shared constants from `platform_compat` when they run, so a patch of one of those
+there reaches them too.
+
 This is the contract. The Windows install and runtime story a user follows is
 [windows-install.md](../../guides/windows-install.md).
 
@@ -25,12 +37,18 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Need | Use (`platform_compat`) | NOT |
 |------|--------------------------|-----|
 | Tail a rotating log | `open_log_file_for_tail(path)` returns a binary read descriptor (caller closes); Windows permits read/write/delete sharing so the writer can rename during a read. Only for log readers, never security pinning. | plain `open` held while a Windows writer rolls over |
-| File lock | `file_lock(fd, exclusive=)` / `acquire_lock`+`release_lock` / `try_acquire_lock`. Windows takes a byte-range lock on byte 0 (`msvcrt.locking`), acquired by spinning on the non-blocking code because msvcrt's own blocking code gives up with `EDEADLOCK`; the spin is bounded so a stuck holder is reported rather than waited on forever, and both platforms fail CLOSED past the ceiling. That range lock is MANDATORY, unlike POSIX advisory `flock`: while it is held, byte 0 is unreadable and unwritable through every other descriptor, including another descriptor of the holding process. So a lock descriptor is never written through — not even to place a byte for the range to cover, which a sibling's acquire turns into `EACCES` on the writer. A byte-range lock covers byte 0 of a ZERO-LENGTH file and still excludes every other descriptor and process, so a lock sidecar stays empty | `fcntl.flock`; writing a byte through a lock descriptor to make its range "lockable" |
+| File lock | `file_lock(fd, exclusive=)` / `acquire_lock`+`release_lock` / `try_acquire_lock`, which reads every failure as not taken; `try_acquire_lock_or_raise` returns `False` only when another holder has the lock and raises the `OSError` of a filesystem that cannot lock, so a caller that retries on busy never retries forever. Windows takes a byte-range lock on byte 0 (`msvcrt.locking`), acquired by spinning on the non-blocking code because msvcrt's own blocking code gives up with `EDEADLOCK`; the spin is bounded so a stuck holder is reported rather than waited on forever, and both platforms fail CLOSED past the ceiling. That range lock is MANDATORY, unlike POSIX advisory `flock`: while it is held, byte 0 is unreadable and unwritable through every other descriptor, including another descriptor of the holding process. So a lock descriptor is never written through — not even to place a byte for the range to cover, which a sibling's acquire turns into `EACCES` on the writer. A byte-range lock covers byte 0 of a ZERO-LENGTH file and still excludes every other descriptor and process, so a lock sidecar stays empty | `fcntl.flock`; writing a byte through a lock descriptor to make its range "lockable" |
+| Create-or-open a lock sidecar race-safely | `open_create_or_existing(path, flags, mode, dir_fd=)` creates the name EXCLUSIVELY first and, when a sibling already made it, reopens WITHOUT `O_CREAT` so both hold the sibling's inode; never truncates; returns the raw fd the caller owns. `open_lock_file(path)` is the context-managed form for a plain lock file. A leaf that vanishes between the two opens is a genuine `ENOENT` left to the caller. `test/test_dir_fd_create_race_ratchet.py` refuses a new `dir_fd=` open whose flags carry `O_CREAT` without `O_EXCL` | nonexclusive `O_CREAT`, which can return `ENOENT` on Darwin when two callers race to create the same absent name |
+| Open a file you write AND lock, never through a link at the name | `open_create_no_reparse(path, mode)`: POSIX is `open_create_or_existing` with `O_RDWR \| O_NOFOLLOW` and no `O_NONBLOCK` (a lease break is waited out, as a plain open would); Windows is `win_open_no_reparse(path, directory=False, links_only=True)`, a `CreateFileW` read/write open-or-create with `FILE_FLAG_OPEN_REPARSE_POINT` and no `FILE_SHARE_DELETE`, refusing a link or junction with `ELOOP` (`win_fd_is_link` reads the name-surrogate bit of the opened handle's own reparse tag and fails closed), while a regular file carrying a non-link tag such as a cloud-files placeholder opens (the decision-log append shares the open without `links_only`, refusing every reparse point). `open_file_no_reparse(path, links_only=True)` is the read-only counterpart. Never truncates; the caller still `fstat`s the descriptor for `S_ISREG`, since a directory, FIFO or socket at the name can open. To name who holds a lock on that file, pass the descriptor's `fstat` to `flock_owner_pid` / `pids_holding_file`, which accept an `os.stat_result` | `os.open(path, O_RDWR \| O_CREAT)` (follows a link at the name, and creates a dangling link's target); an `lstat` check before the open (a check-to-open window); `flock_owner_pid(path)` after a no-follow open (re-resolves the name, so it can name the holder of something else) |
 | Liveness probe | `pid_exists(pid)` / `pid_liveness(pid)` | `os.kill(pid, 0)` (kills on Windows!) |
+| Process-group liveness | `pgroup_exists(pgid)`; an out-of-native-range positive identity is unknown and therefore conservatively reads as alive, so persisted-state cleanup refuses it without aborting the rest of the sweep | `os.killpg(pgid, 0)` directly, or treating an oversized integer as a dead group |
 | Kill a process | `kill_pid(pid, sig)` | `os.kill(pid, sig)` |
 | Kill a tree | `kill_process_tree(pid, sig)` | `os.killpg(os.getpgid(pid), sig)` |
+| Stop a child whose TERM trap must run (an installer that restores what it moved aside) | `terminate_and_reap(proc, grace=…, reap_timeout=…)` — SIGTERM to the child's own group (read while its leader is alive), pipes drained for up to *grace*, then SIGKILL to whatever is left and `kill_and_reap`'s bounded reap; shielded against the caller's cancellation. Windows, or a child that does not lead its own group: exactly `kill_and_reap`. `terminate_and_reap_sync(popen, grace=…)` is the blocking sibling for a `Popen` child writing to the caller's terminal (`kirocrew update`'s installer) | `kill_and_reap` (SIGKILL first, so the trap never runs) |
 | Kill a group the caller CAPTURED | `kill_process_group(pgid, sig)` — group-addressed; the id must have been read while the group's leader was alive and identity-checked (`process_identity.isolated_group_of`), the broadcast/self guard refuses with `ValueError` instead of degrading to a pid, POSIX only | `os.getpgid(pid)` at signal time (a recycled pid names a stranger's group) |
-| Parent PID | `get_ppid(pid)` | `/proc` read / libproc |
+| Kill a `Popen` child and its descendants | `kill_popen_tree(proc)` — for a child started in its own group (`start_new_session` / a new Windows process group); signals the group only while `proc` is unreaped, then `proc.kill()`, which polls first and so may itself reap a child that already exited; never raises. Collect the status through `Popen.wait()`/`poll()`, never a raw `waitpid` | `proc.kill()` alone (a grandchild survives); a group signal after `wait()` (the pid may name a stranger) |
+| Parent PID | `get_ppid(pid)` (Linux: `PPid:` through `read_proc_status_int`), or `parent_pid(pid)` from `read_proc_stat` where `None` must mean unknown | a text read of `/proc/<pid>/status` (its `Name:` line is the raw comm) / libproc |
+| Fields of `/proc/<pid>/stat` (parent, group, session, state, start ticks, RSS pages) and `status` | `read_proc_stat(pid, proc_root=)` -> `ProcStat`, the reader new code uses: ONE bytes read, `comm` never decoded (any process may set it to arbitrary bytes through `prctl(PR_SET_NAME)`, and the kernel cuts a multibyte name at 15 bytes mid-character); `None` when the file is unreadable or the line has no `)`, otherwise each field is `None` on its own when its token is missing or not a number, and `ProcStat()` is the all-unknown reading. `process_age_secs(start_ticks, now=)` gives the age on the `boottime_now()` clock (`now` for a fixture's own `uptime`). `read_proc_status_int(pid, label)` reads one `status` number (`PPid`, `Threads`, `VmRSS`) from bytes. `linux_pgroup_members(pgid)` is a group's running members with each one's start ticks from the same read; `proc_child_map()` the whole host's parent edges. `_process_group_supervisor.py` runs as `python -I -c` and must stay stdlib-only, so it carries its own minimal bytes parse. Strict text-mode readers of these files still exist, so do not copy one: `dashboard/handlers/terminal.py` (`_proc_comm`), `diag/recorder.py`, `acp/runtime_process_tree._get_start_time`, the pod e2e script, and two readers of `/proc/self/status` (`_linux_peak_rss_bytes` here and `doctor_checks/confinement._read_linux_proc_self`) | `read_text` on the stat or status file (a comm that is not UTF-8 raises `UnicodeDecodeError`, which an `except OSError` does not catch and an `except ValueError` reads as "gone"; a strict ASCII decode fails on any non-ASCII name); splitting before the LAST `)`; one read per field (a recycled pid can answer the second) |
 | Session process identity | `get_process_start_id(pid)`; Windows uses query-only creation FILETIME, Linux start ticks, macOS libproc microseconds with a `sysctl KERN_PROC_PID` fallback for a zombie (libproc refuses one; the kernel's zombie list still carries the same `p_start` instant) | caller-supplied PID or a bare PID without its creation identity |
 | Listener-owner ancestry | `process_descendant_identities(pid, candidate_pids=...)` returns each PID, PPID, start token, and its `ATOMIC` or `LSTART` source. Rechecks use `process_start_id_for_source` and never fall across encodings; an unavailable capture source is inconclusive. Before the POSIX fallback filters stable rows, it derives the root subtree from the first `ps` snapshot and requires every one of those rows to be unchanged in the second; any missing, reparented, or re-identified subtree row returns `None`, while unrelated rows may churn. The shared tri-state process-start comparator accepts strictly later, excludes strictly earlier, and treats equal coarse or unparseable order as inconclusive. A discovered parent must keep the same identity across its child-list read. Every child named by that read must still have a readable identity and the same parent. A changed parent, vanished child, or reparented child makes the whole walk return `None` rather than a completed partial result. On Windows each candidate-to-root chain must also keep the same PIDs, creation IDs, and edges across two Toolhelp snapshots, while unrelated siblings may churn. `created_after` remains a numeric-only Boolean wrapper over that core for its pod and harness callers | requiring the whole process tree to remain unchanged, accepting a bare descendant PID, filtering unstable root-subtree rows into a completed partial result, comparing an `lstart` capture with atomic ticks or microtime, treating same-second fallback timestamps or a changed/vanished task as foreign, or maintaining a second comparison implementation |
 | macOS zombie state | `darwin_pid_is_zombie(pid)` (`True` / `False` / `None` unreadable; a pid the kernel does not list reads `True`); `darwin_kinfo_proc(pid)` for the record with its start id; `darwin_pgroup_members(pgid)` lists a process group with each member's zombie flag | `pid_exists` as an exit oracle (a zombie is alive to it); `pgroup_exists` as an empty-group oracle (a retained zombie leader keeps it true); `proc_pidinfo` on a zombie |
@@ -47,10 +65,14 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Signals | `platform_compat.SIGKILL` / `SIGTERM` | `signal.SIGKILL` (undefined on Windows) |
 | Spawn isolation | `start_new_session=IS_POSIX` + `creationflags=CREATE_NEW_PROCESS_GROUP` | bare `start_new_session=True` |
 | Wait on a subprocess PIPE with a deadline | a daemon reader thread feeding a `queue.Queue`, consumed with a bounded `get` (`testing/harness.py`'s `_StdoutPump`) | `selectors.DefaultSelector()` on the pipe (select()-based on Windows, which accepts SOCKETS only, so registering a pipe RAISES there) |
-| Re-enter an edition's stable gateway launcher | `reexec_launcher(launcher, args)` after `gateway_restart.resolve_restart_launcher()` validates it; keeps the dispatch pathname, original arguments and UTF-8 environment | resolving the symlink basename away, passing Python `-m` flags to a launcher, or evaluating a shell command |
-| Re-exec the current Python module | `reexec_python_module(module, args)` | `os.execv(sys.executable, [sys.executable, ...])` (breaks when the Windows interpreter path contains spaces) |
+| Re-enter an edition's stable gateway launcher | `reexec_launcher(launcher, args)` after `gateway_restart.resolve_restart_launcher()` validates it; keeps the dispatch pathname, original arguments and UTF-8 environment, cancels a managed-venv apply in flight (`cancel_wheel_applies_in_flight`), and puts every variable registered with `keep_for_reexec` back into `os.environ` right before `os.execv` | resolving the symlink basename away, passing Python `-m` flags to a launcher, or evaluating a shell command |
+| Re-exec the current Python module | `reexec_python_module(module, args)`; like `reexec_launcher`, it cancels a managed-venv apply in flight, then restores the UTF-8 environment and the `keep_for_reexec` variables right before `os.execv` | `os.execv(sys.executable, [sys.executable, ...])` (breaks when the Windows interpreter path contains spaces) |
+| Take a variable out of the environment for descendants while this process's own exec successor still gets it (the managed-service launch marker) | `keep_for_reexec(name, value)` after popping it; `kept_for_reexec()` reads what is held. Only the two reexec seams restore it, so a child spawned meanwhile does not inherit it, and if `execv` raises, `os.environ` keeps it until the process exits | re-setting it in `os.environ` by hand before an exec (every child spawned in between inherits it); an exec outside the two reexec seams (the successor loses it) |
+| End the process at once, other than the gateway's own final exit | `hard_exit(code)`: cancels a managed-venv apply in flight, then `os._exit` (the second-signal force exit, the owner's `/kirocrew restart`) | a bare `os._exit` (a managed-venv apply in flight keeps writing its tree after the process that supervised it is gone) |
+| Stop a managed-venv apply at every exec, hard exit or shutdown | `cancel_wheel_applies_in_flight(reason)`: looks `kiro_crew.platform.wheel_apply` up in `sys.modules` (never imports it) and calls its `cancel_wheel_applies(reason)` when loaded; both exec seams and `hard_exit` call it, and a shutdown that wants the apply stopped before its own teardown calls it itself. Synchronous, quick, safe to call twice; a cancel that raises never stops the exit | an `atexit` handler (an exec and `os._exit` both skip it); a general exit-hook registry (it had one registrant, so it abstracted over nothing) |
 | Launch a Kiro Crew-owned Python child | `isolated_python_argv(*args, executable=...)`; it adds `-s` for the bundle and parents whose user site is already unavailable, unless the option prefix carries `-s` or stronger `-I` | a raw `[sys.executable, ...]`, or an ad hoc `PYTHONNOUSERSITE` env that another spawn path can omit |
 | Replace the current process with another program (a supervised service body) | spawn a child, record its pid + `process_start_time`, and `wait()` on it under `IS_WINDOWS` (see `pod.windows.supervise_gateway`) | `os.execve` (on Windows this SPAWNS and terminates the caller, so the pid changes and the service manager sees the unit exit while the real program keeps running orphaned) |
+| Make `print()` reach a non-terminal stdout as it is printed (the gateway's status lines under a service manager) | `ensure_line_buffered_stdout()` once at gateway start, before the first status print: a stdout that is not a tty is reconfigured to `line_buffering=True`; a tty is left untouched (already line-buffered), and a stream with no `reconfigure` (absent, closed, a `StringIO`, a plain object a launcher left behind) is left as it is. `sys.stderr` needs nothing: CPython line-buffers it on every attachment. Independent of `ensure_utf8_console()`, which keeps the encoding job and runs first. Contract: [cli](../modules/cli.md#gateway-stdout-is-line-buffered-off-a-terminal) | `flush=True` on each `print()` (every new print has to remember it); `PYTHONUNBUFFERED=1` in a generated unit (reaches that one launcher and no installed unit, launchd agent, Desktop supervisor or detached gateway); turning the prints into `logging` records (changes what the log carries) |
 | Open an exact Windows process object for later tree discovery/termination | `open_process_termination_handle(pid, expected_token)` validates the opened handle's creation identity before returning it (caller closes with `close_process_handle`); combine with `descendant_termination_handles` so the anchored root and each retained child receive a final post-exit snapshot | opening by PID and checking the token beforehand (PID reuse can occur between those operations) |
 | Race-free Job object assignment | `creationflags \|= CREATE_SUSPENDED`, then `apply_job_limits`, then `resume_process_main_thread` | assigning a job to an already-running child (descendants it already spawned escape) |
 | Fork-bomb / memory ceiling on a spawned tree | `sandbox.apply_windows_resource_ceiling(pid)` after the spawn, alongside `cgroup_scope_argv` | `cgroup_scope_argv` alone (a no-op on Windows, so no ceiling at all) |
@@ -68,16 +90,25 @@ produces exactly those silent failures, which is why the helper is named per cal
 | READ a file you judged in the same traversal (screen-then-read) | `PinnedDirectory.read_text(name, max_bytes=…)` -- the open itself refuses a link at the name, the descriptor's own `fstat` rejects a non-regular entry, a hardlink and anything over `max_bytes`, and the open is non-blocking so a FIFO cannot stall the read. The size is asked of the OPEN DESCRIPTOR, not of a stat taken before it, and the read itself is bounded too, so a file that grows between the two stops at the cap. The layers under it are private on purpose: reaching for a raw descriptor would be operating outside the pin | screening a name and then reading that name -- the entry is re-resolved in between, and the screen only refuses a link that was PRESENT at check time, so a flip-flop serves a file of the adversary's choosing. Also: a pre-open `stat` for the size, which measures a different file than the one the read then opens |
 | ENUMERATE a directory whose contents an agent writes | `PinnedDirectory.names_bounded(limit)`, which answers None when the directory holds more than *limit* entries | `names()` (or `sorted(os.listdir(...))`) on such a tree: the eager list IS the exhaustion, allocated in full before any budget the caller applies afterwards could refuse it. Returning the first *limit* names instead of None would be worse than either -- the caller acts on a partial directory while believing it saw all of it |
 | Process RSS (live) / peak RSS / CPU | `proc_rss_bytes()` / `proc_peak_rss_bytes()` / `proc_cpu_seconds()` | `resource.getrusage` (`ru_maxrss` is a high-water mark, never a live reading, and its unit is KiB on Linux but bytes on macOS). The peak on Linux is NOT `ru_maxrss`: `execve` seeds it with the pre-exec image's peak, so a gateway started from a large parent would report that parent's number for life; Linux reads its own `/proc/self/status` `VmHWM` instead, monotonic across reads (the kernel folds live RSS into `hiwater_rss` lazily, so raw consecutive readings can dip a few hundred KiB), and an unreadable `/proc` is the documented 0, never the inherited figure. `pdf_extract_child` carries the same `VmHWM` parser rather than importing this module (its imports stay minimal under a capped address space) |
+| Another process's macOS memory footprint | `proc_phys_footprint_bytes_for_pid(pid)` | `proc_pid_rusage(pid, RUSAGE_INFO_V2)` -> `ri_phys_footprint` through `libproc` (no subprocess, no entitlement for a same-uid pid); `None` off macOS or when unreadable. This is the figure jetsam acts on and Activity Monitor's "Memory" column shows: it counts compressed and swapped pages, which `ps` RSS omits, so an idle process that has grown can read a small fraction of its real cost through `ps` (16x measured). `acp/runtime_process_tree` measures each pid of a macOS tree by it, with `ps` RSS as the per-pid fallback, so the runtime ceilings and the Sessions panel read it there |
 | A deadline that survives a host suspend and needs no thread or GIL | `arm_process_alarm(seconds)` (`0` cancels), guarded by `process_alarm_available()`: the kernel's `setitimer(ITIMER_REAL)`, which Linux runs on `CLOCK_MONOTONIC` and macOS on the absolute mach timebase, so a pending deadline keeps its remaining time across a sleep instead of firing on resume; pair it with `faulthandler.register(SIGALRM, ...)` for a GIL-free stack dump, released with `faulthandler.unregister` and registered afresh on every arm (a repeat `register` reinstalls nothing while faulthandler believes it still holds the signal, so a temporary owner that handed `SIGALRM` back with `SIG_DFL` would otherwise leave the next alarm to end the process without a dump). `False` on Windows, which has no such timer — the caller falls back to a mechanism it names for that platform (the loop watchdog uses faulthandler's timer thread there). The timer belongs to the process image that armed it and to no successor: `execve` preserves `ITIMER_REAL` while it resets a caught `SIGALRM` to its default disposition, so `reexec_launcher` / `reexec_python_module` cancel it immediately before `os.execv`, and the gateway entrypoint clears any deadline that still arrived (`loop_watchdog.disarm_inherited_alarm`, only while `SIGALRM` is at its default disposition) | `faulthandler.dump_traceback_later` as a standing deadline (its wait is `CLOCK_REALTIME`-based on every macOS build and on any Linux build without `sem_clockwait`, so a suspend longer than the budget fires it on resume); `signal.setitimer` / `signal.SIGALRM` reached directly (neither exists on Windows); a bare repeat `faulthandler.register` as a way to re-install the handler; an `os.execv` outside the two reexec seams while a deadline is pending (the successor is ended by a signal it never armed) |
 | Now on the suspend-inclusive clock (dating a process start, or measuring a sleep) | `boottime_now()`: `CLOCK_BOOTTIME` on Linux (it counts time the host spent suspended, as `/proc/uptime` and the `starttime` field of `/proc/<pid>/stat` do), `time.time()` on macOS (the clock libproc dates process starts on; it can step, so the liveness oracle pairs it with `acp/liveness.steady_now`), `None` where neither exists — a caller reads `None` as "cannot say", never as a time. The liveness oracle stamps a tool dispatch on it, and the loop watchdog compares its advance against `time.monotonic()` across one poll to name a resume | `time.monotonic()` against a `/proc` process age (`CLOCK_MONOTONIC` stands still through a suspend, so a boot-clock age minus a monotonic stamp places a live child before its own dispatch); `time.clock_gettime(time.CLOCK_BOOTTIME)` outside the compatibility layer (absent on macOS and Windows); importing the reader from `kiro_crew.acp` in application code (the agent-SDK boundary gate refuses the edge) |
 | Available host memory | `host_available_mib()` (0 = unknown, never 0 = no memory) | `/proc/meminfo` directly (Linux-only, so the bound built on it silently vanishes on macOS and Windows) |
+| macOS kernel memory pressure | `memory_pressure_level()`: `kern.memorystatus_vm_pressure_level` through `sysctlbyname` on the cached `_darwin_sysctl_handle()`, in-process (built once under a lock, both prototypes declared before the handle is published, so a concurrent first call never reads None). It answers `MEMORY_PRESSURE_NORMAL` (1), `MEMORY_PRESSURE_WARN` (2) or `MEMORY_PRESSURE_CRITICAL` (4): XNU's `NOTE_MEMORYSTATUS_PRESSURE_*`, the same values as libdispatch's `DISPATCH_MEMORYPRESSURE_*`, with the kernel's internal "urgent" level reported as WARN. `memory_pressure_name(level)` renders it. `None` off macOS and on any failure (no libc, a failed call, a wrong-size answer, an unknown value), and a caller fails open on `None`. The level is the kernel's lagging verdict (subagent.md, *macOS: the kernel memory-pressure hold*): use it as a backstop beside a figure, never as one | a `sysctl` subprocess (the app sandbox can deny the spawn, and callers run on the event loop); a fresh `CDLL` per read; treating the level as a measure of free memory, or a NORMAL reading as proof the host has room |
 | FD soft limit | `raise_nofile_soft_limit(n)` | `resource.setrlimit` |
 | Port to PID | `find_listening_pids(port)` / `listening_pid_tool_available()`; `find_port_listeners(port)` when ownership must be scoped to the local address actually probed; `probe_port_listeners(port)` when completed-empty must be distinguished from timeout or execution failure; `process_owns_loopback_listener(pid, port)` for per-process ownership through Linux procfs, PID-scoped `lsof`, or Windows `GetExtendedTcpTable` owner-PID tables | `lsof` or `netstat` directly |
 | Spawn a system tool (`ps`, `lsof`, `netstat`, `taskkill`) | `trusted_system_bin(name)`, treating `None` as "unavailable" | a bare argv name (resolved through a `PATH` that can lead with same-uid-writable dirs) |
+| Resolve a system tool on the event loop (a periodically refreshed capability probe) | `trusted_system_bin_quiet(name)`: the same fixed-directory lookup with no miss diagnostic, reporting a miss in the caller's own words | `trusted_system_bin`, whose miss diagnostic walks `PATH` with `shutil.which` and can hang on an entry on a stalled mount |
 | Decide whether an executable's PATH can be trusted (ownership, mode bits, writability by some account) | `traversed_components(path)` for the ENUMERATION, then the site's own predicate over every entry. It resolves the path COMPONENT BY COMPONENT, expanding each symlink it meets, and returns every directory the walk actually reads — the original spelling's side, each hop's side and the target's side — plus the final target, root-first, each once; `None` on `OSError` or past `_MAX_SYMLINK_HOPS`, which every caller treats as a refusal. The trust QUESTION stays with the caller, because the sites ask different ones and must keep asking them: `_is_root_owned_path` (`trusted_aws_bin`: root's alone to change), `github_runner.validate_provider_executable` POSIX branch (not another uid's, not world-writable unless sticky; strict mode root-owned and unwritable), `browser_cli.install._gateway_writable_component` POSIX branch (not writable by this gateway process), `service.apparmor._substitutable_by_others` (no `0o022` bit, no third-account owner). Windows branches keep their ACL-driven lexical chains; the walker is `os.sep`-rooted and does not model drive anchors or junctions | `realpath` and then `.parents` / `os.path.dirname` (collapses the chain, so a hop through writable space — `gh -> /tmp/link -> /usr/bin/gh` — is never stat'd); a lexical `.parents` walk over the spelling as given (`os.stat` follows symlinks and `dirname` does not, so for `/usr/local/bin -> /opt/x/bin` the target's parent `/opt/x` is never visited); or walking BOTH endpoints' lexical chains (still names no hop in the middle). Adding a fourth spelling of the walk for a new site |
 | Spawn the AWS CLI (`aws`) | `trusted_aws_bin()` — `trusted_system_bin` plus a `/usr/local/bin` fallback (the installers' default `--bin-dir`), accepted only when `_is_root_owned_path` finds every entry of `traversed_components` (see the row above: every directory the walk reads, including the directories on a symlinked component's target side, plus the final target) root-owned, not group/world-writable, and (via `os.access(..., effective_ids=True)`, the only form that reads a POSIX ACL) not writable by the non-root account through an ACL entry `st_mode` cannot express. Running AS root DECLINES: there `os.access` answers True for everything, so the ACL arm has no signal, and the entry it would catch grants a NON-root user write — the one case root must not execute. Only the `/usr/local/bin` fallback is lost under root; `trusted_system_bin` does not route through this. The fallback also refuses a `#!` SCRIPT (`_is_native_program`): a shebang names its interpreter in the file's CONTENT, which the path walk never validated, and `sudo pip install awscli` against a pyenv Python produces exactly that — AWS CLI v2 ships a native executable, so the case this exists for is unaffected. Both conditions live in ONE predicate, `_local_aws_bin_is_trusted`, because the resolver and `aws_bin_declined_on_ownership` both ask and must never contradict each other about one file. Debian policy has `/usr/local` subdirectories `root:staff` mode `2775`, so the fallback DECLINES by default on stock Debian/Ubuntu: intended, because a `staff` member can replace the binary. A diagnostic must then report the decline with `aws_bin_declined_on_ownership()` rather than as absence | adding `/usr/local/bin` to `_TRUSTED_SYSTEM_BIN_DIRS` (Intel macOS Homebrew owns that directory as the console user, so membership alone would let a same-uid process supply `ps`, `lsof` and every other pinned tool); or validating the path with `realpath` (collapses a chain, so a hop through writable space vanishes) or a lexical `dirname` walk (`os.stat` follows symlinks and `dirname` does not, so a symlinked component's target ancestors are never seen) |
 | Read a Windows system tool's ANSWER (`schtasks /Query`, `tasklist`, `sc query`) | the tool's **exit code**, or a fact the program under test recorded itself | parsing its stdout (column headers AND status words are translated by the UI language, so a match on `"Running"` reports every instance down on a non-English host — the fail-OPEN direction) |
 | strftime no-pad | `strftime(dt, "%-I")` | bare `dt.strftime("%-I")` (`ValueError` on Windows) |
+
+The shared POSIX process snapshot requests each column separately:
+`ps -A -o pid= -o ppid= -o lstart=`. Some `ps` implementations parse the commas
+after an empty header as part of that header, returning only PIDs. Separate
+output options preserve the parent and start-time fields that descendant
+discovery and PID-reuse checks need, even when the combined form exits successfully.
 
 **Its relationship to `pinned_fs`.** That module owns this discipline and says so —
 mechanism in one place, callers as thin consumers — and `PinnedDirectory` is the
@@ -123,6 +154,91 @@ boundaries. It includes resident runtime workers such as
 parent-policy decision. Adding one requires routing it through the helper and adding it
 to that inventory, so a later spawn cannot silently return to the user-site-dependent
 behavior.
+
+## TLS trust bootstrap across an in-app restart
+
+`kiro_crew._ssl_compat._ensure_ssl_certs` runs in the startup prelude of every entry
+point (`__main__`, `cli`, `mcp_gateway.gatewayd`) before any HTTPS client caches an
+SSL context. Its order is the clean-start order: an operator's `SSL_CERT_FILE` wins
+outright (one warning when the file it names cannot be found, nothing else touched);
+Windows exports nothing (`rustls-native-certs` in the kiro-cli child treats
+`SSL_CERT_FILE` as a replacement for the platform store, so a public-roots bundle
+would subtract every private CA); macOS injects Security.framework evaluation for
+this process; then the interpreter's own default cafile (nothing to export), then the
+Linux distribution bundles in `_CA_CANDIDATES`, then certifi's bundle. The found
+bundle is exported as `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` for the children that
+cannot inherit a process-local injection (kiro-cli, Node MCP servers).
+
+The certifi export is **install-pinned**: `certifi.where()` is
+`<prefix>/lib/pythonX.Y/site-packages/certifi/cacert.pem` inside the running install.
+The in-app restart seams hand the successor this process's environment
+(`platform_compat.reexec_launcher` / `reexec_python_module` behind the dashboard's
+update and restart actions, `service.live_target.maybe_reexec` for a live-target
+cutover), so a successor re-enters the prelude holding its predecessor's value.
+Honoured as an operator override, that value keeps the successor pointing at the
+previous install's bundle; once an upgrade or an installer re-run deletes that tree
+every TLS handshake fails until a restart from a clean environment (#15713).
+
+The rule is the one #15607 proposes for the other install-pinned runtime export,
+`LLAMA_CPP_LIB_PATH` (that change is not merged; its names are not cited here): **a value
+the runtime exported is its own transitional value, not an operator's, however it is
+inherited.** Here the export must stay in the environment — the children need it — so the
+runtime publishes its provenance beside it, **one marker per variable it assigns**:
+`KIROCREW_EXPORTED_SSL_CERT_FILE` and `KIROCREW_EXPORTED_REQUESTS_CA_BUNDLE`, each holding
+the value `_export_ca_bundle` wrote into that variable, and each published only when the
+call assigned the variable — `REQUESTS_CA_BUNDLE` is only defaulted, so an operator's
+value found there gets no marker, not even when it equals the bundle this install derives
+(an operator who pinned `REQUESTS_CA_BUNDLE` to `$(python -m certifi)` of this very
+install; one path marker shared by both variables would have vouched for theirs too).
+`_inherited_export_reason` is the one classifier, and it answers yes in exactly one case:
+the variable equals its own marker. A successor inherits a variable and its marker
+together, so it reads its predecessor's export as what it is; an operator sets the
+variable alone, so theirs never matches. **Nothing else is provenance** — not the path's
+shape, and not the directory it lies in, Kiro Crew's own install trees included. An
+operator who set `SSL_CERT_FILE` to a certifi bundle of their own (`$(python -m certifi)`,
+or one they appended a private CA to) holds a working policy while the file exists and a
+fail-closed one once it does not — every handshake fails until they repair the pin, as
+they chose; an operator can place a restricted bundle inside this runtime's own venv, and
+a tree the installers delete takes that pin with it, leaving a fail-closed state that is
+theirs rather than a stale export to re-derive over; and on macOS an explicit bundle is
+also an exclusion (it bypasses the Security.framework injection, so the Keychain's CAs are
+not trusted). Re-deriving over any of these would widen trust past what the operator
+chose, so the prelude infers nothing from a path. It reads no data home and does not load
+the config package or the update engine; the test file pins its import set at `kiro_crew`
+and `kiro_crew._ssl_compat`, the same on every platform.
+
+The one value this leaves unrecognised, by design, is a predecessor's export from **before
+the provenance existed**: it reads as an operator's and is kept. While its file exists it
+works (the managed-venv update engine keeps the current tree and the previous one, so a
+predecessor's bundle survives one update and is pruned after the next); once that tree is gone the successor fails closed, and the
+existing missing-file `WARNING` names the file and the way out — "if an earlier Kiro Crew
+install exported this value, start it from a clean environment". The producing case is
+narrow and one-time: an installer re-run deletes the retired `<data home>/venv` under a
+running gateway (`cli.sh` retires it without stopping the service), and the operator then
+uses the in-app restart rather than a service restart. One clean start heals the lineage
+for good, because this runtime publishes the provenance and every later restart is
+recognised.
+
+A runtime value in either variable is dropped before the operator check (so a stale
+`REQUESTS_CA_BUNDLE` beside an operator's `SSL_CERT_FILE` does not survive either), the
+inherited provenance is dropped with it, and trust is derived for this install in the
+clean-start order above, so a successor behaves exactly as a fresh start on the same host
+would: the system bundle wins where there is one, the same install re-exports the same
+path with nothing logged, both entry points running the prelude in one process see their
+own export and keep it silently, and an operator's `REQUESTS_CA_BUNDLE` beside the
+runtime's `SSL_CERT_FILE` survives the restart untouched. One `WARNING` line names each
+value that changed and the reason it was judged the runtime's — WARNING rather than the
+INFO #15607 proposes, because this runs in the prelude before logging is configured and
+the last-resort handler drops everything below WARNING. Not on Windows: the prelude
+exports nothing there, so no Kiro Crew process can have left a value behind, and whatever
+is set is an operator's. `test/test_ssl_certs.py::TestInheritedInstallPinnedBundle` pins
+the rule, including the two-bootstrap restart with the first run's environment carried
+into the second against a pruned bundle, a dead pin without provenance kept even inside a
+former install tree (with the clean-environment clause in its warning), an operator's
+`REQUESTS_CA_BUNDLE` at the derived path kept across an upgrade restart while the
+runtime's `SSL_CERT_FILE` beside it is re-derived, the two-module import set of the
+prelude, and the operator's certifi pin on macOS that keeps its exclusion.
+
 ## Confined decision-log append
 
 `platform_log_append.append_line` owns the decision log's filesystem transaction.
@@ -165,6 +281,18 @@ than one because a slow open must not reach the lock with nothing left; the retr
 covers the open alone, so no partial write is ever replayed. No additional worker
 is spawned; a stalled filesystem syscall itself is not cancellable by either
 deadline.
+
+A DELETE meets the same transient hold. When `pod down` removes a pod's Task
+Scheduler `.cmd` wrapper, the pod's own processes are already drained, but a
+process the backend does not own (the Task Scheduler service finishing with the
+action file, an indexer or AV scanner) can still have it open, and the delete
+fails with `[WinError 32]`. `pod.windows._unlink_waiting_out_sharing` retries that
+one error under a bounded deadline and re-raises it unchanged once the deadline
+passes, so a real leak still fails closed; every other error raises at once. The
+startup rollback of a cancelled `pod up` deletes the same wrapper through the same
+helper. A teardown that deletes a file another process may have just used follows
+the same rule: retry `ERROR_SHARING_VIOLATION` only, with a deadline, never any
+`PermissionError`.
 
 On write failure, rollback removes only the bytes counted for that append when
 the file has exactly the expected size. Existing bytes or unrelated growth are
@@ -405,6 +533,20 @@ an empty tree; ACP retains the original process and PID tracking when the owning
 call does not complete, while the transferred exact handles remain independently
 retryable after provider/client references are dropped.
 
+A pass that runs out of its bounded budget (`_WINDOWS_TREE_REAP_TIMEOUT_SECS`)
+before every member is confirmed raises `WindowsTreeDrainPending`. Members
+discovered too late in the pass to be signalled count as pending too. It is an
+`OSError`, so every caller that treats an unconfirmed drain as a failed kill keeps
+doing so. It names the root and the number of members still pending. The tree is
+not lost: its pins stay in the pending state, and the maintenance sweep resumes the
+drain from the members already confirmed. A slow host meets this routinely,
+because each member's pass costs two identity reads and two Toolhelp snapshots.
+`AcpRuntime` therefore logs it as one WARNING line, not a traceback, and still
+raises. A failed kiro session setup logs its original failure at WARNING before the
+cleanup kill, redacted and folded to one bounded printable line, because that text
+can come from the backend. Without that line, the cleanup's own output would be
+the only trace of a repeating setup failure.
+
 This does not reconstruct an intermediary that exited before any available
 handle observed it, and the completeness a successful drain asserts is therefore
 scoped to the members it retains: the pinned root plus every descendant some
@@ -431,6 +573,28 @@ directly from the event loop, so its Windows arm asks for the creation half
 alone: no liveness wait, no poll, and no sleep on a coroutine's thread. The
 creation `FILETIME` is the whole identity, so answering without the exit half
 costs the caller nothing.
+
+`TerminateProcess` answers a process whose exit has begun with
+`ERROR_ACCESS_DENIED`, the same code a genuine refusal carries, and a drain meets
+that routinely: every member started with `CREATE_NO_WINDOW` owns a `conhost.exe`
+that Toolhelp lists as its child, and that console host exits on its own once its
+client is killed, so it can leave between the liveness read and the terminate. The
+refusal can arrive before the object signals: an exit publishes the exit code, then
+runs the process down (the terminate is refused from there on), and only then
+signals the object. `terminate_process_handle` therefore reads that refusal as an
+exit, and returns `False` as it does for any member that had already exited, when
+`GetExitCodeProcess` no longer answers `STILL_ACTIVE` (a running process always
+does), or when the object signals within a bounded wait
+(`_WINDOWS_TERMINATE_REFUSAL_WAIT_MS`, a zero-time look on the event loop), which
+covers a process whose exit code is 259. A refusal neither settles stays an
+`OSError`: a genuine refusal of a process still running after that wait, or one on a
+handle that cannot be waited on while its exit code reads `STILL_ACTIVE`. So does any
+other error. Real-process regressions force both interleavings:
+`test/test_runtime_cleanup_windows.py::test_a_member_exiting_inside_the_terminate_window_reads_as_exited`
+and `test/test_runtime_cleanup_windows.py::test_a_member_refused_before_its_object_signals_reads_as_exited`;
+`test/test_platform_compat.py::TestTerminateRefusedOnAnExitingMember` pins each
+branch on a virtual clock. `pod._windows_job.retire_identity` meets the same refusal
+when it ends a pod publisher, and judges it by its own bounded retirement wait.
 
 Teardown deliberately does not keep a Job handle and call `TerminateJobObject`
 instead of draining exact handles. The Job that `apply_job_limits` creates is

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio.proactor_events
 import json
 import os
 import pathlib
@@ -51,6 +52,51 @@ if os.name == "nt":
         _loop_factory = _WindowsTestProactorEventLoop
 
     asyncio.set_event_loop_policy(_WindowsTestEventLoopPolicy())
+
+#: What the proactor loop's self-pipe needs. ``_make_self_pipe`` calls
+#: ``socket.socketpair`` through ``asyncio.proactor_events.socket``, and the Windows
+#: fallback compares its family against the module-global ``AF_INET``/``AF_INET6`` at
+#: call time. One of these left rebound makes every later ``new_event_loop()`` on the
+#: worker raise, so pytest-asyncio's ``event_loop`` finalizer fails every remaining
+#: async test in the shard with "Event loop is closed".
+_SOCKET_STATE = (
+    (socket, "socket"),
+    (socket, "socketpair"),
+    (socket, "AF_INET"),
+    (socket, "AF_INET6"),
+    (asyncio.proactor_events, "socket"),
+)
+_SOCKET_STATE_KEY = pytest.StashKey[tuple]()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    item.stash[_SOCKET_STATE_KEY] = tuple(getattr(m, n) for m, n in _SOCKET_STATE)
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None):
+    """Put back socket state a test left rebound, then fail that test by name.
+
+    A tripwire, not a leak finder: it stops one leak from killing the shard and names
+    the test that left it. A hook rather than an autouse fixture because it must read
+    the state after the test's ``monkeypatch`` has undone; autouse fixtures in one
+    conftest are set up in alphabetical order and an earlier one already requests
+    ``monkeypatch``, so a fixture here would be torn down first.
+    """
+    leaked: list[str] = []
+    try:
+        result = yield
+    finally:
+        before = item.stash.get(_SOCKET_STATE_KEY, None)
+        for (module, name), value in zip(_SOCKET_STATE, before or ()):
+            if getattr(module, name, None) is not value:
+                setattr(module, name, value)
+                leaked.append(f"{module.__name__}.{name}")
+    if leaked:
+        pytest.fail(f"test left {', '.join(leaked)} rebound (restored)", pytrace=False)
+    return result
+
 
 # ── Hypothesis profiles ─────────────────────────────────────────────────
 # Default (CI): fast iteration.  Run ``HYPOTHESIS_PROFILE=thorough python -m pytest``
@@ -220,23 +266,10 @@ def make_escaping_link(inside: pathlib.Path, outside: pathlib.Path) -> str:
     return "link.py"
 
 
-def make_dir_link(link: pathlib.Path, target: pathlib.Path) -> None:
-    """Create a reparse point at ``link`` that resolves to the directory ``target``.
-
-    Same privilege reasoning as :func:`make_escaping_link`, for the tests that
-    need a *directory* link rather than a path through one: a directory symlink
-    needs SeCreateSymbolicLinkPrivilege on Windows (WinError 1314 in an
-    unelevated shell), while a junction needs none and is followed by the same
-    reparse machinery — ``rglob``, ``resolve`` and
-    ``GetFinalPathNameByHandleW`` all traverse it identically. So the behaviour
-    under test stays exercised on Windows instead of being skipped.
-    """
-    if platform_compat.IS_WINDOWS:
-        import _winapi
-
-        _winapi.CreateJunction(str(target), str(link))
-        return
-    link.symlink_to(target, target_is_directory=True)
+# ``make_dir_link`` lives in kiro_crew.testing.links so the app-embedded test
+# packages, which never see this conftest, share the one copy. Re-exported so
+# ``from conftest import make_dir_link`` keeps working.
+from kiro_crew.testing.links import make_dir_link  # noqa: E402,F401
 
 
 def plant_day_link(link: pathlib.Path, secret_file: pathlib.Path) -> None:
@@ -318,6 +351,15 @@ REDOS_LARGE_BUDGET_SECONDS = 2.0
 #: Pump lengths for the polynomial class, ascending so a cubic overruns at 2 000
 #: (8e9 steps) before 20 000 is ever attempted.
 REDOS_LARGE_PUMPS = (200, 2_000, 20_000)
+#: Each long pump is 10x the one before, so a linear scan costs about 10x as much
+#: and a quadratic one about 100x. The absolute budget alone cannot see the
+#: difference for a quadratic scan whose steps are cheap: a C-level rescan of the
+#: rest of the text per opener measured 1.8 s at 20 000, under 2.0 s.
+REDOS_SCALING_RATIO = 25
+#: Below this the ratio is not asserted: a cost this small is a few clock ticks on
+#: Windows (15.6 ms), where the cheaper reading can round to zero. The shipped
+#: grammars measured 0.06 s or less at 20 000.
+REDOS_SCALING_FLOOR_SECONDS = 0.25
 
 # The PEM anchor is ASSEMBLED from fragments and split mid-word, so no source line
 # here carries a whole BEGIN...KEY header for the internal content scan to flag.
@@ -381,13 +423,20 @@ def assert_rejected_without_backtracking(reject, build_pump) -> None:
       first over-budget size costs at most ~growth x budget, and the assertion
       fires there; only when the whole ramp passes is a long pump tried at all.
     * **Ascending long pumps** for the polynomial class, so a cubic overruns at
-      2 000 before 20 000 is attempted.
+      2 000 before 20 000 is attempted. Each must also cost at most
+      ``REDOS_SCALING_RATIO`` times the one before (above a small floor): a
+      quadratic scan built from cheap steps stays under the absolute budget at
+      20 000 but grows ~100x per 10x of input where a linear one grows ~10x.
     * **Minimum of two readings, and the second is taken only if the first
       overran.** A gen-2 garbage collection charged to this thread mid-search is
       the one thing that can still spend CPU here; it cannot hit two consecutive
       readings, so a first reading under budget is a verdict on its own and two
-      over-budget readings are a verdict the other way -- the measurement never
-      pays a regression's cost more than twice per size.
+      over-budget readings are a verdict the other way. A long pump is held to
+      the absolute budget and, past the first, to the ratio bound as well; two
+      readings over either line end that size, so the measurement never pays a
+      regression's cost more than twice per size. A long pump the next one is
+      compared against otherwise takes three readings, since its cheapest is
+      that comparison's baseline.
 
     The budgets are generous on purpose (a decade or more over the shipped cost):
     a real complexity regression is orders of magnitude, and a tight bound only
@@ -412,12 +461,43 @@ def assert_rejected_without_backtracking(reject, build_pump) -> None:
             "backtracks catastrophically (a body class now shares a character with "
             "an adjacent quantified run, or two alternatives can consume one span?)"
         )
+
+    def refused(cost: float, bound: float) -> bool:
+        return cost >= REDOS_LARGE_BUDGET_SECONDS or cost > bound
+
+    def floor_of_readings(text: str, settle_below: float, bound: float) -> float:
+        # Up to three readings; stop at the first one under ``settle_below``, and
+        # stop after two once both are over the line this size is held to (a verdict).
+        best = float("inf")
+        for attempt in range(3):
+            start = time.thread_time()
+            reject(text)
+            best = min(best, time.thread_time() - start)
+            if best < settle_below or (attempt and refused(best, bound)):
+                break
+        return best
+
+    previous: tuple[int, float] | None = None
     for n in REDOS_LARGE_PUMPS:
-        cost = cheapest(build_pump(n), REDOS_LARGE_BUDGET_SECONDS)
+        bound = REDOS_LARGE_BUDGET_SECONDS
+        if previous is not None:
+            bound = max(REDOS_SCALING_RATIO * previous[1], REDOS_SCALING_FLOOR_SECONDS)
+        # A size the next one is compared against keeps all three readings: its
+        # cheapest is the baseline, and an inflated baseline would hide a regression.
+        settle_below = bound if n == REDOS_LARGE_PUMPS[-1] else 0.0
+        cost = floor_of_readings(build_pump(n), settle_below, bound)
         assert cost < REDOS_LARGE_BUDGET_SECONDS, (
             f"handling a {n}-unit pump cost {cost:.2f}s of CPU -- superlinear in the "
             "pump length"
         )
+        if previous is not None:
+            assert cost <= bound, (
+                f"handling a {n}-unit pump cost {cost:.3f}s of CPU against "
+                f"{previous[1]:.4f}s at {previous[0]} units -- "
+                f"{cost / max(previous[1], 1e-9):.0f}x for {n // previous[0]}x the "
+                f"input, past the {REDOS_SCALING_RATIO}x a linear scan stays under"
+            )
+        previous = (n, cost)
 
 
 def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
@@ -451,6 +531,32 @@ def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
     monkeypatch.setattr(artifact_source, "project_root_marker", _capped)
 
 
+def cap_node_module_walk(monkeypatch, ceiling: pathlib.Path) -> None:
+    """Make the ACP adapter resolvers' ``node_modules`` walk stop at ``ceiling``.
+
+    ``acp.client._node_module_search_dirs`` walks every ancestor of an adapter
+    entry's real path the way Node resolves a bare import -- to the filesystem
+    root. A test that asserts "this adapter's dependency is reachable NOWHERE" is
+    therefore also asserting that no ``node_modules`` above ``tmp_path`` holds it,
+    which is the host's to decide, not the test's: a ``TMPDIR`` inside a checkout
+    that ran ``npm install`` at its root would make the refusal pass. Directories
+    outside ``ceiling`` are dropped from the walk; inside it the real walk runs, so
+    the ``node_modules`` a test plants beside a link target still counts.
+    """
+    from kiro_crew.acp import client as acp_client
+
+    real_walk = acp_client._node_module_search_dirs
+    top = os.path.normcase(os.path.realpath(str(ceiling)))
+
+    def _capped(start: pathlib.Path):
+        for node_modules in real_walk(start):
+            here = os.path.normcase(os.path.realpath(str(node_modules)))
+            if here == top or here.startswith(top + os.sep):
+                yield node_modules
+
+    monkeypatch.setattr(acp_client, "_node_module_search_dirs", _capped)
+
+
 #: ``pytest_collection_modifyitems`` -- which applies the
 #: ``windows-expected-failures.txt`` skips -- lives in the ROOTDIR ``conftest.py``.
 #: That list already names node ids under
@@ -462,6 +568,45 @@ def cap_project_root_walk(monkeypatch, ceiling: pathlib.Path) -> None:
 #: ``collect_ignore`` above deliberately stays here: it names paths relative to its own
 #: conftest's directory and every entry is a file under ``test/``, so it is correct
 #: where it is.
+
+
+@pytest.fixture(autouse=True)
+def _fresh_update_ownership(_floor_monkeypatch):
+    """Give every test its own update-ownership registry, and fail one that leaks a step.
+
+    ``update_ownership`` keeps process-wide state that production paths a test
+    drives fill; a leftover entry would make a later test in the same worker see
+    a gap owner that belongs to an earlier one. The registry is REBOUND, not
+    cleared: ``step()`` removes its entry from the list it joined, so a step an
+    earlier test left open unwinds against its own list, and the inherited state
+    is put back at teardown. A step still open when this test ends is a task it
+    never finished, which would own the gap in whatever test runs next, so that
+    fails the test that left it.
+    """
+    from kiro_crew import update_ownership
+
+    registry: list = []
+    _floor_monkeypatch.setattr(update_ownership, "_live", registry)
+    _floor_monkeypatch.setattr(update_ownership, "_deferred_restart_until", None)
+    _floor_monkeypatch.setattr(update_ownership, "_restart_refusal", None)
+    yield
+    open_steps = [entry.step.label for entry in registry]
+    assert not open_steps, f"the test left update steps open: {open_steps}"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_reexec_environment(_floor_monkeypatch):
+    """Start every test with nothing kept for an exec successor.
+
+    Consuming the managed-service launch marker keeps it in
+    ``platform_compat._KEPT_FOR_REEXEC`` for the gateway's own exec restart, and
+    ``launched_as_managed_service`` reads it there; a value one test's launch
+    consumed must not make a later test's gateway read as service-launched, nor
+    be written into the environment by a later test's stubbed exec.
+    """
+    from kiro_crew import platform_compat
+
+    _floor_monkeypatch.setattr(platform_compat, "_KEPT_FOR_REEXEC", {})
 
 
 @pytest.fixture(autouse=True)
@@ -933,6 +1078,69 @@ def _restore_autonudge_singleton():
         _an._INSTANCE = inherited
 
 
+#: How long a test's teardown waits for the member event-log writes it queued. A
+#: slow runner disk retires each queued append in tens of milliseconds, so this is
+#: generous; a queue that does not drain in it is a wedge worth failing on.
+_MEMBER_EVENTLOG_DRAIN_SECONDS = 30.0
+
+
+@pytest.fixture(autouse=True)
+def _reset_member_eventlog_singleton():
+    """Reset ``eventlog.service`` process-global singleton at each test boundary.
+
+    ``get_service()`` memoises one ``MemberEventLogService`` for the process,
+    rebuilding it only when the crew-log root changes. The root is derived from
+    ``KIROCREW_HOME``, which the autouse ``_isolate_kirocrew_home`` fixture points
+    at a fresh per-test tmp dir -- so a test that touches the service (directly, or
+    through a dashboard handler / ``members.record_activity``) leaves a live
+    singleton BOUND TO THAT TEST'S HOME, and the next test on the same xdist worker
+    inherits it after that home has been torn down. Its cached ``MemberLog`` objects
+    hold open OS handles under the dead directory, which is harmless on POSIX (the
+    rebuild against the new home just works) but not on Windows: the stale handles
+    block the tmp-dir teardown and the very first write in the inheriting test then
+    fails, so ``record_activity`` returns ``False`` -- exactly the shard-only red on
+    ``TestMemberActivityRoute`` that only Windows CI runs.
+
+    Reset at BOTH ends: teardown so a test's own service does not outlive it, and
+    setup so a test that runs after a leak from an OLDER build (or a test that skips
+    the module-level ``set_service(None)`` helper, as ``test_members_roster_recency``
+    does) still starts on a clean singleton bound to its own home. Silent, like the
+    other singleton floors here -- production genuinely publishes this reference, and
+    a test driving that code cannot avoid inheriting it; stopping the leak from
+    reaching the next test is the part that is not optional.
+
+    Teardown first DRAINS the member event-log writes the test queued. Dashboard DM
+    messages and slot transitions reach the log through ``eventlog_hooks.submit``:
+    one process-wide worker thread that is otherwise drained only at interpreter
+    exit. Undrained, a test's queued write runs during whatever test comes next on
+    the worker, resolves the crew-log root at run time, and so opens that member's
+    log -- holding its open lock -- inside the NEXT test's home. A test there that
+    touches the same member from the event-loop thread meets the held lock, and
+    ``file_lock`` on the loop thread makes one attempt and refuses: the
+    ``record_activity(...) == False`` red. This fixture's teardown runs before the
+    home pin is undone, so every queued write lands in the home of the test that
+    queued it; a queue that does not drain in time fails the test that filled it,
+    not whichever test would have inherited the work. The drain is bound at SETUP:
+    tests of the shutdown path replace ``drain_for_shutdown`` with a wedged or
+    recording stand-in, and that patch is still in place when this teardown runs.
+    """
+    from kiro_crew import eventlog_hooks
+    from kiro_crew.eventlog import service as _svc
+
+    drain = eventlog_hooks.drain_for_shutdown
+    _svc.set_service(None)
+    try:
+        yield
+    finally:
+        drained = drain(_MEMBER_EVENTLOG_DRAIN_SECONDS)
+        _svc.set_service(None)
+        if not drained:
+            raise TimeoutError(
+                "queued member event-log writes did not finish within "
+                f"{_MEMBER_EVENTLOG_DRAIN_SECONDS:.0f}s of the test that queued them"
+            )
+
+
 @pytest.fixture(autouse=True)
 def _reset_reasoning_effort_globals():
     """Snapshot + restore the process-global reasoning-effort allowlist around
@@ -972,6 +1180,29 @@ def _disable_dev_fleet_background_tasks(_floor_monkeypatch):
     via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
     _floor_monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_restart_ready_timeout_override(_floor_monkeypatch):
+    """Keep a developer's ``KIROCREW_RESTART_READY_TIMEOUT`` out of every test.
+
+    ``kirocrew restart`` reads it on every call, and several test files drive
+    ``cli_server._restart`` directly.
+    """
+    _floor_monkeypatch.delenv("KIROCREW_RESTART_READY_TIMEOUT", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_managed_venv_override(_floor_monkeypatch):
+    """Keep a developer's ``KIROCREW_VENV`` out of every test.
+
+    ``wheel_engine.managed_venv_layout`` reads it first, so an exported value
+    would make a test that takes the real update lock create and hold
+    ``${KIROCREW_VENV}.update.lock`` beside the operator's managed venv, racing
+    that install's own updates. Without it the layout sits beside the test's
+    scratch ``KIROCREW_HOME``. A test that needs a layout sets the variable itself.
+    """
+    _floor_monkeypatch.delenv("KIROCREW_VENV", raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -1119,6 +1350,46 @@ def _reset_live_execution_records():
 
 
 @pytest.fixture(autouse=True)
+def _reset_runtime_ownership_tables(request):
+    """A kill gate must answer for THIS test's leases, not a neighbour's.
+
+    ``runtime_ownership`` keeps one process-wide lease table and one tenancy
+    table -- there is one registry per gateway -- and the kill gate refuses any
+    pid found in either. Test doubles reuse a handful of pids (``4242`` appears
+    in about two hundred files), so a lease or tenancy left behind by an
+    earlier test on the same xdist worker makes a later reaper test read
+    ``runtime still leased by another tenant`` and ``outcome == "refused"`` in
+    place of the failed-kill wording it asserts. Measured under a macOS
+    sweep as three same-worker reds in one run (``test_cron_reaper``,
+    ``test_subagent_force_stop_audit`` x2) that passed in the other four.
+    Reset on both sides, like the per-module resets those suites already carry,
+    so a test that raises mid-lease cannot hand its pid to the next one.
+
+    A file whose last test READS the table to prove the file left it clean -- the
+    positive control beside ``test_runtime_reconcile``'s leak scan -- must see the
+    table as its own tests left it, or that read passes vacuously against a table
+    the predecessor's teardown wiped. Such a file opts out MODULE-WIDE with
+    ``pytestmark = pytest.mark.keep_runtime_ownership_tables`` and carries its own
+    intra-file resets; marking the reading test alone would not do, since the
+    wipe that matters is the one at the previous test's teardown.
+    """
+    if request.node.get_closest_marker("keep_runtime_ownership_tables") is not None:
+        yield
+        return
+
+    def clear():
+        module = sys.modules.get("kiro_crew.runtime_ownership")
+        if module is not None:
+            module._reset_for_tests()
+
+    clear()
+    try:
+        yield
+    finally:
+        clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_session_switch_locks(monkeypatch):
     """Tests reuse session keys across loops; the gateway has one serving loop."""
     import weakref
@@ -1205,6 +1476,71 @@ def close_skills_loaders(monkeypatch):
     finally:
         for loader in created:
             loader.close()
+        # ``close()`` wakes the ``skill-catalog-refresh`` worker to exit but does
+        # not join it, by design (a daemon walk may outlive a short-lived loader
+        # in production). A per-test thread probe reads the still-exiting worker
+        # as a leak, so the join here -- bounded -- is what proves it left.
+        for loader in created:
+            worker = loader._catalog_worker
+            if worker is not None:
+                worker.join(timeout=_CATALOG_WORKER_JOIN_SECS)
+
+
+#: Ceiling for joining a closed loader's catalog worker; it exits on its next wake.
+_CATALOG_WORKER_JOIN_SECS = 5.0
+
+
+@pytest.fixture
+def close_subagent_managers(monkeypatch):
+    """Close every ``SubagentManager`` built while the test runs.
+
+    Construction opens the durable task queue (``tasks.db`` + ``-wal`` + ``-shm``,
+    inline under the ``open_store_off_loop=False`` floor above) and ``cancel_all``
+    never releases it, so a manager a test merely drops keeps three descriptors
+    until the cyclic collector runs -- a macOS sweep measured +3..+9
+    per test, GC-timed, across four files that build managers inline. Tracks every
+    instance through ``SubagentManager.__init__`` and calls ``close()`` at
+    teardown. Opt-in like ``close_skills_loaders`` and for the same reason; a
+    module that builds managers inline requests it from a one-line module-level
+    autouse fixture instead of carrying its own copy of this body.
+    """
+    import kiro_crew.subagent as _subagent_mod
+
+    created: list = []
+    orig_init = _subagent_mod.SubagentManager.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        created.append(self)
+
+    monkeypatch.setattr(_subagent_mod.SubagentManager, "__init__", _tracking_init)
+    try:
+        yield
+    finally:
+        for mgr in created:
+            try:
+                mgr.close()
+            except Exception:  # pragma: no cover - a half-built manager
+                pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _shut_down_shared_pools_in_session():
+    """Reap the lazily created shared executors before the session ends.
+
+    ``executors.path_resolve_executor()`` is a process-lifetime
+    ``SubprocessPoolExecutor`` created by whichever test first resolves a path
+    after the previous teardown; its reaper thread (``mc-pathres-reaper``) spawns
+    two children that live until ``atexit``. A sweep attributed
+    those children to 73 unrelated tests across 17 files as ``leaked_child``,
+    because the pool's own shutdown ran after every per-test observation. Closing
+    it here puts the reap inside the session, where the leak reporting can see
+    it, and leaves nothing for ``atexit`` to do.
+    """
+    yield
+    from kiro_crew import executors as _executors
+
+    _executors.shutdown_maintenance_executor()
 
 
 @pytest.fixture(autouse=True)
@@ -1695,6 +2031,46 @@ def _no_release_feed_network(_floor_monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_carried_auto_update_effect(_floor_monkeypatch) -> None:
+    """Start every test with no derived ``auto_update_effect`` on the status frame.
+
+    The gateway's update loop records the effect it acts on, and a recorded one
+    arms the status path's background re-derivation (git probes, policy reads).
+    Left over from one test, it changes the status field the next test reads and
+    can start that derivation inside an unrelated test's event loop.
+    """
+    from kiro_crew.dashboard.handlers import updates
+
+    _floor_monkeypatch.setattr(updates, "_auto_effect", None)
+    _floor_monkeypatch.setattr(updates, "_auto_effect_task", None)
+    _floor_monkeypatch.setattr(updates, "_shape_effect", None)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_kernel_memory_pressure(_floor_monkeypatch) -> None:
+    """Pin the macOS kernel memory-pressure level to "unknown" for the suite.
+
+    ``resource_status.probe`` reads it, and through the probe so do
+    ``prewarm_allowance``, the posture surfaces and the subagent gate's pressure
+    hold. On a macOS runner the live level is whatever the machine is under, so
+    without this pin a busy runner at WARN would hold spawns and zero the prewarm
+    allowance in tests that never asked about pressure. ``None`` is the value
+    every caller fails open on, so it is what a non-macOS host already reads.
+    A test about the level patches it in its own body, on top of this; the
+    reader's own tests capture the real function at import. Patched through the
+    floor's own ``MonkeyPatch`` so a test's ``monkeypatch.undo()`` cannot lift it.
+    """
+    _floor_monkeypatch.setattr(
+        "kiro_crew.platform_compat.memory_pressure_level", lambda: None, raising=True
+    )
+    # On a macOS runner that pinned None would otherwise make the probe log its
+    # once-per-process "level unreadable" WARNING into whichever test came first.
+    _floor_monkeypatch.setattr(
+        "kiro_crew.resource_status._pressure_unreadable_reported", True, raising=True
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_catalog_network(_floor_monkeypatch):
     """Make the official app catalog's network seam unreachable for the suite.
 
@@ -1764,39 +2140,43 @@ def named_cron_caller(monkeypatch):
     return key
 
 
-#: Comfortably clear of both memory guards ``SubagentManager.spawn`` runs: the
-#: absolute floor (``agent.spawn_min_memory_gb``, 4 GB) and the posture tier
-#: (``agent.resource_critical_gb``, 2 GB).
+#: Comfortably clear of the memory floor ``SubagentManager.spawn`` admits on at
+#: defaults (``agent.spawn_min_memory_gb``, 2 GB after a start of up to 1 GB,
+#: plus the starts still warming). A HEALTHY host, not an infinite one: the
+#: floor still compares against this figure, so a test asking for more than it
+#: is refused the way a real 8 GB host would refuse it.
 _HEALTHY_AVAILABLE_GB = 8.0
 
 
 @pytest.fixture
 def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin the host-memory readings ``SubagentManager.spawn`` consults.
+    """Pin the host-memory reading ``SubagentManager.spawn`` consults.
 
-    ``spawn`` refuses -- returning before it registers anything in ``_tasks`` --
-    whenever the machine looks short of memory, and it does so twice: an
-    absolute floor (``check_memory_available`` against
-    ``agent.spawn_min_memory_gb``) and the posture tier
-    (``cached_admission_check``, which refuses while the cgroup-clamped reading
-    is CRITICAL). Both read the host the suite happens to be running on, so
-    without this the verdict is the operator's machine rather than the test's
-    own input.
+    ``spawn`` queues -- returning before it registers anything in ``_tasks`` --
+    whenever the machine looks short of memory: the absolute floor
+    (``check_memory_available`` against ``agent.spawn_min_memory_gb``). It reads
+    the host the suite happens to be running on, so without this the verdict is
+    the operator's machine rather than the test's own input.
 
     The failure it produces is misleading, which is why it is worth a shared
-    fixture: a refusal IS a ``SubagentInfo`` -- a done one carrying ``error`` --
-    so ``assert info is not None`` still passes and the test dies one line later
-    on ``mgr._tasks[info.id]`` with a bare ``KeyError``. Measured on a CI runner
-    with ~0.5 GB free.
+    fixture: a queued spawn IS a ``SubagentInfo``, so ``assert info is not None``
+    still passes and the test dies one line later on ``mgr._tasks[info.id]``
+    with a bare ``KeyError``. Measured on a CI runner with ~0.5 GB free.
 
     Only the HOST reading is pinned: a caller that names its own ``path`` is
     feeding the ``/proc/meminfo`` parser a fixture file rather than asking about
     this machine, so it still runs the real function and a parser regression
-    still goes red. A test that is actually ABOUT either guard patches it in its
+    still goes red. A test that is actually ABOUT the guard patches it in its
     own body, which lands on top of this and reverts to it.
+
+    The pinned host has ``_HEALTHY_AVAILABLE_GB`` free and the floor is still
+    compared against it: ``(8.0 >= min_gb, 8.0)``, the real reader's answer on
+    such a host. Answering ``True`` whatever was asked would let a test pass on
+    a bar no 8 GB machine clears -- a wave whose reserve outgrew the host would
+    read as admitted here and as queued on the operator's.
     """
-    import kiro_crew.resource_status as resource_status
     import kiro_crew.subagent as subagent
+    from kiro_crew.constants import DEFAULT_SPAWN_MIN_MEMORY_GB
 
     real_check = subagent.check_memory_available
 
@@ -1804,22 +2184,13 @@ def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
         min_gb: float | None = None, path: str | None = None
     ) -> tuple[bool, float]:
         if path is None:
-            return (True, _HEALTHY_AVAILABLE_GB)
+            floor = DEFAULT_SPAWN_MIN_MEMORY_GB if min_gb is None else min_gb
+            return (_HEALTHY_AVAILABLE_GB >= floor, _HEALTHY_AVAILABLE_GB)
         if min_gb is None:
             return real_check(path=path)
         return real_check(min_gb=min_gb, path=path)
 
-    def _admit() -> resource_status.AdmissionDecision:
-        return resource_status.AdmissionDecision(
-            admitted=True,
-            posture=resource_status.POSTURE_AMPLE,
-            available_gb=_HEALTHY_AVAILABLE_GB,
-        )
-
     monkeypatch.setattr(subagent, "check_memory_available", _pinned_check)
-    # Also keeps the 5s-TTL refresh thread behind the cached verdict from
-    # starting, so no test leaves one probing the host after it ends.
-    monkeypatch.setattr(subagent, "cached_admission_check", _admit)
 
 
 @pytest.fixture

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo, type ReactNode } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo, lazy, Suspense, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { Bot, ScrollText, X, Lock, CheckCircle, AlertCircle, Loader as LoaderIcon, Ban, Wrench, MessageCircleQuestionMark, Workflow, BookmarkPlus, Component, GitPullRequest, CircleDot, Square, RotateCcw, Clock, Search, Link as LinkIcon, ExternalLink } from 'lucide-react'
@@ -20,13 +20,19 @@ import type { ChatPin } from '../../api/pins'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { markSubagentApproving, openActivityToTab, selectSubagent, clearTerminalSubagents, sseSubagentDone } from '../../store/chatSlice'
 import SegmentedControl from '../../components/SegmentedControl'
-import { PanelSectionHeader } from '../../components/ui'
+import { PanelSectionHeader, ContentSkeleton } from '../../components/ui'
 import SideChat from './SideChat'
 import WorkflowSidebarRow, { type WfRunRow } from './WorkflowSidebarRow'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
 
 import { ContextBreakdownTab } from '../ContextBreakdownPanel'
-import { CrewLogTab } from './CrewLogPanel'
+import ErrorBoundary from '../../components/ErrorBoundary'
+
+// The crew log is a drill-in: six fold sections, their own i18n copy and the table
+// that draws each one, on a tab most sessions never open. Fetched on first open
+// rather than riding in the dashboard shell, the same shape `CapabilitiesPage` uses
+// for its templates tab and `DeveloperPage` for the memory graph.
+const CrewLogTab = lazy(() => import('./CrewLogPanel').then(m => ({ default: m.CrewLogTab })))
 import SessionSummaryTab from './SessionSummaryTab'
 import { i18nT } from '../../i18n/t'
 import { queuedWaitText } from './subagentQueuedReason'
@@ -35,6 +41,7 @@ import { fmtDateFields } from '../../i18n/format'
 import { isModelDowngrade } from './subagentCompletion'
 import { normalizeModelKey } from '../../lib/model'
 import { fmtCredits } from '../../i18n/format'
+import MarkdownRenderer from '../../components/MarkdownRenderer'
 const STATUS = {
   pending: <Lock size={12} className="text-muted" />,
   running: <LoaderIcon size={12} className="text-accent animate-spin" />,
@@ -87,7 +94,7 @@ function DiskLoader({ id, autoLoad }: { id: string; autoLoad?: boolean }) {
     if (autoLoad && text === null && !loading && !error) load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoLoad])
-  if (text !== null) return <>{text}</>
+  if (text !== null) return <MarkdownRenderer content={text} softBreaks readOnlyCode />
   if (loading) return <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.loading')}</span>
   // Retry and hand-off are two separate controls: the notice carries the
   // agent hand-off (a side-panel read failure, nothing to lose), the button
@@ -103,7 +110,7 @@ function DiskLoader({ id, autoLoad }: { id: string; autoLoad?: boolean }) {
 }
 
 function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slot: string; onClick: () => void; selected?: boolean }) {
-  const bodyRef = useRef<HTMLPreElement>(null)
+  const bodyRef = useRef<HTMLDivElement>(null)
   const cardRef = useRef<HTMLDivElement>(null)
   const autoScroll = useRef(true)
   const isPending = a.status === 'pending'
@@ -310,7 +317,7 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
           )}
           {a.task && <>
             <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.input')}</div>
-            <pre className="px-2.5 py-2 bg-bg rounded-md text-[12px] font-mono whitespace-pre-wrap break-all max-h-[120px] overflow-y-auto text-muted/80 leading-relaxed">{a.task}</pre>
+            <div className="px-2.5 py-2 bg-bg rounded-md text-[12px] break-words max-h-[120px] overflow-y-auto text-muted/80 leading-relaxed"><MarkdownRenderer content={a.task} softBreaks readOnlyCode /></div>
           </>}
         </div>
       )}
@@ -334,10 +341,13 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
       <>
       <div className="px-3 pb-2">
         <div className="text-[10px] text-muted/40 uppercase tracking-wider mb-1">{i18nT('pages.chat.activityViewer.output')}</div>
-        <pre ref={bodyRef} onScroll={onScroll} className="px-2.5 py-2 bg-bg rounded-md text-[12px] font-mono whitespace-pre-wrap break-all max-h-[240px] overflow-y-auto text-muted/80 leading-relaxed">
-          {a.streaming || a.result || (isDone ? (isNative ? <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.output_shown_in_chat')}</span> : <DiskLoader id={a.id} autoLoad={selected} />) : <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.waiting_for_output')}</span>)}
-          {a.lastTool && <div className="text-accent mt-1"><Wrench className="lucide-inline" /> {a.lastTool}</div>}
-        </pre>
+        {/* Sub-agent output is usually markdown (fences, lists, tables): render it
+            the way the transcript's completion card does. `streaming` holds a
+            half-typed fence until it closes. */}
+        <div ref={bodyRef} onScroll={onScroll} data-testid="subagent-output-body" className="px-2.5 py-2 bg-bg rounded-md text-[12px] break-words max-h-[240px] overflow-y-auto text-muted/80 leading-relaxed">
+          {(a.streaming || a.result) ? <MarkdownRenderer content={a.streaming || a.result || ''} streaming={isRunning && !!a.streaming} softBreaks readOnlyCode /> : (isDone ? (isNative ? <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.output_shown_in_chat')}</span> : <DiskLoader id={a.id} autoLoad={selected} />) : <span className="text-muted/30 italic">{i18nT('pages.chat.activityViewer.waiting_for_output')}</span>)}
+          {a.lastTool && <div className="text-accent mt-1 font-mono"><Wrench className="lucide-inline" /> {a.lastTool}</div>}
+        </div>
       </div>
       {/* Error details — a backend-reported subagent failure, so it takes the
           shared notice (hand-off on: nothing in this panel is unsaved). */}
@@ -1252,7 +1262,16 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
           beside Logs and Context for the same reason they sit together: all
           three answer "what actually happened in THIS session", this one from
           the record the gateway wrote rather than from live client state. */}
-      {effectiveTab === 'crewlog' && <CrewLogTab key={slot} slot={slot} />}
+      {/* ErrorBoundary around the lazy chunk, matching CapabilitiesPage: a stale chunk
+          request after a deploy rejects, and without a local boundary that rejection
+          would replace the whole dashboard with the app-shell error screen. */}
+      {effectiveTab === 'crewlog' && (
+        <ErrorBoundary>
+          <Suspense fallback={<ContentSkeleton rows={6} />}>
+            <CrewLogTab key={slot} slot={slot} />
+          </Suspense>
+        </ErrorBoundary>
+      )}
 
       {/* Session summary — the goal-level view of this session, so returning to
           it does not mean re-reading the transcript. */}

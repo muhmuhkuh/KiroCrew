@@ -50,6 +50,7 @@ from kiro_crew.history_consolidation import (  # noqa: F401 - facade re-exports
     _CONSOLIDATION_BACKOFF_MAX_SECS,
     _CONSOLIDATION_MAX_ATTEMPTS,
     _CONSOLIDATION_META_KEYS,
+    _CONSOLIDATION_PROMPT_BUDGET_CHARS,
     _CONSOLIDATION_REFUSED,
     _CONSOLIDATION_THRESHOLD,
     _PLACEHOLDER_BODIES,
@@ -58,6 +59,7 @@ from kiro_crew.history_consolidation import (  # noqa: F401 - facade re-exports
     _TOOL_ROLES,
     AttemptedSpan,
     HistoryConsolidator,
+    _consolidation_chunk,
     _ConsolidationNotDispatched,
     _ConsolidationRefusedSentinel,
     _count_tool_call_messages,
@@ -632,6 +634,7 @@ def append_rows_if_absent_off_loop(
     rows: "Sequence[tuple[str, str, str, str | None]]",
     *,
     agent: str | None = None,
+    row_meta: "Sequence[dict[str, Any] | None] | None" = None,
 ) -> Any:
     """Persist SEVERAL rows of one turn as one indivisible off-loop write.
 
@@ -652,7 +655,9 @@ def append_rows_if_absent_off_loop(
     *rows* is an ordered sequence of ``(role, content, cls, mid)``; they are
     appended in that order. Each row keeps ``append_if_absent``'s idempotence,
     so a row the periodic slot save already serialized is skipped individually
-    without dropping its siblings.
+    without dropping its siblings. ``row_meta``, when given, is aligned with
+    *rows* by index and adds display fields to that row's ``meta``
+    (see :meth:`ConversationLog.append`).
 
     Returns the executor future, or None when the write already happened inline
     (no running loop). Best-effort like its siblings: a lock timeout or I/O
@@ -661,8 +666,11 @@ def append_rows_if_absent_off_loop(
 
     def _do() -> None:
         with conversation_log.atomic_appends(key):
-            for role, content, cls, mid in rows:
-                conversation_log.append_if_absent(key, role, content, agent=agent, cls=cls, mid=mid)
+            for i, (role, content, cls, mid) in enumerate(rows):
+                extra = row_meta[i] if row_meta and i < len(row_meta) else None
+                conversation_log.append_if_absent(
+                    key, role, content, agent=agent, cls=cls, mid=mid, extra_meta=extra
+                )
 
     try:
         loop = asyncio.get_running_loop()
@@ -1577,6 +1585,18 @@ class ConversationLog:
     # serialize on it.
     _flock_state: dict[str, list[int]] = {}
     _flock_guard = threading.Lock()
+
+    # Permanent deletes in flight in THIS process, keyed by store directory and
+    # transcript lock stem (see ``_delete_in_flight_marks``) and counted so nested windows (the session-delete
+    # handler's window around ``delete_session``'s own) release cleanly. A
+    # delete holds the transcript lock across its whole transaction, so a
+    # lock-free existence probe made inside it still sees the file and cannot
+    # tell "present" from "about to be unlinked". Resume consults this before
+    # it publishes a slot (see :meth:`delete_in_flight`). Cross-process deletes
+    # (the CLI) are not visible here; the slot save's delete-won guard is the
+    # backstop for those.
+    _deletes_in_flight: dict[str, int] = {}
+    _deletes_in_flight_guard = threading.Lock()
 
     # Monotonic count of cross-process flock RELEASES per lock_key, bumped
     # under ``_flock_guard`` when a deferred release actually retires a held
@@ -2530,8 +2550,12 @@ class ConversationLog:
         tab_id: str | None = None,
         cls: str = "",
         mid: str | None = None,
+        extra_meta: dict[str, Any] | None = None,
     ) -> None:
         """Append a message with optional provenance to the session log.
+
+        *extra_meta* adds display fields (e.g. ``turn_stats``) to the row's
+        ``meta``; it never overrides ``mid``.
 
         *cls* persists the message's presentation class. The in-memory slot
         carries one (``_ChatSlot.append``) but this durable copy had nowhere to
@@ -2621,6 +2645,8 @@ class ConversationLog:
                 # the read side — persisting any other shape would store an id
                 # the reader is structurally unable to honour.
                 msg["meta"] = {"mid": mid}
+            if extra_meta:
+                msg["meta"] = {**extra_meta, **msg.get("meta", {})}
 
             # Session transcripts are intentionally local plaintext JSONL (the
             # documented storage format), not a credential/secret store.
@@ -2652,6 +2678,7 @@ class ConversationLog:
         tab_id: str | None = None,
         cls: str = "",
         mid: str | None = None,
+        extra_meta: dict[str, Any] | None = None,
     ) -> bool:
         """Append a message only if an identical one is not already persisted.
 
@@ -2734,7 +2761,16 @@ class ConversationLog:
             # the critical section we already hold. The skip paths above leave
             # the persisted rows untouched — an id is never retrofitted onto a
             # row already on disk.
-            self.append(key, role, content, agent=agent, tab_id=tab_id, cls=cls, mid=mid)
+            self.append(
+                key,
+                role,
+                content,
+                agent=agent,
+                tab_id=tab_id,
+                cls=cls,
+                mid=mid,
+                extra_meta=extra_meta,
+            )
             return True
 
     def recent(
@@ -3241,8 +3277,9 @@ class ConversationLog:
         """True when the recorded attempts belong to the span in front of us now.
 
         A span is identified by where it starts AND how far it reaches: the
-        ``(rotation_generation, last_consolidated)`` pair it was charged against
-        plus the message count that was actually attempted. While a span keeps
+        ``(rotation_generation, last_consolidated)`` pair it was charged against,
+        the message count the transcript held at the time, and the boundary the
+        prompt actually reached. While a span keeps
         failing none of the three move — the marker is only advanced on success —
         so the cap holds across attempts. Anything that changes the CONTENT under
         the counter moves one of them: a rotation and a dashboard rewrite
@@ -3272,6 +3309,27 @@ class ConversationLog:
         ``None`` means "no count available", which skips the extent test and keeps
         the cap — the conservative direction, since the alternative is spending a
         billed turn on an unverified premise.
+
+        Growth releases the cap only for an attempt that reached the END of the
+        transcript it was charged against — ``consolidation_attempts_prompted``
+        equal to ``consolidation_attempts_count``. A bounded attempt
+        (``prompted`` short of the total, because
+        :func:`~kiro_crew.history_consolidation._consolidation_chunk` cut the
+        prompt at the budget) attempted a PREFIX of the unconsolidated tail, and
+        appending messages cannot change a prefix: the next pass starts at the
+        same marker, renders the same budget, and puts the same content in front
+        of the provider. Counting that as new content is what would let a
+        permanently over-budget head message be re-billed on every idle window
+        for as long as the session keeps receiving turns — the attempts would
+        reset before they could ever reach the cap that abandons it. Whether the
+        attempt was bounded is read from the stamp, so this stays one metadata
+        read with no transcript access.
+
+        The cost is that a bounded span whose abandon-marker write ALSO failed
+        keeps its cap until a rotation, a rewrite, or a later successful marker
+        write moves it. That span is genuinely unchanged, so refusing it is
+        correct in itself; what it loses is the growth rescue an unbounded span
+        keeps. Re-billing identical content forever is the worse of the two.
 
         Growth is compared with ``>`` rather than ``!=`` on purpose. A count that
         SHRANK is a rotation or compaction, which already moves the generation or
@@ -3303,9 +3361,10 @@ class ConversationLog:
         if message_count is not None and "consolidation_attempts_count" in meta:
             try:
                 attempted = int(meta.get("consolidation_attempts_count", 0) or 0)
+                prompted = int(meta.get("consolidation_attempts_prompted", attempted) or attempted)
             except (TypeError, ValueError, OverflowError):
                 return True
-            if message_count > attempted:
+            if prompted >= attempted and message_count > attempted:
                 return False
         return True
 
@@ -3326,6 +3385,7 @@ class ConversationLog:
             "consolidation_attempts_generation": span.generation,
             "consolidation_attempts_offset": max(0, span.offset),
             "consolidation_attempts_count": max(0, span.total),
+            "consolidation_attempts_prompted": max(0, span.prompted),
         }
 
     def record_consolidation_failure(
@@ -3450,14 +3510,18 @@ class ConversationLog:
     def _canonical_key(key: str) -> str:
         return SessionCatalogProjection._canonical_key(key)
 
-    def list_sessions(self) -> list[dict]:
-        return self._catalog_projection.list_sessions()
+    def list_sessions(self, *, keys: Iterable[str] | None = None) -> list[dict]:
+        if keys is None:
+            return self._catalog_projection.list_sessions()
+        return self._catalog_projection.list_sessions(keys=keys)
 
     def agent_usage(self) -> dict[str, tuple[int, float]]:
         return self._catalog_projection.agent_usage()
 
-    def search_sessions(self, query: str, limit: int = 50) -> list[dict]:
-        return self._catalog_projection.search_sessions(query, limit)
+    def search_sessions(
+        self, query: str, limit: int = 50, *, keys: Container[str] | None = None
+    ) -> list[dict]:
+        return self._catalog_projection.search_sessions(query, limit, keys=keys)
 
     def _folded_content(self, key: str) -> tuple[int, str]:
         return self._catalog_projection._folded_content(key)
@@ -3542,6 +3606,48 @@ class ConversationLog:
     def note_tab_id(self, key: str, tab_id: str | None) -> None:
         self._read_projection.note_tab_id(key, tab_id)
 
+    @contextlib.contextmanager
+    def delete_in_flight_window(self, key: str) -> Iterator[None]:
+        """Mark *key*'s transcript as being permanently deleted for the block.
+
+        Non-blocking bookkeeping only, so it is safe on the event loop. Held by
+        ``delete_session`` for its whole transaction, and by callers whose
+        delete spans more than that call (the session-delete handler captures
+        which slot to remove before its first await, so the window has to open
+        there for a slot published after that capture to be refused).
+        """
+        marks = self._delete_in_flight_marks(key)
+        with ConversationLog._deletes_in_flight_guard:
+            for mark in marks:
+                ConversationLog._deletes_in_flight[mark] = (
+                    ConversationLog._deletes_in_flight.get(mark, 0) + 1
+                )
+        try:
+            yield
+        finally:
+            with ConversationLog._deletes_in_flight_guard:
+                for mark in marks:
+                    depth = ConversationLog._deletes_in_flight.get(mark, 0) - 1
+                    if depth > 0:
+                        ConversationLog._deletes_in_flight[mark] = depth
+                    else:
+                        ConversationLog._deletes_in_flight.pop(mark, None)
+
+    def delete_in_flight(self, key: str) -> bool:
+        """True while a permanent delete of *key* is in flight in this process."""
+        marks = self._delete_in_flight_marks(key)
+        with ConversationLog._deletes_in_flight_guard:
+            return any(mark in ConversationLog._deletes_in_flight for mark in marks)
+
+    def _delete_in_flight_marks(self, key: str) -> tuple[str, ...]:
+        # The transcript lock stems, not ``_path``: ``_path`` stats the disk and
+        # picks the legacy Slack file only while it exists, so a mark taken
+        # before the unlink and a probe made after it would name different
+        # files. The stems are pure string math and every spelling of one
+        # session maps to the same set, exactly as the transcript lock does.
+        base = str(self._dir)
+        return tuple(f"{base}{os.sep}{stem}" for stem in transcript_lock_stems(key))
+
     @overload
     def delete_session(self, key: str, *, skip_pinned: Literal[False] = ...) -> bool: ...
 
@@ -3549,9 +3655,18 @@ class ConversationLog:
     def delete_session(self, key: str, *, skip_pinned: Literal[True]) -> bool | None: ...
 
     def delete_session(self, key: str, *, skip_pinned: bool = False) -> bool | None:
-        if skip_pinned:
-            return self._metadata_projection.delete_session(key, skip_pinned=True)
-        return self._metadata_projection.delete_session(key, skip_pinned=False)
+        with self.delete_in_flight_window(key):
+            if skip_pinned:
+                deleted = self._metadata_projection.delete_session(key, skip_pinned=True)
+            else:
+                deleted = self._metadata_projection.delete_session(key, skip_pinned=False)
+        if deleted:
+            # A deleted session's restart-surviving vouch goes with it, so the
+            # vouched-executions/ files track live sessions, not every one ever made.
+            from kiro_crew._durable_vouch import forget_durable_vouch
+
+            forget_durable_vouch(key)
+        return deleted
 
     def delete_memory_consolidation_session(self, key: str, expected_store: str) -> bool:
         """Delete every artifact of one retired generated consolidation turn."""

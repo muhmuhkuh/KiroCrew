@@ -256,7 +256,7 @@ class TaskRunner:
     # task_executor.execute_task()/self_review(), task_reporter.build_status()
 
     def attach_workflow_service(self, service: WorkflowRunPublisher | None) -> None
-    async def plan(self, input_text: str = "", source: str = "text", spec_path: str = "", agent: str = "", workspace_dir: str = "", workflow_name: str = "", workflow_id: str = "", workflow_slug: str = "", workflow_revision: int = 0, workflow_source: str = "", session_key: str = "", execution_context: ExecutionContext | None = None) -> Project
+    async def plan(self, input_text: str = "", source: str = "text", spec_path: str = "", agent: str = "", workspace_dir: str = "", workflow_name: str = "", workflow_id: str = "", workflow_slug: str = "", workflow_revision: int = 0, workflow_source: str = "", session_key: str = "", execution_context: ExecutionContext | None = None, start_priority: StartPriority = BACKGROUND) -> Project
     async def run(self, spec_path: str | Path, task_id: str = "", name: str = "", source: str = "", workspace_dir: str = "", auto_approve: bool = False, input_content: str | None = None) -> Project
     async def start_background(self, spec_path: str | Path, agent: str = "", name: str = "", source: str = "", workspace_dir: str = "", auto_approve: bool = False, *, session_key: str = "", execution_context: ExecutionContext | None = None, input_content: str | None = None) -> str
     def cancel(self, task_id: str | None = None, *, exact: bool = False) -> None  # None = cancel all
@@ -347,6 +347,7 @@ class Task:
     attempts: int = 0
     error: str = ""
     result: str = ""  # updated during streaming (partial results visible)
+    resume_hint: str = ""  # "resume, do not restart" after a death that may have run the prompt
     requires_approval: bool = False
     force_approval: bool = False  # blocks even in YOLO mode
     depends_on: list[int] = field(default_factory=list)
@@ -698,7 +699,7 @@ workspace is never removed.
 | POST | `/api/taskrunner/{task_id}/retry` | Retry from step N (`{from_step}` in body) |
 | POST | `/api/taskrunner/{task_id}/pause` | Pause a running project |
 | POST | `/api/taskrunner/{task_id}/execute` | Execute or resume a planned project |
-| POST | `/api/taskrunner/{task_id}/to-chat` | Open task results in a new chat slot for manual review |
+| POST | `/api/taskrunner/{task_id}/to-chat` | Open task results in a new chat slot for manual review: `task-review-<token>`, linked to the `taskrunner:<task_id>:chat:<token>` session minted for it and owned by the app the task ran for, which passes the per-slot checkpoint on it ([App Kit platform §13](app-kit-platform.md)); export and rewind still refuse an app any slot with a linked session, this one included |
 | GET | `/api/taskrunner/{task_id}/plan-context` | Return plan text for chat pre-fill |
 | GET | `/api/taskrunner/{task_id}/plan.yaml` | Export the plan as YAML |
 | POST | `/api/taskrunner/refine` | Start background user-input → task-spec refinement; progress arrives via `refine` WS events or GET polling |
@@ -858,6 +859,20 @@ Applies to both exception errors and test failure outputs.
 4. **Completed steps** — titles of passed steps
 5. **Current step** — title, description, spec content
 6. **Retry context** (if attempt > 1) — previous error message
+7. **Resume (do not restart)** (whenever `resume_hint` is set, at any attempt) —
+   the instruction to inspect current repository and session state first
+
+`resume_hint` is set when a step's `AcpProcessDied` may have left its prompt
+run: the death carries `ambiguous_delivery` (a stdin stall the live child may
+still read past), or the attempt had already produced output or a tool call. A
+mid-stream compaction after output sets it too, since it can end in a session
+reset that restates the step. A verbatim retry would run its tools again, and the death keeps the attempt
+number, so the hint cannot ride on the attempt > 1 guard. It is cleared ONLY
+when an attempt completes normally. It survives every give-up, a Resume or
+retry of the failed run (which restarts the step at attempt 1 in the same work
+dir), and the automatic replan, whose prompt is told the failed step may
+already have run. Keeping it costs one inspection; dropping it risks repeated
+side effects.
 
 ## Self-Review
 
@@ -1015,7 +1030,10 @@ The page uses a left run rail plus a detail/compose area. The rail defaults to
 ### Task snapshot persistence
 
 `runs.json` is the ordinary JSON list of retained task records, including each
-run's captured `execution_context`, input, results and diagnostic state. There is
+run's captured `execution_context`, input, results and diagnostic state. Each
+task entry carries its `resume_hint` (see Step Prompt Context), restored on load
+so it survives a gateway restart; the `/api/taskrunner` status payload does not
+expose it. There is
 no private sidecar, hidden directory or separate public projection. Incognito and
 Temporary runs are omitted according to their captured mode; cron runs are also
 excluded from this registry. Restored records reuse their captured identity,
@@ -1044,10 +1062,19 @@ original exception, and cancellation is not logged as failure.
 
 Restore reads this same registry. Unreadable storage leaves the file untouched
 and fences subsequent snapshot writes until restart after recovery. Invalid JSON
-is preserved as `.corrupt` when renaming succeeds. An invalid snapshot shape,
-malformed execution context or obsolete `private_payload` reference refuses
-restore and fences writes; it is not hydrated through a hidden row or downgraded
-to Global memory. Other per-record construction failures leave later valid rows
+is preserved as `.corrupt` when renaming succeeds. An invalid snapshot shape or
+malformed execution context refuses restore and fences writes; it is not hydrated
+through a hidden row or downgraded to Global memory. An obsolete
+`{"task_id": ..., "private_payload": true}` reference, which 0.7.0-insider.1 to .5
+wrote for a member task whose payload lived in the hidden
+`memory_stores/.task-runs/` sidecar, refuses the row, never the runner: a row of
+exactly that shape is never hydrated or run and is left out of the restored runs;
+the other rows restore, and one warning names the left-out task ids and says their
+payloads were not read, so those tasks cannot resume and must be re-created. Restore
+writes nothing for them and does not fence snapshot writes on them, so the next
+snapshot rewrites the registry without those rows; a restart that finds the same
+rows again restores the same way and warns again. Any other `private_payload` row
+still refuses restore. Other per-record construction failures leave later valid rows
 restorable while marking recovery incomplete and fencing writes. A legacy record
 with no execution-context field retains the ordinary Global compatibility path;
 an explicitly malformed field does not take that fallback. Existing crash recovery

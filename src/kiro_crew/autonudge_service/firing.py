@@ -25,9 +25,11 @@ from kiro_crew import shutdown_event
 from kiro_crew.autonudge_service.gate import _WAKE_FOLLOWUP_TICKS
 from kiro_crew.autonudge_service.maintenance import _release_mutation_lock
 from kiro_crew.autonudge_service.model import (
+    _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
     _START_FAILURE_BACKOFF_AFTER,
     _START_FAILURE_STANDDOWN_AFTER,
     APPROVAL_STALL_REASON,
+    CONSECUTIVE_FAILURE_REASON,
     MONITOR_TERMINAL_REASON,
     SESSION_START_FAILURE_REASON,
     NudgeLoop,
@@ -55,6 +57,24 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
     except asyncio.CancelledError:
         return
     if shutdown_event.is_set():
+        return
+    # Whether THIS tick is one a worker's push armed. Moved off the armed-timer mark
+    # the moment the tick starts, so a push landing from here on is news this tick may
+    # not see and is free to arm the next one; and reset on every tick, so a tick that
+    # returns early below leaves nothing for a later scheduled tick to inherit.
+    if loop.id in self._pushed_ticks:
+        self._pushed_ticks.discard(loop.id)
+        self._pushed_running.add(loop.id)
+    else:
+        self._pushed_running.discard(loop.id)
+    # Reached before either dispatch: a fire settles through the same refused writer,
+    # so an unattended turn would go out with no restart able to tell that it had.
+    if self._store.load_refused:
+        logger.error(
+            "AutoNudge: not firing loop %s -- persistence is refused, so a delivered "
+            "cycle could not be recorded; fix the store and restart",
+            loop.id,
+        )
         return
     if is_structured_monitor_loop(loop):
         assert loop.monitor is not None
@@ -92,15 +112,6 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
     if loop.stop_sentinel_path and Path(loop.stop_sentinel_path).exists():
         logger.info("AutoNudge: stop sentinel found for %s — removing loop", loop.id)
         await self.remove(loop.id, stop_reason="stop_sentinel")
-        return
-    # Reached before either dispatch: a fire settles through the same refused writer,
-    # so an unattended turn would go out with no restart able to tell that it had.
-    if self._store.load_refused:
-        logger.error(
-            "AutoNudge: not firing loop %s -- persistence is refused, so a delivered "
-            "cycle could not be recorded; fix the store and restart",
-            loop.id,
-        )
         return
     # Cycle cap reached?
     if loop.max_cycles and loop.cycle_count >= loop.max_cycles:
@@ -221,6 +232,38 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
             )
             self._arm_timer(loop, delay=backoff)
             return
+    # Own cycles that keep FAILING. A delivered cycle that reached a session and
+    # dispatched but died -- turn outcome ``error`` or ``timeout`` -- produced
+    # nothing, and firing the next one on the plain interval reproduces it. The
+    # three bounds above each catch one deterministic sub-case (a malformed
+    # payload, an unanswered approval, a session that never started); a turn that
+    # ran and errored is none of them, so without this a loop firing every
+    # interval into a turn that always fails burns its whole cycle cap producing
+    # nothing. Checked here with the other terminal bounds, on recorded evidence
+    # only (``notify_cycle_failed``); a single landed turn on the slot clears the
+    # streak, so a loop that recovers is never held back. No deferral tier: a
+    # failed turn already spent its own time (a start failure fails fast, so its
+    # deferral throttles a tight retry loop that this one does not have), and the
+    # stand-down threshold is set high enough that a couple of transient errors
+    # pass through untouched.
+    #
+    # Terminal in the same shape as the other bounds: deactivate (inspectable and
+    # restartable, not removed), ``expired`` so the notifier tells the user it
+    # stopped rather than finished, and re-armable once the backend or tool
+    # recovers.
+    if loop.consecutive_failed_cycles >= _CONSECUTIVE_FAILURE_STANDDOWN_AFTER:
+        logger.warning(
+            "AutoNudge: loop %s stood down — %d consecutive cycles failed with "
+            "nothing landing between them, so cycle %d would spend a turn to fail "
+            "the same way; it stays inspectable and can be resumed once the cause "
+            "clears",
+            loop.id,
+            loop.consecutive_failed_cycles,
+            loop.cycle_count + 1,
+        )
+        await self.update(loop.id, active=False, stopped_reason=CONSECUTIVE_FAILURE_REASON)
+        self._emit("expired", loop)
+        return
     # Fire. Update state only if the callback reports actual delivery —
     # otherwise skipped nudges (e.g. slot mid-turn) inflate cycle_count and
     # prematurely trip max_cycles. Missing callback → nothing to deliver.
@@ -267,6 +310,8 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
             loop.id,
         )
         tick_is_quiet = False
+    pushed = loop.id in self._pushed_running
+    self._pushed_running.discard(loop.id)
     if tick_is_quiet:
         # A quiet tick MUST re-arm itself. Nothing else will: the delivered
         # paths re-arm through notify_turn_complete (dashboard slots) or
@@ -288,7 +333,17 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
         # a loop removed during the observation is not resurrected by its own
         # in-flight tick.
         if loop.active and loop.id in self._loops:
-            loop.next_due_ts = time.time() + loop.idle_secs
+            now = time.time()
+            fresh = now + loop.idle_secs
+            if pushed and loop.next_due_ts > now:
+                # A tick a worker's push brought forward is EXTRA. Re-arming it at a
+                # full interval from now would move a deadline that was still ahead
+                # further out, so every quiet push -- a worker's turn ending, say --
+                # would delay the scheduled check it was meant to precede. The earlier
+                # of the two keeps the slow tick where it was.
+                loop.next_due_ts = min(loop.next_due_ts, fresh)
+            else:
+                loop.next_due_ts = fresh
             self._persist_soon()
             self._arm_from_deadline(loop)
         return
@@ -303,10 +358,23 @@ async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = 
         # mid-persist. Apply it now that the window is closed — dropping it
         # would leave a dashboard loop with no armed timer at all, since the
         # delivered path relies on notify_turn_complete for those slots.
-        if loop.id in self._rearm_pending:
+        # A pull-forward refused during the same window is applied here too, and at
+        # delay ZERO rather than toward the deadline: it was asking for a cycle NOW
+        # because a worker had just written something, and the cycle that was in flight
+        # read the ledger before that write landed. Draining it in the same place as the
+        # deferred re-arm is deliberate -- one release point per claim, and the immediate
+        # arm supersedes the deadline one when both are held, since a deadline re-arm
+        # would discard the news.
+        pulled_forward = loop.id in self._pulled_forward
+        self._pulled_forward.discard(loop.id)
+        if loop.id in self._rearm_pending or pulled_forward:
             self._rearm_pending.discard(loop.id)
             if loop.active and loop.id in self._loops:
-                self._arm_from_deadline(loop)
+                if pulled_forward:
+                    self._arm_timer(loop, delay=0.0)
+                    self._pushed_ticks.add(loop.id)
+                else:
+                    self._arm_from_deadline(loop)
 
 
 async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
@@ -637,7 +705,9 @@ async def _run_fire_cycle(self: AutoNudgeService, loop: NudgeLoop) -> None:
         self._arm_from_deadline(loop)
 
 
-async def fire_now(self: AutoNudgeService, loop_id: str) -> tuple["NudgeLoop | None", str, int]:
+async def fire_now(
+    self: AutoNudgeService, loop_id: str, *, defer_if_firing: bool = False
+) -> tuple["NudgeLoop | None", str, int]:
     """Bring one loop's next cycle forward to now, out of band from its countdown.
 
     Returns ``(loop, "", 200)`` once the cycle is armed to run, or
@@ -678,6 +748,16 @@ async def fire_now(self: AutoNudgeService, loop_id: str) -> tuple["NudgeLoop | N
       same answer the sibling immediate-trigger route gives for a run
       already in flight (``POST /api/crons/{id}/run`` -> 409).
 
+      ``defer_if_firing`` changes what happens AFTER that refusal, never the refusal
+      itself: the loop is recorded so the end of the in-flight cycle re-arms at delay
+      zero rather than toward the loop's deadline. Opt-in, because a caller with a
+      person behind it reports the refusal and is pressed again, while the crew-log
+      wake's caller is a drain thread with nobody to tell -- and a deadline re-arm on
+      an hours-long patrol cadence would hold a worker's report for hours.
+      The same flag marks the tick it does arm as a worker's push: that tick observes
+      the subject instead of spending the post-wake follow-up, and a quiet answer keeps
+      the loop's earlier deadline.
+
     NO SUSPENSION POINT, and that is the design rather than an omission.
     ``async def`` for the caller's convenience, but nothing inside awaits, so
     the guards and the arm are atomic with respect to the event loop: between
@@ -717,8 +797,30 @@ async def fire_now(self: AutoNudgeService, loop_id: str) -> tuple["NudgeLoop | N
     if not loop.active:
         return None, "loop is not active", 409
     if loop_id in self._firing:
+        if defer_if_firing:
+            # The refusal still STANDS as this call's answer -- nothing is armed now, and
+            # the caller is told so -- but the intent is remembered, and
+            # ``_run_fire_cycle``'s tail arms at delay zero instead of toward the
+            # deadline. Opt-in rather than the default because the operator's Fire-now
+            # button reports its own refusal to a person who can press again, while the
+            # crew-log wake has no one to tell: its caller is a drain thread reacting to
+            # a worker's write, and dropping the intent there would make the report wait
+            # out the conductor's whole patrol cadence.
+            self._pulled_forward.add(loop_id)
         return None, "loop is already firing", 409
     self._arm_timer(loop, delay=0.0)
+    if defer_if_firing:
+        # A worker's push, not a person's press: the tick it armed is marked so the gate
+        # observes rather than spending the post-wake follow-up, and so a quiet answer
+        # keeps the loop's deadline. Logged at DEBUG because it happens once per worker
+        # write, turn end and close; the operator's button keeps its INFO line below.
+        self._pushed_ticks.add(loop_id)
+        logger.debug(
+            "AutoNudge: loop %s pulled forward by a worker's write -- cycle %d armed to run now",
+            loop.id,
+            loop.cycle_count + 1,
+        )
+        return loop, "", 200
     logger.info(
         "AutoNudge: loop %s brought forward by hand — cycle %d armed to run now",
         loop.id,

@@ -291,7 +291,7 @@ class TestLeafOnlyPopulationIsRecorded:
     #: home it protects (the two ``$HOME``-joined ``_CREW_HOME_PREFIXES`` plus
     #: the resolved ``config_dir()`` when it is a third place, as the relocated
     #: ``KIROCREW_HOME`` the conftest pins always is), so one new root-level
-    #: leaf is three entries in every tier. Four landed after the first
+    #: leaf is three entries in every tier. Six landed after the first
     #: measurement, all at the data-home root, whose parent no stand-in can
     #: hold, so leaf-only is the only hold available to them:
     #:
@@ -308,13 +308,30 @@ class TestLeafOnlyPopulationIsRecorded:
     #:   stays sandbox read-write for SEL and would leave the record forgeable by
     #:   a runtime-built path. Same hold as those two, and the same reason it can
     #:   only be leaf-only.
+    #: * ``config.json`` / ``config.local.json`` -- the owner's settings files,
+    #:   sealed read-only so an agent cannot loosen its own settings. Both sit
+    #:   at the data-home root, so two leaves are six entries per tier.
+    #: * ``vouched-executions`` -- the gateway's restart-surviving vouches for
+    #:   member-store admission. A forged file would admit a session to a peer
+    #:   member's private memory, so it sits at the root, masked, rather than
+    #:   under the sandbox read-write ``trust/``. Leaf-only for the same reason.
+    #:
+    #: One more root-level leaf landed since, three more entries per tier:
+    #:
+    #: * ``registry_trust.json`` -- the operator's grants of ``owner`` trust to a
+    #:   hand-configured app registry, on the same read+write floor as
+    #:   ``denied_commands.json``, so a writable grant cannot clone a registry the
+    #:   agent controls with the machine's git identity.
     #:
     #: Two directories hold what the MCP gateway launches outside the sandbox,
     #: six entries per tier. ``mcp-launch-approvals`` holds the owner's approved
     #: launch fingerprints; ``mcp/resolved`` holds executables substituted for an
     #: approved launch. Each sits beside writable siblings, so no parent stand-in
     #: can hold it.
-    EXPECTED: dict[str, int] = {"standard": 253, "cc": 260, "strict": 261}
+    #: ``jira_oauth_tokens.json`` adds three root-level credential masks. Its
+    #: parent is the writable crew home, so a parent stand-in would hide unrelated
+    #: runtime state; the retained fork mask carries the same leaf-only debt.
+    EXPECTED: dict[str, int] = {"standard": 268, "cc": 275, "strict": 276}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:

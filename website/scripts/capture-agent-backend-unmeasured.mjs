@@ -10,10 +10,11 @@
  * Every `capabilities` row below is copied verbatim from what
  * `backend_cards.card_payload()` emits for that harness on this revision, so a frame
  * documents the answer the server actually gives rather than a shape hand-written to
- * make a point. pi and goose are the two harnesses whose `/compact` cell is declared
- * unmeasured (`DECLARED_UNMEASURED`, from `ACP_BACKENDS_COMPACT`'s own "unclassified"
- * words), and kiro-cli sits beside them as the all-measured comparison — which is what
- * makes the three marks comparable in one read.
+ * make a point. pi is the harness whose `/compact` cell is declared unmeasured
+ * (`DECLARED_UNMEASURED`, from `ACP_BACKENDS_COMPACT`'s own "unclassified" words), and
+ * kiro-cli sits beside it as the all-measured comparison — which is what makes the
+ * three marks comparable in one read. The goose rows are the card as it read before
+ * goose's `/compact` capture, kept so the frames show two unmeasured harnesses.
  *
  * Usage: node scripts/capture-agent-backend-unmeasured.mjs [outDir]
  */
@@ -46,7 +47,7 @@ const PI_CAPABILITIES = [
   { id: 'markdown_agents', available: false, measured: true, unmeasured_reason: '' },
 ]
 
-/** `card_payload("goose")` on this revision: same unmeasured cell, more available. */
+/** `card_payload("goose")` before its `/compact` capture: pi's unmeasured cell, more available. */
 const GOOSE_CAPABILITIES = PI_CAPABILITIES.map(line =>
   line.id === 'crew_tools' ? { ...line, available: true } : line,
 )
@@ -149,7 +150,9 @@ await page.addInitScript(() => {
   localStorage.setItem('mc-onboarded', '1')
 })
 
-const heading = () => page.getByText('Agent Backend', { exact: true }).first()
+// The card's own title, in Settings > Agent Harness (`settings.tabs.agent.label`);
+// the sidebar repeats the label, hence `.first()` for the page title.
+const heading = () => page.getByText('Agent Harness', { exact: true }).first()
 
 const shoot = async name => {
   await heading().waitFor({ timeout: 20000 })
@@ -157,12 +160,18 @@ const shoot = async name => {
   await page.screenshot({ path: `${OUT}/${name}` })
 }
 
-/** Put one harness's detail on screen. Highlighting is not selecting. */
+/**
+ * Put one harness's detail on screen. The rows are one radio group laid out like
+ * first-run setup's picker: checking a row opens its detail under itself, and
+ * the config changes only through the detail's own Use button — so checking is
+ * looking, not switching.
+ */
 const highlight = async name => {
-  await page.getByRole('tab', { name }).click()
+  await page.getByRole('radio', { name }).check()
+  await page.getByTestId('agent-harness-detail').waitFor({ timeout: 20000 })
 }
 
-await page.goto(`${base}/developer?tab=agent-backend`, { waitUntil: 'domcontentloaded' })
+await page.goto(`${base}/settings/agent`, { waitUntil: 'domcontentloaded' })
 
 // Every string the frame is EVIDENCE for is waited on individually, so the shutter
 // cannot fire on a half-rendered card or document an older draft of the copy.

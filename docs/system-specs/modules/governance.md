@@ -246,12 +246,70 @@ pins ride in the policy file for it:
   (a glob so one pin covers a mirror set, and so non-URL remote shapes —
   SCP-style, local path — are pinnable). Empty = unpinned. A checkout whose
   remote cannot be resolved is **denied when a pin exists**: an admin's pin must
-  not be satisfied by "we could not tell".
-- **`min_version`** — the minimum version the fleet may run. A host below it
-  takes a **mandatory** update, overriding the user's `auto_update=false`
-  (user config sits under the enterprise ceiling). It never refuses to *boot*:
-  bricking a fleet on a policy typo would remove the surface an admin needs to
-  fix it. An unparseable floor imposes none, for the same reason.
+  not be satisfied by "we could not tell". The `cli.sh` managed venv's update
+  checks the same pin against the feed and download URLs, so a git-only glob
+  blocks that install's updates, mandatory ones included.
+- **`min_version`** — the minimum version the fleet may run. On an install
+  whose gateway updates itself, a host below it takes a **mandatory** update,
+  overriding the user's `auto_update=false` (user config sits under the
+  enterprise ceiling). It never refuses to *boot*: bricking a fleet on a policy
+  typo would remove the surface an admin needs to fix it. An unparseable floor
+  imposes none, for the same reason. What "takes the update" means depends on
+  the install (`slack/gateway.py` `_check_for_updates` and
+  `_check_for_updates_via_provider`):
+  - **A policy provider** (`check_command` below) applies whenever the check
+    reports a version.
+  - **A git checkout** on a primary branch applies only toward a build whose
+    `__version__` outranks the running one AND that the checkout can take
+    cleanly (behind-only, or already pulled and awaiting a restart). Below the
+    floor with nothing newer, or with a diverged checkout that a reset would
+    strip of local commits, it notifies and refreshes the badge instead of
+    resetting to every new upstream commit, released or not
+    ([#15796](https://github.com/kirodotdev/KiroCrew/issues/15796)). A no-op
+    apply (the required code already on disk) leaves a restart pending without
+    arming a reload. A non-primary branch never applies, floor or not.
+  - **The `cli.sh` managed venv** re-runs the installer when the feed has a
+    newer build that `source` permits. With nothing newer it writes a log line
+    and does not reinstall; About can still read "up to date".
+  - **pip and pipx installs** only light the update badge, even when the feed
+    has nothing newer.
+  - **Docker and the desktop app's bundled gateway** (without a provider) do
+    not apply from the backend; a container needs a newer image. The app's own
+    updater does not act on the floor: with the app's update switch off, the
+    floor only makes the update-found prompt undismissable, and with it on (the
+    default) the floor has no effect.
+  - A mandatory apply waits for idle like any other
+    ([configuration.md → Updates](../../../src/kiro_crew/docs/configuration.md#when-the-gateway-checks))
+    and is never forced: the grace period (`_MANDATORY_UPDATE_MAX_DEFER_SECS`)
+    only logs.
+- **`check_command`** / **`apply_command`** — select the command update
+  provider (`platform/update_provider.py` `CommandProvider`), which then owns
+  the check, the badge and the Update button, and is resolved before any
+  layout's own updater or deferral. `check_command` exits 0 and prints the
+  available version on stdout when an update is available, and exits non-zero
+  when up to date; exit 0 with empty output is a failed check. `apply_command`
+  exits 0 on success; non-zero means the apply failed and the install is intact.
+  One run may take `_APPLY_TIMEOUT_SECS` (600 s), its exit included: a command
+  still running past it, even one that redirects its own output, is stopped and
+  the apply reported failed.
+  Applying needs both. They run unsandboxed as the gateway through a trusted
+  `sh -c` with a system-only `PATH`, so name binaries absolutely. On Windows they
+  never run (`_shell_exec_args` returns `None`), so a Windows host with a
+  provider never updates from the gateway. A packaged desktop app with a provider is
+  treated as policy-managed: `_arm_packaged_app` refuses with "updates on this
+  host are managed by policy".
+- **`platform_commands`** — per-platform overrides of those two commands, keyed
+  `{sys.platform}-{machine}` (`linux-x86_64`, `darwin-arm64`, `win32-x86_64`;
+  an unrecognised machine keeps its raw lowercased name). A matching entry
+  overrides each non-empty field it sets. Any command in any entry selects the
+  provider on every host, so a host whose platform has no command then never
+  checks or applies.
+
+These five are the only keys `updates` accepts (`UpdatePins.from_dict`). Any
+other key, or a non-string value, **fails closed** (`_reject_unknown_keys`); what
+an unparsable file does at boot is in [Loading + precedence](#loading--precedence).
+The desktop marker's camelCase names (`checkCommand`, `updateCommand`) are
+**not** valid here.
 
 **Not an archetype, by design.** Every archetype answers "is X permitted?"; a
 remote URL and a version number are *values the core consumes*. So they ride
@@ -598,6 +656,11 @@ document does, since a merely *large* finite value (`1e12`) passes the finitenes
 `OverflowError` inside the finiteness screen; it is asked only of
 floats now (an int has no non-finite values), and the value is stored without a `float()`
 round-trip, which would have raised three lines later.
+
+A declared `distribution.source` must also be representable as strict UTF-8. JSON accepts a
+lone surrogate, but the cache-provenance digest encodes the source during boot; rejecting that
+input during composition keeps the failure inside the platform error contract instead of leaking
+a `UnicodeEncodeError` from the distribution engine.
 
 **A DECLARED source may not carry a credential.** `PolicyDistribution.from_dict` refuses
 userinfo (`https://user:pass@host/…`) and any query string in a `distribution.source` that
@@ -1963,6 +2026,35 @@ real arguments** the ACP event carries:
 - `tool_kind == "fetch"` + `raw_params["url"]` → `network.egress` (the host is
   extracted from the URL so the `host` matcher applies).
 
+Because the item under test is that extracted host, a `host`-matcher pattern
+that carries a character or shape no host can hold never matches. The checks run
+in this order, and the first to hold names the reason: a `/` (a scheme, a path or
+a CIDR mask), an `@` (userinfo), IPv6 brackets (the pattern starts with `[` and
+`_url_host` of the pattern yields an address holding a `:`, as `[::1]` and
+`[::1]:443` both yield `::1`; `_url_host` unwraps them, so the item never has
+them), or a port, meaning exactly one colon with a
+non-empty text before it and only digits after. Exactly one colon is what tells a
+port from an IPv6 literal, which always has two or more, so a bare `::1` or
+`2001:db8::1` stays silent and so does a single-label `server`, while `server:443`
+warns. The text before the colon must also hold no `*`, `?` or `[`: a glob can
+absorb a colon, so `*:443` matches the item `fe80::443` that
+`https://[fe80::443]/x` yields, and `*:443` or `web*:443` stays silent. Any other bracket is an fnmatch character class, which `_match_host`
+honours, so `[ab].example.com`, `[a:].example.com` or
+`web[0-9][0-9].corp.example` is live and stays silent: a colon inside a class
+does not make it IPv6, since `_url_host` finds no host in `[a:].example.com`. Otherwise deadness is read off the pattern, not off `_url_host`: that function cuts a
+bare IPv6 literal at its last colon (`::1` gives `:`) and a netloc at the first
+`?` (`api?.skills.sh` gives `api`), so comparing its output to the pattern would
+condemn live rules. The entry is dead: in deny mode the scope permits exactly what
+the operator wrote it to block, and in allow mode it refuses it.
+`ScopedRuleset.from_dict` therefore logs a warning (beside the Rule-1 dead-deny
+one) naming the scope and the entry's position, such as `deny[0]`. It never logs
+the pattern itself, because a pasted URL can carry userinfo, a signature or an
+`?api_key=` query, and the warning fires on every boot. Only the list the mode
+reads is checked: `allow` in allow mode, `deny` in deny mode. The warning names
+the dead entry and its reason and offers no replacement host. It warns rather than
+raising: refusing the document would turn one stale entry into a boot failure on
+upgrade for a policy that loads today.
+
 `on_tool_call(..., tool_kind=, raw_params=)` carries these from the ACP event
 (`AcpEvent.tool_kind` / `.raw_tool_params`); the call sites thread them
 (`llm_helpers`, `subagent`, `task_executor`, `task_planner`, dashboard
@@ -2799,6 +2891,32 @@ never approved, so the ceiling stands ABOVE the keystone rather than beside it.
 Governed by the `capabilities.decisions` `SCOPE_CATALOG` capability row
 (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
 change, mirroring the rows above).
+
+**A local preset has its own row: `capabilities.decisions_local`.** The row above
+exists because the seam's state reaches a paid third party; a local preset model
+(`decisions/local_models.py`) answers on this machine and sends nothing off it, so a
+fleet that permits hosted Jev may still want to withdraw local models on its own.
+The local row only NARROWS: a local preset is permitted only while BOTH
+`capabilities.decisions` and `capabilities.decisions_local` permit
+(`capability.is_decisions_denied(local=True)` evaluates the hosted row first). Before
+this row existed, pinning `capabilities.decisions` off withdrew the whole seam, local
+models included, and an upgrade keeps that reach: the hosted row permits while
+absent, so a denial there is always an explicit pin (or the fail-closed degrade).
+`capabilities.decisions_local` (`capability_default=True`, data only) governs the seam
+only while the gateway's own runtime runs the configured preset on its port
+(`capability.is_local_preset`, the runtime's attestation: `config.json` has other
+writers, so a route-built address there proves nothing about what listens on it). A
+hand-written loopback address, which can be a tunnel to hosted Jev, stays under
+`capabilities.decisions`. A preset-shaped address the gateway does not run answers
+under BOTH rows, denied if either denies, so pinning this row off also stops a server
+started by hand on a preset's port from answering. Both
+chokepoints select the row from the configured provider and the runtime, never from
+the request. `PUT /api/decisions/provider`
+refuses a switch to a withdrawn side with `403 decisions_capability_denied`, and its
+`GET` reports `hosted_permitted` / `local_permitted` so the picker greys that side
+out. `decisions_enabled` is `true` while EITHER side permits, so the card is withheld
+only when `capabilities.decisions` is pinned off (which covers both sides) or both
+rows are. A fleet that permits hosted Jev but wants no local model pins this row.
 
 **Two chokepoints, because either alone is a half-control.**
 `PUT /api/decisions/consent` refuses an ENABLING write with

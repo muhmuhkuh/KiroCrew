@@ -8,6 +8,14 @@ the publish-facing policy in
 [../../app-kit/publishing-guide.md](../../app-kit/publishing-guide.md); this
 document is the behaviour and the one-way doors.
 
+## App route failure payloads
+
+Goal Owner's create and lifecycle routes return HTTP 503 with
+`scheduler_reconcile_failed` when a saved goal cannot be fully reconciled with
+cron. The saved goal and scheduler report remain in the response under explicit
+`goal` and `scheduler` keys beside `error` and `code`; no opaque payload spread
+can shadow the failure contract.
+
 ## Scoped frontend HTTP transport
 
 `useAppApi()` exposes `raw(path, RequestInit)`, `request(path, RequestInit)` and
@@ -427,7 +435,7 @@ EBADF and ELOOP — so a child that is a symlink loop looked like a regular file
 was skipped, deleting the bridges of the app under that name.
 
 The complete row-by-row table, including which test pins each row, is the docstring
-of `dashboard/handlers/agents.py::_app_declared_server_names`.
+of `dashboard/agent_admin/app_mcp_ownership.py::_app_declared_server_names`.
 
 Scoped to `mcpServers`: all three bridges writers of this file touch that key and
 nothing else, so every other key still replaces wholesale. The merge runs *ahead
@@ -468,7 +476,7 @@ untouched.
 | `<app>:<server>` on disk | **persisted as submitted** — the snapshot still wins where the platform agrees the name exists |
 | `<app>:<server>` NOT on disk, app uninstalled | **dropped** — `_deregister_mcp_servers` removed it |
 | `<app>:<server>` NOT on disk, app installed but DISABLED | **dropped** — same, and reconciliation never revisits it |
-| `<app>:<server>` NOT on disk, app installed, ENABLED and DECLARING it | **dropped** — `_register_mcp_servers` skips an HTTP server with no live port and scrubs stale rows for it; a manifest's illustrative port is a dead URL that breaks every kiro session |
+| `<app>:<server>` NOT on disk, app installed, ENABLED and DECLARING it | **it depends** — `_register_mcp_servers` scrubs an HTTP server with no live port only when the app runs a GATEWAY-MANAGED backend (`backend.entryPoint` set); a manifest's illustrative port is then a dead URL that breaks every kiro session. A SELF-MANAGED app (empty `backend.entryPoint`) has an authoritative fixed url and is **persisted** — mirroring `_collect_app_mcp_servers` |
 | host-owned name containing `:` (an edition extra), not on disk | **persisted** — the host's key, not an app's; the host axis is unchanged |
 | any, spec readable but carrying no `mcpServers` key | **dropped** — a keyless spec holds no bridge, which is a definite answer; reading it as "unknown" lets the resurrection through |
 | any, spec unreadable, or `mcpServers` present but not an object | **persisted** — best-effort, so this endpoint stays the repair path for a corrupt spec, and nothing is deleted on evidence that cannot be read |
@@ -503,7 +511,7 @@ calls `_reset_all_sessions`, which drains every active session **and** the warm
 pool, so the next cold start reads the reverted row rather than the revert lying
 dormant. And the only writer that puts the live port back is
 `reconcile_enabled_app_resources`, whose single call site is the gateway boot path
-(`dashboard/server.py`) — the mid-turn rung `_recover_app_agent_binding` is gated
+(`dashboard/server_runtime/app_platform.py`) — the mid-turn rung `_recover_app_agent_binding` is gated
 on an UNRESOLVED agent binding, which a reverted port does not produce. So the
 self-heal is a restart, and nothing shorter. Both axes above plus this open cell
 are enumerated in one table by
@@ -512,7 +520,7 @@ any of them has to come through it.
 
 Writer: `apps/bridges.py::_apply_agent_mcp_policy`, `_mcp_json_path`,
 `_scrub_legacy_shared_mcp`;
-`dashboard/handlers/agents.py::_merge_unowned_servers` and
+`dashboard/agent_admin/app_mcp_ownership.py::_merge_unowned_servers` and
 `_drop_unbacked_app_entries` for the PUT side.
 
 App agent registration materializes a host-managed server for both a whole-server
@@ -719,7 +727,7 @@ URL deletes the whole class — neither piece exists any more. A duplicate check
 kept only as a cheap invariant: with distinct segments the filesystem cannot
 produce two identical routes, so a hit means the convention changed under us.
 
-Writer: `dashboard/server.py::discover_app_window_entries`
+Writer: `dashboard/server_runtime/static_assets.py::discover_app_window_entries`
 (`APP_WINDOW_URL_PREFIX = "app-windows"`);
 exclusion: `dashboard/token_auth.py::register_app_window_paths`.
 
@@ -1042,6 +1050,18 @@ lifecycle lock and the one step that can safely refuse runs FIRST:
 5. File removal, preserving `data/` unless the caller asked to purge.
 6. Resume pointers dropped for every conversation the app owned, on success only.
 
+The owner-only migration cleanup route delegates to uninstall for a retired builtin
+listed in `_MIGRATED_BUILTINS` or orphaned in this build. Eligibility is rechecked
+under the app lifecycle lock; linked/junction app directories and shipped builtins
+are refused with `not_orphaned` (HTTP 400). It keeps `data/`, purges uninstall's
+generated dependency artifacts, skips the retired app's `onUninstall` script,
+and removes the rest of the app tree. All other uninstall preconditions and cleanup
+steps apply. Missing records and standalone successors return idempotent success.
+Pointer flush failures and teardown warnings return a redacted `notice` on success;
+the migration page shows it above the completion card and retains the Install from
+Apps handoff. Without a notice, that handoff uses replacement navigation. Orphan
+status comes from the installed-app list, not the single-app detail response.
+
 Step 6 exists because an app's slot key is often DETERMINISTIC — one slot per object
 it tracks, named after that object — and `session.py` resumes a slot's previous
 kiro-cli conversation by that key. Correct while the app is installed; wrong once it
@@ -1115,10 +1135,14 @@ merge, each write being a whole-file rewrite of one snapshot:
   `dropped == 0` is otherwise "owned nothing", "did not try", and "could not write",
   which need different messages — `failed` covers an ENOSPC or permission error on the
   write, where the pointer is still on disk and the default result would have said the
-  app owned nothing. And the CLI prints both non-clear cases to stderr naming the
+  app owned nothing. `failed` also covers a lock that could not be used at all
+  (`LockFileError`: `gateway.lock` is not a regular file, or it or the home could not
+  be opened, created or measured), since no gateway owns the map then and stopping
+  one would not help. And the CLI prints both non-clear cases to stderr naming the
   consequence and the recovery, because the operator who can act on it is standing at
   the command that otherwise printed a success tick; they get different text because
-  they need different actions — stop the gateway, versus fix the storage error. The recovery is re-running
+  they need different actions — stop the gateway, versus fix the storage or lock-file
+  error the log names. The recovery is re-running
   `kirocrew app uninstall <name>` with the gateway stopped, which works because the
   bookkeeping half also runs when `uninstall_app` fails with *not installed* — the
   pointers outlive the app, so that is the one failure whose cleanup is still owed.
@@ -1488,11 +1512,40 @@ or deny tool requests, or change approval modes require an enabled app whose
 live manifest declares `permissions.sessionApproval: true`. The route must also
 be allowed by `permissions.api`. Cron, system, remote, member-mode, and other
 apps' sessions are denied. An app's existing access to its own slots is
-unchanged. Mode changes require an explicit live allowed slot and are limited
-to Normal, Reads and Trust; YOLO is global rather than slot-scoped, so app
-tokens are refused (``app_yolo_forbidden``) for both arming and revoking it.
-Consent is
-captured when the user enables the app, so `update_app` disables an enabled app
+unchanged. On a user-owned session a `POST /api/chat` from the app sends a
+turn: a send carrying a change to the session's agent binding, persona settings,
+or a harness slash command (the body's `agent` onto an agent-less slot, its
+`color_theme` with `theme_consent` and `theme_consent_sha`, or a first word
+`is_harness_slash_command` forwards) is refused with 403
+`app_session_settings_forbidden` and an SEL denial before anything is written or
+queued (`chat_handlers._deny_app_session_settings`), the same policy as the
+agent route. Naming the agent the slot already runs is a
+plain send. On that send the `steer` flag is ignored, so it waits behind running
+sub-agents like any queued message; the gateway mints the row id; the row is
+echoed to the user's open tabs; it starts no auto-title, does not count as a
+user turn for titling or the refresh cadence, and the app's turn, its row and
+the reply to it, is left out of the automatic title prompts and their truncated
+fallback (`chat_title._titling_messages`; the user's own Regenerate title reads
+every row); with `dashboard.merge_queued_messages` on, a queued app send never
+merges with the user's queued words (`chat_utils._dequeue_next_message` stops a
+run where the stamped actor changes); and an SSE send streams the app's own turn
+only, including a recovery that same turn queues to retry it (matched by a
+per-turn id the recovery carries, not by actor): the `turn_end` frame
+lands before the drain or the cycle's end writes a held note, a drop notice or
+the next turn's first row, the stream also stops at any user row that is not
+its own gateway-minted row, and it skips `queued` placeholder rows (a
+cron notification or MCP-App message queued meanwhile), while the user's tabs
+keep receiving the session's rows. A queued
+send that a gateway restart restores has lost its attribution, because the
+restore drops the actor stamp: it drains alone, never merged with fresh words,
+as a user row marked `turnProvenanceRestored`, which titling skips on a slot no
+app owns, and never as a cron or sub-agent event. `test_chat_mode_security`
+pins this, and `test_every_api_chat_body_key_is_classified` fails on a body
+field nobody has classified as turn-only or settings-bearing. Mode changes
+require an explicit live allowed slot and are limited to Normal, Reads and
+Trust; YOLO is global rather than slot-scoped, so app tokens are refused
+(``app_yolo_forbidden``) for both arming and revoking it. Consent is captured
+when the user enables the app, so `update_app` disables an enabled app
 whose new version adds the flag (SEL operation `session_approval_widened`) and
 returns `notice: "session_approval_reconsent"`; the detail page shows that notice
 and the user re-enables the app after seeing the grant. `register_external_app`
@@ -1504,6 +1557,236 @@ that removes the flag clears any lingering `sessionApprovalConsentPending` bit.
 This re-gate covers
 `sessionApproval` only; `permissions.api` and `permissions.events` are likewise
 read live and still widen on update without a consent moment (issue #11212).
+
+**Prefix grants are narrowed to owned resources on the cross-session routes.**
+`permissions.api` is a prefix match, so the routes below are judged per resource
+for an app caller (`handlers/sessions.py`). The rule keys on the request's `app`
+claim, so it covers an app token and also an internal-secret caller whose calling
+session `token_auth` derives to an app (`_derive_internal_caller_app`: an app's
+slot, cron job or subagent).
+
+- `api_approval_resolve` applies `api_chat_slot_approve`'s rule in the same
+  order. `deny_session_approval_caller` runs first, so an app-token caller
+  without the `sessionApproval` grant gets the same 403
+  `session_approval_not_granted` on both routes, its own slots included. That
+  check exempts an internal-secret caller (`request["internal_auth"]`) on both
+  routes alike, so an app's cron job or subagent acting for the app skips the
+  grant and is bounded only by the ownership step that follows: it still reaches
+  no slot the app does not own. Then the live slots holding an undone
+  future under the id are snapshotted, and `chat_handlers._app_may_send_to_slot`
+  judges each one. ACP request ids are connection-scoped and recur, so the id must
+  name exactly one pending request the app may control: with two or more (two of
+  its own slots, or its own plus a granted user session) the route refuses rather
+  than guess, and the slot route, which names the slot, decides one. The one slot
+  is resolved through `state.resolve_slot_approval` with the future snapshotted
+  for it as `expected_future`. That call never touches the state-level registry,
+  and it fails unless the slot still holds that exact undone future, so a request
+  raised under the same id during the awaited permission read, on another slot or
+  on the same one, is never resolved in its place. A resolution is recorded in
+  the SEL as the slot route records it (`caller="app:<name>"`,
+  `tool_approval:<action>`, the id). The coordinator target
+  (`?origin=coordinator`) and every state-level id answer the 404.
+  `api_approvals` lists state-level approvals only, so it returns `[]` to an app.
+- `api_sessions`, `api_sessions_search`, `api_session_detail`,
+  `api_session_delete` and `api_sessions_summarize` admit an app only to
+  transcripts for which `_app_owns_transcript` holds: the metadata line's `app`
+  equals the caller, and a missing transcript or one with no recorded app
+  belongs to no app. The list filters before counting. Search passes the owned
+  keys into `search_sessions(keys=...)`, which drops every other session before
+  ranking and the limit cap, so other sessions' hits cannot crowd the app's off
+  the page; it scores within the same newest-`_SEARCH_SCAN_WINDOW` window as
+  every search. `api_session_delete` also refuses when the slot its delete claim
+  would pop is not the app's, so a metadata line naming the app never closes
+  someone else's live tab. Summarize skips a key the app does not own exactly as
+  it skips a missing one. Its only production caller is the `list_sessions` MCP
+  tool with `summarize=true`, which lists every workspace session itself, so from
+  an app's slot the rows the app does not own come back with their titles and no
+  summary.
+- `api_sessions_clear` and `api_sessions_clearable_count` act on the whole
+  closed history, which no app owns, so `_app_bulk_history_refusal` refuses an
+  app before either reads anything.
+- The `app` marker is written by the slot save, so it holds only because an app
+  cannot open a NEW slot over a transcript it does not own. `api_chat_slot_create`
+  (a named create), `api_chat` (send auto-create) and the resume core
+  (`resume_slot_from_history`, once no live slot answers) call
+  `chat_handlers._app_claim_refused` before creating anything: a transcript the
+  new slot would read or save to that exists and does not record the app
+  (`_app_may_claim_transcript`) gets the same 404. A missing transcript or the
+  app's own is admitted, so an app still reopens its closed sessions.
+
+The handler's first check is unlocked, so the protected step judges ownership
+again under the transcript's own lock hold (`transcript_lock_stems`), and a
+same-key delete and recreate between the two cannot hand the app somebody
+else's transcript. `api_session_detail` reads through `_app_owned_messages` (a lock
+timeout answers 503 `session_busy`), `_delete_history_session(owner_app=...)`
+re-judges before any ledger exclusion or unlink (`_AppOwnershipLost` is the same
+404), and `_summarize_one(owner_app=...)` re-judges inside both the cached-summary
+hold and the row read. App list rows (including the `user_only` content test),
+page-scoped previews and search output metadata are read under a lock-held
+ownership re-judge, with stale or lock-timed-out rows omitted before response counts.
+The first check stays because it keeps a key the app has
+no claim on from creating a lock sidecar.
+
+Refusals share `_app_not_found`: one SEL `app_isolation` record and the
+`slot_not_found` body a missing id or key also returns. Grants are recorded too
+(`_audit_app_allow`, outcome `allowed`, same `app_isolation` source): one per key
+for detail, a completed delete, summarize and an admitted slot claim, and one per
+request for list and search, carrying the count of owned rows rather than one
+record per row.
+
+Not ownership-judged yet: `/api/sessions/{id}/agents` and its `/{agent_id}` and
+`/stream` children (subagent results), `POST /api/sessions/restart`, and
+`/api/sessions/usage` (with `usage/refresh`), `/health` and `/memory`. An app
+that declares `/api/sessions/*` still reaches them as before; narrowing them is
+a follow-up. The `/api/sessions/{id}/crew-log*` reads are owner-only already.
+
+**Every per-slot route takes one ownership decision.** `permissions.api` is a
+prefix match, so an app granted `/api/chat` reaches every
+`/api/chat/slots/{slot}/*` path. `slot_ownership_middleware`
+(`dashboard/slot_ownership.py`), registered inner to `token_auth_middleware` and
+`sel_audit_middleware` in both server chains, decides app reach for that whole
+family before any handler runs. It matches any single path parameter in the slot
+position (`{slot}`, `{name}`, or a spelling added later), so a new per-slot route
+is owner-gated by default:
+
+| Caller | Outcome |
+|---|---|
+| no app claim (the dashboard user, an internal-secret call with no derived app) | passes; the handler's own owner and identity checks apply |
+| app that owns the slot (`slot._app == request["app"]`) while the slot still runs on its own session and writes its own transcript | passes. The slot's own session is `dashboard:<key>`, or, for a task-runner result tab `task-review-<token>`, the `taskrunner:<task_id>:chat:<token>` session minted for that tab (`own_session_key`) |
+| app that owns the slot, but the slot is linked to another session or writes another transcript | 404 `slot_not_found`, plus an SEL `app_isolation` denial naming the route |
+| any other app, including on a slot with no app scope | 404 `slot_not_found`, plus an SEL `app_isolation` denial naming the route (`slot_route <METHOD> <template>`) |
+| any app, on a slot name that is not live | 404 `slot_not_found`, with no SEL row, so polling a closed tab cannot flood the log |
+
+Successful app checkpoints on live slots (including `SESSION_GRANT`) emit SEL
+`app_isolation` rows with outcome `allowed`, the same `slot_route <METHOD> <template>`
+operation, and `slot=<name>` resources: a five-minute window per app/operation/slot
+carries `suppressed=N` on the next emitted row, with a 1,024-entry cache evicting
+the oldest emission and its pending count when full. Auditing is best-effort and
+never changes the verdict; dashboard callers, `HANDLER` routes, and missing slots
+produce no checkpoint row.
+
+Identity is positive: a slot with no app scope is never read as anyone's. Every
+refusal has the same body, so on these routes no response tells "not yours" from
+"does not exist". The decision is keyed by the PATH segment. A slot key read from
+the body, query or a header is covered only where the handler decides it. The
+other session-scoped families, `/api/approvals` and `/api/sessions`, are outside
+this checkpoint. It applies whether or not a handler carries a check of its own.
+`SLOT_ROUTE_POLICIES` lists the only exceptions, each with its reason:
+
+- `POST .../approve` is `SESSION_GRANT`: the owner app on its own session and
+  transcript, or the `sessionApproval` grant on a local user session
+  (`app_may_control_session`, the one rule send uses too). The handler also
+  requires the grant from every app caller, the owner included, so an app without
+  it gets `404` on a slot it does not own and `403 session_approval_not_granted`
+  on its own. The grant is read once per request, for every app caller, before
+  the slot is looked up (`session_grant`), so the cost of a refusal does not
+  depend on which kind of session was named. The handler reads it again, fresh,
+  after the body upload, and so does `/api/chat/mode`.
+- `POST .../resume` is `HANDLER`, because it opens a persisted transcript that
+  usually has no live slot (see below).
+
+The middleware publishes the slot object it judged on the request
+(`CHECKPOINT_SLOT_KEY`). A handler that awaits before it looks its slot up
+(regenerate and rewind after the readiness probe, mirror-unlink and slack-unlink
+after the body read) refuses with the same 404 when the slot it finds is not that
+object (`checkpoint_slot_replaced`). Handlers that retain that object across
+work also check live identity before post-await effects: manual title and summary
+generation refuse a replacement before publication and before broadcasting or
+returning generated content. Their off-loop publication checks identity under
+the transcript lock. Regenerate and switch-variant recheck after their guarded
+history save; rewind rechecks after preparation, persistence, and orphan cleanup,
+including its cancellation commit and deferred dispatch. These additional checks
+apply only to app callers; the dashboard's existing behavior is unchanged.
+
+`test_slot_ownership_checkpoint.py` pins that every route the router registers
+under `/api/chat/slots/{...}` is decided, that each exception names a registered
+route, and that the middleware sits in both chains. It also sweeps the live table
+on one server, refusing a non-owner app route by route.
+
+Handlers keep their own calls to the shared helpers, as defence in depth: behind
+the checkpoint they never refuse, and they catch a handler mounted outside the
+chain, and a missing slot there gets the same `slot_not_found` body as a
+refused one. The cancel routes (`_app_cancel_denied`) also authorize the session
+they cancel, against the slot's own session (`own_session_key`). The metadata writes (`deny_app_slot_session_access`) also authorize the
+session and transcript they persist into. The folder, tag and mode writes also
+authorize the transcript key (`app_owns_transcript`). Export answers an app the
+checkpoint's body for a missing slot and on every ownership refusal, including
+its own channel-linked slot.
+
+A request that can create the slot it names decides ownership before
+`get_or_create_slot`, whose memory-mode and under-construction 409s would
+otherwise answer an app about a session it may not see. That covers
+`POST /api/chat` and `POST /api/chat/slots` (`_app_slot_acquisition_denial`). The
+raw name is normalized once, as `get_or_create_slot` normalizes it. For an app
+caller, each of these gets the same 404, and nothing is created:
+
+- a member, cron or workflow key, judged on the history key so no spelling slips
+  past (`app_reserved_key_reason`);
+- a `dashboard_`-prefixed key, whose transcript is another slot's;
+- a key under construction (an import's async tail), in any letter case. This
+  gets no SEL row; the person still gets the retryable 409;
+- a key that matches another live slot's key or transcript key only up to letter
+  case (`live_case_alias_reason`): on a case-insensitive filesystem (the macOS
+  and Windows defaults) the two would write one transcript file, and the
+  transcript check below cannot see a live slot that has written nothing yet;
+- a live slot the app may not act on: on send, the session-control rule
+  (`app_may_control_session`); on create, the owner app on its own session and
+  transcript (`app_owns_slot_session`);
+- a key whose persisted transcript records a different app, or none
+  (`transcript_acquisition_reason`). An unreadable metadata line refuses under its
+  own audit reason, and a name the filesystem rejects refuses instead of
+  raising.
+
+The pre-check is an early out. Immediately before `get_or_create_slot`, both
+send and create recheck (`_app_slot_acquisition_recheck`) that a judged live slot
+still holds its key (`_acquired_slot_was_judged`). For a key that was and remains
+free, they reserve it with the existing construction marker while re-reading
+transcript ownership off-loop. The marker prevents another acquisition from
+creating and closing that exact key during the read; it is released in `finally`,
+including on cancellation. The key and alias checks run again after the read,
+and neither caller awaits between the recheck's return and acquisition. A live
+slot that appeared where none was judged takes the existing post-create ownership
+decision without a transcript-read await. A granted user session closed in the
+meantime is not minted afresh as an app-owned slot on its key. A
+409 raised at acquisition is a 404 for an app unless the slot is the app's own
+live slot, the one the pre-check judged and that still holds the key
+(`_app_acquisition_conflict`): there the 409 text tells the app nothing new, and
+a 404 would tell it its own session is gone. Create re-applies the session half
+after acquisition (`deny_app_slot_session_access`), so a new slot that
+`get_or_create_slot` links to another conversation is refused too.
+
+Resume authorizes both transcripts at stake (`_app_resume_refusal`): the one it
+reads (`key`, which for an app defaults to the slot's own `dashboard:<name>`) must
+record the app, and the one the new slot writes (`dashboard:<name>`) must pass
+the acquisition rule above, a publish name under construction included (the
+person keeps the retryable `409 resume_in_progress`). A live slot that already
+satisfies the resume is judged like any per-slot route
+(`deny_app_slot_session_access`). It decides before any durable change. After
+setup, app resumes recheck the destination with `_app_slot_acquisition_recheck`,
+reserving its publish name through the off-loop ownership read. The final source
+metadata snapshot follows that await, so both ownership decisions precede
+materialisation without another yield on the successful path. A late refusal
+puts back the `closed` marker the eager clear dropped. Non-app resumes do not
+perform the destination recheck. A key with no transcript is the 404
+with no SEL row, as on every per-slot route. So a closed user session cannot be reopened as an
+app-owned slot. `/api/chat/mode` answers an app the same 404 for an unknown slot
+as for one it may not control.
+
+The cron and workflow binders never adopt an app-owned slot found under the key
+they mint (`app_holds_gateway_key`). Linking it would hand the app the job's or
+run's transcript, so the binder stands down and records the refusal under the
+actor that asked for the bind (the gateway, or the to-chat caller) with the
+holder app in its resources, since the holder made no request, and
+`POST /api/crons/{id}/to-chat` answers `409 cron_slot_unavailable`. The run-start
+pre-create (`ensure_cron_slot`) and the transcript prefetches skip such a slot
+before any read, so the one refusal per run is the result injection's. Request
+audit records an app-token call under the app's name (`server.audit_actor`); an
+internal-secret call whose app claim was derived from the calling session keeps
+its transport label, `<caller>:<app>`.
+
+Known limit: `POST /api/chat/slots` with a name answers 200 for a free key and 404
+for a taken one, so an app can still learn that a key is in use. Closing that
+needs app-chosen keys in their own namespace.
 
 **Filtering the frame is not always enough.** Two event shapes carry other
 tenants' data inside a payload the gate admits wholesale, so they are narrowed on
@@ -1520,6 +1803,8 @@ with a compensating per-response control — event scoping is that control for
 `/api/ws` — so `/api/status` is not in it despite being a liveness probe: it
 returns owner hash, host specs, cron and usage stats, and the live safety-override
 state, and an app that wants it declares it in `permissions.api`.
+
+**A dashboard PUT to the generic config route is owner-only.** `PUT /api/apps/<name>/config` (`apps/routes.py` `handle_app_config`, which serves every app that registers no `/config` route of its own) refuses a dashboard subject that is not the owner with the shared 403 `owner_only`, while an app token stays within the grant the `token_auth` middleware gave it (its own namespace, or a `permissions.api` entry).
 
 **Implicit self-ownership stops at the shared literal routes.** Beyond the
 declared `permissions.api` allowlist, `_app_owns_path` grants an app token
@@ -1552,7 +1837,11 @@ resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
 `_serialize_for_client`, `SlotOrigin`), `dashboard/token_auth.py`
 (`_APP_TOKEN_IMPLICIT_ALLOW`, `app_token_path_allowed`, `_app_owns_path`,
 `RESERVED_APP_PATH_SEGMENTS`), `apps/manifest.py`
-(`_granted_list`, `RESERVED_APP_PATH_SEGMENTS`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
+(`_granted_list`, `RESERVED_APP_PATH_SEGMENTS`), `dashboard/slot_ownership.py`
+(`slot_ownership_middleware`, `SLOT_ROUTE_POLICIES`, `deny_app_slot_access`,
+`app_reserved_key_reason`, `transcript_acquisition_reason`, `app_holds_gateway_key`),
+`dashboard/chat_handlers.py` (`_app_slot_acquisition_denial`,
+`_app_resume_refusal`, `resume_slot_from_history`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
 authors: [../../architecture/app-platform-trust-model.md](../../architecture/app-platform-trust-model.md).
@@ -1741,18 +2030,206 @@ By the time a credential decision is made, the row was read from
 there would relocate the confused-deputy read from the index to its cache:
 anything able to write `_registry_<name>.json` could name a private repo on the
 operator's own forge and have it cloned with the gateway's identity. So the
-escalation is split across two predicates with different reach:
+escalation is split across three predicates with different reach, and none of
+them reads the tier off a cached row:
 
-- `_is_owner_designated_repo` — the pre-existing byte-identical same-repo
-  ground, and the ONLY escalation the **automatic** browse/refresh paths get. It
-  compares against a URL the operator typed, so a poisoned cache row cannot
-  widen it. `anonymous_git_env`'s contract — automatic clones stay
-  credential-free because no per-repo owner action gates them — therefore still
-  holds unchanged.
+- `_is_owner_designated_repo` — the byte-identical same-repo ground, and the
+  only escalation a **cache-miss** browse or refresh clone gets. It compares
+  against a URL the operator typed, so a poisoned cache row cannot widen it.
+  `anonymous_git_env`'s contract — a clone driven by a cached row stays
+  credential-free because no owner action gates it — holds for those clones.
 - `_owner_tier_confirmed` — **install only**, and honours the tier only after a
   FRESH fetch of that registry's index confirms an entry whose clone URL is
   byte-identical to the row's. Same rule as the official catalog, whose install
   coordinates likewise never come from a cache.
+- `_prewarm_owner_tier_store_assets` (`registry_pipeline/store_art.py`) — the
+  one **browse-time** use of the tier, and it needs no re-fetch because it runs
+  on the fresh index itself. Both callers (`_load_external_registries` on a
+  cache miss, `refresh_registries` after its manifest-cache expiry) hand it the
+  row list `_fetch_and_cache_external_registry` just returned, in the same call,
+  before anything reads the cache back. `_load_external_registries` fetches its
+  registries concurrently and runs the prewarms **after that gather settles**,
+  one bounded batch per fresh registry run together: the provenance gate below
+  reads every sibling's cache, and a prewarm run inside the per-registry load
+  would find the siblings' caches still unwritten on a first load and skip every
+  row as ambiguous. `refresh_registries` does the same after its per-registry
+  loop — it collects each refreshed registry's fresh rows and prewarms them only
+  once every registry has been fetched and had its manifest caches expired, so a
+  later sibling's index cache is already written when an earlier registry's
+  gate reads it. The rows handed over are still the fresh in-memory lists.
+  For each row it does one
+  owner-credentialed shallow clone (`minimal_env` + context sandbox mode,
+  `is_clone_host_trusted` still gating the host, a
+  `prewarm_store_art_owner_tier` SEL grant per clone) — but only after the row's
+  clone URL passes `_is_supported_registry_transport`, the same https/ssh
+  allowlist the index fetch applies: a plaintext `http://` or `git://` row is
+  refused **before** any credential is offered, so owner credentials are never
+  handed to an unauthenticated transport, and the row stays cold. It reads the
+  row's `app.json` through the SAME pinned no-follow descriptor walk the art files
+  use (`_open_pinned_asset` with `max_bytes=_MANIFEST_MAX_BYTES`) — not by path: a
+  hostile clone can make `app.json` a symlink to any readable JSON on the host and
+  whatever the read returns lands in the agent-readable manifest cache, so a
+  by-path `resolve`/`stat`/`read_text` was a TOCTOU a same-uid swap could win. The
+  pinned read refuses a link at any component, a non-regular or hard-linked file,
+  and one over `_MANIFEST_MAX_BYTES` (the ceiling now validated on the opened
+  descriptor, folding in the old separate `os.stat` pre-check), and a non-UTF-8
+  body is refused like malformed JSON. It then writes
+  that `app.json` to the manifest cache and copies the image files that
+  manifest declares into the blob cache at exactly the path `handle_blob_proxy`
+  computes for the URL `_merge_manifest` emits. That copy PUBLISHES through a
+  pinned destination-parent descriptor (`_publish_pinned_asset`): the blob cache
+  root is opened once, each intermediate directory is created/opened with `dir_fd`
+  refusing a link, and the leaf is written with `atomic_write`'s `parent_dir_fd`
+  (its temp create and rename both `dir_fd`-relative) — so a same-uid process that
+  swaps an intermediate parent for a symlink cannot make the copy land bytes
+  outside the cache; the blob cache holds no secret, so no owner restriction is
+  applied. Browsing then hits both caches; a
+  miss still clones anonymously, so the cache-driven paths keep their contract.
+  A row whose `repo` key's provenance is not unambiguously this one registry's is
+  skipped: a sibling source that DECLARES the key makes it ambiguous, and so does
+  a sibling whose cache is **absent or unreadable** — an unfetched or GC'd sibling
+  could publish the same key, so the row is warmed only when every other source
+  has a readable cache that does not declare it. This is the SAME source-counting
+  core the blob proxy's single-owner credential rule reads (`sources._repo_key_claims`,
+  which both `_repo_key_owner_count` and the prewarm's `_prewarm_foreign_claims`
+  wrap): the two gates differ only in a `strict` flag — the prewarm reads an
+  absent sibling cache as a possible claimant (fail closed) where the proxy
+  simply does not count it — and in excluding the registry being attributed to,
+  so the one credential rule cannot drift into two. The prewarm therefore cannot
+  cache bytes a request reaching the same key through a different source would
+  then be served.
+  The batch is bounded by `_PREWARM_BATCH_BUDGET` (20 s), which is the clone
+  **cancellation deadline**, not a ceiling on the wait: the batch runs as one
+  gather task waited on by `asyncio.wait({batch}, timeout=…)`, and at the deadline
+  the in-flight clones are cancelled and their cleanup — the process-group kill and
+  scratch-checkout removal — is settled in a SEPARATE bounded phase capped at
+  `_PREWARM_CLEANUP_BUDGET` (twice the process-kill grace), waited on with
+  `asyncio.wait({batch}, timeout=…)` rather than `asyncio.wait_for(asyncio.shield(batch), …)`
+  so the settling batch's own re-raised `CancelledError` is reported by its absence
+  from `done` while a cancellation delivered to the prewarm from OUTSIDE still
+  propagates instead of being swallowed; a cleanup still running
+  at that second deadline is DETACHED to finish in the background so the request
+  returns, so a listing can take up to the two budgets but no longer. Splitting the
+  two budgets is deliberate — a single `asyncio.wait_for` over the gather would
+  cancel the workers and then await their unbounded cleanup inside that same call,
+  so a hanging forge on a slow filesystem would stall the listing with no bound. It
+  also caps how many rows one batch
+  CONSIDERS at `_PREWARM_MAX_ROWS` (200), checked at the TOP of the per-row loop
+  BEFORE any per-row I/O (the provenance/manifest-cache/backoff reads), so an
+  oversized index bounds not just task creation but preprocessing: once the batch
+  holds the cap's worth of candidates every remaining row is counted as overflow
+  and skipped without a read. It drives the candidates through a FIXED pool of
+  `_PREWARM_CONCURRENCY` workers pulling from a queue — never a task per row — so
+  an owner-tier index with thousands of rows cannot exhaust memory by retaining a
+  row and a coroutine for each; the cap sits at or above what the budget can
+  finish anyway; rows past it stay cold, and because every batch walks the index
+  in order from the top a stable tail past the cap stays cold on later fetches
+  too, so the overflow is logged once per batch with the index size and the cap.
+  Each retained candidate is slimmed to the fields a fetch and its
+  caches read (`name`/`gitUrl`/`repo`/`branch`/`subdirectory`/`commit`/`_registry`),
+  so a row's large `description` is not held for the batch's life; a retained field
+  that is non-string or longer than `_PREWARM_FIELD_MAX_LEN` (2048) rejects the row
+  before it reaches the batch, so an index cannot pad a coordinate to sit in memory
+  or feed a cache key. A cancellation
+  is cooperative for the copy
+  step: the copy worker checks a cancel flag before each asset and, when
+  cancelled, returns without recording anything, and the caller awaits that
+  return before removing the checkout, so a cancelled row leaves neither a
+  partial `.unobtainable` record nor a not-yet-copied path recorded against its
+  manifest cache. Rows still cold when the budget runs out stay cold until the
+  next fresh fetch. It runs nothing from the clone, and each declared path passes
+  the proxy's own grammar, traversal, hidden-segment and image-extension gates,
+  then is read through `_open_pinned_asset`: a no-follow descriptor walk from the
+  clone directory that refuses a symlink at any path component and validates the
+  same opened inode it reads from (regular file, single hard link, within the size
+  cap). A hostile `app.json` therefore cannot name a file outside its clone, and a
+  same-uid process cannot swap a path component in the agent-writable clone tempdir
+  for a symlink to a secret between a check and the read — any link, or a hard
+  link, is a source refusal. A declared image the
+  clone genuinely cannot supply (absent, non-regular, hard-linked, oversize, a
+  link at any component, or a Git LFS POINTER checked out in the image's place —
+  the prewarm's throwaway checkout runs its local git steps with the operator's
+  global/system config masked (`mask_local_git_config`, a prewarm-only flag on
+  `_git_fetch_branch`; installs and updates are NOT masked and keep LFS), so no
+  LFS smudge filter resolves and publishing the pointer text would serve ASCII
+  as an `<img>`) is recorded as unobtainable so the row is
+  not re-cloned
+  for it every fresh fetch; a path the proxy's own gates reject (a non-image, or
+  one outside its grammar) is SKIPPED without being recorded — the proxy would
+  refuse a request for it whatever the clone held, so it never makes the row cold —
+  and a mere failure to WRITE the blob cache is not such a
+  refusal and leaves the asset cold to be retried, never recorded. A CLONE-LEVEL
+  failure (deleted repo, revoked credential, a forge that hangs to the budget)
+  writes no manifest, so the unobtainable record cannot cover it; instead
+  `_fetch_owner_tier_store_assets` writes a short-TTL `.clone-failed.json` record
+  (`{"at", "reason"}`, the reason a credential-free class label from
+  `_redacted_git_failure_class`, never raw git output) beside the row's manifest
+  cache, and the prewarm's pre-filter skips a row whose record is younger than
+  `_CLONE_FAILURE_BACKOFF` (6 h — several index TTLs of quiet, far below the
+  day-scale `_REWARM_AGE`), so a dead row stops stalling the hourly listing fetch
+  instead of paying the full clone attempt every index interval. The
+  budget-cancellation path writes no record (a cancelled row is not a dead row),
+  a later reaching clone removes the record, and an older or malformed record
+  reads as absent so the row is retried once the window lapses. Both sidecar
+  records (`.unobtainable.json` and `.clone-failed.json`) are read ONCE through a
+  no-follow descriptor (`_read_pinned_sidecar`) whose opened inode is validated
+  and whose bytes are bounded by `_MANIFEST_MAX_BYTES`, so a size-check-then-read
+  race cannot let a swapped-in oversize or symlinked record be followed or read
+  past the ceiling. Without the
+  prewarm an `owner`-tier catalog on a credential-only forge installs fine but
+  renders every not-yet-installed app as a generic tile with no screenshots — a
+  gap in what the operator can see, not in what they trust.
+
+Each list art field a manifest declares (`screenshots`/`screenshotsDark`)
+contributes at most `_MAX_LIST_ART_PATHS_PER_FIELD` (12) paths, in declared
+order: an owner-tier index is external and can list an unbounded number of
+screenshots, and every accepted path is a clone read plus a blob-cache file up
+to `_ART_MAX_BYTES`, so one row could otherwise fill the cache. The cap lives in
+`_declared_store_art`, which both the copy and the warm check call, so the same
+paths are dropped from each — a dropped path can never keep the row cold.
+
+**The blob cache is swept on the manifest-GC schedule.** The prewarm fills
+`cache/blobs/<repo_key>/<branch>/<path>` for every declared asset of every
+owner-tier row on each fresh fetch, and an index-driven `branch`/`gitUrl` change
+or a delisted row writes the asset under a NEW `<repo_key>/<branch>` while no
+reader ever derives the old path again — so without a sweep the old bytes live
+forever. `_gc_blob_cache_dir` (in `caches.py`, called from `_write_manifest_cache`
+alongside `_gc_manifest_cache_dir`) reclaims them age-based: the prewarm
+re-publishes a live row's assets on every fresh index fetch and the blob proxy
+refreshes a served file's mtime on every cache hit (off the event loop), so a file
+stays young by being served OR rewritten and only an orphan ages out. Only
+regular files older than every TTL plus `_BLOB_CACHE_GC_GRACE` (wider than the
+rewrite interval, so a warm row's bytes are never reclaimed) are removed, then
+empty directories are pruned bottom-up. The root chain is opened through
+`open_pinned_descendant_dir(config_dir(), ("cache", "blobs"))`, which refuses a
+link at `config_dir`, `cache` or `blobs` (a swapped `cache/blobs` is never
+entered and nothing in its link target is touched) and then hands the sweep the
+pinned `blobs` descriptor — so the walk never follows a symlink, and every
+subdirectory below is opened `O_NOFOLLOW` relative to its parent fd (a symlinked
+directory is neither descended nor removed) with every removal `dir_fd`-relative;
+the by-name fallback `lstat`-refuses a link at each component. The sweep never
+acts outside the pinned root, tolerates per-entry `OSError`, examines at most
+`_BLOB_CACHE_GC_MAX_ENTRIES` entries per call — debited BEFORE each entry is
+dispatched on type, so one oversized directory is never fully listed — and
+descends at most `_BLOB_CACHE_GC_MAX_DEPTH` (16) directories deep, leaving a
+deeper chain for a later sweep (logged once) so an agent-writable tree cannot
+drive it into unbounded recursion. The remainder drains on the next
+manifest-cache write, the only way the tree grows.
+
+**The post-budget cleanup is bounded, and an over-budget cleanup is detached.**
+`_PREWARM_BATCH_BUDGET` (20 s) is the clone-cancellation deadline, not a ceiling
+on the wait: after it fires the in-flight clones are cancelled and each
+`_fetch_owner_tier_store_assets` runs its `finally` → `_rmtree_force_settled` (a
+process-group kill plus a scratch `rmtree`), which is otherwise unbounded, so a
+hanging forge on a slow filesystem stalls a cold App Store load for tens of
+seconds. The batch's cancellation/cleanup phase is wrapped in its own
+`_PREWARM_CLEANUP_BUDGET` (twice `checkout._KILL_GRACE_PERIOD`, whose single kill
+grace is the floor — a value below it would abandon cleanups about to finish),
+and a cleanup still running at that deadline is DETACHED into a background task
+(retained in `_PENDING_PREWARM_CLEANUPS` so the loop does not GC it, self-removing
+on completion) so the listing request returns. The detached `rmtree` is
+idempotent over its system-tempdir scratch dir, so finishing later is safe. A
+cleanup that settles within the budget is not detached.
 
 Four properties keep the tier from becoming a hole, and none is optional:
 
@@ -1802,18 +2279,126 @@ that already agrees with it. `PUT /api/apps/registries` refuses to create a
 conflicting claim, so the case that reaches this rule is a `config.json` that
 predates the build pin.
 
-**Only the BUILD can grant `owner`.** `_registry_trust_tier` resolves the tier
-solely from `AppsLoader.default_registries()`; a row in `config.json` reads as
-`index` no matter what it declares. The reason is that `config.json` is
-agent-writable — `security.py` says so directly, with the check inline
-(`is_sensitive_bash_command("echo x > …/config.json")` is `None`) — so a tier read
-from there would not be an operator's assertion at all. A prompt-injected shell
-could mint `owner`, and the *same* write also adds its chosen host to
-`_configured_registry_hosts()` and lets it control the index that
+**`owner` has exactly two sources, and `config.json` is not one of them.**
+`_registry_trust_tier` resolves the tier from `AppsLoader.default_registries()`
+for a build-pinned row, and from the operator's keystone grant
+(`registry_trust.json`, `config.registry_trust_path`) for a hand-configured row;
+a row in `config.json` reads as `index` no matter what it declares. The reason
+is that `config.json` is agent-writable — `security.py` says so directly, with
+the check inline (`is_sensitive_bash_command("echo x > …/config.json")` is
+`None`) — so a tier read from there would not be an operator's assertion at all.
+A prompt-injected shell could mint `owner`, and the *same* write also adds its
+chosen host to `_configured_registry_hosts()` and lets it control the index that
 `_owner_tier_confirmed` re-fetches: every layer downstream of that decision would
 already be satisfied by the one write that started it. `default_registries()`
-ships in the wheel, so an `owner` tier is a claim the build makes and the agent
-cannot forge.
+ships in the wheel, so a pinned `owner` tier is a claim the build makes and the
+agent cannot forge.
+
+**The operator grant (`registry_trust.json`).** Settings > Security lists the
+operator's configured registries and lets the operator grant each one `owner`
+trust; the dashboard writes `POST /api/security/trusted-registries` (revoke:
+`…/trusted-registries/revoke`, snapshot: `GET …/trusted-registries`, handlers in
+`dashboard/handlers/security.py`). The grant is on the same read+write keystone
+floor as `denied_commands.json` — `security._CREW_SECRET_LEAVES` (the agent's
+file tools refuse it), `sandbox._CREW_READONLY_LEAVES` and
+`_CREW_CHILD_WITHHELD_LEAVES` (the OS sandbox mounts it read-only / withholds it
+from a child) — and the two write endpoints are owner-gated
+(`require_owner_dashboard_request`), so the agent can reach the grant through no
+leg; the snapshot read stays open to any authenticated dashboard caller, like
+every other read in the module. The keystone read is TOLERANT of the sandbox's
+own pre-creation: the sandbox materialises this leaf as an empty `{}` document
+(`sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES`), so the strict mutation read
+treats an empty object exactly like an absent file — the versioned-empty store —
+and the FIRST grant lands rather than being refused as a wrong-version document.
+A NON-empty document is held to the schema: only a version-1 document whose
+`owner_trusted` is a list parses; an unknown `version`, a dict-shaped
+`owner_trusted`, or any other shape is refused. The read/write core lives in
+`apps/registry_trust.py`, a leaf both `dashboard/handlers/security.py` and
+`apps/routes.py` import (`security.py` top-level imports `apps.routes`, so the
+writer cannot live there without a cycle). Properties that carry the design:
+
+- **Keyed by REPOSITORY, never by name.** `_granted_owner_repos` returns a
+  `frozenset` of credential-free repo URLs and `_operator_granted_owner` matches the
+  config row's `repo` with `_same_git_target`. A grant keyed by name could be
+  redirected at any index by rewriting the row's `repo` in agent-writable
+  `config.json`; keyed by the URL the operator saw when granting, a rewritten row
+  simply stops matching and is `index` again. Renaming the row keeps the grant,
+  and so does changing its branch: the grant covers every ref of the repository.
+  Keying on (repo, branch) would not narrow anything: whoever can create a branch
+  in the granted repository can rewrite the granted branch too, so the branch is
+  not a separate trust decision. The grant confirm says so, and
+  `TestTheGrantCoversEveryBranch` pins a branch rewrite as accepted.
+- **Configured rows only; pinned rows refused.** The grant endpoint accepts a
+  `repo` only when it is one of the operator's own `config.json` rows (a decision
+  about a registry the operator can see, never about an arbitrary URL) and
+  refuses a build-pinned registry's repository, whose tier is the build's to
+  state; the runtime reader ignores such a grant as well. Every malformed shape of
+  the file — not JSON, wrong `version`, a credentialed or unsupported key — reads
+  as no grants.
+- **A removed row's grant stays visible.** Removing a registry (in the editor or
+  by a direct `config.json` edit) does not touch the keystone. The snapshot lists
+  every stored grant whose repository matches no config row as its own
+  `served: false`, `not_served_reason: not_configured`, `granted: true` row with a
+  Revoke, so a dormant grant is never alive AND invisible. The grant endpoint holds
+  the shared config lock (`_get_config_lock`) across its config re-read and
+  keystone write, so a grant cannot validate against a row that is being removed.
+  Every keystone read runs off the event loop.
+- **A symlinked or hardlinked keystone confers no trust.** The sandbox's
+  read-only mount seals the one path the keystone was mounted on, not its inode,
+  so a keystone that is a symlink (its name lives in the writable data home) or a
+  regular file carrying a second hardlink (the alias is a different, unsealed
+  path) survives the seal while a sandboxed process can still rewrite the bytes a
+  grant is read from; `sandbox._warn_if_alias_backed` only warns. The alias
+  refusal (`registry_trust._refuse_keystone_alias`) opens through
+  `platform_compat.open_file_no_reparse` — which refuses a symlink or Windows
+  reparse point at the final component in the same operation that opens it — then
+  `fstat`s that descriptor and refuses `st_nlink > 1` or a non-regular file,
+  raising `RegistryTrustCorruptError`, WITHOUT reading any bytes. The decoding
+  reader (`registry_trust._read_keystone_text_no_alias`, reached by every strict
+  read and so by the grant and revoke writers, AND by the clone-time consumer
+  `sources._granted_owner_repos`, which treats the refusal as "no grants in
+  force") calls that alias check and then decodes UTF-8. So a linked keystone
+  reads as corrupt: the Security-page snapshot carries `corrupt`/`corrupt_detail`
+  and the writers refuse to mutate the aliased inode.
+- **Two config rows under one identity key are both served, each on its own
+  grant.** `config.json` is agent-writable, so two rows sharing one identity key
+  (`_registry_identity_key`, casefolded) can coexist; both stay listed as on a
+  build without grants. Every credential path reads the tier off the row object
+  whose index it fetches (`_owner_tier_confirmed`, the store-art prewarm, the
+  snapshot), never by re-resolving the name, so a sibling row cannot borrow
+  another repository's grant.
+
+A grant or revocation expires the registry's index cache (`_expire_cache_file`),
+so the next store listing re-reads the index under the new tier rather than
+waiting out the TTL. `GET /api/apps/registries` reports the tier in force, so a
+granted operator row shows `owner`; it carries no served-state fields. The `GET …/trusted-registries` snapshot
+reports per row `served` (whether the merge lists it) with a `not_served_reason`
+(`pinned_name` / `not_configured`) when it does not, `granted`
+(whether a stored grant names its repository, independent of `served`), and
+`trusted`; a stored grant whose repository matches no config row is surfaced as
+its own `served: false`, `not_served_reason: not_configured`, `granted: true` row
+so it can be revoked rather than re-arming. A top-level `corrupt` flag is set when
+the keystone will not parse.
+
+**On-disk shape: a version-1 list.** `owner_trusted` is a JSON LIST of
+credential-free repo URLs at `version` 1 (`_REGISTRY_TRUST_VERSION`); the grant
+is the entry itself, because SEL already timestamps each grant, so there is no
+per-repo record body for any reader to consume (`_granted_owner_repos` returns a
+`frozenset[str]`). Version 1 is the only shape a reader accepts: an unknown-version
+document, or one whose `owner_trusted` is a dict rather than a list, is corrupt
+and reads as no grants (the schema is validated in one place,
+`_owner_trusted_repos_from_record`, which the tolerant runtime read and the strict
+mutation read share). The blast radius is the pinned `owner` tier's: the registry's authors choose which of
+the operator's reachable private repositories are cloned with the machine's git
+identity, which is what the grant dialog says before it writes.
+
+**A corrupt keystone is visible.** When `registry_trust.json` will not parse (bad
+JSON, an unknown version, the wrong `owner_trusted` shape — the alias case too),
+the grant/revoke writers refuse to mutate it. `build_trusted_registries_snapshot`
+reads it strictly first and carries a top-level `corrupt`/`corrupt_detail` with
+every row `trusted: false`, and the Security page shows a notice. No product
+writer produces a corrupt file, so there is no in-app reset: the operator fixes or
+deletes the file, and the error messages say so.
 
 **Two axes, kept separate: `trust` and `review`.** `trust` answers "may this
 registry's apps clone with this machine's git credentials?"; `review` answers
@@ -1824,7 +2409,8 @@ credentials — collapsing the two would make "we read the listings" hand out a
 credential. `review` is one of `""` / `"curated"` / `"community"`, and `label` is a
 display name shown instead of the `name` id. Both are build-only for the same
 reason `owner` is: `GET /api/apps/registries` reports them empty on operator rows
-and the PUT drops them, so a write into agent-writable `config.json` cannot stamp
+and the PUT drops them, so a write into `config.json` (sealed read-only against an
+in-sandbox shell, but an ordinary settings file to every other writer) cannot stamp
 a source "Reviewed by the Kiro Crew team". An unrecognised `review` DEGRADES to `""` (no
 claim) and is logged at error level; it never drops the pinned row. This list
 also feeds index fetch, the trusted-host allowlist and install, so dropping would
@@ -1843,10 +2429,9 @@ Consequences worth stating, because they close off designs that look reasonable:
   reading the tier off the pinned list alone would keep granting `owner` for a
   registry whose apps are not being listed.
 - `PUT /api/apps/registries` **refuses** `trust: "owner"` rather than storing it,
-  and `GET` reports `index` for every operator row. Persisting or echoing a tier
-  the runtime ignores would report a grant that does not exist, which is worse
-  than declining it. There is correspondingly nothing to preserve across a
-  replace-all PUT: an operator row's tier is always `index`.
+  granted or not. `GET` reports the tier in force (an operator grant reads
+  `owner`), and the dashboard sends back only each row's name, repo and branch,
+  so nothing is echoed. A stored operator row's tier is always `index`.
 - No dashboard control writes the tier, and adding one would not help — the
   question is not how the value is typed but whether the file it lands in is
   agent-writable.
@@ -1883,8 +2468,11 @@ requires the English values to stay byte-identical. External apps fall back to
 their manifest copy because a third-party app id is not first-party provenance.
 
 Store artwork and proof are likewise distinct. `heroImage*` is illustrative
-banner art, while `screenshots*` must be a capture of the real App UI. The detail
-page prefers the wide `heroImageDetail*` banner when present and renders the
+banner art, while `screenshots*` must be a capture of the real App UI. Every
+builtin declares a themeable Store icon; a builtin with a manifest-declared UI
+also supplies at least one real screenshot. Backend-only apps such as Goal Owner
+have no UI to capture and do not substitute artwork for screenshots.
+The detail page prefers the wide `heroImageDetail*` banner when present and renders the
 screenshot gallery independently. Registry manifests project `useCases` and
 `configuration` as display metadata and rewrite repo-relative screenshot and
 hero paths through the same-origin blob proxy. That rewrite (`_merge_manifest`,
@@ -2008,7 +2596,7 @@ file outside the install directory opened cleanly, reported `S_ISREG`, sat under
 cap, and its bytes were served with a 200 — laundering, through an unsandboxed
 gateway, a read the app's own sandboxed code can be refused. Every other
 descriptor-validated read in the tree applies the same gate (`hooks.py`, `memory.py`,
-`spec_builder`, `onboarding_import.py`, `pinned_fs.copy_file_pinned`), so this route
+`spec_builder`, `onboarding_scan.py`, `pinned_fs.copy_file_pinned`), so this route
 was the outlier rather than a new rule.
 
 Spelled inline rather than through `pinned_fs.refuse_hardlink_alias`, which is the
@@ -2034,7 +2622,7 @@ it because the `Content-Type` is derived from the EXTENSION, not the bytes — w
 art named `.png` whose content is markup could still be sniffed into a document.
 
 Set on the response rather than in the middleware because
-`dashboard/server.py`'s security-header middleware uses `setdefault` precisely so a
+`dashboard/server_runtime/security_headers.py`'s security-header policy uses `setdefault` precisely so a
 handler can tighten its own answer. Applied to EVERY art response, not only `.svg`: a
 per-extension shortcut is one `if` away from a gap, and a mutation that narrows it to
 `.svg` is one of the cases pinned.
@@ -2110,7 +2698,7 @@ enumerates the `/apps/` sub-namespaces that have real handlers. A verb missing
 from it is classified as a React Router navigation, so the middleware answers the
 SPA shell and an `<img>` receives HTML with a 200 and renders nothing — silent,
 because the handler is never the thing that fails. The pre-existing drift guard
-cannot catch this (it scans `server.py` only, and its `"{" in p` escape hatch
+cannot catch this (it scans `server.py` and its `server_runtime/` owners only, and its `"{" in p` escape hatch
 treats any pattern route as a real handler without consulting the regex), so
 `test_apps_routes_get_paths_are_matched_by_the_apps_spa_regex` instantiates each
 `/apps/` route literal in `apps/routes.py` and matches the concrete path.
@@ -2483,7 +3071,10 @@ Shared host capability reaches an app through `@kirocrew/app-sdk`, which the hos
 provides rather than publishing to npm — the SDK lives in the dashboard bundle, so
 an app externalizes it at build time instead of vendoring a second copy and a
 second React. Apps receive host events as `CustomEvent`s on `window`
-(`mc:app:<event>`) and raise host notifications through `mc:notify`.
+(`mc:app:<event>`) and raise host notifications through `mc:notify`. The shell's
+rail listens for two window events: `mc:app:badge` sets an app row's badge
+(`website/src/shell/nav/railBadges.ts`), and `mc:apps-changed` re-reads the
+installed apps (`refreshAppNav` in `website/src/App.tsx`).
 
 This is a different mechanism from the MCP App (SEP-1865) `srcdoc` iframes, which
 load their own ESM runtime from a CDN through an import map and are confined by

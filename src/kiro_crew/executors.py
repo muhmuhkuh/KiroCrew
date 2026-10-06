@@ -96,6 +96,7 @@ __all__ = [
     "path_probe_executor",
     "path_transfer_executor",
     "crew_log_executor",
+    "memory_preparation_executor",
     "governance_executor",
     "cron_gate_executor",
     "CronGateTimeout",
@@ -366,6 +367,11 @@ _MAX_PATH_TRANSFER_WORKERS = 8
 # threads under, and the lock would serialize those writes without restoring
 # their order. Appends are small and fsync-bound, so one worker is also enough.
 _MAX_CREW_LOG_WORKERS = 1
+# ONE worker, and the count is the contract: ``wheel_apply.run_wheel_apply``
+# admits one managed-venv apply per process (a second answers busy before it is
+# submitted), and that apply holds the layout's exclusive update lock for its
+# whole run. Busy from ANOTHER process is the lock's answer, not this pool's.
+_MAX_UPDATE_WORKERS = 1
 
 _lock = threading.Lock()
 _pool: ThreadPoolExecutor | None = None
@@ -384,6 +390,7 @@ _path_resolve_pool: SubprocessPoolExecutor | None = None
 _path_probe_pool: ThreadPoolExecutor | None = None
 _path_transfer_pool: ThreadPoolExecutor | None = None
 _crew_log_pool: ThreadPoolExecutor | None = None
+_update_pool: ThreadPoolExecutor | None = None
 
 
 def configure_default_executor() -> None:
@@ -678,6 +685,47 @@ def crew_log_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _crew_log_pool
+
+
+def memory_preparation_executor() -> ThreadPoolExecutor:
+    """Return a NEW one-worker pool for one gateway's memory preparation pass.
+
+    Threads are named ``mc-memprep``. The caller owns the pool and shuts it
+    down once its one job has been submitted and awaited.
+
+    Memory preparation is the barrier that keeps chat admission closed after a
+    restart, and its work is short (about 1.5s on a large store). On the loop's
+    default executor that job waits behind every other boot task queued there
+    -- MCP probes, remote reconnects, app loading -- so admission stayed closed
+    for minutes of queueing. Its own thread starts it at once.
+
+    A fresh pool per pass rather than a process-wide singleton: a stopped
+    pass's worker cannot be cancelled and may still hold its thread, and a
+    shared single slot would queue the next gateway's pass behind it, which is
+    the same wait in a new place.
+    """
+    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="mc-memprep")
+
+
+def update_executor() -> ThreadPoolExecutor:
+    """Return the process-wide pool the managed-venv shadow apply runs on.
+
+    Threads are named ``mc-update``, and there is exactly ONE
+    (:data:`_MAX_UPDATE_WORKERS`). An apply downloads a wheel and builds a full
+    venv, which takes minutes, and a started ``run_in_executor`` future cannot
+    be cancelled, so on the loop's default executor it would hold a worker the
+    loop's own DNS resolution needs for that whole time.
+    """
+    global _update_pool
+    if _update_pool is None:
+        with _lock:
+            if _update_pool is None:
+                _update_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_UPDATE_WORKERS,
+                    thread_name_prefix="mc-update",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _update_pool
 
 
 def embed_executor() -> ThreadPoolExecutor:
@@ -1100,7 +1148,7 @@ def shutdown_maintenance_executor() -> None:
     global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool, _recall_pool
     global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool, _path_resolve_pool
     global _path_probe_pool, _path_transfer_pool
-    global _crew_log_pool, _kiro_spawn_pool, _mcp_probe_pool
+    global _crew_log_pool, _kiro_spawn_pool, _mcp_probe_pool, _update_pool
     with _lock:
         pool, _pool = _pool, None
         subprocess_pool, _subprocess_pool = _subprocess_pool, None
@@ -1118,6 +1166,7 @@ def shutdown_maintenance_executor() -> None:
         path_probe_pool, _path_probe_pool = _path_probe_pool, None
         path_transfer_pool, _path_transfer_pool = _path_transfer_pool, None
         crew_log_pool, _crew_log_pool = _crew_log_pool, None
+        update_pool, _update_pool = _update_pool, None
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
     if subprocess_pool is not None:
@@ -1150,3 +1199,5 @@ def shutdown_maintenance_executor() -> None:
         path_transfer_pool.shutdown(wait=False, cancel_futures=True)
     if crew_log_pool is not None:
         crew_log_pool.shutdown(wait=False, cancel_futures=True)
+    if update_pool is not None:
+        update_pool.shutdown(wait=False, cancel_futures=True)

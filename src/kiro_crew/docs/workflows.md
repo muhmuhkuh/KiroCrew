@@ -18,11 +18,77 @@ authoring and launching happen in one step. You do not write the script.
 Two watching surfaces show a live run:
 
 - The chat side panel's **Workflows** tab, next to Changes and Subagents.
-- **Agent Capabilities → Workflows**, which is the saved library rather than the
+- **Customize → Workflows**, which is the saved library rather than the
   live view: it creates, edits, and runs reusable workflows.
 
 A run streams to the panel while it executes and injects its result into the
 chat on completion, so you do not have to poll it yourself.
+
+### Route steps across ACP backends
+
+Each `ctx.agent()` step accepts `backend=` and `model=`. `backend` selects a
+selectable ACP harness (not a vendor API directly); `model` selects a model
+available through that harness. This lets one workflow plan, implement and review
+on different backends. Backend-routed steps start isolated sessions rather than
+using the warm workflow pool.
+
+Pass backend/model choices as workflow arguments, rather than hard-coding a model
+for every account:
+
+```python
+plan = await ctx.agent(
+    "Plan the change", backend=ctx.args["planner_backend"],
+    model=ctx.args.get("planner_model"),
+)
+implementation = await ctx.agent(
+    "Implement this plan: " + str(plan),
+    backend=ctx.args["implementation_backend"],
+    model=ctx.args.get("implementation_model"),
+)
+review = await ctx.agent(
+    "Review the implementation", backend=ctx.args["review_backend"],
+    model=ctx.args.get("review_model"),
+)
+```
+
+## Parallel and pipeline execution
+
+### `ctx.parallel(thunks)`
+
+Run multiple agent calls concurrently and wait for all of them (barrier). Returns
+results in input order; a failing call resolves to `None` rather than raising.
+
+```python
+# Two independent reviewers run at the same time
+review_a, review_b = await ctx.parallel([
+    lambda: ctx.agent("Review from security perspective", backend="claude-code"),
+    lambda: ctx.agent("Review from performance perspective", backend="codex"),
+])
+```
+
+Each thunk is a zero-arg callable returning an awaitable (`lambda: ctx.agent(...)`).
+Passing an already-created coroutine (`ctx.agent(...)`) also works. Concurrency is
+bounded by the run's global agent limit.
+
+### `ctx.pipeline(items, *stages)`
+
+Process a list of items through multiple stages without inter-stage barriers. Each
+item flows through all stages in its own chain — item B can reach stage 2 while
+item A is still in stage 1. Wall-clock time equals the slowest single-item chain,
+not the sum of slowest-per-stage.
+
+```python
+# Process multiple files: each flows through read → analyze → report independently
+results = await ctx.pipeline(
+    files,
+    lambda path: ctx.agent(f"Read and summarize {path}"),
+    lambda summary: ctx.agent(f"Find issues in: {summary}"),
+    lambda issues: ctx.agent(f"Write report for: {issues}"),
+)
+```
+
+A stage that raises drops that item to `None` and skips its remaining stages.
+Results are returned in input order.
 
 ## Watching and steering a run
 

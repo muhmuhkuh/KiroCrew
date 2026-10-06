@@ -674,13 +674,34 @@ class ReviewPool:
                             logger.debug("activity callback failed", exc_info=True)
                 elif kind == EVENT_PERMISSION_REQUEST:
                     req_id = getattr(ev, "request_id", "")
+                    reason = await asyncio.to_thread(
+                        refusal_for,
+                        ev,
+                        session_key=client._session_id or "",
+                        agent=self._agent,
+                        app="code-review-sage",
+                        security_only=False,
+                    )
+                    if reason is not None:
+                        await self._audit_tool(
+                            client, ev, request_id=req_id, outcome="rejected_hook_deny"
+                        )
+                        await client.reject_tool(req_id)
+                        continue
                     try:
-                        await client.approve_tool(req_id)
+                        approval_sent = await client.approve_tool(req_id)
                     except Exception:
                         logger.debug("Pi tool approve failed", exc_info=True)
                     else:
                         await self._audit_tool(
-                            client, ev, request_id=req_id, outcome="auto_approved"
+                            client,
+                            ev,
+                            request_id=req_id,
+                            outcome=(
+                                "auto_approved"
+                                if approval_sent is not False
+                                else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                            ),
                         )
                 elif kind == EVENT_COMPLETE:
                     reason = getattr(ev, "stop_reason", "") or ""
@@ -863,7 +884,11 @@ class ReviewPool:
                     None,
                     lambda: (
                         _sel().log_tool_invocation(
-                            session_key=getattr(handle, "session_id", "") or "",
+                            session_key=(
+                                getattr(handle, "session_id", "")
+                                or getattr(handle, "_session_id", "")
+                                or ""
+                            ),
                             agent=self._agent,
                             source="subagent",
                             tool_name=getattr(ev, "title", None) or "unknown",

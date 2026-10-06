@@ -45,6 +45,7 @@ from kiro_crew.config.loader import (
     config_dir,
     config_local_path,
     config_path,
+    read_config_text,
     update_config_locked,
 )
 from kiro_crew.loop_lock import LoopBoundLock
@@ -1381,19 +1382,23 @@ def _remove_any_shape(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
+def uninstall_app(name: str, *, keep_data: bool = True, retired_builtin: bool = False) -> AppResult:
     """Uninstall an app while preserving its ``data/`` directory by default.
 
     Passing ``keep_data=False`` is the explicit purge action. Resource
     deregistration should be done before calling this.
-    Built-in apps cannot be uninstalled — only disabled.
+    Built-in apps stay locked unless explicitly cleaning up an eligible retired builtin.
     """
     if not _check_path_safety(name):
         return AppResult(ok=False, name=name, error=f"unsafe app name: {name!r}")
     meta = _read_installed(name)
     if not meta:
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
-    if meta.lifecycle == "locked":
+    if retired_builtin and not migrated_builtin_cleanup_applies(name):
+        return AppResult(
+            ok=False, name=name, error="not a migrated builtin", error_code="not_orphaned"
+        )
+    if meta.lifecycle == "locked" and not retired_builtin:
         return AppResult(
             ok=False,
             name=name,
@@ -1505,15 +1510,11 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
                     ".kirocrew-deps.lock" if _data_pin.fd is not None
                     else str(data / ".kirocrew-deps.lock")
                 )
-                # Match the provisioner's creator election: uninstall can race
+                # Same creator election as the provisioner: uninstall can race
                 # its first open before either caller holds the dependency lock.
-                try:
-                    _lfd = os.open(
-                        _lock_name, _lflags | os.O_CREAT | os.O_EXCL, 0o644,
-                        dir_fd=_data_pin.fd,
-                    )
-                except FileExistsError:
-                    _lfd = os.open(_lock_name, _lflags, dir_fd=_data_pin.fd)
+                _lfd = platform_compat.open_create_or_existing(
+                    _lock_name, _lflags, 0o644, dir_fd=_data_pin.fd,
+                )
                 _deps_lock = contextlib.ExitStack()
                 _lf = _deps_lock.enter_context(os.fdopen(_lfd, "r+"))
                 _deps_lock.enter_context(platform_compat.file_lock(_lf.fileno(), exclusive=True))
@@ -1781,6 +1782,9 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         remove_dev_app(name)
     except Exception:
         logger.debug("dev-mode cleanup on uninstall of %r failed", name, exc_info=True)
+    # The orphan set may have named this app; a successor installed under the
+    # same name must not inherit its stale `orphaned` flag.
+    invalidate_orphan_cache()
     return AppResult(ok=True, name=name, message=f"uninstalled {name}{residual}")
 
 
@@ -1807,7 +1811,7 @@ def trust_grant_removal_blocked(name: str) -> str | None:
     local = config_local_path()
     if local.is_file():
         try:
-            raw_local = json.loads(local.read_text(encoding="utf-8"))
+            raw_local = json.loads(read_config_text(local))
         except (OSError, UnicodeError, json.JSONDecodeError):
             raw_local = {}  # the loader ignores an unreadable overlay, so do we
         agent_local = raw_local.get("agent") if isinstance(raw_local, dict) else None
@@ -1821,7 +1825,7 @@ def trust_grant_removal_blocked(name: str) -> str | None:
     path = config_path()
     if path.is_file():
         try:
-            json.loads(path.read_text(encoding="utf-8"))
+            json.loads(read_config_text(path))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             # Report rather than stay silent: a quiet bail here is precisely the
             # "uninstalled but still trusted" state the caller must not reach. The
@@ -1864,7 +1868,7 @@ def _drop_trust_grant(name: str) -> None:
     if not path.is_file():
         return
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         # RAISE rather than return: a silent bail here is precisely the
         # "uninstalled but still trusted" state the caller must not reach. The
@@ -1974,7 +1978,7 @@ def _has_trust_grant(name: str) -> bool:
     if not path.is_file():
         return False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     if not isinstance(raw, dict):
@@ -1992,7 +1996,7 @@ def _trust_grant_repository(name: str) -> str:
     if not path.is_file():
         return ""
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return ""
     agent_raw = raw.get("agent") if isinstance(raw, dict) else None
@@ -2009,7 +2013,7 @@ def _trust_grant_local(name: str) -> bool:
     if not path.is_file():
         return False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(read_config_text(path))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     agent_raw = raw.get("agent") if isinstance(raw, dict) else None
@@ -3823,6 +3827,30 @@ def invalidate_orphan_cache() -> None:
 # ---------------------------------------------------------------------------
 # Migration cleanup
 # ---------------------------------------------------------------------------
+
+
+def migrated_builtin_cleanup_applies(name: str) -> bool:
+    """Whether a safe builtin-owned record qualifies for migration teardown and removal.
+
+    An app directory that is a symlink or junction is ineligible, and so is anything
+    at ``data`` that is not a real directory (:func:`gateway_data_dir_obstruction`):
+    the teardown keeps only a directory there, so it would delete anything else.
+    """
+    from kiro_crew.apps.builtins import _MIGRATED_BUILTINS
+
+    if not _check_path_safety(name):
+        return False
+    path = app_dir(name)
+    if path.is_symlink() or is_link_or_junction(path):
+        return False
+    if gateway_data_dir_obstruction(path):
+        return False
+    meta = _read_installed(name)
+    return bool(
+        meta
+        and meta.origin == "builtin"
+        and (name in _MIGRATED_BUILTINS or name in detect_orphaned_builtins(force_refresh=True))
+    )
 
 
 def cleanup_migrated_builtin(name: str) -> AppResult:

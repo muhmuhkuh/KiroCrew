@@ -248,6 +248,16 @@ class MemoryConfig:
             "Inject the learned-corrections and user-profile blocks into " "new-session context.",
         ),
     )
+    inject_lessons_per_turn: bool = field(
+        default=False,
+        metadata=_meta(
+            "Lessons Per Message",
+            "On each follow-up message, add up to three stored lessons that match it "
+            "and have not been shown in the session yet. The session-start block "
+            "holds only what fits its budget; this adds the rest as the topic "
+            "reaches them. Requires inject_lessons.",
+        ),
+    )
     inject_activity: bool = field(
         default=True,
         metadata=_meta(
@@ -560,8 +570,12 @@ class SkillsConfig:
             "Lazy Skill Injection",
             "When true (the default), show a bounded usage-ranked index of on-demand "
             "skills, each with its path, plus a line naming the families the index "
-            "leaves out. Set to false for the shorter entry that names only the eight "
-            "hottest skills and points at skill_search for the rest. Both modes use the "
+            "leaves out. Set to false for the shorter entry that names eight skills "
+            "and points at skill_search for the rest. Both order their rows the same "
+            "way: the user's own skills (user-created, extra_paths, trusted project, "
+            "mapped) take up to six of the first eight places, the rest of those "
+            "eight go to the highest-ranked remaining skills of either kind, so a "
+            "shipped skill with real usage keeps its name. Both modes use the "
             "same Crew background budget, independent of model window size, and neither "
             "applies to an agent with its own skill:// mapping, which gets a bounded "
             "directory of mapped skills with complete search, paginated listing and exact "

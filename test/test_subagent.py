@@ -279,6 +279,70 @@ class TestSpawnWithoutApprovalCallback:
         assert manager.has_pending_work_for("cron:j1") is True
         assert manager.queued_count_for("cron:other") == 0
 
+    @pytest.mark.asyncio
+    async def test_is_queued_names_pending_spawns_and_the_dispatch_window(self) -> None:
+        """``is_queued`` is the serial-guard done-probe's queue check: it names
+        a fresh ``_queue`` entry and the pop-to-claim window the pump tracks in
+        ``_dispatch_window_ids``, skips a ``_resume_id`` re-entry (its real row is
+        in ``_agents``) and an id-less row, and does not claim a started run."""
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+            on_spawn_approval=AsyncMock(return_value=True),
+        )
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            manager.spawn("task one", parent_session_key="dashboard:tab")
+            queued = manager.spawn("task two", parent_session_key="dashboard:tab")
+
+        assert queued is not None and queued.queued is True
+        assert manager.is_queued(queued.id) is True  # waiting in _queue
+        assert manager.is_queued("ffffffffffffffff") is False  # unknown id
+        # A started run (one with an _agents row) is not "queued".
+        for started_id in list(manager._agents):
+            assert manager.is_queued(started_id) is False
+
+        # A resume re-entry and an id-less row are not fresh queued spawns.
+        manager._queue.append({"_resume_id": "abc", "_preassigned_id": "abc"})
+        manager._queue.append({"_preassigned_id": "", "parent_session_key": "dashboard:tab"})
+        assert manager.is_queued("abc") is False
+        assert manager.is_queued("") is False
+
+        # The pump's pop-to-claim window: the row left _queue but is held in
+        # _dispatch_window_ids; is_queued still names it so the guard holds.
+        params = next(p for p in list(manager._queue) if p.get("_preassigned_id") == queued.id)
+        manager._queue.remove(params)
+        manager._dispatch_window_ids.add(queued.id)
+        assert manager.is_queued(queued.id) is True
+
+    def test_unmark_dispatching_keeps_the_window_for_a_retained_claim(self) -> None:
+        """``_unmark_dispatching`` drops the depth-count id mark unconditionally
+        but keeps the queryability window (``_dispatch_window_ids``) for a
+        retained claim -- the contract BOTH the inner per-row finally and the
+        outer drain-pass sweep rely on, so a claim retained across a pass is not
+        erased by that same pass's cleanup (GPT F1)."""
+        manager = SubagentManager(
+            sessions=_mock_sessions(),
+            ctx_builder=_mock_ctx_builder(),
+            max_concurrent=1,
+        )
+        pump = manager._admission
+        params = {"_preassigned_id": "held", "parent_session_key": "dashboard:tab"}
+        manager._dispatching_ids.add("held")
+        manager._dispatch_window_ids.add("held")
+
+        # retained=True: the slot leaves the depth count but the row stays
+        # queryable, so the done-probe keeps the serial guard.
+        pump._unmark_dispatching(params, retained=True)
+        assert "held" not in manager._dispatching_ids
+        assert "held" in manager._dispatch_window_ids
+        assert manager.is_queued("held") is True
+
+        # retained=False (the settled path): both marks go.
+        pump._unmark_dispatching(params, retained=False)
+        assert "held" not in manager._dispatch_window_ids
+        assert manager.is_queued("held") is False
+
 
 class TestSpawnWithApprovalCallback:
     """When on_spawn_approval is set, spawns are gated behind approval."""
@@ -1714,8 +1778,8 @@ class TestSpawnMemoryGuard:
         assert call_kwargs["outcome"] == "deferred_low_memory"
         assert call_kwargs["metadata"]["available_gb"] == 2.5
 
-    def test_spawn_refused_low_memory(self):
-        """Without a store, spawn() returns an error SubagentInfo."""
+    def test_spawn_queued_low_memory_without_a_store(self):
+        """Without a store, spawn() still queues: the in-memory window holds it."""
         from unittest.mock import MagicMock, patch
 
         mgr = self._mgr()
@@ -1733,13 +1797,16 @@ class TestSpawnMemoryGuard:
             info = mgr.spawn(task="test task", parent_session_key="sess-1")
 
         assert info is not None
-        assert info.done is True
-        assert "2.5" in info.error
-        assert "4" in info.error
-        assert "0.5 GB per warming start" in info.error
+        assert info.done is False and info.queued is True and info.error == ""
+        assert info.queued_reason == "low_memory"
+        assert "2.5 GB available" in info.queued_reason_detail
+        assert "need 5.0 GB" in info.queued_reason_detail  # the 4.0 floor plus this start
+        assert "1.00 GB for this start" in info.queued_reason_detail
+        assert [p["_preassigned_id"] for p in mgr._queue] == [info.id]
+        assert info.id not in mgr._agents and mgr._running_count == 0
         mock_sel.return_value.log_tool_invocation.assert_called_once()
         call_kwargs = mock_sel.return_value.log_tool_invocation.call_args[1]
-        assert call_kwargs["outcome"] == "refused_low_memory"
+        assert call_kwargs["outcome"] == "deferred_low_memory"
 
 
 class TestSpawnEmptyTaskGuard:

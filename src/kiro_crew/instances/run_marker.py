@@ -756,6 +756,10 @@ def _marker_lock(port: int) -> Iterator[bool]:
 def _record_names_another_live_gateway(port: int, pid: int) -> bool:
     """True when *port*'s pid record names a LIVE process that is not *pid*.
 
+    The supervisor an in-app restart through a supervising launcher leaves
+    behind is not "another" gateway: a live ancestor whose image is not a
+    Python interpreter (:func:`platform_compat.is_exec_supervisor_of_this_process`).
+
     The proof is the start identity, not the pid number: a pid alone cannot be
     told apart from the same number recycled onto an unrelated process after a
     crash left the sidecar behind. So the recorded token must still match what
@@ -768,12 +772,31 @@ def _record_names_another_live_gateway(port: int, pid: int) -> bool:
     record its marker on a doubt loses port discovery for the rest of its life.
     The case being excluded is narrow and specific -- a successor already holds
     the port and has published -- so only a positive proof of it declines.
+
+    The token answers IDENTITY, never LIVENESS, so liveness is asked first. On
+    Windows a process object outlives its process for as long as any handle to
+    it is open, and its creation ``FILETIME`` stays readable that whole time
+    (:func:`kiro_crew.pod.windows.supervised_pid` documents the same trap). An
+    in-app restart there is ``CreateProcess`` plus an exit of the caller, and
+    the pod supervisor that spawned the caller still holds its ``Popen`` handle
+    while it waits for the successor to publish -- so the predecessor's record
+    kept matching its token after the process was gone, the successor declined
+    to write its own, and the supervisor, seeing no claim, drained the Job with
+    the live successor in it. A pid that has exited is not another gateway.
     """
     record = read_pid_record_path(pid_path(port))
     if record is None:
         return False
     recorded_pid, recorded_token = record
     if recorded_pid == pid or not recorded_token:
+        return False
+    if not platform_compat.pid_exists(recorded_pid):
+        return False
+    if pid == os.getpid() and platform_compat.is_exec_supervisor_of_this_process(recorded_pid):
+        # An in-app restart through a supervising launcher leaves the previous
+        # image alive as this gateway's ancestor, token unchanged, now running
+        # the launcher. It does not serve the port; this process does. A live
+        # gateway ancestor still runs Python and keeps its record.
         return False
     return pid_start_token(recorded_pid) == recorded_token
 

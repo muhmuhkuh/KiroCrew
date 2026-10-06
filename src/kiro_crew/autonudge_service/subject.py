@@ -111,7 +111,13 @@ def _judge_pr_targets(judge: Mapping[str, Any] | None) -> list[str]:
         return []
 
 
-def infer_subject(message: str, judge: Mapping[str, Any] | None = None) -> "targets.Target | None":
+def infer_subject(
+    message: str,
+    judge: Mapping[str, Any] | None = None,
+    *,
+    watch: str = "",
+    slot_key: str = "",
+) -> "targets.Target | None":
     """WHICH pull request a loop is about: its judge brief first, then its instruction.
 
     One function, because the answer is needed in five places -- the arm, the
@@ -158,6 +164,14 @@ def infer_subject(message: str, judge: Mapping[str, Any] | None = None) -> "targ
     the collector drops that entry.
     """
     listed: list["targets.Target"] = []
+    if str(watch or "").strip() == targets.WORK_LEDGER:
+        # A work-ledger watch is bound to the conductor's OWN session, resolved from
+        # ``slot_key`` -- never from a pull request. The judge brief may still name a
+        # PR as a collection target, but that must NOT retarget the watch: the block
+        # below would read a one-entry brief as the subject and arm the loop on the PR
+        # instead of the ledger, silently, with no error to the caller. Resolve the
+        # watch's own subject here, before the brief is consulted at all.
+        return targets.infer(message, watch=watch, slot_key=slot_key)
     for entry in _judge_pr_targets(judge):
         found = targets.infer(entry)
         if found is None:
@@ -165,7 +179,7 @@ def infer_subject(message: str, judge: Mapping[str, Any] | None = None) -> "targ
         identity = (found.kind, found.subject, found.host_key)
         if all(identity != (other.kind, other.subject, other.host_key) for other in listed):
             listed.append(found)
-    from_message = targets.infer(message)
+    from_message = targets.infer(message, watch=watch, slot_key=slot_key)
     if len(listed) == 1:
         only = listed[0]
         if not targets.names_pull_request(message):
@@ -214,7 +228,14 @@ def loop_subject(loop: Any) -> "targets.Target | None":
     """The subject one stored loop is about, from that loop's own two strings."""
     from kiro_crew import autonudge_judge as _judge
 
-    return infer_subject(str(getattr(loop, "message", "") or ""), _judge.spec_of(loop))
+    _monitor = getattr(loop, "monitor", None)
+    _watch_kind = getattr(_monitor, "kind", "") if _monitor is not None else ""
+    return infer_subject(
+        str(getattr(loop, "message", "") or ""),
+        _judge.spec_of(loop),
+        watch=_watch_kind or "",
+        slot_key=getattr(loop, "slot_key", "") or "",
+    )
 
 
 def infer_monitor(
@@ -223,6 +244,8 @@ def infer_monitor(
     *,
     creation_surface: MonitorCreationSurface = MonitorCreationSurface.UNKNOWN,
     judge: Mapping[str, Any] | None = None,
+    watch: str = "",
+    slot_key: str = "",
 ) -> MonitorState | None:
     """Build a monitor for this loop's subject, or ``None`` to stay ungated.
 
@@ -244,13 +267,16 @@ def infer_monitor(
     this function's.
 
     Budgets are left at their defaults and are NOT enforced on this path. The
-    default cap is 8 agent turns, and real babysit loops run for dozens of
-    cycles, so enforcing it here would stop working watches early -- a
-    regression wearing a budget's clothing. Enforcement belongs with the
-    decision controller that owns the rest of the budget vocabulary, and is
-    deliberately not smuggled in behind a token saving.
+    default wake cap is unlimited, so there is nothing here to enforce for the
+    budget a shadow monitor would otherwise trip on first; what remains -- the
+    runtime, token and provider-error bounds -- is enforced by the decision
+    controller that owns the rest of the budget vocabulary, against live state
+    this function does not have. Enforcement is deliberately not smuggled in
+    behind a token saving: a bound applied here, without the probe history the
+    controller reads, would stop working watches early -- a regression wearing a
+    budget's clothing.
     """
-    target = infer_subject(message, judge)
+    target = infer_subject(message, judge, watch=watch, slot_key=slot_key)
     if target is None:
         return None
     try:

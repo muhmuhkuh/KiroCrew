@@ -145,6 +145,8 @@ transcript delivery; explicit cancel and unmount remain discard-only and do not 
 | Voice hook | `website/src/hooks/useVoiceInput.ts` | Chooses streaming or batch, owns mic and device selection |
 | Composer wiring | `website/src/chat-core/composer/useComposerVoice.ts` | The `Composer` root's Voice atom: splices the live region into the input box, owns the one-mic mutex and the frozen-prefix snapshot; `ChatPage.tsx` and `ChatPane.tsx` mount the root and supply only host options |
 | Recording UI | `website/src/components/VoiceDictationPanel.tsx`, `VoiceStatusBar.tsx` | The animated panel, and the thin bar it falls back to |
+| Composer dictation | `website/src/components/chat-input/voice.ts` | The composer's side of the Voice atom: the caret a transcript splices in at, the dictation-panel gate, Escape to discard, and on touch the hold-to-talk mode and the labels its controls carry |
+| Composer voice controls | `website/src/components/chat-input/VoiceControls.tsx` | Renders that state: the hold gesture's cancel cue, the dictation panel or status bar, the hold target, and the mic |
 | Settings UI | `website/src/pages/settings/SttSettings.tsx` | Enable, provider, model, language, and the streaming knobs |
 
 ## WebSocket protocol
@@ -243,6 +245,50 @@ request is a grant an automated caller can take.
 
 Moving that check later, adding a CLI verb that records a grant, or reporting the
 refusal over some other channel each break one of those three properties.
+
+### Custom vocabulary (`transcribe` only)
+
+`stt.transcribe_vocabulary` names a custom vocabulary the operator already created
+in Amazon Transcribe (empty: none). Both Transcribe paths pass it as
+`VocabularyName`: the live socket and `transcribe._transcribe_aws`, so a voice memo
+hears the same names dictation does. Kiro Crew never creates, uploads or edits a
+vocabulary.
+
+- **One name rule for both writers.** `config.sections.transcribe_vocabulary_name`
+  is AWS's own constraint (1-200 of `[0-9A-Za-z._-]`, case-sensitive, surrounding
+  whitespace dropped). `PUT /api/config/stt` stores only a name it accepts, and the
+  loader degrades anything else to none with a one-time warning: the name rides on
+  every request as a header, so an unusable one could only fail them all.
+- **A refusal has its own code, narrowly.** A vocabulary that is missing, not yet
+  `READY`, or in a language other than the request's `LanguageCode` makes
+  `start_stream_transcription` itself raise `BadRequestException`, before any audio
+  is sent, with a message naming the vocabulary. When a vocabulary is configured
+  and the service's message names it, the frame carries
+  `stt_transcribe_vocabulary_rejected`, whose fix is in Settings rather than a
+  retry; every other start failure keeps `stt_session_failed`. The batch path keeps
+  its `None` failure contract.
+- **The panel warns before the first dictation.** The Voice panel compares the
+  chosen vocabulary against the list read from AWS and its language against
+  `effective_language_code`, and says that dictation will fail when the vocabulary
+  is not ready or is for another language. `VocabularyName` is also not valid with
+  language identification, which would need `VocabularyNames` instead.
+- **`GET /api/stt/vocabularies` lists what the picker offers.** Read from live
+  config, refused to an app token, and gated twice before any AWS call: `transcribe`
+  must be the provider and `aws_consent.refuse_and_log` must grant, otherwise it
+  answers `listed: false` with an empty list, and the panel judges only a listed
+  answer. It pages `ListVocabularies` through boto3 with the stream's credential
+  resolution (named profile, else the default chain) under bounded timeouts and a
+  page cap, and answers `listed: true` echoing the profile and region it read so a
+  list about a target the user has since changed decides nothing; `truncated` says
+  whether that cap left another page unread, so the picker does not infer absence
+  from an incomplete list. A failure answers 502 with `stt_vocabularies_access_denied`
+  (plus the IAM `permission` to grant) or
+  `stt_vocabularies_list_failed`, never the service's text, which names the caller's
+  ARN on a denial.
+- **The picker never changes the setting by itself.** It offers `READY`
+  vocabularies plus the stored name when the list lacks it, is disabled and says it
+  is loading while the list is still being read with the stored value still shown,
+  and warns when the stored name is not ready in the configured region.
 
 ## The local provider's pipeline
 
@@ -443,7 +489,7 @@ answers were tried first and are worth naming: force-adding the files into
 `temp-screenshots/` puts binaries in this repository's history forever past a
 `.gitignore` rule that exists to prevent exactly that -- the force-add is reserved for
 a fork contributor whom GitHub's upload endpoint refuses, never for this repository's
-own agents (prepare-pr's `references/rationale.md` records the exception and its
+own agents (kirocrew-prepare-pr's `references/rationale.md` records the exception and its
 merge-time cost) -- and hosting them on a side branch leaves the evidence outside the
 PR with no tie to its head, which the design lane rejects as unevaluable. For an
 author with write access the attachment path is the only one that satisfies both.
@@ -673,7 +719,7 @@ rather than a new one. The prompt forbids changing a word at all, and
 the recogniser has (CER 0.436 on `base`) and therefore the input a model is most
 tempted to "fix" by rendering it in one language.
 
-Four properties, each with a test:
+Five properties, each with a test:
 
 - **Never blocks dictation.** The recogniser's own text is in the composer and is
   already sendable before the request goes out. The correction replaces it a moment
@@ -782,6 +828,24 @@ Four properties, each with a test:
   byte-identical drafts -- an empty one is the common case -- so a late reply for slot
   A satisfied "the text is unchanged" and rewrote slot B's draft. Identity has to be
   checked as identity.
+
+- **The failure notice lives as long as the delivery it describes, and no longer.**
+  A cleanup that did not run is surfaced on the composer's existing dismissible error
+  channel, which it SHARES with the microphone's own error -- so it has to share that
+  error's lifetime too. `useVoiceInput` clears its half at the top of every `start()`,
+  and `useComposerVoice` clears `polishError` at the four moments the delivery stops
+  being the one in front of the user: a new capture, a new delivery, a send, and a slot
+  change. Without that the notice is not merely stale: `ChatInput`'s `showDictation`
+  gate blanks the live dictation panel whenever `voiceError` is set, on the premise
+  that an error on that channel means the microphone, so a cleanup failure left
+  standing takes the waveform down for the NEXT recording, whose microphone is fine.
+  Clearing at those four moments is not enough on its own: the request can be in flight
+  across any of them (the server allows up to `_POLISH_TIMEOUT_SECS`, and a transport
+  drop or gateway restart rejects it late), so the rejection would re-raise the notice
+  after the clear ran. The `.catch` therefore carries the same owner, epoch and
+  capture-generation snapshot the `.then` does and drops the notice when any has moved
+  on -- the capture generation and not just the epoch, because a new `start()` clears
+  the notice and bumps the capture generation but does not bump the epoch.
 
 - **Not applied to a manually-stopped stream, which is a known gap.** After a manual
   stop the partial route (not the delivery route) is what turns the last hypothesis

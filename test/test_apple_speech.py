@@ -1135,6 +1135,33 @@ class TestStreamingSession:
         await session.close()
         await session.close()
 
+    @pytest.mark.asyncio
+    async def test_a_helper_line_that_is_not_an_object_is_skipped_mid_utterance(self):
+        """``RecursionError`` (a line nested past the decoder) and the plain
+        ``ValueError`` of an over-long integer are not ``JSONDecodeError``s:
+        unlisted, either ended the reader and dictation with it."""
+        from types import SimpleNamespace
+
+        from stray_line_helpers import STRAY_LINES
+
+        stdout = asyncio.StreamReader(limit=1 << 20)
+        for line in (
+            b'{"type": "partial", "text": "hel"}\n',
+            *(make() for make in STRAY_LINES.values()),
+            b'{"type": "final", "text": "hello"}\n',
+        ):
+            stdout.feed_data(line)
+        stdout.feed_eof()
+        session = apple_speech.StreamingSession()
+        session._proc = SimpleNamespace(stdout=stdout)  # type: ignore[assignment]
+
+        await asyncio.wait_for(session._read_events(), timeout=10)
+
+        kinds = []
+        while (event := session._queue.get_nowait()) is not None:
+            kinds.append(event["type"])
+        assert kinds == ["partial", "final"]
+
 
 class TestHelperArgvPinsFast:
     """Pin the ``--fast`` flag in the STREAMING helper argv.
@@ -1763,6 +1790,8 @@ class TestEndToEndMacOS:
 
     Skipped rather than mocked on other platforms because the point is to catch a
     Swift-side regression (an API rename, a signature change) that no mock can see.
+    The fixture uses the en-US Samantha voice rather than the operator's default
+    voice, matching the recognizer locale without changing any host preference.
     """
 
     @pytest.mark.asyncio
@@ -1783,7 +1812,7 @@ class TestEndToEndMacOS:
         # child runs from tmp_path so any file it creates lands there, not in
         # the checkout it would otherwise inherit as CWD.
         proc = await asyncio.create_subprocess_exec(
-            "say", "-o", str(audio), "the build is green", cwd=tmp_path
+            "say", "-v", "Samantha", "-o", str(audio), "the build is green", cwd=tmp_path
         )
         await proc.wait()
         assert audio.is_file()
@@ -1819,6 +1848,8 @@ class TestEndToEndMacOS:
         # stray output out of the checkout (see test_round_trip).
         proc = await asyncio.create_subprocess_exec(
             "say",
+            "-v",
+            "Samantha",
             "-o",
             str(aiff),
             "the continuous integration build is green and the tests all pass",

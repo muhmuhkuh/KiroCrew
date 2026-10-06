@@ -54,6 +54,7 @@ from kiro_crew.apps.builtins.auto_research.session_keys import (
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
     AUTONUDGE_STOP_REASON,
+    CONSECUTIVE_FAILURE_REASON,
     MONITOR_TERMINAL_REASON,
     is_channel_key,
 )
@@ -663,6 +664,12 @@ async def _monitor_start(
         # splat, so a brief the tool accepted and this line omitted would be dropped
         # without a word -- the loop would arm with no judge and nothing would say so.
         judge=args.get("judge") if isinstance(args.get("judge"), dict) else None,
+        # Named explicitly for the reason the two lines above are: this call has no
+        # splat, so a watch the tool accepted and this line omitted would validate
+        # cleanly and then be discarded -- the caller told its request was valid and
+        # handed an ordinary timer, which is the exact contract the schema's own
+        # absence-pin was holding the field back to avoid.
+        watch=str(args.get("watch") or ""),
         source="mcp-directive",
         caller="session-directive",
         gate=gate,
@@ -1001,6 +1008,18 @@ async def _monitor_update(
                     "a tool it needed went unanswered at the approval prompt; "
                     "re-enable auto-approve, then re-arm it with monitor_start"
                 )
+            elif reason == CONSECUTIVE_FAILURE_REASON:
+                # Not a cap and not a human pause: several of its own cycles
+                # reached a session and died in a row. Raising a bound does not
+                # fix the fault, so this stays in the deny path with the remedy
+                # that works — look at the error, fix the cause, re-arm; a cycle
+                # that completes clears the streak.
+                bound = (
+                    "several of its cycles reached a model session and then died "
+                    "in a row (a backend error, a persistent tool failure or a "
+                    "timeout); look at the session for the error, fix the cause, "
+                    "then re-arm it with monitor_start"
+                )
             else:
                 bound = "it was paused manually; ask the user, or use monitor_start"
             raise _DirectiveDenied(
@@ -1043,6 +1062,10 @@ async def _monitor_update(
         # Absent leaves the brief alone; ``{}`` clears it. Same absent-vs-explicit
         # distinction as ``banner`` above, preserved by the tool surface.
         judge=patch.get("judge"),
+        # Absent leaves the loop's subject alone. There is no clear request to pass on:
+        # the tool drops a blank rather than forwarding one, so anything that arrives
+        # here names the watch to arm.
+        watch=patch.get("watch"),
         # A message write with NO baseline SKIPS the stale check rather than failing it, so
         # hand it the token read above -- scoped to the message case, as the handler's 409 is.
         expect_fingerprint=(baseline_token if patch.get("message") is not None else None),
@@ -1161,8 +1184,15 @@ async def _structured_monitor_update(
     }
     if budget_fields & set(patch):
         values = {field: int(patch[field]) for field in budget_fields if field in patch}
-        if any(value <= 0 for value in values.values()):
-            raise _DirectiveDenied("structured monitor budgets must be positive")
+        # ``max_agent_turns`` alone admits 0, its unlimited sentinel; the other
+        # three budgets are what keep an unlimited wake count affordable, so a
+        # zero there would leave the watch with no cost ceiling.
+        unbounded = {"max_agent_turns"}
+        if any(value < (0 if field in unbounded else 1) for field, value in values.items()):
+            raise _DirectiveDenied(
+                "structured monitor budgets must be positive, "
+                "except max_agent_turns where 0 means unlimited"
+            )
         structured["budget_patch"] = values
     updated, error, _status = await authorize_and_update_monitor(
         svc=svc,

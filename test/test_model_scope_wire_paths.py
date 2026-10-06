@@ -471,6 +471,8 @@ class TestTheWarmPoolClaim:
 
         factory = MagicMock(return_value=pooled)
         manager = SessionManager(cfg, factory)
+        # The simulated claim must run even when this harness disables real pooling.
+        manager._pool_size = 2
         manager._drain_and_claim = AsyncMock(return_value=pooled)
         manager._resolve_agent_model = MagicMock(
             return_value="global.anthropic.claude-sonnet-4-6[1m]"

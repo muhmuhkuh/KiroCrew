@@ -1,9 +1,16 @@
-"""Jev Choice questions over HTTP, using https://docs.typesafe.ai/api.
+"""Jev questions over HTTP, using https://docs.typesafe.ai/api.
 
-Requests map options to nullable rubric text in ``criteria``. Responses must
-carry the matching ``choice`` type and a finite probability for the chosen
-option. The gate validates answer domains before a skill selection is consumed.
-Transport and protocol failures raise; the gate supplies fallback, not retries.
+Each question type maps to the provider's own: a ``Choice`` sends its options as
+nullable rubric text in ``criteria``, a ``Noul`` sends its optional yes/no rubric
+as ``criteria.true`` / ``criteria.false``, and a ``Score`` sends its levels as
+the ordered ``criteria`` array. Every answer must carry the type of the question
+it answers and that type's own fields, finite and in range; anything else is a
+protocol error. The gate validates answer domains again before anything is
+consumed. Transport and protocol failures raise; the gate supplies fallback, not
+retries.
+
+The same client serves a local System One server (``decisions/local_models.py``):
+an endpoint on a literal loopback address is sent no credential at all.
 """
 
 from __future__ import annotations
@@ -12,11 +19,53 @@ import asyncio
 import logging
 import math
 from typing import Any
+from urllib.parse import urlsplit
 
 from kiro_crew.config.sections import DECISION_PROVIDER_MODEL_DEFAULT
-from kiro_crew.decisions.types import Answer, Answers, Choice, Question, is_model_id
+from kiro_crew.decisions.local_models import active_id, is_loopback_endpoint
+from kiro_crew.decisions.types import (
+    SCORE_MAX_LEVELS,
+    SCORE_MIN_LEVELS,
+    Answer,
+    Answers,
+    Choice,
+    Noul,
+    Question,
+    Score,
+    is_model_id,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Hand-written loopback addresses already warned about, so the withheld key is
+#: said once per address rather than once per decision. Keyed on scheme, host and
+#: port -- not the raw string, which a config writer could vary without end -- and
+#: bounded, so no sequence of writes can grow it past a handful of entries.
+_keyless_loopback_warned: set[str] = set()
+_KEYLESS_WARNED_MAX = 32
+
+
+def _warn_keyless_custom_loopback(endpoint: str, model: str) -> None:
+    """Say once that a hand-written loopback address is sent no Jev key.
+
+    A preset is a local model server and needs none. An address the owner wrote by
+    hand may be a tunnel to hosted Jev, which then answers 401 and the decisions
+    quietly stop; this line is what names the cause.
+    """
+    if active_id(endpoint, model) != "custom":
+        return
+    parts = urlsplit(endpoint.strip())
+    key = f"{parts.scheme}://{parts.hostname}:{parts.port}"
+    if key in _keyless_loopback_warned:
+        return
+    if len(_keyless_loopback_warned) >= _KEYLESS_WARNED_MAX:
+        _keyless_loopback_warned.clear()
+    _keyless_loopback_warned.add(key)
+    logger.warning(
+        "decisions: no Jev API key is sent to a loopback endpoint; a local proxy to "
+        "hosted Jev must add the credential itself"
+    )
+
 
 # Bound the complete body, including chunked responses, before JSON parsing.
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -89,7 +138,7 @@ def resolve_api_key(raw: str) -> str:
 
 
 def _to_wire(state: dict | str, model: str, questions: list[Question]) -> dict[str, Any]:
-    """Map Choice options to the provider's criteria map.
+    """Map each question to the provider's wire shape for its type.
 
     The model id is checked here as well as by the gate's scrub: this is the one
     function that puts it on the wire, so the bound holds for any caller.
@@ -98,14 +147,31 @@ def _to_wire(state: dict | str, model: str, questions: list[Question]) -> dict[s
         raise JevProtocolError("provider.model is not a model id")
     wire_questions: dict[str, Any] = {}
     for q in questions:
-        if not isinstance(q, Choice):
-            raise JevProtocolError("unsupported question type")
-        wire_questions[q.id] = {
+        wire_questions[q.id] = _question_to_wire(q)
+    return {"state": state, "model": model, "questions": wire_questions}
+
+
+def _question_to_wire(q: object) -> dict[str, Any]:
+    """One question in the provider's shape, or raise for a class it has none for."""
+    if isinstance(q, Choice):
+        return {
             "type": "choice",
             "instructions": q.prompt,
             "criteria": {opt: None for opt in q.options},
         }
-    return {"state": state, "model": model, "questions": wire_questions}
+    if isinstance(q, Noul):
+        wire: dict[str, Any] = {"type": "noul", "instructions": q.prompt}
+        criteria = {
+            key: text for key, text in (("true", q.true_means), ("false", q.false_means)) if text
+        }
+        if criteria:
+            wire["criteria"] = criteria
+        return wire
+    if isinstance(q, Score):
+        if not SCORE_MIN_LEVELS <= len(q.levels) <= SCORE_MAX_LEVELS:
+            raise JevProtocolError("score question has an unsupported number of levels")
+        return {"type": "score", "instructions": q.prompt, "criteria": list(q.levels)}
+    raise JevProtocolError("unsupported question type")
 
 
 def _from_wire(body: Any, questions: list[Question]) -> Answers:
@@ -125,7 +191,13 @@ def _from_wire(body: Any, questions: list[Question]) -> Answers:
 
 
 def _answer_from_wire(q: Question, raw: dict) -> Answer:
-    """Validate wire fields before constructing an answer."""
+    """Validate wire fields before constructing an answer, by question type."""
+    if isinstance(q, Noul):
+        return _noul_from_wire(q, raw)
+    if isinstance(q, Score):
+        return _score_from_wire(q, raw)
+    if not isinstance(q, Choice):
+        raise JevProtocolError("unsupported question type")
     if raw.get("type") != "choice":
         raise JevProtocolError("answer type does not match question")
     chosen = raw.get("choice")
@@ -145,6 +217,45 @@ def _answer_from_wire(q: Question, raw: dict) -> Answer:
     )
 
 
+def _noul_from_wire(q: Noul, raw: dict) -> Answer:
+    """``{"type": "noul", "noul": <0..1>}``: the value IS the probability of yes."""
+    if raw.get("type") != "noul":
+        raise JevProtocolError("answer type does not match question")
+    value = _as_float_or_none(raw.get("noul"))
+    if value is None or not 0.0 <= value <= 1.0:
+        raise JevProtocolError("answer has no valid 'noul' probability")
+    return Answer(id=q.id, value=value, p=max(value, 1.0 - value))
+
+
+def _score_from_wire(q: Score, raw: dict) -> Answer:
+    """``{"type": "score", "score", "probabilities", "confidence"}``, checked against the levels.
+
+    ``probabilities`` is keyed by level index as a string. It may name only this
+    question's own levels and must name at least one, because ``p`` is the
+    probability of the most likely level and an empty map carries none.
+    """
+    if raw.get("type") != "score":
+        raise JevProtocolError("answer type does not match question")
+    top = len(q.levels) - 1
+    value = _as_float_or_none(raw.get("score"))
+    if value is None or not 0.0 <= value <= top:
+        raise JevProtocolError("answer has no valid 'score'")
+    probabilities = raw.get("probabilities")
+    if not isinstance(probabilities, dict) or not probabilities:
+        raise JevProtocolError("answer has no 'probabilities' object")
+    allowed = {str(index) for index in range(top + 1)}
+    level_ps: list[float] = []
+    for level, raw_p in probabilities.items():
+        if level not in allowed:
+            raise JevProtocolError("probabilities name a level this question does not offer")
+        level_p = _as_float_or_none(raw_p)
+        if level_p is None or not 0.0 <= level_p <= 1.0:
+            raise JevProtocolError("a level probability is not a finite number in 0..1")
+        level_ps.append(level_p)
+    confidence = _as_float_or_none(raw.get("confidence"))
+    return Answer(id=q.id, value=value, p=max(level_ps), confidence=confidence)
+
+
 def _as_float_or_none(raw: Any) -> float | None:
     """*raw* as a finite float, or ``None``. Never coerces: a bool or a string is not a number."""
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
@@ -154,7 +265,7 @@ def _as_float_or_none(raw: Any) -> float | None:
 
 
 class JevOracle:
-    """Ask Jev for the Choice answers consumed by the decision gate."""
+    """Ask Jev for the typed answers consumed by the decision gate."""
 
     def __init__(self, provider: Any) -> None:
         self._endpoint = str(getattr(provider, "endpoint", "") or _DEFAULT_ENDPOINT)
@@ -170,9 +281,17 @@ class JevOracle:
         """
         if not questions:
             raise JevProtocolError("no questions to ask")
-        api_key = await asyncio.to_thread(resolve_api_key, self._api_key_setting)
-        if not api_key:
-            raise JevProtocolError("no api key configured")
+        headers = {"Content-Type": "application/json"}
+        # A local model server gets NO credential. Whatever listens on a loopback
+        # port is not TypeSafe, and handing it the Jev key would give that key to
+        # any process on this machine that bound the port first.
+        if not is_loopback_endpoint(self._endpoint):
+            api_key = await asyncio.to_thread(resolve_api_key, self._api_key_setting)
+            if not api_key:
+                raise JevProtocolError("no api key configured")
+            headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            _warn_keyless_custom_loopback(self._endpoint, self._model)
 
         import aiohttp
 
@@ -188,10 +307,7 @@ class JevOracle:
                 self._endpoint,
                 json=body,
                 allow_redirects=False,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
             ) as resp:
                 if resp.status < 200 or resp.status >= 300:
                     raise JevHttpError(f"HTTP {resp.status}")

@@ -26,6 +26,9 @@ include src/kiro_crew/model_tokens.json
 # Excluded from package_data globs and .gitignored, but it MUST ship so that a
 # `pip install .` / sdist install serves the dashboard with no npm/node present.
 recursive-include src/kiro_crew/static *
+# ...but not the immutable copies staging keeps beside it: static/dist links
+# to one of them and ships through the link.
+prune src/kiro_crew/static/.dist.*
 
 # --- Other package_data directories ------------------------------------------
 recursive-include src/kiro_crew/config *
@@ -33,8 +36,19 @@ recursive-include src/kiro_crew/config *
 # setup.cfg alone would still ship a wheel-only fix: `python -m build` builds the
 # wheel from the sdist, so a template missing here is missing everywhere.
 recursive-include src/kiro_crew/agent_panel_templates *.html
+# Derived-card pages (e.g. the pipeline board), for the same reason: a page missing
+# from the sdist is missing from the wheel built out of it, and a page that never
+# shipped renders an empty card with every gate green. Kept out of dashboard_templates
+# on purpose -- that is the TemplateSpec registry package, and a card page that does not
+# use that framework must not sit under the gate that requires a registry row.
+recursive-include src/kiro_crew/dashboard_card_pages *.html
+# Dashboard-template pages, for the same reason: a page missing from the sdist is
+# missing from the wheel built out of it, and a page that never shipped renders an
+# empty card with every gate green.
+recursive-include src/kiro_crew/dashboard_templates *.html
 recursive-include src/kiro_crew/connections *.json
 recursive-include src/kiro_crew/data *.json
+recursive-include src/kiro_crew/decisions/local_servers *.py *.txt
 recursive-include src/kiro_crew/apps *.json
 # ATTRIBUTION.md / README.md under a builtin app carry the upstream-author credit
 # for apps ported from third-party work; Apache-2.0 attribution must ship.

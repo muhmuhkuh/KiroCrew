@@ -55,7 +55,9 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.mcp_gateway import read_limits
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
+from kiro_crew.mcp_gateway.hashing import format_pool_label
 
 if TYPE_CHECKING:
     from kiro_crew.mcp_gateway.backend import Backend
@@ -63,44 +65,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Per-stream byte ceiling for ``readuntil(b"\n")`` across the gateway.
-# Passed as ``limit=`` to every asyncio reader the module creates
-# (subprocess pipes, unix sockets). Default 64 MiB — generous enough for
-# any real MCP tool response (ReadInternalWebsites can return 1-5 MiB pages).
-# Config-driven via ``mcp_gateway.read_buffer_limit_bytes`` / env var
-# ``KIROCREW_MCP_READ_LIMIT``. Asyncio's stdlib default is 64 KiB which is
-# too small, and even a 1 MiB limit silently drops legitimate large responses.
-_DEFAULT_READ_BUFFER_LIMIT = 64 * 1024 * 1024  # 64 MiB
+# Per-stream byte ceiling for ``readuntil(b"\n")`` across the gateway, passed
+# as ``limit=`` to every asyncio reader this module creates (subprocess pipes,
+# unix sockets). The value and its resolution order live in the stdlib-only
+# ``read_limits`` leaf so ``mcp_gateway.stub`` can read the same ceiling without
+# importing this module and the config package behind it; the names below are
+# the surface callers of this module already use.
+_DEFAULT_READ_BUFFER_LIMIT = read_limits._DEFAULT_READ_BUFFER_LIMIT
+_resolve_read_buffer_limit = read_limits.resolve_read_buffer_limit
 
-
-def _resolve_read_buffer_limit() -> int:
-    """Resolve the read buffer limit.
-
-    Precedence: env var ``KIROCREW_MCP_READ_LIMIT`` (bytes) → config key
-    ``mcp_gateway.read_buffer_limit_bytes`` → hard-coded default. Config read is
-    function-level to avoid an import cycle and is best-effort (config
-    unavailable at import → default).
-    """
-    raw = os.environ.get("KIROCREW_MCP_READ_LIMIT")
-    if raw:
-        try:
-            val = int(raw)
-            if val >= 1024:
-                return val
-        except (ValueError, TypeError):
-            pass
-    try:
-        from kiro_crew.config.loader import _raw_config
-
-        cfg_val = (_raw_config().get("mcp_gateway") or {}).get("read_buffer_limit_bytes")
-        if isinstance(cfg_val, int) and not isinstance(cfg_val, bool) and cfg_val >= 1024:
-            return cfg_val
-    except Exception:
-        logger.debug("mcp read limit: config unavailable, using default", exc_info=True)
-    return _DEFAULT_READ_BUFFER_LIMIT
-
-
-READ_BUFFER_LIMIT_BYTES: int = _resolve_read_buffer_limit()
+READ_BUFFER_LIMIT_BYTES: int = read_limits.resolve_read_buffer_limit()
 
 
 # Default spill threshold — responses larger than this (but under the read
@@ -268,22 +242,12 @@ class PoolKey:
     def human_readable(self) -> str:
         """Short log-friendly label. NOT collision-resistant — use
         :meth:`stable_hash` as the actual pool dict key.
+
+        Delegates to :func:`kiro_crew.mcp_gateway.hashing.format_pool_label`, which
+        reads the same fields off a Register payload, so the stub's log line
+        and the daemon's name one identity the same way.
         """
-        cmd_short = (
-            (self.command_args_hash[:8] + "…")
-            if len(self.command_args_hash) > 8
-            else self.command_args_hash
-        )
-        env_short = (
-            (self.effective_env_hash[:8] + "…")
-            if len(self.effective_env_hash) > 8
-            else self.effective_env_hash
-        )
-        return (
-            f"{self.agent_name}:{self.server_name} "
-            f"uid={self.os_uid} sbx={self.sandbox_mode} "
-            f"cmd={cmd_short} env={env_short} ws={self.work_dir}"
-        )
+        return format_pool_label(asdict(self))
 
 
 # --- BackendPool skeleton ---------------------------------------------------

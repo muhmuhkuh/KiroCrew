@@ -54,7 +54,7 @@ from kiro_crew.executors import embed_executor, run_in_embed_pool, run_with_reca
 from kiro_crew.history import is_incognito_transcript, transcript_privacy_mode
 from kiro_crew.hooks import FileTooLargeError
 from kiro_crew.loop_lock import LoopBoundLock
-from kiro_crew.memory import normalize_projects_document
+from kiro_crew.memory import normalize_projects_document, projects_cap_overflow
 from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.platform.context import redact_log_via_context
@@ -166,6 +166,18 @@ def _memory_document_changed_response() -> web.Response:
         {
             "error": "memory changed while this document was being saved",
             "code": "memory_document_changed",
+        },
+        status=409,
+    )
+
+
+def _memory_document_undecodable_response(name: str) -> web.Response:
+    """Refuse a document whose bytes are not UTF-8; the file is left as it is."""
+    return web.json_response(
+        {
+            "error": f"{name} is not valid UTF-8 and cannot be shown or saved",
+            "code": "memory_document_undecodable",
+            "file": name,
         },
         status=409,
     )
@@ -438,11 +450,15 @@ async def api_memory_preferences(request: web.Request) -> web.Response:
                         return _memory_document_changed_response()
                 except _MemoryDocumentRedacted:
                     return _memory_document_redacted_response()
+                except UnicodeDecodeError:
+                    return _memory_document_undecodable_response("preferences.md")
                 except (UnknownMemoryStore, OSError) as exc:
                     return _store_unavailable_response(store, exc)
         return web.json_response({"ok": True})
     try:
         content = await asyncio.to_thread(mem.read_preferences)
+    except UnicodeDecodeError:
+        return _memory_document_undecodable_response("preferences.md")
     except (UnknownMemoryStore, OSError) as exc:
         return _store_unavailable_response(store, exc)
     return _memory_document_response(content)
@@ -520,11 +536,29 @@ async def api_memory_projects(request: web.Request) -> web.Response:
                         return _memory_document_changed_response()
                 except _MemoryDocumentRedacted:
                     return _memory_document_redacted_response()
+                except UnicodeDecodeError:
+                    return _memory_document_undecodable_response("projects.md")
                 except (UnknownMemoryStore, OSError) as exc:
                     return _store_unavailable_response(store, exc)
+                from datetime import datetime
+
+                today = datetime.now().strftime("%Y-%m-%d")
+                overflow = projects_cap_overflow(normalize_projects_document(content, today=today))
+                if overflow:
+                    # Saved whole, but session startup injects only the head: say so.
+                    return web.json_response(
+                        {
+                            "ok": True,
+                            "warning": "Saved, but sessions only load the start of Active "
+                            f"Projects: {overflow} chars past the limit are cut off.",
+                            "overflow_chars": overflow,
+                        }
+                    )
         return web.json_response({"ok": True})
     try:
         content = await asyncio.to_thread(mem.read_projects)
+    except UnicodeDecodeError:
+        return _memory_document_undecodable_response("projects.md")
     except (UnknownMemoryStore, OSError) as exc:
         return _store_unavailable_response(store, exc)
     return _memory_document_response(content)
@@ -1564,7 +1598,11 @@ async def api_memory_embedding_status(request: web.Request) -> web.Response:
                 "path": str(custom.path) if custom is not None else "",
                 "error": setup_error,
             },
-            "setup_warning": LEGACY_EMBEDDING_WARNING if inherited else "",
+            "setup_warning": (
+                LEGACY_EMBEDDING_WARNING
+                if inherited
+                else str(_embedding_setup_status.get("warning", ""))
+            ),
             "setup_warning_code": "legacy_embedding_vectors" if inherited else "",
             "setup_warning_params": {},
             "repair": repair,
@@ -1718,6 +1756,7 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
         )
 
     # Ensure faiss-cpu is installed (required for FAISS vector index).
+    faiss_warning = ""
     async with _faiss_install_lock:
         try:
             import faiss  # noqa: F401
@@ -1797,15 +1836,12 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
                             status=500,
                         )
                     if proc.returncode != 0:
-                        logger.warning("faiss-cpu install failed: %s", _redact_pip_stderr(stderr))
-                        _embedding_setup_status = {
-                            "step": "idle",
-                            "error": "faiss-cpu installation failed — click Enable to retry",
-                        }
-                        return web.json_response(
-                            {"error": "faiss-cpu installation failed. Click Enable to retry."},
-                            status=500,
-                        )
+                        # Same fall-through as the no-sandbox branch; the reason
+                        # reaches the card via embedding-status's setup_warning.
+                        reason = _redact_pip_stderr(stderr)
+                        logger.warning("faiss-cpu install failed: %s", reason)
+                        tail = reason.strip().splitlines()[-1:] or ["no compatible wheel"]
+                        faiss_warning = f"faiss install failed: {tail[0][:200]}"
                     else:
                         importlib.invalidate_caches()
                         logger.info("Installed faiss-cpu for vector indexing")
@@ -1890,7 +1926,7 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
     state = request.app["state"]
     if state.consolidator:
         state.consolidator._migrated = True
-    _embedding_setup_status = {"step": "done", "error": ""}
+    _embedding_setup_status = {"step": "done", "error": "", "warning": faiss_warning}
     return web.json_response({"ok": True})
 
 

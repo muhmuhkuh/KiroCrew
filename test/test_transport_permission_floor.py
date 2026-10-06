@@ -799,6 +799,7 @@ _IDENTITY_GATED_APPROVAL_CALLERS = Counter(
         ("acp/client.py", "_handle_permission"): 1,
         ("apps/builtins/auto_improvement/spine/agent_runner.py", "_approve"): 1,
         ("apps/builtins/code_review_sage/sage_lib/review_pool.py", "send"): 1,
+        ("apps/builtins/code_review_sage/sage_lib/review_pool.py", "_send_pi"): 1,
         ("channel.py", "_stream_task"): 4,
         ("cli_chat.py", "_answer_permission"): 1,
         ("dashboard/chat_runner.py", "_run_chat"): 6,

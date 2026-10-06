@@ -57,7 +57,7 @@ class TestResolveLinkSummaries:
                 self.text = text
 
         class FakeClient:
-            async def prompt(self, prompt):
+            async def prompt(self, prompt, *, allow_image=True):
                 yield FakeEvent(EVENT_TEXT_CHUNK, "1. Nav Panel Feature CR\n2. Memory V2 Design Doc\n")
                 yield FakeEvent(EVENT_COMPLETE)
 
@@ -68,7 +68,7 @@ class TestResolveLinkSummaries:
                 pass
 
         class FakeSessions:
-            async def get_bg_session(self):
+            async def get_bg_session(self, start_priority=None):
                 return FakeClient()
 
         class FakeState:
@@ -91,7 +91,7 @@ class TestResolveLinkSummaries:
                 self.text = text
 
         class FakeClient:
-            async def prompt(self, prompt):
+            async def prompt(self, prompt, *, allow_image=True):
                 yield FakeEvent(EVENT_TEXT_CHUNK, "2024 Design Roadmap\n3-phase rollout plan\n")
                 yield FakeEvent(EVENT_COMPLETE)
 
@@ -102,7 +102,7 @@ class TestResolveLinkSummaries:
                 pass
 
         class FakeSessions:
-            async def get_bg_session(self):
+            async def get_bg_session(self, start_priority=None):
                 return FakeClient()
 
         class FakeState:
@@ -125,7 +125,7 @@ class TestResolveLinkSummaries:
                 self.text = text
 
         class FakeClient:
-            async def prompt(self, prompt):
+            async def prompt(self, prompt, *, allow_image=True):
                 yield FakeEvent(EVENT_TEXT_CHUNK, text)
                 yield FakeEvent(EVENT_COMPLETE)
 
@@ -136,7 +136,7 @@ class TestResolveLinkSummaries:
                 pass
 
         class FakeSessions:
-            async def get_bg_session(self):
+            async def get_bg_session(self, start_priority=None):
                 return FakeClient()
 
         class FakeState:

@@ -1573,10 +1573,14 @@ def drive(element):
             if isinstance(msg.get("id"), int):
                 got[msg["id"]] = msg
         if 2 in got and "result" in got[2]:
-            # The child MCP server is launched and queried after session/new answers.
+            # The child MCP server is launched and tools/list is queried after session/new answers.
             for _ in range(120):
-                if os.path.exists(report):
-                    break
+                try:
+                    with open(report) as f:
+                        if "tools/list" in json.load(f).get("methods", []):
+                            break
+                except (OSError, ValueError):
+                    pass
                 time.sleep(0.25)
         return got.get(1) or {}, got.get(2) or {}
     finally:
@@ -2456,7 +2460,7 @@ def test_the_installed_adapter_still_builds_the_frames_the_refusal_reads():
     """The frame VOCABULARY the deny channel keys on, pinned against the adapter.
 
     Three things identify a codex MCP call to Crew: the ``tool_call`` frame's
-    ``rawInput = {server, tool, arguments}`` (``createMcpRawInput``), its
+    ``rawInput = {server, tool, arguments}`` (the MCP input builder), its
     ``_meta.is_mcp_tool_call`` marker, and the approval request's
     ``_meta.is_mcp_tool_approval`` marker with ``cancel`` as its reject option
     (``buildMcpPermissionRequest`` / ``McpApprovalOptionId``). All three come from
@@ -2471,8 +2475,19 @@ def test_the_installed_adapter_still_builds_the_frames_the_refusal_reads():
     _require_codex_acp()
     assert _ENTRY is not None
     source = _ENTRY.read_text(encoding="utf-8", errors="replace")
+    # Pin the complete input mapping, not just a private helper's signature.
+    compact = re.sub(r"\s+", "", source)
+    input_builders = (
+        "functioncreateMcpRawInput(server,tool,argumentsValue){"
+        "return{server,tool,arguments:argumentsValue};}",
+        "functionmcpInput(item){"
+        "return{server:item.server,tool:item.tool,arguments:item.arguments};}",
+    )
+    assert any(builder in compact for builder in input_builders), (
+        f"codex-acp at {_ENTRY} no longer builds the exact server/tool/arguments input: "
+        "the frame shape the spec-restriction refusal reads has drifted"
+    )
     for needle in (
-        "function createMcpRawInput(server, tool, argumentsValue)",
         "is_mcp_tool_call: true",
         "is_mcp_tool_approval: true",
         'Cancel: "cancel"',

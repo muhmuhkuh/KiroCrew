@@ -1431,7 +1431,7 @@ def publish_if_authorized(pr: str, status: dict[str, Any]) -> tuple[bool, str]:
         proc = _gitlab_ready(pr)
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or [""]
-            return False, f"glab mr update --ready failed: {tail[0][:160]}"
+            return False, f"glab mr update --ready failed: {redact_via_context(tail[0])[:160]}"
         logger.info("watchers: marked MR %s ready for review (%s)", pr, reason)
         return True, reason
     proc = _gh("pr", "ready", pr)

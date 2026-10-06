@@ -35,7 +35,7 @@ const ACTION_CREATORS = [
   'clearTerminalSubagents', 'clearUndeletableHistory', 'clearUnresumableResume',
   'clearWorkflowRun', 'confirmOptimisticSend', 'dismissFollowupItem', 'editQueuedMessage',
   'endLocalTurn', 'finalizeAssistant', 'hydrateSlotMessages', 'markSendUnconfirmed', 'markSubagentApproving',
-  'openActivityPanel', 'openActivityToTab', 'openActivityToTool', 'reconcileWorkflowRuns',
+  'openActivityPanel', 'openActivityToTab', 'openActivityToTool', 'reconcileSubagentQueuedFromSlots', 'reconcileWorkflowRuns',
   'removeAutomation', 'removeByApprovalId', 'removeQueuedMessage', 'removeThinking',
   'reorderQueuedMessages', 'replaceMessages', 'requestFolderReveal', 'requestSlotReveal',
   'resolveByApprovalId', 'resolveOptimisticSteer', 'resolveQuestionCard', 'selectSubagent',
@@ -69,12 +69,12 @@ const THUNKS: Record<string, string> = {
 
 const FUNCTIONS = [
   'abortActiveOlderFetch', 'batchedTextAboveFloor', 'capturePendingAskId', 'clampToolOutput',
-  'countMatchedFetchLimit', 'floorForGen', 'isAwaitingSpawnApproval',
+  'countMatchedFetchLimit', 'floorForGen', 'hasUnidentifiedDurableRow', 'isAwaitingSpawnApproval',
   'isSupersededPagingRejection', 'isTerminalWorkflowStatus', 'mcpAppKey', 'missedChunkMarker',
-  'pendingQuestionFor', 'queueEditBroadcastAt', 'queueEntryAttachments', 'raiseChunkSeq',
+  'pendingQuestionFor', 'queueEditBroadcastAt', 'queueEntryAttachments', 'queueEntryQuote', 'raiseChunkSeq',
   'selectActiveSlotProject', 'selectAutomationForSlot', 'selectComposerBusy', 'selectContinuable',
   'selectSendConfirmed', 'selectSidebarApprovalCounts', 'selectSidebarAutomationRunningKeys',
-  'selectSidebarSubagentCounts', 'selectSidebarWorkflowActive', 'selectSidebarWorkflowActiveKeys',
+  'selectSidebarStartedSubagentCounts', 'selectSidebarSubagentCounts', 'selectSidebarWorkflowActive', 'selectSidebarWorkflowActiveKeys',
   'selectSlotMessages', 'selectSlotPendingApproval', 'selectSlotPendingSpawnApprovals',
   'selectSlotRunEpoch', 'selectSlotStreamState', 'selectSlotSubagents',
   'selectSlotSubagentsActive', 'selectSlotToolLog', 'selectSubagentActivityCount', 'selectTrailingSendUnconfirmed',
@@ -91,6 +91,7 @@ const CONSTANTS: Record<string, unknown> = {
   REFRESH_LIMIT_CEILING: 500,
   SLOT_DETAIL_MAX_LIMIT: 500,
   TOOL_OUTPUT_MAX_CHARS: 64000,
+  WINDOW_WALK_MAX_PAGES: 8,
   WORKFLOW_TERMINAL_STATUSES: ['finished', 'failed', 'cancelled'],
 }
 
@@ -101,7 +102,7 @@ const INITIAL_STATE = {
   slotStatusDetail: {}, slotHasMore: false, slotOldestIndex: 0, slotCursorKey: null,
   slotSwitchRequestId: null, slotSwitchTarget: null, slotSwitchOrigin: null, switchSlotGone: null,
   loadingOlder: false, slotOlderError: false, lastChunkSeq: undefined, lastChunkGen: undefined,
-  _wsChunkedDuringFetch: false, _redeliveredFramesDropped: 0, history: [], historyHasMore: false,
+  _wsChunkedDuringFetch: false, liveFrameSeq: 0, refreshAppliedSeq: {}, _redeliveredFramesDropped: 0, history: [], historyHasMore: false,
   historyOffset: 0, unresumableResume: null, lastResumeRequestId: null, undeletableHistory: null,
   pendingInput: null, agentSwitchNotice: null, creatingSlot: false, foregroundCreateId: null,
   lastCreatedActivation: null, slotContextPct: {}, slotContextTokens: {}, voicePlaying: false,

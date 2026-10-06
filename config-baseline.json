@@ -49,7 +49,7 @@
         "session_sharing": true,
         "max_subagents": 0,
         "max_stop_hook_nudges": 100,
-        "spawn_min_memory_gb": 4.0,
+        "spawn_min_memory_gb": 2.0,
         "resource_pressure_gb": 4.0,
         "resource_critical_gb": 2.0,
         "admission_gate": true,
@@ -57,6 +57,7 @@
         "task_dispatch_window": 64,
         "task_store_journal_mode": "auto",
         "admit_wait_secs": 30,
+        "subagent_queue_max_wait_secs": 1800,
         "start_collect_timeout_secs": 300,
         "lane_weights": {},
         "child_reserve": 1,
@@ -633,7 +634,7 @@
       "sensitive": false,
       "tags": [],
       "label": "MCP Tool Search",
-      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli backend only. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. Kiro Crew's OWN servers are exempt and always send full specs, whatever this is set to: loading one mid-turn would change the tools list a thinking block's signature is bound to and the provider would reject the conversation. No effect on an alternate ACP backend.",
+      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli backend only. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. Crew's servers defer only when the spawn runs the pinned kiro-cli install or its kiro-cli-chat, and both are >= 2.27.0; any other executable, an older or unknown version keeps them resident. To override the never-defer list, set ASBX_KIRO_MANDATORY_MCPS (comma-separated server names) in the gateway's environment. No effect on an alternate ACP backend.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -717,10 +718,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Spawn Min Memory GB",
-      "help": "Minimum available memory (GB) required to spawn a subagent. 0 disables the check.",
+      "help": "Available memory (GB) that must remain after admitting a subagent start. A dedicated-process start is priced at what such a runtime settles at (about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below subagent_cost_gb); one that shares its parent's runtime at about 0.35 GB less. A spawn that does not fit waits in the queue and is re-checked after admit_wait_secs; one in temporary or incognito memory mode, or with task_queue_enabled off, is lost if the gateway restarts. On macOS a start also waits while the kernel reports memory pressure and one of this gateway's dedicated subagents is running. 0 disables the check, that wait included.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 4.0
+      "defaultValue": 2.0
     },
     {
       "path": "agent.resource_pressure_gb",
@@ -731,7 +732,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Resource Pressure Threshold (GB)",
-      "help": "Available memory (GB) at or below which the agent is told host memory is 'tight' via a compact [RESOURCES] context line, so it can prefer the lighter path for heavy work (targeted tests, smaller sub-agent waves). Advisory only — not enforced. 0 disables the context line. Lower this on small-memory hosts / memory-limited containers (e.g. a 2-4 GB pod) so the advisory only fires under genuine pressure.",
+      "help": "Available memory (GB) at or below which the agent is told host memory is 'tight' via a compact [RESOURCES] context line, so it can prefer the lighter path for heavy work (targeted tests, smaller sub-agent waves). On macOS the line also fires while the kernel reports memory pressure. Advisory only — not enforced. 0 disables the context line, that macOS case included. Lower this on small-memory hosts / memory-limited containers (e.g. a 2-4 GB pod) so the advisory only fires under genuine pressure.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 4.0
@@ -759,7 +760,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Posture Admission Gate",
-      "help": "While available memory is at or below resource_critical_gb, defer scheduled cron firings to the next tick and defer new subagent spawns (they stay queued in the task store and are re-checked after admit_wait_secs) until memory frees. Manually triggered cron runs, in-flight subagents, and direct chat turns are never gated; an unreadable probe admits (fail-open). Set false to make the critical posture advisory-only.",
+      "help": "While available memory is at or below resource_critical_gb, defer scheduled cron firings to the next tick until memory frees. Subagent spawns are not gated on this posture; they wait on spawn_min_memory_gb instead. Manually triggered cron runs and direct chat turns are never gated; an unreadable probe admits (fail-open). Set false to make the critical posture advisory-only.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -822,6 +823,20 @@
       "enumValues": null,
       "defaultValue": 30,
       "requiresRestart": true
+    },
+    {
+      "path": "agent.subagent_queue_max_wait_secs",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Subagent Queue Max Wait (seconds)",
+      "help": "How long a subagent waits for free memory before it gives up. Its parent is then told it never started. Waiting for a free slot does not count, except on macOS: a start held for memory pressure is timed from its first hold. 0 waits forever; the most is 86400 (one day).",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 1800
     },
     {
       "path": "agent.start_collect_timeout_secs",
@@ -919,7 +934,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Session Start Concurrency",
-      "help": "How many ACP session/new requests may be outstanding at once per gateway event loop (the SessionStartGate). session/new blocks while the backend initializes the session's MCP servers, so a burst of subagent starts on one shared runtime slows every start until the budget is hit; queued starts wait in FIFO order and their queue time is not counted against the start budget or the startup watchdog. A fixed bound, not adaptive: the adaptive loop is the MCP gateway spawn gate and the execution-cap controller. Clamped to 1..64.",
+      "help": "How many ACP session/new requests may be outstanding at once per gateway event loop (the SessionStartGate). session/new blocks while the backend initializes the session's MCP servers, so a burst of subagent starts on one shared runtime slows every start until the budget is hit; queued starts a person is waiting on are served first, except that a waiting background start is let through after a bounded run of them so it is never starved, and FIFO within each class. Queue time is not charged to the start budget or the startup deadline, but a subagent start that stays queued past the start-queue cap ends as never started, unless its subagent timeout ends it first. A fixed bound, not adaptive: the adaptive loop is the MCP gateway spawn gate and the execution-cap controller. Clamped to 1..64.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 2,
@@ -1206,7 +1221,7 @@
       "sensitive": false,
       "tags": [],
       "label": "SubAgent Memory Cost (GB)",
-      "help": "Free memory (GB) each sub-agent start must find on top of the admission floor; also the per-agent fallback used to auto-size the cap until a learned value accumulates. Raise it on hosts whose runtimes settle heavier.",
+      "help": "The least a dedicated sub-agent start is priced at when admission reserves its memory (the measured or learned settled size applies when higher); also the per-agent fallback used to auto-size the cap until a learned value accumulates.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.5
@@ -1248,7 +1263,7 @@
       "sensitive": false,
       "tags": [],
       "label": "SubAgent Spawn Stagger (seconds)",
-      "help": "Delay between successive subagent spawns (initial fill and queued drain) to bound cold-start CPU/memory spikes. Starts stay serialized; the interval only decides how fast a wide fan-out fills. Raise it if this host or the model provider is the bottleneck -- a spawn still has to clear spawn_min_memory_gb and the host budget, and the adaptive controller cuts the cap on real pressure, so this is a smoothing interval rather than the memory guard.",
+      "help": "Delay between successive subagent spawns (initial fill and queued drain) to bound cold-start CPU/memory spikes. Starts stay serialized; the interval only decides how fast a wide fan-out fills. Raise it if this host or the model provider is the bottleneck -- a spawn still has to leave spawn_min_memory_gb free after its start and clear the host budget, and the adaptive controller cuts the cap on real pressure, so this is a smoothing interval rather than the memory guard.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.25
@@ -1452,12 +1467,13 @@
         "empty_response_auto_continue": true,
         "empty_response_max_continues": 1,
         "autocompact_pct": 70.0,
+        "compact_wait_secs": 0.0,
         "pool_size": 0,
         "pool_agent": "",
         "pool_ttl_secs": 1800,
         "eager_spawn": true,
         "archive_retention_days": 30,
-        "watchdog_rss_max_mb": 1536,
+        "watchdog_rss_max_mb": 0,
         "reconcile_max_kills": 5
       }
     },
@@ -1516,6 +1532,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 70.0
+    },
+    {
+      "path": "session.compact_wait_secs",
+      "kind": "core",
+      "type": "number",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Compaction Wait Budget",
+      "help": "Seconds to wait for a compaction to finish: automatic, the task runner's context-overflow compaction, and a manual /compact on any surface. Past it, the session manager's automatic compaction and the task runner's compaction restart the session, a chat channel's near-limit compaction gives up and keeps the session, and a manual /compact reports that it timed out. 0 (the default) uses the built-in budget. A positive value below 60 is raised to 60 and a value above 3600 is capped. Raise it on a host where compaction on a large context window regularly needs longer than the built-in budget; a stuck compaction also waits the full budget.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0.0
     },
     {
       "path": "session.pool_size",
@@ -1597,10 +1627,10 @@
       "sensitive": false,
       "tags": [],
       "label": "Watchdog RSS Limit (MiB)",
-      "help": "Recycle a session when its process tree resident memory exceeds this many MiB (default 1536). 0 disables. Busy sessions (turn in flight) are never recycled.",
+      "help": "Recycle a session when its process tree resident memory exceeds this many MiB. 0 disables (the default); the internal background runtime still recycles at 1536 MiB. Busy sessions (turn in flight) are never recycled.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 1536
+      "defaultValue": 0
     },
     {
       "path": "session.reconcile_max_kills",
@@ -1660,51 +1690,6 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
-    },
-    {
-      "path": "orchestrator",
-      "kind": "core",
-      "type": "object",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Orchestrator",
-      "help": "Autopilot/orchestrator settings.",
-      "hasChildren": true,
-      "enumValues": null,
-      "defaultValue": {
-        "stage_timeout_seconds": 1800,
-        "max_plan_duration_seconds": 7200
-      }
-    },
-    {
-      "path": "orchestrator.stage_timeout_seconds",
-      "kind": "core",
-      "type": "integer",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Stage Timeout",
-      "help": "Max seconds per stage before auto-run stops. Default 30 min.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": 1800
-    },
-    {
-      "path": "orchestrator.max_plan_duration_seconds",
-      "kind": "core",
-      "type": "integer",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Max Plan Duration",
-      "help": "Ceiling for a WHOLE auto-run plan in seconds, checked at each stage boundary, with one warning at 75% of the budget. The per-stage timeout above multiplies by stage count, so without this a long plan can run unattended for hours. 0 disables. Default 2 h.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": 7200
     },
     {
       "path": "messaging",
@@ -1909,6 +1894,7 @@
         "persistence_enabled": true,
         "inject_memory": true,
         "inject_lessons": true,
+        "inject_lessons_per_turn": false,
         "inject_activity": true,
         "migrated": false
       }
@@ -2311,6 +2297,20 @@
       "defaultValue": true
     },
     {
+      "path": "memory.inject_lessons_per_turn",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Lessons Per Message",
+      "help": "On each follow-up message, add up to three stored lessons that match it and have not been shown in the session yet. The session-start block holds only what fits its budget; this adds the rest as the topic reaches them. Requires inject_lessons.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "memory.inject_activity",
       "kind": "core",
       "type": "boolean",
@@ -2692,7 +2692,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Lazy Skill Injection",
-      "help": "When true (the default), show a bounded usage-ranked index of on-demand skills, each with its path, plus a line naming the families the index leaves out. Set to false for the shorter entry that names only the eight hottest skills and points at skill_search for the rest. Both modes use the same Crew background budget, independent of model window size, and neither applies to an agent with its own skill:// mapping, which gets a bounded directory of mapped skills with complete search, paginated listing and exact reads on demand. Required pinned instructions share an explicit startup capacity; explicit loading and trigger gates are preserved.",
+      "help": "When true (the default), show a bounded usage-ranked index of on-demand skills, each with its path, plus a line naming the families the index leaves out. Set to false for the shorter entry that names eight skills and points at skill_search for the rest. Both order their rows the same way: the user's own skills (user-created, extra_paths, trusted project, mapped) take up to six of the first eight places, the rest of those eight go to the highest-ranked remaining skills of either kind, so a shipped skill with real usage keeps its name. Both modes use the same Crew background budget, independent of model window size, and neither applies to an agent with its own skill:// mapping, which gets a bounded directory of mapped skills with complete search, paginated listing and exact reads on demand. Required pinned instructions share an explicit startup capacity; explicit loading and trigger gates are preserved.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -3159,7 +3159,8 @@
         "dictation_panel": true,
         "timeout_secs": 300,
         "transcribe_region": "us-east-1",
-        "transcribe_profile": ""
+        "transcribe_profile": "",
+        "transcribe_vocabulary": ""
       }
     },
     {
@@ -3364,6 +3365,20 @@
       "tags": [],
       "label": "Transcribe Profile",
       "help": "AWS profile for Transcribe API.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "stt.transcribe_vocabulary",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Transcribe Vocabulary",
+      "help": "Name of a custom vocabulary you created in Amazon Transcribe, in the same region, so names and terms it would mishear are recognised (`transcribe` provider only). Its language must match the dictation language, or Amazon Transcribe refuses it and dictation fails. Empty uses none.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
@@ -4106,7 +4121,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Max Recovery Attempts",
-      "help": "Consecutive self-heal attempts before a dropped tunnel is left disconnected. With the capped-exponential backoff, the default 8 spans a ~2 min recovery window, enough to outlast a transient drop (screen lock, proxy warmup) before giving up.",
+      "help": "Consecutive self-heal attempts before a dropped tunnel is left disconnected. A rebuild that fails outright spans a ~2 min window under the capped-exponential backoff (enough to outlast a transient drop such as a screen lock or proxy warmup); a forward that re-binds but whose far end stays dead additionally spends one probe window per attempt (probe_failure_threshold x probe_interval), so handoff to diagnosis takes roughly attempts x (90s + backoff) ~= 16 min at the default 8. Size this against the longer window.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 8
@@ -4685,7 +4700,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Max total memory (MB)",
-      "help": "cgroup MemoryMax for the whole agents SLICE -- how much every agent tree may claim together, independent of the per-scope ceiling. 0 or unset uses the host-proportional module default; the aggregate ceiling is never left unset.",
+      "help": "cgroup MemoryMax for the whole agents SLICE -- how much every agent tree may claim together, independent of the per-scope ceiling. 0 or unset uses the host-proportional module default; the aggregate ceiling is never left unset where a systemd user manager is available (Linux); not enforced on Windows/macOS.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null,
@@ -4700,7 +4715,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Max total processes",
-      "help": "cgroup TasksMax for the whole agents SLICE, counting tasks (threads) across every agent tree. 0 or unset uses the module default; the aggregate ceiling is never left unset.",
+      "help": "cgroup TasksMax for the whole agents SLICE, counting tasks (threads) across every agent tree. 0 or unset uses the module default; the aggregate ceiling is never left unset where a systemd user manager is available (Linux); not enforced on Windows/macOS.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null,
@@ -4751,7 +4766,8 @@
         "home_tab_sessions_per_kind": 5,
         "sessions_limit": 10,
         "use_tunnel_url": false,
-        "session_folder": ""
+        "session_folder": "",
+        "auto_link_sessions": false
       }
     },
     {
@@ -5021,7 +5037,7 @@
         "slack"
       ],
       "label": "Home Tab Sessions Per Kind",
-      "help": "Max sessions shown per category (main chat / autopilot) in the Slack Home Tab.",
+      "help": "Max sessions shown per category (main chat / task runner) in the Slack Home Tab.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 5
@@ -5073,6 +5089,22 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "slack.auto_link_sessions",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "Connect New Sessions To Slack Automatically",
+      "help": "Open a Slack thread for every new dashboard session on its first message, exactly as the Connect to Slack button does, so you can follow and reply from Slack without clicking the button each time. The thread is created when the first message is sent, not when the tab opens, so an abandoned tab leaves nothing behind. Only sessions a person starts in the dashboard qualify: cron, app, sub-agent, incognito, temporary and channel-born sessions are never connected this way. The thread always opens in the owner's DM with the bot, which only the owner can read. Off by default. Takes effect on the next new session; no restart.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "publish",
@@ -7041,6 +7073,7 @@
         "restore_sessions": false,
         "dynamic_dashboard_cards": false,
         "crewmate_threads": false,
+        "crewmates_in_agent_picker": false,
         "qr_session_until_restart": true,
         "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
@@ -7286,6 +7319,20 @@
       "defaultValue": false
     },
     {
+      "path": "dashboard.crewmates_in_agent_picker",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Crewmates in the chat agent picker",
+      "help": "List crewmates in the chat composer's agent picker, beside the agent templates, so a chat can be switched onto a crewmate (and its own workspace and memory) without opening it from the Crew page. Off by default: the picker lists templates plus any crewmate no listed template already covers. Takes effect when the dashboard is reloaded; no gateway restart.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "dashboard.qr_session_until_restart",
       "kind": "core",
       "type": "boolean",
@@ -7426,7 +7473,8 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null,
-      "nullable": true
+      "nullable": true,
+      "requiresRestart": true
     },
     {
       "path": "dashboard.chat_entry_cache_max_entries",
@@ -7779,6 +7827,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "dashboard.terminal.reuse_current",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Reuse the current terminal",
+      "help": "Run-in-terminal focuses the terminal tab you have selected and copies the command, so you can paste it into that shell and keep its state (working directory, environment, an active login session). With no terminal open, it still copies the command for you to paste — it is never run for you. Off = a fresh terminal each time.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.terminal.completion",
@@ -8979,7 +9041,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Auto Update",
-      "help": "Enable automatic update checks.",
+      "help": "Where the install can apply updates, true installs them once no work is running and restarts; false only notifies. Elsewhere it has no effect. On those same installs a policy minimum version applies regardless.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true

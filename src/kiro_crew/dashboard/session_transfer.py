@@ -1132,8 +1132,7 @@ async def build_transfer_bundle_async(
     # plumbed end to end -- the import reports ``resume_mode: prefix`` and the
     # sender's row reads "Sent (transcript only)" -- so the user is told, rather
     # than being handed a silently divergent copy or a hard failure on a
-    # legitimate action. ``_in_stage_execution`` is included because ``running``
-    # reads False between the stages of a staged plan (chat_handlers).
+    # legitimate action.
     #
     # Computed INSIDE the retry loop below, never once up front: a retry happens
     # precisely because the slot changed, and a prompt starting during a threaded
@@ -1239,9 +1238,7 @@ async def build_transfer_bundle_async(
         # same breath as the tail snapshot -- so the transcript and the context we
         # ship always come from one consistent view of the slot. See the note
         # above for why a pre-loop value goes stale across a retry.
-        mid_turn = bool(getattr(slot, "running", False)) or bool(
-            getattr(slot, "_in_stage_execution", False)
-        )
+        mid_turn = bool(getattr(slot, "running", False))
         if not include_layer_b:
             # Withheld because this caller's policy gate resolved false -- the
             # decision belongs to the call site, not this builder. The file
@@ -1936,7 +1933,7 @@ async def _stream_request_to_file(request: web.Request, dst: Path) -> tuple[bool
     ``request.read()`` / ``.post()`` / ``.json()``: those buffer the whole body and
     are the calls aiohttp enforces ``client_max_size`` in, so reading the stream
     directly is what lets a session of any size arrive (the streaming multipart
-    reader in ``handlers/files.py`` bypasses the same limit the same way). The body
+    reader in ``dashboard/file_api/uploads.py`` bypasses the same limit the same way). The body
     lands on disk a chunk at a time, so memory is bounded by the write rather than
     by the body's size.
 

@@ -188,6 +188,7 @@ than blurred:
 | `subagent_manager.monitoring._reconcile_orphans_impl` | convention |
 | `subagent_manager.terminal._sigkill_session_impl` | convention |
 | `runtime_reconcile._default_authorize` | convention |
+| `runtime_reconcile.RuntimeReconciler.reclaim_untracked` (through the same `_authorize` seam) | convention |
 
 A convention site that drops its gate call is not caught: the primitive call it
 still makes stays counted, so `BYPASS_BASELINE` does not move and the suite stays
@@ -281,7 +282,7 @@ different leak:
 | Direction | What it means | Action |
 |---|---|---|
 | `owned_dead` | A record names a pid that is gone, or one the kernel gave to an unrelated process. | Retract the record; tell the holder once. The stranger is never signalled. |
-| `unowned_alive` | A process runs in this install's own agent slice and no record claims it. | Count it. Kill only when every condition below holds. |
+| `unowned_alive` | A process runs in this install's own agent slice and no record claims it, and it is not excluded as sandboxed tool work (below). | Count it. Kill only when every condition below holds. |
 | `owned_alive` | The healthy population. | Reported as the denominator. |
 
 `unowned_alive` and `owned_dead` are the SLI, published so an operator sees a leak
@@ -289,6 +290,12 @@ while it is small; the actions are what makes a non-zero reading temporary rathe
 than permanent. `test/e2e/process_inventory.py` uses the same three names for the
 same reconciliation read from outside the process, so a published reading and an
 external inventory describe one host state in one vocabulary.
+
+One qualification on that shared vocabulary: `resource_status.slice_ownership`
+publishes `unowned_alive` as every unclaimed slice pid, while the reconciler's own
+reading subtracts the tool-marker exclusion. On a host doing long-lived tool work the
+two therefore disagree by design, and the larger number is not a fault — it answers
+"what is unclaimed", where the reconciler's answers "what this arm can act on".
 
 A recycled pid belongs in `owned_dead` and not in the healthy population, which is
 what makes the reading a usable safety number: a record whose pid now names a
@@ -303,6 +310,12 @@ reading that cannot be taken, and a registry that cannot be read, each refuse th
 entire pass rather than acting on the half that answered. An incomplete active-pid
 union does the same.
 
+### Leaked untracked runtimes: read every pass, reclaimed only on a user confirm
+
+`session_pid`'s report-only arm finds a managed runtime reparented to init with our marker and in neither pid file. Every pass copies its current hits into the reading as `leaked_untracked`, `leaked_rss_bytes` (each root counted with its descendants) and `leaked`, Linux only. No scheduled arm acts on them.
+
+`RuntimeReconciler.reclaim_untracked` is the one path that may, and its only caller is the owner-only `POST /api/system/leaked-runtimes/reclaim` with `{"confirm": true}`. A candidate must have been reported by a sweep and be detected again on a complete tracked snapshot. Each condition can only withhold: tracked, protected, leased or claimed; not a managed harness; no spawn marker; younger than the age floor; a `KIROCREW_SPAWN_HOME` that is absent or names another data home (the marker is shared by every install on this uid, and a sibling's runtime is tracked only in its own pid files); a live session leader or group leader other than itself (the session id comes from `platform_compat.read_proc_stat`, so a leader whose name is not UTF-8 still reads as live); no readable `KIROCREW_SPAWN_INSTANCE`; or any live process outside its own tree carrying the same instance. The last one is what keeps a live runtime's descendant safe: the stamps are inherited, so that runtime itself holds the instance. The start identity is re-read before `authorize_runtime_kill` and pinned into `_kill_pid_tree`, under the tenancy barrier, at most `DEFAULT_MAX_KILLS` trees per call.
+
 ### Why an unowned process is counted before it is killed
 
 Absence from the record is evidence that something is unclaimed, not evidence that
@@ -313,6 +326,21 @@ stub connection, sandbox shim wrappers owned by a spawn in progress. Killing on
 first sight would take a user's live browser out from under them and call it a leak
 fixed. Measured at rest on a live instance: 20 such processes; under load, 57 to
 97.
+
+One class leaves the population before any of that, in `_unowned` rather than by a
+condition: a pid carrying the `KIROCREW_SANDBOX_TOOL` marker whose argv0 is **not** a
+managed harness. The sandbox chokepoint stamps that marker on every tree it spawns, so
+a build, an `npx` install or a provisioning run is identified as tool work by
+exec-time state a same-uid process cannot forge on another process, rather than by the
+argv0 the name test reads. Both conditions are required, because the marker describes
+a tree while the argv test is per process: the chokepoint takes harness argv on purpose
+(`is_kiro_cli`), and a marked tool tree can spawn a harness, so an orphaned harness can
+carry the marker without being tool work and must stay reachable. The exclusion is
+therefore exactly the population the argv condition withheld already — the arm's reach
+is unchanged, and what it removes is their per-pass count, gate allow and attribution.
+It FAILS OPEN, unlike every condition below: an unreadable marker leaves the pid a
+candidate, because a sparing that fails closed would widen what escapes the conditions
+on doubt.
 
 So a kill needs all of these, and any one missing leaves the process alone and
 merely counted (`RuntimeReconciler._why_not_yet`, `_reconcile_unowned`):
@@ -331,7 +359,12 @@ merely counted (`RuntimeReconciler._why_not_yet`, `_reconcile_unowned`):
    guard asked here at the decision point). Most of the unowned population carries
    the inherited spawn marker and is not a harness — a Playwright chromium tree, an
    `mcp start-server` broker, a sandbox shim, another install's interpreter — and
-   the seam declines every one. Asked here they are withheld by name; asked only
+   the seam declines every one. A sandbox shim is declined for what it WRAPS, not
+   for being a shim: on Linux the namespace launcher is the pid a real agent runtime
+   is tracked under, so the gate steps over the launcher and asks its positional
+   rules of the wrapped argv (see [session.md](session.md) §Reclaim identity) — a
+   launcher around an MCP probe or an app backend still answers "not a harness", and
+   one around `kiro-cli` answers that it is. Asked here they are withheld by name; asked only
    inside the seam, each first collects a gate allow and the attribution that allow
    writes. The seam still re-applies it last, because a pid can change hands
    between the two answers;
@@ -536,11 +569,20 @@ recover.
   decide which sessions may share a process, and a flag to stage it. Neither
   exists, so every runtime serves one session.
 - **Membership is narrower than the slice it is compared against.** An app
-  backend's pid record (`app_backends.pids.json`) and a long-lived sandboxed
-  subprocess are in none of the sources `recorded()` reads, so both are unowned by
-  construction on every pass, and what keeps them unsignalled is the argv
-  condition rather than an ownership record. Issue #15019 carries the membership
-  source that would close it.
+  backend's pid record (`app_backends.pids.json`) is in none of the sources
+  `recorded()` reads, so a running backend is unowned by construction on every
+  pass, and what keeps it unsignalled is the argv condition rather than an
+  ownership record. Issue #15019 carries the membership source that would close
+  it. A long-lived sandboxed subprocess is the other case and answers by identity
+  instead: the sandbox chokepoint stamps `KIROCREW_SANDBOX_TOOL` on its whole tree
+  and `_unowned` excludes a pid that carries it and is not a managed harness, so
+  tool work leaves the candidate population on exec-time evidence rather than on
+  its argv0. Both conditions are required because the marker is inherited while the
+  argv test is per process: a harness leaked inside a tool tree carries the marker
+  without being tool work, and stays a candidate. The excluded population is
+  therefore exactly the one the argv condition withheld already — the kill arm's
+  reach is the same, and what the exclusion removes is their per-pass count, gate
+  allow and kill attribution.
 - **[session.md](session.md)'s sweep contract does not describe the gate**
   (issue #14726). The reconciler is specified here; the sentences in that spec that
   still describe an ungated sweep are corrected by the change that owns it.

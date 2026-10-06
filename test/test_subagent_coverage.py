@@ -723,7 +723,7 @@ class TestApprovalLogging:
         event = SimpleNamespace(title="write", tool_kind="fs")
         with patch.object(sa, "sel") as sel_mock:
             await SubagentManager._reject_and_log(
-                client, 3, "subagent:a1", event, error="policy denied"
+                client, 3, "subagent:a1", event, cause=None, error="policy denied"
             )
         client.reject_tool.assert_awaited_once_with(3)
         assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "denied"
@@ -733,7 +733,7 @@ class TestApprovalLogging:
         client = AsyncMock()
         event = SimpleNamespace(title="write", tool_kind="fs")
         with patch.object(sa, "sel") as sel_mock:
-            await SubagentManager._reject_and_log(client, 4, "subagent:a1", event)
+            await SubagentManager._reject_and_log(client, 4, "subagent:a1", event, cause=None)
         assert sel_mock().log_tool_invocation.call_args.kwargs["outcome"] == "rejected"
 
 
@@ -967,7 +967,7 @@ class TestRecordCost:
         info.peak_cpu_cores = 0.75
         with patch.object(sa, "append_cost_sample") as append:
             mgr._record_cost(info)
-        append.assert_called_once_with("scout", 1.5, 0.75, shared=False)
+        append.assert_called_once_with("scout", 1.5, 0.75, shared=False, settled_gb=0.0)
 
     def test_store_failure_is_swallowed(self) -> None:
         mgr = _manager()
@@ -1203,7 +1203,7 @@ class TestReadSurfaces:
         mgr._report_tasks = {report}
         mgr._followup_watchers = {"run": followup}
         mgr._reconcile_task = reconcile
-        mgr._abandoned_state_writers = {"state-writer"}
+        mgr._abandoned_state_writers = {"state-writer": {report}}
         try:
             # queue + recovery + report + follow-up + reconciliation + writer
             assert mgr.pending_work_count == 6

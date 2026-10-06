@@ -131,6 +131,178 @@ def _live_state(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
+@pytest.mark.asyncio
+async def test_backend_switch_after_setup_does_not_probe(tmp_config) -> None:
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    service = MagicMock(spec=KiroPrerequisiteService)
+    service.initial_setup_complete = True
+    service.record_independent_backend_setup = AsyncMock(
+        side_effect=AssertionError("completed setup must not probe again")
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 200
+    service.record_independent_backend_setup.assert_not_awaited()
+    assert json.loads(tmp_config.read_text(encoding="utf-8"))["agent"]["acp_backend"] == "claude"
+
+
+@pytest.mark.asyncio
+async def test_selecting_installed_independent_agent_persists_first_run_completion(
+    tmp_config, tmp_path, monkeypatch
+) -> None:
+    """A second browser must not depend on the first browser's localStorage."""
+    from kiro_crew import sandbox
+    from kiro_crew.agent_sdk import backend_install
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    data_home = tmp_path / "data-home"
+    service = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=data_home,
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(sandbox, "detect_backend", lambda: "bwrap")
+    monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "standard")
+    monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+    monkeypatch.setattr(
+        backend_install,
+        "probe_backend",
+        lambda backend: backend_install.BackendInstallState(
+            backend, backend, backend_install.INSTALLED
+        ),
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 200
+
+    restarted = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=data_home,
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    assert restarted.initial_setup_complete is True
+
+
+@pytest.mark.asyncio
+async def test_marker_write_failure_reports_saved_config_without_claiming_setup_complete(
+    tmp_config, tmp_path, monkeypatch
+) -> None:
+    from kiro_crew import sandbox
+    from kiro_crew.agent_sdk import backend_install
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    service = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=tmp_path / "data-home",
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(sandbox, "detect_backend", lambda: "bwrap")
+    monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "standard")
+    monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+    monkeypatch.setattr(
+        backend_install,
+        "probe_backend",
+        lambda backend: backend_install.BackendInstallState(
+            backend, backend, backend_install.INSTALLED
+        ),
+    )
+    monkeypatch.setattr(
+        service, "_mark_setup_complete", MagicMock(side_effect=OSError("disk full"))
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 503
+        body = await response.json()
+        assert body["code"] == "setup_marker_write_failed"
+        assert body["config_saved"] is True
+    assert json.loads(tmp_config.read_text(encoding="utf-8"))["agent"]["acp_backend"] == "claude"
+    assert service.initial_setup_complete is False
+
+
+@pytest.mark.asyncio
+async def test_recheck_records_setup_after_configure_then_install(
+    tmp_config, tmp_path, monkeypatch
+) -> None:
+    from kiro_crew import sandbox
+    from kiro_crew.agent_sdk import backend_install
+    from kiro_crew.dashboard.handlers import acp_backend_status
+    from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+    service = KiroPrerequisiteService(
+        platform_name="linux",
+        environ={"HOME": str(tmp_path), "PATH": ""},
+        home=tmp_path,
+        data_home=tmp_path / "data-home",
+        audit_writer=lambda *_args, **_kwargs: None,
+    )
+    installed = False
+    monkeypatch.setattr(sandbox, "detect_backend", lambda: "bwrap")
+    monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "standard")
+    monkeypatch.setattr(sandbox, "credential_mask_applies", lambda _mode: True)
+    monkeypatch.setattr(
+        backend_install,
+        "probe_backend",
+        lambda backend: backend_install.BackendInstallState(
+            backend,
+            backend,
+            backend_install.INSTALLED if installed else backend_install.MISSING,
+        ),
+    )
+    monkeypatch.setattr(
+        acp_backend_status,
+        "_recheck",
+        lambda backend: {"id": backend, "installed": backend_install.INSTALLED},
+    )
+    app = _make_app()
+    app["kiro_prerequisite_service"] = service
+    app.router.add_post("/api/acp-backends/recheck", acp_backend_status.api_acp_backend_recheck)
+    audit = MagicMock()
+    monkeypatch.setattr(acp_backend_status, "sel", lambda: audit)
+
+    async with TestClient(TestServer(app)) as client:
+        response = await _patch(client, "agent.acp_backend", "claude")
+        assert response.status == 200
+        assert service.initial_setup_complete is False
+        installed = True
+        mark_setup_complete = service._mark_setup_complete
+        monkeypatch.setattr(
+            service, "_mark_setup_complete", MagicMock(side_effect=OSError("disk full"))
+        )
+        response = await client.post("/api/acp-backends/recheck", json={"backend": "claude"})
+        assert response.status == 503
+        body = await response.json()
+        assert body["code"] == "setup_marker_write_failed"
+        # The fresh probe row rides along on the marker-write failure so the
+        # client can apply it instead of re-painting the stale pre-install
+        # verdict under a "could not check" line.
+        assert body["backend"] == {"id": "claude", "installed": backend_install.INSTALLED}
+        assert service.initial_setup_complete is False
+        audit.log_api_access.assert_called_once()
+        audit_args = audit.log_api_access.call_args.kwargs
+        assert audit_args["outcome"] == "error"
+        assert audit_args["resources"] == "claude"
+        assert audit_args["error"] == "setup_marker_write_failed"
+        monkeypatch.setattr(service, "_mark_setup_complete", mark_setup_complete)
+        response = await client.post("/api/acp-backends/recheck", json={"backend": "claude"})
+        assert response.status == 200
+    assert service.initial_setup_complete is True
+
+
 # ── Per-role models (agent.role_models.*) ─────────────────────────────────
 
 
@@ -316,6 +488,56 @@ class TestTerminalCompletionEnabled:
         app, _ = _make_app_with_state()
         async with TestClient(TestServer(app)) as client:
             resp = await _patch(client, "dashboard.terminal.completion.enabled", "false")
+            assert resp.status == 400
+
+
+# ── Terminal tab reuse (dashboard.terminal.reuse_current) ─────────────────
+
+
+class TestTerminalReuseCurrent:
+    """The Settings → Display → Terminal "Reuse the current terminal" toggle."""
+
+    @pytest.mark.asyncio
+    async def test_true_written_nested(self, tmp_config) -> None:
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.reuse_current", True)
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"]["reuse_current"] is True
+
+    @pytest.mark.asyncio
+    async def test_write_keeps_sibling_terminal_keys(self, tmp_config) -> None:
+        # The shell and completion keys live in the same `terminal` object;
+        # flipping reuse must not drop them.
+        tmp_config.write_text(
+            json.dumps(
+                {
+                    "dashboard": {
+                        "terminal": {"shell": "/bin/bash", "completion": {"enabled": False}}
+                    }
+                }
+            )
+        )
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.reuse_current", True)
+            assert resp.status == 200
+        data = json.loads(tmp_config.read_text())
+        assert data["dashboard"]["terminal"] == {
+            "shell": "/bin/bash",
+            "completion": {"enabled": False},
+            "reuse_current": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_boolean_rejected(self, tmp_config) -> None:
+        # `bool("true")` is True: the route must refuse rather than coerce, so
+        # the handler's literal-``True`` check keeps meaning "on" only for a
+        # real boolean.
+        app, _ = _make_app_with_state()
+        async with TestClient(TestServer(app)) as client:
+            resp = await _patch(client, "dashboard.terminal.reuse_current", "true")
             assert resp.status == 400
 
 
@@ -813,6 +1035,15 @@ def _make_app_with_sessions() -> tuple[web.Application, MagicMock]:
 
 class TestDefaultModelPatch:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["vendor/model-v1", "vendor/group/model-v1", "model[1m]"])
+    async def test_provider_qualified_id_persists(self, tmp_config, model) -> None:
+        app, _ = _make_app_with_sessions()
+        async with TestClient(TestServer(app)) as client:
+            assert (await _patch(client, "agent.model", model)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["model"] == model
+
+    @pytest.mark.asyncio
     async def test_kiro_style_id_persists(self, tmp_config) -> None:
         app, _ = _make_app_with_sessions()
         async with TestClient(TestServer(app)) as c:
@@ -897,14 +1128,30 @@ class TestDefaultModelPatch:
             "claude opus",  # whitespace
             "model;rm -rf /",  # shell metacharacters
             "../../etc/passwd",  # path traversal
+            "vendor/../model",
+            "vendor/./model",
+            "vendor//model",
+            "vendor/model/",
+            "vendor/..",
+            "vendor/.",
             "model$(id)",  # command substitution
             "model\nnewline",
         ],
     )
-    async def test_malformed_ids_rejected(self, tmp_config, bad) -> None:
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "agent.model",
+            "agent.role_models.background",
+            "agent.role_models.subagent",
+            "agent.fallback_model",
+            "agent.refusal_fallback_model",
+        ],
+    )
+    async def test_malformed_ids_rejected(self, tmp_config, bad, field) -> None:
         app, _ = _make_app_with_sessions()
         async with TestClient(TestServer(app)) as c:
-            assert (await _patch(c, "agent.model", bad)).status == 400
+            assert (await _patch(c, field, bad)).status == 400
         data = json.loads(tmp_config.read_text(encoding="utf-8"))
         assert "model" not in data["agent"]
 

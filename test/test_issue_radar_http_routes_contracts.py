@@ -28,10 +28,12 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew import llm_helpers
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
 from kiro_crew.apps.builtins.issue_radar.backend import provider, routes, store
+from kiro_crew.start_priority import StartPriority
 
 BASE = "/api/apps/issue-radar"
 SHA = "a" * 40
@@ -50,6 +52,10 @@ def _get(path: str, query: dict | None = None, app: web.Application | None = Non
 
 def _post(path: str, body: object, app: web.Application | None = None) -> web.Request:
     req = make_mocked_request("POST", f"{BASE}/{path}", app=app or web.Application())
+    if "state" not in req.app:
+        req.app["state"] = NoConfiguredOwner()
+    req["user"] = "local-app"
+    req["app"] = ""
     req.json = AsyncMock(return_value=body)  # type: ignore[method-assign]
     return req
 
@@ -784,7 +790,10 @@ class TestModelAdapter(unittest.IsolatedAsyncioTestCase):
         ) as stream:
             with self.assertRaises(asyncio.CancelledError):
                 await routes._run_oneshot_model(_get("issue-ai", app=app), "k1", "prompt")
-        state.sessions.get_or_create.assert_awaited_once_with("k1", agent="kirocrew-lite")
+        # No owner claim on the request: not a person's click, so BACKGROUND.
+        state.sessions.get_or_create.assert_awaited_once_with(
+            "k1", agent="kirocrew-lite", start_priority=StartPriority.BACKGROUND
+        )
         self.assertIs(
             stream.await_args.kwargs["approval_policy"], llm_helpers.ToolApprovalPolicy.REJECT_ALL
         )
@@ -804,7 +813,10 @@ class TestModelAdapter(unittest.IsolatedAsyncioTestCase):
                 )
         key = state.sessions.get_or_create.await_args.args[0]
         self.assertRegex(key, r"^issue-radar-reco:o/r:[0-9a-f]{32}$")
-        self.assertEqual(state.sessions.get_or_create.await_args.kwargs, {"agent": "kirocrew-lite"})
+        self.assertEqual(
+            state.sessions.get_or_create.await_args.kwargs,
+            {"agent": "kirocrew-lite", "start_priority": StartPriority.BACKGROUND},
+        )
         self.assertIs(
             stream.await_args.kwargs["approval_policy"], llm_helpers.ToolApprovalPolicy.REJECT_ALL
         )
@@ -1010,7 +1022,11 @@ class TestConfigRoutesKeepTheirProvider(unittest.IsolatedAsyncioTestCase):
             await routes._handle_add_settings_label(
                 _post("settings/role", {**GITLAB_Q, "role": "triage", "label": "bug"})
             )
-            resp = await routes._handle_disconnect(_get("repos", GITLAB_Q))
+            disconnect = _get("repos", GITLAB_Q)
+            disconnect.app["state"] = NoConfiguredOwner()
+            disconnect["user"] = "local-app"
+            disconnect["app"] = ""
+            resp = await routes._handle_disconnect(disconnect)
         self.assertEqual(_body(resp), {"ok": True, "owner": "g", "repo": "p"})
         self.assertEqual(read.call_args, mock.call("g", "p", **identity))
         self.assertEqual(write.call_args.kwargs, {"expected_revision": 0, **identity})

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildCommandCenter, runTitle, scopedSlots, slotKey, type CommandCenterSources } from '../pages/chat/command-center/model'
+import { buildCommandCenter, questionText, runTitle, scopedSlots, slotKey, type CommandCenterSources } from '../pages/chat/command-center/model'
 import type { ChatSlot, SubagentActivity } from '../types'
 
 const slot = (key: string, extra: Partial<ChatSlot> = {}): ChatSlot => ({ key, messages: 0, running: false, ...extra })
@@ -45,6 +45,42 @@ describe('command center projection', () => {
     }))
     expect(model.nodes.map(n => n.id)).toEqual(['session:root', 'session:child', 'session:grandchild'])
     expect(model.attention.map(a => a.id)).toEqual(['question:child:q1'])
+  })
+  it('lists an idle session\'s trailing [OPTIONS:] ask as a question, unless a real card, live turn or queued answer outranks it', () => {
+    const asking = { has_options: true, options: ['Keep the blur', 'Make it clear'] }
+    const model = buildCommandCenter(sources({ slots: [slot('root', asking), slot('child', { created_by: 'root', ...asking, running: true }),
+      slot('stalled', { created_by: 'root', ...asking, interrupted: true }), slot('queued', { created_by: 'root', ...asking, queue_depth: 1 }),
+      slot('carded', { created_by: 'root', ...asking }), slot('other', asking)],
+      questions: [{ slot: 'carded', card_id: 'c', questions: [] }] }))
+    expect(model.attention.map(a => [a.kind, a.slot, !!a.question?.followUp])).toEqual([['question', 'carded', false], ['question', 'root', true]])
+    expect(model.attention[1].question!.questions[0].options.map(o => o.label)).toEqual(['Keep the blur', 'Make it clear'])
+    expect(questionText(model.attention[1].question!)).toBe('The session is waiting for your choice.')
+    expect(model.settled).toBe(false)
+    expect(buildCommandCenter(sources({ slots: [slot('root', { has_options: false, options: ['stale'] })] })).attention).toEqual([])
+  })
+  it.each(['/clear', '  /model x'])('drops the slash-command follow-up label %j while keeping a safe choice', label => {
+    const model = buildCommandCenter(sources({ slots: [slot('root', { has_options: true, options: [label, 'Keep it'] })] }))
+    expect(model.attention).toHaveLength(1)
+    expect(model.attention[0].question!.questions[0].options).toEqual([{ label: 'Keep it' }])
+  })
+  it('omits a follow-up question when every option is a slash command', () => {
+    const model = buildCommandCenter(sources({ slots: [slot('root', { has_options: true, options: ['/clear'] })] }))
+    expect(model.attention).toEqual([])
+  })
+  it('keys identical options separately for each new reply but keeps the same reply stable', () => {
+    const card = (options_ts: string) => buildCommandCenter(sources({ slots: [slot('root', {
+      options_ts, has_options: true, options: ['Keep the blur', 'Make it clear'],
+    })] })).attention[0]
+    const first = '2026-10-01T12:00:00-07:00'
+    const second = '2026-10-01T12:01:00-07:00'
+    expect(card(first).id).toBe(card(first).id)
+    expect(card(first).id).not.toBe(card(second).id)
+  })
+  it('keeps an options question stable when a passive row advances last_ts', () => {
+    const card = (last_ts: string) => buildCommandCenter(sources({ slots: [slot('root', {
+      last_ts, options_ts: '2026-10-01T12:00:00-07:00', has_options: true, options: ['Keep the blur', 'Make it clear'],
+    })] })).attention[0]
+    expect(card('2026-10-01T12:00:00-07:00').id).toBe(card('2026-10-01T12:01:00-07:00').id)
   })
   it('does not loop on cyclic or orphaned creator edges', () => {
     expect(scopedSlots([slot('a', { created_by: 'b' }), slot('b', { created_by: 'a' }), slot('orphan', { created_by: 'missing' })], 'a').map(s => s.key)).toEqual(['a', 'b'])
@@ -165,6 +201,22 @@ describe('command center projection', () => {
     expect(model.nodes.filter(n => n.kind === 'workflow').map(n => n.ref)).toEqual(['done'])
     expect(model.nodes.find(n => n.id === 'workflow:done')?.state).toBe('done')
   })
+  it('rests a paused workflow but keeps planning workflows and pending workers unsettled', () => {
+    const workflow = (status: string) => buildCommandCenter(sources({ workflows: [
+      { run_id: status, session_key: 'dashboard:root', status },
+    ] }))
+    const paused = workflow('paused')
+    // Still labelled as waiting, but no tile counts it, so it cannot pin the dock.
+    expect(paused.nodes.find(n => n.id === 'workflow:paused')?.state).toBe('waiting')
+    expect(paused.settled).toBe(true)
+    expect(workflow('pausing').settled).toBe(true)
+    expect(workflow('planning').settled).toBe(false)
+    expect(workflow('finished').settled).toBe(true)
+    // A queued worker also reads `waiting` and is the task's own unfinished work.
+    const pending = buildCommandCenter(sources({ subagents: { root: { w: agent('w', { status: 'pending' }) } } }))
+    expect(pending.nodes.find(n => n.id === 'subagent:w')?.state).toBe('waiting')
+    expect(pending.settled).toBe(false)
+  })
   it('uses a real todo denominator when there is no work board', () => {
     const model = buildCommandCenter(sources({ slots: [slot('root', { todo: { description: 'Plan', tasks: [{ id: '1', text: 'Build', completed: true }, { id: '2', text: 'Test', completed: false }], total: 2, completed: 1, current: 'Test' } })] }))
     expect(model.progress).toEqual({ done: 1, total: 2, source: 'todo' })
@@ -188,5 +240,42 @@ describe('command center projection', () => {
       { slot: 'child', card_id: 'card', questions: [] },
     ] }))
     expect(model.attention.map(a => a.id)).toEqual(['question:root:card', 'question:child:card'])
+  })
+
+  it.each([
+    ['delegated work before live subagent frames arrive', { subagents_running: true }],
+    ['a queued message', { queue_depth: 1 }],
+  ] satisfies [string, Partial<ChatSlot>][])('keeps an idle turn unsettled while %s remains', (_description, activity) => {
+    const model = buildCommandCenter(sources({ slots: [slot('root', activity)] }))
+    expect(model.nodes[0].state).toBe('running')
+    expect(model.settled).toBe(false)
+  })
+
+  it('settles only when every run rests, the plan is complete and the board omitted nothing', () => {
+    const done = { item_id: 'a', title: 'a', state: 'accepted' }
+    expect(buildCommandCenter(sources({ work: { items: [done] } })).settled).toBe(true)
+    // A rejected item rests without counting as done; the board is still finished.
+    expect(buildCommandCenter(sources({ work: { items: [done, { item_id: 'r', title: 'r', state: 'rejected' }] } })).settled).toBe(true)
+    expect(buildCommandCenter(sources({ work: { items: [done], omitted: 1 } })).settled).toBe(false)
+    expect(buildCommandCenter(sources({ work: { items: [done, { item_id: 'b', title: 'b', state: 'dispatched' }] } })).settled).toBe(false)
+    expect(buildCommandCenter(sources({ slots: [slot('root', { todo: { tasks: [{ id: '1', text: 'x', completed: false }], total: 1, completed: 0 } }), slot('child', { created_by: 'root' })] })).settled).toBe(false)
+    // A board supplies the progress number, but the plan is still tested on its own.
+    const halfDone = slot('root', { todo: { tasks: [{ id: '1', text: 'x', completed: true }, { id: '2', text: 'y', completed: false }], total: 2, completed: 1 } })
+    expect(buildCommandCenter(sources({ slots: [halfDone, slot('child', { created_by: 'root' })], work: { items: [done] } })).settled).toBe(false)
+    expect(buildCommandCenter(sources({ subagents: { root: { w: agent('w') } } })).settled).toBe(false)
+    expect(buildCommandCenter(sources({ subagents: { root: { w: agent('w', { status: 'done' }) } } })).settled).toBe(true)
+    expect(buildCommandCenter(sources({ approvals: [{ id: 'p', slot: 'child' }] })).settled).toBe(false)
+  })
+})
+
+
+describe('effectiveApprovalMode', () => {
+  it('reads a live app-armed scoped grant as trust, like the chat header', async () => {
+    const { effectiveApprovalMode } = await import('../pages/chat/command-center/model')
+    const { slotApprovalMode } = await import('../utils/slotApprovalMode')
+    const slot = { key: 'crew', messages: 0, running: false, trust: false, trust_scope: 'app:issue-radar' }
+    expect(effectiveApprovalMode('normal', slot)).toBe('trust')
+    expect(effectiveApprovalMode('normal', slot)).toBe(slotApprovalMode('normal', slot))
+    expect(effectiveApprovalMode('normal', { ...slot, trust_scope: '' })).toBe('normal')
   })
 })

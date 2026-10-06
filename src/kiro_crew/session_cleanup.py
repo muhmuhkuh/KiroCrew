@@ -38,6 +38,36 @@ if TYPE_CHECKING:
 #: Caller name on this module's kill-decision audit rows.
 _SWEEP = "session_cleanup sweep"
 
+#: How long after a session's harness launched work that outlives the prompt
+#: the RSS recycle and the idle sweep still treat that session as busy. Claude
+#: Code runs a backgrounded command or a Workflow in the session's own process
+#: tree after the prompt returns, and reports the launch on the launching tool
+#: call; it reports nothing a client can read while that work runs, nor when it
+#: ends. So the hold is bounded by time: long enough for an ordinary workflow,
+#: short enough that a launch cannot exempt a runaway tree from the memory
+#: ceiling for the rest of the session's life.
+HARNESS_BACKGROUND_WORK_HOLD_SECS = 3600.0
+
+#: Hard ceiling multiplier on ``rss_max_mb`` that the hold cannot override.
+#: The hold's clock restarts on every launch, so an agent that keeps launching
+#: background work -- possibly steered to by injected content -- renews it
+#: forever and the time bound alone does not bound memory. Inside the hold
+#: the RSS recycle therefore still proceeds once the tree exceeds this multiple
+#: of the configured ceiling, and the notice names the launched work that may
+#: have been stopped (only this recycle does: one let through past the hold
+#: presumed the work finished, so its notice stays plain).
+#: Why 2x: the reported workflow trees read 2398-2641 MB against
+#: a 1536 MB ceiling, so the hold must survive an ordinary workflow
+#: at ~1.6-1.7x while still cutting off a runaway before it grows unbounded.
+HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR = 2
+
+#: How long after an RSS recycle a session crossing the ceiling again counts as
+#: the replacement climbing straight back. A recycled session restarts its
+#: process on its next message, which can be hours after an idle recycle, so
+#: the window spans a day. A crossing inside it suggests the ceiling sits below
+#: the workload's steady footprint rather than one session leaking.
+RSS_REBOUND_WINDOW_SECS = 86400.0
+
 
 class ShutdownSignal(Protocol):
     """The subset of ``asyncio.Event`` used by the cleanup loop."""
@@ -133,6 +163,11 @@ def _no_pending_injection(key: str) -> bool:
     return False
 
 
+def _no_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+    """Default background-launch probe: no provider reports a launch."""
+    return None
+
+
 @dataclass(slots=True)
 class CleanupState:
     """Mutable state exclusively owned by :class:`SessionCleanup`."""
@@ -150,6 +185,14 @@ class CleanupState:
     # at most once per ``PROBE_FAILURE_WARN_INTERVAL_SECS`` across all keys,
     # never once per candidate per tick.
     probe_failure_warned_at: float | None = None
+    # Session key -> (monotonic time, tree RSS in MiB) of its last RSS recycle,
+    # kept for ``RSS_REBOUND_WINDOW_SECS``. The next crossing by that key pops
+    # its entry, so the rebound warning fires once per recycle cycle.
+    rss_recycled: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # When the agent-scope reap hook last failed loudly. A failure there stops
+    # every scope from being reclaimed, so it surfaces at WARNING at most once
+    # per ``PROBE_FAILURE_WARN_INTERVAL_SECS``; a clean pass re-arms it.
+    scope_reap_failure_warned_at: float | None = None
     stuck_reported: dict[str, float] = field(default_factory=dict)
     last_pycache_gc: float | None = None
     active_dashboard_slots: set[str] | None = None
@@ -180,6 +223,15 @@ class CleanupState:
     # the read that gathers it happens where it is legal. Reading it from the
     # worker would drain the warm pool's asyncio.Queue off-loop.
     runtime_reconcile_active: frozenset[int] = frozenset()
+    # When the reconciler last refused a pass at WARNING, and the reason it
+    # carried, so a persistent refusal surfaces once instead of once per tick
+    # while a NEW reason re-warns at once and a resumed supported pass logs a
+    # recovery. A refusal disables reclamation and stops the SLI publishing;
+    # reported only at debug (the previous behaviour) it left the reconciler
+    # silently inert behind one debug line. ``None`` reason means "not currently
+    # refusing"; the two move together.
+    reconcile_refusal_warned_at: float | None = None
+    reconcile_refusal_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +247,9 @@ class CleanupDeps:
     cleanup_stale_sandbox_profiles: Callable[[], int]
     prune_session_pid_mappings: Callable[[], int]
     prune_member_pid_bindings: Callable[[], int]
+    # Rotates the bundled shell-audit hook's ``audit.log`` once it reaches its
+    # cap; answers whether this call moved it aside. See ``shell_audit_log``.
+    rotate_shell_audit_log: Callable[[], bool]
     prune_pycache: Callable[[], tuple[int, int]]
     collect_active_pids: ActivePidCollector
     periodic_pid_sweep: PeriodicPidSweep
@@ -236,6 +291,14 @@ class CleanupDeps:
     # and defaults to "nothing injecting" so a manager without a gateway keeps
     # its existing behaviour.
     has_pending_injection: Callable[[str], bool] = _no_pending_injection
+    # ``(seconds since, description)`` of the newest work the session's harness
+    # launched to keep running after the prompt returned, or ``None``. A free
+    # semaphore only proves Kiro Crew's own prompt returned, and this is the only
+    # witness to that work. Synchronous -- it reads one record -- and defaults
+    # to "nothing launched" so a manager without ACP providers is unchanged.
+    provider_background_launch: Callable[[LLMProvider], tuple[float, str] | None] = (
+        _no_background_launch
+    )
 
 
 class SessionCleanup:
@@ -249,6 +312,15 @@ class SessionCleanup:
     # RSS reap, so it must surface above debug -- but one line per candidate
     # per tick is the noise this bound exists to prevent.
     PROBE_FAILURE_WARN_INTERVAL_SECS = 3600.0
+
+    # Floor between two WARNING lines about a reconcile pass that refuses. A
+    # refusal disables both reclamation directions and stops the liveness SLI
+    # publishing for as long as the unreadable source stays unreadable, so it
+    # must surface above debug -- but the reconciler ticks on the cleanup
+    # cadence, so one line per tick for a condition that persists for minutes is
+    # the noise this bound exists to prevent. A CHANGE of reason bypasses the
+    # floor and re-warns at once, because a new failure is a new event.
+    RECONCILE_REFUSAL_WARN_INTERVAL_SECS = 3600.0
 
     # Ceiling on the tick interval itself.
     #
@@ -429,6 +501,7 @@ class SessionCleanup:
                 self._deps.reap_agent_scopes,
                 active_pids,
             )
+            self.state.scope_reap_failure_warned_at = None
             reclaimed = int(getattr(summary, "reclaimed", 0) or 0)
             if reclaimed:
                 self._deps.logger.info(
@@ -436,8 +509,9 @@ class SessionCleanup:
                     reclaimed,
                 )
         except Exception:
-            # Best-effort, like the orphan-MCP sweep: never promote severity.
-            self._deps.logger.debug("agent-scope reap hook failed", exc_info=True)
+            # Best-effort, like the orphan-MCP sweep, but not silent: an escape
+            # here skips every scope, so it reaches WARNING, rate-limited.
+            self._note_scope_reap_failure()
 
     def _sessions_on_pid(self, pid: int) -> list[str]:
         """The session keys whose provider is running on *pid*.
@@ -514,9 +588,15 @@ class SessionCleanup:
                 # into the leak it exists to report. Housekeeping deferred one
                 # tick costs nothing that killing a live runtime would not cost
                 # more.
-                self._deps.logger.debug(
-                    "runtime reconcile skipped: the active-pid union is incomplete"
-                )
+                #
+                # This is the SAME silent-inert condition a ``run_once`` refusal
+                # is -- the pass produces no reading and publishes no counts -- so
+                # it goes through the same warn-once ledger and not a bare debug
+                # line. Its reason is distinct, so it is its own transition: a
+                # gateway stuck here and a gateway stuck on an unreadable source
+                # are two different faults an operator must tell apart, and the
+                # next supported pass clears whichever one was standing.
+                self._note_reconcile_refusal("the active-pid union is incomplete")
                 return
             snapshot = frozenset(active_now)
             self.state.runtime_reconcile_active = snapshot
@@ -544,10 +624,9 @@ class SessionCleanup:
                 reconciler.run_once,
             )
             if not reading.supported:
-                self._deps.logger.debug(
-                    "runtime reconcile skipped: %s", reading.reason or "unsupported"
-                )
+                self._note_reconcile_refusal(reading.reason or "unsupported")
                 return
+            self._clear_reconcile_refusal()
             self._deps.emit_counter(
                 "session.runtime_reconcile",
                 reading.as_counter_fields(),
@@ -570,6 +649,66 @@ class SessionCleanup:
         except Exception:
             # Best-effort, like the sweeps either side of it.
             self._deps.logger.debug("runtime reconcile hook failed", exc_info=True)
+
+    def _note_reconcile_refusal(self, reason: str) -> None:
+        """Report a refused reconcile pass: the reason at debug, the fact at a bounded WARNING.
+
+        A refused pass (``ReconcileReading.supported`` false) reclaims nothing and
+        publishes no ``unowned_alive``/``owned_dead`` reading, and it goes on
+        refusing for as long as the source it could not read stays unreadable -- a
+        corrupt MCP backend pidfile, an incomplete tracked-pid snapshot. Reported
+        only at debug (the previous behaviour) that left the reconciler silently
+        inert: an operator watching the liveness SLI sees the counts stop and
+        nothing above debug says the pass is refusing rather than reading zero.
+
+        So the fact surfaces at WARNING. It must NOT surface once per tick for a
+        condition that persists for minutes, so a steady refusal repeats at most
+        once per :data:`RECONCILE_REFUSAL_WARN_INTERVAL_SECS`; a CHANGE of reason
+        bypasses the floor, because a different unreadable source is a different
+        event worth its own line. The exact reason (which source, which error)
+        stays at debug every tick for a reader who wants the detail.
+        """
+        self._deps.logger.debug("runtime reconcile skipped: %s", reason)
+        now = self._deps.monotonic()
+        last = self.state.reconcile_refusal_warned_at
+        if (
+            last is not None
+            and reason == self.state.reconcile_refusal_reason
+            and now - last < self.RECONCILE_REFUSAL_WARN_INTERVAL_SECS
+        ):
+            return
+        self.state.reconcile_refusal_warned_at = now
+        self.state.reconcile_refusal_reason = reason
+        self._deps.logger.warning(
+            "Runtime reconcile refused a pass and is reclaiming nothing and "
+            "publishing no counts until its sources read again: %s. This warning "
+            "repeats at most once per %.0fs while the condition persists (reason "
+            "detail at debug).",
+            reason,
+            self.RECONCILE_REFUSAL_WARN_INTERVAL_SECS,
+        )
+
+    def _clear_reconcile_refusal(self) -> None:
+        """Log recovery once when a supported pass follows a refused one, then re-arm.
+
+        Without this the first refusal after boot would consume the only WARNING
+        the process emits for this condition, and a LATER refusal that arrived
+        while the flag was still set (within the re-warn floor) would be silent --
+        the original defect back in a subtler form. Clearing on the first supported
+        pass says the reconciler is working again and re-arms the warn-once so the
+        next outage warns immediately, exactly as ``kiro_readiness`` clears its own
+        refusal flag on recovery.
+        """
+        if self.state.reconcile_refusal_reason is None:
+            return
+        recovered_from = self.state.reconcile_refusal_reason
+        self.state.reconcile_refusal_warned_at = None
+        self.state.reconcile_refusal_reason = None
+        self._deps.logger.warning(
+            "Runtime reconcile is reading its sources again and has resumed "
+            "reclaiming and publishing counts (previously refusing: %s)",
+            recovered_from,
+        )
 
     def _note_dead_runtime(self, pid: int, loop: asyncio.AbstractEventLoop) -> None:
         """Tell whoever still holds *pid* that the process behind it is gone.
@@ -606,6 +745,12 @@ class SessionCleanup:
     async def _rss_threshold_check(self) -> None:
         if not self.state.rss_max_mb:
             return
+
+        now = self._deps.monotonic()
+        last_recycles = self.state.rss_recycled
+        for stale, (at, _) in list(last_recycles.items()):
+            if now - at > RSS_REBOUND_WINDOW_SECS:
+                del last_recycles[stale]
 
         candidates: list[tuple[str, int, SessionEntry]] = []
         persistent_keys = self._deps.get_persistent_keys()
@@ -655,6 +800,18 @@ class SessionCleanup:
                     )
                     rss_by_pid[pid] = rss
                 if rss > self.state.rss_max_mb:
+                    previous = last_recycles.pop(key, None)
+                    if previous is not None:
+                        self._deps.logger.warning(
+                            "RSS recycle rebound: session %s tree rss=%dMB is back above "
+                            "%dMB %.0fs after a recycle at %dMB; "
+                            "session.watchdog_rss_max_mb may be set too low for this workload",
+                            key,
+                            rss,
+                            self.state.rss_max_mb,
+                            now - previous[0],
+                            previous[1],
+                        )
                     victims.append((key, pid, rss, session))
 
         # One RECLAIM per runtime per tick. The threshold was crossed by a
@@ -704,6 +861,33 @@ class SessionCleanup:
                         key,
                     )
                     continue
+                # The harness's own background work, which neither the
+                # semaphore nor the sub-agent probe can see: Claude Code keeps a
+                # backgrounded command or Workflow running in this tree after
+                # the prompt returned. A launch inside the hold keeps the
+                # session; an older one recycles with the plain memory-limit
+                # notice (letting it through presumes the work finished).
+                # The hold yields to the hard ceiling: every new launch
+                # refreshes the hold's clock, so without a memory bound of its
+                # own, a session that keeps launching work would keep this
+                # check off forever while its tree grows without limit.
+                # Synchronous, so the no-suspend window to ``reset`` holds.
+                launch = self._harness_background_launch(session)
+                if (
+                    launch is not None
+                    and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS
+                    and rss <= self.state.rss_max_mb * HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR
+                ):
+                    self._deps.logger.info(
+                        "RSS recycle: session %s tree rss=%dMB exceeds %dMB but its "
+                        "harness launched background work %.0fs ago (%s); skipping",
+                        key,
+                        rss,
+                        self.state.rss_max_mb,
+                        launch[0],
+                        launch[1],
+                    )
+                    continue
                 # reset revalidates both object identity and the busy semaphore
                 # under its own lock after the unlocked RSS measurement, and
                 # ``skip_if_injecting`` puts the counter read under that same
@@ -719,6 +903,7 @@ class SessionCleanup:
                 if not recycled:
                     continue
                 recycled_pids.add(pid)
+                self.state.rss_recycled[key] = (self._deps.monotonic(), rss)
                 self._deps.logger.warning(
                     "RSS recycle: session %s tree rss=%dMB exceeds %dMB",
                     key,
@@ -726,13 +911,40 @@ class SessionCleanup:
                     self.state.rss_max_mb,
                 )
                 self._deps.stats_factory().inc_session_cleaned()
-                await self._owner._fire_recycle_callback(
-                    key,
-                    reason=f"memory limit ({rss}MB)",
-                )
+                reason = f"memory limit ({rss}MB)"
+                # Name the launched work only while the launch is still inside
+                # the hold — in practice, a hard-ceiling recycle. A recycle let
+                # through PAST the hold just presumed that work finished (that
+                # is what ending the hold means), and the record is never
+                # cleared while the process lives, so warning "may have been
+                # stopped" about a launch from hours ago would be permanent
+                # noise on every later recycle.
+                if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+                    reason += (
+                        "; background work its agent started earlier may have been "
+                        f"stopped: {launch[1]}"
+                    )
+                await self._owner._fire_recycle_callback(key, reason=reason)
             except Exception:
                 # One victim cannot suppress the rest of this tick.
                 self._deps.logger.exception("RSS recycle failed for session %s", key)
+
+    def _harness_background_launch(self, session: SessionEntry) -> tuple[float, str] | None:
+        """*session*'s newest background launch as ``(seconds since, description)``.
+
+        ``None`` means its harness launched nothing, or the provider cannot say.
+        Not fail-closed, unlike the two probes below: no launch is the normal
+        answer for every session that started no background work, and an
+        unreadable one must not hold the memory ceiling off.
+        """
+        provider = getattr(session, "provider", None)
+        if provider is None:
+            return None
+        try:
+            return self._deps.provider_background_launch(provider)
+        except Exception:
+            self._deps.logger.debug("Background-launch probe failed", exc_info=True)
+            return None
 
     def _injection_pending(self, key: str) -> bool:
         """Fail-closed read of "is a completion injection in flight for *key*?".
@@ -800,6 +1012,20 @@ class SessionCleanup:
         except Exception:
             self._note_probe_failure(key)
             return True
+
+    def _note_scope_reap_failure(self) -> None:
+        """Log an agent-scope reap escape: the traceback at debug, the fact at a bounded WARNING."""
+        self._deps.logger.debug("agent-scope reap hook failed", exc_info=True)
+        now = self._deps.monotonic()
+        last = self.state.scope_reap_failure_warned_at
+        if last is not None and now - last < self.PROBE_FAILURE_WARN_INTERVAL_SECS:
+            return
+        self.state.scope_reap_failure_warned_at = now
+        self._deps.logger.warning(
+            "Agent-scope reap failed, so no abandoned scope was reclaimed this tick "
+            "(details at debug; this warning repeats at most once per %.0fs)",
+            self.PROBE_FAILURE_WARN_INTERVAL_SECS,
+        )
 
     def _note_probe_failure(self, key: str) -> None:
         """Log a work-probe failure: the traceback at debug, the fact at a bounded WARNING."""
@@ -979,6 +1205,7 @@ class SessionCleanup:
             await self._sweep_sandbox_artifacts()
             await self._sweep_session_pid_mappings()
             await self._sweep_member_pid_bindings()
+            await self._sweep_shell_audit_log()
             await self._maybe_prune_pycache()
             await self._sweep_periodic_pids()
             await self._sweep_untracked_mcps()
@@ -1094,6 +1321,35 @@ class SessionCleanup:
         except Exception as exc:
             self._deps.logger.debug(
                 "member-memory pid binding sweep failed: %s",
+                type(exc).__name__,
+            )
+
+    async def _sweep_shell_audit_log(self) -> None:
+        """Bound the bundled shell-audit hook's ``audit.log``.
+
+        The hook in ``config/defaults.json`` is one shell append with no size
+        check, so nothing on the writing side ever bounds the file. The bound is
+        ``shell_audit_log.rotate_shell_audit_log`` (one ``.1`` generation at a
+        named cap, try-locked, never raises); it needs a caller on a bounded
+        cadence, which is what this tick is -- the same cadence that retracts
+        session-pid mappings, capped by :data:`MAX_TICK_INTERVAL_SECS`, so the
+        live file can overshoot the cap by at most one tick's worth of shell
+        activity. On the maintenance executor for the same reason as its
+        siblings: the data home is same-uid agent-writable, and a stat plus a
+        rename over such a path is filesystem work the event loop must not do.
+        """
+        try:
+            rotated = await asyncio.get_running_loop().run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._deps.rotate_shell_audit_log,
+            )
+            if rotated:
+                self._deps.logger.info(
+                    "Periodic sweep: rotated the shell audit log; one previous generation kept"
+                )
+        except Exception as exc:
+            self._deps.logger.debug(
+                "shell audit log sweep failed: %s",
                 type(exc).__name__,
             )
 
@@ -1464,6 +1720,23 @@ class SessionCleanup:
                 self._deps.logger.info(
                     "Idle sweep: %s began a turn mid-sweep - left running",
                     key,
+                )
+                continue
+            # Then the harness, on BOTH axes, for the reason the RSS recycle
+            # asks it: a free semaphore and no attached sub-agent do not mean
+            # the harness stopped working for this session. Work it launched to
+            # run after the prompt keeps going with no turn and no tab, which is
+            # what makes it look idle to ``last_used`` and abandoned to the
+            # orphan axis. Synchronous, like every read from here to ``reset``.
+            launch = self._harness_background_launch(scanned)
+            if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+                self._deps.logger.info(
+                    "Idle sweep: %s looks %s but its harness launched background "
+                    "work %.0fs ago (%s) - left running",
+                    key,
+                    "orphaned" if is_orphan else "idle",
+                    launch[0],
+                    launch[1],
                 )
                 continue
             # Then the clock, on the idle axis only. A turn that started AND

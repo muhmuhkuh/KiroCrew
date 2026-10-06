@@ -295,9 +295,33 @@ interface CrewWebviewProps {
    * sentence without a dead control under it.
    */
   onSetUp?: () => void;
+  /**
+   * Report whether this webview is holding a live minted document.
+   *
+   * `everExpanded` keeps the frame mounted behind `display:none` across a
+   * collapse, because the minted URL is single-use and a re-created iframe would
+   * request a spent one. That rule only reaches as far as this component: the
+   * page that owns the side panel decides whether the whole subtree stays
+   * mounted, and it cannot see this flag. So the flag is reported outward, and a
+   * consumer that keeps a hidden panel alive for an unsent answer keeps it alive
+   * for a live frame on the same terms.
+   *
+   * Called with `false` on unmount, so a consumer holding the value in state
+   * does not keep holding the panel for a frame that is gone.
+   */
+  onLiveFrameChange?: (live: boolean) => void;
+  /**
+   * How the crewmate is NAMED to the reader, for the empty state's sentence.
+   *
+   * `member` is the exact identity the read is keyed on and must stay the raw
+   * name; but a crewmate can carry a display name the roster shows instead, and
+   * "atlas has not published" under a header that says "Atlas" names the same
+   * crewmate two ways. Falls back to `member`.
+   */
+  displayName?: string;
 }
 
-function CrewWebviewView({ slug, member, onSetUp }: CrewWebviewProps) {
+function CrewWebviewView({ slug, member, onSetUp, onLiveFrameChange }: CrewWebviewProps) {
   const [expanded, setExpanded] = useState(false);
   /**
    * Whether the document has EVER been opened, which is what gates minting.
@@ -313,6 +337,17 @@ function CrewWebviewView({ slug, member, onSetUp }: CrewWebviewProps) {
    *    bug this flag exists to make impossible, not merely to avoid.
    */
   const [everExpanded, setEverExpanded] = useState(false);
+
+  /* Keyed on a ref so a consumer passing an inline arrow does not re-run this on
+     every render and report the same value repeatedly. */
+  const reportLiveFrame = useRef(onLiveFrameChange);
+  reportLiveFrame.current = onLiveFrameChange;
+  useEffect(() => {
+    reportLiveFrame.current?.(everExpanded);
+    return () => {
+      if (everExpanded) reportLiveFrame.current?.(false);
+    };
+  }, [everExpanded]);
 
   /**
    * The shared-element timing, and what reduced motion changes about it.
@@ -961,6 +996,121 @@ function CrewWebviewView({ slug, member, onSetUp }: CrewWebviewProps) {
             )}
           </div>
         </motion.div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The crewmate's published dashboard, and nothing around it: the Members side
+ * panel's Dashboard tab (crewmate-panel IA). The drawer above frames the same
+ * document in a summary card, a Contained bar and an Expand control, which in a
+ * panel that already IS the dashboard read as three containers stacked over
+ * one page. This renders the full document straight into the space it is given.
+ *
+ * Same read (`api.memberPanel`, keyed on slug AND exact member), same sandbox
+ * (`CREW_WEBVIEW_SANDBOX`) and same single-use mint rule: the frame stays
+ * mounted once it has a URL, and a read error drops the srcdoc so recovery
+ * mints afresh. It mints on mount rather than on Expand, because being on
+ * screen is the only reason this component exists.
+ */
+export function CrewDashboardFrame(props: CrewWebviewProps) {
+  // Keyed on the exact identity for the drawer's reason: slugs are lossy.
+  return (
+    <CrewDashboardFrameView
+      key={JSON.stringify([props.slug, props.member])}
+      {...props}
+    />
+  );
+}
+
+function CrewDashboardFrameView({ slug, member, displayName }: CrewWebviewProps) {
+  const { theme, colorTheme, themeVersion } = useTheme();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const themeVars = useMemo(() => readThemeVars(), [theme, colorTheme, themeVersion]);
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ["member-panel", slug, member],
+    queryFn: () => api.memberPanel(slug, member),
+    enabled: Boolean(slug) && Boolean(member),
+  });
+  const html = data?.html ?? null;
+  const meta = data?.panel ?? null;
+  const srcdoc = useMemo(
+    () =>
+      html && !isError
+        ? buildSrcdoc({ html, themeVars, mode: theme, rewriteBareLinks: false })
+        : null,
+    [html, isError, themeVars, theme],
+  );
+  const mint = useSandboxDoc(srcdoc);
+  const { url, pending, retry } = mint;
+  const failed = mint.failed || mint.stalled;
+
+  if (isLoading) {
+    return (
+      <div className="p-4 space-y-1.5" data-testid="crew-webview-loading" aria-hidden>
+        <div className="h-3 rounded bg-bg-hover animate-pulse" />
+        <div className="h-3 w-2/3 rounded bg-bg-hover animate-pulse" />
+      </div>
+    );
+  }
+  if (isError) {
+    return (
+      <div className="p-4 space-y-1.5">
+        {/* No hand-off: this frame is the Members page's Dashboard tab, and the
+            hand-off is a raw navigate to /chat that unmounts the whole page —
+            the Profile card's New schedule draft and the crew editor's unsaved
+            panes with it — without asking the page's leave guard (ErrorNotice
+            has no gate to hand it). The retry below is the recovery; the chat
+            beside this frame is one click away. */}
+        <ErrorNotice message={i18nT("pages.membersPage.webview_error")} testId="crew-webview-error" />
+        <Btn onClick={() => void refetch()} data-testid="crew-webview-error-retry">
+          <RotateCw className="lucide-inline" aria-hidden />
+          {i18nT("pages.membersPage.webview_retry")}
+        </Btn>
+      </div>
+    );
+  }
+  if (!html) {
+    return (
+      // No set-up control: the crew editor has nothing that makes a crewmate
+      // publish. It publishes through `panel_publish` when asked or on its own
+      // cycle, so the honest next step is asking it in the chat beside this.
+      <div className="p-4 text-[13px] text-muted" data-testid="crew-webview-empty">
+        {i18nT("pages.membersPage.dashboard_empty", { name: displayName || member })}
+      </div>
+    );
+  }
+  return (
+    <div className="h-full min-h-0 flex flex-col" data-testid="crew-dashboard-frame">
+      {failed && (
+        // A band above the frame, never over it: a document already on screen
+        // keeps every pixel, and the sentence says which failure this is.
+        <div className="shrink-0 border-b border-border p-2 flex items-start gap-2" data-testid="crew-webview-mint-error-band">
+          {/* No hand-off, for the read-error state's reason: the navigate would
+              unmount the page's unsaved Profile / editor drafts unguarded. */}
+          <ErrorNotice
+            message={i18nT(url ? "pages.membersPage.webview_refresh_error" : "pages.membersPage.webview_error")}
+            className="flex-1 min-w-0"
+            testId="crew-webview-mint-error"
+          />
+          <Btn disabled={pending} onClick={retry} className="shrink-0">
+            <RotateCw className="lucide-inline" aria-hidden />
+            {i18nT("pages.membersPage.webview_retry")}
+          </Btn>
+        </div>
+      )}
+      {url ? (
+        <iframe
+          src={url}
+          sandbox={CREW_WEBVIEW_SANDBOX}
+          className="flex-1 min-h-0 w-full border-none bg-bg"
+          style={{ colorScheme: theme }}
+          title={i18nT("pages.membersPage.webview_frame_title", { crew: meta?.crew || slug })}
+          data-testid="crew-dashboard-iframe"
+        />
+      ) : failed && !pending ? null : (
+        <div className="p-4 text-[11px] text-muted">{i18nT("pages.membersPage.webview_rendering")}</div>
       )}
     </div>
   );

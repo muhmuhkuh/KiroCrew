@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew import name_grant, permission_floor
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
-from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.constants import (
     DENY_CAUSE_INVALID_NAME,
@@ -45,6 +45,8 @@ from kiro_crew.platform.tool_paths import (
     command_shaped_strings,
     edit_target_candidates,
     is_document_writing_tool,
+    mcp_document_body_keys,
+    split_document_bodies,
 )
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
@@ -66,6 +68,7 @@ from kiro_crew.security import (
     sensitive_path_refusal,
 )
 from kiro_crew.sel import sel as _sel
+from kiro_crew.start_priority import StartPriority
 
 _PROMPT_BUSY_RETRIES = 2
 _PROMPT_BUSY_DELAY = 1.5  # seconds between retries
@@ -257,6 +260,22 @@ def acp_error_is_transient(exc: BaseException) -> bool:
     if isinstance(flag, bool):
         return flag
     return is_transient_backend_error(str(exc))
+
+
+def acp_error_is_session_not_found(exc: BaseException) -> bool:
+    """True when a live backend says it holds no session under the id it was sent.
+
+    The process answered, so nothing marks it dead and the dead-provider
+    eviction never fires; the binding keeps naming a session the backend has
+    dropped, and every later prompt draws the same answer. The backend
+    session's transcript is usually intact, so the remedy is a fresh process
+    that re-loads the SAME id -- not a retry on this one.
+
+    Scoped to ``AcpError``: the phrase is the adapter's own answer to a prompt,
+    and an unrelated exception that mentions a missing session elsewhere (an
+    HTTP 404 body, a dashboard lookup) must never reset a chat.
+    """
+    return isinstance(exc, AcpError) and "session not found" in str(exc).lower()
 
 
 def transient_retry_delay(attempt: int) -> float:
@@ -496,6 +515,8 @@ def next_fallback_candidate(
     chain: Sequence[str],
     active_model: str,
     advertised: Sequence[str] | None,
+    *,
+    backend: str = "",
 ) -> str | None:
     """First usable fallback candidate from *chain*, or ``None``.
 
@@ -529,7 +550,7 @@ def next_fallback_candidate(
         if not low or low == act:
             continue
         if adv:
-            served = resolve_pin_spelling(cand, adv)
+            served = resolve_pin_spelling_on(cand, adv, backend=backend)
             if not served:
                 logger.debug("model fallback: skipping %r (not advertised)", cand)
                 continue
@@ -541,7 +562,9 @@ def next_fallback_candidate(
     return None
 
 
-def _fallback_wire_spelling(candidate: str, advertised: Sequence[str] | None) -> str:
+def _fallback_wire_spelling(
+    candidate: str, advertised: Sequence[str] | None, *, backend: str = ""
+) -> str:
     """The spelling of *candidate* to send on the wire and keep in records.
 
     A chain entry stays in its OWN spelling for ``FallbackState`` bookkeeping
@@ -556,7 +579,7 @@ def _fallback_wire_spelling(candidate: str, advertised: Sequence[str] | None) ->
     (empty/unknown fails open, matching :func:`next_fallback_candidate`).
     """
     ids = [a for a in (advertised or []) if isinstance(a, str) and a.strip()]
-    return (resolve_pin_spelling(candidate, ids) if ids else "") or candidate
+    return (resolve_pin_spelling_on(candidate, ids, backend=backend) if ids else "") or candidate
 
 
 @dataclass
@@ -578,10 +601,12 @@ class FallbackState:
     primary: str = ""
     walked: list[str] = dataclass_field(default_factory=list)
 
-    def next_candidate(self, active_model: str, advertised: Sequence[str] | None) -> str | None:
+    def next_candidate(
+        self, active_model: str, advertised: Sequence[str] | None, *, backend: str = ""
+    ) -> str | None:
         """Advance to and return the next usable candidate, or ``None``."""
         remaining = self.chain[self.pos :]
-        cand = next_fallback_candidate(remaining, active_model, advertised)
+        cand = next_fallback_candidate(remaining, active_model, advertised, backend=backend)
         if cand is None:
             self.pos = len(self.chain)
             return None
@@ -666,13 +691,14 @@ async def advance_fallback_candidate(
     set_model_fn = resolve_substitute_set_model(provider)
     if set_model_fn is None:
         return None
+    backend = provider_backend(provider)
     while True:
-        cand = fb_state.next_candidate(fb_state.primary or active, advertised)
+        cand = fb_state.next_candidate(fb_state.primary or active, advertised, backend=backend)
         if cand is None:
             return None
         # The chain's own spelling drove the walk bookkeeping; the wire and
         # every served-model comparison below use the advertised spelling.
-        wire = _fallback_wire_spelling(cand, advertised)
+        wire = _fallback_wire_spelling(cand, advertised, backend=backend)
         if wire.strip().lower() == (active or "").strip().lower():
             # With a marker-seeded primary, the chain can still name the
             # CURRENTLY-failing fallback the session sits on — retrying it is
@@ -852,6 +878,24 @@ def provider_advertised_ids(provider: Any) -> list[str]:
         return advertised_model_ids(getter())
     except Exception:
         return []
+
+
+def provider_backend(provider: Any) -> str:
+    """The provider's ACP backend id, ``""`` when unknown.
+
+    Lets the fallback walk fold a bare pair-id chain entry (e.g. a codex pin)
+    to its advertised wire spelling via :func:`resolve_pin_spelling_on`, the
+    same backend-aware fold the cold-start, substitute and warm-pool wire
+    sites apply; an unknown backend keeps the generic (backend-less) fold.
+    """
+    for attr in ("backend",):
+        try:
+            val = getattr(provider, attr, "")
+        except Exception:  # pragma: no cover - exotic property getters
+            val = ""
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
 
 
 def provider_active_model(provider: Any) -> str:
@@ -1318,6 +1362,7 @@ def _first_tool_input_denial(
     denied_regexes: list[str] | None,
     *,
     exempt_command: str | None = None,
+    command_rules: bool = True,
 ) -> tuple[str, str, str] | None:
     """Return the first tool_input denial among *strings*, or ``None``.
 
@@ -1334,6 +1379,11 @@ def _first_tool_input_denial(
     own wall clock -- a denied oversized string is recoverable, a worker parked
     for minutes on a pathological payload is not -- and an oversized one is
     denied rather than scanned or skipped.
+
+    ``command_rules=False`` applies the size ceiling and the path tier only:
+    the caller passes it for a named MCP document body
+    (``platform.tool_paths.MCP_DOCUMENT_BODY_FIELDS``), which is stored text
+    and not a command line.
 
     The tuple is ``(kind, reason, matched_string)`` where *kind* is
     ``"path"`` / ``"bash"`` / ``"regex"`` / ``"oversize"``. Mechanism
@@ -1364,6 +1414,8 @@ def _first_tool_input_denial(
             if is_unverifiable_path_refusal(path_refusal):
                 return ("path", path_refusal, s)
             return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
+        if not command_rules:
+            continue
         _input_bash = is_sensitive_bash_command(s)
         if _input_bash:
             return ("bash", _input_bash, s)
@@ -1534,9 +1586,14 @@ async def run_bg_oneliner(
     crew_log_session_key: str = "",
     max_output_bytes: int | None = None,
     retry_rejected_model: bool = True,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
 ) -> str:
     """Stream a single prompt through an ephemeral background session and return
     the accumulated text.
+
+    ``start_priority`` orders the session's start; FOREGROUND only for a caller a
+    person is waiting on (rule: ``kiro_crew.start_priority``). ``timeout`` bounds
+    the DRIVE only -- see the acquisition below for why it must not be cancelled.
 
     ``strict_model=True`` makes the requested ``model`` a hard requirement
     rather than a preference: a failed ``set_model`` override raises instead
@@ -1582,7 +1639,15 @@ async def run_bg_oneliner(
     # background runtime lock and start a runtime -- so resolving after it is
     # already late enough to name the successor.
     _crew_log_owner = _background_crew_log_owner(sessions, crew_log_session_key, crew_log_kind)
-    session = await sessions.get_bg_session()
+    # NOT under ``timeout``: the acquisition can be the shared ``_bg`` runtime's own
+    # (re)spawn, run inline under its lock, and a cancelled one is killed with
+    # nothing assigned -- so a short-budget caller would destroy the runtime every
+    # later caller reuses, repeatedly. Cancelling it after ``session/new`` went out
+    # also leaks that session: the gate's late-answer collector belongs to the
+    # runtime's own timeout, not to a caller's. ``start_priority`` is what keeps a
+    # person's wait here short; the queue waits are bounded by the gate's own
+    # budgets.
+    session = await sessions.get_bg_session(start_priority=start_priority)
     # The stats object as it stands BEFORE this turn. The runner replaces it when
     # a turn actually begins, so comparing identity at teardown separates a turn
     # that ran from one whose dispatch failed while the previous turn's already
@@ -1640,10 +1705,12 @@ async def run_bg_oneliner(
             )
         # A one-liner's prompt is text ABOUT a session (a summary, a title, a
         # label), so any image path in it is quoted history, not an attachment.
-        # Left in, the prompt builder re-inlines every still-readable file as an
-        # image block: a session summary carried one per pasted screenshot, and
-        # a text-only background model rejected the whole request on each pass.
-        async for event in session.prompt(strip_image_refs(prompt)):
+        # Inlined, every still-readable file became an image block: a session
+        # summary carried one per pasted screenshot, and a text-only background
+        # model rejected the whole request on each pass. So the turn goes out
+        # text-only, which holds for every shape a caller composes; the scrub
+        # only tidies the text, swapping a reference it can read for the marker.
+        async for event in session.prompt(strip_image_refs(prompt), allow_image=False):
             if event.kind == EVENT_TEXT_CHUNK:
                 if max_output_bytes is not None:
                     output_bytes += len(event.text.encode("utf-8"))
@@ -2301,6 +2368,7 @@ async def stream_and_collect(
     app: str = "",
     model_fallback: bool = False,
     fallback_models: Sequence[str] = (),
+    allow_image: bool = True,
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -2366,6 +2434,8 @@ async def stream_and_collect(
             Every swap is logged at warning and published on the provider via
             :data:`TURN_FALLBACK_ATTR`; the swap is sticky for the session and
             a later call on the same provider probes one primary restore.
+        allow_image: ``False`` sends every attempt text-only (see
+            ``LLMProvider.stream``), for a prompt that is text ABOUT a session.
 
     Returns:
         The complete response text.
@@ -2421,7 +2491,12 @@ async def stream_and_collect(
         # baseline an attempt that was billed and then failed is invisible.
         attempt_stats_before = _billing_stats(provider)
         try:
-            async for event in provider.stream(message):
+            events = (
+                provider.stream(message)
+                if allow_image
+                else provider.stream(message, allow_image=False)
+            )
+            async for event in events:
                 if event.kind == EVENT_TEXT_CHUNK:
                     result_text += event.text
                     if on_chunk:
@@ -2739,6 +2814,7 @@ async def stream_and_collect_json(
     approval_policy: ToolApprovalPolicy = ToolApprovalPolicy.AUTO_APPROVE,
     hooks: HookManager | None = None,
     model_fallback: bool = False,
+    allow_image: bool = True,
 ) -> dict | None:
     """Stream a message and parse the response as JSON.
 
@@ -2751,6 +2827,7 @@ async def stream_and_collect_json(
         approval_policy=approval_policy,
         hooks=hooks,
         model_fallback=model_fallback,
+        allow_image=allow_image,
     )
     return parse_llm_json(text)
 
@@ -2939,11 +3016,47 @@ async def _resolve_permission(
         )
         else None
     )
+    # A Kiro Crew core MCP tool listed in ``platform.tool_paths.
+    # MCP_DOCUMENT_BODY_FIELDS`` (``knowledge_add_document``'s ``content``)
+    # stores that field as document text, so the field skips the command-text
+    # rules -- the deny list and the argv floor -- that read a page mentioning a
+    # product subcommand as an attempt to run it. The body keeps the size
+    # ceiling and the path tier; every other argument keeps the full scan. The
+    # params and identity bar match the built-in scoping above, and the identity is the
+    # cached server AND tool, so a same-named tool on another server, or a frame
+    # whose identity did not come from the caches, keeps the full scan.
+    #
+    # Unlike the built-in scoping, ``shell_classified`` is not required: the
+    # trusted cached server+tool pair (adapter-written ``_meta``, never the
+    # payload) already names exactly what runs. kiro-cli's MCP ``tool_call``
+    # frame carries no ``kind`` (only its later updates do), so the shell cache
+    # is empty for a real kiro-cli MCP call. A frame that does report a shell
+    # kind still sets ``is_shell`` and is refused the exemption.
+    _mcp_body_keys = (
+        mcp_document_body_keys(
+            getattr(event, "tool_name", ""), getattr(event, "mcp_server_name", "")
+        )
+        if (
+            _edit_params is None
+            and _scoped_params is None
+            and not getattr(event, "is_shell", False)
+            and getattr(event, "raw_params_trusted", False)
+            and getattr(event, "mcp_identity_trusted", False)
+            and isinstance(getattr(event, "raw_tool_params", None), dict)
+        )
+        else frozenset()
+    )
     _scoped_truncated = False
+    _body_strings: list[str] = []
     if _edit_params is not None:
         _input_strings: list[str] = []
     elif _scoped_params is not None:
         _scoped_strings = command_shaped_strings(_scoped_params)
+        _scoped_truncated = _scoped_strings.truncated
+        _input_strings = list(_scoped_strings)
+    elif _mcp_body_keys and isinstance(event.raw_tool_params, dict):
+        _rest_params, _body_strings = split_document_bodies(event.raw_tool_params, _mcp_body_keys)
+        _scoped_strings = command_shaped_strings(_rest_params, body_keys=frozenset())
         _scoped_truncated = _scoped_strings.truncated
         _input_strings = list(_scoped_strings)
     else:
@@ -2985,6 +3098,10 @@ async def _resolve_permission(
             )
             if input_hit is not None:
                 return (*input_hit, "always_deny_input")
+        if _body_strings:
+            body_hit = _first_tool_input_denial(_body_strings, _denied_regexes, command_rules=False)
+            if body_hit is not None:
+                return (*body_hit, "always_deny_input")
         return None
 
     _hit = await asyncio.to_thread(_scan_off_loop)

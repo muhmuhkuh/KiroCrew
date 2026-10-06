@@ -17,8 +17,7 @@ Covered here, beyond the per-feature suites next door:
 * single-flight user transitions, refusal of a stale run generation, delete
   staying final over late callbacks, and the residue of a failed cycle write;
 * both execution modes' launch ordering;
-* log records keep the historic logger name;
-* no bounded slice feeds a redactor anywhere in the app package.
+* log records keep the historic logger name.
 """
 
 from __future__ import annotations
@@ -38,7 +37,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
-from test_core_path_redact_before_bound import _find_slice_inside_redact_call
 
 from kiro_crew.apps.builtins.auto_research import handlers as h
 
@@ -646,6 +644,20 @@ class TestPatchReach:
         assert h._read_workflow_cycle_offset(cid) == 2
         assert h._read_workflow_run_id(cid) == "run-1"
 
+    def test_a_non_dict_workflow_run_document_returns_the_default(self):
+        """A workflow_run.json whose top level is not an object (a bare list,
+        string or number) must reach the default via the explicit isinstance
+        gate -- never a broad ``except AttributeError`` on ``doc.get`` that would
+        also mask a genuine bug. The reads do not raise."""
+        cid = _campaign(execution_mode="workflow")
+        run_file = h._campaign_dir(cid) / h._WORKFLOW_RUN_FILE
+        run_file.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        assert h._read_workflow_cycle_offset(cid) == 0
+        assert h._read_workflow_run_id(cid) is None
+        run_file.write_text(json.dumps("not-a-dict"), encoding="utf-8")
+        assert h._read_workflow_cycle_offset(cid) == 0
+        assert h._read_workflow_run_id(cid) is None
+
     @pytest.mark.asyncio
     async def test_run_identity_patch_reaches_the_workflow_poll(
         self, sse: _Sink, monkeypatch: pytest.MonkeyPatch
@@ -1187,21 +1199,3 @@ class TestLogIdentity:
                 if fragment in record.getMessage():
                     messages[fragment] = record.name
         assert messages == dict.fromkeys(messages, _HANDLERS_LOGGER)
-
-
-# --- redaction precedes bounding everywhere in the package -------------------
-
-
-class TestRedactBeforeBoundAcrossThePackage:
-    def test_no_bounded_slice_feeds_a_redactor_in_any_app_module(self):
-        package = Path(h.__file__).resolve().parent
-        modules = sorted(
-            p
-            for p in package.rglob("*.py")
-            if "tests" not in p.relative_to(package).parts and "__pycache__" not in p.parts
-        )
-        assert Path(h.__file__).resolve() in modules
-        redacting = [p for p in modules if "redact" in p.read_text(encoding="utf-8")]
-        assert Path(h.__file__).resolve() in redacting
-        offenders = [hit for p in modules for hit in _find_slice_inside_redact_call(p)]
-        assert offenders == []

@@ -1,24 +1,29 @@
-"""Messaging handlers — spawn, notifications, send-message, slack profile."""
+"""Messaging handlers — spawn, notifications, send-message, slack profile.
+
+The route families are composed from the owners in ``kiro_crew.dashboard.messaging_api``;
+this module stays their import path and their patch surface (see that package).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import functools
-import importlib.util
+import importlib.util  # noqa: F401
+import inspect  # noqa: F401
 import json
 import logging
-import math
+import math  # noqa: F401
 import os
 import platform
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, cast  # noqa: F401
 
 from aiohttp import web
 
 from kiro_crew import platform_compat
-from kiro_crew.agent_sdk.drivers.acp_vocab import NATIVE_CHILD_NOT_RESUMABLE
+from kiro_crew.agent_sdk.drivers.acp_vocab import NATIVE_CHILD_NOT_RESUMABLE  # noqa: F401
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser.command_bus import (
     DEFAULT_COMMAND_TIMEOUT_MS,
@@ -28,20 +33,23 @@ from kiro_crew.browser.command_bus import (
     get_command_bus,
 )
 from kiro_crew.browser_cli import install as browser_cli_install
+from kiro_crew.browser_cli import install_job as browser_install_job
 from kiro_crew.browser_cli import launcher as browser_cli_launcher
 from kiro_crew.browser_cli import token as browser_cli_token
 from kiro_crew.browser_cli import view as browser_cli_view
-from kiro_crew.config import live
+from kiro_crew.config import live  # noqa: F401
 from kiro_crew.config import loader as _loader
-from kiro_crew.config.loader import (
+from kiro_crew.config.loader import (  # noqa: F401
     IMESSAGE_SERVICES,
     TELEGRAM_ACTIVATIONS,
     KiroCrewConfig,
     config_path,
+    read_config_text,
 )
-from kiro_crew.constants import CHANNEL_SEND_NAMESPACES
-from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
-from kiro_crew.dashboard.channel_folders import (
+from kiro_crew.constants import CHANNEL_SEND_NAMESPACES, SUBAGENT_COMPLETION_META_KEY  # noqa: F401
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable  # noqa: F401
+from kiro_crew.dashboard import messaging_api as _messaging_api
+from kiro_crew.dashboard.channel_folders import (  # noqa: F401
     CHANNEL_CONFIG_SECTIONS,
     channel_restart_required,
     clean_session_folder,
@@ -50,8 +58,9 @@ from kiro_crew.dashboard.channel_folders import (
 )
 from kiro_crew.dashboard.channel_slots import backfill_channel_folder
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
-from kiro_crew.dashboard.chat_utils import (
+from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     CRON_NOTIFICATION_KIND,
+    SUBAGENT_COMPLETION_KIND,
     _remove_queued_by_id,
     dashboard_slot_key,
     drained_to_thread,
@@ -62,7 +71,7 @@ from kiro_crew.dashboard.chat_utils import (
     slack_options_owner_key,
     subagent_event_slot,
 )
-from kiro_crew.dashboard.handlers._shared import (
+from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
     _pip_install_channel_available,
     guard_owner_surface_routes,
     internal_memory_scope,
@@ -70,18 +79,157 @@ from kiro_crew.dashboard.handlers._shared import (
     read_bounded_json,
 )
 from kiro_crew.dashboard.handlers.browser_view_relay import ROUTE_PREFIX
-from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
+from kiro_crew.dashboard.handlers.core import _hot_apply_after_write  # noqa: F401
+from kiro_crew.dashboard.messaging_api import channel_delivery as _owner_channel_delivery
+from kiro_crew.dashboard.messaging_api import discord_settings as _owner_discord_settings
+from kiro_crew.dashboard.messaging_api import feishu_settings as _owner_feishu_settings
+from kiro_crew.dashboard.messaging_api import imessage_settings as _owner_imessage_settings
+from kiro_crew.dashboard.messaging_api import notifications as _owner_notifications
+from kiro_crew.dashboard.messaging_api import proactive_send as _owner_proactive_send
+from kiro_crew.dashboard.messaging_api import run_control as _owner_run_control
+from kiro_crew.dashboard.messaging_api import run_views as _owner_run_views
+from kiro_crew.dashboard.messaging_api import slack_settings as _owner_slack_settings
+from kiro_crew.dashboard.messaging_api import spawn as _owner_spawn
+from kiro_crew.dashboard.messaging_api import teams_settings as _owner_teams_settings
+from kiro_crew.dashboard.messaging_api import telegram_settings as _owner_telegram_settings
+from kiro_crew.dashboard.messaging_api import webex_settings as _owner_webex_settings
+from kiro_crew.dashboard.messaging_api import wecom_settings as _owner_wecom_settings
+from kiro_crew.dashboard.messaging_api.channel_delivery import (  # noqa: F401
+    _channel_delivery_key,
+    _ChannelSendFailed,
+    _deliver_channel_dm,
+    _deliver_to_channel,
+    _owner_dm_target,
+    _send_to_channel_target,
+    _vet_channel_send,
+)
+from kiro_crew.dashboard.messaging_api.discord_settings import (  # noqa: F401
+    _discord_config_save_locked,
+    _validate_discord_token,
+    api_discord_config_get,
+    api_discord_config_save,
+)
+from kiro_crew.dashboard.messaging_api.feishu_settings import (  # noqa: F401
+    _channel_sdk_status,
+    _feishu_config_save_locked,
+    _is_valid_feishu_id,
+    api_feishu_config_get,
+    api_feishu_config_save,
+)
+from kiro_crew.dashboard.messaging_api.imessage_settings import (  # noqa: F401
+    _clean_imessage_path,
+    _imessage_config_save,
+    _is_valid_imessage_handle,
+    api_imessage_config_get,
+)
+from kiro_crew.dashboard.messaging_api.notifications import (  # noqa: F401
+    api_notification_ack,
+    api_notification_channel_settings,
+    api_notification_channels,
+    api_notification_delete,
+    api_notification_unack,
+    api_notifications,
+    api_notifications_ack_all,
+    api_notifications_clear,
+)
+from kiro_crew.dashboard.messaging_api.proactive_send import (  # noqa: F401
+    _audit_send_message,
+    _deliver_send_message_fallback,
+    _post_send_message_to_slack,
+    _read_send_message,
+    _redact_all,
+    _resolve_session_link_url,
+    _resolve_session_target,
+    _sanitize_blocks,
+    _send_message_response,
+    _SendMessageBody,
+    _SendMessageOutcome,
+    _session_link_blocks,
+    api_delete_message,
+    api_update_message,
+)
+from kiro_crew.dashboard.messaging_api.run_control import (  # noqa: F401
+    _log_panel_dismissal,
+    _native_child_refusal,
+    _queue_unreadable,
+    _queued_lookup,
+    _queued_not_started,
+    _queued_run,
+    _queued_run_payload,
+    _queued_runs,
+    _retry_failed_run,
+    _spawn_scope_refusal,
+    api_spawn_delete,
+    api_spawn_lost,
+    api_spawn_mark_collected,
+    api_spawn_release,
+    api_spawn_retry,
+    api_spawn_steer,
+    api_spawn_stop_all,
+)
+from kiro_crew.dashboard.messaging_api.run_views import (  # noqa: F401
+    _apply_result_view,
+    _awaiting_spawn_approval,
+    _redact,
+    _spawn_result_view,
+    api_spawn_list,
+    api_spawn_status,
+)
+from kiro_crew.dashboard.messaging_api.slack_settings import (  # noqa: F401
+    _slack_config_save_locked,
+    _validate_slack_token,
+    api_slack_config_get,
+    api_slack_config_save,
+)
+from kiro_crew.dashboard.messaging_api.spawn import (  # noqa: F401
+    _continue_on_loop,
+    _slot_for_parent,
+    _spawn_on_loop,
+    _spawn_request_memory_mode,
+    api_spawn,
+    api_spawn_continue,
+)
+from kiro_crew.dashboard.messaging_api.teams_settings import (  # noqa: F401
+    _is_valid_teams_principal,
+    _teams_config_save,
+    _validate_teams_app_credentials,
+    api_teams_config_get,
+    api_teams_config_save,
+)
+from kiro_crew.dashboard.messaging_api.telegram_settings import (  # noqa: F401
+    _telegram_config_save_locked,
+    _validate_telegram_token,
+    api_telegram_config_get,
+    api_telegram_config_save,
+)
+from kiro_crew.dashboard.messaging_api.webex_settings import (  # noqa: F401
+    _coerce_like,
+    _is_valid_webex_email,
+    _validate_webex_token,
+    _webex_config_save,
+    api_webex_config_get,
+    api_webex_config_save,
+)
+from kiro_crew.dashboard.messaging_api.wecom_settings import (  # noqa: F401
+    _is_valid_wecom_userid,
+    _wecom_config_save_locked,
+    api_wecom_config_get,
+    api_wecom_config_save,
+)
 from kiro_crew.dashboard.origin import is_direct_local_request, is_proxied_request
-from kiro_crew.dashboard.state import (
+from kiro_crew.dashboard.state import (  # noqa: F401
     CRON_NOTIFY_END,
     CRON_NOTIFY_PREFIX,
     PERSISTED_SUBAGENT_REPLAY_KEEP,
     PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
-    stage_boundary_for,
 )
-from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
-from kiro_crew.dashboard.ws_event_scope import (
+from kiro_crew.dashboard.token_auth import (  # noqa: F401
+    LINK_WINDOW_SECS,
+    caller_names_a_missing_slot,
+    generate_token,
+)
+from kiro_crew.dashboard.ws_event_scope import (  # noqa: F401
     _audit_allow,
     _audit_deny,
     persisted_replay_denial_reason,
@@ -89,14 +237,14 @@ from kiro_crew.dashboard.ws_event_scope import (
     slot_owner_snapshot,
 )
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
-from kiro_crew.messaging.renderer import (
+from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink  # noqa: F401
+from kiro_crew.messaging.renderer import (  # noqa: F401
     chunk_for_transport,
     chunk_text,
     display_safe_for,
     format_overflow,
 )
-from kiro_crew.messaging.transport import (
+from kiro_crew.messaging.transport import (  # noqa: F401
     DM_TARGET_PREFIX,
     delivery_confirmed,
     sole_direct_target,
@@ -105,21 +253,37 @@ from kiro_crew.notifications.bus import (
     NotificationPayload,
     NotificationValidationError,
 )
-from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
-from kiro_crew.platform_compat import IS_MACOS
-from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
-from kiro_crew.slack.client import BLOCKS_REMOTE_MEDIA_ERROR, blocks_request_remote_media
-from kiro_crew.slack.format import build_options_blocks, extract_options
-from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions
-from kiro_crew.spawn_warm import warm_project_agents_for_spawn
-from kiro_crew.subagent import (
+from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY  # noqa: F401
+from kiro_crew.platform_compat import IS_MACOS  # noqa: F401
+from kiro_crew.security import (  # noqa: F401
+    is_sensitive_path,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
+from kiro_crew.slack.client import (  # noqa: F401
+    BLOCKS_REMOTE_MEDIA_ERROR,
+    blocks_request_remote_media,
+)
+from kiro_crew.slack.format import (  # noqa: F401
+    SESSION_LINK_ACTION,
+    build_options_blocks,
+    extract_options,
+)
+from kiro_crew.slack.outbound import OPTIONS_FALLBACK_TEXT, PostedOptions  # noqa: F401
+from kiro_crew.spawn_warm import warm_project_agents_for_spawn  # noqa: F401
+from kiro_crew.subagent import (  # noqa: F401
     DEFERRED_QUEUED_REASONS,
+    SUCCESSOR_UNKNOWN,
     effort_applied_note,
     effort_drop_reason,
     parent_spawn_allowlists,
-    stage_boundary_owner_for_run,
 )
-from kiro_crew.subagent_persistence import (
+from kiro_crew.subagent_manager.admission.types import (  # noqa: F401
+    QueuedReadUnavailable,
+    QueuedRun,
+    QueuedRunListing,
+)
+from kiro_crew.subagent_persistence import (  # noqa: F401
     DISMISSAL_FAILED,
     DISMISSAL_NO_FOLDER,
     PanelRecords,
@@ -130,7 +294,7 @@ from kiro_crew.subagent_persistence import (
     read_tombstone,
     record_panel_dismissal_outcome,
 )
-from kiro_crew.validation import (
+from kiro_crew.validation import (  # noqa: F401
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
     CHANNEL_MAX_LEN,
@@ -435,144 +599,6 @@ def _run_belongs_to_caller(caller: str, run_id: str, parent: object) -> bool:
     return parent_key == caller
 
 
-async def _spawn_scope_refusal(
-    request: web.Request, *, claimed_session: str | None = None
-) -> web.Response | None:
-    """Keep run controls with their originating session, regardless of target member.
-
-    Every INTERNAL caller (kiro-cli's MCP servers, the CLI) takes the ownership
-    check, whatever memory store its identity resolved to and whether it resolved
-    one at all: a verified Global-memory session is still only the owner of its
-    own runs, and a caller that presented no ``X-Session-Key`` owns no run a
-    session started. Only the dashboard owner (cookie auth, no ``internal_auth``)
-    is admitted without it, because that surface IS the owner. Refusals answer
-    404 ``task_scope_denied`` so a run id is never confirmed to a caller that may
-    not see it; the identity-less refusal says why, since a wrong run id and a
-    missing identity are indistinguishable from the caller's side otherwise.
-    """
-    scope, refusal = await internal_memory_scope(
-        request, "spawn.access", claimed_session=claimed_session
-    )
-    if refusal is not None:
-        return refusal
-    if request.get("internal_auth") is not True:
-        return None  # the dashboard owner's own surface
-    caller = request.headers.get("X-Session-Key", "")
-    state = request.app["state"]
-    run_id = request.match_info["agent_id"]
-    info = state.subagents.get(run_id) if state.subagents else None
-    record = None if info is not None else await asyncio.to_thread(read_state, run_id)
-    parent: object
-    if info is not None:
-        parent = info.parent_session_key
-    elif record is not None:
-        # The persisted record spells the field ``parent_session``
-        # (``subagent_persistence.write_state``). A record that lacks it is an
-        # unknown owner, not a parentless run: ``None`` stays ``None``.
-        parent = record.get("parent_session")
-    else:
-        # A harness-native child has no managed run and no persisted record; its
-        # ownership is the dashboard slot that tracks its card. Anything else
-        # unknown stays ``None`` and is refused.
-        card = (getattr(state, "_native_cards", None) or {}).get(run_id)
-        # The card stores the bare slot key (``_register_native_card``); the
-        # caller's identity is that slot's session key, ``dashboard:<slot>``.
-        slot = card.get("slot") if isinstance(card, dict) else None
-        parent = f"dashboard:{slot}" if isinstance(slot, str) and slot else None
-    if _run_belongs_to_caller(caller, run_id, parent):
-        return None
-    _sel().log_api_access(
-        caller=caller or "internal",
-        operation="spawn.access",
-        outcome="denied",
-        source="subagent",
-        error=(
-            "The run belongs to another originating session."
-            if caller
-            else "The caller presented no session identity."
-        ),
-        resources=f"run={run_id} scope={'private' if scope else 'global'}",
-    )
-    return web.json_response(
-        {
-            "error": "not found" if caller else _IDENTITY_LESS_RUN_CONTROL,
-            "code": "task_scope_denied",
-        },
-        status=404,
-    )
-
-
-async def _spawn_request_memory_mode(
-    state: DashboardState, request: web.Request, parent: str
-) -> str:
-    from kiro_crew.dashboard.handlers._shared import resolve_session_memory_mode
-    from kiro_crew.messaging.privacy_mode import strictest
-
-    parent_mode = await resolve_session_memory_mode(state, parent)
-    caller = request.headers.get("X-Session-Key", "")
-    caller_mode = (
-        parent_mode if caller == parent else await resolve_session_memory_mode(state, caller)
-    )
-    return strictest((parent_mode, caller_mode)) or "persistent"
-
-
-def _stage_boundary_slot_for_parent(
-    state: DashboardState,
-    parent: str,
-    boundary_owner: str = "",
-) -> Any | None:
-    """Return an exact tagged owner, or legacy parent/latest fallback."""
-    slots = getattr(state, "_slots", None)
-    if not isinstance(slots, dict):
-        return None
-    slot_name = dashboard_slot_key(parent)
-    if not slot_name and parent.startswith("dashboard:"):
-        slot_name = parent.removeprefix("dashboard:")
-    canonical = slots.get(slot_name) if slot_name else None
-    same_parent = tuple(
-        candidate
-        for candidate in slots.values()
-        if candidate is canonical or effective_session_key(candidate) == parent
-    )
-    if boundary_owner:
-        return next(
-            (
-                candidate
-                for candidate in same_parent
-                if stage_boundary_for(candidate).owner == boundary_owner
-            ),
-            None,
-        )
-    aliases = tuple(candidate for candidate in same_parent if candidate is not canonical)
-    active_aliases = tuple(
-        candidate for candidate in aliases if stage_boundary_for(candidate).owner
-    )
-    if active_aliases:
-        parent_matches = tuple(
-            candidate
-            for candidate in active_aliases
-            if parent in stage_boundary_for(candidate).parent_session_keys
-        )
-        eligible = parent_matches or active_aliases
-        return max(
-            eligible,
-            key=lambda candidate: (
-                stage_boundary_for(candidate).armed_at,
-                str(getattr(candidate, "key", "")),
-            ),
-        )
-    return canonical or (same_parent[0] if same_parent else None)
-
-
-def _stage_boundary_owner_for_parent(state: DashboardState, parent: str) -> str:
-    """Return the active stage token for *parent*, or explicit unowned ``""``."""
-    slot = _stage_boundary_slot_for_parent(state, parent)
-    if slot is None:
-        return ""
-    owner = stage_boundary_for(slot).owner
-    return owner if isinstance(owner, str) else ""
-
-
 def parent_work_supported(state: Any, parent_session: str) -> bool:
     """Only dashboard-owned turns have the verified busy-turn completion queue.
 
@@ -590,1472 +616,27 @@ def parent_work_supported(state: Any, parent_session: str) -> bool:
     )
 
 
-async def api_spawn(request: web.Request) -> web.Response:
-    """POST /api/spawn — spawn a subagent.
-
-    Invariant: every error returned after ``state.subagents.spawn`` is called
-    must include ``counted: true``. The manager counts submissions on entry;
-    omitting the flag would make ``spawn_run`` reconcile the member again and
-    could close a batch wave early.
-    """
-    # Owner identity is a property of a dashboard-user request: ``app == ""`` is
-    # the class ``is_owner_dashboard_request`` can rule on at all. The other two
-    # caller classes keep the control that already governs them -- an
-    # ``X-Internal-Secret`` loopback process is admitted by the constant-time
-    # secret match and reaches here with ``app`` ABSENT, and an app token is
-    # confined to its manifest's declared paths by ``_enforce_app_scope``.
-    if request.get("internal_auth") is not True and request.get("app") == "":
-        # Body-scope import, like the sibling gates in this package
-        # (``connections.py``, ``mcp_apps.py``, ``files.py``): ``source_providers``
-        # reaches back into sibling handler modules, so importing the helper at
-        # module scope from here would close a cycle.
-        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-
-        owner_denied = await require_owner_dashboard_request(request, "spawn.create")
-        if owner_denied is not None:
-            return owner_denied
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response({"error": "subagents not available"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    try:
-        cleaned = validate_tool_args(
-            {
-                "task": body.get("task", ""),
-                "agent": body.get("agent", ""),
-                "max_turns": body.get("max_turns", 0),
-                "cwd": body.get("cwd", ""),
-                "model": body.get("model", ""),
-                "reasoning_effort": body.get("reasoning_effort", ""),
-                "include_memory": body.get("include_memory", True),
-                "include_lessons": body.get("include_lessons", True),
-                "include_project": body.get("include_project", True),
-                # The dict is CLOSED -- validate_tool_args only sees what is
-                # listed here -- so omitting a schema field silently disables it
-                # rather than failing. That is what made the crew delegation
-                # below unreachable: the block, its unknown_crew refusal and its
-                # store resolution all ran off a value that was always None.
-                "crew": body.get("crew", ""),
-                "target_member": body.get("target_member", ""),
-            },
-            SPAWN_RUN_SCHEMA,
-        )
-    except ValidationError as exc:
-        return web.json_response({"error": str(exc)}, status=400)
-    task = (cleaned.get("task") or "").strip()
-    if not task:
-        return web.json_response({"error": "task is required"}, status=400)
-    parent_session = body.get("parent_session", "")
-    if not isinstance(parent_session, str):
-        return web.json_response(
-            {"error": "parent_session must be a string", "code": "invalid_parent_session"},
-            status=400,
-        )
-    _, refusal = await internal_memory_scope(
-        request, "spawn.create", claimed_session=parent_session
-    )
-    if refusal is not None:
-        return refusal
-    try:
-        admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
-    except (OSError, ValueError):
-        return web.json_response(
-            {
-                "error": "The originating session's memory mode is unavailable.",
-                "code": "memory_unavailable",
-            },
-            status=409,
-        )
-    # approval_mode and silent are HTTP API parameters passed by the SDK,
-    # NOT MCP tool arguments from the LLM.  The LLM's spawn_run tool
-    # (mcp_core.py) does not expose these params — they are added by the
-    # SDK's spawn() method for app-level control.  Validated inline here
-    # rather than in SPAWN_RUN_SCHEMA because they are transport-layer
-    # params, not tool-schema params.
-    #
-    # Security: this endpoint requires X-Internal-Secret (internal_paths
-    # in server.py), so only local MCP server processes can call it.
-    approval_mode = body.get("approval_mode", "")
-    if approval_mode not in ("", "auto"):
-        return web.json_response({"error": "approval_mode must be '' or 'auto'"}, status=400)
-    silent = body.get("silent", False)
-    if not isinstance(silent, bool):
-        silent = str(silent).lower() in ("true", "1", "yes")
-    # keep=True marks the run's session as a continuable conversation
-    # (spawn_continue can dispatch follow-up turns into it). Transport-layer
-    # param like silent/approval_mode.
-    keep = body.get("keep", False)
-    if not isinstance(keep, bool):
-        keep = str(keep).lower() in ("true", "1", "yes")
-    agent = cleaned.get("agent") or ""
-    from kiro_crew.dashboard.handlers._shared import member_request_scope
-    from kiro_crew.execution_context import (
-        ExecutionContext,
-        MemoryStoreRef,
-        derive_execution,
-        read_session_execution,
-    )
-
-    crew = cleaned.get("target_member") or cleaned.get("crew") or ""
-    if (
-        cleaned.get("target_member")
-        and cleaned.get("crew")
-        and cleaned["target_member"] != cleaned["crew"]
-    ):
-        return web.json_response(
-            {"error": "Conflicting target members", "code": "invalid_target_member"}, status=400
-        )
-    try:
-        caller = await member_request_scope(request)
-        parent_execution = caller.execution
-        if parent_execution is None and parent_session:
-            parent_execution = await asyncio.to_thread(read_session_execution, parent_session)
-        # The parent agent spec's ``availableAgents`` declaration, read off-loop
-        # from the template the record named, so the gate needs neither a second
-        # record read nor a directory scan on the loop. A parentless request has
-        # no declaration to honour: the synthesized context below carries the
-        # CHILD's template, which must not be mistaken for a parent.
-        parent_spawn_policy = (
-            (
-                parent_execution.template_id,
-                await asyncio.to_thread(parent_spawn_allowlists, parent_execution.template_id),
-            )
-            if parent_execution is not None
-            else ("", ())
-        )
-        if parent_execution is None:
-            parent_execution = ExecutionContext(
-                None, MemoryStoreRef("default"), "template", agent or "kirocrew"
-            )
-        config = await asyncio.to_thread(KiroCrewConfig.load) if crew else None
-        if crew and config is not None and crew not in config.agents:
-            return web.json_response(
-                {"error": "The target member does not exist.", "code": "unknown_member"},
-                status=404,
-            )
-        if crew and config is not None and not config.agents[crew].triggers.strip():
-            return web.json_response(
-                {
-                    "error": "The target member has not enabled delegated tasks.",
-                    "code": "crew_delegation_disabled",
-                },
-                status=403,
-            )
-        admitted_execution = derive_execution(
-            parent_execution,
-            target_member=crew or None,
-            config=config,
-            requested_mode=admitted_mode,
-        )
-        child_memory_store = admitted_execution.store.legacy_name
-    except (OSError, ValueError) as exc:
-        return web.json_response(
-            {"error": str(exc), "code": "member_identity_unavailable"}, status=409
-        )
-    max_turns = cleaned.get("max_turns") or 0
-    cwd = cleaned.get("cwd") or ""
-    model = cleaned.get("model") or ""
-    reasoning_effort = cleaned.get("reasoning_effort") or ""
-    can_work = parent_work_supported(state, parent_session)
-    # Batch/wave identity (transport-layer params from spawn_run MCP, like
-    # approval_mode/silent above): validated inline, bounded, never LLM-schema.
-    batch_id = str(body.get("batch_id", "") or "")[:32]
-    if batch_id and not batch_id.isalnum():
-        return web.json_response({"error": "batch_id must be alphanumeric"}, status=400)
-    try:
-        batch_total = max(0, min(int(body.get("batch_total", 0) or 0), 1000))
-    except (TypeError, ValueError):
-        batch_total = 0
-    # The async moment preceding the synchronous spawn(): warm here so the
-    # on-loop, cache-only agent validation inside spawn() is a hit.
-    if agent:
-        await warm_project_agents_for_spawn(state, cwd)
-    info = await _spawn_on_loop(
-        state,
-        task,
-        parent_session_key=parent_session,
-        agent=agent,
-        max_turns=max_turns,
-        cwd=cwd,
-        model=model or None,
-        reasoning_effort=reasoning_effort,
-        approval_mode=approval_mode or None,
-        silent=silent,
-        batch_id=batch_id,
-        batch_total=batch_total,
-        keep=keep,
-        include_memory=cleaned.get("include_memory", True) is not False,
-        include_lessons=cleaned.get("include_lessons", True) is not False,
-        include_project=cleaned.get("include_project", True) is not False,
-        memory_store=child_memory_store,
-        crew=crew,
-        _memory_mode=admitted_mode,
-        _execution_context=admitted_execution.to_record(),
-        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
-        _parent_spawn_policy=parent_spawn_policy,
-    )
-    if not info:
-        # Reached mgr.spawn (submission COUNTED at the top of spawn()) but
-        # refused for capacity — tell the client so it does NOT reconcile
-        # this member as a lost submission (double-count would close the
-        # wave early).
-        return web.json_response(
-            {"error": f"capacity reached ({state.subagents.max_concurrent})", "counted": True},
-            status=429,
-        )
-    if info.done and info.error:
-        # Rejected INSIDE mgr.spawn: already counted as submitted and (for
-        # batch members) announced through the completion consumer
-        # (_announce_rejection). "counted" tells spawn_run's client-side
-        # reconcile to skip this member.
-        #
-        # ``code`` is what the client switches on; ``error`` is advisory prose
-        # (RFC 9457 3.1.3). Only the unknown-agent refusal mints its own
-        # identifier today, because it is the only rejection a client treats
-        # differently — spawn_run stops re-posting a name already refused. Every
-        # other rejection reports the generic code, matching the sibling
-        # /continue handler below.
-        return web.json_response(
-            {
-                "error": info.error,
-                "code": info.error_code or _SPAWN_REJECTED_CODE,
-                "counted": True,
-            },
-            status=400,
-        )
-    resp: dict[str, object] = {
-        "id": info.id,
-        "task": task,
-        "status": "spawned",
-        "parent_work_supported": can_work,
-    }
-    # A row the gate DEFERRED (memory floor, critical posture, adaptive cap at
-    # 0) is accepted and keyed like any other -- same ``id``, counted in its
-    # wave -- but it is not running and may not run for a long time: the pump
-    # re-checks it every admit wait for as long as the host stays below the
-    # bar. Saying ``spawned`` for it left the caller waiting on a completion
-    # event that was not coming. ``queued`` names the wait; ``reason`` is the
-    # kind, ``reason_detail`` the gate's own sentence. A row waiting only for a
-    # slot or the stagger tick (``concurrency_limit``) keeps ``spawned``: that
-    # wait is the ordinary wave shape and clears within seconds.
-    queued_reason = str(getattr(info, "queued_reason", "") or "")
-    if queued_reason in DEFERRED_QUEUED_REASONS:
-        resp["status"] = "queued"
-        resp["reason"] = queued_reason
-        resp["reason_detail"] = _redact(str(getattr(info, "queued_reason_detail", "") or ""))
-    # Server-side effort verdict: only this side knows the model the factory's
-    # effort gate will see (explicit per-call value, else the subagent role
-    # pin, else the session chain for the effective agent — a crew's pin, else
-    # a non-sentinel global). Additive, optional key — reporting only, never
-    # changes whether the spawn happened.
-    if reasoning_effort:
-        # Read the allocation-owned namespace on the loop. A reporting failure
-        # cannot undo the submission or turn an unknown selection into "auto".
-        selection: tuple[str, str] | None
-        try:
-            if agent:
-                selection = ("template", agent)
-            elif crew:
-                selection = ("member", crew)
-            elif parent_session:
-                selection = state.sessions.get_agent_selection(parent_session)
-            else:
-                selection = ("template", "")
-        except Exception:
-            selection = None
-
-        def _effort_verdict() -> tuple[str, str]:
-            if (
-                not isinstance(selection, tuple)
-                or len(selection) != 2
-                or selection[0] not in ("template", "member")
-                or not isinstance(selection[1], str)
-                or (selection[0] == "member" and not selection[1])
-            ):
-                return "", ""
-            kind, verdict_agent = selection
-            claim = verdict_agent if kind == "member" else ""
-            d = effort_drop_reason(model, reasoning_effort, verdict_agent, crew_agent=claim)
-            if d:
-                return d, ""
-            return "", effort_applied_note(model, reasoning_effort, verdict_agent, crew_agent=claim)
-
-        # The resolvers read config and glob ~/.kiro/agents — file I/O that
-        # must not run on the gateway event loop (the same reason
-        # get_or_create runs _session_model in an executor).
-        drop, applied = await asyncio.to_thread(_effort_verdict)
-        if drop:
-            resp["effort_dropped"] = drop
-        elif applied:
-            resp["effort_applied"] = applied
-    if keep:
-        # The conversation id is the FIRST run's id: spawn_continue targets it.
-        resp["conversation"] = info.id
-    return web.json_response(resp)
-
-
-async def _spawn_on_loop(state: "DashboardState", task: str, **kwargs: Any) -> Any:
-    """Spawn from an async handler WITHOUT blocking the loop on the task store.
-
-    ``SubagentManager.spawn_async`` writes the durable row on the store's
-    writer thread and only then starts the run (write-before-ack, off-loop).
-    A manager without that entry -- a test double -- is spawned synchronously,
-    which is the pre-queue behaviour those doubles model.
-    """
-    import inspect
-
-    subagents = state.subagents
-    assert subagents is not None  # every caller checked ``state.subagents`` first
-    spawn_async = getattr(subagents, "spawn_async", None)
-    if inspect.iscoroutinefunction(spawn_async):
-        return await spawn_async(task, **kwargs)
-    return subagents.spawn(task, **kwargs)
-
-
-async def _continue_on_loop(state: "DashboardState", conv_id: str, task: str, **kwargs: Any) -> Any:
-    """:func:`_spawn_on_loop` for continuations: ``continue_conversation_async``
-    writes the durable row off-loop; a double without it continues synchronously."""
-    import inspect
-
-    subagents = state.subagents
-    assert subagents is not None
-    continue_async = getattr(subagents, "continue_conversation_async", None)
-    if inspect.iscoroutinefunction(continue_async):
-        return await continue_async(conv_id, task, **kwargs)
-    return subagents.continue_conversation(conv_id, task, **kwargs)
-
-
-def _native_child_refusal(state: "DashboardState", conversation_id: str) -> str | None:
-    """Typed reason when *conversation_id* is a harness-native child of a live
-    session (kiro-cli ``use_subagent`` / KAS subtask), else None."""
-    probe = getattr(state.subagents, "native_child_resume_refusal", None)
-    if not callable(probe):
-        return None
-    try:
-        reason = probe(conversation_id)
-    except Exception:  # noqa: BLE001 - advisory lookup
-        return None
-    # A typed refusal is a str with the known prefix; anything else (a test
-    # double's attribute, a stray object) is not a refusal.
-    if isinstance(reason, str) and reason.startswith(NATIVE_CHILD_NOT_RESUMABLE):
-        return reason
-    return None
-
-
-async def api_spawn_continue(request: web.Request) -> web.Response:
-    """POST /api/spawn/{agent_id}/continue — follow-up turn on a conversation.
-
-    ``agent_id`` is the conversation id (the first keep=True run's id). Mints
-    a NEW run on the same underlying session (resumed via session/load), so
-    the follow-up executes with the conversation's accumulated context.
-    """
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response(
-            {"error": "subagents not available", "code": "subagents_unavailable"},
-            status=503,
-        )
-    conv_id = request.match_info["agent_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    task = str(body.get("task", "") or "").strip()
-    if not task:
-        return web.json_response({"error": "task is required", "code": "task_required"}, status=400)
-    parent_session = str(body.get("parent_session", "") or "")
-    refusal = await _spawn_scope_refusal(request, claimed_session=parent_session)
-    if refusal is not None:
-        return refusal
-    try:
-        admitted_mode = await _spawn_request_memory_mode(state, request, parent_session)
-    except (OSError, ValueError):
-        return web.json_response(
-            {
-                "error": "The originating session's memory mode is unavailable.",
-                "code": "memory_unavailable",
-            },
-            status=409,
-        )
-    agent = str(body.get("agent", "") or "")
-    model = str(body.get("model", "") or "")
-    try:
-        max_turns = max(0, min(int(body.get("max_turns", 0) or 0), 1000))
-    except (TypeError, ValueError):
-        max_turns = 0
-    # The run's own cwd, resolved OFF the event loop: a continuation has to run
-    # where the run ran (a project-local agent does not resolve against the pool
-    # project), but reading state.json and probing the path are blocking calls and
-    # `continue_conversation` is synchronous. Doing it here keeps the gateway
-    # responsive even when the recorded path lives on a stalled mount.
-    resumed_cwd = await asyncio.to_thread(state.subagents.recorded_cwd, conv_id)
-    info = await _continue_on_loop(
-        state,
-        conv_id,
-        task,
-        parent_session_key=parent_session,
-        agent=agent,
-        model=model or None,
-        max_turns=max_turns,
-        cwd=resumed_cwd,
-        _memory_mode=admitted_mode,
-        _stage_boundary_owner=_stage_boundary_owner_for_parent(state, parent_session),
-    )
-    if not info:
-        return web.json_response(
-            {
-                "error": f"capacity reached ({state.subagents.max_concurrent})",
-                "code": "capacity_reached",
-            },
-            status=429,
-        )
-    if info.done and info.error:
-        if info.error.startswith("conversation_busy"):
-            return web.json_response({"error": info.error, "code": "conversation_busy"}, status=409)
-        if info.error.startswith(NATIVE_CHILD_NOT_RESUMABLE):
-            # A harness-native child of a live session: the lever that exists
-            # is the parent, so the refusal is a conflict, not a lookup miss.
-            return web.json_response(
-                {"error": info.error, "code": NATIVE_CHILD_NOT_RESUMABLE}, status=409
-            )
-        if info.error.startswith("conversation_gone"):
-            return web.json_response({"error": info.error, "code": "conversation_gone"}, status=404)
-        return web.json_response({"error": info.error, "code": _SPAWN_REJECTED_CODE}, status=400)
-    return web.json_response({"id": info.id, "conversation": conv_id, "status": "spawned"})
-
-
-async def api_spawn_steer(request: web.Request) -> web.Response:
-    """POST /api/spawn/{agent_id}/steer — inject into a RUNNING run's turn.
-
-    Body: ``{message, mode?}``. ``mode="interrupt"`` (default) injects into
-    the running turn; ``mode="follow_up"`` queues the message for delivery as
-    a continuation AFTER the run's current turn completes (never interrupts).
-    """
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response(
-            {"error": "subagents not available", "code": "subagents_unavailable"},
-            status=503,
-        )
-    agent_id = request.match_info["agent_id"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    message = str(body.get("message", "") or "").strip()
-    if not message:
-        return web.json_response(
-            {"error": "message is required", "code": "message_required"}, status=400
-        )
-    mode = str(body.get("mode", "") or "interrupt").strip()
-    if mode not in ("interrupt", "follow_up"):
-        return web.json_response(
-            {"error": "mode must be 'interrupt' or 'follow_up'", "code": "invalid_mode"},
-            status=400,
-        )
-    if mode == "follow_up":
-        ok, detail = await state.subagents.follow_up_run(agent_id, message)
-    else:
-        ok, detail = await state.subagents.steer_run(agent_id, message)
-    if not ok:
-        if detail == "not_found":
-            native = _native_child_refusal(state, agent_id)
-            if native is not None:
-                return web.json_response(
-                    {"error": native, "code": NATIVE_CHILD_NOT_RESUMABLE}, status=409
-                )
-            return web.json_response({"error": detail, "code": "not_found"}, status=404)
-        if detail.startswith("not_running"):
-            return web.json_response({"error": detail, "code": "not_running"}, status=409)
-        if detail.startswith("session_starting"):
-            # Transient: the run is alive but its session has not registered
-            # yet. 503 + Retry-After tells clients to retry, unlike
-            # the terminal 502 steer_failed.
-            return web.json_response(
-                {"error": detail, "code": "session_starting"},
-                status=503,
-                headers={"Retry-After": "5"},
-            )
-        return web.json_response({"error": detail, "code": "steer_failed"}, status=502)
-    return web.json_response(
-        {"id": agent_id, "status": "follow_up_queued" if mode == "follow_up" else "steered"}
-    )
-
-
-async def api_spawn_release(request: web.Request) -> web.Response:
-    """POST /api/spawn/{agent_id}/release — end a continuable conversation.
-
-    Deletes the persisted session mapping and the on-disk session files.
-    Refuses while a run is in flight on the conversation.
-    """
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response(
-            {"error": "subagents not available", "code": "subagents_unavailable"},
-            status=503,
-        )
-    conv_id = request.match_info["agent_id"]
-    ok, detail = state.subagents.release_conversation(conv_id)
-    if not ok:
-        if detail.startswith("conversation_busy"):
-            return web.json_response({"error": detail, "code": "conversation_busy"}, status=409)
-        return web.json_response({"error": detail, "code": "conversation_gone"}, status=404)
-    return web.json_response({"conversation": conv_id, "status": "released"})
-
-
-async def api_spawn_lost(request: web.Request) -> web.Response:
-    """POST /api/spawn/lost — reconcile a batch member whose spawn POST failed.
-
-    Called by ``spawn_run`` (mcp_core) when a member was explicitly rejected
-    BEFORE ``mgr.spawn`` ran (validation 400 / 503), so the response carried
-    no ``counted`` flag. Every sibling's ``batch_total`` already counts the
-    lost member, so without this reconcile the wave's ``submitted < expected``
-    forever and held digest results strand until restart (Opus MEDIUM + Design
-    Review CONCERN 1).
-
-    Transport failures are excluded because the gateway may have accepted the
-    member before its response failed; reconciling that member as lost could
-    close the wave early. The stuck-wave sweep safely handles truly lost
-    transport submissions after its grace period.
-    """
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response({"error": "subagents not available"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    batch_id = str(body.get("batch_id", "") or "")[:32]
-    if not batch_id or not batch_id.isalnum():
-        return web.json_response({"error": "valid batch_id required"}, status=400)
-    try:
-        batch_total = max(0, min(int(body.get("batch_total", 0) or 0), 1000))
-    except (TypeError, ValueError):
-        batch_total = 0
-    reason = str(body.get("reason", "") or "spawn submission failed")[:300]
-    parent_session = str(body.get("parent_session", "") or "")
-    _, refusal = await internal_memory_scope(request, "spawn.batch", claimed_session=parent_session)
-    if refusal is not None:
-        return refusal
-    state.subagents.record_lost_submission(
-        batch_id, batch_total, reason, parent_session_key=parent_session
-    )
-    return web.json_response({"status": "reconciled", "batch_id": batch_id})
-
-
-async def api_spawn_mark_collected(request: web.Request) -> web.Response:
-    """POST /api/spawn/mark-collected — suppress injection for blocking tool.
-
-    Called by the spawn_sub_agents MCP tool after it has polled and collected
-    results inline.  Records the agent IDs on the parent slot so that the
-    subsequent _subagent_done callback skips the _run_chat injection (the model
-    already processed these results as a tool-call return value).  Without this,
-    each completion event triggers a redundant LLM turn whose response shadows
-    any [OPTIONS:] buttons the synthesis message rendered.
-    """
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    ids = body.get("ids")
-    if not ids or not isinstance(ids, list):
-        return web.json_response(
-            {"error": "'ids' array required", "code": "ids_required"}, status=400
-        )
-    parent_session = str(body.get("parent_session", "") or "")
-    _, refusal = await internal_memory_scope(request, "spawn.batch", claimed_session=parent_session)
-    if refusal is not None:
-        return refusal
-    slot_name = dashboard_slot_key(parent_session)
-    if not slot_name:
-        return web.json_response({"status": "no_slot"})
-    slot = state.get_slot(slot_name)
-    if not slot:
-        return web.json_response({"status": "no_slot"})
-    # Record the IDs (bounded to 200 to prevent unbounded growth)
-    for aid in ids[:200]:
-        if isinstance(aid, str) and aid:
-            slot._subagents_inline_collected.add(aid)
-    return web.json_response({"status": "ok", "marked": len(ids)})
-
-
-def _redact(text: str) -> str:
-    """Two-pass redaction for LLM-derived content on external surfaces."""
-    text, _ = redact_exfiltration_urls(text)
-    text, _ = redact_credentials(text)
-    return text
+#: Bounds on the inline-collected ids a slot retains: each id's length (run ids
+#: are 16 hex characters), and the set as a whole, since only a completion that
+#: matches an id evicts it.
+_COLLECTED_ID_MAX_LEN = 128
+_COLLECTED_IDS_CAP = 1000
 
 
 _SPAWN_STATUS_MAX_LINES = 2000  # cap lines returned per spawn_status page
 _SPAWN_STATUS_MAX_GREP_LEN = 500
 
 
-def _spawn_result_view(text: str, offset: int, limit: int, grep: str) -> tuple[str, dict]:
-    """Apply optional grep (regex line filter) then offset/limit line slicing.
-
-    Line-oriented, like reading code: *offset* is a 0-based start line and *limit*
-    caps returned lines (0 = to end, hard-capped at ``_SPAWN_STATUS_MAX_LINES``).
-    When *grep* is set, lines are filtered by a case-insensitive regex first, then
-    offset/limit apply to the matches. Returns ``(view_text, meta)``; on a bad
-    regex ``meta['grep_error']`` is set and *view_text* is empty. Pure CPU — run
-    via ``asyncio.to_thread`` so a pathological regex never stalls the loop.
-    """
-    lines = text.splitlines()
-    total = len(lines)
-    if grep:
-        try:
-            pat = re.compile(grep[:_SPAWN_STATUS_MAX_GREP_LEN], re.IGNORECASE)
-        except re.error as exc:
-            return "", {"grep_error": f"invalid grep regex: {exc}"}
-        lines = [ln for ln in lines if pat.search(ln)]
-    meta: dict = {"total_lines": total}
-    if grep:
-        meta["matched_lines"] = len(lines)
-    start = min(max(0, offset), len(lines))
-    span = _SPAWN_STATUS_MAX_LINES if limit <= 0 else min(limit, _SPAWN_STATUS_MAX_LINES)
-    end = min(len(lines), start + span)
-    meta["offset"] = start
-    meta["returned_lines"] = end - start
-    meta["has_more"] = end < len(lines)
-    return "\n".join(lines[start:end]), meta
-
-
-async def _apply_result_view(request: web.Request, text: str) -> tuple[str, dict]:
-    """Read offset/limit/grep query params and apply :func:`_spawn_result_view`.
-
-    Returns ``(text, {})`` unchanged when no paging/filter params are present, so
-    the default ``spawn_status`` contract (full transcript) is preserved. Only a
-    paged/filtered request pays the split+regex cost, offloaded to a thread.
-    """
-
-    def _q_int(name: str) -> int:
-        try:
-            return max(0, int(request.query.get(name, 0)))
-        except (TypeError, ValueError):
-            return 0
-
-    offset = _q_int("offset")
-    limit = _q_int("limit")
-    grep = (request.query.get("grep") or "").strip()[:_SPAWN_STATUS_MAX_GREP_LEN]
-    if not (grep or offset > 0 or limit > 0):
-        return text, {}
-    return await asyncio.to_thread(_spawn_result_view, text, offset, limit, grep)
-
-
-async def api_spawn_status(request: web.Request) -> web.Response:
-    """GET /api/spawn/{id} — poll subagent status."""
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response({"error": "subagents not available"}, status=503)
-    agent_id = request.match_info["agent_id"]
-    info = state.subagents.get(agent_id)
-    if not info:
-        # Fall back to persistence layer (orphaned/recovered agents)
-        try:
-            disk_state = read_state(agent_id)
-            if disk_state:
-                disk_data: dict[str, object] = {
-                    "id": agent_id,
-                    "task": _redact(disk_state.get("task", "")),
-                    "done": True,
-                    "started": disk_state.get("started"),
-                }
-                tombstone = await asyncio.to_thread(read_tombstone, agent_id) or {}
-                # Legacy persisted records do not carry terminal usage. Keep
-                # those fields absent rather than presenting invented zeros.
-                for field in ("elapsed", "credits"):
-                    if field in tombstone:
-                        value = tombstone[field]
-                        if (
-                            not isinstance(value, bool)
-                            and isinstance(value, (int, float))
-                            and math.isfinite(value)
-                            and value >= 0
-                        ):
-                            disk_data[field] = float(value)
-                agent_dir = _agent_dir(agent_id)
-                result_path = agent_dir / "result.txt"
-                result = ""
-                if result_path.exists() and not is_sensitive_path(str(result_path)):
-                    try:
-                        result = await asyncio.to_thread(
-                            result_path.read_text, encoding="utf-8", errors="replace"
-                        )
-                    except OSError:
-                        pass
-                # _redact() defined at line 82 of this file; calls both
-                # redact_exfiltration_urls() and redact_credentials() per security guidelines.
-                view, view_meta = await _apply_result_view(request, result)
-                if view_meta:
-                    disk_data["result_meta"] = view_meta
-                disk_data["result"] = _redact(view) if view else "_No result._"
-                # One classifier, shared with the panel list. Reading the
-                # tombstone here as well let the same folder answer "completed"
-                # in a list and "Orphaned: delivered" when opened, and flattened
-                # a recorded user stop into a failure.
-                outcome, error, stopped = await asyncio.to_thread(
-                    classify_persisted_ending, agent_dir
-                )
-                if not outcome:
-                    # Nothing recorded an ending, so this run has no outcome to
-                    # report. The caller asked for this id by name, so the card
-                    # is served with what IS known and the outcome field is left
-                    # out rather than filled with a guess.
-                    disk_data.pop("outcome", None)
-                    disk_data["stopped"] = False
-                    disk_data["error"] = ""
-                    return web.json_response(disk_data)
-                disk_data["outcome"] = outcome
-                disk_data["stopped"] = stopped
-                disk_data["error"] = _redact(error) if error else ""
-                return web.json_response(disk_data)
-        except Exception:
-            logger.debug("Persistence fallback failed for %s", agent_id, exc_info=True)
-        return web.json_response({"error": "not found"}, status=404)
-    data = {"id": info.id, "task": _redact(info.task), "done": info.done}  # type: dict[str, object]
-    data["started"] = info.started
-    if info.done:
-        data["elapsed"] = info.elapsed
-        data["credits"] = info.credits
-        # Read full result from disk (info.result is truncated to 3000 chars)
-        result = info.result
-        if info.result_path and not is_sensitive_path(info.result_path):
-            try:
-                result = await asyncio.to_thread(
-                    Path(info.result_path).read_text,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-            except OSError:
-                pass
-        view, view_meta = await _apply_result_view(request, result)
-        data["result"] = _redact(view)
-        if view_meta:
-            data["result_meta"] = view_meta
-        data["error"] = _redact(info.error) if info.error else ""
-    else:
-        data["turns"] = info.turns
-        data["last_tool"] = _redact(info.last_tool)
-        data["elapsed"] = round(time.time() - info.started)
-        partial = _redact(getattr(info, "streaming_text", ""))
-        view, view_meta = await _apply_result_view(request, partial)
-        data["result"] = view
-        if view_meta:
-            data["result_meta"] = view_meta
-        # Same predicate, same present-only-while-true convention as
-        # api_spawn_list. This endpoint is the one a blocking `kirocrew spawn
-        # run` polls every 2s (cli_commands.py), so leaving it out would keep the
-        # CLI silent: the caller would sit on "waiting for result..." while the
-        # answer ("a prompt is waiting for you") was only discoverable from a
-        # separate `spawn list` or a log grep.
-        if _awaiting_spawn_approval(info):
-            data["awaiting_approval"] = True
-    return web.json_response(data)
-
-
-def _awaiting_spawn_approval(info: object) -> bool:
-    """True only while a run is parked on the SPAWN-approval gate.
-
-    ``_awaiting_approval`` alone is NOT sufficient: ``run.py`` sets the same
-    flag for TOOL approvals raised INSIDE a running subagent (three sites), so
-    reading it bare would report a run at turn 5 waiting on a tool prompt as
-    though it were waiting to START -- rendering "waiting for spawn approval"
-    and telling a caller to approve it "to start this run" that already
-    started. ``_exec_started`` is the permanent discriminator: it is stamped
-    once when execution begins, so ``None`` means the run never entered
-    execution, which for a registered run is only reachable via the spawn gate.
-
-    Both read paths go through this ONE predicate rather than repeating the
-    pair, because the two handlers build their payloads independently and a
-    drift between them is invisible to a behavioural test.
-
-    ``subagent_manager/terminal.py`` computes the same pair for the reap message.
-    Deliberately not extracted onto ``SubagentInfo``: that read is a plain
-    attribute read on a live run inside the manager package, whereas this one
-    must survive the info doubles the handlers are tested with (below). The
-    duplication is two lines and both sites name each other.
-
-    ``getattr`` with a strict ``is True`` / ``is None``: these handlers are
-    exercised with lightweight info doubles (SimpleNamespace / MagicMock) that
-    carry only the fields a case cares about, so a bare attribute read raises
-    and a truthy Mock would otherwise advertise a wait that isn't happening.
-    """
-    return (
-        getattr(info, "_awaiting_approval", False) is True
-        and getattr(info, "_exec_started", None) is None
-    )
-
-
-async def api_spawn_list(request: web.Request) -> web.Response:
-    """GET /api/spawn — list all subagents."""
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response({"agents": []})
-    # Called for its REFUSAL: it rejects an internal caller whose execution
-    # identity cannot be verified. The store it resolves is deliberately not kept
-    # as the ownership gate -- a verified internal caller on the default store
-    # answers an empty store, which is indistinguishable from the dashboard
-    # owner's absent one, so gating on it admits the very callers the bound is
-    # for. ``_admit`` gates on ``internal_auth`` instead, the signal the live
-    # branch below already uses on the same field.
-    _store, refusal = await internal_memory_scope(request, "spawn.list")
-    if refusal is not None:
-        return refusal
-    agents = []
-    caller = request.headers.get("X-Session-Key", "")
-    # An internal caller lists only the runs it may control, by the same
-    # ownership rule the per-run routes apply: its own runs, or -- with no
-    # identity at all -- only runs no session started. Listing is a read, but a
-    # run id, its task text and its parent key are exactly what a later steer
-    # needs, so the list must not hand out what the control route would refuse.
-    # The dashboard owner (no ``internal_auth``) still sees everything.
-    internal = request.get("internal_auth") is True
-    for info in state.subagents.all_agents:
-        if internal and not _run_belongs_to_caller(caller, info.id, info.parent_session_key):
-            continue
-        entry: dict[str, object] = {
-            "id": info.id,
-            "task": _redact(info.task),
-            "done": info.done,
-            "parent": info.parent_session_key,
-            "agent": info.agent or info.crew,
-            "started": info.started,
-        }
-        if info.done:
-            entry["result"] = _redact(info.result)
-            entry["error"] = _redact(info.error) if info.error else ""
-            entry["stopped"] = info.user_stopped
-            entry["outcome"] = info.outcome
-        else:
-            entry["turns"] = info.turns
-            entry["last_tool"] = _redact(info.last_tool)
-            entry["elapsed"] = round(time.time() - info.started)
-            # Present only while the run is parked on its spawn-approval
-            # prompt, so the default payload is unchanged. Without it a run
-            # waiting for a human is byte-identical to one that is executing --
-            # `kirocrew spawn list` would show the same hourglass for a run that
-            # has no child process and is only ever waiting to be approved.
-            if _awaiting_spawn_approval(info):
-                entry["awaiting_approval"] = True
-        # Present only when a group was actually withheld, so the default
-        # (everything on) payload is unchanged.
-        withheld = [
-            group
-            for group, on in (
-                ("memory", info.include_memory),
-                ("lessons", info.include_lessons),
-                ("project", info.include_project),
-            )
-            if not on
-        ]
-        if withheld:
-            entry["context_withheld"] = withheld
-        agents.append(entry)
-    # Durable half of the inventory: the runs this process never tracked, which
-    # a memory-only listing cannot name at all. Live entries win -- an id listed
-    # above is excluded rather than merged -- and the caller's own scope gate is
-    # re-applied here on the record's parent, the same field the live branch
-    # compares.
-    listed = {str(entry["id"]) for entry in agents}
-    # The audit identity is the APP, never the caller-supplied session key. The
-    # dedup registry behind ``_audit_deny`` is keyed on it and is not evicted, so a
-    # per-run session id would leave one permanent entry per subagent run. Every
-    # other call site in the tree passes a bounded app id for the same reason.
-    auditee = str(request.get("app") or "<owner>")
-
-    # An app-authenticated caller and the dashboard owner BOTH reach this route
-    # with `scope is None` -- `internal_memory_scope` answers that for a
-    # non-internal caller and for a verified session whose execution record is
-    # empty -- so scope alone cannot tell them apart. The app claim can, and it
-    # is the instrument the rest of the tree uses: `derive_caller_app` states
-    # that app-ownership checks gate on `request["app"]`. Publication is
-    # narrowing-only -- every transport sets the claim ONLY for a positively
-    # resolved app and leaves it absent for the person -- so a present non-empty
-    # claim is itself the positive signal, the same one the middleware inverts
-    # into `is_dashboard_user`. A transport flag is the wrong question here: it
-    # answers which credential arrived, and three arms publish a validated app
-    # claim without it.
-    caller_app = str(request.get("app") or "")
-    caller_is_app = bool(caller_app)
-
-    # Slot ownership is read on the LOOP, twice, and never from the worker
-    # thread. Once here as a snapshot, so the row cap is sized over the records
-    # this caller may actually see; then again after the thread returns, which is
-    # the authoritative check. A slot's owner can flip while the scan runs --
-    # keys are caller-supplied and not app-namespaced, so another app can reclaim
-    # one -- and a decision taken off-loop would be read from state the caller
-    # does not describe. The WS replay reads the same pair for the same reason.
-    owner_now = slot_owner_snapshot(state)
-
-    def _admit(record: dict) -> bool:
-        """This caller's own visibility, applied before the cap.
-
-        Two bounds with different reach. The app bound is unconditional, because
-        an app token must never read another app's run text no matter how its
-        session scope resolved. The session bound is conditional on
-        ``internal_auth`` -- the same condition the live branch above applies to
-        the same field -- so the durable half of one listing is neither wider nor
-        narrower than the live half a caller sees beside it. It is deliberately
-        NOT conditional on the resolved memory store: that answers empty for a
-        verified internal caller on the default store exactly as it does for the
-        dashboard owner, so it would lift the bound for nearly every attested
-        caller it exists to bind.
-
-        Both read only the request's own values and the record, so they are sound
-        on a worker thread. The ownership dimension is not: it answers from live
-        slot state, so here it consults the loop-taken snapshot and sizes the cap
-        only, and the record is decided again on the loop before it is listed.
-
-        Every refusal is a permission decision and leaves a SEL record under the
-        reason it actually had -- a lazily hydrated slot is `slot_missing`, not an
-        ownership breach.
-        """
-        if caller_is_app and str(record["app"] or "") != caller_app:
-            _audit_deny(auditee, "api_spawn_list", "persisted_app_mismatch")
-            return False
-        if not internal:
-            return True
-        parent = str(record["parent_session"])
-        agent_id = str(record["id"])
-        if parent != caller and caller != f"subagent:{agent_id}":
-            _audit_deny(auditee, "api_spawn_list", "persisted_scope_mismatch")
-            return False
-        # The ownership dimension, sized off the loop snapshot. Withholding is
-        # itself the permission decision, so it audits here under the reason it
-        # had; the surviving records are decided again on the loop, and the two
-        # sets are disjoint, so no record is audited twice.
-        denial = persisted_snapshot_denial_reason(owner_now, subagent_event_slot(parent), record)
-        if denial:
-            _audit_deny(auditee, "api_spawn_list", denial)
-            return False
-        return True
-
-    try:
-        persisted = await asyncio.to_thread(
-            read_panel_records,
-            keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
-            max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
-            exclude_ids=listed,
-            include_result=True,
-            admit=_admit,
-        )
-    except Exception:
-        logger.debug("Persisted spawn listing failed", exc_info=True)
-        persisted = PanelRecords([], 0, False)
-    for record in persisted.records:
-        parent = str(record["parent_session"])
-        agent_id = str(record["id"])
-        if internal:
-            # The authoritative gate, on the loop, against state as it is NOW
-            # rather than as the snapshot found it. A record the snapshot
-            # admitted and this rejects had its slot reclaimed mid-scan. Same
-            # reused-slot-key exposure the replay guards, reached here through the
-            # parent session rather than a frame.
-            denial = persisted_replay_denial_reason(state, subagent_event_slot(parent), record)
-            if denial:
-                _audit_deny(auditee, "api_spawn_list", denial)
-                continue
-        # The GRANT is a permission decision too, and the one an operator needs to
-        # reconstruct who was handed a persisted run's text. Recording only the
-        # refusals leaves the admissions invisible, so a review of this stream can
-        # show what was blocked and never what was released.
-        _audit_allow(auditee, "api_spawn_list")
-        error = str(record["error"])
-        agents.append(
-            {
-                "id": agent_id,
-                "task": _redact(str(record["task"])),
-                "done": True,
-                "parent": parent,
-                "agent": _redact(str(record["agent"])),
-                "started": record["started"],
-                "result": _redact(str(record.get("result") or "")),
-                "error": _redact(error) if error else "",
-                # The tombstone records the run's own outcome, so a user stop
-                # stays a stop here rather than being flattened into a failure.
-                "stopped": bool(record.get("stopped")),
-                "outcome": record["outcome"],
-            }
-        )
-    payload: dict[str, object] = {"agents": agents}
-    if persisted.overflow or persisted.overflow_is_lower_bound:
-        # Said out loud once per listing, to the operator rather than the client:
-        # a listing of 50 of 51 eligible runs otherwise reads exactly like a
-        # listing of all 50 there were. The WARNING carries the count, and it is
-        # the whole report: a truncation refuses nobody, so it is not a permission
-        # decision and does not belong in the SEL deny stream beside the ownership
-        # refusals an operator has to be able to see there. No client reads a
-        # count it cannot act on, so it stays out of the payload too.
-        # A saturated scan window reports even at a count of zero, because that
-        # is the case where the count itself cannot see what was left out.
-        logger.warning(
-            "persisted spawn listing truncated: %s%d eligible run(s) past the %d cap%s",
-            "at least " if persisted.overflow_is_lower_bound else "",
-            persisted.overflow,
-            PERSISTED_SUBAGENT_REPLAY_KEEP,
-            (
-                " (scan window saturated, older admissible runs may be uninspected)"
-                if persisted.overflow_is_lower_bound
-                else ""
-            ),
-        )
-    return web.json_response(payload)
-
-
-async def api_spawn_retry(request: web.Request) -> web.Response:
-    """POST /api/spawn/{agent_id}/retry — re-spawn a FAILED subagent's task.
-
-    Backs the chip's "Retry failed (N)" batch control. Only terminal failed
-    agents are retryable (never running ones — that would double the work —
-    and never user-stopped ones — the user killed that work on purpose).
-    Spawns a fresh agent with the original task/agent/parent (new id; the old
-    terminal card stays for history). Batch identity is NOT carried over: the
-    retry is a standalone spawn, so a wave's digest accounting (already
-    completed) is never reopened.
-    """
-    state: DashboardState = request.app["state"]
-    if not state.subagents:
-        return web.json_response({"error": "subagents not available"}, status=503)
-    agent_id = request.match_info["agent_id"]
-    if agent_id.startswith("native:"):
-        return web.json_response(
-            {"error": "native subagents run inside the parent turn and cannot be retried"},
-            status=400,
-        )
-    old = state.subagents.get(agent_id)
-    if not old:
-        return web.json_response({"error": "not found"}, status=404)
-    if not old.done:
-        return web.json_response({"error": "agent is still running"}, status=409)
-    if old.outcome != "failed":
-        return web.json_response(
-            {"error": f"only failed agents can be retried (outcome={old.outcome})"},
-            status=409,
-        )
-    execution = old.execution_context
-    if execution is None:
-        from kiro_crew.subagent_persistence import read_run_execution
-
-        try:
-            execution = await asyncio.to_thread(read_run_execution, old.id)
-        except (OSError, ValueError) as exc:
-            return web.json_response(
-                {"error": f"memory_unavailable: {exc}", "code": "memory_unavailable"}, status=400
-            )
-    # Same validated warm as the primary spawn handler. old.cwd was validated
-    # at the ORIGINAL spawn, but the allowlist may have changed since (and a
-    # gateway restart leaves the cache cold), so it is re-checked against the
-    # current config before any discovery read.
-    if old.agent:
-        await warm_project_agents_for_spawn(state, old.cwd or "")
-    # Keep the failed run's captured owner only while that exact boundary is
-    # still active. After release, current parent routing wins; an empty owner
-    # lets completion select the canonical slot at delivery time instead of
-    # carrying a stale token that exact lookup must reject.
-    previous_boundary_owner = stage_boundary_owner_for_run(old)
-    exact_boundary = (
-        _stage_boundary_slot_for_parent(
-            state,
-            old.parent_session_key,
-            boundary_owner=previous_boundary_owner,
-        )
-        if previous_boundary_owner
-        else None
-    )
-    retry_boundary_owner = (
-        previous_boundary_owner
-        if exact_boundary is not None
-        else _stage_boundary_owner_for_parent(state, old.parent_session_key)
-    )
-    info = await _spawn_on_loop(
-        state,
-        old._raw_task or old.task,
-        parent_session_key=old.parent_session_key,
-        agent=old.agent,
-        max_turns=old.max_turns,
-        cwd=old.cwd,
-        model=old.model or None,
-        # Like model and the context groups: a retry must run at the SAME
-        # effort as the run it replaces, or it is a different experiment.
-        reasoning_effort=old.reasoning_effort,
-        approval_mode=old.approval_mode or None,
-        silent=old.silent,
-        # A retry must see the SAME context scope as the run it replaces —
-        # otherwise the retried agent is a different experiment.
-        delegation=dict(old.delegation),
-        include_memory=old.include_memory,
-        include_lessons=old.include_lessons,
-        include_project=old.include_project,
-        # Same scope the original ran under. Omitting it makes a retry widen to
-        # the global store, so the failure mode is "retrying a delegation leaks
-        # it" -- and a retry is exactly when nobody re-reads the scope.
-        memory_store=old.memory_store,
-        crew=old.crew,
-        app=execution.app,
-        _memory_mode=execution.memory_mode,
-        _execution_context=execution.to_record(),
-        _stage_boundary_owner=retry_boundary_owner,
-    )
-    if not info:
-        return web.json_response(
-            {"error": f"capacity reached ({state.subagents.max_concurrent})"}, status=429
-        )
-    if info.done and info.error:
-        return web.json_response({"error": info.error}, status=400)
-    return web.json_response({"id": info.id, "retried_from": agent_id, "status": "spawned"})
-
-
-async def api_spawn_delete(request: web.Request) -> web.Response:
-    """DELETE /api/spawn/{agent_id} — cancel a running subagent or remove a finished one."""
-    state: DashboardState = request.app["state"]
-    agent_id = request.match_info["agent_id"]
-    # Handle native kiro-cli subagents (native:* IDs not in SubagentManager)
-    if agent_id.startswith("native:") and hasattr(state, "_native_cards"):
-        card_info = getattr(state, "_native_cards", {}).get(agent_id)
-        if card_info:
-            # Can't actually kill the kiro-cli internal sub-agent, but we can
-            # close the Activity card so it stops showing "Starting..."
-            state._native_cards.pop(agent_id, None)
-            # Persist the stop on the slot-owned tracker record so WS replay
-            # (native_subagent_snapshots) reconstructs this card as STOPPED for
-            # reconnecting clients — not as still-running or completed.
-            try:
-                _slot = state.get_slot(card_info["slot"])
-                _rec = (
-                    _slot._native_subagent_tracker.get(card_info.get("session_id", ""))
-                    if _slot is not None
-                    else None
-                )
-                if _rec is not None and not _rec.get("done"):
-                    _rec["done"] = True
-                    _rec["done_at"] = time.time()
-                    _rec["elapsed"] = time.time() - card_info.get("started", time.time())
-                    _rec["error"] = None
-                    _rec["stopped"] = True
-                    _rec["outcome"] = "stopped"
-                    _rec["result"] = "(cancelled)"
-            except Exception:
-                logger.debug("native cancel: tracker update failed for %s", agent_id, exc_info=True)
-            # User-initiated cancellation is an auditable action (parity with
-            # the managed path, which audits inside SubagentManager.cancel()).
-            try:
-                _sel().log_tool_invocation(
-                    session_key=card_info["slot"],
-                    source="subagent",
-                    tool_name="cancel_native_subagent",
-                    outcome="cancelled_by_user",
-                    metadata={"card_id": agent_id},
-                )
-            except Exception:
-                logger.debug("SEL audit failed for native cancel %s", agent_id, exc_info=True)
-            state.broadcast_ws(
-                "subagent_done",
-                {
-                    "id": agent_id,
-                    "slot": card_info["slot"],
-                    "elapsed": time.time() - card_info.get("started", time.time()),
-                    "error": None,
-                    "stopped": True,
-                    "task": "",
-                    "agent": "",
-                    "result": "(cancelled)",
-                },
-            )
-            return web.json_response({"ok": True, "cancelled": True})
-        return web.json_response({"error": "not found"}, status=404)
-    manager = state.subagents
-    info = manager.get(agent_id) if manager is not None else None
-    if manager is None or info is None:
-        # A card the durable replay rebuilt has no manager entry -- after a
-        # gateway restart that is every finished run -- so a flat 404 made those
-        # cards undismissable: the delete failed, the banner showed, and the next
-        # reconnect sent the card again. The dismissal is recorded against the
-        # folder instead, which is the same record the live path writes.
-        #
-        # Dashboard owner only. That is exactly as wide as what the owner can
-        # already see -- their sockets short-circuit visibility to every live slot
-        # -- so no caller gains reach over a run it could not list. An app token
-        # is refused rather than handed a route into another app's runs, and an
-        # absent claim means the request never passed the auth middleware.
-        request_app = request.get("app", "")
-        if "app" not in request or request_app:
-            _sel().log_api_access(
-                caller=request_app or "unknown",
-                operation="spawn.dismiss",
-                outcome="denied",
-                source="app_isolation",
-                resources="dashboard-only dismissal of a persisted run",
-                error="app tokens cannot dismiss persisted subagent runs",
-            )
-            return web.json_response(
-                {"error": "app token not allowed", "code": "app_token_forbidden"}, status=403
-            )
-        outcome = await asyncio.to_thread(record_panel_dismissal_outcome, agent_id)
-        if outcome == DISMISSAL_NO_FOLDER:
-            # No folder, so nothing durable can rebuild this card and there is no
-            # run here to speak of. Same answer as before for a truly unknown id.
-            return web.json_response({"error": "not found"}, status=404)
-        if outcome == DISMISSAL_FAILED:
-            # The store is unwritable, so this card returns on the next rebuild.
-            # Answering 404 would say the run does not exist, and answering ok
-            # would claim a dismissal that did not happen; both leave the user
-            # watching a dismissed card come back with nothing to explain it.
-            _sel().log_api_access(
-                caller="internal",
-                operation="spawn.dismiss",
-                outcome="denied",
-                source="subagent",
-                resources=f"persisted run {agent_id}",
-                error="the dismissal record could not be written",
-            )
-            return web.json_response(
-                {"error": "dismissal not recorded", "code": "dismissal_unwritable"}, status=503
-            )
-        _sel().log_api_access(
-            caller="internal",
-            operation="spawn.dismiss",
-            outcome="allowed",
-            source="subagent",
-            resources=f"persisted run {agent_id}",
-        )
-        return web.json_response({"ok": True, "cancelled": False, "dismissed": True})
-    cancelled = await manager.cancel(agent_id)
-    if not cancelled:
-        deleted_owner = stage_boundary_owner_for_run(info)
-        deleted_boundary_slot = (
-            _stage_boundary_slot_for_parent(
-                state,
-                info.parent_session_key,
-                boundary_owner=deleted_owner,
-            )
-            if deleted_owner
-            else None
-        )
-        active_owner = deleted_owner if deleted_boundary_slot is not None else ""
-        settlement = await manager.settle_before_delete(agent_id, active_owner)
-        if settlement == "pending":
-            return web.json_response(
-                {
-                    "error": "completion delivery is still pending",
-                    "code": "completion_delivery_pending",
-                },
-                status=409,
-            )
-    return web.json_response({"ok": True, "cancelled": cancelled})
-
-
-async def api_spawn_stop_all(request: web.Request) -> web.Response:
-    """POST /api/spawn/stop-all — stop one chat's running and queued subagents."""
-    state: DashboardState = request.app["state"]
-    request_app = request.get("app", "")
-    if "app" not in request or request_app:
-        _sel().log_api_access(
-            caller=request_app or "unknown",
-            operation="spawn.stop_all",
-            outcome="denied",
-            source="app_isolation",
-            resources="dashboard-only bulk cancellation",
-            error="app tokens cannot stop dashboard subagent waves",
-        )
-        return web.json_response(
-            {"error": "app token not allowed", "code": "app_token_forbidden"}, status=403
-        )
-    if not state.subagents:
-        return web.json_response(
-            {"error": "subagents not available", "code": "subagents_unavailable"},
-            status=503,
-        )
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    slot_name = body.get("slot") if isinstance(body, dict) else None
-    if not isinstance(slot_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", slot_name):
-        return web.json_response(
-            {"error": "valid slot is required", "code": "invalid_slot"}, status=400
-        )
-    slot = state.get_slot(slot_name)
-    if slot is None:
-        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
-    _, refusal = await internal_memory_scope(
-        request, "spawn.stop_all", claimed_session=effective_session_key(slot)
-    )
-    if refusal is not None:
-        return refusal
-    running, queued = await state.subagents.cancel_for_parent(effective_session_key(slot))
-    return web.json_response(
-        {"ok": True, "stopped": running + queued, "running": running, "queued": queued}
-    )
+#: No unit holds the child, so no crew-log record was owed or written.
+DISMISSAL_LOG_ABSENT = "absent"
+#: A unit holds the child and the append COMMITTED.
+DISMISSAL_LOG_COMMITTED = "committed"
+#: A unit holds the child and the append did not commit inside the bound. The run
+#: exists, so this is not an unknown id; the dismissal simply did not happen.
+DISMISSAL_LOG_FAILED = "failed"
 
 
 # ── Sessions / Notifications ──
-
-
-async def api_notifications(request: web.Request) -> web.Response:
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {"notifications": state._notification_log, "unread": state._unread_count}
-    )
-
-
-async def api_notification_delete(request: web.Request) -> web.Response:
-    """DELETE /api/notifications — delete a single notification by timestamp."""
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    ts = body.get("ts", "")
-    if not ts:
-        return web.json_response({"error": "ts is required"}, status=400)
-    ok = await state.delete_notification(ts)
-    return web.json_response({"ok": ok})
-
-
-async def api_notifications_clear(request: web.Request) -> web.Response:
-    """POST /api/notifications/clear — clear all notifications."""
-    state: DashboardState = request.app["state"]
-    await state.clear_notifications()
-    return web.json_response({"ok": True})
-
-
-async def api_notification_ack(request: web.Request) -> web.Response:
-    """POST /api/notifications/ack — mark a single notification as read."""
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    ts = body.get("ts", "")
-    if not ts:
-        return web.json_response({"error": "ts is required"}, status=400)
-    ok = await state.ack_notification(ts)
-    return web.json_response({"ok": ok})
-
-
-async def api_notification_unack(request: web.Request) -> web.Response:
-    """POST /api/notifications/unack — mark a single notification as unread."""
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    ts = body.get("ts", "")
-    if not ts:
-        return web.json_response({"error": "ts is required"}, status=400)
-    # If this is a cron notification, also remove the last acked item from the job
-    for n in state._notification_log:
-        if n.get("ts") == ts and n.get("kind") == "cron" and n.get("job_id"):
-            try:
-                await state.crons.unack_job_async(n["job_id"])
-            except (CronStoreBusy, CronStoreUnreadable) as exc:
-                # Store transiently contended, or refusing writes outright — the
-                # notification-level unack below still succeeds; the acked-item
-                # trim is best-effort. Unreadable degrades here rather than
-                # surfacing a 409: the person unacking a notification asked
-                # nothing of the cron store, so failing their request for a
-                # bookkeeping trim they did not request would be the wrong
-                # trade. Escaping instead becomes a 500 on a request that does
-                # not depend on the store at all.
-                logger.warning("unack_job skipped: %s (job %s)", type(exc).__name__, n["job_id"])
-            break
-    ok = await state.unack_notification(ts)
-    return web.json_response({"ok": ok})
-
-
-async def api_notifications_ack_all(request: web.Request) -> web.Response:
-    """POST /api/notifications/ack-all — mark all notifications as read."""
-    state: DashboardState = request.app["state"]
-    for n in state._notification_log:
-        n["acked"] = True
-    # Same ordered executor as every other notification-file mutation: a
-    # rewrite submitted after a queued delivery append can never be
-    # overtaken by it, and durability is awaited before responding.
-    await state._rewrite_notifications_async()
-    state.broadcast_ws("notification_ack", {"ts": "*"})
-    return web.json_response({"ok": True})
-
-
-async def api_notification_channels(request: web.Request) -> web.Response:
-    """GET /api/notifications/channels — registered channels + user settings.
-
-    Returns every channel the bus knows about, grouped by source (``system``
-    or the owning app name), each with its default priority, the user's
-    stored settings, and whether it is protected (approval cannot be muted).
-    Channels with stored settings but no live registration (e.g. app
-    currently disabled) are included so mutes remain visible and editable.
-    """
-    from kiro_crew.notifications.settings import PROTECTED_CHANNELS
-
-    state: DashboardState = request.app["state"]
-    registered = state.notification_bus.channels()
-    stored = state.notification_channel_settings.all_settings()
-    channels = []
-    for channel in sorted(set(registered) | set(stored)):
-        source = channel.split(".", 1)[0]
-        channels.append(
-            {
-                "channel": channel,
-                "source": source,
-                "registered": channel in registered,
-                "default_priority": registered.get(channel),
-                "protected": channel in PROTECTED_CHANNELS,
-                "settings": stored.get(channel, {}),
-            }
-        )
-    return web.json_response({"channels": channels})
-
-
-async def api_notification_channel_settings(request: web.Request) -> web.Response:
-    """PUT /api/notifications/channels/settings — update one channel's settings.
-
-    Body: ``{"channel": str, "muted"?: bool, "priority"?: str|null}`` —
-    ``priority: null`` clears the override. Protected channels reject mute
-    and priority-lowering with 400.
-    """
-    from kiro_crew.notifications.settings import ChannelSettingsError
-
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON body"}, status=400)
-    if not isinstance(body, dict):
-        # Valid-but-non-object JSON ([], null, "str") would AttributeError on
-        # body.get below -- an unintended 500 instead of a validation 400.
-        return web.json_response({"error": "body must be a JSON object"}, status=400)
-    channel = body.get("channel")
-    if not isinstance(channel, str) or not channel.strip():
-        return web.json_response({"error": "channel is required"}, status=400)
-    channel = channel.strip()
-    if len(channel) > 256:
-        return web.json_response({"error": "channel name too long"}, status=400)
-    muted = body.get("muted")
-    if muted is not None and not isinstance(muted, bool):
-        return web.json_response({"error": "muted must be a boolean"}, status=400)
-    has_priority = "priority" in body
-    priority = body.get("priority")
-    if has_priority and priority is not None and not isinstance(priority, str):
-        return web.json_response({"error": "priority must be a string or null"}, status=400)
-    try:
-        # update() persists via atomic_write (blocking file I/O) -- keep it
-        # off the event loop. ChannelSettings serializes internally with its
-        # own lock, so concurrent updates from worker threads are safe.
-        entry = await asyncio.to_thread(
-            state.notification_channel_settings.update,
-            channel,
-            muted=muted,
-            priority=priority if has_priority and priority is not None else None,
-            clear_priority=has_priority and priority is None,
-        )
-    except ChannelSettingsError as exc:
-        return web.json_response({"error": str(exc)}, status=400)
-    state.broadcast_ws("notification_channel_settings", {"channel": channel, "settings": entry})
-    return web.json_response({"ok": True, "channel": channel, "settings": entry})
 
 
 async def api_notification_agent_push(request: web.Request) -> web.Response:
@@ -2116,8 +697,8 @@ async def api_notification_agent_push(request: web.Request) -> web.Response:
     # trustworthy for a caller that never had a slot (a Slack thread, a cron the
     # person owns); a ``dashboard:`` key names one, so a missing slot is a
     # failure to attribute rather than proof of the dashboard user. Refused HERE
-    # rather than in the middleware: a popped slot no longer says whose tab it
-    # was, so refusing centrally would also refuse the person's own in-flight
+    # rather than in the middleware: a popped slot cannot identify its tab's
+    # owner, so refusing centrally would also refuse the person's own in-flight
     # calls on every internal route. This route refuses because of what it
     # publishes -- ``source="system"`` on the system.agent channel.
     if caller_names_a_missing_slot(
@@ -2217,94 +798,6 @@ _MAX_WALK_DEPTH = 10  # defense-in-depth against deeply nested LLM output
 _blocks_request_remote_media = blocks_request_remote_media
 
 
-def _redact_all(value: str) -> str:
-    """Both outbound redactors as one callable, in the canonical order.
-
-    ``redact_for_display`` re-runs its redactor over each normalised form, so it
-    needs the pair behind a single call rather than two sequential passes.
-    """
-    value, _ = redact_exfiltration_urls(value)
-    value, _ = redact_credentials(value)
-    return value
-
-
-def _sanitize_blocks(
-    blocks: list[dict],
-    *redactors: Any,
-    display_form: bool = False,
-) -> list[dict]:
-    """Walk Block Kit blocks and sanitize all strings (both keys and values).
-
-    Block Kit structural keys (type, text, mrkdwn, etc.) pass through
-    sanitizers unchanged since they don't match hostile patterns.
-
-    With ``display_form=True`` each string is scanned through
-    :func:`redact_for_display` (composing the redactors via ``_redact_all``)
-    rather than by the literal redactors alone. That is the SAME floor the text
-    path uses, and it is what catches a credential split across Block Kit markup
-    — ``AKIA`` in one run and the rest bolded in the next — which the literal
-    scan sees only as fragments. Block text a caller controls is LLM-authored,
-    so it is exactly where such a split arrives.
-    """
-    from copy import deepcopy  # noqa: F811
-
-    def _redact_str(s: str) -> str:
-        if display_form:
-            s, _ = redact_for_display(s, _redact_all)
-            return s
-        for fn in redactors:
-            s, _ = fn(s)
-        return s
-
-    def _walk(obj: Any, depth: int = 0) -> Any:
-        if depth > _MAX_WALK_DEPTH:
-            if isinstance(obj, str):
-                return _redact_str(obj)
-            if isinstance(obj, (dict, list)):
-                return {} if isinstance(obj, dict) else []
-            return obj  # scalars (int, bool, None) are safe
-        if isinstance(obj, str):
-            return _redact_str(obj)
-        if isinstance(obj, dict):
-            return {_redact_str(k): _walk(v, depth + 1) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_walk(item, depth + 1) for item in obj]
-        return obj
-
-    return _walk(deepcopy(blocks[:_MAX_BLOCKS]))
-
-
-def _resolve_session_target(
-    state: DashboardState, target: str, caller_session: str
-) -> tuple[str, str] | tuple[None, None]:
-    """Resolve a session target to a dashboard slot key and job name.
-
-    ``target="origin"`` looks up the cron job that owns *caller_session*
-    and returns ``(session_key, job_name)``.
-    Returns ``(None, None)`` if the origin session can't be resolved
-    (non-"origin" target, non-cron caller, unknown job, or cron with no
-    originating session_key — e.g. one created from the dashboard UI).
-
-    Note: ``target="slack"`` is NOT handled here — it is intercepted in
-    ``api_send_message`` and converted to an explicit fall-through to the
-    Slack DM path, so it never reaches this resolver.
-    """
-    if target != "origin":
-        return None, None  # only "origin" is allowed — reject arbitrary slot keys
-    # caller_session is "cron:{job_id}" or "cron:{job_id}:{run_id}" (stateless)
-    if not caller_session.startswith("cron:"):
-        return None, None
-    cron_id = caller_session.removeprefix("cron:").split(":")[0]
-    jobs = state.crons.list_jobs(include_disabled=True)
-    job = next((j for j in jobs if j.id == cron_id), None)
-    if not job or not job.session_key:
-        return None, None
-    # session_key is e.g. "dashboard:chat-3-1712793600" but slot names
-    # don't have the "dashboard:" prefix
-    slot_key = job.session_key.removeprefix("dashboard:")
-    return slot_key, job.name
-
-
 #: ``session`` values on ``/api/send-message`` that name a delivery MODE rather
 #: than a chat channel. Any other value is looked up in the registered channel
 #: transports, so a channel becomes reachable here by registering its transport
@@ -2341,519 +834,17 @@ _SLACK_ONLY_BODY_FIELDS = (
 )
 
 
-def _owner_dm_target(transport: Any) -> str:
-    """The configured owner-DM target id on *transport*, or ``""``.
-
-    ``configured_targets()`` is the channel-neutral allowlist the dashboard's own
-    target picker reads, so a proactive DM can only be addressed at something the
-    user configured for that channel. Two entries are skipped: a target the
-    transport marks unavailable (WeCom may only reply to an inbound message), and
-    a thread or room target, which is a wider audience than a DM.
-
-    No channel carries a separate "owner" field the way Slack's ``owner_id`` does,
-    so an owner can only be inferred, and this REFUSES to infer one from an
-    ambiguous list: a target is returned only when the channel advertises exactly
-    ONE available direct target. Picking the first of several would send private
-    agent output to whichever allow-listed person happened to sort first, which is
-    the wrong human rather than a smaller audience, and fanning out to all of them
-    would deliver a message the agent decided to send once N times. With no single
-    answer the caller degrades to the dashboard notification, which reaches the
-    operator without guessing who they are.
-
-    The inference itself is :func:`~kiro_crew.messaging.transport.sole_direct_target`,
-    shared with session control's owner-DM audience predicate so the two surfaces
-    name the same human as the owner; this wrapper adds only the enumeration guard
-    and the send-path logging.
-    """
-    try:
-        targets = list(transport.configured_targets())
-    except Exception:
-        logger.warning("send_message: could not enumerate channel targets", exc_info=True)
-        return ""
-    target = sole_direct_target(targets)
-    if target:
-        return target
-    direct_count = sum(
-        1
-        for candidate in targets
-        if str(getattr(candidate, "target_id", "") or "").startswith(_DM_TARGET_PREFIX)
-        and getattr(candidate, "available", False)
-    )
-    if direct_count:
-        logger.info(
-            "send_message: %d configured DM targets and no owner field, so no single "
-            "recipient can be inferred; degrading to the dashboard notification",
-            direct_count,
-        )
-    return ""
+#: ``action_id`` on the "Open session" link button. Slack still emits a
+#: ``block_actions`` event when a URL button is clicked, so this stable id is
+#: declared and ack'd as a no-op by ``slack.interactions.dispatch``; the ``url``
+#: is what actually opens the tab. The id lives in ``slack.format`` so the
+#: producer here and the router there share one source of truth.
 
 
-async def _deliver_channel_dm(
-    state: DashboardState, channel_type: str, text: str, *, caller_session: str
-) -> tuple[bool, str, str]:
-    """Deliver *text* as a DM on *channel_type*. Returns ``(sent, code, detail)``.
-
-    Channel-neutral by construction: the transport is looked up by name, the
-    destination comes from its own configured-target allowlist, and delivery runs
-    through the shared cross-surface send ladder
-    (``chat_runner._resolve_channel_target``), the same fail-closed, SEL-audited
-    ``channels`` governance gate the mirror-link endpoint passes. A channel added
-    later needs no code here.
-
-    An empty *code* with ``sent=False`` is the SOFT miss: the channel is not
-    connected, or the user configured no reachable DM target. It degrades to the
-    dashboard notification the caller already got, exactly as an absent Slack
-    client does. A non-empty *code* is a refusal or a failed delivery, and the
-    caller must answer non-2xx: reporting success for a message the user will
-    never see is the failure this contract exists to prevent.
-    """
-    transport = state.get_channel_transport(channel_type)
-    if transport is None:
-        logger.info("send_message: channel %s is not connected", channel_type)
-        return False, "", ""
-    target_id = _owner_dm_target(transport)
-    if not target_id:
-        logger.info("send_message: channel %s advertises no DM target", channel_type)
-        return False, "", ""
-    # Imported here, not at module scope: chat_runner imports from
-    # kiro_crew.dashboard.handlers, so a top-level import closes that cycle. Only
-    # this one is deferred -- `HOST_SESSION_KEY` is a constant and is imported at
-    # module scope, where the top-level-imports rule wants it.
-    from kiro_crew.dashboard.chat_runner import _resolve_channel_target
-
-    # A cron carries its own validated session key; an out-of-band send owns no
-    # session, and the host sentinel is what operators bind host-side governance
-    # to (an empty key classifies as unknown and matches no profile at all).
-    session_key = caller_session or HOST_SESSION_KEY
-    # Vet BEFORE resolving the target: resolution is itself a visible side effect
-    # on some channels (Discord opens a DM channel over REST), so a denied
-    # channel must never reach it. Offloaded because the governance evaluation
-    # reads profile files.
-    # The principal is supplied rather than derived: this addresses a
-    # ``configured_targets()`` entry, so the link carries a ``user:<id>`` target id
-    # and ``session_key`` is a host sentinel naming nobody. The id came off the
-    # transport's own allow-list via ``_owner_dm_target``, which is the authoritative
-    # answer the recipient check would otherwise be unable to reach.
-    governed = await asyncio.to_thread(
-        functools.partial(
-            _resolve_channel_target,
-            state,
-            session_key,
-            ChannelLink(channel_type=channel_type, channel_id=target_id),
-            principal=target_id.removeprefix(_DM_TARGET_PREFIX),
-        )
-    )
-    if governed is None:
-        return False, "channel_not_permitted", f"{channel_type} is not permitted"
-    _, live_transport = governed
-    try:
-        resolved = await live_transport.resolve_configured_target(target_id)
-    except Exception as exc:
-        logger.exception("send_message: %s target resolution failed", channel_type)
-        return False, "channel_delivery_failed", str(exc)
-    if resolved is None:
-        # The advertised target stopped resolving between enumeration and use
-        # (revoked from the allow-list, or no longer a private thread). Refuse
-        # rather than fall back to a wider audience.
-        return False, "channel_delivery_failed", f"{channel_type} DM target is unavailable"
-    conversation_id, thread_id = resolved
-    # Chunked at the transport's own declared ceiling, as a mirrored turn is:
-    # Discord rejects a message over its cap outright, so an unchunked long
-    # report would arrive as a delivery failure instead of a message. At least one
-    # unit always comes back, because the route rejects an empty body. One
-    # governance decision covers the whole send -- this is a single message the
-    # transport happens to split, not the sequence of independent egress actions
-    # the mirror backfill re-vets per unit.
-    #
-    # ``chunk_for_transport``, not ``chunk_text``: a byte-capped channel (Webex)
-    # is reachable here, and its char declaration is only the 4x-pessimistic floor
-    # a caller that can measure bytes does not need. The same helper the two
-    # cross-surface mirror legs use, so one channel cannot be chunked against a
-    # unit it does not have.
-    #
-    # ``display_safe`` is the display-form floor at the egress rather than only at
-    # the caller that happens to exist today: this leg passes no renderer, and a
-    # renderer is where a turn gets that floor. `api_send_message` already applies
-    # it, so on that path this is a second, idempotent application; what it buys is
-    # that a future caller of this helper cannot reach a channel without it. The
-    # neutral sink rather than a bare redactor pair, because the leg is
-    # channel-NEUTRAL and Slack/Discord both parse broadcast-mention grammars.
-    # Offloaded: the display sink threads the credential-aware splitter's whole-text
-    # budget search (up to 128 dense probes plus span-repair passes) onto the call,
-    # and this leg runs on the gateway's single loop thread with model-authored,
-    # length-unchecked text -- a large body would stall the loop past the watchdog's
-    # 25s dump-then-exit alarm. Offloaded like the renderer's own send legs.
-    units = await asyncio.to_thread(
-        chunk_for_transport,
-        display_safe_for(text, live_transport.capabilities),
-        live_transport.capabilities,
-    )
-    try:
-        for unit in units:
-            # Fail on the first UNCONFIRMED unit rather than pressing on: the
-            # remaining chunks of a message whose head never landed would arrive as
-            # an orphaned fragment. `delivery_confirmed` owns which of the two id
-            # conventions this transport follows.
-            sent = await live_transport.send_message(conversation_id, unit, thread_id=thread_id)
-            if not delivery_confirmed(live_transport.capabilities, sent):
-                logger.warning(
-                    "send_message: %s returned no message id; treating as undelivered",
-                    channel_type,
-                )
-                return False, "channel_delivery_failed", "the channel returned no message id"
-    except Exception as exc:
-        logger.exception("send_message: %s delivery failed", channel_type)
-        return False, "channel_delivery_failed", str(exc)
-    return True, "", ""
-
-
-def _channel_delivery_key(state: DashboardState, caller_session: str, declared_session: str) -> str:
-    """The session whose channel conversation a proactive send should reach.
-
-    Two sources, in order, and the request BODY's own idea of who it is talking to
-    is not one of them:
-
-    * a **cron** caller (``caller_session`` has already matched
-      ``CRON_SESSION_RE``) names its job, and the job's stored ``session_key`` is
-      gateway-owned state — so the conversation is chosen by the scheduler rather
-      than by whoever posted the request.
-    * any other caller is identified by the ``X-Session-Key`` header, which
-      ``token_auth._verify_unix_peer`` kernel-attests against the peer's own
-      process ancestry on the AF_UNIX socket and denies on mismatch. A body field
-      carries no such check, so naming another session's key there would post
-      into a conversation the caller does not own.
-
-    Unlike :func:`_resolve_session_target` this returns the job's session key
-    VERBATIM. That function wants a dashboard slot name and strips the
-    ``dashboard:`` prefix to get one; channel links are keyed by the full session
-    key, so stripping it here would lose a dashboard session's outbound mirror.
-
-    Returns ``""`` when neither source answers, which fails the send closed.
-    """
-    if caller_session.startswith("cron:"):
-        cron_id = caller_session.removeprefix("cron:").split(":")[0]
-        jobs = state.crons.list_jobs(include_disabled=True)
-        job = next((j for j in jobs if j.id == cron_id), None)
-        if job is None:
-            return ""
-        return job.session_key or ""
-    return declared_session
-
-
-async def _deliver_to_channel(
-    state: DashboardState, session_key: str, text: str, *, channel_type: str = ""
-) -> bool:
-    """Governed proactive send to the channel conversation behind *session_key*.
-
-    Rides the same cross-surface ladder as the auto-compact notice and the
-    inbound-unbind notice (``chat_runner._resolve_channel_target``) rather than
-    reaching for a transport directly, so the send is capability-checked,
-    governance-vetted under the ``channels`` scope and SEL-audited exactly like
-    every other outbound notice. Slack is not reachable through it by design —
-    that transport is not registered in ``state.channel_transports``.
-
-    *channel_type*, when given, is the transport the caller NAMED. The resolved
-    link must match it: a session can only have one channel link, so a mismatch
-    means the caller asked for a conversation this session does not have, and
-    posting to the link it does have would deliver to an audience nobody asked
-    for. Empty accepts whatever the link names.
-
-    Fails closed and returns ``False`` — never falls through to another
-    destination — for every reason a send can be refused: no link, a link on
-    another transport, a governance denial, an unregistered transport, one that
-    cannot send proactively, or a transport error. Each is audited, because a
-    proactive message that reached nobody is exactly what the caller must not
-    read as success.
-    """
-    # Lazy: chat_runner imports this package at module scope (MAX_PROMPT_BYTES,
-    # _find_prompt), so a top-level import here would close the cycle.
-    from kiro_crew.dashboard.chat_runner import _resolve_channel_target
-
-    def _audit(outcome: str, reason: str) -> None:
-        try:
-            _sel().log_tool_invocation(
-                session_key=session_key or "dashboard",
-                tool_name="send_message",
-                outcome=outcome,
-                downstream_service=channel_type or "channel",
-                resources=f"channel_type={channel_type} reason={reason}",
-            )
-        except Exception:
-            logger.warning("SEL logging failed for channel send", exc_info=True)
-
-    if not session_key or not text:
-        _audit("denied", "no_session_key" if not session_key else "empty_text")
-        return False
-    # Own inbound conversation first, then the outbound mirror: a channel-born
-    # session has the former, a dashboard session linked to a channel has the
-    # latter, and only one of the two is ever set for a given session.
-    link = state.sessions.get_origin_link(session_key) or state.sessions.get_mirror_link(
-        session_key
-    )
-    if link is None:
-        _audit("denied", "no_channel_link")
-        return False
-    if channel_type and link.channel_type != channel_type:
-        _audit("denied", f"link_is_{link.channel_type}")
-        return False
-    try:
-        # Off-loop: the ladder's governance gate walks the profile directory,
-        # which is unbounded on slow storage.
-        target = await asyncio.to_thread(_resolve_channel_target, state, session_key, link)
-    except Exception:
-        # Includes PlatformCompositionError, which _resolve_channel_target
-        # re-raises. Refusing the send is the fail-closed answer either way, and
-        # the audit line is what keeps a broken ceiling from reading as a
-        # routine skip.
-        logger.warning("channel send: target resolution failed for %s", session_key, exc_info=True)
-        _audit("error", "resolve_failed")
-        return False
-    if target is None:
-        # Governance denial, no registered transport, or one that cannot send
-        # proactively. The ladder logs which; all three are a refusal here.
-        _audit("denied", "not_permitted_or_unregistered")
-        return False
-    resolved, transport = target
-    if not resolved.channel_id:
-        _audit("denied", "no_conversation_id")
-        return False
-    # ``display_safe_for`` is the SHARED outbound display sink (redact against the
-    # rendered form, then defang mentions ONLY where the platform parses one).
-    # Routing through it rather than re-running the two byte-level scanners is what
-    # keeps this from becoming a second, differently-sanitised copy of the same
-    # egress boundary — and the capability-aware variant rather than the flat
-    # ``display_safe`` because this leg is channel-NEUTRAL: Webex reaches it, has no
-    # broadcast grammar, and its allow-list IS email addresses, so a blanket defang
-    # would insert a ZWSP into every address the agent prints.
-    #
-    # CHUNKED against the transport's own cap, like the sibling leg above. A
-    # transport caps by SLICING (Telegram's `_cap_text` at 4096), so handing it a
-    # longer message loses the tail and still answers with a message id -- a
-    # delivery this function would then audit as complete. Chunking is what makes
-    # the confirmation mean the whole message. The two legs keep separate loops on
-    # purpose: this one splits plain text, while the gateway's splits markdown with
-    # fence sealing, and collapsing them would silently retune one of the two.
-    parts = chunk_text(
-        display_safe_for(text, transport.capabilities), transport.capabilities.max_message_chars
-    )
-    for part in parts:
-        try:
-            # "No exception" is not delivery on its own, and auditing it as such
-            # would report a success for a message the user never saw -- the one
-            # outcome this helper's contract exists to prevent.
-            # `delivery_confirmed` owns which id convention this transport follows.
-            delivered = await transport.send_message(
-                resolved.channel_id,
-                part,
-                thread_id=resolved.thread_id,
-            )
-        except Exception:
-            logger.warning("channel send: delivery failed for %s", session_key, exc_info=True)
-            _audit("error", "transport_error")
-            return False
-        if not delivery_confirmed(transport.capabilities, delivered):
-            logger.warning(
-                "channel send: %s returned no message id for %s", channel_type, session_key
-            )
-            _audit("error", "empty_message_id")
-            return False
-    _audit("completed", "delivered")
-    return True
-
-
-def _coerce_like(value: Any, stored: Any) -> Any:
-    """*stored* rendered in *value*'s own type, for a no-op comparison.
-
-    config.json can legitimately hold a ``null`` or a string where a field is a
-    bool or an int (a hand-edited file, or a key written before the field gained
-    its type), and an untyped ``!=`` against that reports a change on every save —
-    which makes ``restart_required`` permanently true and tells the operator to
-    restart for nothing. Coercing to the staged value's type is what keeps a
-    genuine no-op reading as one. An unrecognised type is returned unchanged, so
-    the comparison degrades to the untyped one rather than guessing.
-    """
-    if isinstance(value, bool):
-        return bool(stored)
-    if isinstance(value, int):
-        try:
-            return int(stored or 0)
-        except (TypeError, ValueError):
-            return stored
-    if isinstance(value, str):
-        return str(stored or "")
-    if isinstance(value, list):
-        try:
-            return list(stored or [])
-        except TypeError:
-            # A hand-edited scalar where a list belongs (``"allowed_room_ids": 5``).
-            # Returned unchanged so the comparison degrades to the untyped one and
-            # reports a change, exactly as the int branch above does — the
-            # alternative is `list(5)` raising out of the handler as a 500 that
-            # persists nothing, on a request that may not even mention this field.
-            return stored
-    return stored
-
-
-async def _send_to_channel_target(
-    state: DashboardState,
-    channel_type: str,
-    target_id: str,
-    text: str,
-    *,
-    caller_session: str = "",
-) -> web.Response:  # noqa: C901
-    """Deliver *text* to an opaque configured target on a registered transport.
-
-    Four gates, all fail-closed, in the order their evidence is cheapest:
-
-    1. **A registered transport.** Expressed as membership in the registry, never
-       as ``channel_type != "slack"``: a negation hands every channel added later
-       whatever this path grants, in the permissive direction.
-    2. **``supports_proactive_send``.** A channel whose reply is bound to an
-       inbound token (WeCom) cannot originate a message at all, and saying so is
-       better than a confusing platform error.
-    3. **Governance.** The same ``channels``-scope chokepoint the mirror leg uses,
-       fail-closed, so a profile that narrows after startup stops sends too.
-    4. **The transport's own allow-list**, re-applied by
-       ``resolve_configured_target``. The opaque id travelled through the browser
-       or the model, and the config may have narrowed since it was minted.
-
-    Every non-2xx body carries a machine-readable ``code``: backend strings have
-    no i18n catalog path, so the caller needs something stable to branch on.
-    """
-    transports = getattr(state, "channel_transports", None) or {}
-    transport = transports.get(channel_type)
-    if transport is None:
-        return web.json_response(
-            {"error": f"channel {channel_type} is not connected", "code": "channel_not_connected"},
-            status=404,
-        )
-    if not getattr(transport.capabilities, "supports_proactive_send", False):
-        return web.json_response(
-            {
-                "error": f"channel {channel_type} cannot start a conversation",
-                "code": "channel_no_proactive_send",
-            },
-            status=400,
-        )
-    # Vet under the CALLER's identity, not the destination's. The ``channels``
-    # scope resolves against the surface that ORIGINATED the send, so a cron
-    # profile permitting only Slack must deny a Webex target; a key synthesized
-    # from ``channel_type`` would resolve the DESTINATION channel's own profile
-    # instead, making every per-surface operator binding inert on this leg while
-    # the sibling ``_deliver_channel_dm`` honours it. Empty ``caller_session``
-    # is a non-cron caller (a browser operator, or a direct call): the host
-    # sentinel is what operators bind host-side governance to.
-    session_key = caller_session or HOST_SESSION_KEY
-    # Offloaded: the governance evaluation stats and reads the profile files (and
-    # writes a SEL record either way), which is filesystem latency on the shared
-    # gateway loop. The sibling ``_deliver_channel_dm`` already runs its own vet
-    # through ``asyncio.to_thread`` for exactly this reason.
-    gov = await asyncio.to_thread(_vet_channel_send, channel_type, session_key)
-    if gov:
-        return web.json_response({"error": gov, "code": "channel_denied"}, status=403)
-    resolved = await transport.resolve_configured_target(target_id)
-    if resolved is None:
-        # Audited like the governance denial above: this is a permission decision
-        # on an egress chokepoint, and the caller may be the model. A refusal that
-        # leaves no record is the one an operator cannot review — someone probing
-        # target ids would look identical to normal traffic.
-        _sel().log_api_access(
-            caller=session_key,
-            operation="channel.send_message",
-            outcome="denied",
-            source="dashboard",
-            resources=f"channel={channel_type} reason=target_not_configured",
-        )
-        return web.json_response(
-            {"error": "target is not configured for this channel", "code": "target_not_allowed"},
-            status=403,
-        )
-    conversation_id, thread_id = resolved
-    # The DISPLAY sink, not a byte-level redactor pair. This text can come from
-    # the model, and a credential split by markdown delimiters
-    # (``AKIA**IOSF**ODNN7EXAMPLE``) survives a byte scan and is reassembled whole
-    # by the platform's own renderer. ``display_safe`` canonicalizes to the
-    # displayed form before scanning, and defangs broadcast-mention grammars —
-    # correct here because this leg is channel-NEUTRAL and Slack/Discord do have
-    # them.
-    # Offloaded for the same reason as the live-transport leg above: the display
-    # sink runs the credential-aware splitter's whole-text budget search on the
-    # gateway's single loop thread with model-authored, length-unchecked text, and
-    # a large body would stall the loop past the watchdog's 25s dump-then-exit alarm.
-    parts = await asyncio.to_thread(
-        chunk_for_transport,
-        display_safe_for(text, transport.capabilities),
-        transport.capabilities,
-    )
-    try:
-        for index, part in enumerate(parts):
-            # Most transports report a failed send by RETURNING a falsy id rather
-            # than raising, so reading only exceptions would answer 200 "ok" for a
-            # message that never arrived — worse than an error, because the caller
-            # (including the LLM, which cannot see the room) records it as delivered
-            # and moves on. But two transports carry no id at all (WeCom's proactive
-            # command, Feishu's reply) and raise on failure instead, so there the
-            # empty string is the SUCCESS value. ``delivery_confirmed`` owns which
-            # convention each transport follows, from its own declared
-            # ``returns_message_id`` — the alternative is this leg reporting every
-            # delivered message on those two as lost.
-            sent = await transport.send_message(conversation_id, part, thread_id=thread_id)
-            if not delivery_confirmed(transport.capabilities, sent):
-                raise _ChannelSendFailed(f"part {index + 1} of {len(parts)} was not accepted")
-    except Exception as exc:
-        logger.warning("channel send failed for %s: %s", channel_type, exc, exc_info=True)
-        _sel().log_api_access(
-            caller=session_key,
-            operation="channel.send_message",
-            outcome="error",
-            source="dashboard",
-            resources=f"channel={channel_type} parts={len(parts)}",
-        )
-        return web.json_response(
-            {"error": "delivery failed", "code": "channel_delivery_failed"}, status=502
-        )
-    _sel().log_api_access(
-        caller=session_key,
-        operation="channel.send_message",
-        outcome="allowed",
-        source="dashboard",
-        resources=f"channel={channel_type} parts={len(parts)}",
-    )
-    return web.json_response({"ok": True, "delivered_to": channel_type, "parts": len(parts)})
-
-
-class _ChannelSendFailed(Exception):
-    """A transport declined a part of a channel-addressed send.
-
-    Raised so the falsy-return path and the raising path converge on one handler:
-    the endpoint must not answer 200 for a message the channel never accepted.
-    """
-
-
-def _vet_channel_send(channel_type: str, caller_session: str) -> str:
-    """Governance for a channel-addressed send; ``""`` when permitted.
-
-    Fail-closed, and audited by ``vet_and_audit`` on both grant and denial: this
-    is an egress chokepoint on a network surface, so a degraded governance
-    evaluation must DENY rather than degrade to permit.
-    """
-    try:
-        from kiro_crew.platform.governance_profiles import vet_and_audit
-
-        decision = vet_and_audit(
-            "channels",
-            channel_type,
-            session_key=caller_session,
-            tool_name="channel.send_message",
-            fail_closed=True,
-        )
-        if not getattr(decision, "permitted", False):
-            return f"channel {channel_type} is denied by the active governance profile"
-    except Exception:
-        logger.warning("channel send governance check failed", exc_info=True)
-        return "governance evaluation unavailable"
-    return ""
+# Slack rejects a ``section`` block whose mrkdwn ``text`` exceeds 3000 chars, so
+# a plain-text send longer than this is posted as text (via ``post_message``)
+# with the button trailing, rather than merged into one ``section`` Slack refuses.
+_SLACK_SECTION_TEXT_MAX = 3000
 
 
 async def api_send_message(request: web.Request) -> web.Response:
@@ -2864,244 +855,25 @@ async def api_send_message(request: web.Request) -> web.Response:
     value names a registered channel transport (``"discord"``) and delivers a DM
     to that channel's configured owner. The Slack-only options are refused, not
     ignored, when combined with a channel session (see ``_SLACK_ONLY_BODY_FIELDS``).
+
+    ``_read_send_message`` reads and refuses the body (and delivers a configured
+    ``channel_type`` + ``target_id`` itself), and the fallback legs, the audit row
+    and the response are built in ``messaging_api.proactive_send``. The redaction and authorization of the
+    Slack target and the origin-session injection stay here.
     """
     from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F811
     from kiro_crew.slack.handler import is_allowed_user, is_tracked_channel  # noqa: F811
     from kiro_crew.validation import USER_ID_RE  # noqa: F811
 
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    text = body.get("text", "").strip()
-    if not text:
-        return web.json_response({"error": "text required"}, status=400)
-    title = body.get("title", "Agent Message")
-    blocks = body.get("blocks")
-    if blocks and not isinstance(blocks, list):
-        return web.json_response({"error": "blocks must be an array"}, status=400)
-    if isinstance(blocks, list) and _blocks_request_remote_media(blocks):
-        return web.json_response(
-            {
-                "error": (
-                    "agent-supplied Block Kit cannot contain image/video blocks "
-                    "or image_url/thumbnail_url/video_url fields because Slack "
-                    "fetches that media without a recipient click"
-                ),
-                "code": BLOCKS_REMOTE_MEDIA_ERROR,
-            },
-            status=400,
-        )
-
-    # ── Channel-addressed leg ──
-    # Handled before the Slack-shaped validation below, because a Webex room id is
-    # not a Slack channel id and must not have to satisfy CHANNEL_ID_RE. The target
-    # is an OPAQUE ConfiguredChannelTarget id, never a raw platform conversation
-    # id: this endpoint is reachable by the LLM, and re-resolving an opaque id
-    # through the transport is what re-applies that channel's own allow-list at the
-    # side-effect boundary.
-    #
-    # ``target_id`` is what selects THIS leg. ``channel_type`` alone means the
-    # non-Slack conversation the SESSION already belongs to (``_deliver_to_channel``
-    # further down); ``channel_type`` + ``target_id`` names an explicit configured
-    # destination on that transport, which is this one. So the field pair reads as
-    # "which transport, and — if given — which destination on it", and a
-    # ``target_id`` with no transport to resolve it against is the only
-    # under-specified combination.
-    addressed_channel = str(body.get("channel_type", "") or "").strip().lower()
-    target_id = str(body.get("target_id", "") or "").strip()
-    if target_id:
-        if not addressed_channel:
-            return web.json_response(
-                {
-                    "error": "target_id requires channel_type",
-                    "code": "channel_target_incomplete",
-                },
-                status=400,
-            )
-        # This leg is the explicit address, so it returns before the Slack-shaped
-        # validation below ever runs. Refuse a Slack-only field or a routing
-        # ``session`` travelling with it rather than dropping them: the caller
-        # (a browser, or the model) cannot observe a drop, and would read a
-        # private DM as a threaded post to a named Slack channel. Same posture,
-        # and the same ``code`` shape, as the channel-session refusal further
-        # down; ``presence`` not truthiness, because ``unfurl_links=False`` is
-        # still a Slack option the caller asked for.
-        stray = [f for f in _SLACK_ONLY_BODY_FIELDS if body.get(f) is not None]
-        stray_session = body.get("session")
-        if isinstance(stray_session, str) and stray_session:
-            stray.append("session")
-        if stray:
-            return web.json_response(
-                {
-                    "error": (
-                        "channel_type/target_id addresses the destination directly and "
-                        f"cannot be combined with: {', '.join(stray)}"
-                    ),
-                    "code": "slack_field_with_channel_target",
-                },
-                status=400,
-            )
-        # Vet on the CALLER's REAL identity so the fail-closed ``channels`` re-vet
-        # inside the leg resolves the caller's own profile rather than a
-        # permissive ``HOST_SESSION_KEY`` default. Filtering to ``cron:`` here
-        # discarded every non-cron caller's identity, and the MCP-side channel vet
-        # fails OPEN on an evaluation error, so a non-cron session whose own
-        # profile denies the transport could reach a host-permitted target.
-        #
-        # The identity is honoured ONLY on the proven-internal transport:
-        # ``internal_auth`` is set solely after a constant-time ``X-Internal-Secret``
-        # match — the path the MCP gateway and cron use, where ``caller_session``
-        # is derived from the verified session key, not a tool arg. This route is
-        # on ``_STRICT_INTERNAL_API_PATHS`` today (no browser reaches it), so the
-        # gate also guards a future reclassification. Absent (a direct operator
-        # send naming no session) degrades to the host sentinel inside the leg.
-        addressed_caller = body.get("caller_session", "") if request.get("internal_auth") else ""
-        return await _send_to_channel_target(
-            state, addressed_channel, target_id, text, caller_session=addressed_caller
-        )
-
-    target_channel = body.get("channel", "").strip()
-    target_user = body.get("user", "").strip()
-    unfurl_links = body.get("unfurl_links")
-    unfurl_media = body.get("unfurl_media")
-    if (unfurl_links is not None and not isinstance(unfurl_links, bool)) or (
-        unfurl_media is not None and not isinstance(unfurl_media, bool)
-    ):
-        return web.json_response(
-            {"error": "unfurl_links and unfurl_media must be booleans"}, status=400
-        )
-    # Refused, not silently dropped (same posture as _SLACK_ONLY_BODY_FIELDS):
-    # this endpoint is reachable from agent-authored tool calls, and a Slack
-    # unfurl is a zero-click fetch of a possibly agent-written URL, so an
-    # explicit ``true`` is the one bit a prompt-injected agent needs to
-    # re-enable the exfiltration channel. ``false``/absent are accepted for
-    # backward compatibility — they ask for what is now always the case.
-    # See docs/request-for-change/rfc-redaction-explain-and-reveal.md §5.
-    if unfurl_links or unfurl_media:
-        return web.json_response(
-            {
-                "error": (
-                    "unfurl_links/unfurl_media cannot be enabled: bot posts "
-                    "never fetch link or media previews (a preview is a "
-                    "zero-click request of a possibly agent-written URL)"
-                ),
-                "code": "unfurl_disabled",
-            },
-            status=400,
-        )
-
-    thread_ts = body.get("thread_ts")
-    if thread_ts is not None:
-        if not _is_slack_ts(thread_ts):
-            return web.json_response(
-                {"error": "thread_ts must be a Slack timestamp string like '1712793600.123456'"},
-                status=400,
-            )
-    reply_broadcast = body.get("reply_broadcast")
-    if reply_broadcast is not None and not isinstance(reply_broadcast, bool):
-        return web.json_response({"error": "reply_broadcast must be a boolean"}, status=400)
-    if reply_broadcast and not thread_ts:
-        return web.json_response({"error": "reply_broadcast requires thread_ts"}, status=400)
-
-    # Fail fast: mutual exclusion before any redaction/regex work (#4)
-    if target_channel and target_user:
-        return web.json_response({"error": "specify channel or user, not both"}, status=400)
-
-    # A ``session`` naming a channel transport takes the routing over, so a
-    # Slack-only option travelling with it has no destination. Refuse here,
-    # before any delivery, rather than posting a message whose thread/layout/
-    # audience request was silently discarded.
-    raw_session = body.get("session")
-    session_name = raw_session if isinstance(raw_session, str) else ""
-    channel_target = (
-        session_name
-        if session_name not in _RESERVED_SESSION_TARGETS and _CHANNEL_TYPE_RE.match(session_name)
-        else ""
-    )
-    if channel_target:
-        slack_only = [f for f in _SLACK_ONLY_BODY_FIELDS if body.get(f) is not None]
-        if slack_only:
-            return web.json_response(
-                {
-                    "error": (
-                        f"session '{channel_target}' does not accept the Slack-only "
-                        f"field(s): {', '.join(slack_only)}"
-                    ),
-                    "code": "slack_only_field_with_channel_session",
-                },
-                status=400,
-            )
-
-    channel_type = body.get("channel_type") or ""
-    if not isinstance(channel_type, str):
-        return web.json_response(
-            {"error": "channel_type must be a string", "code": "channel_type_not_a_string"},
-            status=400,
-        )
-    channel_type = channel_type.strip()
-    if channel_type:
-        # Refused, never resolved by precedence: with two destinations named,
-        # either order silently drops one and the caller cannot tell which. The
-        # field list is the shared ``_SLACK_ONLY_BODY_FIELDS`` rather than a
-        # hand-rolled three, so a Slack option added there is refused here too.
-        conflicts = [f for f in _SLACK_ONLY_BODY_FIELDS if body.get(f) is not None]
-        if session_name == SLACK_NAMESPACE:
-            conflicts.append('session="slack"')
-        if conflicts:
-            return web.json_response(
-                {
-                    "error": (
-                        f"channel_type cannot be combined with {', '.join(conflicts)} — "
-                        "those route to Slack only"
-                    ),
-                    "code": "channel_type_conflicts_slack_routing",
-                },
-                status=400,
-            )
-        if channel_type == SLACK_NAMESPACE:
-            return web.json_response(
-                {
-                    "error": 'channel_type "slack" is not supported — use session="slack"',
-                    "code": "channel_type_slack_unsupported",
-                },
-                status=400,
-            )
-        if channel_type not in _SEND_MESSAGE_CHANNEL_TYPES:
-            return web.json_response(
-                {
-                    "error": (
-                        f"unknown channel_type {channel_type!r} — expected one of "
-                        f"{', '.join(sorted(_SEND_MESSAGE_CHANNEL_TYPES))}"
-                    ),
-                    "code": "channel_type_unknown",
-                },
-                status=400,
-            )
-    # Two DESTINATIONS named, so it is refused rather than resolved by branch
-    # order: whichever won, the caller would be told the send succeeded to a place
-    # they did not ask for. ``session="slack"`` is caught by the conflicts list
-    # above for the same reason.
-    #
-    # ``session="origin"`` is deliberately NOT caught here, and is not a third
-    # destination: it is a MODE meaning "inject where this came from", which is why
-    # it sits in ``_RESERVED_SESSION_TARGETS`` rather than resolving to a channel.
-    # Combined with channel_type it is the fallback ladder the cron path needs -- a
-    # job whose origin slot has died still reaches its user on the channel -- and
-    # the response reports ``delivered_to`` as the surface that actually took the
-    # message, so a caller is never told the channel received something it did not.
-    if channel_type and channel_target:
-        return web.json_response(
-            {
-                "error": (
-                    f"channel_type '{channel_type}' cannot be combined with "
-                    f"session '{channel_target}' — each names a different destination"
-                ),
-                "code": "channel_type_conflicts_channel_session",
-            },
-            status=400,
-        )
+    send = await _read_send_message(request, state)
+    if isinstance(send, web.Response):
+        return send
+    body, text, title, blocks = send.body, send.text, send.title, send.blocks
+    target_channel, target_user = send.target_channel, send.target_user
+    thread_ts, reply_broadcast = send.thread_ts, send.reply_broadcast
+    session_name = send.session_name
+    channel_target, channel_type = send.channel_target, send.channel_type
 
     # Validate format first, then redact (#2)
     if target_channel and (
@@ -3178,18 +950,14 @@ async def api_send_message(request: web.Request) -> web.Response:
             status=403,
         )
 
-    sent_slack = False
-    slack_ts: str | None = None
     sent_session = False
     # A channel target is not a session-injection target: _resolve_session_target
     # accepts only "origin", and the delivery below keys off channel_target.
     target_session = "" if channel_target else session_name
     job_name = None
-    slack_attempted = False
-    slack_error = ""
-    sent_channel = False
-    channel_code = ""
-    channel_detail = ""
+    # What the fallback legs reached, on one record the audit below reads even
+    # when a leg raised part-way.
+    outcome = _SendMessageOutcome()
     try:
         # ───────────────────────────────────────────────────────────────────
         # send_message delivery contract
@@ -3281,18 +1049,14 @@ async def api_send_message(request: web.Request) -> web.Response:
                     label = job_name or "cron"
                     label, _ = redact_exfiltration_urls(label)
                     label, _ = redact_credentials(label)
-                    # text and title already redacted above (L2538-2542)
+                    # text and title already redacted above
                     # Text wrapper kept for LLM context and queue detection;
                     # cronLabel in cls JSON provides structured data for frontend.
                     wrapped = f'{CRON_NOTIFY_PREFIX}"{label}"]\n{text}\n{CRON_NOTIFY_END}'
                     inject_cls = json.dumps({"cronLabel": label})
-                    # Queue while a turn is live OR a multi-stage plan is mid-flight.
-                    # During stage execution slot.task is None between stages (see
-                    # chat_orchestrator), so slot.running alone reads False in that
-                    # window and would let this injection start a concurrent turn that
-                    # clobbers the plan. _in_stage_execution closes it — same predicate
-                    # the user-typed path uses (chat_handlers._api_chat).
-                    if slot.running or slot._in_stage_execution:
+                    # Queue while a turn is live -- same predicate the user-typed
+                    # path uses (chat_handlers._api_chat).
+                    if slot.running:
                         from kiro_crew.dashboard.slot_queue_repository import MAX_LIVE_QUEUE_ENTRIES
 
                         if len(slot._queue) >= MAX_LIVE_QUEUE_ENTRIES:
@@ -3343,259 +1107,44 @@ async def api_send_message(request: web.Request) -> web.Response:
                     sent_session = True
         # Fall back to normal delivery if no session target or session is gone
         if not sent_session:
-            # Snapshot before the suffix below: that sentence describes the BELL's
-            # delivery, and a channel post is a real delivery, not the
-            # notification fallback it announces. A channel-born cron reaches
-            # here with job_name set on every run (its job.session_key names a
-            # channel session, never a dashboard slot), so this is the normal
-            # path for one, not an edge case.
-            channel_text = text
-            if target_session and job_name:
-                safe_name, _ = redact_exfiltration_urls(job_name)
-                safe_name, _ = redact_credentials(safe_name)
-                title = f"⏰ {safe_name}"
-                text += "\n\n_(session closed — delivered as notification)_"
-            state.notify("agent", title, text)
-            # No widget on either channel path, so a parsed [OPTIONS:] trailer is
-            # re-attached as a numbered list rather than dropped: the user still
-            # learns the choices exist and can answer by typing one. Built from the
-            # snapshot, so the notification-fallback sentence never rides along, and
-            # hoisted above both legs so neither mechanism drops it.
-            if options:
-                channel_text = f"{channel_text}\n\n{format_overflow(options, 0)}"
-            if channel_target:
-                sent_channel, channel_code, channel_detail = await _deliver_channel_dm(
-                    state,
-                    channel_target,
-                    channel_text,
-                    # Vet on the CALLER's real identity so the fail-closed
-                    # ``channels`` re-vet inside the leg resolves that caller's own
-                    # profile rather than the permissive ``HOST_SESSION_KEY``
-                    # default. Filtering to ``cron:`` here discarded every non-cron
-                    # caller's identity, and the MCP-side channel vet fails OPEN on
-                    # an evaluation error, so a non-cron session whose own profile
-                    # denies the transport could reach a host-permitted target --
-                    # the same hole the ``channel_type``/``target_id`` leg above
-                    # already closed, on the leg that was not migrated with it.
-                    #
-                    # The two arms take their identity from where each is trustworthy,
-                    # matching ``_channel_delivery_key`` on this same path: a cron's
-                    # body key is format-validated above before it may escalate
-                    # routing, and a non-cron caller is identified by the
-                    # ``X-Session-Key`` header, which ``token_auth._verify_unix_peer``
-                    # kernel-attests against the peer's own process ancestry -- never
-                    # the body, which a tool arg could name. So the governance vet and
-                    # the delivery key resolve the SAME principal. Absent (a direct
-                    # operator send naming no session) still degrades to the host
-                    # sentinel inside the leg, unchanged.
-                    caller_session=caller_session if is_cron_caller else declared_session,
-                )
-            if channel_type:
-                sent_channel = await _deliver_to_channel(
-                    state,
-                    _channel_delivery_key(state, caller_session, declared_session),
-                    channel_text,
-                    channel_type=channel_type,
-                )
-            # A separate ``if``, not an ``elif``: ``send_to_slack`` is the single
-            # predicate that decides Slack delivery, so it must be false when a
-            # channel session took the routing over rather than merely
-            # unreachable behind another branch.
-            if send_to_slack and state.slack_client:
-                try:
-                    if target_channel:
-                        channel = target_channel
-                    elif target_user:
-                        channel = await state.slack_client.open_dm(target_user)
-                    elif state.owner_id:
-                        channel = await state.slack_client.open_dm(state.owner_id)
-                    else:
-                        channel = ""
-
-                    if channel:
-                        slack_attempted = True
-                        if blocks:
-                            slack_ts = await state.slack_client.post_blocks(
-                                channel,
-                                blocks,
-                                text,
-                                thread_ts=thread_ts,
-                                reply_broadcast=reply_broadcast,
-                            )
-                        else:
-                            slack_ts = await state.slack_client.post_message(
-                                channel,
-                                text,
-                                thread_ts=thread_ts,
-                                reply_broadcast=reply_broadcast,
-                            )
-                            if options:
-                                try:
-                                    # Asker is the thread's owner: an out-of-band
-                                    # post has no running session of its own, so
-                                    # the conversation that receives the reply is
-                                    # the right subject.
-                                    _sm_o = slack_options_owner_key(state, thread_ts or "")
-                                    _sm_t = (
-                                        await asyncio.to_thread(mint_options_token, state, _sm_o)
-                                        if _sm_o
-                                        else None
-                                    )
-                                    option_blocks = build_options_blocks(
-                                        options, staleness_token=_sm_t
-                                    )
-                                    # Fallback text is the SAFE stub, not the
-                                    # message body. Slack parses entities in a
-                                    # message's top-level `text` -- which is what
-                                    # notifications render -- so an agent-authored
-                                    # body containing `<!channel>` would ping the
-                                    # whole channel, and the expiry would ping it
-                                    # AGAIN every time it replays this text on its
-                                    # edit. Nothing is lost: the body was already
-                                    # posted as its own message just above, so here
-                                    # it was pure duplication. This is the same stub
-                                    # the other three posting paths use.
-                                    option_ts = await state.slack_client.post_blocks(
-                                        channel,
-                                        option_blocks,
-                                        OPTIONS_FALLBACK_TEXT,
-                                        thread_ts=thread_ts,
-                                    )
-                                    # A thread IS a conversation, so bind the
-                                    # control to whichever session owns that
-                                    # thread — a dashboard session mirroring into
-                                    # it, or the Slack-born one. Without a thread
-                                    # there is no conversation to supersede it, so
-                                    # nothing is recorded.
-                                    if thread_ts and option_ts:
-                                        remember_slack_options(
-                                            state,
-                                            slack_options_owner_key(state, str(thread_ts)),
-                                            PostedOptions(
-                                                channel=channel,
-                                                ts=option_ts,
-                                                choices=tuple(options),
-                                                blocks=tuple(option_blocks),
-                                            ),
-                                        )
-                                except Exception:
-                                    logger.debug(
-                                        "send_message: failed to post OPTIONS blocks",
-                                        exc_info=True,
-                                    )
-                        sent_slack = True
-                except Exception as exc:
-                    slack_attempted = True
-                    slack_error = str(exc)
-                    logger.exception("send_message: Slack delivery failed")
+            await _deliver_send_message_fallback(
+                state,
+                body,
+                outcome,
+                text=text,
+                title=title,
+                blocks=blocks,
+                options=options,
+                target_channel=target_channel,
+                target_user=target_user,
+                thread_ts=thread_ts,
+                reply_broadcast=reply_broadcast,
+                target_session=target_session,
+                job_name=job_name,
+                channel_target=channel_target,
+                channel_type=channel_type,
+                caller_session=caller_session,
+                declared_session=declared_session,
+                is_cron_caller=is_cron_caller,
+                send_to_slack=send_to_slack,
+            )
     finally:
-        try:
-            thread_hint = " threaded=1" if thread_ts else ""
-            if reply_broadcast:
-                thread_hint += " broadcast=1"
-            if target_channel or target_user:
-                base_res = f"target_channel={target_channel} target_user={target_user}"
-            elif sent_session:
-                base_res = "session=origin"
-            elif channel_target or channel_type:
-                base_res = f"channel_type={channel_target or channel_type}"
-            else:
-                base_res = "fallback=owner_dm"
-            if sent_session:
-                downstream_service = "session"
-            elif sent_channel:
-                # The channel type itself, so a reader of the audit learns WHICH
-                # surface took the message and a channel added later needs no new
-                # vocabulary here.
-                downstream_service = channel_target or channel_type
-            elif sent_slack:
-                downstream_service = "slack"
-            else:
-                downstream_service = "dashboard"
-            # A refused or failed channel delivery is an error for the same reason a
-            # failed Slack post is: the caller asked for that surface. channel_code is
-            # empty when the channel was merely absent, which is the documented
-            # degradation to a notification rather than a failure. The channel_type leg
-            # has no soft miss, so any non-delivery is its 502 -- but a satisfied
-            # session injection is not one, which is the same condition that guard
-            # uses, so this row and the HTTP status cannot disagree.
-            failed = (
-                (slack_attempted and not sent_slack)
-                or bool(channel_code)
-                or bool(channel_type and not sent_channel and not sent_session)
-            )
-            _sel().log_tool_invocation(
-                session_key="dashboard",
-                tool_name="send_message",
-                outcome="error" if failed else "completed",
-                downstream_service=downstream_service,
-                resources=base_res + thread_hint,
-                error=channel_code,
-            )
-        except Exception:
-            logger.warning("SEL logging failed for send_message", exc_info=True)
-    if channel_code:
-        safe_detail, _ = redact_credentials(channel_detail)
-        safe_detail, _ = redact_exfiltration_urls(safe_detail)
-        detail = f"{channel_target} delivery failed: {safe_detail}"
-        # Both responses are spelled out inline, with a literal status and a
-        # literal body, rather than sharing a hoisted dict or computing the
-        # status. `test_error_code_contract` ratchets BOTH of those shapes for the
-        # same reason: a computed status and a body a static scan cannot read are
-        # each a way to slip an uncoded error response past the gate, so the one
-        # form that stays checkable is the verbose one. A governance refusal is
-        # the caller's own permission problem; anything else is downstream.
-        if channel_code == "channel_not_permitted":
-            return web.json_response(
-                {"ok": False, "error": detail, "code": channel_code}, status=403
-            )
-        return web.json_response({"ok": False, "error": detail, "code": channel_code}, status=502)
-    if slack_attempted and not sent_slack:
-        safe_error, _ = redact_credentials(slack_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
-        return web.json_response(
-            {"ok": False, "error": f"Slack delivery failed: {safe_error}", "slack": False},
-            status=502,
+        _audit_send_message(
+            outcome,
+            sent_session=sent_session,
+            target_channel=target_channel,
+            target_user=target_user,
+            thread_ts=thread_ts,
+            reply_broadcast=reply_broadcast,
+            channel_target=channel_target,
+            channel_type=channel_type,
         )
-    # A named channel that was not reached is a failure, not a notification-only
-    # success: the caller asked for a specific conversation, Slack was suppressed
-    # as its fallback, and the bell is not a substitute for the surface the user
-    # is actually reading. _deliver_to_channel has already audited which of the
-    # refusals it was.
-    if channel_type and not sent_channel and not sent_session:
-        return web.json_response(
-            {
-                "ok": False,
-                "error": (
-                    f"channel delivery to {channel_type} failed — the message was "
-                    "not posted to the conversation"
-                ),
-                "code": "channel_delivery_failed",
-            },
-            status=502,
-        )
-    # Report the actual delivery channel so callers (and the read-back
-    # steering) can distinguish a real Slack post from a notification-only
-    # send; "ok: true" alone masks that difference.
-    if sent_session:
-        delivered_to = "session"
-    elif sent_channel:
-        # The channel type itself, so a caller reads WHICH surface took the message
-        # and a channel added later needs no new vocabulary here.
-        delivered_to = channel_target or channel_type
-    elif sent_slack:
-        delivered_to = "slack"
-    else:
-        delivered_to = "notification"
-    resp_body: dict[str, Any] = {
-        "ok": True,
-        "slack": sent_slack,
-        "session": sent_session,
-        "delivered_to": delivered_to,
-    }
-    if slack_ts:
-        resp_body["ts"] = slack_ts
-    return web.json_response(resp_body)
+    return _send_message_response(
+        outcome,
+        sent_session=sent_session,
+        channel_target=channel_target,
+        channel_type=channel_type,
+    )
 
 
 async def api_slack_pins(request: web.Request) -> web.Response:
@@ -3780,181 +1329,6 @@ async def api_slack_reactions(request: web.Request) -> web.Response:
             error=safe_error,
         )
         return web.json_response({"error": safe_error}, status=502)
-
-
-async def api_delete_message(request: web.Request) -> web.Response:
-    """POST /api/delete-message — delete a bot-authored Slack message."""
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    channel = body.get("channel", "").strip()
-    ts = body.get("ts", "").strip()
-    if not channel or not ts:
-        return web.json_response({"error": "channel and ts required"}, status=400)
-    slack = state.slack_client
-    if not slack:
-        return web.json_response({"error": "Slack not connected"}, status=503)
-    try:
-        await slack.delete_message(channel, ts)
-    except Exception as e:
-        safe_error = str(e).split("\n")[0][:200]
-        safe_error, _ = redact_credentials(safe_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
-        return web.json_response({"error": f"Delete failed: {safe_error}"}, status=502)
-    return web.json_response({"ok": True})
-
-
-async def api_update_message(request: web.Request) -> web.Response:
-    """POST /api/update-message — edit a bot-authored Slack message in place.
-
-    The egress twin of ``api_delete_message``: same "the bot's own message"
-    addressing, but it PUBLISHES replacement content, so the outbound floor is
-    ``api_send_message``'s — ``redact_for_display`` over the text and
-    ``_sanitize_blocks`` over the blocks, before either reaches Slack.
-
-    Authorization is per target kind. A ROOM must be in the tracked-channel
-    allowlist, which is the operator's revocation lever rather than only a
-    first-contact check — without it a message the bot authored while the channel
-    was tracked would stay a writable slot in it after the operator revoked egress.
-    A DM must be the CURRENT owner's, resolved through the same
-    ``open_dm(owner_id)`` the send path uses, and fails closed when no owner is
-    configured or the lookup raises. Admitting every ``D`` channel on its prefix
-    would leave a FORMER owner's DM permanently writable, since ``owner_id``
-    changes and the DM channel id does not.
-
-    That is one notch stricter than the ``file_send`` Slack leg
-    (``dashboard/upload_destination.py::resolve_slack``), which still passes DMs on
-    the prefix. Deliberate: this endpoint publishes replacement content into a
-    message that is already there, so a wrong audience is not merely a new message
-    they can ignore.
-    """
-    # circular import: slack.handler imports from dashboard.* at module load
-    from kiro_crew.slack.handler import is_tracked_channel  # noqa: F811
-
-    state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    channel = body.get("channel", "")
-    if not isinstance(channel, str):
-        return web.json_response(
-            {"error": "invalid channel ID format", "code": "invalid_channel"}, status=400
-        )
-    channel = channel.strip()
-    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
-        return web.json_response(
-            {"error": "invalid channel ID format", "code": "invalid_channel"}, status=400
-        )
-    ts = body.get("ts", "")
-    if not _is_slack_ts(ts):
-        return web.json_response(
-            {
-                "error": "ts must be a Slack timestamp string like '1712793600.123456'",
-                "code": "invalid_ts",
-            },
-            status=400,
-        )
-    text = body.get("text", "")
-    if not isinstance(text, str):
-        return web.json_response(
-            {"error": "text must be a string", "code": "invalid_text"}, status=400
-        )
-    blocks = body.get("blocks")
-    if blocks is not None and not isinstance(blocks, list):
-        return web.json_response(
-            {"error": "blocks must be a list", "code": "invalid_blocks"}, status=400
-        )
-    # The edit path publishes replacement content, so it carries the SAME
-    # server-fetched-media boundary as api_send_message: without this, an
-    # agent could send clean blocks and then EDIT remote media into the
-    # message — Slack fetches Block Kit media regardless of unfurl flags.
-    if isinstance(blocks, list) and _blocks_request_remote_media(blocks):
-        return web.json_response(
-            {
-                "error": (
-                    "agent-supplied Block Kit cannot contain image/video blocks "
-                    "or image_url/thumbnail_url/video_url fields because Slack "
-                    "fetches that media without a recipient click"
-                ),
-                "code": BLOCKS_REMOTE_MEDIA_ERROR,
-            },
-            status=400,
-        )
-    if not text and not blocks:
-        return web.json_response(
-            {"error": "text or blocks required", "code": "content_required"}, status=400
-        )
-    # A DM is authorized by IDENTITY, a room by the tracked-channel allowlist --
-    # and a DM must be the CURRENT owner's, not merely D-prefixed. Passing every
-    # `D...` on the prefix alone would leave any DM this bot ever posted in a
-    # writable slot forever, including a FORMER owner's: `owner_id` changes, the
-    # old DM channel id does not, and an edit publishes new agent-authored text
-    # into it. So the prefix is a routing fact, never an authorization one.
-    #
-    # For rooms, tracking is the operator's revocation lever (see
-    # api_send_message's 403: "Add it to config.json ... restart the gateway"), not
-    # just a first-contact check -- a message this bot authored while the channel
-    # was tracked must not remain writable after the operator revoked egress.
-    #
-    # Both refused before any content processing, matching api_send_message's
-    # "Authorization gates (before any side effects)" ordering.
-    if channel.startswith("D"):
-        # Resolved through the same `open_dm(state.owner_id)` the send path uses
-        # (see the send_message Slack leg), so the two agree on who the owner is.
-        # Fail CLOSED when there is no owner configured or the lookup raises: an
-        # unresolvable owner means we cannot prove this DM is theirs.
-        owner_dm = ""
-        if state.owner_id and state.slack_client:
-            try:
-                owner_dm = await state.slack_client.open_dm(state.owner_id)
-            except Exception:
-                logger.warning("update_message: could not resolve the owner DM", exc_info=True)
-        denied = not owner_dm or channel != owner_dm
-        # Deliberately does NOT echo the resolved owner DM id: the refusal is
-        # returned to the caller that just failed authorization.
-        deny_reason = f"channel {channel} is not the owner's DM"
-        deny_code = "not_owner_dm"
-    else:
-        denied = not is_tracked_channel(channel)
-        deny_reason = f"channel {channel} not in tracked channels"
-        deny_code = "channel_not_tracked"
-    if denied:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="update_message",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            resources=f"channel={channel}",
-        )
-        return web.json_response({"error": deny_reason, "code": deny_code}, status=403)
-    # Sanitize LLM-generated content before it reaches Slack, on the same
-    # DISPLAY-form floor api_send_message uses: the literal-form scan alone lets a
-    # markdown-collapse credential through, and an edit is posted as-is.
-    text, _ = redact_for_display(text, _redact_all)
-    if blocks:
-        blocks = _sanitize_blocks(
-            blocks, redact_exfiltration_urls, redact_credentials, display_form=True
-        )
-    slack = state.slack_client
-    if not slack:
-        return web.json_response(
-            {"error": "Slack not connected", "code": "slack_not_connected"}, status=503
-        )
-    try:
-        await slack.update_message(channel, ts, text, blocks)
-    except Exception as e:
-        safe_error = str(e).split("\n")[0][:200]
-        safe_error, _ = redact_credentials(safe_error)
-        safe_error, _ = redact_exfiltration_urls(safe_error)
-        return web.json_response(
-            {"error": f"Update failed: {safe_error}", "code": "update_failed"}, status=502
-        )
-    return web.json_response({"ok": True})
 
 
 def _missing_scope_message(needed: str) -> str:
@@ -4381,19 +1755,167 @@ async def api_browser_command_result(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+def _browser_install_job(state: DashboardState) -> browser_install_job.BrowserInstallJob | None:
+    """The gateway's current or most recent install job, if one ran."""
+    job = getattr(state, "_browser_install_job", None)
+    return job if isinstance(job, browser_install_job.BrowserInstallJob) else None
+
+
+def _browser_install_active(state: DashboardState) -> bool:
+    """Whether an install occupies the gateway's one slot.
+
+    The task is consulted as well as the job so the slot stays closed until
+    the task that owns the worker has actually returned.
+    """
+    job = _browser_install_job(state)
+    task = getattr(state, "_browser_install_task", None)
+    return bool((job is not None and job.running) or (task is not None and not task.done()))
+
+
+def _browser_install_status(state: DashboardState) -> dict[str, Any]:
+    """The job-derived fields every install response carries.
+
+    ``installing`` and ``last_error`` keep their meaning for older dashboards:
+    whether a job runs, and the latest job's detail when it failed.
+    """
+    job = _browser_install_job(state)
+    failed = job is not None and job.status == browser_install_job.STATUS_FAILED
+    return {
+        "installing": _browser_install_active(state),
+        "install_job": job.snapshot() if job is not None else None,
+        "last_error": job.error_detail if failed and job is not None else None,
+    }
+
+
+def _browser_install_conflict(state: DashboardState) -> web.Response:
+    """409 naming the job that holds the slot, so the panel can say which one."""
+    job = _browser_install_job(state)
+    return web.json_response(
+        {
+            "error": "an install is already running",
+            "code": "install_already_running",
+            "install_job": job.snapshot() if job is not None and job.running else None,
+        },
+        status=409,
+    )
+
+
+def _start_browser_install_job(
+    state: DashboardState,
+    kind: str,
+    engine: str | None,
+    work: Callable[[browser_cli_install.StageCallback], dict[str, Any]],
+    default_step: str,
+) -> None:
+    """Publish a new running job, then start its worker.
+
+    The job is on ``state`` before the task exists, so a status read that
+    lands between this call and the worker's first stage already reports it.
+    Stage updates arrive from the worker thread and are marshalled onto the
+    loop; each is bound to THIS job object, whose own id and status checks make
+    a late update from a finished job a no-op.
+
+    Cancelling the task (gateway shutdown cancels every pending task) kills
+    the installer's process tree through the job's
+    :class:`~kiro_crew.browser_cli.install.InstallScope` before the task
+    ends, because cancelling the awaiting coroutine alone leaves the worker
+    thread and its subprocess running.
+    """
+    loop = asyncio.get_running_loop()
+    job = browser_install_job.BrowserInstallJob.start(kind, engine)
+    scope = browser_cli_install.InstallScope()
+    state._browser_install_job = job
+    state._browser_install_scope = scope
+
+    def _on_stage(stage: str) -> None:
+        # Runs on the worker thread; the loop owns the job.
+        loop.call_soon_threadsafe(job.apply_stage, job.id, stage)
+
+    async def _run() -> None:
+        try:
+            result = await asyncio.to_thread(
+                browser_cli_install.run_in_scope, scope, work, _on_stage
+            )
+        except asyncio.CancelledError:
+            await _terminate_install_scope(scope)
+            job.finish(
+                job.id,
+                browser_install_job.STATUS_INTERRUPTED,
+                browser_install_job.ERROR_INTERRUPTED,
+                "interrupted: the gateway stopped this install",
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
+            # Redact the full text, then truncate: see bounded_detail. Pinned by
+            # test_a_credential_straddling_a_pre_redaction_cut_is_still_masked.
+            job.finish(
+                job.id,
+                browser_install_job.STATUS_FAILED,
+                browser_install_job.ERROR_EXCEPTION,
+                browser_install_job.bounded_detail(str(exc)),
+            )
+            return
+        status, code, detail = browser_install_job.outcome_of(result, default_step)
+        if scope.terminated and status != browser_install_job.STATUS_INTERRUPTED:
+            status = browser_install_job.STATUS_INTERRUPTED
+            code = browser_install_job.ERROR_INTERRUPTED
+        job.finish(job.id, status, code, detail)
+
+    state._browser_install_task = asyncio.create_task(_run())
+
+
+async def _terminate_install_scope(scope: Any) -> None:
+    """Kill an install scope's children off the event loop.
+
+    ``InstallScope.terminate`` runs ``taskkill`` on Windows, a blocking call with
+    its own timeout, so it goes to a worker thread. At interpreter teardown the
+    default executor may already refuse work; the call then runs inline, since
+    nothing else is left on the loop to stall.
+    """
+    try:
+        await asyncio.to_thread(scope.terminate)
+    except RuntimeError:
+        scope.terminate()
+
+
+async def stop_browser_install(state: DashboardState) -> None:
+    """Terminate the running install's subprocesses and wait for its task.
+
+    For the gateway's shutdown path. Idempotent and never raises. The job is
+    left ``interrupted``; nothing is persisted or resumed, so the next gateway
+    starts with no job and the operator retries explicitly.
+    """
+    scope = getattr(state, "_browser_install_scope", None)
+    if isinstance(scope, browser_cli_install.InstallScope):
+        await _terminate_install_scope(scope)
+    task = getattr(state, "_browser_install_task", None)
+    if isinstance(task, asyncio.Task) and not task.done():
+        task.cancel()
+        # ``wait`` reports the child's outcome instead of raising it here, so the
+        # CancelledError the child raises because it was just cancelled never
+        # reaches this frame, while a cancellation of THIS task (the gateway's
+        # shutdown deadline expiring around ``_shutdown()``) still propagates out
+        # of the await. A plain ``await task`` inside ``except CancelledError``
+        # could not tell the two apart and swallowed both.
+        await asyncio.wait({task})
+        if not task.cancelled():
+            # Consume a failure so the loop does not log "exception was never
+            # retrieved" at teardown; the job record already carries it.
+            task.exception()
+
+
 async def api_browser_install_get(request: web.Request) -> web.Response:
     """GET /api/browser/install -- whether browsing is available, and why not.
 
-    Reports `installing` separately from the detection fields so the card can show
-    progress for an install already in flight, including one started by a different
-    dashboard tab: the job lives on the gateway, not in a page.
+    Reports the install job separately from the detection fields so the card can
+    show progress for an install already in flight, including one started by a
+    different dashboard tab: the job lives on the gateway, not in a page. A read
+    never spawns an installer, launches a browser, or attaches to one.
     """
     state: DashboardState = request.app["state"]
     payload = dict(await asyncio.to_thread(browser_cli_install.detect))
-    task = getattr(state, "_browser_install_task", None)
-    payload["installing"] = bool(task and not task.done())
+    payload.update(_browser_install_status(state))
     payload["token"] = browser_cli_token.has_token()
-    payload["last_error"] = getattr(state, "_browser_install_error", None)
     return web.json_response(payload)
 
 
@@ -4404,71 +1926,27 @@ async def api_browser_install_start(request: web.Request) -> web.Response:
     browser, which takes long enough that holding the request open would read as a
     hung dashboard, so progress is observed by re-reading rather than awaited here.
 
-    Concurrent clicks are folded into the one running job: npm and the browser
-    installer are not safe to run twice over the same target at once.
+    A click while CLI setup already runs is folded into that job: it is the same
+    work, and npm is not safe to run twice over the same target at once. A click
+    while an ENGINE download runs is refused with 409 naming that job, because
+    folding it would answer "CLI setup accepted" for work that is not happening.
     """
     denied = _deny_non_owner_browser_request(request, "browser_cli_install")
     if denied is not None:
         return denied
     state: DashboardState = request.app["state"]
-    task = getattr(state, "_browser_install_task", None)
-    if not (task and not task.done()):
-
-        async def _run() -> None:
-            state._browser_install_error = None
-            try:
-                result = await asyncio.to_thread(browser_cli_install.install)
-                # The LAST step, not the first failed one. Two reasons, both of
-                # them cases this string is the only cure for:
-                #   * A step can fail and be RECOVERED -- a refused
-                #     ``--with-deps`` is retried without the flag
-                #     (browser_cli.os_deps) and its failed attempt stays in
-                #     ``steps`` so the operator can see what was tried. Reporting
-                #     "any failed step" would raise a permanent banner quoting a
-                #     sudo refusal on a host where browsing works.
-                #   * When the install really did fail, the FIRST failed step may
-                #     be that same recovered one, which would mask the step that
-                #     actually decided the outcome and drop the remedy it carries.
-                # ``install`` returns ``ok`` from its last step and every earlier
-                # gate returns on a real failure, so the last step is always the
-                # decisive one.
-                steps = result.get("steps") or []
-                failed = [] if result.get("ok") or not steps else steps[-1:]
-                if failed:
-                    first = failed[0]
-                    # `stderr`, not `error`: install steps only ever carry
-                    # `stderr` (see browser_cli.install._step), so reading
-                    # `error` discarded the npm / download output and left the
-                    # operator with a bare "failed" -- which cannot tell a
-                    # registry auth error apart from a blocked download, the two
-                    # cases the panel renders this string to explain.
-                    # Redacted before it reaches the panel. Step stderr is already
-                    # scrubbed at the source (browser_cli.install._step runs the
-                    # npm-aware redactor on it), but the `error` fallback and the
-                    # exception arm below are composed HERE and never pass through
-                    # _step. This call re-runs the same npm-aware redactor
-                    # (redact_install_output: the shared two-pass PLUS the npm
-                    # shapes such as a bare `_authToken=`) so all three carriers
-                    # get identical coverage -- the module-local _redact runs only
-                    # the shared pair and would let an npm registry line through.
-                    detail = first.get("stderr") or first.get("error") or "failed"
-                    state._browser_install_error = browser_cli_install.redact_install_output(
-                        f"{first.get('name', 'install')}: {str(detail).strip()}"
-                    )[:2000]
-            except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-                # Redact the FULL text, then truncate: any pre-redaction cut can
-                # split a credential so its `@` anchor is gone, no pattern
-                # matches, and npm-line compression pulls the surviving fragment
-                # into the 2000-char display window. Pinned by
-                # test_a_credential_straddling_a_pre_redaction_cut_is_still_masked.
-                # Unbounded input cannot reach this arm in practice: install._run
-                # reports subprocess failures as return codes rather than raising
-                # with output, and every raise site carries a short message.
-                state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
-                    :2000
-                ]
-
-        state._browser_install_task = asyncio.create_task(_run())
+    if _browser_install_active(state):
+        job = _browser_install_job(state)
+        if job is not None and job.running and job.kind != browser_install_job.KIND_CLI_SETUP:
+            return _browser_install_conflict(state)
+    else:
+        _start_browser_install_job(
+            state,
+            browser_install_job.KIND_CLI_SETUP,
+            None,
+            lambda on_stage: browser_cli_install.install(on_stage=on_stage),
+            "install",
+        )
     return await api_browser_install_get(request)
 
 
@@ -4477,10 +1955,9 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
 
     Body: ``{"engine": "chromium" | "firefox" | "webkit"}``.
 
-    Shares the ONE ``_browser_install_task`` slot with the CLI install rather than
-    taking its own: both drive the same browser installer, which is not safe to run
-    twice over the same cache at once, and sharing the slot means the panel's single
-    "installing" flag stays true for whichever download is in flight.
+    Shares the ONE install slot with the CLI install rather than taking its own:
+    both drive the same browser installer, which is not safe to run twice over the
+    same cache at once.
     """
     denied = _deny_non_owner_browser_request(request, "browser_engine_install")
     if denied is not None:
@@ -4503,41 +1980,18 @@ async def api_browser_engine_install(request: web.Request) -> web.Response:
     # gets a 400 instead of an error they have to go re-read the status to find.
     if engine not in browser_cli_install.BROWSER_ENGINES:
         return web.json_response({"error": "unknown engine", "code": "unknown_engine"}, status=400)
-    task = getattr(state, "_browser_install_task", None)
-    if task and not task.done():
-        # 409, NOT a folded success. Folding is right for the CLI install, which
-        # has one target: a second click means the same work. Engines are three
-        # DISTINCT targets sharing one slot, so answering 200 while a different
-        # engine installs makes the panel show WebKit downloading when Firefox
-        # actually is. Refuse and say why.
-        return web.json_response(
-            {"error": "an install is already running", "code": "install_already_running"},
-            status=409,
-        )
-
-    async def _run() -> None:
-        state._browser_install_error = None
-        try:
-            result = await asyncio.to_thread(browser_cli_install.install_browser, engine)
-            # The decisive step, not the first failed one: see the CLI install
-            # path above for why a recovered attempt must neither raise a banner
-            # nor mask the step that actually decided the outcome.
-            steps = result.get("steps") or []
-            failed = [] if result.get("ok") or not steps else steps[-1:]
-            if failed:
-                first = failed[0]
-                # npm-aware redactor, same reasoning as the CLI install above.
-                state._browser_install_error = browser_cli_install.redact_install_output(
-                    f"{first.get('name', 'install-browser')}: "
-                    f"{first.get('stderr') or first.get('error') or 'failed'}"
-                )[:2000]
-        except Exception as exc:  # noqa: BLE001 - surfaced to the operator
-            # Redact the full text, then truncate; see the CLI install above.
-            state._browser_install_error = browser_cli_install.redact_install_output(str(exc))[
-                :2000
-            ]
-
-    state._browser_install_task = asyncio.create_task(_run())
+    if _browser_install_active(state):
+        # 409, NOT a folded success. Engines are three DISTINCT targets sharing
+        # one slot, so answering 200 while a different engine installs makes the
+        # panel show WebKit downloading when Firefox actually is.
+        return _browser_install_conflict(state)
+    _start_browser_install_job(
+        state,
+        browser_install_job.KIND_ENGINE_DOWNLOAD,
+        engine,
+        lambda on_stage: browser_cli_install.install_browser(engine, on_stage=on_stage),
+        "install-browser",
+    )
     return await api_browser_install_get(request)
 
 
@@ -4703,34 +2157,6 @@ async def api_browser_open(request: web.Request) -> web.Response:
     return web.json_response(await asyncio.to_thread(_launch))
 
 
-async def _validate_slack_token(key: str, token: str) -> str | None:
-    """Check a pasted token against Slack before it is stored.
-
-    Bot tokens are checked with ``auth.test``; app-level tokens with
-    ``apps.connections.open`` (the same call the gateway makes at startup, so
-    a token that passes here will connect at boot). Returns ``None`` when
-    Slack accepts the token, or Slack's error code (e.g. ``invalid_auth``)
-    when it rejects it. Network failures propagate to the caller, which
-    treats them as "unverifiable" rather than invalid — saves must not be
-    blocked by being offline.
-    """
-    from slack_sdk.errors import SlackApiError
-    from slack_sdk.web.async_client import AsyncWebClient
-
-    client = AsyncWebClient(token=token, timeout=_TOKEN_VERIFY_TIMEOUT)
-    try:
-        if key == "SLACK_APP_TOKEN":
-            await client.apps_connections_open(app_token=token)
-        else:
-            await client.auth_test()
-        return None
-    except SlackApiError as exc:
-        try:
-            return str(exc.response.get("error", "") or "rejected")[:60]
-        except Exception:
-            return "rejected"
-
-
 def _mask_secret(val: str) -> str:
     """Return a masked preview keeping the token prefix + last 4 chars.
 
@@ -4762,7 +2188,7 @@ def _clean_id_list(raw: object, is_valid: Callable[[str], bool], label: str) -> 
     return out
 
 
-async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
+async def _write_env_off_loop(updates: dict[str, str | None], *, config_kept: bool = False) -> None:
     """Run the blocking ``.env`` write on a worker, drained under the config lock.
 
     Every caller holds ``_get_config_lock()`` across this, and a thread cannot be
@@ -4781,6 +2207,17 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     All six channel saves go through here. The offload itself is already in
     place on every one of them; the bare offload is what leaves the hole, so
     covering a subset would leave the same window open in the rest.
+
+    A ``.env`` saved as UTF-16 or UTF-32 is refused before anything is written
+    (:func:`_write_env_updates_locked` never overwrites a file it cannot
+    parse). That refusal is raised here as a 409 carrying the fix, so every
+    channel save answers it the same way instead of with an opaque 500. A
+    caller that rolls its config write back on a failed ``.env`` write (Slack,
+    Teams, Webex, WeCom and Feishu) still does, because it catches every
+    exception; Discord and Telegram commit config before this call and keep it,
+    so their 409 leaves the config change in place and only the ``.env`` part
+    unsaved, which a retry after the UTF-8 re-save completes. Those two callers
+    pass ``config_kept=True`` so the 409 says their other settings were saved.
     """
     fut = asyncio.ensure_future(asyncio.to_thread(_write_env_updates, updates))
     try:
@@ -4788,6 +2225,29 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
     except asyncio.CancelledError:
         await asyncio.wait([fut])
         raise
+    except _loader.EnvFileWideEncodingError as exc:
+        raise _wide_env_refusal(exc, config_kept=config_kept) from exc
+
+
+def _wide_env_refusal(
+    exc: _loader.EnvFileWideEncodingError, *, config_kept: bool = False
+) -> web.HTTPConflict:
+    """The response for a channel save refused because ``.env`` is wide-encoded.
+
+    ``config_kept`` is set by a caller whose config write stays in place when
+    the ``.env`` write is refused, so the message does not imply the whole save
+    was discarded.
+    """
+    outcome = "The .env was not changed"
+    outcome += "; your other settings were saved." if config_kept else "."
+    message = (
+        f"{_loader.env_path()} is saved as {exc.wide_encoding}, which Kiro Crew "
+        f"cannot read. Re-save it as UTF-8 and save again. {outcome}"
+    )
+    return web.HTTPConflict(
+        text=json.dumps({"error": message}),
+        content_type="application/json",
+    )
 
 
 def _write_env_updates(updates: dict[str, str | None]) -> None:
@@ -4852,7 +2312,7 @@ def _write_env_updates_locked(ep: "Path", updates: dict[str, str | None]) -> Non
     """The read-modify-atomic-rewrite of .env, run under the .env lock held by
     the caller (:func:`_write_env_updates`)."""
 
-    lines = ep.read_text(encoding="utf-8").splitlines() if ep.exists() else []
+    lines = _loader.read_env_text(ep, encoding="utf-8").splitlines() if ep.exists() else []
     seen: set[str] = set()
     out: list[str] = []
     for line in lines:
@@ -4871,7 +2331,12 @@ def _write_env_updates_locked(ep: "Path", updates: dict[str, str | None]) -> Non
         if k not in seen and new_val:
             out.append(f"{k}={new_val}")
     content = "\n".join(out) + ("\n" if out else "")
-    atomic_write(ep, content, restrict_to_owner=True, restrict_on_error="warn")
+    atomic_write(
+        ep,
+        _loader.env_bom_prefix(ep) + content,
+        restrict_to_owner=True,
+        restrict_on_error="warn",
+    )
 
 
 async def api_slack_manifest(request: web.Request) -> web.Response:
@@ -5007,312 +2472,6 @@ async def api_channel_folder_backfill(request: web.Request) -> web.Response:
     return web.json_response(report)
 
 
-async def api_slack_config_get(request: web.Request) -> web.Response:
-    """GET /api/slack/config — read Slack config + masked secret status."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_OWNER_ID,
-        CRED_SLACK_APP_TOKEN,
-        CRED_SLACK_BOT_TOKEN,
-        KiroCrewConfig,
-    )
-
-    cfg = KiroCrewConfig.load()
-    creds = cfg.load_credentials()
-    bot = creds.get(CRED_SLACK_BOT_TOKEN, "")
-    app = creds.get(CRED_SLACK_APP_TOKEN, "")
-    owner = creds.get(CRED_OWNER_ID, "")
-    slack = cfg.slack
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only when the socket-mode connect succeeded this session —
-            # NOT merely "tokens were present at boot" (see DashboardState).
-            "connected": bool(getattr(state, "slack_socket_connected", False)),
-            # Short reason from the failed connect attempt ("invalid_auth",
-            # a network error class name, or "" when connected / untried).
-            "connect_error": str(getattr(state, "slack_connect_error", ""))[:120],
-            "configured": bool(bot and app and owner),
-            # Remote sessions get a read-only view: config edits (PUT) are
-            # loopback-only, so the UI disables all inputs and hides Save.
-            "read_only": not is_direct_local_request(request),
-            "bot_token_set": bool(bot),
-            "app_token_set": bool(app),
-            "bot_token_preview": _mask_secret(bot),
-            "app_token_preview": _mask_secret(app),
-            "owner_id": owner,
-            "command": slack.command,
-            # allowed_users / open_channels are deliberately NOT exposed: the
-            # runtime enforces owner-only access in this build (is_allowed_user
-            # ignores both), so surfacing editors would create access rules
-            # that are never honored. Re-add when multi-user Slack lands.
-            "allowed_enterprise_ids": list(slack.allowed_enterprise_ids),
-            "reactions_enabled": slack.reactions_enabled,
-            "show_thinking": slack.show_thinking,
-            "session_folder": slack.session_folder,
-        }
-    )
-
-
-async def api_slack_config_save(request: web.Request) -> web.Response:
-    """PUT /api/slack/config — persist Slack secrets (.env) + config (config.json).
-
-    Token/owner changes need a gateway restart to reconnect Slack (creds are
-    read at gateway startup); the response returns ``restart_required`` so the
-    UI can surface a hint. Config-only changes take effect on the next message
-    or restart.
-
-    Serialized with every other config.json writer via the repository-wide
-    ``_get_config_lock()`` (also used by the MCP, memory, and agent
-    handlers) — this handler read-modify-writes the shared ``.env`` /
-    ``config.json`` stores, so interleaving with ANY other config writer
-    (including the Discord and Telegram saves) would silently lose writes.
-    """
-    # circular import: agents imports from dashboard.handlers at module load
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    async with _get_config_lock():
-        # A save is a config.json + credential transaction: a cancelled request
-        # (client gone, gateway shutting down) must not abandon it between its
-        # phases -- see ``run_to_completion``.
-        return await run_to_completion(_slack_config_save_locked(request))
-
-
-async def _slack_config_save_locked(request: web.Request) -> web.Response:
-    """Body of the Slack save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_OWNER_ID,
-        ConfigReadError,
-        config_path,
-    )
-    from kiro_crew.validation import USER_ID_RE  # noqa: F811
-
-    caller = request.get("user", "dashboard")
-
-    def _deny(msg: str, status: int = 400) -> web.Response:
-        _sel().log_api_access(
-            caller=caller,
-            operation="slack.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-        return web.json_response({"error": msg}, status=status)
-
-    # Remote sessions are read-only: like /reveal, config writes are accepted
-    # only from the machine running the gateway, so a remote or tunneled
-    # session (even with a valid dashboard token) cannot alter Slack access
-    # or plant new tokens.
-    if not is_direct_local_request(request):
-        return _deny("read-only from remote sessions (local machine only)", status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid JSON")
-    if not isinstance(body, dict):
-        return _deny("body must be an object")
-
-    # ── Phase 1: validate everything and stage changes. No writes happen until
-    # all validation passes, so a rejected field never leaves partial state
-    # (e.g. a token persisted while a bad channel ID 400s). ──
-
-    # Secrets → .env (empty/omitted token = leave unchanged; explicit clear via
-    # *_clear flag to avoid accidentally wiping a token on save).
-    env_updates: dict[str, str | None] = {}
-    for field_name, key in _SLACK_SECRET_FIELDS.items():
-        clear_flag = body.get(f"{field_name}_clear")
-        if clear_flag is not None and not isinstance(clear_flag, bool):
-            return _deny(f"{field_name}_clear must be a boolean")
-        if clear_flag is True:
-            env_updates[key] = None
-            continue
-        raw = body.get(field_name)
-        if isinstance(raw, str):
-            tok = raw.strip()
-            if tok.startswith(f"{key}="):  # strip an accidentally pasted env line
-                tok = tok[len(key) + 1 :].strip()
-            if tok:
-                if any(ch.isspace() for ch in tok):
-                    return _deny(f"{field_name} must not contain whitespace")
-                env_updates[key] = tok
-
-    if "owner_id" in body:
-        owner = str(body.get("owner_id", "")).strip()
-        if owner and not USER_ID_RE.match(owner):
-            return _deny("owner_id must be a Slack member ID (starts with U or W)")
-        # Only stage a real change: the UI sends the field on every save, and
-        # staging an unchanged value would flag restart_required on every
-        # config-only save.
-        current_owner = os.environ.get(CRED_OWNER_ID, "").strip()
-        if owner != current_owner:
-            env_updates[CRED_OWNER_ID] = owner or None
-
-    # Config → config.json under "slack" (staged, applied only after Phase 1).
-    path = config_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except Exception:
-        return _deny("config.json is corrupt", status=500)
-    if not isinstance(data.get("slack"), dict):
-        data["slack"] = {}
-    slack_cfg = data["slack"]
-    staged: dict[str, object] = {}
-    applied: list[str] = []
-
-    if "command" in body:
-        cmd = str(body.get("command", "")).strip().lstrip("/").strip()
-        if cmd and (len(cmd) > 32 or not all(c.isalnum() or c in "-_" for c in cmd)):
-            return _deny("command must be alphanumeric/-/_ and at most 32 chars")
-        # Empty input resets to the default rather than silently keeping the
-        # old value, so the slash command can be cleared. Stage only on actual
-        # change: the UI sends the field on
-        # every save, and command is boot-read, so staging an unchanged value
-        # would flag restart_required on every save.
-        new_cmd = cmd or "kirocrew"
-        if new_cmd != slack_cfg.get("command", "kirocrew"):
-            staged["command"] = new_cmd
-            applied.append("command")
-
-    if "allowed_enterprise_ids" in body:
-        try:
-            new_ents = _clean_id_list(
-                body.get("allowed_enterprise_ids"),
-                lambda v: bool(re.fullmatch(r"[ET][A-Z0-9]+", v)),
-                "enterprise ID",
-            )
-        except ValueError as exc:
-            return _deny(str(exc))
-        # Boot-read field: stage only on actual change (see command above).
-        if new_ents != slack_cfg.get("allowed_enterprise_ids", []):
-            staged["allowed_enterprise_ids"] = new_ents
-            applied.append("allowed_enterprise_ids")
-
-    for key in ("reactions_enabled", "show_thinking"):
-        if key in body:
-            val = body.get(key)
-            if not isinstance(val, bool):
-                return _deny(f"{key} must be a boolean")
-            staged[key] = val
-            applied.append(key)
-
-    if "session_folder" in body:
-        try:
-            new_folder = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny(str(exc))
-        if new_folder != str(slack_cfg.get("session_folder", "") or ""):
-            staged["session_folder"] = new_folder
-            applied.append("session_folder")
-
-    # ── Phase 1.5: verify newly pasted tokens against Slack before storing.
-    # A token Slack rejects (invalid_auth etc.) fails the save right here,
-    # where the user can act on it — instead of being stored and silently
-    # failing at the next gateway startup. Network failure is NOT a rejection:
-    # the save proceeds with a warning so being offline never blocks config.
-    verify_warning = ""
-    for field_name, key in _SLACK_SECRET_FIELDS.items():
-        pending_tok = env_updates.get(key)
-        if not pending_tok:
-            continue  # cleared or unchanged — nothing to verify
-        try:
-            slack_err = await _validate_slack_token(key, pending_tok)
-        except Exception:
-            verify_warning = "Slack was unreachable, so the token was saved without verification."
-            continue
-        if slack_err:
-            return _deny(f"{field_name} rejected by Slack ({slack_err})")
-
-    # ── Phase 2: commit. All validation passed, so writes are safe. Config
-    # first, then .env, with the config rolled back if the .env write fails --
-    # the same two-file transaction as the Teams, Webex and WeCom saves. The
-    # config write is the one that can still be refused after validation (the
-    # file may have gone corrupt between the snapshot and the locked reread),
-    # and a refusal must not leave a credential already committed to .env
-    # beside config the caller was told did not save. ──
-    _cfg_write = _LockedSectionWrite(path, "slack", staged)
-    # Hold the live-config watcher for the whole config+credential transaction:
-    # the two files commit separately and a failed .env write rolls the config
-    # back, so nothing between here and the end of the block may be applied to
-    # the running gateway (a widened allow-list must never go live on a save
-    # that then fails). The release wakes the watcher on the committed state.
-    with live.hold():
-        if staged:
-            slack_cfg.update(staged)
-            # Through ``update_config_locked``: it holds the advisory lock on the
-            # sidecar ``<path>.lock`` across the whole read-modify-write, so a
-            # writer in ANOTHER PROCESS cannot land between our read and our
-            # write, and the staged keys are merged into the file as re-read
-            # inside that lock. The helper drains its worker, so a cancellation
-            # arriving mid-write cannot release the config lock while the thread
-            # is still replacing the file.
-            try:
-                await _cfg_write.commit()
-            except ConfigReadError:
-                return _deny("config.json is corrupt", status=500)
-        if env_updates:
-            # Off-loop: the .env write is blocking file IO (lock, temp write,
-            # owner-only lockdown, replace) and must not block the event loop.
-            try:
-                await _write_env_off_loop(env_updates)
-            except BaseException:
-                # Roll config back so a failed .env write cannot leave the NEW
-                # settings paired with the OLD credentials on disk.
-                if staged:
-                    await _cfg_write.rollback("Slack")
-                raise
-            # Keep the live process environment in sync with the new .env state.
-            # load_credentials() lets os.environ win over .env, so without this a
-            # replaced/cleared token would keep being reported as installed by
-            # GET until restart, and spawned children would inherit the stale
-            # value. The Slack socket connection itself still reconnects only on
-            # restart, which restart_required below surfaces to the UI.
-            for key, new_val in env_updates.items():
-                if new_val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = new_val
-
-    # Create the configured session folder now, on this user-initiated save,
-    # so the reconcile path never has to write the folder store. Best-effort:
-    # a failure leaves conversations unfiled until the next save.
-    _folder_name = stored_folder_name(slack_cfg.get("session_folder"))
-    if _folder_name:
-        _state = request.app.get("state")
-        if _state is not None:
-            await ensure_channel_folder(
-                _state,
-                "slack",
-                _folder_name,
-                relabel="session_folder" in staged,
-            )
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="slack.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied + list(env_updates.keys())),
-    )
-    # Only ``slack.command`` still needs a restart: it is registered in the Slack
-    # app manifest, so no local reload can make Slack route a new trigger. Every
-    # other slack.* field -- including the enterprise allow-list, which the
-    # gateway re-reads through its validated reader on a config change -- is
-    # applied live. A credential/owner write still needs one: those live in .env,
-    # which the config watcher does not watch.
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required(
-                "slack", staged.keys(), env_updates=env_updates
-            ),
-            "verify_warning": verify_warning,
-        }
-    )
-
-
 def _threshold_pct_rejection(body: dict[str, Any], key: str) -> tuple[str, str] | None:
     """``(code, message)`` when *body[key]* is present and not a valid percentage.
 
@@ -5337,850 +2496,24 @@ def _threshold_pct_rejection(body: dict[str, Any], key: str) -> tuple[str, str] 
     )
 
 
-# ── Discord configuration API ──
-# The bot token lives in config_dir/.env as DISCORD_BOT_TOKEN (0600), with
-# config.json's discord.bot_token as a legacy fallback. Non-secret config
-# (enabled, allowed_user_ids, allowed_thread_ids, soft_threshold_pct) lives
-# in config.json under
-# the "discord" key. GET returns a masked preview + presence boolean; raw
-# token values are write-only (reset at the Developer Portal if ever needed).
+# ── Discord configuration API: dashboard/messaging_api/discord_settings.py ──
 
 #: Loose shape check for Discord bot tokens: three dot-separated base64url
 #: segments (e.g. "MTA5...aBc.GhIjKl.MnOpQrStUvWxYz0123456789_-").
 _DISCORD_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{20,}$")
 
 
-async def _validate_discord_token(token: str) -> str | None:
-    """Check a pasted bot token against Discord before it is stored.
-
-    Uses ``GET /users/@me`` — the cheapest authenticated REST call. Returns
-    ``None`` when Discord accepts the token, or Discord's error message when
-    it rejects it. Network failures propagate to the caller, which treats
-    them as "unverifiable" rather than invalid — saves must not be blocked by
-    being offline.
-    """
-    import aiohttp  # noqa: F811
-
-    timeout = aiohttp.ClientTimeout(total=_TOKEN_VERIFY_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(
-            "https://discord.com/api/v10/users/@me",
-            headers={"Authorization": f"Bot {token}"},
-        ) as resp:
-            if 200 <= resp.status < 300:
-                return None
-            desc = ""
-            try:
-                data = await resp.json(content_type=None)
-                if isinstance(data, dict):
-                    desc = str(data.get("message", "") or "")
-            except Exception:
-                pass
-            return (desc or f"HTTP {resp.status}")[:60]
-
-
-async def api_discord_config_get(request: web.Request) -> web.Response:
-    """GET /api/discord/config — read Discord config + masked secret status."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_DISCORD_BOT_TOKEN,
-        KiroCrewConfig,
-    )
-
-    cfg = KiroCrewConfig.load()
-    creds = cfg.load_credentials()
-    token = creds.get(CRED_DISCORD_BOT_TOKEN, "") or cfg.discord.bot_token
-    dc = cfg.discord
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only when the Gateway WebSocket transport actually started
-            # this session — NOT merely "a token was present at boot".
-            "connected": bool(getattr(state, "discord_connected", False)),
-            "connect_error": str(getattr(state, "discord_connect_error", ""))[:120],
-            # allowed_user_ids is part of "configured": the transport fails
-            # closed and rejects every message while the allowlist is empty.
-            "configured": bool(token and dc.enabled and dc.allowed_user_ids),
-            # Remote sessions get a read-only view: config edits (PUT) are
-            # loopback-only, so the UI disables all inputs and hides Save.
-            "read_only": not is_direct_local_request(request),
-            "bot_token_set": bool(token),
-            "bot_token_preview": _mask_secret(token),
-            "enabled": bool(dc.enabled),
-            "allowed_user_ids": [str(u) for u in dc.allowed_user_ids],
-            "allowed_thread_ids": [str(t) for t in dc.allowed_thread_ids],
-            "allowed_channel_ids": [str(c) for c in dc.allowed_channel_ids],
-            "auto_thread": bool(dc.auto_thread),
-            "reactions_enabled": bool(dc.reactions_enabled),
-            "show_thinking": bool(dc.show_thinking),
-            "soft_threshold_pct": int(dc.soft_threshold_pct),
-            "session_folder": dc.session_folder,
-        }
-    )
-
-
-async def api_discord_config_save(request: web.Request) -> web.Response:
-    """PUT /api/discord/config — persist Discord secret (.env) + config (config.json).
-
-    Every Discord field is read once at gateway startup (token, enabled flag,
-    allowlist are consumed in the orchestrator's constructor), so any actual
-    change returns ``restart_required`` for the UI hint.
-
-    Serialized with every other config.json writer via the repository-wide
-    ``_get_config_lock()`` (also used by the MCP, memory, and agent
-    handlers) — this handler read-modify-writes the shared ``.env`` /
-    ``config.json`` stores, so interleaving with ANY other config writer
-    (including the Slack and Telegram saves) would silently lose writes.
-    """
-    # circular import: agents imports from dashboard.handlers at module load
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    async with _get_config_lock():
-        # A save is a config.json + credential transaction: a cancelled request
-        # (client gone, gateway shutting down) must not abandon it between its
-        # phases -- see ``run_to_completion``.
-        return await run_to_completion(_discord_config_save_locked(request))
-
-
-async def _discord_config_save_locked(request: web.Request) -> web.Response:
-    """Body of the Discord save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_DISCORD_BOT_TOKEN,
-        ConfigReadError,
-        config_path,
-    )
-
-    caller = request.get("user", "dashboard")
-
-    def _deny(msg: str, status: int = 400, *, code: str = "") -> web.Response:
-        _sel().log_api_access(
-            caller=caller,
-            operation="discord.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-        # ``code`` is optional: most rejections in this handler are prose-only, and a
-        # machine-readable code is added per field as one is retrofitted. The dashboard
-        # renders ``error`` verbatim into a localized UI, so prose alone is
-        # untranslatable by construction (RFC 9457 3.1.3).
-        payload: dict[str, Any] = {"error": msg}
-        if code:
-            payload["code"] = code
-        return web.json_response(payload, status=status)
-
-    # Remote sessions are read-only: config writes are accepted only from the
-    # machine running the gateway, so a remote or tunneled session (even with
-    # a valid dashboard token) cannot alter Discord access or plant tokens.
-    if not is_direct_local_request(request):
-        return _deny("read-only from remote sessions (local machine only)", status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid JSON")
-    if not isinstance(body, dict):
-        return _deny("body must be an object")
-
-    # ── Phase 1: validate everything and stage changes. No writes happen until
-    # all validation passes, so a rejected field never leaves partial state. ──
-
-    env_updates: dict[str, str | None] = {}
-    clear_flag = body.get("bot_token_clear")
-    if clear_flag is not None and not isinstance(clear_flag, bool):
-        return _deny("bot_token_clear must be a boolean")
-    if clear_flag is True:
-        env_updates[CRED_DISCORD_BOT_TOKEN] = None
-    else:
-        raw = body.get("bot_token")
-        if isinstance(raw, str):
-            tok = raw.strip()
-            if tok.startswith(f"{CRED_DISCORD_BOT_TOKEN}="):  # accidental env line
-                tok = tok[len(CRED_DISCORD_BOT_TOKEN) + 1 :].strip()
-            if tok.startswith("Bot "):  # accidental Authorization-header prefix
-                tok = tok[4:].strip()
-            if tok:
-                if any(ch.isspace() for ch in tok):
-                    return _deny("bot_token must not contain whitespace")
-                if not _DISCORD_TOKEN_RE.match(tok):
-                    return _deny(
-                        "bot_token must be the bot token from the Discord "
-                        "Developer Portal (Bot page → Reset Token)"
-                    )
-                env_updates[CRED_DISCORD_BOT_TOKEN] = tok
-
-    # Config → config.json under "discord" (staged, applied only after Phase 1).
-    path = config_path()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except Exception:
-        return _deny("config.json is corrupt", status=500)
-    if not isinstance(data.get("discord"), dict):
-        data["discord"] = {}
-    dc_cfg = data["discord"]
-    staged: dict[str, object] = {}
-    applied: list[str] = []
-
-    if "enabled" in body:
-        val = body.get("enabled")
-        if not isinstance(val, bool):
-            return _deny("enabled must be a boolean")
-        if val != bool(dc_cfg.get("enabled", False)):
-            staged["enabled"] = val
-            applied.append("enabled")
-
-    if "allowed_user_ids" in body:
-        raw_ids = body.get("allowed_user_ids")
-        if not isinstance(raw_ids, list):
-            return _deny("allowed_user_ids must be a list")
-        new_ids: list[str] = []
-        for item in raw_ids:
-            s = str(item).strip()
-            if not s:
-                continue
-            # Discord user IDs are numeric snowflakes (17-20 digits today;
-            # accept any all-digit string to stay future-proof).
-            if not s.isdigit():
-                return _deny(f"invalid Discord user ID: {s} (numeric IDs only)")
-            if s not in new_ids:
-                new_ids.append(s)
-        if new_ids != [str(u) for u in dc_cfg.get("allowed_user_ids", [])]:
-            staged["allowed_user_ids"] = new_ids
-            applied.append("allowed_user_ids")
-
-    if "allowed_thread_ids" in body:
-        raw_ids = body.get("allowed_thread_ids")
-        if not isinstance(raw_ids, list):
-            return _deny("allowed_thread_ids must be a list")
-        new_ids = []
-        for item in raw_ids:
-            s = str(item).strip()
-            if not s:
-                continue
-            if not s.isdigit():
-                return _deny(f"invalid Discord thread ID: {s} (numeric IDs only)")
-            if s not in new_ids:
-                new_ids.append(s)
-        if new_ids != [str(t) for t in dc_cfg.get("allowed_thread_ids", [])]:
-            staged["allowed_thread_ids"] = new_ids
-            applied.append("allowed_thread_ids")
-
-    if "allowed_channel_ids" in body:
-        raw_ids = body.get("allowed_channel_ids")
-        if not isinstance(raw_ids, list):
-            return _deny("allowed_channel_ids must be a list")
-        new_ids = []
-        for item in raw_ids:
-            s = str(item).strip()
-            if not s:
-                continue
-            if not s.isdigit():
-                return _deny(f"invalid Discord channel ID: {s} (numeric IDs only)")
-            if s not in new_ids:
-                new_ids.append(s)
-        if new_ids != [str(c) for c in dc_cfg.get("allowed_channel_ids", [])]:
-            staged["allowed_channel_ids"] = new_ids
-            applied.append("allowed_channel_ids")
-
-    if "auto_thread" in body:
-        val = body.get("auto_thread")
-        if not isinstance(val, bool):
-            return _deny("auto_thread must be a boolean")
-        if val != bool(dc_cfg.get("auto_thread", True)):
-            staged["auto_thread"] = val
-            applied.append("auto_thread")
-
-    bad_pct = _threshold_pct_rejection(body, "soft_threshold_pct")
-    if bad_pct is not None:
-        return _deny(bad_pct[1], code=bad_pct[0])
-    if "soft_threshold_pct" in body:
-        pct = int(body["soft_threshold_pct"])
-        if pct != int(dc_cfg.get("soft_threshold_pct", 80)):
-            staged["soft_threshold_pct"] = pct
-            applied.append("soft_threshold_pct")
-
-    # Both render toggles are read per turn by the dispatcher, not at boot, so a
-    # change takes effect on the next message. `channel_restart_required` keeps
-    # `restart_required` honest about that; promising a restart the user does not
-    # need is how a settings page trains people to restart for everything.
-    for toggle in ("reactions_enabled", "show_thinking"):
-        if toggle in body:
-            val = body.get(toggle)
-            if not isinstance(val, bool):
-                return _deny(f"{toggle} must be a boolean")
-            if val != bool(dc_cfg.get(toggle, toggle == "reactions_enabled")):
-                staged[toggle] = val
-                applied.append(toggle)
-
-    if "session_folder" in body:
-        try:
-            new_folder = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny(str(exc))
-        if new_folder != str(dc_cfg.get("session_folder", "") or ""):
-            staged["session_folder"] = new_folder
-            applied.append("session_folder")
-
-    # Whenever the .env token is set or cleared, also drop the legacy
-    # config.json ``discord.bot_token`` fallback. The gateway (and GET above)
-    # fall back to that field when .env is empty, so leaving it behind would
-    # resurrect a removed credential on the next restart — an explicit clear
-    # must actually revoke access, and a replacement must not shadow-keep the
-    # old token. It also sits in agent-readable ``config.json``, so the copy is
-    # worth strictly less than the .env one it shadows. Staged here (write
-    # happens only in Phase 2), matching the Telegram and Webex saves.
-    if CRED_DISCORD_BOT_TOKEN in env_updates and dc_cfg.get("bot_token"):
-        dc_cfg.pop("bot_token", None)
-        applied.append("legacy_bot_token_removed")
-
-    # ── Phase 1.5: verify a newly pasted token against Discord before storing.
-    # A token Discord rejects fails the save right here, where the user can
-    # act on it. Network failure is NOT a rejection: the save proceeds with a
-    # warning so being offline never blocks config.
-    verify_warning = ""
-    pending_tok = env_updates.get(CRED_DISCORD_BOT_TOKEN)
-    if pending_tok:
-        try:
-            dc_err = await _validate_discord_token(pending_tok)
-        except Exception:
-            verify_warning = "Discord was unreachable, so the token was saved without verification."
-        else:
-            if dc_err:
-                return _deny(f"bot_token rejected by Discord ({dc_err})")
-
-    # ── Phase 2: commit. All validation passed, so writes are safe. Order
-    # matters for crash safety: config.json — which carries the legacy
-    # ``bot_token`` fallback removal — is persisted FIRST, so there is no
-    # failure window in which .env was already cleared but the legacy fallback
-    # survives to silently resurrect the revoked credential on restart. The
-    # inverse failure mode (config written, then a crash before the .env
-    # update) is benign and visible: the .env token remains exactly as GET
-    # reports it, and re-running the save completes the operation. ──
-    # The purge is decided against the document the write lands on, not the
-    # snapshot: whenever this save updates the credential, a legacy ``bot_token``
-    # a concurrent writer landed after our read is dropped too, so the cleared
-    # ``.env`` slot cannot leave a fallback behind. Absent, the drop is a no-op
-    # and the write is skipped.
-    purge_legacy_token = CRED_DISCORD_BOT_TOKEN in env_updates
-    if staged or purge_legacy_token:
-        dc_cfg.update(staged)
-        # Through ``update_config_locked``: it holds the advisory lock on the
-        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
-        # in ANOTHER PROCESS cannot land between our read and our write, and the
-        # staged keys (plus the legacy ``bot_token`` purge) are merged into the
-        # file as re-read inside that lock. Off-loop: file IO, and it may wait on
-        # another holder of the lock.
-        try:
-            await _LockedSectionWrite(
-                path, "discord", staged, drop_keys=("bot_token",) if purge_legacy_token else ()
-            ).commit()
-        except ConfigReadError:
-            return _deny("config.json is corrupt", status=500)
-
-    # Create the configured session folder now, on this user-initiated save,
-    # so the reconcile path never has to write the folder store. Best-effort:
-    # a failure leaves conversations unfiled until the next save.
-    _folder_name = stored_folder_name(dc_cfg.get("session_folder"))
-    if _folder_name:
-        _state = request.app.get("state")
-        if _state is not None:
-            await ensure_channel_folder(
-                _state,
-                "discord",
-                _folder_name,
-                relabel="session_folder" in staged,
-            )
-    if env_updates:
-        # Off-loop: the .env write is blocking file IO (lock, temp write,
-        # owner-only lockdown, replace) and must not block the event loop.
-        await _write_env_off_loop(env_updates)
-        # Keep the live process environment in sync with the new .env state
-        # (load_credentials() lets os.environ win over .env — see the Slack
-        # save handler for the full rationale).
-        for key, new_val in env_updates.items():
-            if new_val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = new_val
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="discord.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied + list(env_updates.keys())),
-    )
-    # The restart hint is answered from the schema: the token is hoisted from the
-    # environment at connect time, so a credential write still needs a restart;
-    # the config fields are applied by the watcher above.
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required(
-                "discord", staged.keys(), env_updates=env_updates
-            ),
-            "verify_warning": verify_warning,
-        }
-    )
-
-
-# ── Telegram configuration API ──
-# The bot token lives in config_dir/.env as TELEGRAM_BOT_TOKEN (0600), with
-# config.json's telegram.bot_token as a legacy fallback. Non-secret config
-# (enabled, allowed_user_ids, soft_threshold_pct) lives in config.json under
-# the "telegram" key. GET returns a masked preview + presence boolean; raw
-# token values are write-only (rotate at @BotFather if ever needed).
+# ── Telegram configuration API: dashboard/messaging_api/telegram_settings.py ──
 
 #: Loose shape check for Telegram bot tokens: "<bot_id>:<secret>" from
 #: @BotFather (e.g. "110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw").
 _TELEGRAM_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]{10,}$")
 
 
-async def _validate_telegram_token(token: str) -> str | None:
-    """Check a pasted bot token against Telegram before it is stored.
-
-    Uses ``getMe`` — the cheapest authenticated Bot API call. Returns ``None``
-    when Telegram accepts the token, or Telegram's error description (e.g.
-    ``Unauthorized``) when it rejects it. Network failures propagate to the
-    caller, which treats them as "unverifiable" rather than invalid — saves
-    must not be blocked by being offline.
-    """
-    import aiohttp  # noqa: F811
-
-    timeout = aiohttp.ClientTimeout(total=_TOKEN_VERIFY_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(f"https://api.telegram.org/bot{token}/getMe") as resp:
-            data = await resp.json(content_type=None)
-            if isinstance(data, dict) and data.get("ok"):
-                return None
-            desc = ""
-            if isinstance(data, dict):
-                desc = str(data.get("description", "") or "")
-            return (desc or "rejected")[:60]
-
-
-async def api_telegram_config_get(request: web.Request) -> web.Response:
-    """GET /api/telegram/config — read Telegram config + masked secret status."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_TELEGRAM_BOT_TOKEN,
-        KiroCrewConfig,
-    )
-
-    cfg = KiroCrewConfig.load()
-    creds = cfg.load_credentials()
-    token = creds.get(CRED_TELEGRAM_BOT_TOKEN, "") or cfg.telegram.bot_token
-    tg = cfg.telegram
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only when the long-polling transport actually started this
-            # session — NOT merely "a token was present at boot".
-            "connected": bool(getattr(state, "telegram_connected", False)),
-            "connect_error": str(getattr(state, "telegram_connect_error", ""))[:120],
-            # allowed_user_ids is part of "configured": the transport fails
-            # closed and rejects every message while the allowlist is empty.
-            "configured": bool(token and tg.enabled and tg.allowed_user_ids),
-            # Remote sessions get a read-only view: config edits (PUT) are
-            # loopback-only, so the UI disables all inputs and hides Save.
-            "read_only": not is_direct_local_request(request),
-            "bot_token_set": bool(token),
-            "bot_token_preview": _mask_secret(token),
-            "enabled": bool(tg.enabled),
-            # Serialized as strings for the tag editor UI; the save path
-            # accepts digit strings and stores canonical ints.
-            "allowed_user_ids": [str(u) for u in tg.allowed_user_ids],
-            "soft_threshold_pct": int(tg.soft_threshold_pct),
-            "show_thinking": bool(tg.show_thinking),
-            "voice_replies": bool(tg.voice_replies),
-            "session_folder": tg.session_folder,
-            # Forum per-topic config. chat_ids are serialized as strings for
-            # the tag editor UI; they are NEGATIVE (e.g. "-1001234567890"),
-            # so the save path accepts a leading minus (not a digits-only check).
-            "allow_forum": bool(tg.allow_forum),
-            "allowed_forum_chat_ids": [str(c) for c in tg.allowed_forum_chat_ids],
-            "forum_activation": tg.forum_activation,
-        }
-    )
-
-
-async def api_telegram_config_save(request: web.Request) -> web.Response:
-    """PUT /api/telegram/config — persist Telegram secret (.env) + config (config.json).
-
-    Every Telegram field is read once at gateway startup (token, enabled flag,
-    allowlist are consumed in the orchestrator's constructor), so any actual
-    change returns ``restart_required`` for the UI hint.
-
-    Serialized with every other config.json writer via the repository-wide
-    ``_get_config_lock()`` (also used by the MCP, memory, and agent
-    handlers) — this handler read-modify-writes the shared ``.env`` /
-    ``config.json`` stores, so interleaving with ANY other config writer
-    (including the Slack save) would silently lose writes.
-    """
-    # circular import: agents imports from dashboard.handlers at module load
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    async with _get_config_lock():
-        # A save is a config.json + credential transaction: a cancelled request
-        # (client gone, gateway shutting down) must not abandon it between its
-        # phases -- see ``run_to_completion``.
-        return await run_to_completion(_telegram_config_save_locked(request))
-
-
-async def _telegram_config_save_locked(request: web.Request) -> web.Response:
-    """Body of the Telegram save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_TELEGRAM_BOT_TOKEN,
-        ConfigReadError,
-        config_path,
-    )
-
-    caller = request.get("user", "dashboard")
-
-    def _deny(msg: str, status: int = 400, *, code: str = "") -> web.Response:
-        """Refuse with *msg*, and with a machine-readable *code* when one is given.
-
-        ``code`` is optional so the existing denials keep their exact bodies, and is
-        added per field as one is retrofitted. It exists because backend-owned
-        strings have no i18n catalog path: the dashboard renders ``error`` verbatim
-        into a localized UI, so prose alone is untranslatable by construction (RFC
-        9457 3.1.3) and a caller reacting to a specific refusal would have to match
-        on that prose. New denials should supply one.
-        """
-        _sel().log_api_access(
-            caller=caller,
-            operation="telegram.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-        payload: dict[str, Any] = {"error": msg}
-        if code:
-            payload["code"] = code
-        return web.json_response(payload, status=status)
-
-    # Remote sessions are read-only: config writes are accepted only from the
-    # machine running the gateway, so a remote or tunneled session (even with
-    # a valid dashboard token) cannot alter Telegram access or plant tokens.
-    if not is_direct_local_request(request):
-        return _deny("read-only from remote sessions (local machine only)", status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid JSON")
-    if not isinstance(body, dict):
-        return _deny("body must be an object")
-
-    # ── Phase 1: validate everything and stage changes. No writes happen until
-    # all validation passes, so a rejected field never leaves partial state. ──
-
-    env_updates: dict[str, str | None] = {}
-    clear_flag = body.get("bot_token_clear")
-    if clear_flag is not None and not isinstance(clear_flag, bool):
-        return _deny("bot_token_clear must be a boolean")
-    if clear_flag is True:
-        env_updates[CRED_TELEGRAM_BOT_TOKEN] = None
-    else:
-        raw = body.get("bot_token")
-        if isinstance(raw, str):
-            tok = raw.strip()
-            if tok.startswith(f"{CRED_TELEGRAM_BOT_TOKEN}="):  # accidental env line
-                tok = tok[len(CRED_TELEGRAM_BOT_TOKEN) + 1 :].strip()
-            if tok:
-                if any(ch.isspace() for ch in tok):
-                    return _deny("bot_token must not contain whitespace")
-                if not _TELEGRAM_TOKEN_RE.match(tok):
-                    return _deny("bot_token must look like <bot_id>:<secret> from @BotFather")
-                env_updates[CRED_TELEGRAM_BOT_TOKEN] = tok
-
-    # Config → config.json under "telegram" (staged, applied only after Phase 1).
-    # Off-loop read: a large or slow config.json must not stall the gateway
-    # event loop (chat, heartbeats). Reading under _get_config_lock() keeps
-    # the snapshot current relative to every other config writer.
-    path = config_path()
-
-    def _read_config() -> dict:
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-
-    try:
-        data = await asyncio.to_thread(_read_config)
-    except Exception:
-        return _deny("config.json is corrupt", status=500)
-    if not isinstance(data.get("telegram"), dict):
-        data["telegram"] = {}
-    tg_cfg = data["telegram"]
-    staged: dict[str, object] = {}
-    applied: list[str] = []
-
-    if "enabled" in body:
-        val = body.get("enabled")
-        if not isinstance(val, bool):
-            return _deny("enabled must be a boolean")
-        if val != bool(tg_cfg.get("enabled", False)):
-            staged["enabled"] = val
-            applied.append("enabled")
-
-    if "allowed_user_ids" in body:
-        raw_ids = body.get("allowed_user_ids")
-        if not isinstance(raw_ids, list):
-            return _deny("allowed_user_ids must be a list")
-        new_ids: list[int] = []
-        for item in raw_ids:
-            s = str(item).strip()
-            if not s:
-                continue
-            if not s.isdigit():
-                return _deny(f"invalid Telegram user ID: {s} (numeric IDs only)")
-            uid = int(s)
-            if uid not in new_ids:
-                new_ids.append(uid)
-        if new_ids != list(tg_cfg.get("allowed_user_ids", [])):
-            staged["allowed_user_ids"] = new_ids
-            applied.append("allowed_user_ids")
-
-    bad_pct = _threshold_pct_rejection(body, "soft_threshold_pct")
-    if bad_pct is not None:
-        return _deny(bad_pct[1], code=bad_pct[0])
-    if "soft_threshold_pct" in body:
-        pct = int(body["soft_threshold_pct"])
-        if pct != int(tg_cfg.get("soft_threshold_pct", 80)):
-            staged["soft_threshold_pct"] = pct
-            applied.append("soft_threshold_pct")
-
-    if "show_thinking" in body:
-        val = body.get("show_thinking")
-        # Strict bool, like every other toggle on this handler: a truthy string
-        # would silently enable a per-turn extra message nobody asked for.
-        if not isinstance(val, bool):
-            return _deny("show_thinking must be a boolean")
-        if val != bool(tg_cfg.get("show_thinking", False)):
-            staged["show_thinking"] = val
-            applied.append("show_thinking")
-
-    if "voice_replies" in body:
-        val = body.get("voice_replies")
-        # Strict bool for the same reason as show_thinking: a truthy string would
-        # silently start uploading synthesized audio, one extra message per turn.
-        if not isinstance(val, bool):
-            return _deny("voice_replies must be a boolean")
-        if val != bool(tg_cfg.get("voice_replies", False)):
-            staged["voice_replies"] = val
-            applied.append("voice_replies")
-
-    if "forum_activation" in body:
-        val = body.get("forum_activation")
-        # Validated against the closed set HERE rather than left to the loader's
-        # degrade-to-always: the loader's fallback exists for a config file edited
-        # by hand, and silently storing an unusable value the operator picked in a
-        # dropdown would report success for a setting that never took effect.
-        if not isinstance(val, str) or val not in TELEGRAM_ACTIVATIONS:
-            return _deny(
-                "forum_activation must be one of " + ", ".join(sorted(TELEGRAM_ACTIVATIONS)),
-                code="invalid_forum_activation",
-            )
-        if val != str(tg_cfg.get("forum_activation", "always") or "always"):
-            staged["forum_activation"] = val
-            applied.append("forum_activation")
-
-    if "session_folder" in body:
-        try:
-            new_folder = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny(str(exc))
-        if new_folder != str(tg_cfg.get("session_folder", "") or ""):
-            staged["session_folder"] = new_folder
-            applied.append("session_folder")
-
-    if "allow_forum" in body:
-        val = body.get("allow_forum")
-        if not isinstance(val, bool):
-            return _deny("allow_forum must be a boolean")
-        if val != bool(tg_cfg.get("allow_forum", False)):
-            staged["allow_forum"] = val
-            applied.append("allow_forum")
-
-    if "allowed_forum_chat_ids" in body:
-        raw_chat_ids = body.get("allowed_forum_chat_ids")
-        if not isinstance(raw_chat_ids, list):
-            return _deny("allowed_forum_chat_ids must be a list")
-        new_chat_ids: list[int] = []
-        for item in raw_chat_ids:
-            s = str(item).strip()
-            if not s:
-                continue
-            # Forum supergroup chat_ids are NEGATIVE (e.g. -1001234567890),
-            # so accept an optional leading minus — the digits-only check used
-            # for allowed_user_ids would wrongly reject every group id here.
-            digits = s[1:] if s.startswith("-") else s
-            if not digits.isdigit():
-                return _deny(f"invalid Telegram chat ID: {s} (integer IDs only)")
-            cid = int(s)
-            if cid not in new_chat_ids:
-                new_chat_ids.append(cid)
-        if new_chat_ids != list(tg_cfg.get("allowed_forum_chat_ids", [])):
-            staged["allowed_forum_chat_ids"] = new_chat_ids
-            applied.append("allowed_forum_chat_ids")
-
-    # Whenever the .env token is set or cleared, also drop the legacy
-    # config.json ``telegram.bot_token`` fallback. The gateway (and GET above)
-    # fall back to that field when .env is empty, so leaving it behind would
-    # resurrect a removed credential on the next restart — an explicit clear
-    # must actually revoke access, and a replacement must not shadow-keep the
-    # old token. Staged here (write happens only in Phase 2).
-    if CRED_TELEGRAM_BOT_TOKEN in env_updates and tg_cfg.get("bot_token"):
-        tg_cfg.pop("bot_token", None)
-        applied.append("legacy_bot_token_removed")
-
-    # ── Phase 1.5: verify a newly pasted token against Telegram before storing.
-    # A token Telegram rejects fails the save right here, where the user can
-    # act on it. Network failure is NOT a rejection: the save proceeds with a
-    # warning so being offline never blocks config.
-    verify_warning = ""
-    pending_tok = env_updates.get(CRED_TELEGRAM_BOT_TOKEN)
-    if pending_tok:
-        try:
-            tg_err = await _validate_telegram_token(pending_tok)
-        except Exception:
-            verify_warning = (
-                "Telegram was unreachable, so the token was saved without verification."
-            )
-        else:
-            if tg_err:
-                return _deny(f"bot_token rejected by Telegram ({tg_err})")
-
-    # ── Phase 2: commit. All validation passed, so writes are safe. Order
-    # matters for crash safety: config.json — which carries the legacy
-    # ``bot_token`` fallback removal — is persisted FIRST, so there is no
-    # failure window in which .env was already cleared but the legacy
-    # fallback survives to silently resurrect the revoked credential on
-    # restart. The inverse failure mode (config written, then a crash before
-    # the .env update) is benign and visible: the .env token remains exactly
-    # as GET reports it, and re-running the save completes the operation. ──
-    # The purge is decided against the document the write lands on, not the
-    # snapshot: whenever this save updates the credential, a legacy ``bot_token``
-    # a concurrent writer landed after our read is dropped too, so the cleared
-    # ``.env`` slot cannot leave a fallback behind. Absent, the drop is a no-op
-    # and the write is skipped.
-    purge_legacy_token = CRED_TELEGRAM_BOT_TOKEN in env_updates
-    if staged or purge_legacy_token:
-        tg_cfg.update(staged)
-        # Through ``update_config_locked``: it holds the advisory lock on the
-        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
-        # in ANOTHER PROCESS cannot land between our read and our write, and the
-        # staged keys (plus the legacy ``bot_token`` purge) are merged into the
-        # file as re-read inside that lock. Off-loop: file IO, and it may wait on
-        # another holder of the lock.
-        try:
-            await _LockedSectionWrite(
-                path, "telegram", staged, drop_keys=("bot_token",) if purge_legacy_token else ()
-            ).commit()
-        except ConfigReadError:
-            return _deny("config.json is corrupt", status=500)
-
-    # Create the configured session folder now, on this user-initiated save,
-    # so the reconcile path never has to write the folder store. Best-effort:
-    # a failure leaves conversations unfiled until the next save.
-    _folder_name = stored_folder_name(tg_cfg.get("session_folder"))
-    if _folder_name:
-        _state = request.app.get("state")
-        if _state is not None:
-            await ensure_channel_folder(
-                _state,
-                "telegram",
-                _folder_name,
-                relabel="session_folder" in staged,
-            )
-    if env_updates:
-        # Off-loop: the .env write is blocking file IO (lock, temp write,
-        # owner-only lockdown, replace) and must not block the event loop.
-        await _write_env_off_loop(env_updates)
-        # Keep the live process environment in sync with the new .env state
-        # (load_credentials() lets os.environ win over .env — see the Slack
-        # save handler for the full rationale).
-        for key, new_val in env_updates.items():
-            if new_val is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = new_val
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="telegram.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied + list(env_updates.keys())),
-    )
-    # All Telegram fields are boot-read: token/enabled/allowlist are consumed
-    # in the orchestrator's constructor and the dispatcher is built at boot.
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required(
-                "telegram", staged.keys(), env_updates=env_updates
-            ),
-            "verify_warning": verify_warning,
-        }
-    )
-
-
-# ── Webex configuration API ──
-# Mirrors the Slack config API above: the bot token lives in config_dir/.env
-# (0600, WEBEX_BOT_TOKEN); non-secret config (enabled, allowed_emails) lives
-# in config.json under the "webex" key. GET returns a masked preview +
-# presence boolean; raw token values are write-only.
-
-
-def _is_valid_webex_email(v: str) -> bool:
-    """Loose email shape check using linear string ops (no regex).
-
-    CodeQL flags ``[^@\\s]+@[^@\\s]+\\.[^@\\s]+`` as polynomially backtracking
-    on adversarial input; exactly-one-``@``, non-empty local part, a dot in
-    the domain (not at its edges), and no whitespace covers the same shape in
-    O(n) without a regex engine.
-    """
-    if not v or len(v) > 254:
-        return False
-    if any(ch.isspace() for ch in v):
-        return False
-    local, sep, domain = v.partition("@")
-    if not sep or not local or "@" in domain:
-        return False
-    return "." in domain[1:-1]
-
+# ── Webex configuration API: dashboard/messaging_api/webex_settings.py ──
 
 #: Seconds to wait for Webex when verifying a pasted token at save time.
 _WEBEX_VERIFY_TIMEOUT = 8
-
-
-async def _validate_webex_token(token: str) -> str | None:
-    """Check a pasted bot token against Webex before it is stored.
-
-    ``GET /people/me`` is the cheapest authenticated call (the same identity
-    call the client makes at connect time). Returns ``None`` when Webex
-    accepts the token, or a short error string when it rejects it (401/403).
-    Network failures propagate to the caller, which treats them as
-    "unverifiable" rather than invalid — saves must not be blocked by being
-    offline. Mirrors ``_validate_slack_token``.
-    """
-    import aiohttp
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(
-            "https://webexapis.com/v1/people/me",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=aiohttp.ClientTimeout(total=_WEBEX_VERIFY_TIMEOUT),
-        ) as resp:
-            if 200 <= resp.status < 300:
-                return None
-            if resp.status in (401, 403):
-                return f"invalid_token (http {resp.status})"
-            # 5xx / 429 are Webex-side trouble, not a bad token.
-            raise RuntimeError(f"webex verify http {resp.status}")
 
 
 async def api_teams_activity(request: web.Request) -> web.Response:
@@ -6294,1023 +2627,9 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     return response
 
 
-async def api_teams_config_get(request: web.Request) -> web.Response:
-    """GET /api/teams/config — read Teams channel status + config summary."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_MICROSOFT_APP_ID,
-        CRED_MICROSOFT_APP_PASSWORD,
-        CRED_MICROSOFT_APP_TENANT_ID,
-        KiroCrewConfig,
-    )
-
-    # Deferred for the same reason as in api_teams_activity: importing the client
-    # probes for the optional PyJWT, which must not happen on the boot path.
-    from kiro_crew.teams.client import HAS_JWT  # noqa: F811
-
-    cfg = KiroCrewConfig.load()
-    creds = cfg.load_credentials()
-    tc = cfg.teams
-    # Credential resolution mirrors the boot path (slack/gateway.py) exactly: the
-    # env credential wins over config.json for all three values, so the panel
-    # reports the identity the channel will actually run as.
-    app_id = creds.get(CRED_MICROSOFT_APP_ID, "") or tc.app_id
-    app_password = creds.get(CRED_MICROSOFT_APP_PASSWORD, "") or tc.app_password
-    tenant_id = creds.get(CRED_MICROSOFT_APP_TENANT_ID, "") or tc.tenant_id
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only once the outbound app credentials validated this
-            # session (kept truthful by TeamsClient.on_state_change).
-            "connected": bool(getattr(state, "teams_connected", False)),
-            "connect_error": str(getattr(state, "teams_connect_error", ""))[:120],
-            "configured": bool(app_id and app_password and tc.enabled and tc.allowed_emails),
-            "read_only": not is_direct_local_request(request),
-            "app_id_set": bool(app_id),
-            # Presence only, deliberately with no masked preview: an Azure client
-            # secret carries no vendor prefix, so the shared prefix-preserving
-            # mask (_mask_secret keeps everything before the first "-") would
-            # reveal real secret bytes rather than a type marker.
-            "app_password_set": bool(app_password),
-            # PyJWT ships in the optional `kirocrew[teams]` extra and the channel
-            # REFUSES to start without it (teams/gateway.py), because inbound JWT
-            # validation is impossible. Reported so an operator sees the reason
-            # instead of a channel that silently never starts.
-            "jwt_available": bool(HAS_JWT),
-            "enabled": tc.enabled,
-            # Non-secret: blank means a multi-tenant bot, a value means
-            # single-tenant. The operator needs it to tell those apart.
-            "tenant_id": tenant_id,
-            "allowed_emails": list(tc.allowed_emails),
-            "soft_threshold_pct": int(tc.soft_threshold_pct),
-            "hard_threshold_pct": int(tc.hard_threshold_pct),
-            "session_folder": tc.session_folder,
-        }
-    )
-
-
-def _is_valid_teams_principal(v: str) -> bool:
-    """Accept an allow-list entry that is either an email/UPN or an AAD object
-    id. Both are non-empty, whitespace-free, and length-bounded; keeping the
-    check shape-only (no regex) mirrors the Webex email helper and lets object
-    ids (GUIDs) through, since Teams activities key on those."""
-    if not v or len(v) > 254:
-        return False
-    return not any(ch.isspace() for ch in v)
-
-
 #: Azure AD OAuth error codes that mean "these credentials are wrong" rather than
 #: "Azure is having trouble". Anything else is treated as unverifiable.
 _TEAMS_CREDENTIAL_REJECT_STATUSES = frozenset({400, 401, 403})
-
-
-async def _validate_teams_app_credentials(
-    app_id: str, app_password: str, tenant_id: str
-) -> str | None:
-    """Check Azure Bot app credentials against Azure AD before they are stored.
-
-    The client-credentials token exchange is the same call ``TeamsClient.connect``
-    makes to prime its outbound token, so it is both the cheapest credential check
-    available and exactly the one the channel performs at boot. Returns ``None``
-    when Azure issues a token, or a short error code (``invalid_client``,
-    ``unauthorized_client``, …) when it refuses the credentials. Azure-side
-    trouble (5xx/429) and network failures propagate to the caller, which treats
-    them as "unverifiable" rather than invalid — saves must not be blocked by
-    being offline. Mirrors ``_validate_webex_token`` / ``_validate_discord_token``.
-
-    Only the OAuth ``error`` code is surfaced, never ``error_description``: the
-    description carries tenant ids, app ids, and a correlation id, none of which
-    belong in a dashboard error string.
-    """
-    import aiohttp  # noqa: F811
-
-    from kiro_crew.teams.client import (  # noqa: F811
-        _TOKEN_SCOPE,
-        _TOKEN_URL_TMPL,
-        TEAMS_MULTITENANT_AUTHORITY,
-    )
-
-    # A blank tenant_id means a multi-tenant bot, whose token is issued by the Bot
-    # Framework authority rather than a directory tenant. The default comes from
-    # teams.client so the pre-store check and the running channel cannot disagree
-    # about which authority a blank tenant means.
-    authority = tenant_id.strip() or TEAMS_MULTITENANT_AUTHORITY
-    timeout = aiohttp.ClientTimeout(total=_TOKEN_VERIFY_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(
-            _TOKEN_URL_TMPL.format(tenant=authority),
-            data={
-                "grant_type": "client_credentials",
-                "client_id": app_id,
-                "client_secret": app_password,
-                "scope": _TOKEN_SCOPE,
-            },
-        ) as resp:
-            if 200 <= resp.status < 300:
-                return None
-            if resp.status in _TEAMS_CREDENTIAL_REJECT_STATUSES:
-                desc = ""
-                try:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, dict):
-                        desc = str(data.get("error", "") or "")
-                except Exception:
-                    pass
-                return (desc or f"HTTP {resp.status}")[:60]
-            raise RuntimeError(f"teams credential verify http {resp.status}")
-
-
-async def api_teams_config_save(request: web.Request) -> web.Response:
-    """PUT /api/teams/config — persist the Teams secret (.env) + config (json).
-
-    The app password (secret) is written ONLY to config_dir/.env
-    (``MICROSOFT_APP_PASSWORD``, 0600); non-secret config (enabled, app_id,
-    tenant_id, allowed_emails, thresholds) lives in config.json under the "teams"
-    key. Remote sessions are read-only. Every field except ``session_folder`` is
-    read at gateway startup, so an actual change returns ``restart_required``.
-    """
-    # A save is a config.json + credential transaction: a cancelled request
-    # (client gone, gateway shutting down) must not abandon it between its
-    # phases -- see ``run_to_completion``.
-    return await run_to_completion(_teams_config_save(request))
-
-
-async def _teams_config_save(request: web.Request) -> web.Response:
-    """Body of the Teams save; runs to completion once started."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_MICROSOFT_APP_ID,
-        CRED_MICROSOFT_APP_PASSWORD,
-        CRED_MICROSOFT_APP_TENANT_ID,
-        ConfigReadError,
-        _threshold_pct,
-        config_path,
-        read_env_file_credential,
-    )
-
-    caller = request.get("user", "dashboard")
-
-    def _audit_denial(msg: str) -> None:
-        _sel().log_api_access(
-            caller=caller,
-            operation="teams.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-
-    def _deny(msg: str, status: int = 400) -> web.Response:
-        _audit_denial(msg)
-        return web.json_response({"error": msg}, status=status)
-
-    def _reject(code: str, msg: str) -> web.Response:
-        """Reject with a machine-readable ``code``; ``msg`` is advisory prose.
-
-        A sibling of ``_deny`` rather than an extra parameter on it: the status is
-        a literal here so the error-code contract gate can see the response, and
-        the dashboard renders ``error`` verbatim into a localized UI, so prose
-        alone would be untranslatable by construction (RFC 9457 3.1.3).
-        """
-        _audit_denial(msg)
-        return web.json_response({"error": msg, "code": code}, status=400)
-
-    # Remote sessions are read-only: a remote/tunneled session cannot alter
-    # channel access or plant the Azure Bot secret.
-    if not is_direct_local_request(request):
-        return _deny("read-only from remote sessions (local machine only)", status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid JSON")
-    if not isinstance(body, dict):
-        return _deny("body must be an object")
-
-    # ── Phase 1: validate + stage (no partial writes). The secret goes to .env
-    # only — never config.json — so the agent-readable config never holds it.
-    env_updates: dict[str, str | None] = {}
-    clear_flag = body.get("app_password_clear")
-    if clear_flag is not None and not isinstance(clear_flag, bool):
-        return _deny("app_password_clear must be a boolean")
-    if clear_flag is True:
-        env_updates[CRED_MICROSOFT_APP_PASSWORD] = None
-    else:
-        raw = body.get("app_password")
-        if isinstance(raw, str):
-            secret = raw.strip()
-            if secret.startswith(f"{CRED_MICROSOFT_APP_PASSWORD}="):
-                secret = secret[len(CRED_MICROSOFT_APP_PASSWORD) + 1 :].strip()
-            if secret:
-                if any(ch.isspace() for ch in secret):
-                    return _deny("app_password must not contain whitespace")
-                env_updates[CRED_MICROSOFT_APP_PASSWORD] = secret
-
-    staged: dict[str, object] = {}
-    if "enabled" in body:
-        val = body.get("enabled")
-        if not isinstance(val, bool):
-            return _deny("enabled must be a boolean")
-        staged["enabled"] = val
-    for str_key in ("app_id", "tenant_id"):
-        if str_key in body:
-            val = body.get(str_key)
-            if not isinstance(val, str):
-                return _deny(f"{str_key} must be a string")
-            v = val.strip()
-            if any(ch.isspace() for ch in v):
-                return _deny(f"{str_key} must not contain whitespace")
-            staged[str_key] = v
-    if "allowed_emails" in body:
-        try:
-            new_ids = _clean_id_list(
-                body.get("allowed_emails"), _is_valid_teams_principal, "principal"
-            )
-        except ValueError as exc:
-            return _deny(str(exc))
-        staged["allowed_emails"] = new_ids
-
-    # Context-window nudge thresholds, on the shared validator.
-    for pct_key in ("soft_threshold_pct", "hard_threshold_pct"):
-        bad_pct = _threshold_pct_rejection(body, pct_key)
-        if bad_pct is not None:
-            return _reject(*bad_pct)
-        if pct_key in body:
-            staged[pct_key] = int(body[pct_key])
-
-    if "session_folder" in body:
-        try:
-            staged["session_folder"] = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny(str(exc))
-
-    # ── Phase 1.5: verify the app credentials against Azure AD before storing.
-    # Runs whenever any part of the credential triple changes: a mistyped App ID
-    # or tenant is as fatal as a bad secret, and all three are checked by the one
-    # token exchange. Rejection fails the save here, where the operator can act on
-    # it, and writes nothing. A network failure is NOT a rejection — the save
-    # proceeds with a warning so being offline never blocks config (mirrors the
-    # Webex and Discord saves).
-    #
-    # The fallbacks come from a config snapshot taken OUTSIDE the config lock and
-    # are advisory only: they decide what to verify, never what to write. The
-    # authoritative read-modify-write is still Phase 2 under the lock. Resolution
-    # order mirrors the boot path (slack/gateway.py) — the env credential wins —
-    # so the check exercises the credentials the channel will actually use.
-    verify_warning = ""
-    #: The exact (app_id, password, tenant) Azure accepted, or None when nothing was
-    #: verified. Re-confirmed under the config lock before anything is written.
-    verified_triple: tuple[str, str, str] | None = None
-    credential_touched = (
-        CRED_MICROSOFT_APP_PASSWORD in env_updates or "app_id" in staged or "tenant_id" in staged
-    )
-    if credential_touched:
-        # Read credentials directly from .env (+ os.environ override) rather
-        # than via KiroCrewConfig.load(), which triggers _load_resolved() ->
-        # cfg.save(), an unconditional migration write-back that purges
-        # teams.app_password from config.json as a side-effect.  That
-        # write-back races Phase 2's write-order invariant (SET: .env first,
-        # then config purge) by clearing the legacy credential before the .env
-        # write has succeeded.  read_env_file_credential touches only the .env
-        # file and never writes config.json.
-        _p15_cfg = config_path()
-        _raw_teams_15: dict = {}
-        try:
-            # Offload read_text + json.loads to a thread so a slow filesystem
-            # cannot stall the async event loop.
-            def _read_config_15() -> dict:
-                return json.loads(_p15_cfg.read_text(encoding="utf-8")) if _p15_cfg.exists() else {}
-
-            _rd15 = await asyncio.to_thread(_read_config_15)
-            # Guard against a malformed config.json where "teams" is not a dict
-            # (e.g. someone hand-edited it to a list).  .get() on a list raises
-            # AttributeError; the isinstance check degrades gracefully.
-            _t15 = _rd15.get("teams")
-            _raw_teams_15 = _t15 if isinstance(_t15, dict) else {}
-        except Exception:
-            pass
-        _c_pw = await asyncio.to_thread(read_env_file_credential, CRED_MICROSOFT_APP_PASSWORD)
-        _c_app_id = await asyncio.to_thread(read_env_file_credential, CRED_MICROSOFT_APP_ID)
-        _c_tenant = await asyncio.to_thread(read_env_file_credential, CRED_MICROSOFT_APP_TENANT_ID)
-        # ENV-first, matching load_credentials() semantics: os.environ overrides
-        # the .env file.  A pending in-flight update still wins as
-        # the outermost layer (see env_updates.get() below).
-        _c_pw = os.environ.get(CRED_MICROSOFT_APP_PASSWORD, "") or _c_pw
-        _c_app_id = os.environ.get(CRED_MICROSOFT_APP_ID, "") or _c_app_id
-        _c_tenant = os.environ.get(CRED_MICROSOFT_APP_TENANT_ID, "") or _c_tenant
-        # ENV-first: env_updates wins, then .env/os.environ (_c_pw).  When the
-        # password lives ONLY in legacy config.json (not in .env or os.environ,
-        # so _c_pw is empty), fall back to the raw legacy value so verification
-        # and Phase-2's purge-write see the existing credential and preserve it.
-        _c_pw_effective = _c_pw or _raw_teams_15.get("app_password", "")
-        eff_password = env_updates.get(CRED_MICROSOFT_APP_PASSWORD, _c_pw_effective)
-        eff_app_id = _c_app_id or str(staged.get("app_id", _raw_teams_15.get("app_id", "")))
-        eff_tenant = _c_tenant or str(staged.get("tenant_id", _raw_teams_15.get("tenant_id", "")))
-        # Nothing to verify while half the pair is missing (e.g. the operator is
-        # clearing the secret, or is filling the form in two saves).
-        if eff_app_id and eff_password:
-            try:
-                teams_err = await _validate_teams_app_credentials(
-                    eff_app_id, eff_password, eff_tenant
-                )
-            except Exception:
-                verify_warning = (
-                    "Azure was unreachable, so the credentials were saved " "without verification."
-                )
-            else:
-                if teams_err:
-                    return _reject(
-                        "credentials_rejected",
-                        f"credentials rejected by Azure ({teams_err})",
-                    )
-                verified_triple = (eff_app_id, eff_password, eff_tenant)
-
-    # ── Phase 2: commit under the repo-wide config lock (read fresh, merge only
-    # the teams section, write atomic) so a concurrent save is never clobbered.
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    applied: list[str] = []
-    async with _get_config_lock():
-        path = config_path()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
-            return _deny("config.json is corrupt", status=500)
-        if not isinstance(data.get("teams"), dict):
-            data["teams"] = {}
-        teams_cfg = data["teams"]
-
-        _f_app_id: str | None = ""
-        _f_tenant: str | None = ""
-        now_password: str | None = ""
-        if verified_triple is not None:
-            # Re-derive the effective triple under the lock and refuse if what is about
-            # to be STORED is not what Azure accepted. Optimistic, deliberately: the
-            # verification is a network round trip and the config lock serializes EVERY
-            # writer in the process, so holding it across that call would stall unrelated
-            # saves and a hung endpoint would wedge them until the timeout. Verifying
-            # outside and confirming inside costs one extra .env read and keeps the
-            # invariant that nothing unverified is stored.
-            #
-            # The race it closes: two concurrent saves, one changing the app id and one
-            # the secret. Each verifies a triple containing the OTHER's old value and
-            # passes; the serialized commits then merge into a stored triple neither one
-            # checked, and the channel is dead at the next restart with a green "Saved."
-            # Read credentials directly from .env (same rationale as Phase 1.5:
-            # avoid KiroCrewConfig.load() which would trigger migration write-back).
-            _f_pw = await asyncio.to_thread(read_env_file_credential, CRED_MICROSOFT_APP_PASSWORD)
-            _f_app_id = await asyncio.to_thread(read_env_file_credential, CRED_MICROSOFT_APP_ID)
-            _f_tenant = await asyncio.to_thread(
-                read_env_file_credential, CRED_MICROSOFT_APP_TENANT_ID
-            )
-            # ENV-first, matching load_credentials() semantics.
-            _f_pw = os.environ.get(CRED_MICROSOFT_APP_PASSWORD, "") or _f_pw
-            _f_app_id = os.environ.get(CRED_MICROSOFT_APP_ID, "") or _f_app_id
-            _f_tenant = os.environ.get(CRED_MICROSOFT_APP_TENANT_ID, "") or _f_tenant
-            now_password = env_updates.get(
-                CRED_MICROSOFT_APP_PASSWORD,
-                _f_pw or str(teams_cfg.get("app_password", "")),
-            )
-            now_app_id = _f_app_id or str(staged.get("app_id", teams_cfg.get("app_id", "")))
-            now_tenant = _f_tenant or str(staged.get("tenant_id", teams_cfg.get("tenant_id", "")))
-            if (now_app_id, now_password, now_tenant) != verified_triple:
-                return _reject(
-                    "config_changed",
-                    "the Teams credentials changed while these were being verified; "
-                    "nothing was saved — reload and try again",
-                )
-            # The same comparison runs once more INSIDE the sidecar lock, against
-            # the merged section (``_finalize_teams`` below): the snapshot this
-            # block read cannot see an ``app_id`` / ``tenant_id`` another PROCESS
-            # lands before the write, and the .env-first fallback here would let
-            # that value be stored under the verified password.
-
-        # Threshold ordering is checked against the EFFECTIVE pair (the staged
-        # value, else what is stored, else the shipped default), because a request
-        # may send only one half. Still commit-last: nothing is written yet.
-        # Stored values go through the loader's own coercion so a hand-edited
-        # config.json is read here exactly as the next load will read it.
-        eff_soft = _threshold_pct(
-            staged.get("soft_threshold_pct", teams_cfg.get("soft_threshold_pct")), 80
-        )
-        eff_hard = _threshold_pct(
-            staged.get("hard_threshold_pct", teams_cfg.get("hard_threshold_pct")), 95
-        )
-        if eff_hard < eff_soft:
-            # The loader would silently pull soft down to hard
-            # (_normalize_threshold_pair), so an inverted pair is not a crash but
-            # is never what the operator meant: the soft nudge would be
-            # unreachable. Refuse it here instead of storing a value that reads
-            # back different.
-            return _reject(
-                "threshold_pct_inverted",
-                "hard_threshold_pct must be >= soft_threshold_pct",
-            )
-
-        changes: dict[str, object] = {}
-        if "enabled" in staged and staged["enabled"] != bool(teams_cfg.get("enabled", False)):
-            changes["enabled"] = staged["enabled"]
-        for str_key in ("app_id", "tenant_id"):
-            if str_key in staged and staged[str_key] != teams_cfg.get(str_key, ""):
-                changes[str_key] = staged[str_key]
-        for pct_key, pct_default in (("soft_threshold_pct", 80), ("hard_threshold_pct", 95)):
-            if pct_key in staged and staged[pct_key] != _threshold_pct(
-                teams_cfg.get(pct_key), pct_default
-            ):
-                changes[pct_key] = staged[pct_key]
-        if "allowed_emails" in staged and staged["allowed_emails"] != teams_cfg.get(
-            "allowed_emails", []
-        ):
-            changes["allowed_emails"] = staged["allowed_emails"]
-        if "session_folder" in staged and staged["session_folder"] != str(
-            teams_cfg.get("session_folder", "") or ""
-        ):
-            changes["session_folder"] = staged["session_folder"]
-        applied = list(changes.keys())
-        # The secret is env-only; if a legacy plaintext app_password ever landed
-        # in config.json, purge it when the credential is safely held elsewhere:
-        # either it is being written to .env in this same save, or it already
-        # exists in .env / os.environ (so purging the config copy is safe).
-        # Do NOT purge when the password lives ONLY in legacy config.json (no .env
-        # entry, no env_update) — that would erase the sole credential copy and
-        # produce a dead pair at the next restart.
-        # _c_pw is only populated inside ``if credential_touched`` (Phase 1.5).
-        # For metadata-only saves (credential_touched=False) fall back to a
-        # synchronous os.environ check — load_credentials() seeds os.environ from
-        # .env at startup, so the key is present when .env holds the credential.
-        _pw_in_env_or_environ = locals().get("_c_pw") or os.environ.get(
-            CRED_MICROSOFT_APP_PASSWORD, ""
-        )
-        _pw_safe_in_env = bool(
-            CRED_MICROSOFT_APP_PASSWORD in env_updates  # being written this save
-            or _pw_in_env_or_environ  # already in .env / os.environ
-        )
-        if teams_cfg.get("app_password") and _pw_safe_in_env:
-            applied.append("app_password_purged")
-        # Blanked against the document the write lands on (see
-        # ``_LockedSectionWrite``): a legacy copy a concurrent writer landed after
-        # the snapshot is purged too, whenever the credential is safely in .env.
-        blank_keys = ("app_password",) if _pw_safe_in_env else ()
-
-        # Through ``update_config_locked``: it holds the advisory lock on the
-        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
-        # in ANOTHER PROCESS cannot land between our read and our write, and the
-        # changes are merged into the file as re-read inside that lock. The same
-        # object undoes exactly those keys if the .env write below fails.
-        def _finalize_teams(section: dict) -> None:
-            # Both rules re-decided against the document the write lands on: a
-            # concurrent writer may have moved a counterpart threshold or the
-            # app id / tenant since the snapshot was taken, and a pair that is
-            # inverted -- or a credential tuple Azure never saw -- only in the
-            # merged result would otherwise be stored.
-            if verified_triple is not None:
-                fresh_app_id = _f_app_id or str(section.get("app_id", ""))
-                fresh_tenant = _f_tenant or str(section.get("tenant_id", ""))
-                if (fresh_app_id, now_password, fresh_tenant) != verified_triple:
-                    raise _CredentialTupleChanged()
-            if _threshold_pct(section.get("hard_threshold_pct"), 95) < _threshold_pct(
-                section.get("soft_threshold_pct"), 80
-            ):
-                raise _ThresholdPairInverted()
-
-        _cfg_write = _LockedSectionWrite(
-            path, "teams", changes, blank_keys=blank_keys, finalize=_finalize_teams
-        )
-        # Hold the live-config watcher for the whole config+credential transaction:
-        # the two files commit separately and a failed .env write rolls the config
-        # back, so nothing between here and the end of the block may be applied to
-        # the running gateway. The release wakes the watcher on the committed state.
-        with live.hold():
-            if changes or blank_keys:
-                teams_cfg.update(changes)
-                # Off-loop: file IO, and it may wait on another holder of the lock.
-                try:
-                    await _cfg_write.commit()
-                except ConfigReadError:
-                    return _deny("config.json is corrupt", status=500)
-                except _ThresholdPairInverted:
-                    return _reject(
-                        "threshold_pct_inverted",
-                        "hard_threshold_pct must be >= soft_threshold_pct",
-                    )
-                except _CredentialTupleChanged:
-                    return _reject(
-                        "config_changed",
-                        "the Teams credentials changed while these were being verified; "
-                        "nothing was saved — reload and try again",
-                    )
-
-            # Create the configured session folder now, on this user-initiated save,
-            # so the reconcile path never has to write the folder store. Best-effort:
-            # a failure leaves conversations unfiled until the next save.
-            _folder_name = stored_folder_name(teams_cfg.get("session_folder"))
-            if _folder_name:
-                _state = request.app.get("state")
-                if _state is not None:
-                    await ensure_channel_folder(
-                        _state,
-                        "teams",
-                        _folder_name,
-                        relabel="session_folder" in changes,
-                    )
-            if env_updates:
-                # Off-loop: the .env write is blocking file IO (lock, temp write,
-                # owner-only lockdown, replace) that would stall the gateway loop
-                # if run inline.
-                #
-                # Cancellation guard: _write_env_off_loop shields + drains its
-                # worker, so a CancelledError from it means the .env write has
-                # already finished (either succeeded or failed). Roll config back
-                # ONLY when the write actually failed; if it succeeded, the pair
-                # is consistent and rolling back would create a mismatch.
-                _env_write_task: asyncio.Task[None] = asyncio.ensure_future(
-                    _write_env_off_loop(env_updates)
-                )
-                try:
-                    await asyncio.shield(_env_write_task)
-                except asyncio.CancelledError:
-                    # Drain to completion WITHOUT propagating, so we can inspect the
-                    # outcome and roll back before re-raising (a second shield() would
-                    # re-raise CancelledError before the rollback ran).
-                    await asyncio.gather(_env_write_task, return_exceptions=True)
-                    _env_exc = (
-                        _env_write_task.exception() if not _env_write_task.cancelled() else None
-                    )
-                    if _env_exc is not None:
-                        # .env write failed — roll config back for consistency.
-                        if changes or blank_keys:
-                            await _cfg_write.rollback("Teams")
-                    raise
-                except BaseException:
-                    # Genuine .env write failure — roll the config metadata back so
-                    # a failed write cannot leave the NEW metadata paired with the
-                    # OLD credential on disk.
-                    if changes or blank_keys:
-                        await _cfg_write.rollback("Teams")
-                    raise
-                for key, new_val in env_updates.items():
-                    if new_val is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = new_val
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="teams.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied + list(env_updates.keys())),
-    )
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required("teams", applied, env_updates=env_updates),
-            "verify_warning": verify_warning,
-        }
-    )
-
-
-async def api_webex_config_get(request: web.Request) -> web.Response:
-    """GET /api/webex/config — read Webex config + masked secret status."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_WEBEX_BOT_TOKEN,
-        KiroCrewConfig,
-    )
-
-    cfg = KiroCrewConfig.load()
-    creds = cfg.load_credentials()
-    token = creds.get(CRED_WEBEX_BOT_TOKEN, "") or cfg.webex.bot_token
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only while the device WebSocket is actually connected +
-            # authorized this session — NOT merely "a token was present at
-            # boot" or "the transport registered". Kept truthful by the
-            # client's on_state_change observer (see maybe_start_webex).
-            "connected": bool(getattr(state, "webex_connected", False)),
-            # Short reason from the most recent connection failure ("" when
-            # connected / untried).
-            "connect_error": str(getattr(state, "webex_connect_error", ""))[:120],
-            "configured": bool(token and cfg.webex.enabled and cfg.webex.allowed_emails),
-            # Remote sessions get a read-only view: config edits (PUT) are
-            # loopback-only, so the UI disables all inputs and hides Save.
-            "read_only": not is_direct_local_request(request),
-            "bot_token_set": bool(token),
-            "bot_token_preview": _mask_secret(token),
-            "enabled": cfg.webex.enabled,
-            "allowed_emails": list(cfg.webex.allowed_emails),
-            "allow_group_rooms": bool(cfg.webex.allow_group_rooms),
-            "allowed_room_ids": list(cfg.webex.allowed_room_ids),
-            "reply_in_thread": bool(cfg.webex.reply_in_thread),
-            "soft_threshold_pct": int(cfg.webex.soft_threshold_pct),
-            "hard_threshold_pct": int(cfg.webex.hard_threshold_pct),
-            "session_folder": cfg.webex.session_folder,
-        }
-    )
-
-
-async def api_webex_config_save(request: web.Request) -> web.Response:
-    """PUT /api/webex/config — persist the Webex token (.env) + config (config.json).
-
-    The whole Webex channel config is read at gateway startup, so every
-    change returns ``restart_required`` for the UI hint.
-    """
-    # A save is a config.json + credential transaction: a cancelled request
-    # (client gone, gateway shutting down) must not abandon it between its
-    # phases -- see ``run_to_completion``.
-    return await run_to_completion(_webex_config_save(request))
-
-
-async def _webex_config_save(request: web.Request) -> web.Response:
-    """Body of the Webex save; runs to completion once started."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_WEBEX_BOT_TOKEN,
-        ConfigReadError,
-        WebexConfig,
-        _normalize_threshold_pair,
-        _threshold_pct,
-        config_path,
-    )
-
-    caller = request.get("user", "dashboard")
-
-    def _deny(msg: str, status: int = 400) -> web.Response:
-        _sel().log_api_access(
-            caller=caller,
-            operation="webex.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-        return web.json_response({"error": msg}, status=status)
-
-    # Remote sessions are read-only (same gate as the Slack config API): a
-    # remote or tunneled session cannot alter channel access or plant tokens.
-    if not is_direct_local_request(request):
-        return _deny("read-only from remote sessions (local machine only)", status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid JSON")
-    if not isinstance(body, dict):
-        return _deny("body must be an object")
-
-    # ── Phase 1: validate everything and stage changes (no partial writes). ──
-    env_updates: dict[str, str | None] = {}
-    clear_flag = body.get("bot_token_clear")
-    if clear_flag is not None and not isinstance(clear_flag, bool):
-        return _deny("bot_token_clear must be a boolean")
-    if clear_flag is True:
-        env_updates[CRED_WEBEX_BOT_TOKEN] = None
-    else:
-        raw = body.get("bot_token")
-        if isinstance(raw, str):
-            tok = raw.strip()
-            if tok.startswith(f"{CRED_WEBEX_BOT_TOKEN}="):  # accidentally pasted env line
-                tok = tok[len(CRED_WEBEX_BOT_TOKEN) + 1 :].strip()
-            if tok:
-                if any(ch.isspace() for ch in tok):
-                    return _deny("bot_token must not contain whitespace")
-                env_updates[CRED_WEBEX_BOT_TOKEN] = tok
-
-    # ── Phase 1 (continued): validate the config fields from the request
-    # alone — the current config.json is NOT read here. The authoritative
-    # read-modify-write happens entirely under the config lock in Phase 2,
-    # so a concurrent save by another handler can never be clobbered by a
-    # stale full-file snapshot.
-    staged: dict[str, object] = {}
-
-    if "enabled" in body:
-        val = body.get("enabled")
-        if not isinstance(val, bool):
-            return _deny("enabled must be a boolean")
-        staged["enabled"] = val
-
-    if "allowed_emails" in body:
-        try:
-            new_emails = _clean_id_list(body.get("allowed_emails"), _is_valid_webex_email, "email")
-        except ValueError as exc:
-            return _deny(str(exc))
-        staged["allowed_emails"] = new_emails
-
-    for flag in ("allow_group_rooms", "reply_in_thread"):
-        if flag in body:
-            val = body.get(flag)
-            if not isinstance(val, bool):
-                return _deny(f"{flag} must be a boolean")
-            staged[flag] = val
-
-    if "allowed_room_ids" in body:
-        rooms = body.get("allowed_room_ids")
-        if not isinstance(rooms, list) or not all(isinstance(r, str) for r in rooms):
-            return _deny("allowed_room_ids must be a list of strings")
-        # De-duplicated, order preserved, blanks dropped. Not otherwise validated:
-        # a Webex room id is an opaque base64 blob whose shape is the platform's to
-        # define, and a format guess here would reject a legitimate id from a
-        # cluster this code has never seen.
-        seen: set[str] = set()
-        cleaned: list[str] = []
-        for raw in rooms:
-            room = raw.strip()
-            if room and room not in seen:
-                seen.add(room)
-                cleaned.append(room)
-        staged["allowed_room_ids"] = cleaned
-
-    # Range-validated here; CLAMPED in Phase 2, where the locked fresh read
-    # supplies the counterpart. Reading the config here instead would be both a
-    # torn read and a side-effecting one: ``KiroCrewConfig.load()`` normalizes and
-    # writes the file back, which materializes every default into config.json and
-    # makes the next no-op save report a change.
-    for name in ("soft_threshold_pct", "hard_threshold_pct"):
-        if name in body:
-            pct = body.get(name)
-            if not isinstance(pct, int) or isinstance(pct, bool) or not (1 <= pct <= 100):
-                return _deny(f"{name} must be an integer between 1 and 100")
-            staged[name] = pct
-
-    if "session_folder" in body:
-        try:
-            staged["session_folder"] = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny(str(exc))
-
-    # ── Phase 1.5: verify a newly pasted token against Webex before storing.
-    # Network failure is NOT a rejection: the save proceeds with a warning so
-    # being offline never blocks config. Mirrors the Slack token verification.
-    verify_warning = ""
-    pending_tok = env_updates.get(CRED_WEBEX_BOT_TOKEN)
-    if pending_tok:
-        try:
-            webex_err = await _validate_webex_token(pending_tok)
-        except Exception:
-            verify_warning = "Webex was unreachable, so the token was saved without verification."
-        else:
-            if webex_err:
-                return _deny(f"bot_token rejected by Webex ({webex_err})")
-
-    # ── Phase 2: commit. All validation passed, so writes are safe. The
-    # read-modify-write of config.json happens ENTIRELY under the repo-wide
-    # config lock (read fresh, merge only the webex section, write atomic),
-    # so a concurrent save by another settings handler is never overwritten
-    # by a stale snapshot taken before the lock.
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    applied: list[str] = []
-    async with _get_config_lock():
-        path = config_path()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
-            return _deny("config.json is corrupt", status=500)
-        if not isinstance(data.get("webex"), dict):
-            data["webex"] = {}
-        webex_cfg = data["webex"]
-
-        # Reduce staged fields to actual changes against the fresh read so
-        # restart_required stays truthful on no-op saves.
-        #
-        # Generic over ``staged`` rather than one branch per field. A hand-written
-        # branch list silently DROPS any field added to Phase 1 without a matching
-        # branch here — the whole write is ``webex_cfg.update(changes)``, so a
-        # missing branch means the value validates, reports success, and is never
-        # persisted. The dataclass supplies each field's default, so the
-        # comparison is against the same value a fresh config would read.
-        defaults = WebexConfig()
-        # Clamp the thresholds as a PAIR through the same helper the config
-        # dataclass uses, so a soft value above the hard one cannot make the soft
-        # nudge unreachable -- ``_maybe_notice`` tests ``pct >= hard`` first. Done
-        # here because clamping needs the counterpart, and only this fresh read
-        # under the config lock has an untorn view of it.
-        if "soft_threshold_pct" in staged or "hard_threshold_pct" in staged:
-
-            def _pct(name: str) -> int:
-                """This request's value for *name*, or the STORED counterpart.
-
-                The stored side is coerced defensively: ``config.json`` is a file
-                an operator can hand-edit, so a non-numeric counterpart would make
-                saving the OTHER threshold raise out of the handler as a 500 and
-                persist nothing — a value this request never mentioned breaking a
-                value it did. A malformed stored number falls back to the dataclass
-                default, which is the same thing the loader does with it.
-                """
-                if name in staged:
-                    return int(cast(int, staged[name]))
-                try:
-                    return int(webex_cfg.get(name, getattr(defaults, name)))
-                except (TypeError, ValueError):
-                    return int(getattr(defaults, name))
-
-            soft, hard = _normalize_threshold_pair(
-                _pct("soft_threshold_pct"), _pct("hard_threshold_pct")
-            )
-            if "soft_threshold_pct" in staged:
-                staged["soft_threshold_pct"] = soft
-            if "hard_threshold_pct" in staged:
-                staged["hard_threshold_pct"] = hard
-
-        changes: dict[str, object] = {}
-        for key, value in staged.items():
-            stored = webex_cfg.get(key, getattr(defaults, key, None))
-            if value != _coerce_like(value, stored):
-                changes[key] = value
-        applied = list(changes.keys())
-        # Any token set/clear also purges the legacy config.json
-        # ``webex.bot_token`` fallback so a stale plaintext copy can't shadow
-        # (or outlive) the .env credential. The config write commits BEFORE
-        # the .env write — if we crash between the two, the legacy copy is
-        # already gone rather than resurrected.
-        if CRED_WEBEX_BOT_TOKEN in env_updates and webex_cfg.get("bot_token"):
-            applied.append("bot_token_purged")
-        # Blanked against the document the write lands on (see
-        # ``_LockedSectionWrite``): a legacy copy a concurrent writer landed after
-        # the snapshot is purged too, whenever this save updates the credential.
-        blank_keys = ("bot_token",) if CRED_WEBEX_BOT_TOKEN in env_updates else ()
-
-        # Through ``update_config_locked``: it holds the advisory lock on the
-        # sidecar ``<path>.lock`` across the whole read-modify-write, so a writer
-        # in ANOTHER PROCESS cannot land between our read and our write, and the
-        # changes are merged into the file as re-read inside that lock. The same
-        # object undoes exactly those keys if the .env write below fails.
-        def _normalize_pair(section: dict) -> None:
-            # The pair was normalized against the snapshot above; a concurrent
-            # writer may have moved the counterpart since, so normalize once more
-            # against the merged section -- exactly what the loader does on read,
-            # so the file stores the pair the runtime will use.
-            if "soft_threshold_pct" in changes or "hard_threshold_pct" in changes:
-                soft, hard = _normalize_threshold_pair(
-                    _threshold_pct(section.get("soft_threshold_pct"), defaults.soft_threshold_pct),
-                    _threshold_pct(section.get("hard_threshold_pct"), defaults.hard_threshold_pct),
-                )
-                section["soft_threshold_pct"] = soft
-                section["hard_threshold_pct"] = hard
-
-        _cfg_write = _LockedSectionWrite(
-            path, "webex", changes, blank_keys=blank_keys, finalize=_normalize_pair
-        )
-        # Hold the live-config watcher for the whole config+credential transaction:
-        # the two files commit separately and a failed .env write rolls the config
-        # back, so nothing between here and the end of the block may be applied to
-        # the running gateway. The release wakes the watcher on the committed state.
-        with live.hold():
-            if changes or blank_keys:
-                webex_cfg.update(changes)
-                # Off-loop: file IO, and it may wait on another holder of the lock.
-                try:
-                    await _cfg_write.commit()
-                except ConfigReadError:
-                    return _deny("config.json is corrupt", status=500)
-
-            # Create the configured session folder now, on this user-initiated save,
-            # so the reconcile path never has to write the folder store. Best-effort:
-            # a failure leaves conversations unfiled until the next save.
-            _folder_name = stored_folder_name(webex_cfg.get("session_folder"))
-            if _folder_name:
-                _state = request.app.get("state")
-                if _state is not None:
-                    await ensure_channel_folder(
-                        _state,
-                        "webex",
-                        _folder_name,
-                        relabel="session_folder" in changes,
-                    )
-            if env_updates:
-                # Off-loop: the .env write is blocking file IO (lock, temp write,
-                # owner-only lockdown, replace) and must not block the event loop.
-                #
-                # Cancellation guard: see Teams save for the full rationale. Only
-                # roll config back when the .env write actually failed, not when
-                # cancellation arrived after the write already committed.
-                _env_write_task_wx: asyncio.Task[None] = asyncio.ensure_future(
-                    _write_env_off_loop(env_updates)
-                )
-                try:
-                    await asyncio.shield(_env_write_task_wx)
-                except asyncio.CancelledError:
-                    await asyncio.gather(_env_write_task_wx, return_exceptions=True)
-                    _env_exc_wx = (
-                        _env_write_task_wx.exception()
-                        if not _env_write_task_wx.cancelled()
-                        else None
-                    )
-                    if _env_exc_wx is not None:
-                        if changes or blank_keys:
-                            await _cfg_write.rollback("Webex")
-                    raise
-                except BaseException:
-                    # Roll config back so a failed .env write cannot leave the
-                    # NEW metadata paired with the OLD token on disk.
-                    if changes or blank_keys:
-                        await _cfg_write.rollback("Webex")
-                    raise
-                # Keep the live process environment in sync (see the Slack save path).
-                for key, new_val in env_updates.items():
-                    if new_val is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = new_val
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="webex.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied + list(env_updates.keys())),
-    )
-    # The entire Webex channel config is read once at gateway startup.
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required("webex", applied, env_updates=env_updates),
-            "verify_warning": verify_warning,
-        }
-    )
-
-
-# ── iMessage configuration API ──
-# The only channel with NO credential to manage: the transport is the operator's
-# own signed-in Messages.app, reached through a local bridge process, so there is
-# nothing to mask, verify against a vendor, or write to .env. Everything lives in
-# config.json under the "imessage" key, and the whole section is read once at
-# gateway startup (only session_folder reloads live).
-
-
-def _is_valid_imessage_handle(v: str) -> bool:
-    """Accept an Apple ID email or a phone-shaped handle.
-
-    Linear string ops, no regex: the same polynomial-backtracking concern that
-    shaped ``_is_valid_webex_email`` applies to any pattern run over an
-    operator-supplied list.
-
-    A phone handle may carry the punctuation people actually type, spaces
-    included -- ``normalize_handle`` strips it before any comparison, so
-    rejecting ``+1 (555) 123-4567`` here would refuse a handle the transport
-    treats as identical to the digits-only form.
-    """
-    if not v or len(v) > 254:
-        return False
-    if "@" in v:
-        return _is_valid_webex_email(v)
-    body = v[1:] if v.startswith("+") else v
-    digits = [ch for ch in body if ch.isdigit()]
-    # Anything outside digits and dialling punctuation is rejected, so a stray
-    # identifier cannot be smuggled in as a "phone" and silently authorized.
-    if any(not (ch.isdigit() or ch in "()-. ") for ch in body):
-        return False
-    return 4 <= len(digits) <= 18
-
-
-def _clean_imessage_path(raw: object, label: str) -> str:
-    """Validate an operator-supplied filesystem path for the bridge.
-
-    The value becomes ``argv[0]`` (or a ``--db-path`` argument) of a spawned
-    child. It is passed to ``create_subprocess_exec``, never a shell, so quoting
-    is not the risk -- but a newline or NUL would corrupt the argv and is
-    rejected rather than silently truncated.
-    """
-    if raw is None:
-        return ""
-    if not isinstance(raw, str):
-        raise ValueError(f"{label} must be a string")
-    value = raw.strip()
-    if any(ch in value for ch in ("\n", "\r", "\x00")):
-        raise ValueError(f"{label} must not contain line breaks")
-    if len(value) > 4096:
-        raise ValueError(f"{label} is too long")
-    return value
-
-
-async def api_imessage_config_get(request: web.Request) -> web.Response:
-    """GET /api/imessage/config — read the iMessage channel config."""
-    cfg = KiroCrewConfig.load()
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only while the bridge's watch is actually live this session —
-            # NOT merely "enabled in config". Kept truthful by the client's
-            # on_state_change observer (see maybe_start_imessage).
-            "connected": bool(getattr(state, "imessage_connected", False)),
-            "connect_error": str(getattr(state, "imessage_connect_error", ""))[:120],
-            "configured": bool(cfg.imessage.enabled and cfg.imessage.allowed_handles),
-            # The UI explains the macOS-only requirement instead of leaving the
-            # operator to infer it from a channel that silently never connects.
-            "supported": bool(IS_MACOS),
-            # Remote sessions get a read-only view: config edits (PUT) are
-            # loopback-only, so the UI disables all inputs and hides Save.
-            "read_only": not is_direct_local_request(request),
-            "enabled": cfg.imessage.enabled,
-            # No bridge path is exposed: the executable is resolved in code,
-            # never from agent-writable config. See imessage.bridge_path.
-            "db_path": cfg.imessage.db_path,
-            "allowed_handles": list(cfg.imessage.allowed_handles),
-            "service": cfg.imessage.service,
-            "session_folder": cfg.imessage.session_folder,
-        }
-    )
 
 
 async def api_imessage_config_save(request: web.Request) -> web.Response:
@@ -7319,562 +2638,6 @@ async def api_imessage_config_save(request: web.Request) -> web.Response:
     # (client gone, gateway shutting down) must not abandon it between its
     # phases -- see ``run_to_completion``.
     return await run_to_completion(_imessage_config_save(request))
-
-
-async def _imessage_config_save(request: web.Request) -> web.Response:
-    """Body of the iMessage save; runs to completion once started."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        ConfigReadError,
-        update_config_locked,
-    )
-
-    caller = request.get("user", "dashboard")
-
-    def _audit_denial(msg: str) -> None:
-        _sel().log_api_access(
-            caller=caller,
-            operation="imessage.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-
-    def _deny(code: str, msg: str) -> web.Response:
-        """Reject a bad request. ``code`` is the contract, ``msg`` is advisory.
-
-        The status is a literal rather than a parameter so this lands in the
-        error-code gate's CHECKED bucket: a computed status puts a response in
-        the unverifiable ``dynamic_status`` escape hatch, which the gate caps
-        precisely because hoisting a status out of view looks like refactoring.
-        The dashboard renders ``error`` verbatim into a localized UI, so prose
-        alone would be untranslatable by construction (RFC 9457 3.1.3).
-        """
-        _audit_denial(msg)
-        return web.json_response({"error": msg, "code": code}, status=400)
-
-    # Remote sessions are read-only (same gate as every other channel config
-    # API): a remote or tunneled session cannot widen who may reach the agent.
-    if not is_direct_local_request(request):
-        message = "read-only from remote sessions (local machine only)"
-        _audit_denial(message)
-        return web.json_response({"error": message, "code": "remote_read_only"}, status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid_json", "invalid JSON")
-    if not isinstance(body, dict):
-        return _deny("body_not_object", "body must be an object")
-
-    # ── Phase 1: validate everything and stage changes (no partial writes).
-    # The current config.json is NOT read here; the authoritative
-    # read-modify-write happens entirely under the config lock in Phase 2.
-    staged: dict[str, object] = {}
-
-    if "enabled" in body:
-        val = body.get("enabled")
-        if not isinstance(val, bool):
-            return _deny("enabled_not_bool", "enabled must be a boolean")
-        staged["enabled"] = val
-
-    if "allowed_handles" in body:
-        try:
-            staged["allowed_handles"] = _clean_id_list(
-                body.get("allowed_handles"), _is_valid_imessage_handle, "handle"
-            )
-        except ValueError as exc:
-            return _deny("invalid_handle", str(exc))
-
-    if "service" in body:
-        val = body.get("service")
-        if not isinstance(val, str) or val.strip().lower() not in IMESSAGE_SERVICES:
-            return _deny("invalid_service", "service must be one of: imessage, sms, auto")
-        staged["service"] = val.strip().lower()
-
-    for key in ("db_path",):
-        if key in body:
-            try:
-                staged[key] = _clean_imessage_path(body.get(key), key)
-            except ValueError as exc:
-                return _deny("invalid_path", str(exc))
-
-    if "session_folder" in body:
-        try:
-            staged["session_folder"] = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny("invalid_session_folder", str(exc))
-
-    # ── Phase 2: commit. The read-modify-write of config.json happens ENTIRELY
-    # under the repo-wide config lock (read fresh, merge only the imessage
-    # section, write atomic), so a concurrent save by another settings handler
-    # is never overwritten by a stale snapshot taken before the lock.
-    #
-    # Through ``update_config_locked``, not ``_atomic_json_write``: it holds an
-    # advisory lock on the sidecar ``<path>.lock`` for the entire read-modify-write,
-    # so a concurrent ``kirocrew config set`` in ANOTHER PROCESS cannot land between
-    # our read and our write. ``_get_config_lock()`` serializes writers inside this
-    # process only, and loader.py names that combination the required path for a
-    # config.json mutation.
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    applied: list[str] = []
-    async with _get_config_lock():
-        path = config_path()
-        session_folder = ""
-
-        def _apply_staged(fresh: dict) -> dict | None:
-            """Merge the staged iMessage fields into the config read inside the lock.
-
-            Returns ``None`` when nothing changed, which tells
-            ``update_config_locked`` to skip the write -- preserving the previous
-            behaviour of not touching config.json on a no-op save.
-            """
-            nonlocal applied, session_folder
-            if not isinstance(fresh.get("imessage"), dict):
-                fresh["imessage"] = {}
-            imessage_cfg = fresh["imessage"]
-
-            # Reduce staged fields to actual changes against the fresh read so
-            # restart_required stays truthful on no-op saves.
-            changes: dict[str, object] = {}
-            if "enabled" in staged and staged["enabled"] != bool(
-                imessage_cfg.get("enabled", False)
-            ):
-                changes["enabled"] = staged["enabled"]
-            if "allowed_handles" in staged and staged["allowed_handles"] != imessage_cfg.get(
-                "allowed_handles", []
-            ):
-                changes["allowed_handles"] = staged["allowed_handles"]
-            for key, default in (("service", "imessage"), ("db_path", "")):
-                if key in staged and staged[key] != str(imessage_cfg.get(key, default) or default):
-                    changes[key] = staged[key]
-            if "session_folder" in staged and staged["session_folder"] != str(
-                imessage_cfg.get("session_folder", "") or ""
-            ):
-                changes["session_folder"] = staged["session_folder"]
-            applied = list(changes.keys())
-
-            imessage_cfg.update(changes)
-            # Read AFTER the merge and inside the lock: the folder below must be
-            # created for the value that was actually committed, not for a
-            # pre-merge snapshot.
-            session_folder = str(imessage_cfg.get("session_folder", "") or "")
-            return fresh if changes else None
-
-        # Shield + drain so a cancellation arriving mid-write cannot
-        # release the config lock while the worker thread is still
-        # replacing the file (interleaved-write race).
-        _cfg_write_task_im: asyncio.Task[dict] = asyncio.ensure_future(
-            asyncio.to_thread(functools.partial(update_config_locked, path, mutate=_apply_staged))
-        )
-        try:
-            await asyncio.shield(_cfg_write_task_im)
-        except asyncio.CancelledError:
-            await asyncio.gather(_cfg_write_task_im, return_exceptions=True)
-            raise
-        except ConfigReadError:
-            message = "config.json is corrupt"
-            _audit_denial(message)
-            return web.json_response({"error": message, "code": "config_corrupt"}, status=500)
-
-        # Create the configured session folder now, on this user-initiated save,
-        # so the reconcile path never has to write the folder store. Best-effort:
-        # a failure leaves conversations unfiled until the next save.
-        _folder_name = stored_folder_name(session_folder)
-        if _folder_name:
-            _state = request.app.get("state")
-            if _state is not None:
-                await ensure_channel_folder(
-                    _state,
-                    "imessage",
-                    _folder_name,
-                    relabel="session_folder" in applied,
-                )
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="imessage.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied),
-    )
-    # The entire iMessage channel config is read once at gateway startup.
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required("imessage", applied),
-            "verify_warning": "",
-        }
-    )
-
-
-# ── WeCom (企业微信) configuration API ──
-# Mirrors the Telegram config API above with one structural difference: WeCom
-# uses TWO credentials (WECOM_BOT_ID + WECOM_SECRET, both in config_dir/.env,
-# 0600) instead of a single bot token. Non-secret config (enabled,
-# allowed_users, soft_threshold_pct) lives in config.json under the "wecom"
-# key. GET returns masked previews + presence booleans; raw values are
-# write-only. The UI maps WECOM_SECRET onto the shared panel's primary secret
-# ("bot_token") and WECOM_BOT_ID onto its second credential field ("bot_id").
-
-
-def _is_valid_wecom_userid(v: str) -> bool:
-    """WeCom userid shape check (linear string ops, no regex).
-
-    WeCom userids are 1-64 chars: ASCII letters, digits, and ``.-_@`` — the
-    same charset the WeCom admin console accepts. ASCII-only on purpose:
-    ``str.isalnum()`` alone would admit Unicode letters/digits, which can
-    never match a real WeCom userid and would sit in the allow-list looking
-    authoritative. Fail closed on anything else (whitespace, display names,
-    zero-width blobs).
-    """
-    if not v or len(v) > 64:
-        return False
-    return all((ch.isascii() and ch.isalnum()) or ch in "._-@" for ch in v)
-
-
-async def api_wecom_config_get(request: web.Request) -> web.Response:
-    """GET /api/wecom/config — read WeCom config + masked credential status."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_WECOM_BOT_ID,
-        CRED_WECOM_SECRET,
-        KiroCrewConfig,
-    )
-
-    cfg = KiroCrewConfig.load()
-    creds = cfg.load_credentials()
-    bot_id = creds.get(CRED_WECOM_BOT_ID, "")
-    secret = creds.get(CRED_WECOM_SECRET, "")
-    wc = cfg.wecom
-    userids = [
-        str(u.get("userid")) for u in wc.allowed_users if isinstance(u, dict) and u.get("userid")
-    ]
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only when the WS transport actually started this session —
-            # NOT merely "credentials were present at boot".
-            "connected": bool(getattr(state, "wecom_connected", False)),
-            "connect_error": str(getattr(state, "wecom_connect_error", ""))[:120],
-            # allowed_users is part of "configured" unless allow-all is on:
-            # the transport fails closed and rejects every message while the
-            # allow-list is empty (the owner fallback still needs a userid
-            # entry to match on).
-            "configured": bool(
-                bot_id and secret and wc.enabled and (userids or wc.allow_all_users)
-            ),
-            # Remote sessions get a read-only view: config edits (PUT) are
-            # loopback-only, so the UI disables all inputs and hides Save.
-            "read_only": not is_direct_local_request(request),
-            # Primary secret slot of the shared panel = WECOM_SECRET.
-            "bot_token_set": bool(secret),
-            "bot_token_preview": _mask_secret(secret),
-            # Second credential slot = WECOM_BOT_ID.
-            "bot_id_set": bool(bot_id),
-            "bot_id_preview": _mask_secret(bot_id),
-            "enabled": bool(wc.enabled),
-            # Explicit opt-in: every org member may DM the bot (allow-list
-            # bypassed). Never inferred from an empty allow-list.
-            "allow_all_users": bool(wc.allow_all_users),
-            # Projected for the tag editor UI; the save path re-attaches the
-            # stored display names to surviving entries.
-            "allowed_user_ids": userids,
-            "soft_threshold_pct": int(wc.soft_threshold_pct),
-            "session_folder": wc.session_folder,
-        }
-    )
-
-
-async def api_wecom_config_save(request: web.Request) -> web.Response:
-    """PUT /api/wecom/config — persist WeCom secrets (.env) + config (config.json).
-
-    Every WeCom field is read once at gateway startup (credentials, enabled
-    flag, and allow-list are consumed when ``maybe_start_wecom`` builds the
-    transport), so any actual change returns ``restart_required``.
-
-    Serialized with every other config.json writer via the repository-wide
-    ``_get_config_lock()`` — this handler read-modify-writes the shared
-    ``.env`` / ``config.json`` stores, so interleaving with ANY other config
-    writer would silently lose writes.
-    """
-    # circular import: agents imports from dashboard.handlers at module load
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    async with _get_config_lock():
-        # A save is a config.json + credential transaction: a cancelled request
-        # (client gone, gateway shutting down) must not abandon it between its
-        # phases -- see ``run_to_completion``.
-        return await run_to_completion(_wecom_config_save_locked(request))
-
-
-async def _wecom_config_save_locked(request: web.Request) -> web.Response:
-    """Body of the WeCom save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_WECOM_BOT_ID,
-        CRED_WECOM_SECRET,
-        ConfigReadError,
-        config_path,
-    )
-
-    caller = request.get("user", "dashboard")
-
-    def _deny(msg: str, status: int = 400, *, code: str = "") -> web.Response:
-        _sel().log_api_access(
-            caller=caller,
-            operation="wecom.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-        # ``code`` is optional: most rejections in this handler are prose-only, and a
-        # machine-readable code is added per field as one is retrofitted. The dashboard
-        # renders ``error`` verbatim into a localized UI, so prose alone is
-        # untranslatable by construction (RFC 9457 3.1.3).
-        payload: dict[str, Any] = {"error": msg}
-        if code:
-            payload["code"] = code
-        return web.json_response(payload, status=status)
-
-    # Remote sessions are read-only: config writes are accepted only from the
-    # machine running the gateway, so a remote or tunneled session (even with
-    # a valid dashboard token) cannot alter WeCom access or plant credentials.
-    if not is_direct_local_request(request):
-        return _deny("read-only from remote sessions (local machine only)", status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid JSON")
-    if not isinstance(body, dict):
-        return _deny("body must be an object")
-
-    # ── Phase 1: validate everything and stage changes. No writes happen until
-    # all validation passes, so a rejected field never leaves partial state. ──
-
-    env_updates: dict[str, str | None] = {}
-    # Two independent credential slots, each with the same set/clear contract
-    # as the single-token channels (clear wins over a simultaneously-sent value).
-    for field_key, clear_key, cred_key, label in (
-        ("bot_token", "bot_token_clear", CRED_WECOM_SECRET, "bot secret"),
-        ("bot_id", "bot_id_clear", CRED_WECOM_BOT_ID, "bot ID"),
-    ):
-        clear_flag = body.get(clear_key)
-        if clear_flag is not None and not isinstance(clear_flag, bool):
-            return _deny(f"{clear_key} must be a boolean")
-        if clear_flag is True:
-            env_updates[cred_key] = None
-            continue
-        raw = body.get(field_key)
-        if isinstance(raw, str):
-            cred_val = raw.strip()
-            if cred_val.startswith(f"{cred_key}="):  # accidental env line paste
-                cred_val = cred_val[len(cred_key) + 1 :].strip()
-            if cred_val:
-                if any(ch.isspace() for ch in cred_val):
-                    return _deny(f"{label} must not contain whitespace")
-                if len(cred_val) > 256:
-                    return _deny(f"{label} is implausibly long")
-                env_updates[cred_key] = cred_val
-
-    # Config → config.json under "wecom" (staged, applied only after Phase 1).
-    # Off-loop read: a large or slow config.json must not stall the gateway
-    # event loop. Reading under _get_config_lock() keeps the snapshot current
-    # relative to every other config writer.
-    path = config_path()
-
-    def _read_config() -> dict:
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-
-    try:
-        data = await asyncio.to_thread(_read_config)
-    except Exception:
-        return _deny("config.json is corrupt", status=500)
-    if not isinstance(data.get("wecom"), dict):
-        # Back-compat: seed from a COPY of the legacy "wechat" section (the
-        # config key was renamed) so an existing install's allow-list /
-        # thresholds / ws_url survive the first dashboard save instead of
-        # being reset. Copy so the legacy block is never mutated in place.
-        legacy = data.get("wechat")
-        data["wecom"] = dict(legacy) if isinstance(legacy, dict) else {}
-    wc_cfg = data["wecom"]
-    staged: dict[str, object] = {}
-    applied: list[str] = []
-
-    if "enabled" in body:
-        val = body.get("enabled")
-        if not isinstance(val, bool):
-            return _deny("enabled must be a boolean")
-        if val != bool(wc_cfg.get("enabled", False)):
-            staged["enabled"] = val
-            applied.append("enabled")
-
-    if "allow_all_users" in body:
-        val = body.get("allow_all_users")
-        if not isinstance(val, bool):
-            return _deny("allow_all_users must be a boolean")
-        if val != bool(wc_cfg.get("allow_all_users", False)):
-            staged["allow_all_users"] = val
-            applied.append("allow_all_users")
-
-    if "allowed_user_ids" in body:
-        raw_ids = body.get("allowed_user_ids")
-        if not isinstance(raw_ids, list):
-            return _deny("allowed_user_ids must be a list")
-        # Preserve stored display names for entries that survive the edit —
-        # the UI round-trips only userids, but ``{userid, name}`` is the
-        # canonical config shape consumed by the transport allow-list.
-        existing = {
-            str(u.get("userid")): u
-            for u in wc_cfg.get("allowed_users", [])
-            if isinstance(u, dict) and u.get("userid")
-        }
-        new_users: list[dict] = []
-        seen: set[str] = set()
-        for item in raw_ids:
-            s = str(item).strip()
-            if not s:
-                continue
-            if not _is_valid_wecom_userid(s):
-                return _deny(f"invalid WeCom userid: {s}")
-            if s in seen:
-                continue
-            seen.add(s)
-            new_users.append(existing.get(s) or {"userid": s, "name": ""})
-        if new_users != list(wc_cfg.get("allowed_users", [])):
-            staged["allowed_users"] = new_users
-            applied.append("allowed_users")
-
-    bad_pct = _threshold_pct_rejection(body, "soft_threshold_pct")
-    if bad_pct is not None:
-        return _deny(bad_pct[1], code=bad_pct[0])
-    if "soft_threshold_pct" in body:
-        pct = int(body["soft_threshold_pct"])
-        if pct != int(wc_cfg.get("soft_threshold_pct", 80)):
-            staged["soft_threshold_pct"] = pct
-            applied.append("soft_threshold_pct")
-
-    if "session_folder" in body:
-        try:
-            new_folder = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny(str(exc))
-        if new_folder != str(wc_cfg.get("session_folder", "") or ""):
-            staged["session_folder"] = new_folder
-            applied.append("session_folder")
-
-    # No Phase 1.5 credential verification: validating WeCom credentials
-    # requires opening the AI-bot WebSocket long-connection (no cheap REST
-    # "whoami" like Telegram's getMe), so credentials are stored as given and
-    # the status badge reports the truth after the next gateway restart.
-
-    # ── Phase 2: commit. All validation passed, so writes are safe. ──
-    # Through ``update_config_locked``: it holds the advisory lock on the sidecar
-    # ``<path>.lock`` across the whole read-modify-write, so a writer in ANOTHER
-    # PROCESS cannot land between our read and our write, and the staged keys are
-    # merged into the file as re-read inside that lock. The same object undoes
-    # exactly those keys if the .env write below fails.
-    _cfg_write = _LockedSectionWrite(path, "wecom", staged, seed_from="wechat")
-    # Hold the live-config watcher for the whole config+credential transaction:
-    # the two files commit separately and a failed .env write rolls the config
-    # back, so nothing between here and the end of the block may be applied to
-    # the running transport (a widened allow-list must never go live on a save
-    # that then fails). The release wakes the watcher on the committed state.
-    with live.hold():
-        if staged:
-            wc_cfg.update(staged)
-            # Off-loop: file IO, and it may wait on another holder of the lock.
-            try:
-                await _cfg_write.commit()
-            except ConfigReadError:
-                return _deny("config.json is corrupt", status=500)
-
-        # Create the configured session folder now, on this user-initiated save,
-        # so the reconcile path never has to write the folder store. Best-effort:
-        # a failure leaves conversations unfiled until the next save.
-        _folder_name = stored_folder_name(wc_cfg.get("session_folder"))
-        if _folder_name:
-            _state = request.app.get("state")
-            if _state is not None:
-                await ensure_channel_folder(
-                    _state,
-                    "wecom",
-                    _folder_name,
-                    relabel="session_folder" in staged,
-                )
-        if env_updates:
-            # Off-loop: the .env write is blocking file IO (lock, temp write,
-            # owner-only lockdown, replace) and must not block the event loop.
-            #
-            # Cancellation guard: see Teams save for the full rationale. Only
-            # roll config back when the .env write actually failed, not when
-            # cancellation arrived after the write already committed.
-            _env_write_task_wc: asyncio.Task[None] = asyncio.ensure_future(
-                _write_env_off_loop(env_updates)
-            )
-            try:
-                await asyncio.shield(_env_write_task_wc)
-            except asyncio.CancelledError:
-                await asyncio.gather(_env_write_task_wc, return_exceptions=True)
-                _env_exc_wc = (
-                    _env_write_task_wc.exception() if not _env_write_task_wc.cancelled() else None
-                )
-                if _env_exc_wc is not None:
-                    if staged:
-                        await _cfg_write.rollback("WeCom")
-                raise
-            except BaseException:
-                # Roll config back so a failed .env write cannot leave the NEW
-                # metadata paired with the OLD credentials on disk.
-                if staged:
-                    await _cfg_write.rollback("WeCom")
-                raise
-            # Keep the live process environment in sync with the new .env state
-            # (load_credentials() lets os.environ win over .env — see the Slack
-            # save handler for the full rationale).
-            for key, new_val in env_updates.items():
-                if new_val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = new_val
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="wecom.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied + list(env_updates.keys())),
-    )
-    # The entire WeCom channel config is read once at gateway startup.
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required(
-                "wecom", staged.keys(), env_updates=env_updates
-            ),
-            "verify_warning": "",
-        }
-    )
-
-
-# ── Feishu (飞书/Lark) configuration API ──
-# Same two-credential shape as WeCom: FEISHU_APP_ID + FEISHU_APP_SECRET live in
-# config_dir/.env (0600), non-secret config (enabled, allowed_open_ids,
-# allow_group, allowed_group_ids, soft_threshold_pct, session_folder) lives in
-# config.json under the "feishu" key. GET returns masked previews + presence
-# booleans; raw values are write-only. The UI maps FEISHU_APP_SECRET onto the
-# shared panel's primary secret ("bot_token") and FEISHU_APP_ID onto its second
-# credential field ("bot_id").
-#
-# Group access is a SEPARATE axis from the DM allow-list here (unlike WeCom's
-# allow-all switch): allow_group gates group chats at all, and allowed_group_ids
-# names which ones. Both fail closed — allow_group with an empty list serves no
-# group, which is why the panel shows a hint rather than silently doing nothing.
 
 
 # Channels whose SDK ships as an optional extra rather than in core. Maps the
@@ -7887,503 +2650,29 @@ _CHANNEL_SDK_EXTRA: dict[str, tuple[str, str]] = {
 }
 
 
-def _channel_sdk_status(channel: str) -> tuple[bool, bool, str]:
-    """``(installed, install_supported, install_command)`` for *channel*'s extra.
-
-    Computed HERE rather than read off the connection badge, because the badge
-    cannot answer it in the case that matters. ``maybe_start_feishu`` returns at
-    its first line when the channel is disabled, and the ``ImportError`` branch
-    that records the missing SDK sits after that return — so a user who has not
-    yet flipped the enable toggle gets no hint at all, and one who has must
-    restart the gateway before the hint appears. This endpoint answers either
-    way and without a restart.
-
-    ``install_command`` is empty when it would be useless or actively wrong: the
-    SDK is already importable, or no install channel exists in this
-    build/interpreter (see :func:`_pip_install_channel_available` — on the
-    bundled desktop interpreter a pip install writes into the code-signed bundle
-    and is discarded on the next app update, so naming the command there is bad
-    advice rather than merely unhelpful).
-
-    Blocking: ``find_spec`` and the PEP 668 marker check both touch the
-    filesystem, so call it from a worker thread on an async path.
-    """
-    entry = _CHANNEL_SDK_EXTRA.get(channel)
-    if entry is None:
-        # No optional extra for this channel: nothing is ever missing, so the
-        # panel renders no card.
-        return True, False, ""
-    import_name, extra = entry
-    if importlib.util.find_spec(import_name) is not None:
-        return True, True, ""
-    if not _pip_install_channel_available():
-        return False, False, ""
-    return False, True, pip_extra_install_command(extra)
-
-
-def _is_valid_feishu_id(v: str, prefix: str) -> bool:
-    """Feishu opaque-id shape check (linear string ops, no regex).
-
-    Feishu ids are a fixed prefix (``ou_`` for a user open_id, ``oc_`` for a
-    group chat_id) followed by an opaque ASCII alphanumeric body. Only the
-    prefix and the charset are asserted, never a length equality: the body
-    length is not contractual and a stricter check would reject valid ids from a
-    future tenant. ASCII-only on purpose — ``str.isalnum()`` alone admits
-    Unicode digits, which can never match a real Feishu id and would sit in the
-    allow-list looking authoritative. Fail closed on anything else (whitespace,
-    display names, a pasted @-mention, zero-width blobs).
-    """
-    if not v.startswith(prefix) or len(v) > 128:
-        return False
-    body = v[len(prefix) :]
-    if not body:
-        return False
-    return all(ch.isascii() and ch.isalnum() for ch in body)
-
-
-async def api_feishu_config_get(request: web.Request) -> web.Response:
-    """GET /api/feishu/config — read Feishu config + masked credential status."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_FEISHU_APP_ID,
-        CRED_FEISHU_APP_SECRET,
-        KiroCrewConfig,
-    )
-
-    # Off-loop: both calls are synchronous filesystem reads (config.json, then
-    # .env) and the settings panel polls this endpoint every 15s, so on slow or
-    # contended storage they would stall every other task on the gateway loop
-    # rather than just this request. Read as ONE unit of work: the credential
-    # read is a method on the config object, and splitting them into two hops
-    # would let the two files be read either side of a concurrent save.
-    def _read() -> "tuple[KiroCrewConfig, dict, tuple[bool, bool, str]]":
-        loaded = KiroCrewConfig.load()
-        # The SDK probe joins this same unit of work: find_spec and the PEP 668
-        # marker are filesystem reads, and the panel polls this endpoint every
-        # 15s, so giving them their own thread hop would double the cost of a
-        # poll for no isolation benefit.
-        return loaded, loaded.load_credentials(), _channel_sdk_status("feishu")
-
-    cfg, creds, (sdk_installed, sdk_supported, sdk_command) = await asyncio.to_thread(_read)
-    app_id = creds.get(CRED_FEISHU_APP_ID, "")
-    app_secret = creds.get(CRED_FEISHU_APP_SECRET, "")
-    fs = cfg.feishu
-    state: DashboardState = request.app["state"]
-    return web.json_response(
-        {
-            # True only while the WS receiver thread is alive this session —
-            # NOT merely "credentials were present at boot". A refused app ends
-            # that thread within seconds, which flips this back to false.
-            "connected": bool(getattr(state, "feishu_connected", False)),
-            "connect_error": str(getattr(state, "feishu_connect_error", ""))[:120],
-            # allowed_open_ids is part of "configured": the transport fails
-            # closed and rejects every DM while the allow-list is empty, so a
-            # credentialed + enabled channel with no ids is not yet usable.
-            "configured": bool(app_id and app_secret and fs.enabled and fs.allowed_open_ids),
-            # Remote sessions get a read-only view: config edits (PUT) are
-            # loopback-only, so the UI disables all inputs and hides Save.
-            "read_only": not is_direct_local_request(request),
-            # Primary secret slot of the shared panel = FEISHU_APP_SECRET.
-            "bot_token_set": bool(app_secret),
-            "bot_token_preview": _mask_secret(app_secret),
-            # Second credential slot = FEISHU_APP_ID.
-            "bot_id_set": bool(app_id),
-            "bot_id_preview": _mask_secret(app_id),
-            "enabled": bool(fs.enabled),
-            "allowed_user_ids": list(fs.allowed_open_ids),
-            "allow_group": bool(fs.allow_group),
-            "allowed_group_ids": list(fs.allowed_group_ids),
-            "soft_threshold_pct": int(fs.soft_threshold_pct),
-            "session_folder": fs.session_folder,
-            # The channel needs lark-oapi, which ships as the optional [feishu]
-            # extra. False means the gateway process cannot import it and the
-            # channel will be skipped at boot no matter how complete the rest of
-            # this config is.
-            "sdk_installed": sdk_installed,
-            # False in the three environments where a pip install cannot work
-            # (bundled desktop interpreter, no pip module, PEP 668
-            # externally-managed): the panel shows an unsupported notice instead
-            # of a command that would silently achieve nothing.
-            "sdk_install_supported": sdk_supported,
-            # Names THIS gateway's interpreter, because installing into the
-            # wrong environment is the actual failure mode. Empty when the SDK is
-            # present or no install channel exists.
-            "sdk_install_command": sdk_command,
-        }
-    )
-
-
-async def api_feishu_config_save(request: web.Request) -> web.Response:
-    """PUT /api/feishu/config — persist Feishu secrets (.env) + config (config.json).
-
-    Every Feishu field is read once at gateway startup (credentials, enabled
-    flag, and both allow-lists are consumed when ``maybe_start_feishu`` builds
-    the transport), so any actual change returns ``restart_required``.
-
-    Serialized with every other config.json writer via the repository-wide
-    ``_get_config_lock()`` — this handler read-modify-writes the shared
-    ``.env`` / ``config.json`` stores, so interleaving with ANY other config
-    writer would silently lose writes.
-    """
-    # circular import: agents imports from dashboard.handlers at module load
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
-
-    async with _get_config_lock():
-        # A save is a config.json + credential transaction: a cancelled request
-        # (client gone, gateway shutting down) must not abandon it between its
-        # phases -- see ``run_to_completion``.
-        return await run_to_completion(_feishu_config_save_locked(request))
-
-
-async def _feishu_config_save_locked(request: web.Request) -> web.Response:
-    """Body of the Feishu save; caller holds ``_get_config_lock()``."""
-    from kiro_crew.config.loader import (  # noqa: F811
-        CRED_FEISHU_APP_ID,
-        CRED_FEISHU_APP_SECRET,
-        ConfigReadError,
-        config_path,
-        update_config_locked,
-    )
-
-    caller = request.get("user", "dashboard")
-
-    def _audit_denial(msg: str) -> None:
-        _sel().log_api_access(
-            caller=caller,
-            operation="feishu.config.update",
-            outcome="denied",
-            source="dashboard",
-            error=msg,
-        )
-
-    def _deny(msg: str, *, code: str) -> web.Response:
-        """Reject a bad request. ``code`` is the contract, ``msg`` is advisory.
-
-        400 is a literal rather than a parameter, and the 403/500 replies below
-        are written out at their own call sites for the same reason: a computed
-        status puts a response in the error-code gate's unverifiable
-        ``dynamic_status`` bucket, which the gate caps precisely because hoisting
-        a status out of view looks like refactoring. The dashboard renders
-        ``error`` verbatim into a localized UI, so prose alone would be
-        untranslatable by construction (RFC 9457 3.1.3).
-        """
-        _audit_denial(msg)
-        return web.json_response({"error": msg, "code": code}, status=400)
-
-    # Remote sessions are read-only: config writes are accepted only from the
-    # machine running the gateway, so a remote or tunneled session (even with a
-    # valid dashboard token) cannot widen Feishu access or plant credentials.
-    if not is_direct_local_request(request):
-        message = "read-only from remote sessions (local machine only)"
-        _audit_denial(message)
-        return web.json_response({"error": message, "code": "remote_read_only"}, status=403)
-
-    try:
-        body = await request.json()
-    except Exception:
-        return _deny("invalid JSON", code="invalid_json")
-    if not isinstance(body, dict):
-        return _deny("body must be an object", code="body_not_object")
-
-    # ── Phase 1: validate everything and stage changes. No writes happen until
-    # all validation passes, so a rejected field never leaves partial state. ──
-
-    env_updates: dict[str, str | None] = {}
-    # Two independent credential slots, each with the same set/clear contract
-    # as the single-token channels (clear wins over a simultaneously-sent value).
-    for field_key, clear_key, cred_key, label in (
-        ("bot_token", "bot_token_clear", CRED_FEISHU_APP_SECRET, "app secret"),
-        ("bot_id", "bot_id_clear", CRED_FEISHU_APP_ID, "app ID"),
-    ):
-        clear_flag = body.get(clear_key)
-        if clear_flag is not None and not isinstance(clear_flag, bool):
-            return _deny(f"{clear_key} must be a boolean", code="clear_flag_not_bool")
-        if clear_flag is True:
-            env_updates[cred_key] = None
-            continue
-        raw = body.get(field_key)
-        if isinstance(raw, str):
-            cred_val = raw.strip()
-            if cred_val.startswith(f"{cred_key}="):  # accidental env line paste
-                cred_val = cred_val[len(cred_key) + 1 :].strip()
-            if cred_val:
-                if any(ch.isspace() for ch in cred_val):
-                    return _deny(
-                        f"{label} must not contain whitespace", code="credential_whitespace"
-                    )
-                if len(cred_val) > 256:
-                    return _deny(f"{label} is implausibly long", code="credential_too_long")
-                env_updates[cred_key] = cred_val
-
-    # Config → config.json under "feishu" (staged, applied only after Phase 1).
-    # Off-loop read: a large or slow config.json must not stall the gateway
-    # event loop. Reading under _get_config_lock() keeps the snapshot current
-    # relative to every other config writer.
-    path = config_path()
-
-    def _read_config() -> dict:
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-
-    def _corrupt_config() -> web.Response:
-        message = "config.json is corrupt"
-        _audit_denial(message)
-        return web.json_response({"error": message, "code": "config_corrupt"}, status=500)
-
-    try:
-        data = await asyncio.to_thread(_read_config)
-    except Exception:
-        return _corrupt_config()
-    # A readable file whose TOP LEVEL is not an object (a hand-edited `[]`) is the
-    # same class of problem as an unreadable one, and gets the same answer: the
-    # alternative is `data.get` raising AttributeError into a 500 with a stack
-    # trace and no indication of what to fix.
-    if not isinstance(data, dict):
-        return _corrupt_config()
-    if not isinstance(data.get("feishu"), dict):
-        data["feishu"] = {}
-    fs_cfg = data["feishu"]
-    staged: dict[str, object] = {}
-    applied: list[str] = []
-
-    def _stored_list(key: str) -> list:
-        """Stored value only when it really is a list, else empty.
-
-        ``dict.get(key, default)`` substitutes the default only for an ABSENT key:
-        a hand-edited ``"allowed_open_ids": null`` returns None and would reach
-        ``list(None)``, raising into a 500 from the save that is the way to repair
-        the file. Mirrors the loader, which already coerces this shape for the
-        runtime.
-        """
-        value = fs_cfg.get(key)
-        return value if isinstance(value, list) else []
-
-    def _stored_int(key: str, default: int) -> int:
-        """Stored value only when it really is an int, else the default.
-
-        ``bool`` is excluded deliberately: it is an ``int`` subclass, so a stored
-        ``true`` would otherwise compare as the threshold 1.
-        """
-        value = fs_cfg.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) else default
-
-    for flag_key in ("enabled", "allow_group"):
-        if flag_key in body:
-            val = body.get(flag_key)
-            if not isinstance(val, bool):
-                return _deny(f"{flag_key} must be a boolean", code="flag_not_bool")
-            if val != bool(fs_cfg.get(flag_key, False)):
-                staged[flag_key] = val
-                applied.append(flag_key)
-
-    # Both id lists share one validator, differing only in prefix. The wire name
-    # for the DM list is the shared panel's ``allowed_user_ids``; on disk it is
-    # ``allowed_open_ids``, which is what the transport reads.
-    for wire_key, cfg_key, prefix, what in (
-        ("allowed_user_ids", "allowed_open_ids", "ou_", "Feishu open_id"),
-        ("allowed_group_ids", "allowed_group_ids", "oc_", "Feishu group chat_id"),
-    ):
-        if wire_key not in body:
-            continue
-        raw_ids = body.get(wire_key)
-        if not isinstance(raw_ids, list):
-            return _deny(f"{wire_key} must be a list", code="ids_not_list")
-        new_ids: list[str] = []
-        for item in raw_ids:
-            s = str(item).strip()
-            if not s:
-                continue
-            if not _is_valid_feishu_id(s, prefix):
-                return _deny(f"invalid {what}: {s}", code="invalid_id")
-            if s not in new_ids:
-                new_ids.append(s)
-        if new_ids != _stored_list(cfg_key):
-            staged[cfg_key] = new_ids
-            applied.append(cfg_key)
-
-    bad_pct = _threshold_pct_rejection(body, "soft_threshold_pct")
-    if bad_pct is not None:
-        return _deny(bad_pct[1], code=bad_pct[0])
-    if "soft_threshold_pct" in body:
-        pct = int(body["soft_threshold_pct"])
-        if pct != _stored_int("soft_threshold_pct", 80):
-            staged["soft_threshold_pct"] = pct
-            applied.append("soft_threshold_pct")
-
-    if "session_folder" in body:
-        try:
-            new_folder = clean_session_folder(body.get("session_folder"))
-        except ValueError as exc:
-            return _deny(str(exc), code="invalid_session_folder")
-        if new_folder != str(fs_cfg.get("session_folder", "") or ""):
-            staged["session_folder"] = new_folder
-            applied.append("session_folder")
-
-    # No Phase 1.5 credential verification: a REST tenant-token probe would have
-    # to pick a domain (open.feishu.cn vs open.larksuite.com) and would report a
-    # false failure for whichever tenant it guessed wrong. Credentials are stored
-    # as given, and the badge reports receiver liveness after the next restart —
-    # a refused app ends the receiver thread within seconds, so a wrong secret
-    # surfaces as "not connected" with a reason rather than silence.
-
-    # ── Phase 2: commit. All validation passed, so writes are safe. ──
-    #
-    # Through ``update_config_locked``, not ``write_config_atomically``: it holds an
-    # advisory lock on the sidecar ``<path>.lock`` for the entire read-modify-write,
-    # so a concurrent ``kirocrew config set`` in ANOTHER PROCESS cannot land between
-    # our read and our write. ``_get_config_lock()`` (held by the caller) only
-    # serializes writers inside this one, and loader.py names that combination the
-    # required path for a new config.json mutation.
-    #
-    # ``staged`` is applied to the config as re-read INSIDE the lock rather than to
-    # the snapshot taken during validation, so a concurrent edit to an unrelated
-    # section is preserved instead of being replaced by our older copy.
-    prior_feishu: dict | None = None
-
-    def _apply_staged(fresh: dict) -> dict:
-        nonlocal prior_feishu
-        section = fresh.get("feishu")
-        # Captured HERE because this is the only point at which the pre-mutation
-        # state is known to be current.
-        prior_feishu = dict(section) if isinstance(section, dict) else None
-        if not isinstance(section, dict):
-            section = {}
-            fresh["feishu"] = section
-        section.update(staged)
-        return fresh
-
-    def _restore_feishu(fresh: dict) -> dict:
-        """Undo the keys THIS request wrote, and only where we still own them.
-
-        Two narrower than the obvious form, both deliberate. Rewriting the file
-        from a whole-file snapshot would revert whatever a concurrent writer
-        landed; restoring the whole ``feishu`` SECTION would still discard a
-        concurrent ``kirocrew config set feishu.*`` that arrived between our write
-        and this rollback. So the comparison is per key: a key whose stored value
-        is no longer the value we wrote has been changed by someone else since,
-        and reverting it would destroy their edit to undo ours.
-        """
-        section = fresh.get("feishu")
-        if not isinstance(section, dict):
-            # Nothing of ours left to undo (the section is gone or was replaced
-            # wholesale by another writer).
-            return fresh
-        before = prior_feishu if isinstance(prior_feishu, dict) else {}
-        for key, written in staged.items():
-            if section.get(key) != written:
-                continue  # not ours any more
-            if key in before:
-                section[key] = before[key]
-            else:
-                section.pop(key, None)
-        # Drop a section that only ever existed because we created it, so a failed
-        # first-time save leaves no empty scaffold behind.
-        if prior_feishu is None and not section:
-            fresh.pop("feishu", None)
-        return fresh
-
-    async def _rollback_config() -> None:
-        try:
-            await asyncio.to_thread(
-                functools.partial(update_config_locked, path, mutate=_restore_feishu)
-            )
-        except Exception:
-            # A rollback that cannot run must not mask the original failure the
-            # caller is already raising; the mismatch is logged instead.
-            logger.exception("Feishu config rollback failed; config may lead .env")
-
-    # Hold the live-config watcher for the whole config+credential transaction:
-    # the two files commit separately and a failed .env write rolls the config
-    # back, so nothing between here and the end of the block may be applied to
-    # the running gateway. The release wakes the watcher on the committed state.
-    with live.hold():
-        if staged:
-            # Off-loop: the locked read-modify-write does file IO and may block on a
-            # concurrent holder of the lock, neither of which belongs on the loop.
-            try:
-                await asyncio.to_thread(
-                    functools.partial(update_config_locked, path, mutate=_apply_staged)
-                )
-            except ConfigReadError:
-                return _corrupt_config()
-
-        if env_updates:
-            # Off-loop: the .env write is blocking file IO (lock, temp write,
-            # owner-only lockdown, replace) and must not block the event loop.
-            #
-            # Cancellation guard: see the WeCom save for the full rationale. Only
-            # roll config back when the .env write actually failed, not when
-            # cancellation arrived after the write already committed.
-            _env_write_task_fs: asyncio.Task[None] = asyncio.ensure_future(
-                _write_env_off_loop(env_updates)
-            )
-            try:
-                await asyncio.shield(_env_write_task_fs)
-            except asyncio.CancelledError:
-                await asyncio.gather(_env_write_task_fs, return_exceptions=True)
-                _env_exc_fs = (
-                    _env_write_task_fs.exception() if not _env_write_task_fs.cancelled() else None
-                )
-                if _env_exc_fs is not None and staged:
-                    await _rollback_config()
-                raise
-            except BaseException:
-                # Roll config back so a failed .env write cannot leave the NEW
-                # metadata paired with the OLD credentials on disk.
-                if staged:
-                    await _rollback_config()
-                raise
-            # Keep the live process environment in sync with the new .env state
-            # (load_credentials() lets os.environ win over .env — see the Slack save
-            # handler for the full rationale).
-            for key, new_val in env_updates.items():
-                if new_val is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = new_val
-
-    # Create the configured session folder now, on this user-initiated save, so
-    # the reconcile path never has to write the folder store. Best-effort: a
-    # failure leaves conversations unfiled until the next save.
-    #
-    # AFTER the credential write, not before: the .env write can fail (or be
-    # cancelled) and the config write above is rolled back when it does, but a
-    # folder that has already been created, renamed or unhidden is NOT rolled
-    # back. Reconciling here means a save that reported failure leaves no durable
-    # folder change behind.
-    # The staged value when we changed it, else what was already stored: `fs_cfg`
-    # is the VALIDATION snapshot and is not mutated in place — the authoritative
-    # update happens inside the lock.
-    _effective_folder = staged.get("session_folder", fs_cfg.get("session_folder"))
-    _folder_name = stored_folder_name(_effective_folder)
-    if _folder_name:
-        _state = request.app.get("state")
-        if _state is not None:
-            await ensure_channel_folder(
-                _state,
-                "feishu",
-                _folder_name,
-                relabel="session_folder" in staged,
-            )
-
-    _sel().log_api_access(
-        caller=caller,
-        operation="feishu.config.update",
-        outcome="ok",
-        source="dashboard",
-        resources=",".join(applied + list(env_updates.keys())),
-    )
-    # The entire Feishu channel config is read once at gateway startup.
-    # Answer only once the watcher has applied the write: a narrowed allow-list
-    # is in force before the caller sees "saved", not one poll interval later.
-    await _hot_apply_after_write()
-    return web.json_response(
-        {
-            "ok": True,
-            "restart_required": channel_restart_required(
-                "feishu", staged.keys(), env_updates=env_updates
-            ),
-            "verify_warning": "",
-        }
-    )
+# Every function the owners define runs on this module's globals, so a patch of
+# ``kiro_crew.dashboard.handlers.messaging.<name>`` reaches it wherever it lives;
+# see ``kiro_crew.dashboard.messaging_api``. Run once, after this body has bound
+# every name and before the owner-surface guard below wraps the spawn routes.
+_messaging_api.compose(
+    globals(),
+    (
+        _owner_spawn,
+        _owner_run_control,
+        _owner_run_views,
+        _owner_notifications,
+        _owner_proactive_send,
+        _owner_channel_delivery,
+        _owner_slack_settings,
+        _owner_discord_settings,
+        _owner_telegram_settings,
+        _owner_teams_settings,
+        _owner_webex_settings,
+        _owner_imessage_settings,
+        _owner_wecom_settings,
+        _owner_feishu_settings,
+    ),
+)
 
 
 # A private member reaches only the runs its own memory store owns: the per-run

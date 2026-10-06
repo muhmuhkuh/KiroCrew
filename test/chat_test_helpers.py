@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from aiohttp import web
 
+from kiro_crew.dashboard.slot_ownership import slot_ownership_middleware
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
@@ -75,6 +76,35 @@ async def drain_background_tasks(state) -> None:
         f"background tasks still pending after {_DRAIN_ROUNDS} drain rounds: "
         f"{sorted(t.get_name() for t in state._background_tasks if not t.done())}"
     )
+
+
+def chat_done_frames(state) -> list:
+    """Every ``chat_done`` payload sent through a ``MagicMock`` ``broadcast_ws``."""
+    return [
+        c.args[1] for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "chat_done"
+    ]
+
+
+#: The bound on every turn a test awaits: a regression that hangs a hand-off then
+#: fails its own test by name instead of losing the worker (testing-conventions
+#: class 6).
+TURN_WAIT_SECS = 5
+
+
+async def run_as_slot_task(slot, coro) -> "asyncio.Task":
+    """Run *coro* as ``slot.task``, the way a dispatcher does, and await it."""
+    task = asyncio.ensure_future(coro)
+    slot.task = task
+    await asyncio.wait_for(task, timeout=TURN_WAIT_SECS)
+    return task
+
+
+async def await_successor(slot, predecessor) -> "asyncio.Task":
+    """Await the turn *predecessor*'s queue hand-off published in ``slot.task``."""
+    successor = slot.task
+    assert successor is not None and successor is not predecessor, "no successor dispatched"
+    await asyncio.wait_for(successor, timeout=TURN_WAIT_SECS)
+    return successor
 
 
 class _ReadyKiroPrerequisiteService(KiroPrerequisiteService):
@@ -232,6 +262,9 @@ def _make_state(tmp_path, **kwargs):
         if isinstance(channel_id, ChannelLink):
             if _mirror_links.get(key) != channel_id or key not in _mirror_nonces:
                 _mirror_nonces[key] = _mint_nonce()
+            # Parity with ``SessionMap.set_mirror_link``: the link is stored as
+            # handed over, admission included when the caller signed it, and the
+            # store never mints one -- only the two authorized creation paths do.
             _mirror_links[key] = channel_id
             if accepts_inbound:
                 _inbound_keys.add(key)
@@ -299,7 +332,6 @@ def _make_app(state: DashboardState) -> web.Application:
     from kiro_crew.dashboard.chat import (
         api_chat,
         api_chat_mode,
-        api_chat_plan_action,
         api_chat_slot_approve,
         api_chat_slot_color,
         api_chat_slot_delete,
@@ -329,7 +361,10 @@ def _make_app(state: DashboardState) -> web.Application:
             request["user"] = "local-app"  # recognized as owner
         return await handler(request)
 
-    app = web.Application(middlewares=[_test_auth_middleware])
+    # The per-slot app-ownership checkpoint runs inner to auth, as in the real
+    # server chain, so an app-identity test exercises the decision every
+    # /api/chat/slots/{slot}/* route takes before its handler.
+    app = web.Application(middlewares=[_test_auth_middleware, slot_ownership_middleware])
     app["state"] = state
     app.router.add_post("/api/chat", api_chat)
     app.router.add_get("/api/chat/slots", api_chat_slots)
@@ -346,7 +381,6 @@ def _make_app(state: DashboardState) -> web.Application:
     app.router.add_post("/api/chat/slots/{slot}/rewind", api_chat_slot_rewind)
     app.router.add_post("/api/chat/slots/{slot}/switch-variant", api_chat_slot_switch_variant)
     app.router.add_post("/api/chat/mode", api_chat_mode)
-    app.router.add_post("/api/chat/slots/{slot}/plan-action", api_chat_plan_action)
     return app
 
 
@@ -365,7 +399,7 @@ def _make_app_with_agent_routes(state: DashboardState) -> web.Application:
         api_chat_slots,
     )
 
-    app = web.Application()
+    app = web.Application(middlewares=[slot_ownership_middleware])
     app["state"] = state
     app.router.add_get("/api/chat/slots", api_chat_slots)
     app.router.add_post("/api/chat/slots", api_chat_slot_create)

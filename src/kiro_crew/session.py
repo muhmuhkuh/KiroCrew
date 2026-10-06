@@ -133,7 +133,7 @@ from kiro_crew.agent import kiro_agents_dir_path
 from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace
-from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
 from kiro_crew.agent_spec_format import iter_agent_spec_files
 from kiro_crew.config import KiroCrewConfig, live
 from kiro_crew.config.live import ConfigChange
@@ -248,6 +248,8 @@ from kiro_crew.session_pid import (
 )
 from kiro_crew.session_pool import WarmPoolDeps, WarmSessionPool
 from kiro_crew.session_scope_reap import reap_abandoned_agent_scopes
+from kiro_crew.shell_audit_log import rotate_shell_audit_log
+from kiro_crew.start_priority import PrioritySemaphore, StartPriority
 from kiro_crew.stats import Stats
 from kiro_crew.watchdog import CleanupHook, SessionWatchdog
 
@@ -570,11 +572,6 @@ _STATELESS_PREFIXES = (
 # agent without forcing other background callers (chat-title, consolidator,
 # taskkeeper) to load the same MCP servers.
 BACKGROUND_KEY = "_bg"
-# Concurrent cold starts allowed by ``_start_sem``. Named rather than inline so the
-# identity sweep can ask how many starts are in flight (see
-# ``_cold_starts_in_flight``): a provider inside ``start()`` has not published a PID
-# yet, so the semaphore is the only evidence it exists.
-_MAX_CONCURRENT_COLD_STARTS = 4
 # Kiro agent the background session runs as. Named once because it is needed in
 # TWO places — the provider factory call AND the ``_Session`` record — and when
 # only the factory got it, ``_Session.agent`` stayed at its "" default, so every
@@ -634,7 +631,7 @@ def _load_bg_runtime_types() -> tuple[Any, type[BaseException]]:
 # Heartbeat session key — used by HeartbeatService.  Spawned with the full
 # ``kirocrew`` agent so polled tasks can call read-only MCP tools (CR/ticket
 # status, etc.).  Tool approval at runtime is gated by the
-# ``HEARTBEAT_SAFE_TOOLS`` allowlist in ``slack/gateway.py``.
+# ``HEARTBEAT_SAFE_TOOLS`` allowlist in ``slack/gateway_runtime/tool_policy.py``.
 HEARTBEAT_KEY = "_hb"
 
 
@@ -666,20 +663,36 @@ _COMPACT_RESULT_WAIT_MARGIN_SECS = 5.0
 _COMPACT_RESULT_WAIT_FLOOR_SECS = 5.0
 
 
-def _compact_result_wait_secs(elapsed: float) -> float:
+def _compact_result_wait_secs(elapsed: float, budget: float = COMPACT_WAIT_TIMEOUT_SECS) -> float:
     """Inner deadline for the async compaction-status wait.
 
-    The FULL remainder of the shared ``COMPACT_WAIT_TIMEOUT_SECS`` budget
-    after ``elapsed`` seconds — never less, so a compaction completing in the
-    final seconds of the budget is not abandoned early. The outer
-    ``asyncio.wait_for`` carries ``_COMPACT_RESULT_WAIT_MARGIN_SECS`` of
-    headroom on top, keeping this wait's graceful "no result" diagnostic
-    reachable. Clamped to a floor so the wait can never be zero or negative.
+    The FULL remainder of the shared compaction ``budget`` after ``elapsed``
+    seconds — never less, so a compaction completing in the final seconds of
+    the budget is not abandoned early. The outer ``asyncio.wait_for`` carries
+    ``_COMPACT_RESULT_WAIT_MARGIN_SECS`` of headroom on top, keeping this
+    wait's graceful "no result" diagnostic reachable. Clamped to a floor so
+    the wait can never be zero or negative.
+
+    ``budget`` defaults to ``COMPACT_WAIT_TIMEOUT_SECS``; the automatic path
+    passes the effective budget (``_resolve_compact_wait_secs``), so a config
+    key raising the budget raises this inner wait with it rather than leaving
+    it clamped at the built-in default minus elapsed.
     """
     return max(
         _COMPACT_RESULT_WAIT_FLOOR_SECS,
-        COMPACT_WAIT_TIMEOUT_SECS - elapsed,
+        budget - elapsed,
     )
+
+
+def _resolve_compact_wait_secs(configured: float) -> float:
+    """The effective compaction wait budget.
+
+    ``configured`` is ``cfg.session.compact_wait_secs``: a positive value is
+    the operator's chosen budget, and 0 (the default) or any non-positive
+    value falls back to the built-in ``COMPACT_WAIT_TIMEOUT_SECS``. Resolved
+    per compaction so a live config change takes effect on the next one.
+    """
+    return configured if configured > 0 else COMPACT_WAIT_TIMEOUT_SECS
 
 
 # After a failed compact, suppress auto-compaction for this many seconds so a
@@ -869,6 +882,42 @@ def _provider_has_active_turn(provider: LLMProvider) -> bool:
     return res is True
 
 
+def _provider_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+    """``provider``'s newest background launch as ``(seconds since, description)``.
+
+    ``None`` unless the provider answers with exactly that shape. Same defensive
+    shape as :func:`_provider_has_active_turn`: the probe is optional, a raising
+    one reads as "nothing launched", and an ``AsyncMock``-style double's
+    coroutine is closed. A ``MagicMock`` attribute answers a ``MagicMock``,
+    which is not a tuple, so a double can never hold the watchdog off.
+    """
+    fn = getattr(provider, "background_launch", None)
+    if not callable(fn):
+        return None
+    try:
+        res = fn()
+    except Exception:
+        return None
+    if inspect.isawaitable(res):
+        close = getattr(res, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return None
+    if not (isinstance(res, tuple) and len(res) == 2):
+        return None
+    age, description = res
+    if (
+        isinstance(age, bool)
+        or not isinstance(age, (int, float))
+        or not isinstance(description, str)
+    ):
+        return None
+    return float(age), description
+
+
 def _context_pct_is_unknown(provider: LLMProvider) -> bool:
     """True only if ``provider`` reports its 0% context reading as unknown.
 
@@ -933,7 +982,7 @@ def _provider_has_unfinished_turn(provider: LLMProvider) -> bool:
     return res is True
 
 
-StopOutcome = Literal["soft", "hard", "idle"]
+StopOutcome = Literal["soft", "hard", "idle", "compacting"]
 
 
 class FirstTurnState(Enum):
@@ -1022,6 +1071,11 @@ class _Session:
     # remembers WHO held it, so that task's later key-only ``release`` is
     # absorbed instead of unlocking whatever successor now occupies the key.
     turn_owner: Any = None
+    # Set by the allocation layer when a claim or registration adopted entries a
+    # forced stop parked (``session_lifecycle.adopt_parked_queue``); ``release``
+    # reads and clears it to wake those entries' channel drains once the lease
+    # is free.
+    adopted_parked: bool = False
     approval_policy: str = ""  # "" (interactive) | "auto" (auto-approve all tools)
     agent: str = ""  # kiro agent name used for this session
     capability_member: str = ""
@@ -1174,7 +1228,6 @@ class SessionManager:
 
     def _allocation_deps(self) -> AllocationDeps:
         constants = AllocationConstants(
-            max_concurrent_cold_starts=_MAX_CONCURRENT_COLD_STARTS,
             won_race_max_retries=_WON_RACE_MAX_RETRIES,
             circuit_breaker_threshold=_CIRCUIT_BREAKER_THRESHOLD,
             agent_model_cache_ttl=lambda: _AGENT_MODEL_CACHE_TTL,
@@ -1224,7 +1277,11 @@ class SessionManager:
             provider_model_namespace=lambda provider: model_registry_namespace(
                 getattr(getattr(provider, "client", provider), "backend", "") or ""
             ),
-            resolve_pin_spelling=lambda model, advertised: resolve_pin_spelling(model, advertised),
+            resolve_pin_spelling=lambda model, advertised, provider: resolve_pin_spelling_on(
+                model,
+                advertised,
+                getattr(getattr(provider, "client", provider), "backend", "") or "",
+            ),
             to_provider_id=lambda model, provider: model_registry.to_provider_id(model, provider),
             to_acp_id=lambda model: model_registry.to_acp_id(model),
             inc_session_created=lambda: Stats().inc_session_created(),
@@ -1268,7 +1325,6 @@ class SessionManager:
             default_project_dir=lambda: default_project_dir(),
             constants=lambda: SessionLifecycleConstants(
                 max_pool=_MAX_POOL,
-                max_concurrent_cold_starts=_MAX_CONCURRENT_COLD_STARTS,
                 background_key=BACKGROUND_KEY,
                 stateless_prefixes=_STATELESS_PREFIXES,
                 close_all_concurrency=_CLOSE_ALL_CONCURRENCY,
@@ -1311,6 +1367,10 @@ class SessionManager:
             self.__dict__["_cleanup_state"] = state
         return state
 
+    def runtime_reconciler(self) -> Any:
+        """The retained runtime reconciler, or ``None`` before the first cleanup tick."""
+        return self._cleanup_state_boundary().runtime_reconciler
+
     def _cleanup_deps(self) -> CleanupDeps:
         # Resolved HERE, on the thread that builds the deps, and carried into the
         # sandbox sweep. That sweep runs on the maintenance pool, and a path a pool
@@ -1332,6 +1392,10 @@ class SessionManager:
             ),
             prune_session_pid_mappings=lambda: _prune_stale_session_pid_files(),
             prune_member_pid_bindings=lambda: prune_legacy_member_pid_bindings(),
+            # Same resolved home as the sandbox sweep, for the same reason: the
+            # step runs on the maintenance pool, and the hook's own expansion of
+            # ``${KIROCREW_HOME:-$HOME/.kiro/crew}`` is this path.
+            rotate_shell_audit_log=lambda: rotate_shell_audit_log(data_home),
             prune_pycache=lambda: prune_pycache(),
             collect_active_pids=lambda sessions: _collect_active_pids(
                 cast(dict[Any, Any], sessions)
@@ -1357,6 +1421,7 @@ class SessionManager:
             provider_has_active_turn=lambda provider: _provider_has_active_turn(provider),
             emit_counter=lambda event, dimensions: emit_counter(event, dimensions),
             get_persistent_keys=lambda: _PERSISTENT_KEYS,
+            provider_background_launch=lambda provider: _provider_background_launch(provider),
             get_channel_prefix=lambda: _CHANNEL_PREFIX,
             get_stuck_turn_report_secs=lambda: _STUCK_TURN_REPORT_SECS,
             get_pycache_gc_interval_secs=lambda: PYCACHE_GC_INTERVAL_SECS,
@@ -1548,6 +1613,16 @@ class SessionManager:
         return self._closing
 
     @property
+    def final_drain_started(self) -> bool:
+        """Whether ``close_all()`` began, so no turn here outlives this process.
+
+        An update pause also closes admission, but it can resume. ``close_all``
+        revokes that pause, so closing without an owned pause is the final drain
+        of a shutdown or an in-app re-exec restart.
+        """
+        return self._closing and not self._update_pause_owned
+
+    @property
     def _update_pause_owned(self) -> bool:
         return self._registry_state().update_pause_owned
 
@@ -1565,11 +1640,13 @@ class SessionManager:
         self._registry_state().update_restart_fenced = value
 
     @property
-    def _start_sem(self) -> asyncio.Semaphore:
+    def _start_sem(self) -> PrioritySemaphore:
         return self._registry_state().start_sem
 
     @_start_sem.setter
-    def _start_sem(self, value: asyncio.Semaphore) -> None:
+    def _start_sem(self, value: PrioritySemaphore) -> None:
+        if not isinstance(value, PrioritySemaphore):
+            raise TypeError("_start_sem must be a PrioritySemaphore")
         self._registry_state().start_sem = value
 
     @property
@@ -1870,9 +1947,7 @@ class SessionManager:
         # Installed by the gateway once it owns this manager (set_injection_probe);
         # None means "no gateway, so no completion injection can be in flight".
         self._injection_probe: "Callable[[str], bool] | None" = None
-        self._allocation_state = SessionRegistryState(
-            start_sem=asyncio.Semaphore(_MAX_CONCURRENT_COLD_STARTS)
-        )
+        self._allocation_state = SessionRegistryState()
         self._allocation_boundary()
         self._lifecycle_state = SessionLifecycleState()
         self._compaction_state = CompactionState()
@@ -1918,8 +1993,10 @@ class SessionManager:
                 get_recorder=lambda: get_recorder(),
                 context_pct_is_unknown=lambda provider: _context_pct_is_unknown(provider),
                 unlink_session_queue=lambda session: _unlink_session_queue(session),
-                compact_wait_timeout_secs=lambda: COMPACT_WAIT_TIMEOUT_SECS,
-                compact_result_wait_secs=lambda elapsed: _compact_result_wait_secs(elapsed),
+                compact_wait_timeout_secs=lambda: self.compact_wait_budget_secs(),
+                compact_result_wait_secs=lambda elapsed, budget: _compact_result_wait_secs(
+                    elapsed, budget
+                ),
                 context_warn_margin_pct=CONTEXT_WARN_MARGIN_PCT,
                 compact_result_wait_margin_secs=_COMPACT_RESULT_WAIT_MARGIN_SECS,
                 compact_failure_cooldown_secs=_COMPACT_FAILURE_COOLDOWN_SECS,
@@ -2108,9 +2185,11 @@ class SessionManager:
         """Delegate background and warm-pool startup."""
         await self._pool.start_pool(blocking=blocking)
 
-    async def _ensure_background(self) -> None:
+    async def _ensure_background(
+        self, *, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> None:
         """Delegate creation of the persistent background session."""
-        await self._background_runtime._ensure_background()
+        await self._background_runtime._ensure_background(start_priority=start_priority)
 
     # ── Warm Pool ──
 
@@ -2154,26 +2233,44 @@ class SessionManager:
         """Delegate the periodic idle-and-stale retirement of the shared runtime."""
         return await self._background_runtime.reap_idle_stale_bg_runtime()
 
-    async def _provider_backed_bg_session(self) -> "_ProviderBgSession":
+    async def _provider_backed_bg_session(
+        self, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> "_ProviderBgSession":
         """Return the serialized provider-backed background adapter."""
         return cast(
             "_ProviderBgSession",
-            await self._background_runtime._provider_backed_bg_session(),
+            await self._background_runtime._provider_backed_bg_session(start_priority),
         )
 
-    async def get_bg_session(self) -> "AcpSessionHandle | _ProviderBgSession":
-        """Acquire a background handle from the configured runtime shape."""
+    async def get_bg_session(
+        self, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> "AcpSessionHandle | _ProviderBgSession":
+        """Acquire a background handle from the configured runtime shape.
+
+        ``start_priority`` orders its ``session/new`` (rule: ``kiro_crew.start_priority``).
+        """
         return cast(
             "AcpSessionHandle | _ProviderBgSession",
-            await self._background_runtime.get_bg_session(),
+            await self._background_runtime.get_bg_session(start_priority),
         )
 
     async def get_subagent_runtime(
-        self, parent_session_key: str, agent: str | None = None
+        self,
+        parent_session_key: str,
+        agent: str | None = None,
+        *,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
+        on_gate_queued: Callable[..., None] | None = None,
+        on_gate_acquired: Callable[..., None] | None = None,
     ) -> "AcpRuntime":
-        """Get or spawn the shared companion runtime for a parent."""
+        """Get or spawn the shared companion runtime for a parent (the priority
+        and clock callbacks: the allocation boundary's ``get_subagent_runtime``)."""
         return await self._allocation_boundary().get_subagent_runtime(
-            parent_session_key, agent=agent
+            parent_session_key,
+            agent=agent,
+            start_priority=start_priority,
+            on_gate_queued=on_gate_queued,
+            on_gate_acquired=on_gate_acquired,
         )
 
     async def release_subagent_runtime(
@@ -2189,11 +2286,16 @@ class SessionManager:
         )
 
     async def _get_or_bootstrap_run_runtime(
-        self, parent_session_key: str, *, agent: str | None = None, cwd: str | None = None
+        self,
+        parent_session_key: str,
+        *,
+        agent: str | None = None,
+        cwd: str | None = None,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> "AcpRuntime":
         """Get or bootstrap a task-runner shared runtime."""
         return await self._allocation_boundary()._get_or_bootstrap_run_runtime(
-            parent_session_key, agent=agent, cwd=cwd
+            parent_session_key, agent=agent, cwd=cwd, start_priority=start_priority
         )
 
     async def _reacquire_and_validate(
@@ -2225,8 +2327,10 @@ class SessionManager:
         cwd: str | None = None,
         approval_policy: str = "",
         _won_race_retries: int = 0,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> tuple[LLMProvider, bool, bool]:
-        """Open a task session on its run-scoped shared runtime."""
+        """Open a task session on its run-scoped shared runtime (``start_priority``:
+        rule ``kiro_crew.start_priority``)."""
         return await self._allocation_boundary().open_task_session(
             parent_session_key,
             session_key,
@@ -2234,6 +2338,7 @@ class SessionManager:
             cwd=cwd,
             approval_policy=approval_policy,
             _won_race_retries=_won_race_retries,
+            start_priority=start_priority,
         )
 
     def _get_session_agent(self, session_key: str) -> str:
@@ -2452,9 +2557,14 @@ class SessionManager:
         speculative_resume: bool = False,
         wait_if_busy: bool = True,
         _won_race_retries: int = 0,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
         **extra_factory_kwargs: Any,
     ) -> tuple[LLMProvider, bool, bool]:
-        """Claim or allocate a session and return its held lease."""
+        """Claim or allocate a session and return its held lease.
+
+        ``start_priority`` orders a cold start in the start queues; a caller passes
+        FOREGROUND only where a person waits on it (rule: ``kiro_crew.start_priority``).
+        """
         return await self._allocation_boundary().get_or_create(
             key,
             agent=agent,
@@ -2467,6 +2577,7 @@ class SessionManager:
             speculative_resume=speculative_resume,
             wait_if_busy=wait_if_busy,
             _won_race_retries=_won_race_retries,
+            start_priority=start_priority,
             **extra_factory_kwargs,
         )
 
@@ -2562,6 +2673,21 @@ class SessionManager:
         finally:
             boundary.end_ending(key)
 
+    def compact_wait_budget_secs(self) -> float:
+        """The compaction wait budget this manager's config is in force with.
+
+        The ONE resolver for ``session.compact_wait_secs``: the automatic
+        coordinator, the task runner's context-overflow compaction, the
+        dashboard ``/compact`` and every chat channel's compact command and
+        near-limit compaction all hold this manager and read the budget here,
+        so no caller can resolve the key differently. The manager's config is
+        the one the process booted with, re-adopted on every live change, so a
+        change applies to the next compaction, and a standalone
+        ``kirocrew run`` (no live-config watcher) still honours the key. Read
+        per call -- a plain attribute read, safe on the event loop.
+        """
+        return _resolve_compact_wait_secs(self._cfg.session.compact_wait_secs)
+
     def check_context_usage(self, key: str, provider: LLMProvider) -> float:
         """Delegate context accounting and compaction triggering."""
         return self._compaction.check_context_usage(key, provider)
@@ -2608,6 +2734,14 @@ class SessionManager:
     def set_compact_callback(self, cb: _CompactCallback | None) -> None:
         """Register the compaction completion callback."""
         self._compaction.set_compact_callback(cb)
+
+    def set_compacting_callback(self, cb: Callable[[str, bool], None] | None) -> None:
+        """Register the observer told when a session enters or leaves compaction."""
+        self._compaction.set_compacting_callback(cb)
+
+    def is_compacting(self, key: str) -> bool:
+        """Whether an automatic compaction is in flight on *key* right now."""
+        return self._compaction.is_compacting(key)
 
     def mark_needs_reinjection(self, key: str) -> None:
         """Mark a live session for one-shot context reinjection."""
@@ -2890,9 +3024,11 @@ class SessionManager:
             key, pct_before, pct_after, expect=expect
         )
 
-    async def _fire_compact_callback(self, key: str, pct: float, *, success: bool) -> None:
+    async def _fire_compact_callback(
+        self, key: str, pct: float, *, success: bool, outcome: str | None = None
+    ) -> None:
         """Delegate compaction callback dispatch."""
-        await self._compaction._fire_compact_callback(key, pct, success=success)
+        await self._compaction._fire_compact_callback(key, pct, success=success, outcome=outcome)
 
     async def _fire_recycle_callback(self, key: str, *, reason: str) -> None:
         """Dispatch a lifecycle recycle callback through the lifecycle boundary."""
@@ -3019,8 +3155,15 @@ class SessionManager:
         self._allocation_boundary().begin_turn(key)
 
     async def pause_turn_admission_for_update(self) -> bool:
-        """Block new turns for update apply without overriding real shutdown."""
+        """Block new turns for update apply without overriding real shutdown.
+
+        Refused once a gateway stop is signalled: an apply admitted then would
+        be stopped mid-write by the shutdown that follows. Checked under the
+        lock, so a stop landing while the lock is contended is still seen.
+        """
         async with self._lock:
+            if shutdown_event.is_set():
+                return False
             if self._closing and not self._update_pause_owned:
                 return False
             self._closing = True
@@ -3035,14 +3178,23 @@ class SessionManager:
         self.update_restart_fenced = True
         return True
 
-    async def resume_turn_admission_after_update(self) -> None:
-        """Release this caller's temporary update pause, if it still owns it."""
+    async def resume_turn_admission_after_update(self) -> bool:
+        """Release this caller's temporary update pause, if it still owns it.
+
+        Returns True only when admission actually reopened. Kept once a gateway
+        stop is signalled: the shutdown stops the update first, so this runs at
+        its start, and a paused admission keeps refusing (and spooling) inbound
+        turns that reopened admission would admit only for the teardown to
+        cancel. Checked under the same lock as the release, so a stop landing
+        while the lock is contended is still seen.
+        """
         async with self._lock:
-            if not self._update_pause_owned:
-                return
+            if not self._update_pause_owned or shutdown_event.is_set():
+                return False
             self.update_restart_fenced = False
             self._update_pause_owned = False
             self._closing = False
+            return True
 
     # ── Per-session semaphore ──
 
@@ -3115,6 +3267,10 @@ class SessionManager:
         """Delete a persisted conversation and continuable mark."""
         return self._allocation_boundary().forget_conversation(key)
 
+    def forget_conversation_if_sid(self, key: str, expected_sid: str) -> tuple[bool, str | None]:
+        """Delete a persisted conversation only if its SID still matches."""
+        return self._allocation_boundary().forget_conversation_if_sid(key, expected_sid)
+
     def conversation_provider(self, key: str) -> str:
         """Return the persisted provider label for a folded key."""
         return self._allocation_boundary().conversation_provider(key)
@@ -3163,8 +3319,25 @@ class SessionManager:
         """Consume a queued-message cancellation marker."""
         return self._allocation_boundary().is_cancelled(key, msg_ts)
 
-    def clear_queue(self, key: str, owned_by: Callable[[dict], bool] | None = None) -> None:
+    def detach_queue(self, key: str) -> tuple[Any, ...]:
+        """Take the queued entries out of the live queue, keeping their files."""
+        return self._allocation_boundary().detach_queue(key)
+
+    def restore_queue(self, key: str, entries: tuple[Any, ...]) -> None:
+        """Put ``detach_queue``'s entries back at the head of the queue."""
+        self._allocation_boundary().restore_queue(key, entries)
+
+    def clear_queue(
+        self,
+        key: str,
+        owned_by: Callable[[dict], bool] | None = None,
+        *,
+        only: tuple[Any, ...] | None = None,
+    ) -> None:
         """Clear queued messages and their temporary paths.
+
+        *only* narrows the clear to the handles ``detach_queue`` returned, so a
+        Stop drops what was queued when it was pressed and nothing admitted since.
 
         *owned_by* narrows the clear to the entries it selects, for a caller acting for
         ONE principal rather than for the whole session: under
@@ -3178,7 +3351,7 @@ class SessionManager:
         Omitted, the whole queue goes, which is what a whole-session request means:
         teardown, a generation bump, a fresh conversation.
         """
-        self._allocation_boundary().clear_queue(key, owned_by)
+        self._allocation_boundary().clear_queue(key, owned_by, only=only)
 
     async def is_provider_alive(self, key: str) -> bool | None:
         """Probe a folded session provider outside the registry lock."""
@@ -3271,6 +3444,11 @@ class SessionManager:
     def mirror_accepts_inbound(self, key: str) -> bool:
         """True iff this session's mirror is a session-resume (two-way) binding."""
         return self._session_map.mirror_accepts_inbound(key)
+
+    def has_mirror_row(self, key: str) -> bool:
+        """Whether an explicit ``mirror`` row is stored under exactly *key* (no Slack
+        synthesis, no legacy-row fallback); see ``SessionMap.has_mirror_row``."""
+        return self._session_map.has_mirror_row(key)
 
     def mirror_link_nonce(self, key: str) -> str:
         """The per-binding nonce of the mirror ``get_mirror_link`` returns (``""`` for none)."""

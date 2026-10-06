@@ -222,7 +222,7 @@ def test_from_env_resolves_session_key(topo, monkeypatch, view) -> None:
     _wire_common(monkeypatch, topo, view)
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup(view))
     # from_env imports config_dir lazily from the loader module.
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
 
     ctx = mcp_caller.CallerContext.from_env()
     assert ctx.session_key == SESSION_KEY
@@ -240,7 +240,7 @@ def test_mcp_core_resolves_session_key(topo, monkeypatch, view) -> None:
 
     _wire_common(monkeypatch, topo, view)
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup(view))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
 
     assert mcp_core._resolve_session_key() == SESSION_KEY
 
@@ -259,7 +259,9 @@ def test_mcp_core_resolves_session_key(topo, monkeypatch, view) -> None:
 
 
 @pytest.mark.parametrize("view", VIEWS)
-def test_mcp_shared_policy_walk_reaches_gateway(topo, monkeypatch, view) -> None:
+def test_mcp_shared_policy_walk_resolves_but_fails_closed_without_dialling(
+    topo, monkeypatch, view
+) -> None:
     from kiro_crew import mcp_shared
 
     # Reset the module-lifetime policy caches so a prior test (or the
@@ -271,7 +273,7 @@ def test_mcp_shared_policy_walk_reaches_gateway(topo, monkeypatch, view) -> None
 
     monkeypatch.setattr(mcp_shared, "resolve_client_port_src", lambda port: (5476, "config"))
     monkeypatch.setattr(mcp_shared, "config_dir", lambda: topo.cfg_dir)
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
     (topo.cfg_dir / ".local_secret").write_text("s")
 
     topo.write_session_pid(KIRO_CLI)  # direct parent of MCP_SERVER
@@ -284,12 +286,26 @@ def test_mcp_shared_policy_walk_reaches_gateway(topo, monkeypatch, view) -> None
     urlopen = MagicMock(return_value=response)
     monkeypatch.setattr(mcp_shared, "loopback_urlopen", urlopen)
 
-    assert mcp_shared._resolve_tool_policy().excluded == set()
-    # The walk must have RESOLVED a session key and reached the gateway —
-    # under pidns it resolves empty and returns unresolved without the call.
-    assert urlopen.called
-    request = urlopen.call_args[0][0]
-    assert request.get_header("X-session-key") == SESSION_KEY
+    policy = mcp_shared._resolve_tool_policy()
+    # ``tools/list`` stays complete either way (an unresolved policy lists
+    # everything), so the exclusion set is empty, and a walk-resolved key
+    # carries NO attestation -- no signed token on the element, no
+    # gateway-injected ``KIROCREW_SESSION_KEY`` -- so dialling the gateway under
+    # it would be answered ``member_identity_unavailable`` on every call. The
+    # resolver skips that futile dial. True under BOTH views, so it is not the
+    # xfail-sensitive line.
+    assert policy.excluded == set()
+    assert not urlopen.called
+    # Fail CLOSED: a key resolved (host view), so an operator exclusion may
+    # exist and ``tools/call`` must refuse rather than widen it. The reason is
+    # in ``_UNRESOLVED_REFUSES_CALL``. This is the xfail-sensitive line: under
+    # pidns getppid() is ns-local, no file resolves, and the branch returns
+    # ``no_session_key`` instead -- which is what the strict pidns xfail records.
+    assert policy.unresolved == "identity_unattestable"
+    assert policy.unresolved in mcp_shared._UNRESOLVED_REFUSES_CALL
+    # The unsigned ``session_pid`` ancestor walk resolves the HOST key under the
+    # host view; empty under pidns.
+    assert mcp_shared._policy_session_key() == SESSION_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +320,7 @@ def test_stub_caller_block_carries_session_key(topo, monkeypatch, view) -> None:
 
     _wire_common(monkeypatch, topo, view)
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup(view))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
 
     caller = stub._build_caller_block(None)
     assert caller["session_key"] == SESSION_KEY
@@ -404,7 +420,7 @@ def _wire_shared_caller(monkeypatch, topo: ProcessTopology, *, token: str = "") 
 
     _wire_shared(monkeypatch, topo, token=token)
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup("host"))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
 
 
 def _published(tmp_path: Path, monkeypatch, *, co_tenants) -> str:
@@ -524,7 +540,7 @@ def test_mcp_core_refuses_a_co_tenants_key(shared_topo, monkeypatch, caplog) -> 
 
     _wire_shared(monkeypatch, shared_topo)
     monkeypatch.setattr(mcp_caller, "_parent_pid", shared_topo.parent_lookup("host"))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: shared_topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: shared_topo.cfg_dir)
     with caplog.at_level(logging.WARNING):
         assert mcp_core._resolve_session_key() == ""
     assert "co-tenant" in caplog.text
@@ -535,7 +551,7 @@ def test_mcp_core_names_the_co_tenant_from_its_own_token(shared_topo, monkeypatc
 
     _wire_shared(monkeypatch, shared_topo, token=CO_TENANT_TOKEN)
     monkeypatch.setattr(mcp_caller, "_parent_pid", shared_topo.parent_lookup("host"))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: shared_topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: shared_topo.cfg_dir)
     assert mcp_core._resolve_session_key() == CO_TENANT_KEY
 
 
@@ -551,7 +567,7 @@ def _wire_shared_policy(monkeypatch, topo: ProcessTopology, *, token: str = "") 
     monkeypatch.setattr(mcp_shared, "_failure_count", 0)
     monkeypatch.setattr(mcp_shared, "resolve_client_port_src", lambda port: (5476, "config"))
     monkeypatch.setattr(mcp_shared, "config_dir", lambda: topo.cfg_dir)
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
     (topo.cfg_dir / ".local_secret").write_text("s")
     _wire_shared(monkeypatch, topo, token=token)
     response = MagicMock()
@@ -607,7 +623,7 @@ def test_mcp_shared_policy_still_proceeds_when_nothing_has_named_the_session(
     empty.mkdir()
     (empty / ".local_secret").write_text("s")
     monkeypatch.setattr(mcp_shared, "config_dir", lambda: empty)
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: empty)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: empty)
 
     policy = mcp_shared._resolve_tool_policy()
     assert policy.unresolved == "no_session_key"
@@ -802,7 +818,7 @@ def test_the_token_outranks_a_stale_pid_mapping(topo, monkeypatch, resolver) -> 
     topo.write_session_pid(KIRO_CLI, SESSION_KEY)
     _wire_common(monkeypatch, topo, "host")
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup("host"))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
     monkeypatch.setattr(
         session_token_sig,
         "verify_session_token",
@@ -837,7 +853,7 @@ def _wire_protected(monkeypatch, topo, answer, *, raises: bool = False) -> None:
 
     _wire_common(monkeypatch, topo, "host")
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup("host"))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
 
     def probe(pid):
         if raises:
@@ -932,7 +948,7 @@ def test_from_env_host_pid_env_resolves_in_any_view(topo, monkeypatch, view) -> 
 
     _wire_common(monkeypatch, topo, view)
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup(view))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
     # The launcher (session host) exported its HOST pid before unshare.
     monkeypatch.setenv("KIROCREW_HOST_PID", str(SESSION_HOST))
 
@@ -947,7 +963,7 @@ def test_mcp_core_host_pid_env_resolves_in_any_view(topo, monkeypatch, view) -> 
 
     _wire_common(monkeypatch, topo, view)
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup(view))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
     monkeypatch.setenv("KIROCREW_HOST_PID", str(SESSION_HOST))
 
     assert mcp_core._resolve_session_key() == SESSION_KEY
@@ -997,7 +1013,7 @@ def test_from_env_refuses_symlinked_pid_file(topo, monkeypatch) -> None:
     _plant_symlink(topo, SESSION_HOST)
     _wire_common(monkeypatch, topo, "host")
     monkeypatch.setattr(mcp_caller, "_parent_pid", topo.parent_lookup("host"))
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
 
     ctx = mcp_caller.CallerContext.from_env()
     assert ctx.session_key == ""
@@ -1013,7 +1029,7 @@ def test_mcp_shared_refuses_symlinked_pid_file(topo, monkeypatch) -> None:
 
     monkeypatch.setattr(mcp_shared, "resolve_client_port_src", lambda port: (5476, "config"))
     monkeypatch.setattr(mcp_shared, "config_dir", lambda: topo.cfg_dir)
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: topo.cfg_dir)
+    monkeypatch.setattr("kiro_crew.config.paths.config_dir", lambda: topo.cfg_dir)
     (topo.cfg_dir / ".local_secret").write_text("s")
 
     # Symlink at the DIRECT parent's path (where the resolvable-case test
@@ -1122,7 +1138,7 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "the client-declared X-Session-Key header, degrades to status quo "
         "when unresolvable"
     ),
-    "sandbox.py": (
+    "sandbox_launcher.py": (
         "writer-adjacent: launcher exports KIROCREW_HOST_PID (its own HOST pid — "
         "the exact pid the gateway keys the file by) before fork/namespace work, "
         "so in-namespace readers can look the file up directly without a /proc walk"

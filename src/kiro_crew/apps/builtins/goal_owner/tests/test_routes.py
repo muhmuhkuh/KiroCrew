@@ -152,6 +152,34 @@ async def test_create_pause_resume_reconciles_one_job(tmp_path: Path) -> None:
         assert len(cron.jobs) == 1
 
 
+async def test_partial_reconciliation_preserves_saved_goal_and_error_code(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path, _Cron())
+    registered = routes.register_routes(ctx)
+    create = _route(registered, "POST", "/goals")
+    pause = _route(registered, "POST", "/goals/{goal_id}/pause")
+    report = routes.ReconcileReport(errors=["scheduler unavailable"])
+    with (
+        mock.patch.object(routes, "is_app_enabled", return_value=True),
+        mock.patch.object(routes, "_reconcile", new=mock.AsyncMock(return_value=report)),
+    ):
+        created = await create.handler(
+            _request({"goal": "ship", "definition_of_done": "done"}), ctx
+        )
+        body = _payload(created)
+        goal_id = body["goal"]["goal_id"]
+        assert created.status == 503
+        assert body["code"] == "scheduler_reconcile_failed"
+        assert body["scheduler"]["errors"] == 1
+        paused = await pause.handler(_request(match_info={"goal_id": goal_id}), ctx)
+        body = _payload(paused)
+        assert paused.status == 503
+        assert body["code"] == "scheduler_reconcile_failed"
+        assert body["goal"]["status"] == "paused"
+        assert body["scheduler"]["errors"] == 1
+        stored = routes._store(ctx).get(goal_id)
+        assert stored is not None and stored.status == routes.GoalStatus.PAUSED
+
+
 async def test_create_requires_scheduler(tmp_path: Path) -> None:
     ctx = _ctx(tmp_path)
     create = _route(routes.register_routes(ctx), "POST", "/goals")

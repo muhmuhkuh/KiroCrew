@@ -324,7 +324,8 @@ class TestWhatThisSetGrants:
     A spec that references this server gets every tool in it — there is no
     per-tool granularity in the mount. That is sound for the current tools: they
     grant no read the agent lacks (``list_sessions`` in core already returns every
-    session's title and key) and delete nothing. It stops being sound the moment a
+    session's title and key) and delete nothing that holds anything (the one
+    delete verb, ``chat_folder_delete``, accepts only an empty folder). It stops being sound the moment a
     capability with real blast radius is added to this same set, because granting
     the folder tools would silently grant that too.
 
@@ -338,6 +339,11 @@ class TestWhatThisSetGrants:
         "chat_folder_move",
         "chat_folder_move_session",
         "chat_folder_file_self",
+        # Empty-only and creator-only: the endpoint's ``if_empty`` mode refuses
+        # a folder holding a subfolder or a live or archived session instead of
+        # unfiling it, refuses a folder the calling session did not create or
+        # the person has touched, and refuses every app and crew-member caller.
+        "chat_folder_delete",
     }
     #: The tag half of sidebar organization. Same posture as the folder tools —
     #: read, create, update (rename/recolor/status) and assign; no delete — so
@@ -353,6 +359,9 @@ class TestWhatThisSetGrants:
     #: Pinning. Same posture as tag assignment: one metadata flag on a live
     #: session the caller may already file and tag, nothing deleted.
     PIN_TOOLS = {"chat_session_pin"}
+    #: Board columns. Same posture as the tag tools: read, append and reorder;
+    #: no delete and no retag, so nothing the person put on the board is lost.
+    COLUMN_TOOLS = {"chat_tag_column_list", "chat_tag_column_create", "chat_tag_column_move"}
     #: The session-control half. Granted by the SAME assignment as the folder
     #: half — see ``test_session_driving_tools_ship_with_the_folder_tools`` for
     #: why the two classes ride together rather than in two servers.
@@ -360,7 +369,11 @@ class TestWhatThisSetGrants:
         "session_create",
         "session_fork",
         "session_stop",
+        # Wakes a created session from `wait` through the same parked request
+        # the End-wait button writes; nothing discarded, same target fence.
+        "session_end_wait",
         "session_set_model",
+        "session_reload",
         "session_close",
         "session_revive",
         "session_send",
@@ -378,7 +391,7 @@ class TestWhatThisSetGrants:
         "session_read_message",
         "session_summary",
     }
-    GRANTED_TOOLS = FOLDER_TOOLS | TAG_TOOLS | PIN_TOOLS | SESSION_TOOLS
+    GRANTED_TOOLS = FOLDER_TOOLS | TAG_TOOLS | COLUMN_TOOLS | PIN_TOOLS | SESSION_TOOLS
 
     def test_the_set_is_exactly_the_folder_tools(self) -> None:
         from kiro_crew import mcp_dashboard

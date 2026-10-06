@@ -49,12 +49,18 @@ from .pump import _PumpMixin
 from .taskq_bridge import _TaskqBridgeMixin
 from .types import (
     FAIRNESS_SETTINGS_TTL_SECS,
+    MEMORY_WAIT_UNTIL_KEY,
     TASK_STORE_UNAVAILABLE_CODE,
+    WINDOW_ENTRY_RECOVERING,
     CapacityView,
     ClaimPoint,
     DeferPoint,
     FairnessSettings,
+    MemoryReadPoint,
     PreparedSpawn,
+    QueuedReadUnavailable,
+    QueuedRun,
+    QueuedRunListing,
 )
 from .waits import _WaitsMixin
 
@@ -81,6 +87,8 @@ class SpawnAdmissionCoordinator(
     #: Read through ``self`` from the rebound ``spawn_impl``, where this
     #: package's globals are not in scope.
     TASK_STORE_UNAVAILABLE_CODE = TASK_STORE_UNAVAILABLE_CODE
+    WINDOW_ENTRY_RECOVERING = WINDOW_ENTRY_RECOVERING
+    MEMORY_WAIT_UNTIL_KEY = MEMORY_WAIT_UNTIL_KEY
 
 
 def _hoist_impls(cls: type) -> None:
@@ -100,11 +108,17 @@ _hoist_impls(SpawnAdmissionCoordinator)
 
 __all__ = [
     "FAIRNESS_SETTINGS_TTL_SECS",
+    "MEMORY_WAIT_UNTIL_KEY",
     "TASK_STORE_UNAVAILABLE_CODE",
+    "WINDOW_ENTRY_RECOVERING",
     "CapacityView",
     "ClaimPoint",
     "DeferPoint",
     "FairnessSettings",
+    "MemoryReadPoint",
     "PreparedSpawn",
+    "QueuedReadUnavailable",
+    "QueuedRun",
+    "QueuedRunListing",
     "SpawnAdmissionCoordinator",
 ]

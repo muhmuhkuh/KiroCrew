@@ -413,6 +413,31 @@ async def test_app_call_rejects_unknown_spool_id(apps_flag_on, spool_tmp):
         await live.aclose()
 
 
+@pytest.mark.parametrize(
+    "forged",
+    ["\u00e9" * 8, "\u4e2d\u6587", chr(0xDCFF), "x" + chr(0xD800)],
+    ids=["non_ascii", "cjk", "lone_surrogate", "high_surrogate"],
+)
+async def test_app_call_non_ascii_secret_takes_the_audited_deny(apps_flag_on, spool_tmp, forged):
+    """`hmac.compare_digest` raises TypeError on non-ASCII str; the bytes
+    comparison keeps a forged capability carrying one non-ASCII character on the
+    audited deny path instead of an unaudited dropped connection.
+
+    The capability gate runs before any backend work, so no live server is
+    needed — a spare pool is enough, exactly as for the other pre-forward deny
+    tests. The sibling endpoint (``/api/mcp-apps/message``) pins the same shape
+    at ``test_mcp_apps_message_endpoint.py``.
+    """
+    pool = BackendPool(max_backends=2)
+    spool_id = _spool_record()
+    reply = await handle_app_call(pool, {
+        "type": "app-call", "spool_id": spool_id, "callback_secret": forged,
+        "tool": "save_state", "arguments": {},
+    })
+    assert reply["type"] == "app-call-rejected"
+    assert reply["reason"] == "invalid app callback capability"
+
+
 async def test_app_call_rejects_when_no_backend(apps_flag_on, spool_tmp):
     """A valid token whose PRODUCING backend is gone is refused — no fallback
     to another backend for the same server."""
@@ -812,3 +837,46 @@ async def test_app_call_requires_callback_secret(apps_flag_on, spool_tmp):
         assert "callback capability" in missing["reason"]
     finally:
         await live.aclose()
+
+
+class _InboxBackend:
+    """Just the four calls ``_roundtrip`` makes, over a pre-filled inbox."""
+
+    def __init__(self, *lines: bytes) -> None:
+        self.inbox: asyncio.Queue[bytes] = asyncio.Queue()
+        for line in lines:
+            self.inbox.put_nowait(line)
+        self.detached: list[str] = []
+
+    async def attach_stub(self, stub_uuid: str) -> "asyncio.Queue[bytes]":
+        return self.inbox
+
+    async def forward_from_stub(self, stub_uuid: str, frame: dict, **kwargs) -> None:
+        return None
+
+    async def cancel_in_flight_for_stub(self, stub_uuid: str) -> None:
+        return None
+
+    async def detach_stub(self, stub_uuid: str) -> None:
+        self.detached.append(stub_uuid)
+
+
+@pytest.mark.asyncio
+async def test_the_round_trip_skips_stray_frames_to_its_own_response():
+    """``RecursionError`` is not a ``ValueError``: unlisted, a frame nested past
+    the decoder's ceiling failed the app call instead of costing one frame."""
+    from stray_line_helpers import STRAY_LINES
+
+    from kiro_crew.mcp_gateway import app_call as app_call_mod
+
+    reply = {"jsonrpc": "2.0", "id": 4, "result": {"ok": True}}
+    backend = _InboxBackend(
+        *(make() for make in STRAY_LINES.values()),
+        (json.dumps(reply) + "\n").encode("utf-8"),
+    )
+    got = await asyncio.wait_for(
+        app_call_mod._roundtrip(backend, {"id": 4, "method": "tools/call"}, caller=None, timeout=10),
+        timeout=10,
+    )
+    assert got == reply
+    assert len(backend.detached) == 1

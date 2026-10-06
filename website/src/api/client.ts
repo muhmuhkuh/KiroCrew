@@ -108,6 +108,8 @@ export type {
   SecurityPostureData,
   TrustedAppsData,
   TrustedAppsRevokeResult,
+  TrustedRegistryRow,
+  TrustedRegistriesData,
   ManagedSecret,
   SecretsListResponse,
 } from './client/security'
@@ -206,8 +208,12 @@ export type {
   FileMenuContext,
 } from './client/apps'
 export type { AppPublishProvider } from './client/artifacts'
+export { browserInstallConflictJob } from './client/browserAndComputerUse'
 export type {
   BrowserInstallData,
+  BrowserEngine,
+  BrowserEngineStatus,
+  BrowserInstallJob,
   BrowserViewData,
   BrowserOpenData,
   ComputerUsePermissions,

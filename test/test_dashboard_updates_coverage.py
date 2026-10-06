@@ -141,8 +141,11 @@ class _FakeProc:
             raise ProcessLookupError("already gone")
 
 
-def _sequence_procs(monkeypatch, procs: list[_FakeProc]) -> list[tuple[str, ...]]:
-    """Serve *procs* in order to successive ``create_subprocess_exec`` calls."""
+def _sequence_procs(monkeypatch, procs: list[_FakeProc | OSError]) -> list[tuple[str, ...]]:
+    """Serve *procs* in order to successive ``create_subprocess_exec`` calls.
+
+    An ``OSError`` in the sequence is raised by that spawn instead.
+    """
     argv_seen: list[tuple[str, ...]] = []
     pending = list(procs)
 
@@ -150,7 +153,10 @@ def _sequence_procs(monkeypatch, procs: list[_FakeProc]) -> list[tuple[str, ...]
         argv_seen.append(tuple(str(a) for a in args))
         if not pending:
             raise AssertionError(f"unexpected extra subprocess: {args}")
-        return pending.pop(0)
+        served = pending.pop(0)
+        if isinstance(served, OSError):
+            raise served
+        return served
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
     return argv_seen
@@ -461,11 +467,21 @@ class TestAutoUpdateToggle:
             wrote.append(mutate({"agent": {"model": "x"}}))
 
         monkeypatch.setattr(updates, "update_config_locked", _apply)
+        # The writer above is a stand-in, so pin what a reload would now see.
+        cfg = MagicMock()
+        cfg.auto_update = False
+        monkeypatch.setattr(updates.KiroCrewConfig, "load", staticmethod(lambda: cfg))
 
         resp = await updates.api_update_auto(_request({"enabled": False}))
 
         assert resp.status == 200
-        assert json.loads(resp.body.decode()) == {"ok": True, "auto_update": False}
+        assert json.loads(resp.body.decode()) == {
+            "ok": True,
+            # The EFFECTIVE value, re-read after the write.
+            "auto_update": False,
+            "requested": False,
+            "overlay_override": False,
+        }
         assert wrote == [{"agent": {"model": "x"}, "auto_update": False}]
 
     @pytest.mark.asyncio
@@ -481,6 +497,114 @@ class TestAutoUpdateToggle:
 
         assert resp.status == 200
         assert wrote == [{"auto_update": True}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", ["false", "true", 0, 1, None, [], {}])
+    async def test_a_non_boolean_flag_is_refused_without_writing(self, monkeypatch, enabled):
+        """Stored verbatim and read for truthiness: ``"false"`` would read as ON."""
+        wrote: list[dict] = []
+        monkeypatch.setattr(
+            updates, "update_config_locked", lambda _p, *, mutate: wrote.append(mutate({}))
+        )
+
+        resp = await updates.api_update_auto(_request({"enabled": enabled}))
+
+        assert resp.status == 400
+        assert json.loads(resp.body.decode())["code"] == "invalid_enabled"
+        assert wrote == []
+
+    @pytest.mark.asyncio
+    async def test_an_overlay_owned_switch_is_refused_without_writing(self, monkeypatch, tmp_path):
+        """config.local.json deep-merges over the file this endpoint writes.
+
+        A 200 there would show the switch flipped while the next load snaps it
+        back, so the write is refused with the reason, like the other
+        overlay-owned settings.
+        """
+        from kiro_crew.config import loader
+
+        local = tmp_path / "config.local.json"
+        local.write_text(json.dumps({"auto_update": True}), encoding="utf-8")
+        monkeypatch.setattr(loader, "config_local_path", lambda: local)
+        wrote: list[dict] = []
+        monkeypatch.setattr(
+            updates, "update_config_locked", lambda _p, *, mutate: wrote.append(mutate({}))
+        )
+
+        req = _request({"enabled": False})
+        resp = await updates.api_update_auto(req)
+
+        body = json.loads(resp.body.decode())
+        assert resp.status == 409
+        assert body["code"] == "auto_update_overlay_owned"
+        assert body["overlay_override"] is True
+        assert "config.local.json" in body["error"]
+        assert wrote == []
+        req.app["state"].push_refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_response_reports_the_effective_value_after_the_write(self, monkeypatch):
+        """Read back after the merge, never echoed from the request."""
+        monkeypatch.setattr(updates, "update_config_locked", lambda _p, *, mutate: mutate({}))
+        cfg = MagicMock()
+        cfg.auto_update = True  # what a concurrent writer left, say
+        monkeypatch.setattr(updates.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+
+        resp = await updates.api_update_auto(_request({"enabled": False}))
+
+        body = json.loads(resp.body.decode())
+        assert resp.status == 200
+        assert body == {
+            "ok": True,
+            "auto_update": True,
+            "requested": False,
+            "overlay_override": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_successful_write_tells_the_other_tabs(self, monkeypatch):
+        """A second open tab must not keep showing the old switch position."""
+        monkeypatch.setattr(updates, "update_config_locked", lambda _p, *, mutate: mutate({}))
+
+        req = _request({"enabled": False})
+        resp = await updates.api_update_auto(req)
+
+        assert resp.status == 200
+        req.app["state"].push_refresh.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_write_sends_no_refresh(self, monkeypatch):
+        req = _request({"enabled": "false"})
+        resp = await updates.api_update_auto(req)
+
+        assert resp.status == 400
+        req.app["state"].push_refresh.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [b"{not json", '{"timezone": "Europe/Z\u00fcrich"}'.encode("cp1252"), b"[]"],
+        ids=["malformed", "non-utf8", "not-an-object"],
+    )
+    def test_an_unreadable_overlay_reports_not_pinned(self, monkeypatch, tmp_path, raw):
+        """Best-effort, like the loader: a bad overlay must not 500 a committed write."""
+        from kiro_crew.config import loader
+
+        local = tmp_path / "config.local.json"
+        local.write_bytes(raw)
+        monkeypatch.setattr(loader, "config_local_path", lambda: local)
+
+        assert loader.overlay_pins("auto_update") is False
+
+    def test_a_nested_key_is_found_by_path(self, monkeypatch, tmp_path):
+        from kiro_crew.config import loader
+
+        local = tmp_path / "config.local.json"
+        local.write_text(json.dumps({"telemetry": {"enabled": False}}), encoding="utf-8")
+        monkeypatch.setattr(loader, "config_local_path", lambda: local)
+
+        assert loader.overlay_pins("telemetry", "enabled") is True
+        assert loader.overlay_pins("telemetry", "beacon_enabled") is False
+        assert loader.overlay_pins("auto_update") is False
 
 
 class TestChangelogCache:
@@ -603,6 +727,23 @@ _UPSTREAM_OID = b"0123456789abcdef0123456789abcdef01234567"
 
 class TestApplyRefusals:
     """``POST /api/update`` — every precondition, and the worker's own failures."""
+
+    @pytest.mark.asyncio
+    async def test_refuses_once_the_gateway_is_shutting_down(self, monkeypatch):
+        """An apply started now would be cut off mid-write by the shutdown."""
+        from types import SimpleNamespace
+
+        from kiro_crew.platform import update_provider
+
+        monkeypatch.setattr(updates, "shutdown_event", SimpleNamespace(is_set=lambda: True))
+        applied = AsyncMock()
+        monkeypatch.setattr(update_provider, "apply_policy_update", applied)
+
+        resp = await updates.api_update_apply(_request({}))
+
+        assert resp.status == 503
+        assert json.loads(resp.body.decode())["code"] == "shutting_down"
+        applied.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_refuses_when_no_project_dir_is_configured(self):
@@ -801,7 +942,7 @@ class TestApplyRefusals:
         assert pin.killed and pin.communicate_calls == 2
         assert req.app["state"]._background_tasks == set()
 
-    async def _drive_worker(self, monkeypatch, tmp_path, procs: list[_FakeProc]):
+    async def _drive_worker(self, monkeypatch, tmp_path, procs: list[_FakeProc | OSError]):
         """Accept the request, then await the background worker it scheduled."""
         from kiro_crew import dep_sync
 
@@ -878,6 +1019,110 @@ class TestApplyRefusals:
         worker_argv = self._argv_seen[4]
         assert worker_argv[:4] == ("git", "merge", "--ff-only", _UPSTREAM_OID.decode())
         assert not any(c[:2] == ("git", "pull") for c in self._argv_seen)
+
+    @pytest.mark.asyncio
+    async def test_the_worker_owns_the_bundle_gap(self, monkeypatch, tmp_path):
+        """The build can empty the served bundle, so the watchdog must see an owner."""
+        from kiro_crew import update_ownership
+
+        seen = []
+
+        async def _build(_proj, _state):
+            seen.append(update_ownership.current_owner())
+
+        async def _pip(_proj, _state):
+            seen.append(update_ownership.current_owner())
+            return False
+
+        monkeypatch.setattr(updates, "_build_frontend", _build)
+        monkeypatch.setattr(updates, "_venv_pip_install", _pip)
+
+        await self._drive_worker(monkeypatch, tmp_path, [_FakeProc()])
+
+        assert seen == ["the dashboard update", "the dashboard update"]
+        assert update_ownership.current_owner() is None
+
+    @pytest.mark.asyncio
+    async def test_the_worker_hands_the_gap_to_the_restart(self, monkeypatch, tmp_path):
+        """No update step is still open around the restart, so its own maximum binds."""
+        from kiro_crew import update_ownership
+
+        open_at_restart = []
+
+        async def _restart(_state, *, resolver=None):
+            open_at_restart.append(list(update_ownership._live))
+            return True
+
+        monkeypatch.setattr(updates, "_build_frontend", AsyncMock())
+        monkeypatch.setattr(updates, "_venv_pip_install", AsyncMock(return_value=True))
+        monkeypatch.setattr(updates, "_restart_gateway", _restart)
+
+        await self._drive_worker(monkeypatch, tmp_path, [_FakeProc()])
+
+        assert open_at_restart == [[]]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reinstall_refuses_the_watchdogs_relaunch(self, monkeypatch, tmp_path):
+        from kiro_crew import update_ownership
+
+        monkeypatch.setattr(updates, "_build_frontend", AsyncMock())
+        monkeypatch.setattr(updates, "_venv_pip_install", AsyncMock(return_value=False))
+
+        await self._drive_worker(monkeypatch, tmp_path, [_FakeProc()])
+
+        assert update_ownership.restart_refusal() is not None
+
+    @pytest.mark.asyncio
+    async def test_a_later_update_whose_merge_fails_keeps_the_refusal(self, monkeypatch, tmp_path):
+        """The unsynced tree the refusal describes is still on disk."""
+        from kiro_crew import update_ownership
+
+        update_ownership.refuse_restart("an earlier install did not complete")
+
+        await self._drive_worker(monkeypatch, tmp_path, [_FakeProc(returncode=1)])
+
+        assert update_ownership.restart_refusal() == "an earlier install did not complete"
+
+    @pytest.mark.asyncio
+    async def test_a_later_update_that_installs_its_tree_ends_the_refusal(
+        self, monkeypatch, tmp_path
+    ):
+        from kiro_crew import update_ownership
+
+        update_ownership.refuse_restart("an earlier install did not complete")
+        monkeypatch.setattr(updates, "_build_frontend", AsyncMock())
+        monkeypatch.setattr(updates, "_venv_pip_install", AsyncMock(return_value=True))
+        monkeypatch.setattr(updates, "_restart_gateway", AsyncMock(return_value=False))
+
+        await self._drive_worker(monkeypatch, tmp_path, [_FakeProc()])
+
+        assert update_ownership.restart_refusal() is None
+
+    @pytest.mark.asyncio
+    async def test_a_merge_that_never_spawned_records_no_refusal(self, monkeypatch, tmp_path):
+        """A fork failure wrote nothing to the checkout, so nothing describes a moved tree."""
+        from kiro_crew import update_ownership
+
+        await self._drive_worker(
+            monkeypatch, tmp_path, [BlockingIOError(11, "Resource temporarily unavailable")]
+        )
+
+        assert self._argv_seen[-1][:3] == ("git", "merge", "--ff-only")
+        assert update_ownership.restart_refusal() is None
+
+    @pytest.mark.asyncio
+    async def test_an_update_that_raises_after_the_merge_refuses_the_relaunch(
+        self, monkeypatch, tmp_path
+    ):
+        from kiro_crew import update_ownership
+
+        monkeypatch.setattr(
+            updates, "_build_frontend", AsyncMock(side_effect=RuntimeError("vite crashed"))
+        )
+
+        await self._drive_worker(monkeypatch, tmp_path, [_FakeProc()])
+
+        assert "after the tree moved" in (update_ownership.restart_refusal() or "")
 
     @pytest.mark.asyncio
     async def test_an_unexpected_crash_surfaces_as_a_failed_update(self, monkeypatch, tmp_path):
@@ -1798,3 +2043,87 @@ class TestExternallyManagedCheck:
         release.set()
         await asyncio.gather(leader, follower)
         assert calls == ["kirocrew"]
+
+
+class TestAnUnexpectedCheckFailureKeepsTheInstallsShape:
+    """A transient raise must not make a managed venv look notify-only.
+
+    ``_set_update_info`` re-seeds ``can_arm`` to False, so the outer handler has
+    to carry it the way the feed-failure paths do — otherwise one unexpected
+    raise (a signature probe, a venv-layout read) hides the in-app update path
+    until the next successful check.
+    """
+
+    @pytest.mark.asyncio
+    async def test_can_arm_and_the_effect_survive_the_failure(self, monkeypatch):
+        from kiro_crew.platform import update_capability, wheel_engine
+
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(update_capability, "_source_checkout_root", lambda: None)
+        monkeypatch.setattr(update_capability, "_runs_from_managed_venv", lambda: True)
+        monkeypatch.setattr(update_capability, "_installer_runs_here", lambda: True)
+        monkeypatch.setattr("kiro_crew.platform_compat.trusted_system_bin", lambda _n: "/bin/sh")
+        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: True)
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_layout.cdn_bases", lambda: ("https://a", "https://b")
+        )
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_governance.update_blocked_reason", lambda _u: ""
+        )
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_governance.update_required", lambda _v: False
+        )
+
+        def _boom():
+            raise RuntimeError("openssl verify blew up")
+
+        monkeypatch.setattr(updates, "derive_capability", _boom)
+        monkeypatch.setattr(updates, "_auto_effect", None)
+        monkeypatch.setattr(updates, "_auto_effect_task", None)
+        monkeypatch.setattr(updates, "_shape_effect", None)
+
+        await updates._run_update_check()
+        await updates.prime_status_auto_update_effect()
+        fields = updates.status_update_fields()
+
+        assert fields["update_check_status"] == "failed"
+        # The in-app update path is still offered, and the switch still says
+        # what the switch does.
+        assert fields["update_can_arm"] is True
+        assert fields["update_auto_effect"] == "install"
+
+
+class TestTheManualCheckRecordsTheEffect:
+    """The user asked, so the derivation's git probes are warranted here.
+
+    Before the update loop's first cycle a status frame can only answer the
+    shapes that need no git; a manual Check answers every shape and records it,
+    so the switch stops reading ``unknown`` without waiting for the loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_check_derives_and_publishes_it(self, monkeypatch):
+        from kiro_crew.platform.update_capability import AutoUpdateEffect
+
+        monkeypatch.setattr(updates, "_auto_effect", None)
+        monkeypatch.setattr(updates, "_auto_effect_task", None)
+        monkeypatch.setattr(updates, "_do_update_check", AsyncMock())
+        monkeypatch.setattr(
+            updates, "auto_update_effect", lambda: AutoUpdateEffect("install", "git")
+        )
+
+        resp = await updates.api_update_check(_request({}))
+
+        body = json.loads(resp.body.decode())
+        assert body["update_auto_effect"] == "install"
+        # Recorded, so the next status frame carries it too.
+        assert updates.status_update_fields()["update_auto_effect"] == "install"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[], "x", 3])
+async def test_a_non_object_auto_update_body_is_a_400_not_a_500(body):
+    resp = await updates.api_update_auto(_request(body))
+    assert resp.status == 400
+    assert json.loads(resp.body.decode())["code"] == "invalid_json"

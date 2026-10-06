@@ -42,6 +42,10 @@ from kiro_crew.vector_memory import (
 # its own copy of the corpus. Grouping keeps the cache single-copy per run.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_vector_memory")
 
+#: Every callable that constructs a store, so each is held to the config= plumbing
+#: rule below. ``declared_store`` builds the store a named store's declaration asks for.
+_STORE_CONSTRUCTORS = ("VectorMemoryStore", "open_member_database", "declared_store")
+
 
 class TestSemanticCRUD:
     def test_set_and_get(self, tmp_path: Path, opened) -> None:
@@ -2600,7 +2604,7 @@ class TestMemoryTuningPlumbing:
         "dashboard/handlers/memory.py",
         "apps/builtins/ops_mission_control/backend/dispatch.py",
         "apps/builtins/ops_mission_control/backend/routes.py",
-        # Named stores: both the V1 constructor and the V2 open_member_database.
+        # Named stores, through declared_store.
         "context.py",
     )
     # Every other file that constructs a store, with the reason the AST guard does
@@ -2608,7 +2612,7 @@ class TestMemoryTuningPlumbing:
     # neither table, so a new store cannot silently fall back to the defaults.
     _EXEMPT_SITES = {
         # Forwards its caller's `**vector_options` unchanged.
-        "vector_memory.py": "open_member_database forwards caller options",
+        "vector_memory.py": "open_member_database and declared_store forward caller options",
         # Builds its store on an arbitrary data_home whose config
         # KiroCrewConfig.load() does not read.
         "onboarding_import.py": "foreign data_home",
@@ -2616,6 +2620,8 @@ class TestMemoryTuningPlumbing:
         "eval/bench/ingest.py": "bench sweep values",
         # The V2 bench harness opens its own throwaway member database.
         "eval/bench/member_v2.py": "bench V2 member database",
+        # The lesson recall bench writes its golden rules into a throwaway store.
+        "eval/bench/lesson_recall.py": "bench lesson recall store",
         # Scenario workspaces are throwaway stores, not the install's memory.
         "eval/runner.py": "eval scenario workspace",
         # Read-only injection audit; it never writes an episode.
@@ -2679,8 +2685,8 @@ class TestMemoryTuningPlumbing:
     def _find_unplumbed_sites(tree, where: str = "") -> list[str]:
         """Report every store construction that does not take ``config=``.
 
-        Each ``VectorMemoryStore(...)``, and each ``open_member_database(...)``
-        (which constructs one), must pass the loaded config as ``config=``: the
+        Each ``VectorMemoryStore(...)``, and each ``open_member_database(...)`` or
+        ``declared_store(...)`` (each constructs one), must pass the loaded config as ``config=``: the
         constructor applies it through ``reconfigure`` before it subscribes to
         the live watcher, so a reload landing during construction is never
         overwritten by the caller's older snapshot. Checked per call, so each
@@ -2705,7 +2711,7 @@ class TestMemoryTuningPlumbing:
                 continue
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-            if name not in ("VectorMemoryStore", "open_member_database"):
+            if name not in _STORE_CONSTRUCTORS:
                 continue
             config = next((kw.value for kw in node.keywords if kw.arg == "config"), None)
             if config is None:
@@ -2743,8 +2749,8 @@ class TestMemoryTuningPlumbing:
     def test_every_construction_site_is_plumbed_or_exempted(self) -> None:
         """A new production store construction must join one of the tables.
 
-        ``open_member_database(...)`` counts: it constructs a store, and the
-        per-site guard checks it the same way.
+        ``open_member_database(...)`` and ``declared_store(...)`` count: each
+        constructs a store, and the per-site guard checks it the same way.
         """
         import ast
         import inspect
@@ -2758,7 +2764,7 @@ class TestMemoryTuningPlumbing:
             rel = src.relative_to(pkg_root).as_posix()
             text = src.read_text(encoding="utf-8")
             if "/tests/" in f"/{rel}" or (
-                "VectorMemoryStore(" not in text and "open_member_database(" not in text
+                not any(f"{name}(" in text for name in _STORE_CONSTRUCTORS)
             ):
                 continue
             tree = ast.parse(text)
@@ -2767,7 +2773,7 @@ class TestMemoryTuningPlumbing:
                     continue
                 func = node.func
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-                if name in ("VectorMemoryStore", "open_member_database"):
+                if name in _STORE_CONSTRUCTORS:
                     found.add(rel)
                     break
         known = set(self._PLUMBED_SITES) | set(self._EXEMPT_SITES)
@@ -4716,15 +4722,19 @@ class TestHandlerOffload1947:
         assert ".get_lessons()" in violations[0]
 
     def test_async_callers_offload_locked_methods(self) -> None:
-        import ast
-
         locked = self._derive_locked_methods()
         root = self._package_root()
         violations: list[str] = []
-        for path in sorted(root.rglob("*.py")):
+        # A violation is an ``async def`` holding ``<expr>.<locked>(...)``, so a module
+        # whose text lacks ``async`` or every locked NAME cannot carry one: narrow to
+        # those off the shared corpus (NFKC-folded, like the parser) and parse one
+        # tree at a time, instead of a private ``rglob`` + ``ast.parse`` of the whole
+        # package on every run of this one test (~6 s of CPU, measured).
+        for path, _text, tree in source_corpus.parsed_candidates(
+            require_all=("async",), require_any=tuple(sorted(locked))
+        ):
             if path == root / "vector_memory.py":
                 continue  # the store may call its own methods inline
-            tree = ast.parse(path.read_text(encoding="utf-8"))
             violations.extend(self._find_inline_calls(tree, locked, str(path.relative_to(root))))
         assert not violations, "\n".join(violations)
 

@@ -5,7 +5,7 @@ import { Badge, EmptyState, ContentSkeleton } from '../../components/ui'
 import Clickable from '../../components/Clickable'
 import { knowledgeApi } from './api'
 import { formatRelativeDate, FALLBACK_SUPPORTED_FORMATS } from './helpers'
-import { parseSourceProps, shouldShowWordCount } from './knowledgeUtils'
+import { parseSourceProps, shouldShowWordCount, syncStatusLabel } from './knowledgeUtils'
 import { fmtCompact, fmtNumber } from '../../i18n/format'
 import type { Source, SourceSpend, NamespaceInfo, IngestionJob, SourceFilesResponse } from './types'
 
@@ -548,7 +548,7 @@ export default function SourcesList({ onIngest, uploadNamespace, setUploadNamesp
                   <div className="flex items-center gap-1 min-w-0 group/name">
                     <span className="text-sm font-medium text-text-strong truncate">{s.name}</span>
                     <button aria-label={i18nT('pages.knowledge.sourcesList.rename_source')} onClick={() => startRename(s)}
-                      className="text-muted shrink-0 p-0.5 rounded opacity-100 sm:opacity-0 sm:group-hover/name:opacity-100 hover:text-text transition-opacity"><Pencil size={12} /></button>
+                      className="text-muted shrink-0 p-0.5 rounded opacity-100 sm:opacity-0 sm:group-hover/name:opacity-100 [@media(hover:none)]:opacity-100 hover:text-text transition-opacity"><Pencil size={12} /></button>
                   </div>
                 )}
                 <div className="text-[11px] text-muted flex items-center gap-1.5 min-w-0">
@@ -594,7 +594,7 @@ export default function SourcesList({ onIngest, uploadNamespace, setUploadNamesp
                   nothing at mid widths. */}
               <div className="flex items-center gap-2 sm:gap-3 flex-wrap justify-end shrink-0 pl-6 sm:pl-0 sm:max-w-[70%]">
               {isDeleting ? <Badge variant="warn">{i18nT('pages.knowledge.sourcesList.deleting')}</Badge> : (
-                <Badge variant={s.sync_status === 'synced' || s.sync_status === 'active' ? 'ok' : s.sync_status === 'error' ? 'err' : s.sync_status === 'paused' ? 'warn' : 'aim'}>{isPending ? i18nT('pages.knowledge.sourcesList.awaiting_confirmation') : s.sync_status}</Badge>
+                <Badge variant={s.sync_status === 'synced' || s.sync_status === 'active' ? 'ok' : s.sync_status === 'error' ? 'err' : s.sync_status === 'paused' ? 'warn' : 'aim'}>{isPending ? i18nT('pages.knowledge.sourcesList.awaiting_confirmation') : syncStatusLabel(s.sync_status, i18nT)}</Badge>
               )}
               <span className="text-[11px] text-muted whitespace-nowrap">{s.item_count ?? 0} {i18nT('pages.knowledge.sourcesList.items')}</span>
               {/* The failed count renders on the identity meta line (the parent owns

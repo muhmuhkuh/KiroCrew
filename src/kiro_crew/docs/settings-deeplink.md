@@ -47,6 +47,13 @@ shipped prebuilt rather than described:
   lands on an empty tab and highlights nothing.
 - **`%3A` in a route is an encoded `:`** and belongs there. Leave it alone.
 
+A control that sits inside a collapsed group on its tab still works: the link
+opens that group on the way in, because the highlight is resolved by finding the
+control on the page and a collapsed group renders none of its rows at all. Only
+the group holding the control opens — other collapsed groups on the same tab are
+left as they were, including one nested inside it — and it stays open afterwards
+rather than closing again the moment the highlight lands.
+
 A route is a dashboard path, so it is clickable only where a dashboard path
 resolves. On a chat channel (Slack, Telegram, Teams, …) prefix it with the
 gateway's own address — `http://localhost:5476/settings/display/sidebar?highlight=…` for
@@ -88,7 +95,7 @@ second form meeting a translated dashboard, not a stale registry.
 - Controls whose label is computed at runtime rather than written in the panel.
   They are skipped by generation, so a control missing from the file is not
   necessarily missing from the UI.
-- Everything outside Settings — the Developer page, Agent Capabilities, and the
+- Everything outside Settings — the Developer page, Customize, and the
   App Store each have their own routes and are not enumerated here.
 - Config keys with no control at all. Those are set in `config.json` or with
   `kirocrew config`; see [configuration.md](configuration.md).

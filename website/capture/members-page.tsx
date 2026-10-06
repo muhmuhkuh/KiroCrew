@@ -16,6 +16,9 @@
  *                   with a Back button that pops the router's history, and a
  *                   stand-in `/elsewhere` route so a frame can show where one
  *                   Back lands after switching members on /members.
+ *
+ * The `capture:frame` kinds a script can fire after mount are listed at the
+ * listener below; `recency` is the one a recording of the Recent sort needs.
  */
 import { createRoot } from 'react-dom/client'
 import { Provider } from 'react-redux'
@@ -23,10 +26,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 
 import MembersPage from '../src/pages/members/MembersPage'
+import { ThemeProvider } from '../src/hooks/useTheme'
 import { initI18n } from '../src/i18n/all'
 import { store } from '../src/store'
 import { sseSlots } from '../src/store/dashboardSlice'
 import { appendSlotMessage, selectSlotMessages, sseChatMessage } from '../src/store/chatSlice'
+import { memberProjectionStore } from '../src/state/memberProjectionStore'
 import '../src/index.css'
 
 /** The two store frames the capture script needs to fire AFTER the page is up
@@ -37,8 +42,28 @@ function busyFrame(slot: string) {
   return sseChatMessage({ slot, role: 'tool', content: '🔧 gh issue list --state open', ts: '2026-08-27T01:00:06Z', meta: { kind: 'shell' } })
 }
 window.addEventListener('capture:frame', (e) => {
-  const d = (e as CustomEvent<{ kind: string; slot: string; text?: string; sendId?: string }>).detail
+  const d = (e as CustomEvent<{
+    kind: string
+    slot: string
+    text?: string
+    sendId?: string
+    slug?: string
+    ts?: number
+    seq?: number
+  }>).detail
   if (d.kind === 'busy') store.dispatch(busyFrame(d.slot))
+  // A pushed `member_projection` roster frame, the way the WebSocket delivers
+  // one: this is how a crewmate's recency advances on the user's own send
+  // without a roster refetch, so a recording of the Recent sort reordering has
+  // to arrive through the same door rather than through a re-fetched roster.
+  if (d.kind === 'recency' && d.slug) {
+    memberProjectionStore.apply(
+      d.slug,
+      'roster',
+      { name: d.slug, slug: d.slug, last_active_ts: d.ts ?? Date.now() / 1000 },
+      d.seq ?? 5,
+    )
+  }
   if (d.kind === 'steer-echo') {
     // The server echoes the sendId it received in the POST's meta; mirror that
     // by reusing the id of the slot's latest optimistic steer bubble, so the
@@ -63,6 +88,10 @@ const nav = params.get('nav') === '1'
 // decide its busy affordance. Documents the steer-only composer.
 const busy = params.get('busy') === '1'
 document.documentElement.setAttribute('data-theme', theme === 'light' ? 'kiro-light' : 'kiro-dark')
+// ThemeProvider reads its cache from storage; without these it would resolve
+// its own default and repaint over the ?theme= the frame asked for.
+localStorage.setItem('mc-theme', theme)
+localStorage.setItem('mc-color-theme', 'kiro')
 
 // Live presence rides the WS `slots` frames; seed the same shape so the
 // Radar dot renders "working" from the store, not from the roster snapshot.
@@ -143,6 +172,9 @@ async function main() {
   createRoot(document.getElementById('root')!).render(
     <Provider store={store}>
       <QueryClientProvider client={queryClient}>
+        {/* The drawer's CrewDashboardFrame reads useTheme(); without the
+            provider the whole page throws on mount. */}
+        <ThemeProvider>
         <MemoryRouter initialEntries={[route]}>
           <div className="h-screen flex flex-col bg-bg text-text" data-capture-root>
             <div className="flex-1 min-h-0">
@@ -158,6 +190,7 @@ async function main() {
             {nav && <CaptionBar />}
           </div>
         </MemoryRouter>
+        </ThemeProvider>
       </QueryClientProvider>
     </Provider>,
   )

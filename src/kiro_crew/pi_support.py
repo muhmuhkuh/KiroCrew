@@ -477,7 +477,7 @@ def _referenced_mcp_servers(spec: dict[str, Any]) -> set[str]:
     return refs
 
 
-def _load_agent_spec(agent: str) -> dict[str, Any]:
+def _load_agent_spec(agent: str, work_dir: str | Path | None = None) -> dict[str, Any]:
     if not agent or Path(agent).name != agent:
         raise RuntimeError(f"Invalid Pi agent name: {agent!r}")
 
@@ -487,15 +487,17 @@ def _load_agent_spec(agent: str) -> dict[str, Any]:
         _MANAGED_MCP_SERVERS,
         build_agent_config,
         ensure_agent_materialized,
+        require_fresh_derived_spec,
     )
 
+    ensure_agent_materialized(agent)
+    snapshot = require_fresh_derived_spec(agent, work_dir)
     spec: dict[str, Any]
     if agent == "kirocrew":
         # Keep the pure builder as the base so current dynamic fields and user
         # overrides win.  The materialized spec carries user-assigned MCP
         # servers that the builder intentionally does not reconstruct.
         spec = build_agent_config()
-        ensure_agent_materialized(agent)
         materialized = _read_agent_json(kiro_agents_dir() / f"{agent}.json")
         if materialized:
             installed_servers = materialized.get("mcpServers")
@@ -514,8 +516,12 @@ def _load_agent_spec(agent: str) -> dict[str, Any]:
                         and isinstance(raw, dict)
                     ):
                         current_servers[name] = dict(raw)
+    elif snapshot is not None:
+        # Use the bytes verified by the gate, not a second read across a revocation.
+        if snapshot.spec is None:
+            raise RuntimeError(f"Verified agent configuration unavailable for Pi backend: {agent}")
+        spec = snapshot.spec
     else:
-        ensure_agent_materialized(agent)
         path = kiro_agents_dir() / f"{agent}.json"
         if not path.is_file():
             raise RuntimeError(f"Agent configuration not found for Pi backend: {path}")
@@ -692,9 +698,11 @@ def _write_pi_launcher() -> Path:
     return target
 
 
-def prepare_pi_environment(env: dict[str, str], *, agent: str, session_key: str) -> None:
+def prepare_pi_environment(
+    env: dict[str, str], *, agent: str, session_key: str, work_dir: str | Path | None = None
+) -> None:
     """Populate the environment consumed by :func:`main` below."""
-    spec = _load_agent_spec(agent)
+    spec = _load_agent_spec(agent, work_dir)
     adapter = resolve_pi_mcp_adapter()
     if adapter is None:
         raise RuntimeError(

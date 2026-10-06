@@ -36,6 +36,7 @@ const storeState: {
 vi.mock('../../store', () => ({
   useAppDispatch: () => dispatch,
   useAppSelector: (fn: (s: unknown) => unknown) => fn(storeState),
+  useAppStore: () => ({ getState: () => storeState }),
 }))
 vi.mock('../../store/chatSlice', () => ({
   createSlot: (arg: unknown) => ({ type: 'createSlot', arg }),
@@ -67,11 +68,16 @@ vi.mock('../../hooks/useTheme', () => ({ useTheme: () => ({ cycle: vi.fn() }) })
 const listApps = vi.fn(async () => [])
 const chatFolders = vi.fn(async () => [] as unknown[])
 const kirocrewConfig = vi.fn(async () => ({}) as unknown)
+// The settings-search governance reads: the root must answer from cache, never fetch.
+const dashboardConfig = vi.fn(async () => ({}) as unknown)
+const tipsStatus = vi.fn(async () => ({}) as unknown)
 vi.mock('../../api/client', () => ({
   api: {
     listApps: (...a: unknown[]) => listApps(...(a as [])),
     chatFolders: (...a: unknown[]) => chatFolders(...(a as [])),
     kirocrewConfig: (...a: unknown[]) => kirocrewConfig(...(a as [])),
+    dashboardConfig: (...a: unknown[]) => dashboardConfig(...(a as [])),
+    tipsStatus: (...a: unknown[]) => tipsStatus(...(a as [])),
   },
 }))
 
@@ -116,12 +122,18 @@ const folderRowOrder = (names: string[]): string[] =>
  * leaves it: a body puts the entry in its success state; `'failed'` runs one
  * rejecting read through the client first, so the entry is in its ERROR state
  * before the bar mounts — the bar itself never fetches that key.
+ *
+ * Pass `client` to reuse one cache across two mounts, which is what the bar does in
+ * production: `QuickSearchSurface` mounts the overlay only while it is open, so a
+ * close and a reopen are an unmount and a remount against the app's one
+ * `QueryClient`.
  */
 async function mount(
   folders: unknown[] = FOLDERS,
-  opts: { seed?: boolean; config?: Record<string, unknown> | 'failed' } = {},
+  opts: { seed?: boolean; config?: Record<string, unknown> | 'failed'; client?: QueryClient } = {},
 ) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const client =
+    opts.client ?? new QueryClient({ defaultOptions: { queries: { retry: false } } })
   if (opts.seed !== false) client.setQueryData(['chat-folders'], folders)
   if (opts.config === 'failed') {
     await client
@@ -134,12 +146,12 @@ async function mount(
     client.setQueryData(['kirocrewConfig'], opts.config)
   }
   const onClose = vi.fn()
-  render(
+  const { unmount } = render(
     <QueryClientProvider client={client}>
       <CommandBarOverlay open onClose={onClose} />
     </QueryClientProvider>,
   )
-  return { onClose, client }
+  return { onClose, client, unmount }
 }
 
 const type = (text: string) => {
@@ -181,13 +193,18 @@ const hasRow = (text: string): boolean =>
  */
 const openFoldersView = async (
   folders: unknown[] = FOLDERS,
-  opts: { seed?: boolean; config?: Record<string, unknown> | 'failed' } = {},
+  opts: { seed?: boolean; config?: Record<string, unknown> | 'failed'; client?: QueryClient } = {},
 ) => {
   const mounted = await mount(folders, opts)
+  await enterFoldersView()
+  return mounted
+}
+
+/** Walk an ALREADY-MOUNTED bar from the root into the folders view. */
+const enterFoldersView = async () => {
   await waitFor(() => expect(hasRow('Search Folders')).toBe(true))
   fireEvent.mouseDown(rowByText('Search Folders'))
   await waitFor(() => expect(screen.getByPlaceholderText('Search all folders…')).toBeTruthy())
-  return mounted
 }
 
 beforeEach(() => {
@@ -255,6 +272,9 @@ describe('command bar — the root', () => {
     // The folder ORDER's settings read is a cache subscription too: the shell holds
     // that entry, and opening the bar must not refetch it.
     expect(kirocrewConfig).not.toHaveBeenCalled()
+    // Nor do the settings rows' governance reads, whatever their age.
+    expect(dashboardConfig).not.toHaveBeenCalled()
+    expect(tipsStatus).not.toHaveBeenCalled()
   })
 })
 
@@ -418,11 +438,12 @@ describe('command bar — folders view', () => {
     )
   })
 
-  it('refuses a STALE Enter, so a fast typist never reveals the wrong folder', async () => {
+  it('latches a debounce-window Enter and reveals the folder on the live rows', async () => {
     // This view ranks from the DEBOUNCED query like every other scoped one, so for one
-    // debounce interval after a keystroke its rows answer the previous query — and an
-    // Enter in that window acts on the row that was selected against it. Reported first
-    // in the crewmates view; the guard is on the activation path all four share.
+    // debounce interval after a keystroke its rows answer the previous query. An Enter
+    // in that window is held, never acting on the row selected against the old query,
+    // and fired once the rows answer what the reader typed. Reported first in the
+    // crewmates view; the latch is on the activation path all four share.
     await openFoldersView()
     type('sydney')
     await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
@@ -437,18 +458,11 @@ describe('command bar — folders view', () => {
       type: 'requestFolderReveal',
       folderId: 'f-syd',
     })
-    // Once the rows catch up, the same Enter reveals what was typed. BOTH halves are
-    // waited on: `Trading Desk` alone is in the unfiltered listing too, so it is already
-    // true before the debounce flushes, and `Sydney Property` alone is false during the
-    // blank frame while the new query fetches — where there is no row to press at all.
-    await waitFor(() => {
-      expect(hasRow('Trading Desk')).toBe(true)
-      expect(hasRow('Sydney Property')).toBe(false)
-    })
-    fireEvent.keyDown(input, { key: 'Enter' })
+    // The latched Enter reveals what was typed on its own, never the stale folder.
     await waitFor(() =>
       expect(dispatch).toHaveBeenCalledWith({ type: 'requestFolderReveal', folderId: 'f-trade' }),
     )
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'requestFolderReveal', folderId: 'f-syd' })
   })
 
   it('still opens the row a POINTER pressed inside that same window', async () => {
@@ -514,6 +528,54 @@ describe('command bar — folders view', () => {
     await openFoldersView(FOLDERS, { seed: false })
     await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
     expect(chatFolders).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops a folder the sidebar deleted, instead of re-listing it from the view cache', async () => {
+    // The view's corpus IS the sidebar's `['chat-folders']` cache, and every folder
+    // write ends in `invalidateQueries({ queryKey: ['chat-folders'] })`
+    // (`ChatSidebar.tsx` create/delete/update). That invalidation has to reach the
+    // rows this view derives from the corpus, or a deleted folder stays on screen
+    // and stays actionable — activating it reveals an id the sidebar no longer has.
+    //
+    // The sequence is the production one: `QuickSearchSurface` mounts the overlay
+    // only while it is open, so closing the bar unmounts the view and reopening it
+    // remounts against the SAME `QueryClient`. A remount refetches only what is
+    // stale, which is why the invalidation is the whole mechanism here.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    chatFolders.mockResolvedValue(FOLDERS)
+    const { unmount } = await openFoldersView(FOLDERS, { client })
+    await waitFor(() => expect(hasRow('Trading Desk')).toBe(true))
+    unmount()
+
+    // The sidebar deletes `Trading Desk`: the gateway now answers without it, and
+    // the mutation invalidates the shared corpus key.
+    const remaining = FOLDERS.filter(f => f.id !== 'f-trade')
+    chatFolders.mockResolvedValue(remaining)
+    await client.invalidateQueries({ queryKey: ['chat-folders'] })
+
+    mount(FOLDERS, { client, seed: false })
+    await enterFoldersView()
+    await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
+    expect(hasRow('Trading Desk')).toBe(false)
+  })
+
+  it('still serves the view from cache when nothing invalidated the corpus', async () => {
+    // The control for the test above: reopening the bar must not re-derive the list
+    // just because it was reopened. Without this, a fix that simply dropped the
+    // view's `staleTime` would pass the regression while paying for a folder read
+    // on every open — the cost the shared key exists to avoid.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    chatFolders.mockResolvedValue(FOLDERS)
+    const { unmount } = await openFoldersView(FOLDERS, { client })
+    await waitFor(() => expect(hasRow('Trading Desk')).toBe(true))
+    unmount()
+    chatFolders.mockClear()
+
+    mount(FOLDERS, { client, seed: false })
+    await enterFoldersView()
+    await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
+    expect(hasRow('Trading Desk')).toBe(true)
+    expect(chatFolders).not.toHaveBeenCalled()
   })
 
   it('reports a failed folder read through ErrorNotice, with Retry still in the list', async () => {

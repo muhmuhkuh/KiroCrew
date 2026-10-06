@@ -63,13 +63,17 @@ vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 // one: it persists the value and announces it, which is how the open sidebar
 // learns that board view was turned on or off.
 const cfg = vi.hoisted(() => ({
-  value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown>,
+  value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
   saveChatConfig: (next: Record<string, unknown>) => {
     cfg.value = next
     window.dispatchEvent(new Event('mc-config-changed'))
+    // Match the real contract: true on a persisted save. The sidebar's board
+    // toggle gates seeding and width-restore on this (GPT 6.1 F1), so a bare
+    // undefined would read as a failed save and skip both.
+    return true
   },
 }))
 
@@ -189,7 +193,7 @@ function openFilterMenu() {
 beforeEach(() => {
   localStorage.clear()
   window.history.replaceState({}, '', '/chat')
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   for (const m of Object.values(mocks)) m.mockReset()
   mocks.chatFolders.mockResolvedValue([])
   mocks.chatTags.mockResolvedValue([])

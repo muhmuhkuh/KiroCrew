@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import json
 import logging
@@ -152,6 +153,19 @@ class TestInstallAgent:
         config = json.loads(path.read_text(encoding="utf-8"))
         assert config["model"] == "claude-default"
         assert "ReadFile" in config["tools"]
+
+    def test_fresh_install_applies_bom_saved_user_overrides(self, tmp_path: Path):
+        """An agent.json saved with a UTF-8 byte-order mark still overrides."""
+        cfg_dir = _bundled_defaults(tmp_path)
+        user_home = tmp_path / "kirocrew_home"
+        user_home.mkdir()
+        (user_home / "agent.json").write_bytes(
+            codecs.BOM_UTF8 + json.dumps({"model": "user-pick"}).encode("utf-8")
+        )
+
+        path = _run_install(tmp_path, cfg_dir)
+
+        assert json.loads(path.read_text(encoding="utf-8"))["model"] == "user-pick"
 
     def test_fresh_install_preserves_safe_managed_server_overrides(self, tmp_path: Path):
         """A clean rebuild keeps preferences without ceding invocation ownership."""
@@ -1132,13 +1146,17 @@ class TestAtomicJsonWrite:
 
         target = tmp_path / "test.json"
         target.write_text("{}")
-        target.chmod(0o664)
+        if sys.platform != "win32":
+            target.chmod(0o664)
 
         _atomic_json_write(target, {"key": "value"})
 
         import stat
 
-        assert stat.S_IMODE(target.stat().st_mode) == 0o664
+        if sys.platform != "win32":
+            # Windows has no POSIX mode bits; the content contract below is
+            # what this writer guarantees there.
+            assert stat.S_IMODE(target.stat().st_mode) == 0o664
         assert json.loads(target.read_text(encoding="utf-8")) == {"key": "value"}
 
     def test_new_file_gets_0o644(self, tmp_path: Path):
@@ -1149,7 +1167,8 @@ class TestAtomicJsonWrite:
 
         import stat
 
-        assert stat.S_IMODE(target.stat().st_mode) == 0o644
+        if sys.platform != "win32":
+            assert stat.S_IMODE(target.stat().st_mode) == 0o644
         assert json.loads(target.read_text(encoding="utf-8")) == {"new": True}
 
     def test_a_contended_rename_is_retried_on_windows(self, tmp_path: Path, monkeypatch):
@@ -1660,16 +1679,62 @@ class TestResolveKirocrewBin:
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
-    def test_caches_result(self):
-        """Result is cached in global _KIROCREW_BIN."""
+    def test_caches_result(self, tmp_path: Path):
+        """A cached launcher that still works is returned without re-resolving."""
         import kiro_crew.agent as agent_mod
         from kiro_crew.agent import _resolve_kirocrew_bin
 
+        cached = tmp_path / "cached" / "kirocrew"
+        cached.parent.mkdir()
+        cached.write_text("#!/bin/sh\n")
+        cached.chmod(0o755)
         old_val = agent_mod._KIROCREW_BIN
         try:
-            agent_mod._KIROCREW_BIN = "/cached/kirocrew"
-            result = _resolve_kirocrew_bin()
-            assert result == "/cached/kirocrew"
+            agent_mod._KIROCREW_BIN = str(cached)
+            with patch("shutil.which", side_effect=AssertionError("re-resolved")):
+                result = _resolve_kirocrew_bin()
+            assert result == str(cached)
+        finally:
+            agent_mod._KIROCREW_BIN = old_val
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher layout")
+    def test_a_cached_launcher_from_a_pruned_install_is_re_resolved(self, tmp_path: Path):
+        """An update prunes the version directory the process started from.
+
+        The path cached before the prune must not keep being handed out as the
+        launch of kirocrew-core / kirocrew-cron: it is re-resolved, and with the
+        running package gone the walk reaches the current install via PATH.
+        """
+        import shutil as _shutil
+
+        import kiro_crew.agent as agent_mod
+        from kiro_crew.agent import _resolve_kirocrew_bin
+
+        def _launcher(root: Path) -> Path:
+            exe = root / "bin" / "kirocrew"
+            exe.parent.mkdir(parents=True)
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+            return exe
+
+        old_install = tmp_path / "tools" / "kirocrew" / "0.8.0.4"
+        new_install = tmp_path / "tools" / "kirocrew" / "0.8.0.6"
+        old_bin = _launcher(old_install)
+        new_bin = _launcher(new_install)
+        old_val = agent_mod._KIROCREW_BIN
+        try:
+            agent_mod._KIROCREW_BIN = str(old_bin)
+            assert _resolve_kirocrew_bin() == str(old_bin)
+            _shutil.rmtree(old_install)  # the update's prune
+            # The running package lived in the pruned tree too, so steps 1-3
+            # find nothing; only PATH names the current install.
+            with (
+                patch.object(sys, "exec_prefix", str(old_install)),
+                patch("kiro_crew.__file__", str(old_install / "lib" / "kiro_crew" / "__init__.py")),
+                patch("shutil.which", return_value=str(new_bin)),
+            ):
+                assert _resolve_kirocrew_bin() == str(new_bin)
+            assert agent_mod._KIROCREW_BIN == str(new_bin)
         finally:
             agent_mod._KIROCREW_BIN = old_val
 
@@ -2495,6 +2560,25 @@ class TestKiroHooksFiltering:
             assert "auto_approve_tools" not in repaired["hooks"]
             assert "postToolUse" in repaired["hooks"]
             assert "futureHookEvent" in repaired["hooks"]
+
+    def test_sanitize_agent_hooks_repairs_a_bom_saved_owned_file(self, tmp_path: Path):
+        """A hand-saved owned spec with a byte-order mark is repaired, not skipped."""
+        from kiro_crew.agent import _hooks_sanitized_mtimes, _sanitize_agent_hooks
+        from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
+
+        kiro_dir = tmp_path / "agents"
+        kiro_dir.mkdir()
+        spec = {"name": "kirocrew", "hooks": {"auto_approve_tools": ["x"], "stop": []}}
+        target = kiro_dir / sorted(OWNED_KIRO_AGENT_FILES)[0]
+        target.write_bytes(codecs.BOM_UTF8 + json.dumps(spec).encode("utf-8"))
+
+        _hooks_sanitized_mtimes.clear()
+        with patch("kiro_crew.agent.KIRO_AGENTS_DIR", kiro_dir):
+            _sanitize_agent_hooks()
+
+        raw = target.read_bytes()
+        assert not raw.startswith(codecs.BOM_UTF8)
+        assert json.loads(raw)["hooks"] == {"stop": []}
 
     @pytest.mark.parametrize(
         "filename", ["other-tool.json", "kirocrew-custom.json", "sample-app--worker.json"]
@@ -5450,8 +5534,14 @@ class TestKiroHooksAutoimport:
         with caplog.at_level(logging.INFO, logger="kiro_crew.agent"):
             result = _autoimport_kiro_hooks(hooks_dir)
 
+        if sys.platform == "win32":
+            # No execute bit on Windows: a known script extension counts as
+            # runnable via platform_compat.is_executable_file, so the
+            # chmod -x sibling loads too instead of being skipped.
+            assert len(result["preToolUse"]) == 2
+            return
         assert len(result["preToolUse"]) == 1
-        assert result["preToolUse"][0]["command"].endswith("/ok.sh")
+        assert Path(result["preToolUse"][0]["command"]).name == "ok.sh"
         assert any("not executable" in rec.message for rec in caplog.records)
 
     @requires_symlinks
@@ -5528,7 +5618,7 @@ class TestKiroHooksAutoimport:
         _apply_user_kiro_hooks(config, mc_cfg)
 
         assert len(config["hooks"]["preToolUse"]) == 1
-        assert config["hooks"]["preToolUse"][0]["command"].endswith("/only.sh")
+        assert Path(config["hooks"]["preToolUse"][0]["command"]).name == "only.sh"
 
     def test_kiro_hooks_autoimport_respects_total_limit(self, tmp_path: Path, caplog):
         """More scripts than ``_MAX_TOTAL_USER_HOOKS`` get capped; one WARNING logged."""
@@ -6208,6 +6298,12 @@ class TestKiroHooksAutoimport:
         with caplog.at_level(logging.INFO, logger="kiro_crew.agent"):
             result = _autoimport_kiro_hooks(hooks_dir)
 
+        if sys.platform == "win32":
+            # Same platform rule as above: the script loads, so there is no
+            # rejection to audit.
+            assert len(result.get("preToolUse", [])) == 1
+            assert sel_calls == []
+            return
         assert result == {}
         assert len(sel_calls) == 1, (
             f"regression: expected exactly one _sel_hook_rejected call when "
@@ -7017,6 +7113,153 @@ class TestRefreshDynamicFieldsStripsStaleUrl:
         _refresh_dynamic_fields(config)
         assert "deniedCommands" not in config["toolsSettings"]["execute_bash"]
         assert config["toolsSettings"]["execute_bash"]["allowedCommands"] == ["ls", "cat"]
+
+
+class TestMigrateRelocatedSkillUris:
+    """An agent spec mapping a relocated builtin skill's old path follows the move."""
+
+    OLD = "kirocrew-dev/prepare-pr"
+    NEW = "kirocrew-dev/kirocrew-prepare-pr"
+
+    @pytest.fixture
+    def env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        home = tmp_path / "home"
+        skills = home / ".kiro" / "crew" / "skills"
+        (skills / self.NEW).mkdir(parents=True)
+        (skills / self.NEW / "SKILL.md").write_text("---\nname: kirocrew-prepare-pr\n---\n")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        monkeypatch.setattr("kiro_crew.skills.skills_dir", lambda: skills)
+        agents = tmp_path / "kiro_agents"
+        agents.mkdir()
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents)
+        return skills, agents
+
+    def _write(self, agents: Path, resources: list) -> Path:
+        spec = agents / "a.json"
+        spec.write_text(json.dumps({"name": "alpha", "resources": resources}))
+        return spec
+
+    def test_rewrites_home_and_absolute_forms_in_place(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        skills, agents = env
+        spec = self._write(
+            agents,
+            [
+                "file://AGENTS.md",
+                f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md",
+                "skill://~/.kiro/crew/skills/babysit-other/SKILL.md",
+            ],
+        )
+        assert migrate_relocated_skill_uris() == 1
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [
+            "file://AGENTS.md",
+            f"skill://~/.kiro/crew/skills/{self.NEW}/SKILL.md",
+            "skill://~/.kiro/crew/skills/babysit-other/SKILL.md",
+        ]
+
+        spec = self._write(agents, [f"skill://{(skills / self.OLD / 'SKILL.md').as_posix()}"])
+        assert migrate_relocated_skill_uris() == 1
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [
+            f"skill://{(skills / self.NEW / 'SKILL.md').as_posix()}"
+        ]
+
+    def test_drops_the_old_entry_when_the_new_path_is_already_mapped(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        new = f"skill://~/.kiro/crew/skills/{self.NEW}/SKILL.md"
+        spec = self._write(agents, [new, f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
+        assert migrate_relocated_skill_uris() == 1
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [new]
+
+    def test_is_idempotent(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        self._write(agents, [f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
+        assert migrate_relocated_skill_uris() == 1
+        assert migrate_relocated_skill_uris() == 0
+
+    def test_leaves_a_mapping_whose_old_skill_still_loads(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        skills, agents = env
+        (skills / self.OLD).mkdir(parents=True)
+        (skills / self.OLD / "SKILL.md").write_text("---\nname: prepare-pr\n---\n")
+        old = f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"
+        spec = self._write(agents, [old])
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
+
+    def test_reads_and_writes_inside_the_spec_lock(self, env, monkeypatch) -> None:
+        # A concurrent template PATCH holds the same lock; reading before it
+        # would write a stale snapshot back over the user's saved edit.
+        import kiro_crew.agent as agent_mod
+
+        _skills, agents = env
+        self._write(agents, [f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"])
+        held: list[bool] = [False]
+        seen: list[tuple[str, bool]] = []
+
+        @contextlib.contextmanager
+        def recording_lock(agents_dir):
+            held[0] = True
+            try:
+                yield
+            finally:
+                held[0] = False
+
+        real_read = agent_mod._read_agent_spec
+        real_write = agent_mod._atomic_json_write
+
+        def read(*args, **kwargs):
+            seen.append(("read", held[0]))
+            return real_read(*args, **kwargs)
+
+        def write(*args, **kwargs):
+            seen.append(("write", held[0]))
+            return real_write(*args, **kwargs)
+
+        monkeypatch.setattr(agent_mod, "agents_spec_lock", recording_lock)
+        monkeypatch.setattr(agent_mod, "_read_agent_spec", read)
+        monkeypatch.setattr(agent_mod, "_atomic_json_write", write)
+
+        assert agent_mod.migrate_relocated_skill_uris() == 1
+        assert seen == [("read", True), ("write", True)]
+
+    def test_leaves_an_enrolled_members_saved_generation_alone(self, env, monkeypatch) -> None:
+        # An enrolled member's spec carries a digest its capability intent
+        # records; an in-place rewrite would make reconcile refuse sessions.
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        old = f"skill://~/.kiro/crew/skills/{self.OLD}/SKILL.md"
+        spec = self._write(agents, [old])
+
+        monkeypatch.setattr(
+            "kiro_crew.agent_state.get_capabilities",
+            lambda name: {"status": "saved"} if name == "alpha" else None,
+        )
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
+
+        def unreadable(name):
+            raise ValueError("capability_state_invalid")
+
+        monkeypatch.setattr("kiro_crew.agent_state.get_capabilities", unreadable)
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == [old]
+
+    def test_leaves_workspace_relative_and_wildcard_uris_alone(self, env) -> None:
+        from kiro_crew.agent import migrate_relocated_skill_uris
+
+        _skills, agents = env
+        kept = [f".kiro/skills/{self.OLD}/SKILL.md", "skill://~/.kiro/crew/skills/*/SKILL.md"]
+        kept = [f"skill://{kept[0]}", kept[1]]
+        spec = self._write(agents, kept)
+        assert migrate_relocated_skill_uris() == 0
+        assert json.loads(spec.read_text(encoding="utf-8"))["resources"] == kept
 
 
 class TestMigrateAgentSpecs:

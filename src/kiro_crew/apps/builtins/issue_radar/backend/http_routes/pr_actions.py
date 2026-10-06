@@ -220,15 +220,24 @@ async def _pr_action_preamble(
     request: web.Request,
     op: str,
 ) -> tuple[dict, provider.RepoKey, web.Response | None]:
-    """The checks EVERY pull-request action shares: JSON body, owner/repo,
-    connected-repo gate, and the triage/push permission gate.
+    """The checks EVERY pull-request action shares: the dashboard-owner gate,
+    JSON body, owner/repo, connected-repo gate, and the triage/push permission gate.
 
     Factored out because it is the security-relevant part and it is identical for
     all of them — a per-handler copy is how one of them eventually ships without
     the permission check. Returns the parsed body and key, or a response to
     return immediately.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
     from .. import routes  # circular import: backend.routes imports this module
+
+    # Every action here writes to the forge as the OWNER's gh/glab login, so
+    # only the dashboard owner may call it: a non-owner subject and every app
+    # token, this app's own included, are refused before the body is read.
+    owner_denied = await require_owner_dashboard_request(request, f"issue_radar.{op}")
+    if owner_denied is not None:
+        return {}, provider.RepoKey(), owner_denied
 
     try:
         raw = await request.json()
@@ -398,6 +407,11 @@ async def _run_pr_action(
         # trusting the call's return would evict a still-open PR from the open list
         # and report success. The state change is applied only on a merge that
         # actually happened.
+        if result.get("pending"):
+            # GitHub's background merge has not settled yet: the PR is still open,
+            # so only its detail is refreshed and the route reports it as pending.
+            await routes._st(key, store.drop_pr_detail_cache, owner, repo, number)
+            return result
         if not result.get("merged"):
             raise routes.GhCliError(
                 result.get("message")
@@ -899,6 +913,18 @@ async def _handle_pull_merge(request: web.Request) -> web.Response:
     except routes.GhPermissionError as exc:
         routes._audit("pull_merge", target, "denied", error=str(exc))
         return web.json_response({"error": str(exc), "code": "provider_forbidden"}, status=403)
+    except routes.GhMergeRefusedError as exc:
+        # GitHub's async merge took the request and its rules declined it. Same
+        # meaning as the synchronous endpoint's 405 below, but GitHub's reason
+        # is kept, because the background job can fail for more than one cause.
+        routes._audit("pull_merge", target, "denied", error=str(exc))
+        return web.json_response(
+            {
+                "error": f"The provider refused to merge this: {exc}",
+                "code": "merge_not_allowed",
+            },
+            status=409,
+        )
     except routes.GhCliError as exc:
         message = str(exc)
         # 405 here is the repository's RULES speaking, not a broken request: the
@@ -928,6 +954,15 @@ async def _handle_pull_merge(request: web.Request) -> web.Response:
                 status=409,
             )
         return _pr_action_error("pull_merge", target, exc)
+
+    if result.get("pending"):
+        # Not a success: nothing has merged yet, and a caller merging several PRs in
+        # turn must stop here rather than merge the next one onto a base this one
+        # has not reached.
+        routes._audit("pull_merge", target, "failure", error="merge still pending")
+        return web.json_response(
+            {"error": result.get("message") or "", "code": "merge_pending"}, status=409
+        )
 
     routes._audit("pull_merge", target, "ok")
     return web.json_response({**routes._identity(key), "number": number, **result})

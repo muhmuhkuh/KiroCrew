@@ -51,7 +51,7 @@ import { FileCard } from '../../components/FileCard'
 import UserMessage from './UserMessage'
 import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
 import { crewmateBubbleClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
-import { formatTs, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
+import { formatTs, quoteMessageFor, renderAssistantBubble, replyInThreadFor, threadFooterFor, type MessageRenderer, type MessageRenderContext } from '../../app-sdk/messageRenderers'
 import { renderUserContent } from './ChatPageMessageContent'
 import { fmtMessageTimeFull } from './messageTime'
 import type { ChatMessage } from '../../types'
@@ -460,7 +460,8 @@ export function createTranscriptRenderers(
     },
     // Replaces the SDK's `assistant` entry (same id) ONLY for a crewmate's
     // chat: the same AssistantMessage (markdown, option chips, hover actions),
-    // placed as a bubble in a run under the crewmate's avatar and name. The
+    // placed as a bubble in a run with grouped corners (no author line:
+    // the DM header already names the speaker). The
     // run position is derived from the list the pane already filtered, so the
     // neighbours it reads are the rows drawn next to it. The two assistant-role
     // refinements above (system notice, workflow completion) still precede it;
@@ -494,7 +495,7 @@ export function createTranscriptRenderers(
             })
             if (bubble === null) return null
             return ctx.row(
-              <CrewmateMessage crewmate={crewmate} pos={pos} ts={m.ts}>{bubble}</CrewmateMessage>,
+              <CrewmateMessage pos={pos}>{bubble}</CrewmateMessage>,
               true,
             )
           },
@@ -594,6 +595,7 @@ export function createTranscriptRenderers(
                 })}
                 hideSteerBadge
                 onReplyInThread={replyInThreadFor(m, ctx)}
+                onQuoteMessage={quoteMessageFor(m, ctx, 'user')}
               />
               {threadFooterFor(m, ctx, 'end')}
             </>,

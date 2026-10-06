@@ -25,6 +25,7 @@ from kiro_crew.session import (
     SessionEndingError,
     SessionManager,
 )
+from kiro_crew.start_priority import StartPriority
 
 
 @pytest.fixture
@@ -118,6 +119,21 @@ class TestSessionManager:
         mgr.mark_needs_reinjection("thread1")
         assert mgr.consume_needs_reinjection("thread1") is True, "first read sees it"
         assert mgr.consume_needs_reinjection("thread1") is False, "cleared on read"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_release_refreshes_liveness(self, cfg):
+        """Release marks the end of a live turn, not the start of idleness.
+
+        A backdated session released after work must read fresh again, so the
+        idle sweep measures from when the session went quiet rather than when
+        it was acquired and a run working between tasks is not reaped mid-run.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr._sessions["thread1"].last_used = time.monotonic() - 9999
+        mgr.release("thread1")
+        assert mgr._sessions["thread1"].last_used > time.monotonic() - 5
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -6284,6 +6300,7 @@ class TestOpenTaskSession:
             agent="kirocrew",
             approval_policy="auto",
             cwd="/repo/packages/app",
+            start_priority=StartPriority.BACKGROUND,
         )
 
 
@@ -6876,6 +6893,7 @@ class TestParentEndCancelsItsChildren:
             def __init__(self):
                 self._agents = {info.id: info}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {info.id: watcher}
                 self._followup_watcher_parents = {info.id: parent}
@@ -7209,6 +7227,7 @@ class TestParentEndCancelsItsChildren:
                     "ordinary": _run("ordinary", awaiting=False, started=123.0),
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7279,6 +7298,7 @@ class TestParentEndCancelsItsChildren:
                     "delivered": _run("delivered", done=True, reported=True),
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7473,6 +7493,7 @@ class TestParentEndCancelsItsChildren:
                 self._admission = _Admission()
                 self._agents = {}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7607,6 +7628,7 @@ class TestParentEndCancelsItsChildren:
                 self._admission = _Admission()
                 self._agents = {}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7669,13 +7691,18 @@ class TestParentEndCancelsItsChildren:
                 # A live record is what makes the reap reachable: the drain started this
                 # row, so there is a task to stop rather than a row to unqueue.
                 self._agents = {
-                    # The fields cancel_for_teardown WRITES before the reap, on
-                    # a record shaped like the real one.
+                    # The fields cancel_for_teardown reads and WRITES before the
+                    # reap, on a record shaped like the real one.
                     "started-row": SimpleNamespace(
-                        id="started-row", done=False, _reap_reason="", _stop_origin=""
+                        id="started-row",
+                        done=False,
+                        _ending_claimed=False,
+                        _reap_reason="",
+                        _stop_origin="",
                     )
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7741,8 +7768,13 @@ class TestParentEndCancelsItsChildren:
             def __init__(self):
                 self._admission = _Admission()
                 # The lingering record: done, and still in ``_agents``.
-                self._agents = {"late-finisher": SimpleNamespace(id="late-finisher", done=True)}
+                self._agents = {
+                    "late-finisher": SimpleNamespace(
+                        id="late-finisher", done=True, _ending_claimed=False
+                    )
+                }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers: dict = {}
 
@@ -7992,6 +8024,7 @@ class TestParentEndCancelsItsChildren:
             def __init__(self):
                 self._agents = {"run-delivered": delivered}
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {"run-delivered": watcher}
 
@@ -8055,6 +8088,7 @@ class TestParentEndCancelsItsChildren:
                     )
                 }
                 self._queue = []
+                self._undurable_in_dispatch = {}
                 self._teardown_cancelled_ids = set()
                 self._followup_watchers = {"run-1": watcher}
 
@@ -8249,3 +8283,64 @@ class TestParentEndCancelsItsChildren:
             "these parent-end paths reap the companion runtime without ending the "
             f"parent's runs; each name lists what it is missing: {unguarded}"
         )
+
+
+@pytest.mark.asyncio
+async def test_a_dead_run_runtime_is_killed_before_its_replacement_starts(cfg) -> None:
+    """A task-run runtime marked dead on a stdin stall still has a live child
+    that may read the frames left in its pipe, so the next step's bootstrap
+    kills it BEFORE starting the replacement, never beside it."""
+    order: list[str] = []
+    base = _mock_provider_factory()
+
+    def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+        order.append("spawn")
+        return base(session_key, agent, channel_id, **kwargs)
+
+    mgr = SessionManager(cfg, provider_factory=factory)
+    dead = MagicMock()
+    dead.is_alive = lambda: False
+
+    async def _kill(**_kw):
+        order.append("kill")
+
+    dead.kill = _kill
+    mgr._subagent_runtimes["taskrunner:run"] = dead
+    mgr.get_subagent_runtime = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+
+    await mgr._get_or_bootstrap_run_runtime("taskrunner:run")
+
+    assert order[:2] == ["kill", "spawn"], order
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.asyncio
+async def test_a_stalled_run_runtime_is_replaced_only_once_confirmed_dead(cfg, confirmed) -> None:
+    """A runtime that died of a stdin stall keeps a child that may still read the
+    stalled frames, so its replacement starts only once no process that can read
+    that pipe survives; otherwise the step's retry ladder gets an error and runs
+    the kill again."""
+    spawned: list[str] = []
+    base = _mock_provider_factory()
+
+    def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+        spawned.append("spawn")
+        return base(session_key, agent, channel_id, **kwargs)
+
+    mgr = SessionManager(cfg, provider_factory=factory)
+    dead = MagicMock()
+    dead.is_alive = lambda: False
+    dead.stdin_stall_death = True
+    dead.stdin_reader_may_live = lambda: not confirmed
+    dead.kill = AsyncMock()
+    mgr._subagent_runtimes["taskrunner:run"] = dead
+    mgr.get_subagent_runtime = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+
+    if confirmed:
+        await mgr._get_or_bootstrap_run_runtime("taskrunner:run")
+        assert spawned == ["spawn"]
+    else:
+        with pytest.raises(RuntimeError, match="could not be confirmed dead"):
+            await mgr._get_or_bootstrap_run_runtime("taskrunner:run")
+        assert spawned == []
+    dead.kill.assert_awaited_once()

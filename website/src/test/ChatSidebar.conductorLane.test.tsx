@@ -762,6 +762,60 @@ describe('chat sidebar — conductor lane', () => {
     expect(within(lane()).getByTestId('conductor-cites-parent-peer-1:k-w1')).toBeTruthy()
   })
 
+  it('nests a peer worker under the LOCAL row driving its creator when the hub stamps `hub_key`', () => {
+    // A local lead executes on the peer (`executor: 'remote'`), so the sessions it
+    // opens live ON the peer and cite the peer slot the hub drives. The hub filters
+    // that driven row and rewrites each citation to the local lead's key as
+    // `parent.hub_key` -- the one half resolved among LOCAL rows. The payoff: a
+    // remote-executed crew reads as one unit under the row the user chats in, where
+    // it rendered as a column of top-level strays. A peer row whose key collides
+    // with the lead's does NOT gain the workers: `hub_key` is local by contract.
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    localStorage.removeItem('mc-sidebar-conductor-expanded')
+    const peer = (key: string, title: string, modified: number, parent?: { slot?: string; key?: string; hub_key?: string }) => ({
+      key, title, messages: 0, running: false, modified,
+      peer_id: 'peer-1', row_identity: `peer-1:${key}`,
+      ...(parent ? { parent } : {}),
+    })
+    const { getByTestId } = renderSidebar([
+      { key: 'k-lead', title: 'Local lead', messages: 1, running: false, modified: 5000, executor: 'remote', instance_id: 'peer-1' },
+      peer('k-lead', 'Peer twin', 4000),
+      peer('k-w1', 'Peer worker 1', 3000, { slot: 'k-lead', hub_key: 'k-lead' }),
+      peer('k-w2', 'Peer worker 2', 2000, { slot: 'k-lead', hub_key: 'k-lead' }),
+    ])
+    const lane = () => getByTestId('conductor-view-lane')
+    // Two roots: the local lead holding both workers shut, and the colliding peer
+    // twin holding nothing.
+    expect(laneRows(lane())).toEqual(['k-lead', 'k-lead'])
+    expect(within(lane()).getByTestId('conductor-child-count-k-lead').textContent).toBe('2')
+    expect(within(lane()).queryByTestId('conductor-child-count-peer-1:k-lead')).toBeNull()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w1')).toBeNull()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w2')).toBeNull()
+
+    fireEvent.click(within(lane()).getByTestId('conductor-chevron-k-lead'))
+    expect(laneRows(lane())).toEqual(['k-lead', 'k-w1', 'k-w2', 'k-lead'])
+    const w1 = lane().querySelector('[data-slot-key="k-w1"]')
+    expect(w1?.getAttribute('data-conductor-depth')).toBe('1')
+  })
+
+  it('marks a hub-cited worker as opened-by, not orphaned, while the local driver is merely filtered', () => {
+    // The creator-exists check must read `hub_key` among LOCAL rows: looked up in
+    // the peer's origin it would miss, and the glyph would say the lead is closed
+    // while the lead is open and working.
+    localStorage.setItem('mc-sidebar-lane', 'conductor')
+    const { getByTestId, getByPlaceholderText } = renderSidebar([
+      { key: 'k-lead', title: 'Local lead', messages: 1, running: false, modified: 5000, executor: 'remote', instance_id: 'peer-1' },
+      {
+        key: 'k-w1', title: 'Peer worker', messages: 0, running: false, modified: 3000,
+        peer_id: 'peer-1', row_identity: 'peer-1:k-w1', parent: { slot: 'k-lead', hub_key: 'k-lead' },
+      },
+    ])
+    const lane = () => getByTestId('conductor-view-lane')
+    fireEvent.change(getByPlaceholderText(/search/i), { target: { value: 'worker' } })
+    expect(within(lane()).getByTestId('conductor-cites-parent-peer-1:k-w1')).toBeTruthy()
+    expect(within(lane()).queryByTestId('conductor-orphan-peer-1:k-w1')).toBeNull()
+  })
+
   it('caps the indent past six levels and names the level in the tooltip', () => {
     // Depth has no ceiling and each level costs 14px, so a deep chain would walk the
     // card off a 320px sidebar. Past the cap the rows stop stepping and the level is
@@ -887,29 +941,29 @@ describe('chat sidebar — conductor lane', () => {
     expect(says.toLowerCase()).toContain('conductor')
   })
 
-  it('refetches while lineage is provisional, then nests once the seed lands', async () => {
-    // A cold start ships `parent: null` with `lineage_pending`, because the gateway's
-    // projection is still seeding and it deliberately does not broadcast when it lands.
-    // On an IDLE gateway no further frame is coming, so the sidebar has to come back for
-    // the real answer or it stays unnested until the user acts.
+  it('does not poll while lineage is provisional; the pushed rows nest it', async () => {
+    // A cold start ships `parent: null` with `lineage_pending` while the gateway's
+    // projection seeds. The gateway pushes the settled rows when the seed lands, so
+    // the sidebar never reads the slot list again on its own.
     vi.useFakeTimers()
     try {
       localStorage.setItem('mc-sidebar-lane', 'conductor')
-      const { queryByTestId } = renderSidebar([
+      const { queryByTestId, getByTestId, pushFrame } = renderSidebar([
         { key: 'k-root', title: 'Conductor', messages: 1, running: false, modified: 2000, parent: null, lineage_pending: true },
         { key: 'k-kid', title: 'Worker', messages: 1, running: false, modified: 1000, parent: null, lineage_pending: true },
       ])
-      // Provisional and flat: no edges in this frame, so the lane is not offered yet.
       expect(queryByTestId('conductor-view-lane')).toBeNull()
+      await act(async () => { await vi.advanceTimersByTimeAsync(31_000) })
       expect(mocks.chatSlots).not.toHaveBeenCalled()
 
-      // The seed lands; the next read carries the edge.
-      mocks.chatSlots.mockResolvedValue([
-        { key: 'k-root', title: 'Conductor', messages: 1, running: false, modified: 2000, parent: null },
-        { key: 'k-kid', title: 'Worker', messages: 1, running: false, modified: 1000, parent: { slot: 'k-root', key: 'k-root' } },
-      ])
-      await act(async () => { await vi.advanceTimersByTimeAsync(2100) })
-      expect(mocks.chatSlots).toHaveBeenCalled()
+      act(() => {
+        pushFrame([
+          { key: 'k-root', title: 'Conductor', messages: 1, running: false, modified: 2000, parent: null },
+          { key: 'k-kid', title: 'Worker', messages: 1, running: false, modified: 1000, parent: { slot: 'k-root', key: 'k-root' } },
+        ])
+      })
+      expect(getByTestId('conductor-view-lane')).toBeTruthy()
+      expect(getByTestId('conductor-child-count-k-root').textContent).toBe('1')
     } finally {
       vi.useRealTimers()
     }

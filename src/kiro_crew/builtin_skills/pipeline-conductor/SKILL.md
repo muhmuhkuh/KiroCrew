@@ -566,7 +566,7 @@ python3 scripts/claim_preflight.py --repo <owner/repo> --item <N> \
 Exit 3 is why the verdicts are exit codes at all: an unanswerable question is
 not a green light, and partial data yields `UNKNOWN` rather than `CLAIM`.
 
-Five checks run on every call, and the verdict is the FIRST match down this
+Six checks run on every call, and the verdict is the FIRST match down this
 precedence list:
 
 1. `merged_prs` — a MERGED PR that CLAIMS TO CLOSE the item (a closing keyword
@@ -609,10 +609,25 @@ precedence list:
    you read the comment the line names and you decide. The authorization
    condition stays too, for a different reason than it had — `REVIEW` writes
    nothing, but it does withhold a dispatch, and a suppression any passer-by can
-   cast is the same denial-of-work channel rule 4 refuses to open. A closure
+   cast is the same denial-of-work channel rule 5 refuses to open. A closure
    phrase from anybody else is not a closure request — it falls through to the
    remaining checks.
-4. `prose_claim` — a self-claim ("I'm claiming this", "working on this") **from
+4. `forge_claim` — the item's own ownership fields, read off the payload the
+   script already fetched: a `claimed` or `in-progress` label (the vocabulary of
+   the default `skip_signals`, matched by word so `crew: in progress` counts and
+   `unclaimed` does not), or any assignee → **SKIP** `forge-claim`, with the
+   label term and the assignees on the line. **Either field alone is a claim.**
+   It is honoured for anybody but you: a label with yourself as the only
+   assignee is the shape of your own atomic claim, so re-checking an item you
+   hold still reads CLAIM; a label with nobody assigned is unattributed and
+   reads as foreign; so does every claim when your own login cannot be read.
+   This is the live half of the queue build's label exclusion — a claim that
+   lands after the queue is built is exactly what the recheck immediately before
+   the atomic claim exists to catch, and until this check existed it could not:
+   four live items in three days carried another pipeline's `claimed` label and
+   read CLAIM. It sits below rule 1 on purpose, so an item that is open, claimed
+   and already fixed still reads CLOSE.
+5. `prose_claim` — a self-claim ("I'm claiming this", "working on this") **from
    the item's reporter or a repository insider** → **SKIP** `prose-claim`. A claim
    written in prose is invisible to every label and field query that exists, which
    is why it is scanned for rather than inferred. From anybody else it is NOT a
@@ -628,15 +643,15 @@ precedence list:
    honouring suppresses the item forever. Bot comments never claim and never
    close. Ownership is read from the newest STANDING claim, not from the last
    comment, so a passer-by's "any update?" does not clear a claim.
-5. `symbol_on_base` — a symbol the item names is absent from
+6. `symbol_on_base` — a symbol the item names is absent from
    `{default_branch}`. **Absence alone is not a SKIP.** Corroborated as
    bug-class, it is **SKIP** `symbol-absent`: the target code lives only on an
    unmerged branch, so that is a park, not a dispatch. Uncorroborated it
    downgrades to **CLAIM** `risk=high`, because a feature request names the
    symbol it PROPOSES to add — vetoing on absence alone would permanently park
    every item of that class.
-6. any check errored → **UNKNOWN**.
-7. otherwise → **CLAIM**, annotated with `risk` from the `recency` check (a
+7. any check errored → **UNKNOWN**.
+8. otherwise → **CLAIM**, annotated with `risk` from the `recency` check (a
    recently opened item from an active contributor is a high self-claim risk).
 
 **A PR that only MENTIONS the item is a POINTER you hand over, not a verdict you
@@ -725,6 +740,17 @@ reading, and it comes back as `REVIEW` for you to confirm.
   your seeds send workers to `cd` there for forge calls. Do NOT clean it: a
   reset there is destructive and belongs to whoever left it. Take the
   non-destructive half — the brief's commit ban — and report what you found.
+  Staged state there is usually a whole-tree overlay that never moved HEAD
+  (`git checkout <ref> -- .`): `<ref>`'s tree plus the files `<ref>` deleted.
+  In the shared checkout, test `<remote>/<base>` first, then its reflog entries
+  newest first, stopping at the first match or the first one HEAD is not an
+  ancestor of. A `<commit>` matches when it is not HEAD, `git merge-base
+  --is-ancestor HEAD <commit>` exits 0 and `git diff-index --cached --quiet
+  --diff-filter=a <commit>` exits 0; an exit above 1 is unreadable, not a no.
+  On a match, report the owner's repair: `git merge --ff-only --no-autostash
+  --no-overwrite-ignore <commit>`, or `git reset --keep <commit>`, the same move
+  except that it also unstages anything else staged. Both refuse rather than
+  overwrite a local edit, and neither is yours to run.
   Re-read the base head rather than caching it, too: the default branch moves
   under a long run, and a worker preflighting against a remembered sha is
   preflighting against the past.
@@ -815,9 +841,10 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > no `tox`, no `nox`, no `run-tests`/`local-gate`/"run the gates" wrapper of any
 > kind: a wrapper that escalates to the full suite satisfies the letter of a
 > targeted-only brief. The ban is on suite wrappers, NOT on the push gate
-> below — `preflight.py` and `push_guard.py` shell out only to `git` and `gh`
-> and run no test at all, so a targeted-test brief never licenses an unguarded
-> push. Pass `-n0` **explicitly** on every run: omitting `-n`
+> below — `preflight.py` and `push_guard.py` spawn only `git`, `gh` and the
+> OS tree-kill tool, and run no test at all (`--commit` / `--squash` run the
+> repository's own git hooks, as any commit does), so a targeted-test brief
+> never licenses an unguarded push. Pass `-n0` **explicitly** on every run: omitting `-n`
 > does not mean single process, it inherits whatever the project's pytest
 > `addopts` sets, and `-n auto` is a common default. Canonical line —
 > `timeout 900 python3 -m pytest -n0 <test file> -x -q </dev/null`. Do not
@@ -841,15 +868,20 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > look partly correct for entirely the wrong reason.
 > NEVER COMMIT FROM THE SHARED CHECKOUT. You may `cd` there for `gh` calls, but
 > its index is not yours and may hold hundreds of staged files left by another
-> operation, so one `git commit -a` there sweeps unrelated work into your PR.
-> Each worktree has its own index; commit only from yours.
+> operation, so one `git commit -a` there — or any commit after staging even a
+> single file — sweeps that staged work into your PR.
+> Each worktree has its own index; commit only from yours. Run nothing there
+> that moves its HEAD or writes its index or files (merge, pull, reset, clean,
+> checkout, restore, `gh pr checkout`, `gh repo sync`); report its state and
+> leave the repair to its owner. Never `git stash` in any worktree: every
+> worktree shares one stash list.
 > REMOTES: `export GIT_TERMINAL_PROMPT=0` and confirm `gh auth setup-git` has
 > run before any push — a bare https push does not use the CLI's token and hangs
 > on an interactive prompt indefinitely. If a push exceeds ~2 minutes, time the
 > actual pre-push hook over the real payload before naming a cause: process
 > liveness cannot distinguish a credential prompt from a slow hook.
 > PUSH GATE (mandatory, every push): the scripts live in `<gate>` =
-> `<crew-home>/skills/kirocrew-dev/prepare-pr/scripts`, where `<crew-home>` is
+> `<crew-home>/skills/kirocrew-dev/kirocrew-prepare-pr/scripts`, where `<crew-home>` is
 > `KIROCREW_HOME` when set and `$HOME/.kiro/crew` otherwise. Invoke them through
 > Kiro Crew's runtime interpreter the way Startup invokes `spec_check.py`, and
 > quote the resolved path: on POSIX `"$KIROCREW_RUNTIME_PYTHON" -B
@@ -861,16 +893,37 @@ Fill `{...}` from the spec; keep every clause — each one closes a failure mode
 > every push.
 > Run `preflight.py` before the first commit. Then before EVERY push confirm
 > `git status --porcelain` is empty and run `<gate>/push_guard.py
-> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base
-> or a replayed upstream commit. Pass `--max-ahead` explicitly and fill it from
+> --base {default_branch} --max-ahead {max_commits}`, which refuses a stale base,
+> a replayed upstream commit, anything staged that HEAD lacks, or a changed path
+> the gate did not commit on this branch and no other author's pushed commit
+> carries (a commit made by hand). When it lists such paths, read each diff: name
+> the ones that are yours after `--` on the same command (that vouch rewrites
+> nothing), and report any that are not.
+> Pass `--max-ahead` explicitly and fill it from
 > the spec, never from memory: the script defaults to 5, which is looser than
 > most repositories' own PR commit-count gate, so omitting it lets a branch read
 > `SAFE TO PUSH` and then fail that gate. Add `--require-single-on-base` only
-> when you actually squashed to one commit; it asserts `HEAD~1 ==
-> origin/<base>` and refuses a legitimate multi-commit branch.
-> Read the exit code, do not just test for zero: `0` proceed; `30`/`40` the gate
-> REFUSED, so do not push and report the code with the branch state; `2` the gate
-> could not RUN — an environment error, not a verdict — so do not push and report
+> when you actually squashed to one commit with the gate's `--squash`; it
+> asserts HEAD's only parent is `origin/<base>` and that the gate committed
+> every path HEAD changes, and refuses a legitimate multi-commit branch or a
+> squash made by hand.
+> Commit and amend through the gate, by name: `<gate>/push_guard.py --commit -m
+> "<subject>" -- <path>...` (or `-F <message file>`) and `--amend -- <path>...`,
+> never `git commit -a` or a bare `git commit`: the index can hold paths you
+> did not stage. Squash, if you squash, with `<gate>/push_guard.py --base {default_branch} --squash`
+> after writing the message to `<git-dir>/prepare-pr-commit-msg-<branch>.txt`
+> (`/` as `-`): it runs the checks above on the commits BEFORE squashing them
+> (so never `--max-ahead {max_commits}` there), then commits your branch's tree,
+> never an index, and `--require-single-on-base` then enforces the one commit.
+> A `40` whose text is the commits-ahead refusal, on commits you authored, is
+> answered once with the `--max-ahead N` it prints. Before any `git rebase
+> --continue`, `<gate>/push_guard.py --check-index` must exit `0`.
+> Read the exit code, do not just test for zero: `0` proceed; `30`/`40`/`41` the gate
+> REFUSED, so do not push and report the code with the branch state and stderr (a
+> git or network failure inside the gate is a `40` whose stderr names the failed
+> command; a `41` prints the staged paths and their remedy — follow it); `64` is
+> your own command-line mistake — fix it and retry; `2` the gate could not RUN —
+> not a git repository, no git, or a missing script — so do not push and report
 > `BLOCKED: push gate inoperative` with the code and stderr, because a worker
 > whose sandbox cannot reach the scripts has to surface that once instead of
 > stalling every item silently. A non-empty `git status --porcelain` is also a

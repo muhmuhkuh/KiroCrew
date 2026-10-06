@@ -12,11 +12,13 @@ import { useCallback, useLayoutEffect, useMemo, useRef, useSyncExternalStore, ty
 import { isRailSettling } from '../useRailWidth'
 import { inPlaceDeltaAbove, resizedInPlaceBelow } from './inPlaceResize'
 import { HeightIndex } from './HeightIndex'
-import { repriceAboveFoldDelta } from './FollowController'
+import { boundWidthFamilyFor } from '../../utils/widthFamilyGc'
+import { SCROLL_SETTLE_MS, repriceAboveFoldDelta } from './FollowController'
 import type { WindowRange } from './WindowCalculator'
 import { composerExplainsViewportChange } from '../../utils/composerResize'
 import type { ShiftCapture } from './shiftCompensation'
 import type { GeometrySync, StreamingGrace } from './geometryScheduling'
+import type { FollowState } from './followPolicy'
 
 type Ref<V> = MutableRefObject<V>
 
@@ -135,6 +137,20 @@ export function useHeightOwner<T>(ctx: {
         const it = itemsRef.current[i]
         return it ? getKeyRef.current(it, i) : null
       },
+      // Bound this slot's per-width family on the FIRST persist of this width's
+      // blob -- NOT here at construction. A brand-new width has no blob when its
+      // HeightIndex is constructed (construction only loads; the write happens
+      // later, when a measured row flushes), so binding at construction would
+      // skip every fresh width a reader drags the pane through and only ever
+      // fire on a remount or warm return to a width already written. The first
+      // flush that creates the blob (absent -> present) is the one moment a new
+      // width joins the family, so that is when the bound runs. It spares the
+      // scope just written (the current width, and the warm return a reader
+      // oscillates back to), reclaims only the least-recently-used OTHER widths,
+      // operates only on persisted derived caches -- never this live owner, a
+      // draft, or config -- and never caps the measurable width. No-op for a
+      // scope with no `:w<bucket>` suffix (a caller that did not width-scope).
+      onFirstPersist: () => boundWidthFamilyFor(heightScope),
     })
   } else {
     // Transcripts grow while mounted; keep the cap in step with the row count.
@@ -291,6 +307,7 @@ export function useRowMeasurement<T>(ctx: {
   scrollerRef: RefObject<HTMLDivElement | null>
   grace: Pick<StreamingGrace, 'graceIndexRef'>
   sync: Pick<GeometrySync, 'scheduleHeightSync'>
+  follow: Pick<FollowState, 'lastScrollClientHRef' | 'lastReaderScrollAtRef' | 'lastHardInputAtRef'>
 }): RowMeasurement {
   const {
     itemsRef, getKeyRef, streamingIndexRef, eagerFirstMeasureRef, elIndexRef, resizeObserverRef,
@@ -395,6 +412,7 @@ export function useRowMeasurement<T>(ctx: {
     const fired = firedAnchorRef.current
     if (fired && tops.has(fired.node)) tops.set(fired.node, fired.wantedTop)
   }, [])
+  const { lastScrollClientHRef, lastReaderScrollAtRef, lastHardInputAtRef } = ctx.follow
 
   /** Last observed scroller clientHeight, so a viewport resize has a direction. */
   const viewportHeightRef = useRef(0)
@@ -489,6 +507,31 @@ export function useRowMeasurement<T>(ctx: {
         // characters -- the bounce reported from a real phone. Skipped.
         const prevCh = viewportHeightRef.current
         viewportHeightRef.current = el.clientHeight
+        // A viewport change that lands while the reader is AT REST (no scroll
+        // event of THEIRS within the settle window) has no clamp to attribute
+        // and is not part of any gesture, so it must not surface as the next
+        // reader scroll event's delta: re-baseline the scroll-event height
+        // here. When a reader gesture IS in flight the baseline is left
+        // alone, because the observer can run before the clamp's own scroll
+        // event and that event needs to see the growth (see
+        // lastScrollClientHRef in followPolicy.ts). "In flight" is judged on
+        // BOTH reader clocks, the same way `noteHardInput` opens a gesture: the
+        // input that starts a drag lands BEFORE its first scroll event, so on
+        // the first frame of a gesture the scroll clock is still lapsed while
+        // the input clock is fresh -- keyed on the scroll clock alone, the
+        // growth of that first frame (Safari's collapse under the drag that
+        // caused it) was folded away here before the nudge's scroll event
+        // could see it. Our own pins do not count as a gesture -- a streaming
+        // turn pins every few frames, and keyed on those this re-baseline
+        // never ran for the whole turn, so a mid-turn growth was charged to
+        // whatever gesture the reader made next.
+        const now = performance.now()
+        const readerAtRest =
+          now - lastReaderScrollAtRef.current > SCROLL_SETTLE_MS &&
+          now - lastHardInputAtRef.current > SCROLL_SETTLE_MS
+        if (readerAtRest) {
+          lastScrollClientHRef.current = el.clientHeight
+        }
         if (prevCh > 0 && el.clientHeight > prevCh) continue
         if (composerExplainsViewportChange()) continue
         viewportResized = true
@@ -633,7 +676,7 @@ export function useRowMeasurement<T>(ctx: {
       firedAnchorRef.current = { node: anchor.node, wantedTop }
     }
     return { genuineResize, firstMount, viewportResized, tailRowResized, trailingChromeResized, streamingRowResized, aboveFoldReprice }
-  }, [elIndexRef, itemsRef, measurementIndex, streamingIndexRef, graceIndexRef, trailingRef])
+  }, [elIndexRef, itemsRef, measurementIndex, streamingIndexRef, graceIndexRef, trailingRef, lastScrollClientHRef, lastReaderScrollAtRef, lastHardInputAtRef])
 
   // ---- measureRef: per-item ref callback (memoized per index) ----
   //

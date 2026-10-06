@@ -50,6 +50,19 @@ describe('sseSlotPatch', () => {
     expect(after.slotWriteSeq).toBe(before.slotWriteSeq)
   })
 
+  it('reads an absent lineage_pending as false, so restating false is no write', () => {
+    const before = loaded()
+    const after = reducer(before, sseSlotPatch({ slots: [{ key: 'a', lineage_pending: false }] }))
+    expect(after.slots).toBe(before.slots)
+    expect(after.slotWriteSeq).toBe(before.slotWriteSeq)
+  })
+
+  it('clears a pending row when the patch says false', () => {
+    const before = reducer(undefined, sseSlots([row('a', { lineage_pending: true })]))
+    const after = reducer(before, sseSlotPatch({ slots: [{ key: 'a', lineage_pending: false }] }))
+    expect(after.slots.find(s => s.key === 'a')!.lineage_pending).toBe(false)
+  })
+
   it('drops a row for a key this tab does not hold', () => {
     const before = loaded()
     const after = reducer(before, sseSlotPatch({ slots: [{ key: 'zzz', pinned: true }] }))
@@ -69,18 +82,22 @@ describe('sseSlotPatch', () => {
     let state = loaded()
     state = reducer(state, fetchSlots.pending('req-1', undefined))
     state = reducer(state, sseSlotPatch({ slots: [], removed: ['b'] }))
+    expect(state.durablyRemoved).toEqual({ b: true })
     state = reducer(state, fetchSlots.fulfilled([row('a'), row('b'), row('c')], 'req-1', undefined))
     expect(state.slots.map(s => s.key)).toEqual(['a', 'c'])
 
     state = reducer(state, addSlotOptimistic(row('b')))
     expect(state.slots.map(s => s.key)).toEqual(['a', 'c', 'b'])
+    expect(state.durablyRemoved).toEqual({})
   })
 
   it('allows a WebSocket list to show a same-key replacement after a remote removal', () => {
     let state = loaded()
     state = reducer(state, sseSlotPatch({ slots: [], removed: ['b'] }))
+    expect(state.durablyRemoved).toEqual({ b: true })
     state = reducer(state, sseSlots([row('a'), row('b', { title: 'replacement' }), row('c')]))
     expect(state.slots.find(s => s.key === 'b')?.title).toBe('replacement')
+    expect(state.durablyRemoved).toEqual({})
   })
 
   it('removes a closed key and tears down its per-slot state like a full list', () => {
@@ -138,11 +155,29 @@ describe('sseSlotPatch', () => {
     expect(state.unreadSince?.a).toBe('2026-01-01T00:00:00Z')
   })
 
-  it('ignores a removal before the first snapshot', () => {
+  it('records a durable removal before the first snapshot without changing slot visibility', () => {
     const initial = reducer(undefined, { type: '@@INIT' })
     const after = reducer(initial, sseSlotPatch({ slots: [], removed: ['a'] }))
+    expect(after.durablyRemoved).toEqual({ a: true })
     expect(after.slotsLoaded).toBe(initial.slotsLoaded)
     expect(after.slots).toBe(initial.slots)
+  })
+
+  it('clears durable removal on createSlot and refuses unsafe dynamic keys', () => {
+    let state = reducer(undefined, sseSlotPatch({ slots: [], removed: ['b'] }))
+    state = reducer(state, {
+      type: 'chat/createSlot/fulfilled',
+      payload: row('b'),
+      meta: { requestId: 'create-b', requestStatus: 'fulfilled', arg: {} },
+    })
+    expect(state.durablyRemoved).toEqual({})
+
+    state = reducer(state, sseSlotPatch({
+      slots: [],
+      removed: ['__proto__', 'constructor', 'prototype'],
+    }))
+    expect(state.durablyRemoved).toEqual({})
+    expect(Object.getPrototypeOf(state.durablyRemoved)).toBe(Object.prototype)
   })
 })
 

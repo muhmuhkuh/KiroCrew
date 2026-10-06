@@ -311,6 +311,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # its own poisoned clone. Masked at OS level too (`sandbox._CREW_HIDDEN_LEAVES`), since a
     # spawned shell's `open()` never routes through this gate.
     "quarantined-clones",
+    "vouched-executions",  # member-store vouches; also sandbox-masked
     "browser-cookies.txt",
     "playwright-storage-state.json",
     # The refused-inbound spool (messaging/inbound_spool.py). Not a secret: it is
@@ -475,6 +476,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     "policy_cache",
     "admission_policy.json",
     "denied_commands.json",
+    # Operator grants of ``owner`` trust to hand-configured app registries, on the same floor
+    # as ``denied_commands.json``: a writable grant clones a registry the agent controls.
+    "registry_trust.json",
     # The cron store. It holds access-control state, not just scheduling data:
     # ``session_key`` decides which session may manage a job through the MCP cron
     # tools and where the job's output is delivered, ``approval_mode`` is a
@@ -923,11 +927,11 @@ _KEYSTONE_ARTIFACT_PARENTS: list[str] = sorted(
 # shared read+write gate, and reading config.json is routine and intended (the
 # dashboard file viewer, ``cat``, and knowledge indexing all read it). We
 # instead block only WRITES, at the agent file-edit tool gate
-# (hooks.on_tool_call), via ``is_sensitive_write_path``. This is defense in
-# depth on top of the loader's load-time clamp, which already neutralizes any
-# inflated on-disk value no matter how it was written. The operator edits config
-# out-of-band (dashboard config API / CLI), which do NOT route through this
-# gate, so legitimate config changes still work.
+# (hooks.on_tool_call), via ``is_sensitive_write_path``. That gate sees the
+# file-edit tool only, and the loader's clamp bounds NUMBERS, not SWITCHES
+# (``agent.sandbox: "off"``), so the load-bearing half is the OS sandbox, which
+# mounts both files read-only (``sandbox._CREW_READONLY_LEAVES``). The operator
+# edits config out-of-band (dashboard API / own-terminal CLI), outside both.
 # (The denied-command opt-out state does NOT live here — it is a security
 # ceiling and lives on the read+write keystone floor in ``denied_commands.json``
 # above, so no bash-level write matcher is needed for it. The computer-use primary
@@ -3545,7 +3549,9 @@ def sensitive_path_refusal(path_str: str, base_dir: str | None = None) -> str | 
     return None
 
 
-def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
+def path_contains_sensitive(
+    dir_str: str, base_dir: str | None = None, *, pre_resolved: bool = False
+) -> bool:
     """Return True if a read+write-sensitive location lies UNDER *dir_str*.
 
     The REVERSE direction of :func:`is_sensitive_path`: that gate answers "is
@@ -3563,12 +3569,21 @@ def path_contains_sensitive(dir_str: str, base_dir: str | None = None) -> bool:
     *dir_str* is a huge tree. Shares :func:`_candidate_forms` and
     :func:`_home_dir_targets` with :func:`_path_in_home_dirs` so the
     symlink/casefold hardening cannot drift between the two directions.
+
+    ``pre_resolved`` is :func:`_candidate_forms`'s flag of the same name, paired
+    with inline anchors exactly as :func:`_path_in_home_dirs` pairs them, and it
+    carries :func:`is_sensitive_resolved_path`'s preconditions verbatim: no
+    ``mc-pathres`` submission on either half, *dir_str* MUST be the
+    ``os.path.realpath`` the caller computed on its OWN worker thread, and a
+    caller on the event loop forfeits the bound the pool exists to give it. See
+    there for why a bulk walk may claim it. One question per directory, so the
+    walk that asks it would pay a pool hop per directory for nothing.
     """
     if not dir_str:
         return False
     try:
-        sensitive_targets = _home_dir_targets(_SENSITIVE_HOME_DIRS)
-        candidates = _candidate_forms(dir_str, base_dir)
+        sensitive_targets = _home_dir_targets(_SENSITIVE_HOME_DIRS, inline=pre_resolved)
+        candidates = _candidate_forms(dir_str, base_dir, pre_resolved=pre_resolved)
     except PathResolutionStalled:
         return True  # fail closed: see _path_in_home_dirs
     for cand in candidates:

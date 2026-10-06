@@ -34,7 +34,7 @@ import pytest
 from kiro_crew import session_directive
 from kiro_crew import subagent as _sa
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TOOL_CALL, EVENT_TOOL_RESULT, AcpEvent
-from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
+from kiro_crew.autonudge import MANUAL_STOP_REASON, AutoNudgeService, NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.monitoring import models as monitor_models
 from kiro_crew.monitoring.completion import MonitorCompletionHook
@@ -1161,6 +1161,29 @@ class TestAutonudgeRouterAndObserver:
         assert payload["loop"]["cycle_count"] == 2
 
     @pytest.mark.asyncio
+    async def test_observer_frame_carries_stopped_reason_and_deadline_for_a_plain_loop(self):
+        """The dashboard caches the frame over the REST read, so a frame that
+        carried these two fields only for a structured monitor blanked a plain
+        loop's paused reason and countdown the moment it landed."""
+        orch = _make_orchestrator()
+        orch.dashboard_state = _mock_dashboard_state()
+        _on_fire, observer, _inst = await self._wire(orch)
+
+        running = _loop("chat-1-1721", next_due_ts=1_800_000_300.0)
+        observer("armed", running)
+        _topic, payload = orch.dashboard_state.broadcast_ws.call_args.args
+        assert payload["loop"]["stopped_reason"] == ""
+        assert payload["loop"]["next_due_ts"] == 1_800_000_300.0
+
+        paused = _loop("chat-1-1721", active=False, stopped_reason=MANUAL_STOP_REASON)
+        observer("updated", paused)
+        _topic, payload = orch.dashboard_state.broadcast_ws.call_args.args
+        assert payload["loop"]["active"] is False
+        assert payload["loop"]["stopped_reason"] == MANUAL_STOP_REASON
+        assert payload["loop"]["next_due_ts"] == 0.0
+        assert "monitor" not in payload["loop"]
+
+    @pytest.mark.asyncio
     async def test_observer_broadcasts_structured_state_to_owners_only(self):
         orch = _make_orchestrator()
         orch.dashboard_state = _mock_dashboard_state()
@@ -2114,9 +2137,6 @@ class TestFireDashboardNudgeDispatch:
         ds = _mock_dashboard_state()
         slot = MagicMock()
         slot.running = False
-        # Real _ChatSlot defaults this False; a bare MagicMock returns a truthy
-        # Mock and would make the nudge defer on the busy guard.
-        slot._in_stage_execution = False
         slot.key = "chat-1"
         ds.get_slot.return_value = slot
         orch.dashboard_state = ds
@@ -2145,7 +2165,7 @@ class TestFireDashboardNudgeDispatch:
     async def test_structured_delivery_distinguishes_busy_and_unavailable(self, monkeypatch):
         busy = _make_orchestrator()
         busy_state = _mock_dashboard_state()
-        busy_slot = MagicMock(running=True, _in_stage_execution=False)
+        busy_slot = MagicMock(running=True)
         busy_state.get_slot.return_value = busy_slot
         busy.dashboard_state = busy_state
         unavailable = _make_orchestrator()
@@ -2174,7 +2194,6 @@ class TestFireDashboardNudgeDispatch:
 
         restored = MagicMock()
         restored.running = False
-        restored._in_stage_execution = False
         restored.key = "chat-9"
 
         async def _rehydrate(_state, _key, *, adopt_closed=False):
@@ -2557,3 +2576,84 @@ class TestDmFireSpineIsReusable:
         assert result is monitor_models.MonitorDispatchResult.UNAVAILABLE
         transport.dispatcher.handle_message.assert_not_awaited()
         orch.autonudge_svc.remove.assert_not_called()
+
+
+class TestMcpBrokerRefreshPrefetchAndPersistArms:
+    """The broker's refresh, prefetch and approval-persist arms nothing else reaches.
+
+    Each seam is patched on the gateway module, which is also what proves the moved
+    broker code still reads those names from the facade's globals.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_refresh_before_any_broker_start_reports_no_targets(self):
+        orch = _make_orchestrator()
+        orch._mcp_target_env = {}
+        orch._prefetch_mcp_resolutions = AsyncMock()
+        fresh = KiroCrewConfig()
+        with patch.object(gw.KiroCrewConfig, "load", return_value=fresh):
+            result = await orch._refresh_mcp_resolutions()
+        assert result == {"ok": False, "reason": "no_targets", "resolved": {}}
+        assert orch._cfg is fresh
+        orch._prefetch_mcp_resolutions.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_refresh_forces_a_pass_and_names_the_ready_packages(self):
+        orch = _make_orchestrator()
+        orch._mcp_target_env = {"KIROCREW_MCP_TARGET_A": "npx a"}
+        outcomes = {"b": "failed", "a": "ready"}
+        orch._prefetch_mcp_resolutions = AsyncMock(return_value=outcomes)
+        with patch.object(gw.KiroCrewConfig, "load", return_value=KiroCrewConfig()):
+            result = await orch._refresh_mcp_resolutions()
+        assert result == {"ok": True, "resolved": outcomes, "ready": ["a"]}
+        orch._prefetch_mcp_resolutions.assert_awaited_once_with(
+            {"KIROCREW_MCP_TARGET_A": "npx a"}, force=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failed_prefetch_pass_is_logged_and_reports_nothing(self, caplog):
+        orch = _make_orchestrator()
+        failing = AsyncMock(side_effect=RuntimeError("registry unreachable"))
+        with patch.object(gw, "resolve_prefetch", failing):
+            with caplog.at_level(logging.ERROR, logger="kiro_crew.slack.gateway"):
+                assert await orch._prefetch_mcp_resolutions({"K": "v"}) == {}
+        failing.assert_awaited_once()
+        assert "pre-resolve pass failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_prefetch_pass_is_not_swallowed(self):
+        orch = _make_orchestrator()
+        with patch.object(gw, "resolve_prefetch", AsyncMock(side_effect=asyncio.CancelledError())):
+            with pytest.raises(asyncio.CancelledError):
+                await orch._prefetch_mcp_resolutions({"K": "v"})
+
+    @pytest.mark.asyncio
+    async def test_a_failed_approval_persist_is_logged_and_its_task_released(self, caplog):
+        orch = _make_orchestrator()
+        orch._background_tasks = set()
+        with patch.object(gw, "save_pass", side_effect=OSError("disk full")):
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.slack.gateway"):
+                orch._schedule_mcp_launch_approval_persist(MagicMock())
+                (task,) = orch._background_tasks
+                orch._mcp_launch_approval_ready.set()
+                await asyncio.wait_for(task, timeout=5)
+                await asyncio.sleep(0)
+        assert "could not persist the approval store" in caplog.text
+        assert orch._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_stopping_the_broker_cancels_an_in_flight_prefetch(self):
+        orch = _make_orchestrator()
+        orch._mcp_gateway_manager = None
+        started = asyncio.Event()
+
+        async def _pending_install() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(_pending_install())
+        await started.wait()
+        orch._mcp_resolve_prefetch = task
+        await asyncio.wait_for(orch._stop_mcp_broker(), timeout=5)
+        assert task.cancelled()
+        assert orch._mcp_resolve_prefetch is None

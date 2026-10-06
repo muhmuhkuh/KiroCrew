@@ -38,6 +38,7 @@ from kiro_crew._sqlite_compat import (
     sqlite3,
 )
 from kiro_crew.config.loader import config_dir
+from kiro_crew.context_assembly.budget import _MEMORY_PROJECTS_CAP
 from kiro_crew.memory_recall import recall_terms
 from kiro_crew.memory_startup import require_memory_ready
 from kiro_crew.memory_stores import named_store_operation
@@ -185,10 +186,29 @@ def normalize_projects_document(content: str, *, today: str) -> str:
 
 
 def _cap_text(text: str, limit: int) -> str:
-    """*text* cut to *limit* chars with a truncation marker, or unchanged."""
+    """*text* cut to *limit* chars with a marker naming how much was cut, or unchanged."""
     if len(text) > limit:
-        return text[:limit] + "\n…[truncated]"
+        return text[:limit] + f"\n…[truncated] ({len(text) - limit} chars omitted)"
     return text
+
+
+def projects_cap_overflow(document: str) -> int:
+    """Chars of a projects *document* past what session startup injects (0 if it fits).
+
+    ``_projects_section`` cuts the file at ``_MEMORY_PROJECTS_CAP``, so anything
+    past it never reaches a session. Writers report this instead of failing:
+    the file itself keeps every byte.
+    """
+    return max(0, len(_normalize_newlines(document)) - _MEMORY_PROJECTS_CAP)
+
+
+def _warn_projects_over_cap(document: str) -> None:
+    if overflow := projects_cap_overflow(document):
+        logger.warning(
+            "projects.md is %d chars over the %d-char startup cap; sessions will not see its end",
+            overflow,
+            _MEMORY_PROJECTS_CAP,
+        )
 
 
 def _normalize_newlines(text: str) -> str:
@@ -429,6 +449,7 @@ class MemoryStore:
                 return False
             # Indexed inside the lock — see write_preferences.
             self._index_file(self._projects_file, full)
+        _warn_projects_over_cap(full)
         return True
 
     @named_store_operation
@@ -1064,6 +1085,14 @@ class MemoryStore:
             return ""
         return self._vector_store.get_episodic_context(query_text=query, cap=cap) or ""
 
+    def ranks_activity_against(self, query: str) -> bool:
+        """Whether :meth:`get_activity_context` ranks facts and episodes against *query*.
+
+        Ranking embeds the request only when an embedder is bound. When that embed
+        returns a vector, a caller that reads True may reuse it from the shared cache.
+        """
+        return self._vector_store is not None and bool(query)
+
     def get_activity_context(
         self,
         *,
@@ -1093,8 +1122,10 @@ class MemoryStore:
         # Facts and episodes are relevance-ranked against the request. Without a
         # request (the eval runner, a bare session open) there is nothing to rank
         # against, and a recency dump is exactly the noise this block must not be.
-        if self._vector_store and query:
-            semantic_ctx = self._vector_store.get_semantic_context(
+        if self.ranks_activity_against(query):
+            vector_store = self._vector_store
+            assert vector_store is not None
+            semantic_ctx = vector_store.get_semantic_context(
                 query_text=query, cap=semantic_cap, facts_only=True
             )
             if semantic_ctx:

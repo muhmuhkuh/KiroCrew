@@ -204,6 +204,32 @@ def _liveness_platform_line() -> str:
     return f"{sys.platform} — no process-tree backend; UNKNOWN platform_limited"
 
 
+def _doctor_cron_quarantine(issues: list[str]) -> bool:
+    """Name every copy the gateway moved aside, and how to put it back.
+
+    The gateway renames an unparseable ``crons.json`` at startup so it can run
+    on an empty schedule. The jobs in the copy do not run until the user
+    restores it. Returns whether it printed the section header.
+    """
+    store, copies = cli_doctor.cron_store_quarantine_copies()
+    if not copies:
+        return False
+    print("\nCron Jobs")
+    print(f"  quarantine:  ⚠️  {len(copies)} unreadable schedule file(s) moved aside")
+    for copy in copies:
+        print(f"               {render._safe_display(str(copy))}")
+    print("               `crons.json` was not a readable schedule (invalid JSON,")
+    print("               or no `jobs` list), so the gateway moved it aside")
+    print("               unchanged and started with no scheduled tasks.")
+    print("               Jobs in the copy do not run.")
+    print("               Restore: fix the copy, run `kirocrew stop`,")
+    print(f"               move the copy back to {store},")
+    print("               then start the gateway. That replaces any task added")
+    print("               since. Delete the copy once you no longer need it.")
+    issues.append(f"{len(copies)} unreadable cron store copy(ies) set aside")
+    return True
+
+
 def _doctor_cron_health(issues: list[str]) -> None:
     """Report cron jobs that auto-paused or last ran with an error.
 
@@ -218,6 +244,7 @@ def _doctor_cron_health(issues: list[str]) -> None:
     surface. The runtime readers keep degrading quietly; only this diagnostic
     speaks up.
     """
+    header_printed = _doctor_cron_quarantine(issues)
     auto_paused, errored, loadable = cli_doctor.unhealthy_jobs_from_disk()
     if not auto_paused and not errored:
         # The flag rides the scan's own read, so `crons.json` is opened ONCE per
@@ -225,7 +252,8 @@ def _doctor_cron_health(issues: list[str]) -> None:
         # load nothing from it; a missing store and an honestly empty one both
         # report True and stay silent.
         if not loadable:
-            print("\nCron Jobs")
+            if not header_printed:
+                print("\nCron Jobs")
             print("  store:       ⚠️  `crons.json` exists but could not be read")
             print("               No jobs can be loaded from it, so every scheduled")
             print("               job has stopped. The scheduler logs the parse error")
@@ -235,7 +263,8 @@ def _doctor_cron_health(issues: list[str]) -> None:
             issues.append("cron store unreadable")
         return
 
-    print("\nCron Jobs")
+    if not header_printed:
+        print("\nCron Jobs")
     if auto_paused:
         print(f"  auto-paused: ⚠️  {len(auto_paused)} job(s) paused after repeated failures")
         print(f"               {_format_job_labels(auto_paused)}")

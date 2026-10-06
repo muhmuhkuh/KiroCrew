@@ -89,7 +89,7 @@ image block inside `tool_result`. Both shapes drive the same `x11.perform`, so t
 logs and the scenarios are identical either way. `--tool-mode native|custom` pins one.
 
 The model id is a workflow parameter (`inputs.model`, default
-`us.anthropic.claude-opus-5`), never a default in code. The workflow also passes
+`us.anthropic.claude-opus-5-5`), never a default in code. The workflow also passes
 `--price-in 15 --price-out 75` (Opus list prices per million tokens) so the run's
 cost figure and the budget gate count real dollars; the harness's own defaults are
 Sonnet prices, for a `-f model=` override to a Sonnet-class model.
@@ -230,7 +230,11 @@ thread, a toggle already flipped. One that changes persisted state (creates some
 switches a store) and then expects the pre-change state cannot be retried: its second
 attempt meets a precondition that no longer holds and cannot reach a verdict. Write the
 steps and expectations so both attempts read the same, or keep the mutation out of the
-scenario. The same boot also serves every LATER scenario in the run, through one browser
+scenario. A create step names the one row it needs rather than the click that makes
+it: `knowledge-add-folder-source-and-scan` asks for exactly one "Team notes" source and
+adds nothing when an earlier attempt already listed it, because the backend refuses a
+second source on the same path and the form's red "source already exists" would fail
+the run. The same boot also serves every LATER scenario in the run, through one browser
 profile, so a per-device switch (Developer Mode, Show Timestamps, a feature preview)
 that a scenario flips is still flipped when the next scenario starts. A scenario that
 flips one either puts it back before it ends or leaves a state nothing later depends on
@@ -348,7 +352,7 @@ logged, or fail with none.
   or through a lane-scoped role that trusts the branch.
 - **On a PR**: not yet -- see the note at the top and phase 2 of the tracking issue.
 - **Nightly**: `20 9 * * *` UTC on `main`, full tier (currently 32 smoke plus
-  8 nightly-only scenarios). A non-PASS night opens or updates the single open
+  9 nightly-only scenarios). A non-PASS night opens or updates the single open
   issue labelled `gui-test-report`.
 
 ### Locally
@@ -362,12 +366,12 @@ role. On a machine with those:
 ```bash
 sudo apt-get install -y xvfb xdotool x11-utils           # Debian/Ubuntu
 pip install -e . "boto3>=1.34,<2"
-(cd website && npm ci && npm run build) && rm -rf src/kiro_crew/static/dist && cp -R website/dist src/kiro_crew/static/dist
+(cd website && npm ci && npm run build) && PYTHONPATH=src python -m kiro_crew.frontend stage .
 export GUI_OUT="$(mktemp -d)"
 bash scripts/gui-user-test/boot.sh                       # Xvfb :99, gateway, Chromium
 . "$GUI_OUT/target.env"
 python test/gui_user/harness.py --out "$GUI_OUT/results" --base-url "$GUI_BASE_URL" \
-  --model us.anthropic.claude-opus-5 --tier smoke --budget-usd 10 --price-in 15 --price-out 75
+  --model us.anthropic.claude-opus-5-5 --tier smoke --budget-usd 10 --price-in 15 --price-out 75
 bash scripts/gui-user-test/teardown.sh
 ```
 

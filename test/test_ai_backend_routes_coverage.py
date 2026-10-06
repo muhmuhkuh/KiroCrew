@@ -286,7 +286,10 @@ def recipe(monkeypatch: pytest.MonkeyPatch) -> type[FakeRecipe]:
     FakeRecipe.instances = []
     FakeRecipe.raises = None
     FakeRecipe.ref = "https://github.com/owner/repo/pull/9"
-    monkeypatch.setattr(routes, "GitHubPRRecipe", FakeRecipe)
+    monkeypatch.setattr(
+        "kiro_crew.apps.builtins.auto_improvement.profiles.github_repo.pr_recipe.GitHubPRRecipe",
+        FakeRecipe,
+    )
     return FakeRecipe
 
 

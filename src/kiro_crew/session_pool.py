@@ -22,10 +22,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.agent_sdk.backends import ACP_BACKENDS_ACP_RUNTIME
+from kiro_crew.config.loader import resolve_agent_identity
 from kiro_crew.kiro_prerequisite import pre_spawn_identity, spawn_pid, stamp_spawn_identity
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
+    from kiro_crew.start_priority import PrioritySemaphore
 else:
     # The aliases below subscript LLMProvider at module scope, so a name must
     # exist at runtime; a real import would cross the agent-SDK boundary gate.
@@ -34,6 +36,28 @@ else:
 
 ProviderFactory = Callable[..., LLMProvider]
 KillProvider = Callable[[LLMProvider], None]
+
+
+def pool_kiro_agent(cfg: Any) -> str:
+    """The kiro agent the warm pool prewarms and claims for, as a session names it.
+
+    ``session.pool_agent`` (else ``agent.default_agent``) may be blank, a config
+    alias such as ``default``, or a kiro agent name, while a session asks the pool
+    for the RESOLVED kiro agent (``kirocrew`` for the default). A blank name or a
+    config alias is resolved here, through the same in-memory resolver a session's
+    bindings use, so the pool spawns that agent and matches that name. Any other
+    name is already a kiro agent and is kept as written: the resolver would map
+    one it cannot see (a project-scoped agent) to the default. A config the
+    resolver cannot read keeps the configured name too.
+    """
+    name = cfg.session.pool_agent or getattr(cfg.agent, "default_agent", "")
+    if name and name not in cfg.agents:
+        return name
+    try:
+        return resolve_agent_identity(cfg, name or None)[1] or name
+    except Exception:
+        logging.getLogger(__name__).debug("warm pool agent did not resolve", exc_info=True)
+        return name
 
 
 class _SessionMapPort(Protocol):
@@ -54,7 +78,7 @@ class WarmPoolOwner(Protocol):
     _cfg: Any
     _provider_factory: ProviderFactory | None
     _session_map: _SessionMapPort
-    _start_sem: asyncio.Semaphore
+    _start_sem: PrioritySemaphore
     _background_tasks: set[asyncio.Task[Any]]
     _starting_pids: set[int]
 
@@ -86,6 +110,12 @@ class WarmPoolState:
     cwd: str = ""
     queue: asyncio.Queue[tuple[LLMProvider, float]] = field(default_factory=asyncio.Queue)
     fill_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # True while a ``_fill_warm_pool`` loop is live. The fill lock guards the
+    # queue mutations but is released across each start-permit wait, so it does
+    # not serialize whole refills; this flag does, so a second refill
+    # (a replenish scheduled while startup fill runs) returns at once rather
+    # than racing to overfill past the target.
+    fill_active: bool = False
     health_task: asyncio.Task[Any] | None = None
     sweep_pids: set[int] = field(default_factory=set)
     # Monotonic instant of the most recent identity sweep. Every queued provider
@@ -149,7 +179,7 @@ class WarmSessionPool:
             )
         return WarmPoolState(
             size=size,
-            agent=cfg.session.pool_agent or getattr(cfg.agent, "default_agent", ""),
+            agent=pool_kiro_agent(cfg),
             ttl_secs=max(0, cfg.session.pool_ttl_secs),
             cwd=self._deps.default_project_dir(),
         )
@@ -213,6 +243,14 @@ class WarmSessionPool:
         self.state.fill_lock = value
 
     @property
+    def _pool_fill_active(self) -> bool:
+        return self.state.fill_active
+
+    @_pool_fill_active.setter
+    def _pool_fill_active(self, value: bool) -> None:
+        self.state.fill_active = value
+
+    @property
     def _pool_health_task(self) -> asyncio.Task[Any] | None:
         return self.state.health_task
 
@@ -240,14 +278,13 @@ class WarmSessionPool:
         """Disqualify every already-queued provider from future claims.
 
         Called at the head of an identity sweep, before any session key is
-        exposed as claimable. The actual pool teardown
-        (``_retire_kiro_warm_pool``) cannot run inside the sweep's cold-start
-        permit barrier -- it takes ``_pool_fill_lock``, which a fill in progress
-        holds while awaiting a start permit the barrier is holding, so calling it
-        there deadlocks. This timestamp is the fence that covers that gap: a
-        claim during the window is refused on age, so no session can be handed a
-        provider that authenticated as the previous account, whatever order the
-        teardown runs in.
+        exposed as claimable. The fill loop (``_fill_warm_pool_loop``) releases
+        ``_pool_fill_lock`` across each provider start, so a fill suspended in a
+        start can enqueue a pre-sweep provider behind the teardown
+        (``_retire_kiro_warm_pool``) after the drain has run. This timestamp is
+        the fence that covers that gap: a claim during the window is refused on
+        age, so no session can be handed a provider that authenticated as the
+        previous account, whatever order the teardown and a racing fill run in.
         """
         self._pool_identity_epoch = time.monotonic()
 
@@ -327,57 +364,119 @@ class WarmSessionPool:
         """Spawn providers up to the configured size and enqueue them."""
         if not self._pool_size or not self._owner._provider_factory:
             return
-        async with self._pool_fill_lock:
-            while self._warm_pool.qsize() < self._pool_size:
-                provider: LLMProvider | None = None
-                try:
-                    provider = self._owner._provider_factory(
+        if self._pool_fill_active:
+            # A refill is already live. The fill lock guards the queue mutations
+            # but is released across each start wait, so this flag is what serializes
+            # whole refills: the running loop reaches the target, and a second
+            # refill racing it would only risk overshooting the size.
+            return
+        self._pool_fill_active = True
+        try:
+            await self._fill_warm_pool_loop()
+        finally:
+            self._pool_fill_active = False
+
+    async def _fill_warm_pool_loop(self) -> None:
+        while True:
+            provider: LLMProvider | None = None
+            starting_pid: int | None = None
+            stale_identity = False
+            try:
+                # The fill lock guards the shape read and the enqueue, not the
+                # per-iteration start-permit wait: a caller waiting on the lock
+                # (``refresh_defaults`` / ``reload_provider_factory`` from a
+                # config apply, or the identity sweep's ``_retire_kiro_warm_pool``)
+                # interleaves between iterations and waits at most one start,
+                # not the whole refill. The epoch fence (see
+                # ``mark_identity_epoch``) covers the gap the released lock opens
+                # around the start: a provider that authenticated before an
+                # identity change is discarded at the enqueue re-check below
+                # rather than seeded behind the drain, and refused on age at
+                # claim time, whatever order it and the teardown run in.
+                async with self._pool_fill_lock:
+                    factory = self._owner._provider_factory
+                    if factory is None or self._warm_pool.qsize() >= self._pool_size:
+                        return
+                    provider = factory(
                         "",
                         agent=self._pool_agent or None,
                         cwd=self._pool_cwd or None,
                     )
-                    async with self._owner._start_sem:
-                        # Age includes startup time. Startup takes seconds, while
-                        # the warm-pool TTL is 1800 seconds; more importantly, a
-                        # start spanning an identity epoch stays pre-epoch.
-                        spawn_time = time.monotonic()
-                        pre_spawn = await pre_spawn_identity(
-                            getattr(self._owner, "spawn_identity_reader", None)
-                        )
-                        await provider.start()
-                    # Fill-time is authentication time for a pooled provider --
-                    # a claim months of seconds later must compare against THIS
-                    # account, not the claim-time one (first-stamp-wins in the
-                    # helper keeps later starts from relabeling it). The stamp
-                    # read suspends before the pool queue (the orphan sweep's
-                    # pool-PID union) can see this provider, so shield its PID
-                    # for the span.
-                    starting_pid = spawn_pid(provider)
-                    if starting_pid is not None:
-                        self._owner._starting_pids.add(starting_pid)
-                    try:
-                        await stamp_spawn_identity(
-                            getattr(self._owner, "spawn_identity_reader", None),
-                            provider,
-                            pre_spawn=pre_spawn,
-                        )
-                        self._warm_pool.put_nowait((provider, spawn_time))
-                        provider = None
-                    finally:
-                        if starting_pid is not None:
-                            self._owner._starting_pids.discard(starting_pid)
-                    self._deps.logger.info(
-                        "Warm pool: spawned process (pool=%d/%d agent=%s)",
-                        self._warm_pool.qsize(),
-                        self._pool_size,
-                        self._pool_agent or "default",
+                async with self._owner._start_sem:
+                    # Age includes startup time. Startup takes seconds, while
+                    # the warm-pool TTL is 1800 seconds; more importantly, a
+                    # start spanning an identity epoch stays pre-epoch.
+                    spawn_time = time.monotonic()
+                    pre_spawn = await pre_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None)
                     )
-                except Exception:
-                    self._deps.logger.warning("Warm pool: failed to spawn process", exc_info=True)
-                    break
+                    await provider.start()
+                # Fill-time is authentication time for a pooled provider --
+                # a claim months of seconds later must compare against THIS
+                # account, not the claim-time one (first-stamp-wins in the
+                # helper keeps later starts from relabeling it). The stamp
+                # read suspends before the pool queue (the orphan sweep's
+                # pool-PID union) can see this provider, so shield its PID
+                # for the span.
+                starting_pid = spawn_pid(provider)
+                if starting_pid is not None:
+                    self._owner._starting_pids.add(starting_pid)
+                # The stamp read is a multi-second suspension point reached
+                # after the child's process already started but before it is
+                # registered anywhere a sweep can see; its ``finally`` discards
+                # the child if a cancellation (or an enqueue the revalidation
+                # refuses) leaves ``provider`` set, so a cancelled stamp never
+                # leaks the started process.
+                try:
+                    await stamp_spawn_identity(
+                        getattr(self._owner, "spawn_identity_reader", None),
+                        provider,
+                        pre_spawn=pre_spawn,
+                    )
+                    async with self._pool_fill_lock:
+                        # Revalidate under the lock before enqueueing: the lock
+                        # is released across the start, so a config apply or the
+                        # identity sweep can swap the factory, drain the queue, or
+                        # mark the identity epoch in that window.
+                        factory_ok = (
+                            self._owner._provider_factory is factory
+                            and self._warm_pool.qsize() < self._pool_size
+                        )
+                        stale_identity = self._claimed_under_previous_identity(provider, spawn_time)
+                        if factory_ok and not stale_identity:
+                            self._warm_pool.put_nowait((provider, spawn_time))
+                            provider = None
+                    if provider is None:
+                        self._deps.logger.info(
+                            "Warm pool: spawned process (pool=%d/%d agent=%s)",
+                            self._warm_pool.qsize(),
+                            self._pool_size,
+                            self._pool_agent or "default",
+                        )
                 finally:
                     if provider is not None:
+                        # Enqueue refused (factory swapped, pool full, or the
+                        # provider authenticated before an identity epoch), or
+                        # the stamp was cancelled: the child started but is
+                        # unusable, so discard it here rather than leak it.
                         await self._owner._discard_pool_provider(provider, "Warm pool fill cleanup")
+                        provider = None
+                    if starting_pid is not None:
+                        self._owner._starting_pids.discard(starting_pid)
+                # Re-seeding a drained pool is only safe while the identity is
+                # unchanged: a provider refused on the epoch means an identity
+                # change is draining the pool, so stop instead of re-spawning
+                # against the retired identity. The periodic health sweep
+                # refills the pool afterward. A factory swap or a filled pool
+                # just re-reads the installed factory next iteration.
+                if stale_identity:
+                    break
+            except Exception:
+                self._deps.logger.warning("Warm pool: failed to spawn process", exc_info=True)
+                break
+            finally:
+                if provider is not None:
+                    await self._owner._discard_pool_provider(provider, "Warm pool fill cleanup")
 
     def _dispatch_hard_kill(self, provider: LLMProvider) -> None:
         """Dispatch a blocking provider kill without blocking the event loop."""
@@ -709,8 +808,12 @@ class WarmSessionPool:
         keep: list[tuple[LLMProvider, float]] = []
         drop: list[LLMProvider] = []
         complete = True
-        # Holding the fill lock across drain and shutdown prevents a fill that
-        # authenticated before an identity change from enqueueing behind us.
+        # The fill lock serializes this drain against the fill's own queue
+        # mutations, so a concurrent iteration cannot enqueue mid-drain. A fill
+        # suspended in a start holds no lock, so it can still enqueue a provider
+        # that authenticated before an identity change after the drain; the
+        # epoch fence (see ``mark_identity_epoch``) disqualifies that provider on
+        # age at claim time.
         async with self._pool_fill_lock:
             for _ in range(self._warm_pool.qsize()):
                 try:

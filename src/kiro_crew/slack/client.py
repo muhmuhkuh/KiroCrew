@@ -274,9 +274,19 @@ class SlackClientOps(ABC):
         return None
 
     async def fetch_thread_replies(
-        self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True
+        self,
+        channel: str,
+        thread_ts: str,
+        limit: int = 200,
+        warn_on_pagination: bool = True,
+        *,
+        oldest: str | None = None,
+        latest: str | None = None,
     ) -> list[dict]:
-        """Fetch thread replies. Returns list of message dicts with 'user'/'bot_id' and 'text'."""
+        """Fetch thread replies. Returns list of message dicts with 'user'/'bot_id' and 'text'.
+
+        *oldest* / *latest* bound the range by ts, both exclusive.
+        """
         return []
 
     async def conversations_list(self) -> list[dict]:
@@ -685,8 +695,25 @@ class RealSlackClient(SlackClientOps):
                 body["chunks"] = chunks
             resp = await self._web.api_call("chat.startStream", json=body)
             return resp.get("ts")
-        except Exception:
-            logger.warning("chat.startStream failed", exc_info=True)
+        except Exception as exc:
+            # A turn with no originating Slack user -- a subagent run, or a cron
+            # job streaming into a channel -- carries user_id="", so the body
+            # omits recipient_user_id. On an org-wide (Enterprise Grid) install
+            # Slack rejects that with ``missing_recipient_user_id`` (and the
+            # team-less variant ``missing_recipient_team_id``); on a
+            # single-workspace install the same call streams fine. The caller
+            # demotes to chat.update on the None return either way, so this known
+            # rejection is routine, not a defect: log one line without a stack
+            # trace. Anything else is unexpected and keeps the full traceback.
+            code = ""
+            try:
+                code = str(getattr(exc, "response", {}).get("error", "") or "")
+            except Exception:
+                code = ""
+            if code in ("missing_recipient_user_id", "missing_recipient_team_id"):
+                logger.warning("chat.startStream has no recipient (%s); using chat.update", code)
+            else:
+                logger.warning("chat.startStream failed", exc_info=True)
             return None
 
     async def append_stream(self, channel: str, ts: str, text: str) -> bool:
@@ -917,14 +944,31 @@ class RealSlackClient(SlackClientOps):
         return "\n".join(parts) or text or None
 
     async def fetch_thread_replies(
-        self, channel: str, thread_ts: str, limit: int = 200, warn_on_pagination: bool = True
+        self,
+        channel: str,
+        thread_ts: str,
+        limit: int = 200,
+        warn_on_pagination: bool = True,
+        *,
+        oldest: str | None = None,
+        latest: str | None = None,
     ) -> list[dict]:
-        """Fetch parent message + replies via conversations.replies API."""
+        """Fetch parent message + replies via conversations.replies API.
+
+        *oldest* / *latest* bound the range by ts, both exclusive. Unset, they
+        are left out, so the request is the same unbounded read as before.
+        """
+        bounds: dict[str, Any] = {}
+        if oldest:
+            bounds["oldest"] = oldest
+        if latest:
+            bounds["latest"] = latest
         try:
             resp = await self._web.conversations_replies(
                 channel=channel,
                 ts=thread_ts,
                 limit=limit,
+                **bounds,
             )
             data: dict = resp.data if hasattr(resp, "data") else dict(resp)  # type: ignore[assignment,call-overload]
             messages: list[dict] = data.get("messages", [])
@@ -967,6 +1011,14 @@ class RealSlackClient(SlackClientOps):
                     break
             except (SlackClientError, aiohttp.ClientError, asyncio.TimeoutError):
                 logger.debug("conversations_list page failed", exc_info=True)
+                # Re-raise while nothing has been collected yet: an all-empty
+                # result caused by a failing page (e.g. an empty first page that
+                # carried a next_cursor, then a later page erroring) must stay a
+                # failure, not a successful empty refresh — otherwise the
+                # resolver caches [] for an hour and suppresses retries. Once we
+                # have channels, keep the partial result instead.
+                if not out:
+                    raise
                 break
         return out
 

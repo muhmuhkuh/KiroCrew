@@ -51,6 +51,7 @@ import json
 import logging
 import math
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, NamedTuple
 
 from kiro_crew.agent_sdk.capabilities import capabilities_of
@@ -112,30 +113,40 @@ def _matcher_ok(matcher: object) -> bool:
 
 
 def _matcher_names_a_kas_tool(matcher: str) -> bool:
-    """Whether ``matcher`` can match any name in the kiro-cli/KAS tool table."""
+    """Whether ``matcher`` can match any name in the kiro-cli/KAS/goose/opencode tables."""
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
+    from kiro_crew.acp.harness_tool_names import HARNESS_TOOL_MATCH_VOCABULARY
     from kiro_crew.acp.kas_permissions import KAS_TOOL_MATCH_VOCABULARY
     from kiro_crew.hooks import _tool_matches
 
-    return matcher == "*" or any(_tool_matches(matcher, name) for name in KAS_TOOL_MATCH_VOCABULARY)
+    vocabulary = KAS_TOOL_MATCH_VOCABULARY | HARNESS_TOOL_MATCH_VOCABULARY
+    return matcher == "*" or any(_tool_matches(matcher, name) for name in vocabulary)
 
 
 def spec_hook_tool_names(tool_id: str) -> tuple[str, ...] | None:
-    """The names a spec hook's tool matcher meets for a KAS call to ``tool_id``.
+    """The names a spec hook's tool matcher meets for a call the harness named ``tool_id``.
 
-    :func:`kiro_crew.acp.kas_permissions.kas_tool_match_names` of the id, read
-    through this module because application code reaches the ACP layer only via
-    ``agent_sdk``. ``None`` when KAS named no tool, so the caller keeps matching on
-    the call's title, as for a Hooks-page hook, rather than treating the hook as
-    not applying.
+    A goose or opencode id is qualified by its backend (``goose#shell``) and read
+    through that backend's table
+    (:func:`kiro_crew.acp.harness_tool_names.harness_tool_match_names`); any other id
+    is KAS's own, read through
+    :func:`kiro_crew.acp.kas_permissions.kas_tool_match_names`. Both are read through
+    this module because application code reaches the ACP layer only via
+    ``agent_sdk``. ``None`` when the harness named no tool, so the caller keeps
+    matching on the call's title, as for a Hooks-page hook, rather than treating
+    the hook as not applying.
     """
     if not tool_id:
         return None
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
+    from kiro_crew.acp.harness_tool_names import harness_tool_match_names
     from kiro_crew.acp.kas_permissions import kas_tool_match_names
 
+    harness_names = harness_tool_match_names(tool_id)
+    if harness_names is not None:
+        return harness_names
     return kas_tool_match_names(tool_id)
 
 
@@ -176,24 +187,24 @@ def _hook(agent_id: str, event: str, index: int, entry: dict, timeout: int) -> S
         and matcher
         and not _matcher_names_a_kas_tool(matcher)
     ):
-        # Kept, not dropped: the matcher still meets a KAS id of that name (an MCP
-        # tool, a built-in the table has no row for), and dropping it would retire
-        # a guard KAS can serve. Said once, since a kiro-cli-only name (``use_aws``)
-        # never meets a KAS call.
+        # Kept, not dropped: the matcher still meets a harness tool of that name (an
+        # MCP tool, a built-in no table has a row for), and dropping it would retire
+        # a guard the harness can serve. Said once, since a kiro-cli-only name
+        # (``use_aws``) never meets a harness call.
         logger.warning(
-            "agent %r: spec hook matcher %s on %s names no tool in Crew's kiro-cli/KAS "
-            "table; it runs only for a KAS tool id it matches as written",
+            "agent %r: spec hook matcher %s on %s names no tool in Crew's tool tables; "
+            "it runs only for a harness tool id it matches as written",
             agent_id,
             _diagnostic(matcher),
             _diagnostic(event),
         )
     if event == HOOK_EVENT_POST_TOOL_USE and isinstance(matcher, str) and matcher not in ("", "*"):
-        # KAS's tool-call frames name no tool, so a PostToolUse is matched on the
-        # call's title, which a kiro-cli tool name rarely matches. Said once here
-        # rather than left to miss silently.
+        # A finished call reaches the turn loop with no harness tool id, so a
+        # PostToolUse is matched on the call's title, which a kiro-cli tool name
+        # rarely matches. Said once here rather than left to miss silently.
         logger.warning(
-            "agent %r: spec postToolUse matcher %s is compared with the KAS call's "
-            "title, since KAS names no tool on a finished call",
+            "agent %r: spec postToolUse matcher %s is compared with the call's "
+            "title, since the harness names no tool on a finished call",
             agent_id,
             _diagnostic(matcher),
         )
@@ -319,8 +330,14 @@ def _convert(agent_id: str, spec: dict[str, Any]) -> tuple[tuple[ScriptHook, ...
     return result
 
 
-def _agent_spec(agent_id: str) -> dict[str, Any]:
+def _agent_spec(agent_id: str, project_dir: str | None = None) -> dict[str, Any]:
     """*agent_id*'s spec, or ``{}`` when it has none on disk.
+
+    *project_dir* is the session's checkout on a backend that resolves its spec
+    project-nearest first (goose, opencode; see ``overlay_project_scope``). There a
+    project spec of that name is the one the session runs, so its hooks are the
+    ones read, and a project spec that cannot be read raises. KAS reads the user
+    level alone, so it passes none.
 
     A KAS mode switch can move a session to one of KAS's own built-in modes
     (``vibe``), which has no Crew spec: it carries no spec hooks, and the Hooks
@@ -331,15 +348,69 @@ def _agent_spec(agent_id: str) -> dict[str, Any]:
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
     from kiro_crew.acp.kas_agents import agent_spec_absent, load_agent_spec
+    from kiro_crew.acp.session_mcp import project_agent_spec
     from kiro_crew.config.paths import kiro_agents_dir
 
+    if project_dir:
+        declared, spec = project_agent_spec(agent_id, project_dir)
+        if declared:
+            if spec is None:
+                raise ValueError(f"the project spec for agent {agent_id!r} could not be read")
+            return spec
     agents_dir = kiro_agents_dir()
     if agent_spec_absent(agents_dir, agent_id):
         return {}
     return load_agent_spec(agents_dir, agent_id)
 
 
-def crew_fired_spec_hooks(agent_id: str) -> tuple[list[ScriptHook], list[str], int]:
+def kas_spec_load_error(agents_dir: Path, agent_id: str) -> str | None:
+    """Why KAS session creation would refuse *agent_id*'s spec, or ``None``.
+
+    Runs KAS's two LOADING steps and nothing else: ``load_agent_spec``, then
+    ``resolve_prompt`` for a non-blank prompt. Either raising
+    ``KasAgentTranslationError`` refuses a KAS session, and its message is
+    returned. It stops before ``to_client_custom_agent``, which consults the
+    governance ceiling and writes SEL records. Any other exception propagates.
+    """
+    # circular import: kas_agents imports this module at load time.
+    from kiro_crew.acp.kas_agents import (
+        KasAgentTranslationError,
+        load_agent_spec,
+        resolve_prompt,
+    )
+
+    try:
+        spec = load_agent_spec(agents_dir, agent_id)
+        prompt = spec.get("prompt")
+        # A blank or absent prompt takes resolve_prompt's constant fallback and
+        # cannot fail; skipping it avoids that function's warning per probe.
+        if not (prompt is None or (isinstance(prompt, str) and not prompt.strip())):
+            resolve_prompt(spec, agent_id=agent_id, agents_dir=agents_dir)
+    except KasAgentTranslationError as exc:
+        return str(exc)
+    return None
+
+
+def spec_project_dir(provider: object) -> str | None:
+    """The checkout *provider*'s session resolves its agent spec against, or ``None``.
+
+    The session's own work dir on a backend that resolves project-nearest first,
+    as its MCP projection does (``agent_sdk.backends.overlay_project_scope``);
+    ``None`` on one that reads the user level alone (KAS).
+    """
+    from kiro_crew.agent_sdk.backends import overlay_project_scope
+
+    cwd = getattr(provider, "cwd", "")
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    scope = overlay_project_scope(capabilities_of(provider).backend, cwd)
+    work_dir = scope.get("work_dir")
+    return work_dir if isinstance(work_dir, str) and work_dir else None
+
+
+def crew_fired_spec_hooks(
+    agent_id: str, project_dir: str | None = None
+) -> tuple[list[ScriptHook], list[str], int]:
     """The active agent spec's hooks as script hooks, the keys nothing carries, and
     how many ``confirm: true`` hooks are skipped.
 
@@ -347,13 +418,14 @@ def crew_fired_spec_hooks(agent_id: str) -> tuple[list[ScriptHook], list[str], i
     (:func:`kiro_crew.acp.kas_agents.load_agent_spec`). The second and third values
     are for the session-start notice: the spec keys a KAS session runs without, and
     the hooks that wait for a confirmation Crew cannot ask for. Raises when the spec
-    cannot be read; the caller fails PreToolUse closed on that.
+    cannot be read; the caller fails PreToolUse closed on that. *project_dir* is
+    :func:`spec_project_dir` of the session.
     """
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
     from kiro_crew.acp.kas_agents import spec_keys_without_carrier
 
-    spec = _agent_spec(agent_id)
+    spec = _agent_spec(agent_id, project_dir)
     hooks, unconfirmable = _convert(agent_id, spec)
     return list(hooks), spec_keys_without_carrier(spec), unconfirmable
 
@@ -410,7 +482,9 @@ async def turn_spec_hooks(provider: object, agent_id: str) -> TurnSpecHooks:
         logger.warning("no agent is known for this KAS turn; its tool calls are blocked")
         return TurnSpecHooks([], work_dir, True, True)
     try:
-        hooks, _lost, _unconfirmable = await asyncio.to_thread(crew_fired_spec_hooks, agent_id)
+        hooks, _lost, _unconfirmable = await asyncio.to_thread(
+            crew_fired_spec_hooks, agent_id, spec_project_dir(provider)
+        )
     except Exception:  # noqa: BLE001 - the caller fails permission requests closed
         logger.warning(
             "agent spec hooks for %r could not be read; tool calls are blocked",

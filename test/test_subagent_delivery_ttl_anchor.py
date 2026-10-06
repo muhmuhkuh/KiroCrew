@@ -40,31 +40,8 @@ from kiro_crew.subagent_persistence import (
 
 
 @pytest.fixture(autouse=True)
-def _close_subagent_managers(monkeypatch):
-    """Close every ``SubagentManager`` built in a test.
-
-    Construction opens the durable task queue (a SQLite connection and its
-    writer thread); nothing in these unit tests closes it, so each manager
-    leaked those descriptors. Track every instance and release it at teardown.
-    """
-    import kiro_crew.subagent as _subagent_mod
-
-    created: list[SubagentManager] = []
-    orig_init = _subagent_mod.SubagentManager.__init__
-
-    def _tracking_init(self, *args, **kwargs):
-        orig_init(self, *args, **kwargs)
-        created.append(self)
-
-    monkeypatch.setattr(_subagent_mod.SubagentManager, "__init__", _tracking_init)
-    try:
-        yield
-    finally:
-        for mgr in created:
-            try:
-                mgr.close()
-            except Exception:
-                pass
+def _close_subagent_managers(close_subagent_managers):
+    """Every manager built here is closed at teardown; the body is in ``conftest``."""
 
 
 COMPLETION = f"{SUBAGENT_COMPLETION_PREFIX}\nAgent `a1` completed ✅\nResult saved at: /x"
@@ -85,6 +62,15 @@ def _key(content: str) -> str:
 
 def _delivery(agent_id: str, *, elapsed: float = 12.0, credits: float = 0.25):
     return SubagentDelivery(agent_id, elapsed, credits)
+
+
+def _spawned_on_consumed(coro):
+    """The ``_on_consumed`` hook the drain passed to the ``_run_chat`` it spawned.
+
+    ``_run_chat`` runs under its exit guard, so before the coroutine first steps
+    its frame holds the dispatcher's keywords as ``kwargs``.
+    """
+    return coro.cr_frame.f_locals["kwargs"].get("_on_consumed")
 
 
 def _pending_map(slot) -> dict[str, list[str]]:
@@ -398,7 +384,7 @@ class TestConsumptionSignalIsPerTurn:
         spawned: list[dict] = []
 
         def _spawn(_state, _slot, coro):
-            hook = coro.cr_frame.f_locals.get("_on_consumed")
+            hook = _spawned_on_consumed(coro)
             coro.close()
             fut = second_done if spawned else first_done
 
@@ -527,7 +513,7 @@ class TestDrainSettlesDelivery:
         """
 
         def _spawn(_state, _slot, coro):
-            hook = coro.cr_frame.f_locals.get("_on_consumed")
+            hook = _spawned_on_consumed(coro)
             coro.close()  # the real runner would await it; we are not running a turn
             if consumed and hook is not None:
                 hook()
@@ -714,7 +700,7 @@ class TestDrainSettlesDelivery:
         hooks: list = []
 
         def _spawn(_state, _slot, coro):
-            hooks.append(coro.cr_frame.f_locals.get("_on_consumed"))
+            hooks.append(_spawned_on_consumed(coro))
             coro.close()
 
             async def _turn():
@@ -749,7 +735,7 @@ class TestDrainSettlesDelivery:
         hooks: list = []
 
         def _spawn(_state, _slot, coro):
-            hooks.append(coro.cr_frame.f_locals.get("_on_consumed"))
+            hooks.append(_spawned_on_consumed(coro))
             coro.close()
 
             async def _turn():

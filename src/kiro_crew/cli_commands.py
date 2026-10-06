@@ -26,6 +26,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from sqlite3 import Error as StdlibSQLiteError
 from typing import NoReturn
 from zoneinfo import ZoneInfo
 
@@ -37,6 +38,7 @@ from kiro_crew import (
     model_registry,
     platform_compat,
 )
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import reset_agent_model
 from kiro_crew.apps.backend import recorded_backend_port
 from kiro_crew.apps.bridges import (
@@ -79,6 +81,7 @@ from kiro_crew.config.loader import (
     config_path,
     materialize_workspace_dir,
     read_config_for_update,
+    read_config_text,
     read_local_secret,
     update_config_locked,
 )
@@ -154,6 +157,7 @@ from kiro_crew.security import (
     scan_memory,
 )
 from kiro_crew.sel import sel
+from kiro_crew.subagent_wait_reasons import queued_wait_text
 from kiro_crew.terminal_safe import _TERMINAL_CTRL_RE, safe_terminal_line
 from kiro_crew.validation import (
     _AGENT_NAME_RE,
@@ -172,6 +176,7 @@ from kiro_crew.vector_memory import (
     _lesson_display_text,
     _lesson_scope,
     _lesson_scope_unusable,
+    declared_store,
 )
 
 # Workspace dirs are confined to the data home: a workspace is agent-writable
@@ -333,7 +338,7 @@ def _spawn(args: argparse.Namespace) -> None:
 
     if action == "list":
         req = urllib.request.Request(
-            f"{base}/api/spawn",
+            f"{base}/api/spawn?queued=1",
             headers={"X-Internal-Secret": _internal_secret(args.port)},
         )
         try:
@@ -350,9 +355,20 @@ def _spawn(args: argparse.Namespace) -> None:
             print("Error: gateway not running (cannot reach dashboard on port %d)" % args.port)
             sys.exit(1)
         agents = data.get("agents", [])
-        if not agents:
+        queued = [q for q in data.get("queued") or [] if isinstance(q, dict) and q.get("id")]
+        partial = data.get("queued_truncated") is True
+        if not agents and not queued and not partial:
             print("No subagents.")
             return
+        for q in queued:
+            # Accepted, no run yet (or waiting to resume one): a distinct icon,
+            # so this is never read as a run in progress.
+            tag = "resuming" if q.get("resuming") is True else "queued, not started"
+            print(
+                f"  🕒 {q['id']}  {str(q.get('task') or '')[:60]}  — {tag}: {queued_wait_text(q)}"
+            )
+        if partial:
+            print("  (the queued list is partial; more spawns may be queued)")
         for a in agents:
             if a.get("done"):
                 status, note = "✅", ""
@@ -1138,7 +1154,8 @@ def _print_pointer_cleanup(name: str, cleanup: SessionPointerCleanup) -> None:
     installation's first turn resumes the removed app's transcript — and the
     operator who would have to notice that is standing right here, at a command
     that otherwise printed a success tick. The two get different text because they
-    need different actions: stop the gateway, versus fix the storage error.
+    need different actions: stop the gateway, versus fix the storage or lock-file
+    error the log names.
     """
     if cleanup.dropped:
         print(f"   dropped {cleanup.dropped} conversation pointer(s) — a reinstall starts fresh")
@@ -1153,7 +1170,7 @@ def _print_pointer_cleanup(name: str, cleanup: SessionPointerCleanup) -> None:
     elif cleanup.failed:
         print(
             f"   ⚠️  could not clear {name}'s conversation pointers: the session map "
-            f"could not be read or written (see the log for the error). Reinstalling "
+            f"or its lock file could not be used (see the log for the error). Reinstalling "
             f"under this name may resume the removed app's transcript. Fix the cause "
             f"and run `kirocrew app uninstall {name}` again to clear them.",
             file=sys.stderr,
@@ -2204,12 +2221,14 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             print(f"Paused job: {args.job_id}")
         else:
             print(f"Job not found: {args.job_id}")
+            sys.exit(1)
 
     elif action == "resume":
         if svc.enable_job(args.job_id, enabled=True):
             print(f"Resumed job: {args.job_id}")
         else:
             print(f"Job not found: {args.job_id}")
+            sys.exit(1)
 
     elif action == "trigger":
         # Instance-aware, for the same reason as the MCP trigger: DASHBOARD_PORT reads
@@ -2226,6 +2245,8 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             source="cli",
             resources=f"job_id={args.job_id}",
         )
+        if not ok:
+            sys.exit(1)
 
     elif action == "preview":
         _cron_preview(args)
@@ -2237,7 +2258,7 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
 def _cron_preview(args: argparse.Namespace) -> None:
     """Dry-run a script cron with real MCP tools but suppressed hooks."""
     # Imported here (not at module top) to avoid a cron_script import cycle.
-    from kiro_crew.cron_script import Done, McpToolClient, Report, Skip, resolve_script_path
+    from kiro_crew.cron_script import Done, KeptMcpServers, Report, Skip, resolve_script_path
 
     # Resolve and validate script path (same validation as production cron runner:
     # format, existence, sensitive path, containment under ~/.kiro/crew/crons/)
@@ -2294,22 +2315,23 @@ def _cron_preview(args: argparse.Namespace) -> None:
         def __init__(self, message: str):
             self.message = message
             self.job = _PreviewJob()
+            # Bare on purpose: the preview presents no cron identity to its servers.
+            self._kept_servers = KeptMcpServers()
 
         def call_tool(self, server: str, tool: str, tool_args: dict) -> str:
             # Redact credentials/exfiltration URLs (same as production ScriptContext.call_tool)
             args_str = json.dumps(tool_args)
             args_str = redact(args_str)
             safe_args = json.loads(args_str)
-            # Per-call spawn + close (same lifecycle as production ScriptContext.call_tool)
-            client = McpToolClient(server)
+            # One server per name kept for the run, stopped by close() once the
+            # script returns (same lifecycle as production ScriptContext.call_tool)
             outcome = "ok"
             try:
-                result = client.call_tool(tool, safe_args)
+                result = self._kept_servers.call_tool(server, tool, safe_args)
             except Exception:
                 outcome = "error"
                 raise
             finally:
-                client.close()
                 sel().log_tool_invocation(
                     session_key=f"cron:{self.job.id}",
                     tool_name=f"{server}/{tool}",
@@ -2332,7 +2354,7 @@ def _cron_preview(args: argparse.Namespace) -> None:
             return {}
 
         def close(self):
-            pass
+            self._kept_servers.close()
 
     ctx = _LiveTestCtx(message=args.message)
     outcome = "ok"
@@ -2426,8 +2448,15 @@ def _security(args: argparse.Namespace) -> None:
             print(f"  ✗ {p}")
         cfg_path = config_dir() / "config.json"
         if cfg_path.exists():
-            data = json.loads(cfg_path.read_text())
-            extra = data.get("hooks", {}).get("auto_deny_tools", [])
+            try:
+                data = json.loads(read_config_text(cfg_path))
+            except (OSError, ValueError) as exc:
+                # The built-in list above is already printed; say plainly that the
+                # user-configured half could not be read instead of a traceback.
+                print(f"\n⚠️  Could not read user-configured deny patterns from {cfg_path}: {exc}")
+                data = {}
+            hooks = data.get("hooks") if isinstance(data, dict) else None
+            extra = hooks.get("auto_deny_tools", []) if isinstance(hooks, dict) else []
             if extra:
                 print("\n🔧 User-configured deny patterns:")
                 for p in extra:
@@ -3235,6 +3264,11 @@ _IMPORT_FACET_KEYS = ("scope", "surface", "crew", "session_key", "derived_from")
 #: collection this list misses is one that raises AFTER the store was created.
 _IMPORTED_COLLECTIONS = ("semantic", "episodic")
 
+#: Most rows ``memory export`` writes per collection. A cut collection is named on
+#: stderr with its full count, so a short file never reads as a complete one.
+_EXPORT_EPISODIC_LIMIT = 10_000
+_EXPORT_EVENTS_LIMIT = 1_000
+
 
 def _markdown_memory_store() -> MemoryStore:
     """MemoryStore anchored where the DEFAULT runtime writer writes.
@@ -3419,10 +3453,21 @@ def _memory_backup_cmd(action: str, args: argparse.Namespace) -> None:
         keep = getattr(args, "keep", None)
         if keep is None:
             keep = KiroCrewConfig.load().memory.backup_keep
-        result = memory_backup.back_up_all_stores(int(keep))
+        # ``force``: the interval guard exists for the heartbeat, whose per-process tick
+        # counter would otherwise take a copy on every restart. An operator typing this
+        # verb is asking for a copy of the store as it is NOW -- usually right before a
+        # restore or an out-of-band edit -- and silently declining for the next twenty
+        # hours made the verb do nothing at all. Same call the dashboard's "back up now"
+        # and the pre-update snapshot make; the scheduled sweep alone keeps the guard.
+        result = memory_backup.back_up_all_stores(int(keep), force=True)
+        # All four counters. With the guard bypassed, ``skipped`` is ``backup_store``'s
+        # other outcome -- the store has never been opened or its file is empty -- and a
+        # pass that copied nothing must say so rather than print three zeros that read
+        # as a successful no-op.
         print(
             f"Backed up {result['backed_up']} store(s); "
-            f"removed {result['pruned']} old; {result['failed']} failed."
+            f"removed {result['pruned']} old; {result['failed']} failed; "
+            f"{result['skipped']} skipped (nothing to copy)."
         )
 
     elif action == "backups":
@@ -3597,7 +3642,11 @@ def _memory_carve(args: argparse.Namespace) -> None:
     db_path = _admitted_store_path(name, cfg, may_create=False)
     if db_path is None:
         return
-    store = VectorMemoryStore(db_path=db_path, embedding_dim=cfg.memory.embedding_dim, config=cfg)
+    # Opened the way the store's declaration says: a member store refuses a bare
+    # V1 `init()`, and V2 member stores are the stores facets exist for.
+    store = declared_store(
+        db_path, store_id=name, config=cfg, embedding_dim=cfg.memory.embedding_dim
+    )
     store.init()
     try:
         # Keyed by facet NAME, read off the namespace by that name: an omitted flag
@@ -3716,7 +3765,26 @@ def _settle_created_database(
 
 
 def _memory_cmd(args: argparse.Namespace) -> None:
-    """Manage the memory system (vector store + markdown layer)."""
+    """Manage the memory system (vector store + markdown layer).
+
+    A refusal RAISED out of a verb is one line on stderr with exit 1 rather than a
+    traceback, which keeps the stream and exit code that traceback had. An opener
+    raises `ValueError` past admission (a member database that changed after it was
+    admitted, the startup barrier) and SQLite raises its own error on a corrupt
+    file, so the boundary is here rather than at each open. The refusals a verb
+    prints itself (`_admitted_store_path`, carve's name check) keep their stdout
+    one-liners.
+    """
+    try:
+        _memory_verb(args)
+    except (ValueError, sqlite3.Error, StdlibSQLiteError) as exc:
+        logging.getLogger(__name__).debug("kirocrew memory refused", exc_info=True)
+        print(f"Error: {_TERMINAL_CTRL_RE.sub('', str(exc))}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _memory_verb(args: argparse.Namespace) -> None:
+    """Run one ``kirocrew memory`` verb; :func:`_memory_cmd` owns its refusals."""
     action = getattr(args, "mem_action", None)
     # "show" reads only the markdown layer — don't open (or create) the
     # vector store for it.
@@ -3901,8 +3969,10 @@ def _memory_cmd(args: argparse.Namespace) -> None:
         preexisting_sidecars = (
             set(db_path.parent.glob(db_path.name + "-*")) if import_created_db else set()
         )
-        store = VectorMemoryStore(
-            db_path=db_path, embedding_dim=cfg.memory.embedding_dim, config=cfg
+        # A V2 member store reaches here only as an `export` source (a V2 `import` is
+        # refused above), and it must be opened through member admission.
+        store = declared_store(
+            db_path, store_id=store_name, config=cfg, embedding_dim=cfg.memory.embedding_dim
         )
         try:
             # INSIDE the try, because `init()` is itself a creation step: SQLite makes
@@ -4043,10 +4113,26 @@ def _memory_cmd(args: argparse.Namespace) -> None:
                         "Re-run without --include-markdown to export the store's rows."
                     )
                     return
+                episodic = store.get_episodic_list(limit=_EXPORT_EPISODIC_LIMIT)
+                events = store.get_events(limit=_EXPORT_EVENTS_LIMIT)
+                # A full page may hide more rows. Reading past the limit counts
+                # them through the same query the export used, on V1 and V2 alike.
+                for collection, rows, limit, rest in (
+                    ("episodes", episodic, _EXPORT_EPISODIC_LIMIT, store.get_episodic_list),
+                    ("events", events, _EXPORT_EVENTS_LIMIT, store.get_events),
+                ):
+                    if len(rows) >= limit:
+                        omitted = len(rest(limit=-1, offset=limit))
+                        if omitted:
+                            print(
+                                f"warning: exported {len(rows)} of {len(rows) + omitted} "
+                                f"{collection}; {omitted} omitted",
+                                file=sys.stderr,
+                            )
                 data: dict[str, object] = {
                     "semantic": store.get_all_semantic(),
-                    "episodic": store.get_episodic_list(limit=10000),
-                    "events": store.get_events(limit=1000),
+                    "episodic": episodic,
+                    "events": events,
                 }
                 if getattr(args, "include_markdown", False):
                     # Opt-in so the default payload shape stays byte-identical

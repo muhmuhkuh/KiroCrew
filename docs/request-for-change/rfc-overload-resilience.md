@@ -1,7 +1,7 @@
 ---
 title: Overload resilience — durable task queue, admission before allocation, adaptive concurrency, layered recovery
 status: partial
-revision: v4
+revision: v6
 author: bolichen
 created: 2026-09-12
 last-audited: 2026-09-12
@@ -102,7 +102,7 @@ compose multiplicatively with the row above them.
 |---|---|---|---|---|
 | `SubagentManager._max_concurrent` (`resolve_max_subagents`) | active subagent runs, gateway-wide | auto (`compute_max_subagents`, floor 3) | queue in memory | base |
 | `subagent_spawn_stagger_secs` | subagent starts | 0.25s | queue | — |
-| `check_memory_available` (spawn floor) | new subagent spawns | `spawn_min_memory_gb` 4.0 plus the warming-start reserve (`subagent_cost_gb` 0.5 per warming dedicated start, or the learned per-run cost or a live dedicated peak when higher); Q8 moves the floor to 3.0 | DEFER to the durable queue; legacy spawns REFUSE | — |
+| `check_memory_available` (spawn floor) | new subagent spawns | `spawn_min_memory_gb` 2.0 (Q9), required to remain AFTER the start, plus the start reserve: each warming start at the price it was admitted at (dedicated: `max(subagent_cost_gb, learned settled RSS or the measured 1.0 GB default)`; shared: that less 0.35 GB), each in full until it settles | DEFER to the durable queue; legacy spawns REFUSE | — |
 | `cached_admission_check` / `admission_check` (posture gate) | new subagent spawns (cached read), cron firings (uncached read) | `resource_critical_gb` 2.0 | DEFER to the durable queue; interval and one-shot (`every` / `at`) cron firings wait for the next admitted tick (cron-expression jobs are not deferred); legacy spawns REFUSE | — |
 | `_COLD_START_MAX_CONCURRENT` (`_ColdStartAdmission`) | runtime spawn+`initialize`, per event loop | 2 | wait | — (does not cover `session/new` on an existing runtime) |
 | `_SESSION_NEW_TIMEOUT` / `session_start_timeout_secs` | one `session/new` | 90s | `AcpRequestTimeout` → dedicated-process fallback | amplifies ×(1 runtime + N stubs) |
@@ -492,7 +492,7 @@ now classed `compat`).
 
 | Budget | Runs during | Default | Source |
 |---|---|---|---|
-| queue wait | `queued`, `waiting_infra`, `retry_wait` | unbounded unless `deadline_at` | caller |
+| queue wait | `queued`, `waiting_infra`, `retry_wait` | unbounded unless `deadline_at`; a subagent spawn held on the memory floor (durable or in memory) 1800s of parked time → `failed` "never started: waiting for memory" (Q10) | caller; `agent.subagent_queue_max_wait_secs` |
 | admit wait | `admitted` waiting on steps 2–4 | 30s → back to `queued` | `agent.admit_wait_secs` |
 | start | `starting`, active only | 90s | `session_start_timeout_secs` |
 | start collect | `recovering` after start timeout | 300s | `agent.start_collect_timeout_secs` |
@@ -774,7 +774,10 @@ Question text is kept as asked; the decision below it is final for this PR.
   (default `auto`) forces either mode.
 - **Q7 (integration).** Four keys the §12 table first proposed have no consumer
   in the shipped code and are NOT added: `agent.wait_deadline_secs` (the wait
-  bound is the per-task `deadline_at` plus `agent.dependency_wait_deadline_secs`),
+  bound is the per-task `deadline_at` plus `agent.dependency_wait_deadline_secs`;
+  a spawn waiting for memory is bounded separately, by
+  `agent.subagent_queue_max_wait_secs`, which arrived with its consumer under
+  Q10),
   `agent.keep_runtime_secs` (residency during a wait is bounded by the existing
   session idle reclaim), `agent.parent_failure_policy` (a per-call
   `on_child_failure` parameter, not a global), `agent.tool_stall_retries`
@@ -816,7 +819,101 @@ Question text is kept as asked; the decision below it is final for this PR.
   `agent.spawn_min_memory_gb=4.0` restores the previous bar; `0` disables the
   floor and the cold-start reserve together (unchanged). Not decided here: a
   platform-aware floor (scaling to total RAM, or gating on the kernel's
-  pressure level on macOS) stays open under #15244.
+  pressure level on macOS) stays open under #15244. **Partly decided by Q10
+  (2026-10-01):** the macOS pressure-level gate. **Superseded by Q9:** the
+  3.0 default never shipped (the code stayed at 4.0), and on 2026-10-01 the
+  owner set a different direction: the only capacity guarantee is that at least
+  2 GB stays free, with no count cap holding work back, and a stored 4.0 is
+  adopted rather than kept.
+- **Q9 (2026-10-01, accepted).** Q8's 3.0 GB default was recorded but never
+  shipped, and the floor charged every start one flat `subagent_cost_gb`
+  whether or not it launched a process: too much for a start that shares its
+  parent's runtime, and too little for what a dedicated runtime settles at.
+  What default, and what start price, let the floor admit work on a 16 GB host
+  while never admitting a start that would leave the host below it?
+  **Decision (owner direction, 2026-10-01):** the floor is the memory that must
+  remain available AFTER a start, and its default is 2.0 GB. That is the one
+  capacity guarantee; when it does not hold, the spawn waits in the queue, for
+  at most `agent.subagent_queue_max_wait_secs` (Q10). A
+  capacity verdict never refuses a spawn that has a queue to wait in (an
+  in-memory legacy spawn that has none still refuses until it gains one);
+  governance, cwd and memory-identity refusals stay refusals. Each start is
+  priced by how it will run and carries that price in full until it settles:
+  - Dedicated: the larger of `subagent_cost_gb` and what such a runtime settles
+    at, which is its agent's learned settled size once three runs have
+    measured it (bounded), else a measured default of 1.0 GB.
+  - Shared: that less the kiro-cli process it does not launch (0.35 GB),
+    decided by the same rule the run uses to choose its arm.
+  - A shared start that turns dedicated is re-priced and re-checked against
+    the floor before its process starts.
+
+  Bars at defaults with nothing learned: a shared start 2.65 GB, the first
+  dedicated start 3.0 GB, the second while the first warms 4.0 GB. Grounds: a
+  `kiro-cli acp` 2.26.1 process driven with this repo's own `initialize` /
+  `session/new` shape starts a fresh copy of every MCP server the agent declares
+  for each session, shared or not. An extra session cost about 0.01 GB of
+  process-tree USS with no servers and 0.45 to 0.6 GB with the default agent's
+  roster; a dedicated start cost that plus 0.2 to 0.35 GB for its own process,
+  about 0.96 GB in all. So the cost of a start is mostly its MCP roster, and a
+  0.5 GB flat price under-reserved every start. **Stored values:** unlike Q8, a
+  stored 4.0 is adopted to 2.0 once through the superseded-defaults registry
+  (`auto_adopt`). A materialized 4.0 holds subagents in the queue on a 16 GB
+  laptop, the same not-survivable class as the agent timeout budgets, and no
+  suite pins a stored 4.0 as a supported configuration. Adoption is one-shot; a
+  value set back afterwards is kept; a stored 3.0 or 0 is untouched.
+  **Residual:** the prices are projections, from the measured defaults until an
+  agent has learned its settled size; a lighter agent is over-priced until it
+  learns, and an install that only runs shared starts never learns. At defaults
+  the floor equals `resource_critical_gb` (2.0), so a host filled to the floor
+  reads posture `critical` at the line until posture stops gating spawns.
+  Reversal: `agent.spawn_min_memory_gb=4.0` (or 3.0) restores a higher bar; `0`
+  disables the floor and the reserve together (unchanged). Not decided here: the
+  macOS kernel-pressure veto (Q8 measured `kern.memorystatus_vm_pressure_level`
+  2 with two dedicated workers at a 2.5 floor), which lands separately under
+  #15244. **Decided by Q10 (2026-10-01).**
+- **Q10 (2026-10-01, accepted).** Q8 and Q9 left the macOS kernel-pressure
+  veto open under #15244. The floor's macOS figure, the reclaimable-page sum,
+  does not see compressor pressure, so starts that clear the floor can still
+  drive a 16 GB Mac into WARN (Q8's two dedicated workers at a 2.5 floor).
+  Does the kernel's pressure level gate a start, and as what?
+  **Decision (owner direction, 2026-10-01):** on macOS,
+  `kern.memorystatus_vm_pressure_level` at WARN or above vetoes a subagent
+  start. The veto is part of the 2.0 GB floor rule (Q9), not a second rule:
+  the floor's macOS reading takes the level as a second input, read through a
+  `platform_compat` helper. A vetoed start waits in the queue, and that wait
+  is finite under the owner's same-day max-wait direction, which covers every
+  start queued for memory, a vetoed one included: default 1800 s, set by the
+  live-reloadable key `agent.subagent_queue_max_wait_secs` (no restart mark);
+  on expiry the start gets a delivered terminal "never started: waiting for
+  memory" and leaves its parent's queued count. Q7, Q9's floor rule, §8's
+  queue-wait row, §14.1 W1 and §14.9 say so. The clock counts the time the
+  row spends parked by its deferrals, and a re-check does not restart it; a
+  row whose deferral lapsed and that now waits only for a slot is not bounded
+  by it, and that slot wait does not count when it is parked again. Reversal:
+  `agent.subagent_queue_max_wait_secs=0` waits without a bound. Grounds: the
+  level is the kernel's own verdict and it lags, so it is a backstop beside
+  the figure, not a replacement for it.
+  **Implementation:** [#15876](https://github.com/kirodotdev/KiroCrew/pull/15876),
+  whose spec calls the veto the *kernel memory-pressure hold*
+  ([subagent.md § Memory guard](../system-specs/modules/subagent.md#memory-guard-what-must-remain-after-the-start)).
+  Its design choices, which are not owner direction and shape where the veto
+  applies (the spec holds the full set):
+  - Nested children are exempt. A child's parent is a live runtime that may
+    be waiting on it, so holding the child could hold the parent on an
+    episode only the child can end.
+  - The veto applies only while a dedicated subagent runtime of this gateway
+    is running or warming. With none, foreign pressure alone never delays a
+    start.
+  - A vetoed start waits as a capacity-style in-memory wait (reason
+    `memory_pressure`), not a store deferral, and no speculative pre-warm is
+    admitted while the hold applies.
+
+  #15876 landed bounding the hold with its own fixed constant, before the
+  key existed. The key arrived with the store deferrals' bound (#16347),
+  which points the hold's bound at it too, so a reload moves both and `0`
+  lifts both. Reversal:
+  `agent.spawn_min_memory_gb=0` disables the floor, the reserve and the veto
+  together.
 
 ## 14. Waits, yielding and nested recovery (owner addendum, 2026-09-12 15:12)
 
@@ -849,7 +946,7 @@ never decremented for a process that still exists (SPEC-ADDENDUM §2).
 
 | Kind | Wait | Who detects it | Where state is stored | Quotas released | Real resources still charged | Wake event | Termination on recovery failure |
 |---|---|---|---|---|---|---|---|
-| W1 | `queued` (capacity) | scheduler at accept | task row `state=queued` | none held | none | admission grants slot + budget | caller `deadline_at` → `failed{reason=deadline}`; store write failure → refused at accept |
+| W1 | `queued` (capacity) | scheduler at accept | task row `state=queued` | none held | none | admission grants slot + budget | caller `deadline_at` → `failed{reason=deadline}`; a memory deferral past `agent.subagent_queue_max_wait_secs` → `failed` "never started: waiting for memory", delivered (Q10); store write failure → refused at accept |
 | W2 | `waiting_dependency` (unavailable, 429, backoff) | dependency adapter emitting `DependencySignal` (§14.4); liveness oracle only corroborates | `WaitRecord{kind=at_time or signal, dependency_scope}` + `DependencyCoordinator` schedule (in-memory, rebuilt from rows on boot) | lane slot | runtime residency while the wait is short (the existing session idle reclaim bounds it); beyond that the runtime is idle-reclaimed and only the row remains | coordinator fires `retry_at` or a recovery signal for the scope; re-admission through §4.5 | attempts ≥ `dependency_max_attempts` or wait > `agent.dependency_wait_deadline_secs` (or the task's own `deadline_at`) → `failed{reason=dependency}`; `auth_failed`/`permanent_param_error` → `failed` immediately |
 | W3 | `waiting_children` | parent's blocking `spawn_sub_agents` / workflow barrier, via the execution layer (tool call id), never model text | `WaitRecord{kind=children, ids=[...]}`; children rows carry `parent_id` | lane slot | parent runtime residency (shared-runtime: a session handle; dedicated: full process) for the whole wait (checkpoint-pause, §6, is designed but not built -- Q3) | last awaited child reaches terminal; parent re-admitted through §4.5 | per-call `on_child_failure` (§14.3): `fail_fast` → parent `failed` when a child fails; `collect` → parent wakes with partial set; children cancelled on parent cancel |
 | W4 | `waiting_input` (interactive command, business choice, password) | tool layer: interactive-command classifier (§14.6) or oracle `STUCK_INPUT` (Linux only, §14.9) | `WaitRecord{kind=input}` + the pending tool call id | lane slot | runtime residency (the blocked process is kept; nothing is auto-answered) | user input via dashboard/channel, routed to the tool call; or user cancels that call | `agent.interactive_command_policy="cancel"` cancels the call at the no-progress budget; default `wait` holds until the user acts or `deadline_at` |
@@ -1016,7 +1113,8 @@ session handle, never the runtime shared with unrelated sessions.
 
 Wait budgets are separate from the execution budget (§8): time in W1–W6 does
 not count toward `subagent_timeout_secs`; each wait kind has its own bound
-(`deadline_at`, `dependency_wait_deadline_secs`, coordinator caps, ladder caps). A blocking
+(`deadline_at`, `subagent_queue_max_wait_secs` for a W1 row deferred for memory,
+`dependency_wait_deadline_secs`, coordinator caps, ladder caps). A blocking
 `spawn_sub_agents` expiry returns `still_running` with ids and states (§8) and
 never marks the child failed.
 

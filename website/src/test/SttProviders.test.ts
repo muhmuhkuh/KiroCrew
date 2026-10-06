@@ -200,15 +200,19 @@ describe('a streaming session that failed', () => {
   const streamLeaf = (key: string) => key.replace('lib.sttProviders.', '')
 
   it('names every code the streaming socket can only report itself', () => {
-    // `_CODE_MAX_DURATION` and `_CODE_SESSION_FAILED` in `dashboard/stt_stream.py`,
-    // `CODE_DECODE_FAILED` in `stt/engine.py`, plus `stt_model_missing`, which the
-    // socket also sends and which needs different words below the composer than in
-    // the settings panel. An omission renders the backend's English sentence.
+    // `_CODE_MAX_DURATION`, `_CODE_SESSION_FAILED` and `_CODE_VOCABULARY_REJECTED` in
+    // `dashboard/stt_stream.py`, `CODE_DECODE_FAILED` in `stt/engine.py`, plus
+    // `stt_model_missing`, which the socket also sends and which needs different
+    // words below the composer than in the settings panel, and `stt_consent_required`,
+    // the AWS consent gate's refusal of a Transcribe stream. An omission renders the
+    // backend's English sentence.
     expect(Object.keys(STREAM_ERROR_CODE_KEY).sort()).toEqual([
+      'stt_consent_required',
       'stt_decode_failed',
       'stt_max_duration_exceeded',
       'stt_model_missing',
       'stt_session_failed',
+      'stt_transcribe_vocabulary_rejected',
     ])
   })
 
@@ -237,6 +241,15 @@ describe('a streaming session that failed', () => {
       manualStreamErrors[streamLeaf(STREAM_ERROR_CODE_KEY.stt_model_missing)],
     )
     expect(modelMissing).not.toBe(manualStt.unavailable_model_missing)
+  })
+
+  it('localises the consent-gate refusal instead of showing the gateway reason', () => {
+    // The AWS consent gate refuses with an English reason as the frame's advisory
+    // `message`; it is re-checked live, so an expired credential lands here too, not
+    // only a first use. The localised notice has to win over that English detail.
+    expect(streamErrorMessage('stt_consent_required', 'AWS access was refused: foo')).toBe(
+      manualStreamErrors[streamLeaf(STREAM_ERROR_CODE_KEY.stt_consent_required)],
+    )
   })
 
   it('falls back to the availability vocabulary for a setup failure', () => {

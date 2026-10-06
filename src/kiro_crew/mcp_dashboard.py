@@ -19,8 +19,11 @@ every tool in it. That is the unit to keep in mind when adding one — a capabil
 that must be grantable separately belongs in a server of its own.
 
 What it controls today is the chat (sidebar) folder tree: read it, create a
-folder, reparent a folder, and file a live session into one. Create and move
-only — no delete and no rename, so nothing here can lose a conversation. It also
+folder, reparent a folder, file a live session into one, and delete a folder
+that is EMPTY. No rename. The delete asks the endpoint for its empty-only mode
+(``?if_empty=true``), which refuses a folder holding a subfolder or a live or
+archived session instead of unfiling them, so nothing here can lose a
+conversation. It also
 controls session TAGS with the same posture: read the vocabulary, create or
 update a tag (rename, recolor, status flag), and add or remove tags on a live
 session — no tag delete, so nothing here can strip a label from every session
@@ -40,8 +43,8 @@ caller's.
 Why the set needs no second gate behind the assignment: these tools grant no
 read the agent does not already have (``list_sessions`` in ``kirocrew-core`` is
 always available and already returns every session's title and key), they cannot
-delete a folder or a conversation, and the worst outcome is a sidebar the user
-has to tidy. Contrast the keystone leaves in ``security.py``
+delete a conversation or a folder that holds anything, and the worst outcome is
+a sidebar the user has to tidy. Contrast the keystone leaves in ``security.py``
 (``computer_use.json``, ``browser-mode-enabled``, the Ops Mission Control mode):
 each grants reach OUTSIDE Kiro Crew — desktop input synthesis, the operator's
 logged-in browser, writes against production incident tooling — or is the
@@ -87,6 +90,7 @@ from kiro_crew.dashboard.chat_folders import (
     _subtree_holds_foreign_folder,
 )
 from kiro_crew.mcp_core import (
+    _delete,
     _get,
     _patch,
     _post,
@@ -97,16 +101,21 @@ from kiro_crew.mcp_core import (
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.mcp_tool_titles import with_titles
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.sel import sel
 from kiro_crew.validation import (
     BROADCAST_RESPONSE_MARGIN_SECS,
     BROADCAST_TARGET_ALLOWANCE_SECS,
     CHAT_FOLDER_CREATE_SCHEMA,
+    CHAT_FOLDER_DELETE_SCHEMA,
     CHAT_FOLDER_FILE_SELF_SCHEMA,
     CHAT_FOLDER_MOVE_SCHEMA,
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
     CHAT_SESSION_PIN_SCHEMA,
     CHAT_TAG_ASSIGN_SCHEMA,
+    CHAT_TAG_COLUMN_CREATE_SCHEMA,
+    CHAT_TAG_COLUMN_LIST_SCHEMA,
+    CHAT_TAG_COLUMN_MOVE_SCHEMA,
     CHAT_TAG_CREATE_SCHEMA,
     CHAT_TAG_LIST_SCHEMA,
     CHAT_TAG_UPDATE_SCHEMA,
@@ -116,9 +125,11 @@ from kiro_crew.validation import (
     SESSION_BROADCAST_SCHEMA,
     SESSION_CLOSE_SCHEMA,
     SESSION_CREATE_SCHEMA,
+    SESSION_END_WAIT_SCHEMA,
     SESSION_FORK_SCHEMA,
     SESSION_READ_MESSAGE_SCHEMA,
     SESSION_RELEASE_SCHEMA,
+    SESSION_RELOAD_SCHEMA,
     SESSION_REVIVE_SCHEMA,
     SESSION_SEND_SCHEMA,
     SESSION_SET_MODEL_SCHEMA,
@@ -143,7 +154,9 @@ SESSION_CONTROL_TOOLS: tuple[str, ...] = (
     "session_create",
     "session_fork",
     "session_stop",
+    "session_end_wait",
     "session_set_model",
+    "session_reload",
     "session_close",
     "session_revive",
     "session_send",
@@ -188,8 +201,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "then one line per live session (slot key + title) nested under it, "
                 "and an '(unfiled)' group for sessions at the top level. Use this to "
                 "get folder ids/paths and session keys before calling "
-                "chat_folder_create / chat_folder_move / chat_folder_move_session, "
-                "or when the user asks what their tree looks like. This is the "
+                "chat_folder_create / chat_folder_move / chat_folder_move_session / "
+                "chat_folder_delete, or when the user asks what their tree looks like. This is the "
                 "folder-shaped view; list_sessions is the flat newest-first one."
             ),
             "inputSchema": {"type": "object", "properties": {}},
@@ -304,6 +317,28 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["session"],
+            },
+        },
+        {
+            "name": "chat_folder_delete",
+            "description": (
+                "Delete an EMPTY sidebar folder that THIS session created, to clean "
+                "up after your own work. ``folder`` is a folder id or human path "
+                "from chat_folder_tree. Refused for a folder the person created, "
+                "a same-name folder you reused, another session's folder, or one "
+                "the person has since renamed, moved, restyled, hidden, filed a "
+                "session into or nested a folder under: those are the person's. "
+                "Also refused unless it holds no subfolders, no live sessions and "
+                "no archived (history) sessions; the dashboard checks all of this "
+                "in the same step as the removal, and never unfiles a session or "
+                "lifts a subfolder. An app agent or a crew member is refused."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string", "description": "Folder to delete (id or path)."},
+                },
+                "required": ["folder"],
             },
         },
         {
@@ -422,7 +457,20 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "retry. Metadata only: the transcript, model and any running turn are "
                 "untouched. ARCHIVED (history) sessions cannot be tagged — bring one back "
                 "with session_revive first. An app agent may tag only its own sessions; "
-                "a crew member may tag only a session it owns or created."
+                "a crew member may tag only a session it owns or created. The agent "
+                "tag-grants policy applies the same way it does to the chat_tag "
+                "set_state directive: a tag the person RESERVED (a protected grant row "
+                "with policy 'none', or 'add-only' when you try to remove it) is refused "
+                "``tag_policy_denied``; a workflow-STATUS tag whose protected identity is "
+                "missing is refused ``status_identity_unprotected`` on add as well as "
+                "strip, and adding one that would leave the session with two states is "
+                "refused ``status_tag_requires_set_state`` (use chat_tag set_state for "
+                "workflow states); "
+                "and when the grants store is unavailable the refusal is "
+                "``tag_grants_unavailable``. An ordinary label with no protected row is "
+                "yours to apply. A tag chat_tag_create makes stays rowless until the "
+                "owner adopts it, so a freshly-created workflow-STATUS tag may not be "
+                "assignable until then."
             ),
             "inputSchema": {
                 "type": "object",
@@ -471,6 +519,66 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["session", "pinned"],
+            },
+        },
+        {
+            "name": "chat_tag_column_list",
+            "description": (
+                "List the sidebar board's columns in board order: each column's id, "
+                "name, and what it shows (the tags it filters on, or the live-state "
+                "lane it follows). Read-only. Call it before chat_tag_column_move to "
+                "see the order, and before chat_tag_column_create to see whether a "
+                "column for a tag already exists."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "chat_tag_column_create",
+            "description": (
+                "Append a column to the sidebar board that shows the sessions carrying "
+                "``tag`` (a tag id or exact name; see chat_tag_list — the tag must "
+                "already exist, chat_tag_create makes one). ``name`` is the column "
+                "heading (max 60 chars). A column with the same name that already "
+                "filters on exactly that tag is returned instead of duplicated, so "
+                "calling this again is a safe no-op. Create only: this server can "
+                "never delete a column or change what one filters on, because the "
+                "board is the person's own layout. Place the new column with "
+                "chat_tag_column_move. An app agent and a crew member cannot write "
+                "the board; they read it with chat_tag_column_list."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Column heading (max 60 chars)."},
+                    "tag": {"type": "string", "description": "Tag id or exact tag name."},
+                },
+                "required": ["name", "tag"],
+            },
+        },
+        {
+            "name": "chat_tag_column_move",
+            "description": (
+                "Move one sidebar board column so it sits directly before or after "
+                "another. ``column`` is the column to move and exactly one of "
+                "``before`` / ``after`` names the column to place it next to; each is "
+                "a column id or exact name (see chat_tag_column_list). Every other "
+                "column keeps its relative order, and nothing a column filters on "
+                "changes. An app agent and a crew member cannot write the board."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "column": {"type": "string", "description": "Column id or exact name to move."},
+                    "before": {
+                        "type": "string",
+                        "description": "Column id or exact name to place it before.",
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "Column id or exact name to place it after.",
+                    },
+                },
+                "required": ["column"],
             },
         },
         {
@@ -622,6 +730,32 @@ def _tool_definitions() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "session_end_wait",
+            "description": (
+                "Wake a session you created that is sleeping in the `wait` tool, "
+                "without cancelling its turn: the same thing as pressing End wait on "
+                "its countdown. The target's wait returns a normal result that names "
+                "your session as the one that ended it, and its turn carries on. Use "
+                "it when the thing a worker is waiting for has already happened. "
+                "Only sessions you created are reachable. "
+                "Unlike session_stop nothing is discarded, and unlike session_send "
+                "no text reaches the target. A target that is not waiting gets an "
+                "informational reply, not an error, so there is nothing to retry. "
+                "The wake lands on the target's next keepalive ping, within about "
+                "five seconds."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
             "name": "session_set_model",
             "description": (
                 "Change the model another session runs on. Only an IDLE session takes "
@@ -650,6 +784,31 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["target", "model"],
+            },
+        },
+        {
+            "name": "session_reload",
+            "description": (
+                "Relaunch the agent process of a session you created, the same thing as "
+                "Reload session in that tab's menu. Use it after a change that a running "
+                "session cannot see: a newly granted or enabled MCP server, an MCP "
+                "config edit, or an agent-spec fix. The new process re-reads its agent "
+                "spec, environment and MCP servers; the conversation is kept, and the "
+                "target's transcript shows a notice naming your session. Only an IDLE "
+                "session can be reloaded: a running or starting turn, queued messages "
+                "or attached sub-agents fail with 'session busy, not reloaded' and "
+                "nothing changes. You cannot reload yourself, and the agent, model and "
+                "workspace stay as they are."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
             },
         },
         {
@@ -1766,6 +1925,104 @@ def _render_chat_tags(tags: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _chat_tag_column_label(col: dict, tag_names: dict[str, str]) -> str:
+    """What a board column shows, in words: its tag filter or its live-state lane."""
+    if col.get("source") == "state":
+        return f"live state `{col.get('state_key') or '?'}`"
+    # ``tag_columns.json`` is loaded verbatim, so a hand-edited ``tag_ids``
+    # that is not a list must render as "no filter" rather than end the call.
+    raw_ids = col.get("tag_ids")
+    tag_ids = [str(t) for t in raw_ids if isinstance(t, str)] if isinstance(raw_ids, list) else []
+    if not tag_ids:
+        # An empty filter matches every session; ``include_untagged`` adds
+        # nothing to that (``columnMatches`` in the board UI).
+        return "all sessions"
+    names = ", ".join(f"`{tag_names.get(t, t)}`" for t in tag_ids)
+    mode = str(col.get("mode") or "any")
+    label = f"tags {names} (match {mode})"
+    if col.get("include_untagged"):
+        label += " + untagged sessions"
+    return label
+
+
+def _render_chat_tag_columns(columns: list[dict], tags: list[dict]) -> str:
+    """One line per board column, in board order (the endpoint returns it sorted)."""
+    if not columns:
+        return "The board has no columns yet — chat_tag_column_create adds one."
+    tag_names = {str(t.get("id") or ""): str(t.get("name") or "?") for t in tags}
+    lines = [
+        f"\U0001f5c2\ufe0f Board columns — {len(columns)} column{'' if len(columns) == 1 else 's'}"
+    ]
+    for pos, col in enumerate(columns, start=1):
+        name = str(col.get("name") or "").strip() or "(unnamed)"
+        lines.append(
+            f"{pos}. `{name}`  id={col.get('id', '?')}  shows "
+            f"{_chat_tag_column_label(col, tag_names)}"
+        )
+    return "\n".join(lines)
+
+
+def _resolve_chat_tag_column(ref: str, columns: list[dict]) -> tuple[str, str | None]:
+    """Resolve a column reference (id or exact name) to a column id.
+
+    Same rules as :func:`_resolve_chat_tag_ids`: the id wins, a name matches
+    whole and case-insensitively, and a name two columns share is refused
+    rather than guessed, since moving the wrong column rearranges the board.
+    """
+    ref = str(ref or "").strip()
+    ids = [str(c.get("id")) for c in columns if isinstance(c.get("id"), str) and c["id"]]
+    if ref in ids:
+        return ref, None
+    named = [
+        str(c["id"])
+        for c in columns
+        if isinstance(c.get("id"), str)
+        and c["id"]
+        and str(c.get("name") or "").strip().lower() == ref.lower()
+    ]
+    if len(named) > 1:
+        return "", (
+            f"{len(named)} columns share the name {redact(ref)} "
+            f"({', '.join(named)}) — pass the column id instead"
+        )
+    if not ref or not named:
+        return "", (
+            f"no board column matches {redact(ref)} — call chat_tag_column_list for "
+            "the current columns"
+        )
+    return named[0], None
+
+
+def _refuse_channel_board_write(name: str, caller_key: str) -> str | None:
+    """Refuse a board write from a ``channel:`` caller, at dispatch.
+
+    The ``CHANNEL_AGENT_BLOCKED_TOOLS`` name match runs at the permission
+    prompt, which an auto-approved call never reaches, so the containment has to
+    hold here too (the same split ``chat_session_pin`` uses). A channel agent
+    acts on thread text other people wrote, and the board is the person's own
+    sidebar layout.
+    """
+    if not caller_key.startswith("channel:"):
+        return None
+    try:
+        sel().log_tool_invocation(
+            session_key=caller_key,
+            source="mcp",
+            tool_name=name,
+            tool_kind=SERVER_NAME,
+            outcome="rejected_blocked_tool",
+        )
+    except Exception:
+        # Stdio-silent: stderr would corrupt the JSON-RPC stream. The refusal
+        # below holds either way.
+        pass
+    return (
+        f"Error: {name} is not available to channel agents — the board is the "
+        "person's own sidebar layout, and a channel agent acts on thread text "
+        "other people wrote."
+    )
+
+
 def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Validate tool arguments against schema. Returns cleaned args."""
     schema = MCP_DASHBOARD_SCHEMAS.get(name)
@@ -2269,6 +2526,24 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return f"\u2139\ufe0f `{target}`: {info} — nothing to stop."
         return f"\U0001f6d1 Stop sent to `{target}`. Its transcript now shows the stop card."
 
+    if name == "session_end_wait":
+        args = validate_tool_args(args, SESSION_END_WAIT_SCHEMA)
+        resp = _post(
+            "/api/session-control/end-wait",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not end that session's wait: {resp['error']}"
+        target = resp.get("target", args["target"])
+        if not resp.get("ended"):
+            info = resp.get("info") or "not sleeping in the wait tool"
+            return f"\u2139\ufe0f `{target}`: {info}. Nothing to end."
+        return (
+            f"\u23f0 End-wait sent to `{target}`. Its wait returns on the next "
+            "keepalive ping (within about 5s) and the turn continues."
+        )
+
     if name == "session_set_model":
         args = validate_tool_args(args, SESSION_SET_MODEL_SCHEMA)
         resp = _post(
@@ -2281,6 +2556,33 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         target = resp.get("target", args["target"])
         model = resp.get("model") or "auto"
         return redact(f"\U0001f501 `{target}` will switch to `{model}` when its next turn starts.")
+
+    if name == "session_reload":
+        args = validate_tool_args(args, SESSION_RELOAD_SCHEMA)
+        resp = _post(
+            "/api/session-control/reload",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("code") == "target_changed_during_reload":
+            # The process WAS torn down; only the notice was skipped. "Could
+            # not reload" would tell the agent nothing happened.
+            return (
+                "Warning: the target's agent process was reset and starts again on "
+                f"its next message, but no reload notice was added: {resp.get('error', '')}"
+            )
+        if resp.get("error"):
+            return f"Error: could not reload that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        if resp.get("warning"):
+            return redact(
+                f"\U0001f504 `{target}` is relaunching its agent process with the conversation "
+                f"kept, but the old process's teardown reported an error ({resp['warning']})."
+            )
+        return redact(
+            f"\U0001f504 `{target}` is relaunching its agent process with the conversation "
+            "kept. Its transcript shows the reload notice."
+        )
 
     if name == "session_close":
         args = validate_tool_args(args, SESSION_CLOSE_SCHEMA)
@@ -2987,7 +3289,13 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             reorder_body = [{"id": sid, "order": pos} for sid, pos in order_writes]
             shifted = _post(
                 "/api/chat/folders/reorder",
-                {"orders": reorder_body},
+                # Every row in the batch lives in the destination container by
+                # this point (the reparent PATCH above has landed), and the
+                # batch was computed from a snapshot -- so the claim lets the
+                # endpoint refuse the renumber if a concurrent reparent moved a
+                # sibling between that read and this write, instead of landing
+                # an index computed for a container the row has left.
+                {"orders": reorder_body, "expected_parent": dest_id},
                 session_key=caller_key,
             )
             if shifted.get("error"):
@@ -3069,6 +3377,45 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             return redact(f"Unfiled session `{slot_key}` to the top level.")
         folder_label = _chat_folder_paths(chat_folders).get(fld_id, fld_id)
         return redact(f"Moved session `{slot_key}` into `{folder_label}` (id={fld_id}).")
+    if name == "chat_folder_delete":
+        args = validate_tool_args(args, CHAT_FOLDER_DELETE_SCHEMA)
+        caller_key, _caller_app, gate = _refuse_tree_shaping_if_unverifiable("deleting a folder")
+        if gate:
+            return gate
+        chat_folders, folders_err = _get_rows("/api/chat/folders")
+        if folders_err:
+            return f"Error: {folders_err}"
+        fld_id, fld_err = _resolve_chat_folder_id(args["folder"], chat_folders)
+        if fld_err:
+            return redact(f"Error: {fld_err}")
+        if not fld_id:
+            return "Error: 'root' is not a folder — name the folder to delete."
+        fld_path = _chat_folder_paths(chat_folders).get(fld_id) or fld_id
+        # Empty-only, decided by the endpoint: ``if_empty`` makes it re-check
+        # subfolders and live sessions under the folder-store lock in the same
+        # step that removes the row, so nothing filed after this tool's read can
+        # be unfiled by the delete. A pre-check here could not give that answer.
+        # The refusal text names no session and carries no count.
+        d = _delete(
+            f"/api/chat/folders/{quote(fld_id, safe='')}?if_empty=true",
+            session_key=caller_key,
+        )
+        if d.get("error"):
+            if d.get("code") == "folder_not_agent_owned":
+                return redact(
+                    f"Error: folder `{fld_path}` is not deleted: this session did not "
+                    "create it, or the person has edited or used it since. Leave it "
+                    "for the person."
+                )
+            if d.get("code") == "folder_not_empty":
+                return redact(
+                    f"Error: folder `{fld_path}` is not deleted: {d['error']}. Empty it "
+                    "first with chat_folder_move / chat_folder_move_session (an "
+                    "archived session needs session_revive before it can move)."
+                )
+            return redact(f"Error: {d['error']}")
+        return redact(f"Deleted empty folder `{fld_path}` (id={fld_id}).")
+
     if name == "chat_folder_file_self":
         args = validate_tool_args(args, CHAT_FOLDER_FILE_SELF_SCHEMA)
         # The destination may not exist yet (mkdir -p, like session_create's
@@ -3340,8 +3687,6 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # session is listed.
         if caller_key.startswith("channel:"):
             try:
-                from kiro_crew.sel import sel
-
                 sel().log_tool_invocation(
                     session_key=caller_key,
                     source="mcp",
@@ -3394,6 +3739,136 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             state_word = "pinned" if want else "not pinned"
             return redact(f"No change: session `{slot_key}` is already {state_word}.")
         return redact(f"{verb} session `{slot_key}`.")
+    if name == "chat_tag_column_list":
+        validate_tool_args(args, CHAT_TAG_COLUMN_LIST_SCHEMA)
+        # Like the tag vocabulary, the board is one shared layout that names no
+        # session, so the read needs no caller scoping.
+        columns, cols_err = _get_rows("/api/chat/tag-columns")
+        if cols_err:
+            return f"Error: {cols_err}"
+        tags, tags_err = _get_rows("/api/chat/tags")
+        if tags_err:
+            return f"Error: {tags_err}"
+        return redact(_render_chat_tag_columns(columns, tags))
+    if name == "chat_tag_column_create":
+        args = validate_tool_args(args, CHAT_TAG_COLUMN_CREATE_SCHEMA)
+        # Agent-authored heading landing in durable, re-rendered state: redact
+        # before the write and check the stored length, as chat_tag_create does.
+        safe_name = redact(str(args["name"])).strip()
+        if not safe_name:
+            return "Error: column name must not be empty"
+        if len(safe_name) > _MAX_TAG_NAME:
+            return (
+                f"Error: column name too long after redaction ({len(safe_name)} chars): "
+                f"`{safe_name[:40]}…` — keep it to {_MAX_TAG_NAME} characters or fewer"
+            )
+        # Same gate as the vocabulary writes. The app and crew-member rule lives
+        # in the endpoint (``_refuse_vocabulary_write`` in the tag-columns
+        # handlers), which judges every transport on the validated claim.
+        caller_key, _caller_app, gate = _refuse_tree_shaping_if_unverifiable(
+            "creating a board column"
+        )
+        if gate:
+            return gate
+        channel_err = _refuse_channel_board_write(name, caller_key)
+        if channel_err:
+            return channel_err
+        tags, tags_err = _get_rows("/api/chat/tags")
+        if tags_err:
+            return f"Error: {tags_err}"
+        ids, ref_err = _resolve_chat_tag_ids([str(args["tag"])], tags)
+        if ref_err:
+            return redact(f"Error: {ref_err}")
+        tid = ids[0]
+        tag_name = next((str(t.get("name") or "?") for t in tags if t.get("id") == tid), tid)
+        columns, cols_err = _get_rows("/api/chat/tag-columns")
+        if cols_err:
+            return f"Error: {cols_err}"
+        # ``ensure`` makes the endpoint return an existing column with this
+        # name and tag instead of appending a twin, decided under its write
+        # lock, so a retried or racing call converges on one column.
+        d = _post(
+            "/api/chat/tag-columns",
+            {"name": safe_name, "tag_ids": [tid], "mode": "any", "ensure": True},
+            session_key=caller_key,
+        )
+        if d.get("error"):
+            if d.get("code") == "app_forbidden":
+                return (
+                    "Error: an app agent or crew member cannot add a board column — the "
+                    "board is the person's own layout. Read it with chat_tag_column_list."
+                )
+            return redact(f"Error: {d['error']}")
+        got_id = str(d.get("id") or "?")
+        if any(str(c.get("id")) == got_id for c in columns):
+            return redact(
+                f"Column `{d.get('name', safe_name)}` (id={got_id}) already shows "
+                f"tag `{tag_name}`."
+            )
+        return redact(
+            f"Added column `{d.get('name', safe_name)}` (id={got_id}) showing "
+            f"tag `{tag_name}`. Place it with chat_tag_column_move."
+        )
+    if name == "chat_tag_column_move":
+        args = validate_tool_args(args, CHAT_TAG_COLUMN_MOVE_SCHEMA)
+        # An empty string is "not given": the schema passes it through as "",
+        # and treating it as a reference would resolve the literal "None".
+        col_before = args.get("before") or None
+        col_after = args.get("after") or None
+        if (col_before is None) == (col_after is None):
+            return "Error: pass exactly one of ``before`` or ``after``"
+        caller_key, _caller_app, gate = _refuse_tree_shaping_if_unverifiable(
+            "moving a board column"
+        )
+        if gate:
+            return gate
+        channel_err = _refuse_channel_board_write(name, caller_key)
+        if channel_err:
+            return channel_err
+        columns, cols_err = _get_rows("/api/chat/tag-columns")
+        if cols_err:
+            return f"Error: {cols_err}"
+        move_id, col_err = _resolve_chat_tag_column(str(args["column"]), columns)
+        if col_err:
+            return redact(f"Error: {col_err}")
+        anchor_id, col_err = _resolve_chat_tag_column(str(col_before or col_after), columns)
+        if col_err:
+            return redact(f"Error: {col_err}")
+        if anchor_id == move_id:
+            return "Error: a column cannot be placed next to itself"
+        base_ids = [str(c.get("id")) for c in columns if isinstance(c.get("id"), str)]
+        order = list(base_ids)
+        order.remove(move_id)
+        at = order.index(anchor_id) + (0 if col_before is not None else 1)
+        order.insert(at, move_id)
+        names = {str(c.get("id")): str(c.get("name") or "").strip() or "(unnamed)" for c in columns}
+        side = "before" if col_before is not None else "after"
+        if order == base_ids:
+            return redact(
+                f"No change: column `{names[move_id]}` is already {side} `{names[anchor_id]}`."
+            )
+        # ``base_ids`` is the order this call read. The endpoint compares it
+        # under its lock and refuses with ``stale_base`` when the board changed
+        # in between, so the person's own reorder is never overwritten.
+        d = _put(
+            "/api/chat/tag-columns/order",
+            {"ids": order, "base_ids": base_ids},
+            session_key=caller_key,
+        )
+        if d.get("error"):
+            if d.get("code") == "stale_base":
+                return (
+                    "Error: the board's columns changed while this call was composing "
+                    "the move. Nothing was written — call chat_tag_column_move again; "
+                    "it re-reads the current order."
+                )
+            if d.get("code") == "app_forbidden":
+                return (
+                    "Error: an app agent or crew member cannot reorder the board — it "
+                    "is the person's own layout."
+                )
+            return redact(f"Error: {d['error']}")
+        return redact(f"Moved column `{names[move_id]}` {side} `{names[anchor_id]}`.")
     return f"Error: unknown tool '{name}'"
 
 

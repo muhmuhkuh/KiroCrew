@@ -124,6 +124,16 @@ cross-home flake three tests later.
      shutdown, which would keep the next boot's writer from starting.
    * ``sandbox._SHIM_ARGV_CACHE`` -- the spawn shim's resolved argv, derived
      from the boot's config and home.
+   * ``config.loader`` materialized-agent snapshot (``_MATERIALIZED_AGENTS``,
+     ``_MATERIALIZED_STEMS``, ``_MATERIALIZED_SEEN``, ``_MATERIALIZED_COMPLETE``,
+     ``_MATERIALIZED_AGENTS_READY``) -- the declared names, file-name map,
+     removal evidence and scan completeness of the home's
+     ``kiro/agents`` directory, which the next boot would read as its own until
+     its first refresh lands.
+   * ``dashboard.handlers.updates._auto_effect`` -- the update loop's derived
+     ``auto_update_effect``, read from the boot's install root and policy; a
+     stale one is served on the next boot's status frames, and it is also what
+     arms the status path's background re-derivation.
    * ``browser_cli.launch._warned_lifecycle_losses`` -- the warn-once set for
      browser-socket lifecycle losses; carried across boots it would silence
      the second boot's first diagnostic.
@@ -221,9 +231,11 @@ from kiro_crew import (
 )
 from kiro_crew.browser_cli import launch as browser_launch
 from kiro_crew.config import live as config_live
+from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import CREDENTIAL_KEYS
 from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.dashboard import loop_watchdog, revocation_gen, token_auth, token_secret
+from kiro_crew.dashboard.handlers import updates as dashboard_updates
 from kiro_crew.platform import bootstrap as platform_bootstrap
 from kiro_crew.platform import context as platform_context
 from kiro_crew.testing import fake_acp_backend
@@ -710,6 +722,14 @@ def _reset_home_bound_globals() -> None:
     sandbox._SLICE_MEMHIGH_EVENTS_SEEN = None
     sandbox._SLICE_OOM_SEEN = None
     sandbox._SHIM_ARGV_CACHE.clear()
+    config_loader._MATERIALIZED_AGENTS = frozenset()
+    config_loader._MATERIALIZED_STEMS.clear()
+    config_loader._MATERIALIZED_SEEN.clear()
+    config_loader._MATERIALIZED_COMPLETE = False
+    config_loader._MATERIALIZED_AGENTS_READY = False
+    dashboard_updates._auto_effect = None
+    dashboard_updates._auto_effect_task = None
+    dashboard_updates._shape_effect = None
     browser_launch._warned_lifecycle_losses.clear()
     live_nudge = autonudge._INSTANCE
     if live_nudge is not None:
@@ -734,6 +754,12 @@ def home_bound_globals_are_clear() -> bool:
         and sandbox._SLICE_THROTTLE_PROBE_SEEN is None
         and sandbox._SLICE_THROTTLE_EDGE_AT is None
         and not sandbox._SHIM_ARGV_CACHE
+        and not config_loader._MATERIALIZED_AGENTS
+        and not config_loader._MATERIALIZED_STEMS
+        and not config_loader._MATERIALIZED_SEEN
+        and not config_loader._MATERIALIZED_COMPLETE
+        and not config_loader._MATERIALIZED_AGENTS_READY
+        and dashboard_updates._auto_effect is None
         and not browser_launch._warned_lifecycle_losses
     )
 

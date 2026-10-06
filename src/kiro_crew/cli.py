@@ -28,6 +28,7 @@ _ensure_ssl_certs()
 import argparse
 import asyncio
 import atexit
+import errno
 import faulthandler
 import importlib
 import importlib.machinery
@@ -51,7 +52,14 @@ from kiro_crew.config.loader import (
     build_provider_factory,
 )
 from kiro_crew.config.paths import _default_home, _legacy_home
-from kiro_crew.constants import BANNER, MIN_NODE_MAJOR, env_flag_enabled
+from kiro_crew.constants import (
+    BANNER,
+    MIN_NODE_VERSION,
+    env_flag_enabled,
+    node_too_old_message,
+    node_version_meets_floor,
+    parse_node_version,
+)
 from kiro_crew.crash_guard import install as _install_crash_guard
 from kiro_crew.env import git_build_info
 from kiro_crew.gateway_lock import LIVE_HOLDER_EXIT_CODE, GatewayLock, GatewayLockError
@@ -306,7 +314,13 @@ def _ensure_node(proj_dir: str = "") -> bool:
 
 
 def _node_ok() -> bool:
-    """Check if node >= MIN_NODE_MAJOR is available."""
+    """Check that a node of the supported MAJOR is on PATH.
+
+    The answer gates the ensure-node repair at gateway boot and stays major-only,
+    so the full floor adds no boot-time install. A node of that major but below
+    the full ``MIN_NODE_VERSION`` still passes and logs a warning naming the exact
+    required version and how to update.
+    """
     node = shutil.which("node")
     if not node:
         return False
@@ -326,8 +340,12 @@ def _node_ok() -> bool:
             text=True,
             timeout=5,
         )
-        major = int(node_ver.stdout.strip().lstrip("v").split(".")[0])
-        return major >= MIN_NODE_MAJOR
+        version = parse_node_version(node_ver.stdout)
+        if version is None:
+            return False
+        if not node_version_meets_floor(version, MIN_NODE_VERSION):
+            logging.getLogger(__name__).warning(node_too_old_message(version, MIN_NODE_VERSION))
+        return version[0] >= MIN_NODE_VERSION[0]
     except Exception:
         return False
 
@@ -833,10 +851,21 @@ def _consolidate_cmd(args) -> None:
                     print(f"  {key}: no unconsolidated messages, skipping")
                     continue
                 print(f"  {key}: consolidating {count} messages...")
-                if await consolidator.consolidate_now(key):
-                    print(f"  {key}: done ✓")
-                else:
+                if not await consolidator.consolidate_now(key):
                     print(f"  {key}: skipped (consolidation retry backoff)")
+                    continue
+                # consolidate_now drains the tail over as many bounded passes as
+                # it takes, but it can stop short — a backoff armed part-way
+                # through, or a span it could not advance over. Report what the
+                # transcript says rather than the call's success flag: this
+                # process exits here, with no idle sweep behind it to finish a
+                # remainder, so a bare "done" would be the last word on messages
+                # nothing has read.
+                left = conv_log.unconsolidated_count(key)
+                if left:
+                    print(f"  {key}: partially consolidated, {left} message(s) remain")
+                else:
+                    print(f"  {key}: done ✓")
             except Exception:
                 logger.debug("consolidate (or SEL) failed for %s", key, exc_info=True)
 
@@ -907,6 +936,12 @@ def _redirect_fds_to(path: Path, fds: tuple[int, ...] = (1, 2)) -> None:
         os.close(raw_fd)
 
 
+# errnos that will not clear by retrying: the log file cannot be reopened.
+_LOG_FATAL_ERRNOS = frozenset({errno.ENOSYS, errno.EPERM, errno.EACCES, errno.EROFS})
+# Consecutive OSErrors (any errno) after which file logging stops anyway.
+_LOG_ERROR_STREAK_LIMIT = 3
+
+
 class _FdTrackingRotatingFileHandler(RotatingFileHandler):
     """RotatingFileHandler that re-points raw fds 1/2 after each rollover.
 
@@ -918,7 +953,50 @@ class _FdTrackingRotatingFileHandler(RotatingFileHandler):
     stderr disappears from every retained log. Re-pointing the fds at the
     freshly created ``gateway.log`` inside ``doRollover`` keeps raw-write
     capture continuous across the file's whole retention lifecycle.
+
+    If the reopen inside a rollover fails, the fds stay on the RENAMED file
+    and the stdlib ``handleError`` would print a traceback there for every
+    later record, escaping the size cap. So an OSError streak prints only its
+    first traceback, and while no file is open a non-retryable errno (or a
+    long streak) stops file logging: emit becomes a no-op and fds 1/2 move to
+    ``os.devnull``.
     """
+
+    _error_streak = 0
+    _stopped = False
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._stopped:
+            return
+        streak = self._error_streak
+        super().emit(record)
+        if self._error_streak == streak:
+            self._error_streak = 0  # this record was written: streak over
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, OSError):
+            super().handleError(record)
+            return
+        self._error_streak += 1
+        if self._error_streak == 1:
+            super().handleError(record)  # one traceback per streak, not per record
+        # Stop only when no file is open (a rollover could not reopen it): a
+        # write error on the live, still-rotated file may clear by itself.
+        if self.stream is None and (
+            exc.errno in _LOG_FATAL_ERRNOS or self._error_streak >= _LOG_ERROR_STREAK_LIMIT
+        ):
+            self._stop_file_logging(exc)
+
+    def _stop_file_logging(self, exc: OSError) -> None:
+        self._stopped = True
+        line = f"file logging to {self.baseFilename} stopped ({exc!r}); records are dropped\n"
+        try:
+            sys.stderr.write(line)  # same stream the stdlib traceback went to
+            sys.stderr.flush()
+        except (AttributeError, OSError, ValueError):  # None, broken or closed
+            pass  # nowhere left to report to; the devnull re-point still matters
+        _redirect_fds_to(Path(os.devnull))
 
     def doRollover(self) -> None:
         super().doRollover()
@@ -2314,6 +2392,16 @@ Examples:
             "non-default port."
         ),
     )
+    stop_parser.add_argument(
+        "--expect-pid",
+        type=int,
+        default=None,
+        help=(
+            "Stop only if this pid is the sole listener on --port AND holds this "
+            "home's gateway.lock; otherwise refuse and signal nothing. For callers "
+            "that already identified the gateway they mean to stop."
+        ),
+    )
 
     # restart — service-aware: restarts the systemd/launchd service if active,
     # otherwise SIGTERMs the foreground gateway and respawns it detached so the
@@ -3096,7 +3184,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     cfg_set.add_argument(
         "--local",
         action="store_true",
-        help="Save to config.local.json (persists across upgrades)",
+        help="Save to config.local.json, the overlay whose values win over config.json",
     )
     cfg_sub.add_parser("edit", help="Open config in $EDITOR")
     cfg_defaults = cfg_sub.add_parser(
@@ -3126,6 +3214,15 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     cli_help.hide_internal_commands(sub)
 
     args = parser.parse_args()
+
+    # MCP servers and CLI commands hold their managed-venv tree for the process
+    # lifetime, so another process's update cannot prune it underneath them.
+    # The gateway takes the same hold off-loop AFTER readiness, before updates;
+    # even the no-op stat must stay off its boot path.
+    if args.command != "gateway":
+        from kiro_crew.platform.tree_liveness import hold_running_tree_lock
+
+        hold_running_tree_lock()
 
     # Direct agent-bearing CLI commands do not construct the long-lived
     # prerequisite service. Pin an explicit override before the jail gate or
@@ -3260,6 +3357,15 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     if args.command == "chat":
         _run_chat(args.message, args.model, agent=getattr(args, "agent", None))
     elif args.command == "gateway":
+        # The gateway's status lines are plain print() calls. Off a terminal
+        # (systemd journal, launchd file, the Desktop supervisor's log fd, a
+        # detached gateway's own gateway.log) CPython block-buffers stdout, so
+        # they surface at exit, stamped with the stop time, or never after a
+        # kill or an in-app os.execv. One reconfigure here, before the first
+        # status print, covers every launcher; a terminal is already
+        # line-buffered and is left alone. Gateway-only: no other subcommand
+        # is long-lived under a service manager.
+        platform_compat.ensure_line_buffered_stdout()
         # Seam-supplied pre-launch checks (CPP IdentityProvider seam). Runs
         # HERE in the gateway dispatch — not in boot_platform (which runs for
         # every subcommand incl. the mcp-core/mcp-cron stdio servers, where an
@@ -3489,7 +3595,7 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     elif args.command == "stop":
         from kiro_crew.cli_server import _stop
 
-        _stop(args.port)
+        _stop(args.port, expect_pid=args.expect_pid)
     elif args.command == "restart":
         from kiro_crew.cli_server import _restart
 

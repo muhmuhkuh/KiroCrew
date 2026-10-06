@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, Iterator, Literal, MutableMapping
 
 from kiro_crew import agent_state, platform_compat
 from kiro_crew.agent_discovery import (
+    SKILL_URI_PREFIX,
     AmbiguousAgentSpecError,
     _declared_project_agent_name,
     _read_agent_spec,
@@ -71,7 +72,7 @@ from kiro_crew.agent_spec_format import (
     is_markdown_spec,
     iter_agent_spec_files,
 )
-from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.atomic_write import read_json_or, replace_with_retry
 from kiro_crew.config import config_dir
 from kiro_crew.config import config_path as _mc_config_path
 from kiro_crew.config.paths import (
@@ -84,7 +85,7 @@ from kiro_crew.config.paths import (
     kiro_agents_dir,
     shared_kiro_agents_writable,
 )
-from kiro_crew.env import mcp_search_path, spec_path_key
+from kiro_crew.env import mcp_search_path, resolved_command_casing, spec_path_key
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.platform import (
     current_context,
@@ -103,6 +104,7 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
     SecurityEvent,
     sel,
 )
+from kiro_crew.user_json import loads_user_json
 from kiro_crew.validation import is_registered_agent_name
 
 if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
@@ -792,6 +794,23 @@ def _kirocrew_bin_subpath(root: Path) -> Path:
     return root / "bin" / "kirocrew"
 
 
+def _through_stable_link(path: str) -> str:
+    """*path* as a launcher that outlives this process names it.
+
+    On a managed venv the running tree is one versioned tree among several, and
+    a later update's prune may delete it once no process runs from it; the
+    stable link follows every promotion (see
+    :func:`kiro_crew.platform.tree_liveness.through_stable_link`). Only for the
+    ``~/.local/bin`` shim: :func:`_resolve_kirocrew_bin` itself keeps the running
+    tree, because what this process hands its own children (the built-in MCP
+    servers, the jail re-exec) must run the version this process runs, not one a
+    promotion made current before this process restarted.
+    """
+    from kiro_crew.platform.tree_liveness import through_stable_link
+
+    return through_stable_link(path)
+
+
 def _resolve_kirocrew_bin() -> str:
     """Resolve the absolute path of the ``kirocrew`` executable.
 
@@ -818,10 +837,26 @@ def _resolve_kirocrew_bin() -> str:
 
     Every candidate is validated with ``is_file()`` and ``os.access(X_OK)``
     before being returned, so stale paths from previous installs are skipped.
+
+    The cached answer is re-validated on every call, not trusted for the life
+    of the process. A gateway outlives the install it started from: a managed
+    update installs the next version beside it and later prunes the old
+    directory, and a path cached before the prune would keep being written into
+    ``kirocrew.json`` as the launch of ``kirocrew-core`` / ``kirocrew-cron`` --
+    which then fail on every spawn until a restart. A cached launcher that no
+    longer works is dropped and resolution runs again; steps 1-3 are anchored on
+    the (now missing) running package, so they fail and the walk reaches the
+    current install through PATH.
     """
     global _KIROCREW_BIN
     if _KIROCREW_BIN:
-        return _KIROCREW_BIN
+        if _launcher_works(Path(_KIROCREW_BIN)):
+            return _KIROCREW_BIN
+        logger.warning(
+            "cached kirocrew binary %s no longer works (install pruned?); re-resolving",
+            _KIROCREW_BIN,
+        )
+        _KIROCREW_BIN = None
 
     def _usable(p: str | Path) -> bool:
         sp = str(p)
@@ -1215,6 +1250,9 @@ def ensure_kirocrew_on_path(
         return None
 
     target = _resolve_kirocrew_bin()
+    if os.path.isabs(target):
+        # The shim outlives this process, so it follows promotions.
+        target = _through_stable_link(target)
     # Nothing concrete to point at — bare "kirocrew" or a non-executable file.
     if not (os.path.isabs(target) and os.path.isfile(target) and os.access(target, os.X_OK)):
         return None
@@ -1428,24 +1466,8 @@ def run_first_run_setup() -> None:
         logger.warning("First-run: stale MCP purge failed", exc_info=True)
 
 
-def _prompt_path(mode: str = "") -> Path:
-    """Return user prompt if it exists, otherwise shipped prompt.
-
-    When mode="orchestrator", uses the orchestrator prompt.
-    """
-    if mode == "orchestrator":
-        user_orch = _user_dir() / "prompt-orchestrator.md"
-        if user_orch.is_file():
-            return user_orch
-        proj = _project_dir()
-        if proj:
-            candidate = proj / "agents" / "prompt-orchestrator.md"
-            if candidate.is_file():
-                return candidate
-        bundled_orch = _BUNDLED_CFG_DIR / "prompt-orchestrator.md"
-        if bundled_orch.is_file():
-            return bundled_orch
-
+def _prompt_path() -> Path:
+    """Return user prompt if it exists, otherwise shipped prompt."""
     user_prompt = _user_prompt_path()
     if user_prompt.is_file():
         return user_prompt
@@ -1463,7 +1485,7 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = loads_user_json(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         logger.warning("Ignoring invalid %s: %s", path, exc)
         return {}
@@ -1566,12 +1588,11 @@ def _all_skill_paths() -> list[str]:
                     manifest = pkg / ".aim" / ".version-manifest.json"
                     current_event = ""
                     if manifest.is_file():
-                        try:
-                            manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
-                            if isinstance(manifest_data, dict):
-                                current_event = manifest_data.get("currentEventId", "")
-                        except (json.JSONDecodeError, OSError):
-                            pass
+                        manifest_data = read_json_or(
+                            manifest, None, logger=logger, what="AIM version manifest"
+                        )
+                        if isinstance(manifest_data, dict):
+                            current_event = manifest_data.get("currentEventId", "")
                     for sub in pkg.iterdir():
                         if not sub.is_dir() or sub.name.startswith("."):
                             continue
@@ -2361,7 +2382,7 @@ def _load_existing_config(
     runs reads the same decision the caller's audit will report.
     """
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
+        config = loads_user_json(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         config = None
     if not isinstance(config, dict):
@@ -2420,6 +2441,126 @@ def migrate_agent_specs() -> int:
     if cleaned:
         logger.info("Cleaned %d kiro agent spec(s) of KiroCrew bookkeeping keys", cleaned)
     return cleaned
+
+
+def _relocated_skill_uri(uri: str, moves: dict[Path, Path]) -> str | None:
+    """The new ``skill://`` URI for *uri* when it names a relocated skill, else ``None``.
+
+    Only a ``~/`` or absolute URI is matched: a workspace-relative one points into
+    a project tree, never at the builtin skills home. The rewrite keeps the URI's
+    form, so a ``~/`` mapping stays portable across machines.
+    """
+    if not uri.startswith(SKILL_URI_PREFIX):
+        return None
+    raw = uri[len(SKILL_URI_PREFIX) :]
+    home_form = raw.startswith("~/")
+    if home_form:
+        path = Path.home() / raw[2:]
+    elif Path(raw).is_absolute():
+        path = Path(raw)
+    else:
+        return None
+    new = moves.get(Path(os.path.normpath(path)))
+    if new is None:
+        return None
+    if home_form:
+        try:
+            return f"{SKILL_URI_PREFIX}~/{new.relative_to(Path.home()).as_posix()}"
+        except ValueError:
+            pass
+    return f"{SKILL_URI_PREFIX}{new.as_posix()}"
+
+
+def migrate_relocated_skill_uris() -> int:
+    """Point agent specs that map a relocated builtin skill at its new path.
+
+    A builtin skill that moves (``skills._RELOCATED_SKILLS``) leaves its old
+    ``SKILL.md`` quarantined, so an agent spec that maps the old path by
+    ``skill://`` would silently load nothing. This rewrites each such resource to
+    the new path, in place and in order, and drops it instead when the spec
+    already maps the new path. A move counts only once the new ``SKILL.md`` is
+    installed and the old one is gone, so a mapping is never pointed at a file
+    that does not exist, and a skill still loadable at its old path keeps its
+    mapping. Idempotent and safe to run on every rebuild. Returns the number of
+    spec files rewritten.
+    """
+    from kiro_crew.skills import _RELOCATED_SKILLS, skills_dir  # noqa: PLC0415
+
+    agents_dir = kiro_agents_dir_path()
+    if not agents_dir.is_dir():
+        return 0
+    base = skills_dir()
+    moves: dict[Path, Path] = {}
+    for old_name, new_name in _RELOCATED_SKILLS.items():
+        old_md = base / old_name / "SKILL.md"
+        new_md = base / new_name / "SKILL.md"
+        if new_md.is_file() and not old_md.exists():
+            moves[Path(os.path.normpath(old_md))] = new_md
+    if not moves:
+        return 0
+    rewritten = 0
+    # Every template-spec writer holds this lock, and the read sits INSIDE it:
+    # a snapshot taken before a concurrent PATCH saved would otherwise be
+    # written back over that edit.
+    try:
+        with agents_spec_lock(agents_dir):
+            # JSON only, for the same reason as migrate_agent_specs: a markdown spec is
+            # never rewritten by Kiro Crew.
+            for spec_path in sorted(agents_dir.glob("*.json")):
+                if not _spec_path_is_safe(spec_path, agents_dir):
+                    continue
+                data = _read_agent_spec(
+                    spec_path,
+                    operation="migrate_relocated_skill_uris",
+                    source="unknown",
+                )
+                if data is None:
+                    continue
+                name = data.get("name") or spec_path.stem
+                try:
+                    enrolled = agent_state.get_capabilities(str(name)) is not None
+                except (ValueError, OSError):
+                    enrolled = True
+                if enrolled:
+                    # An enrolled member's spec is a saved generation whose
+                    # digest its capability intent records; rewriting it in
+                    # place would make reconcile refuse new sessions. It is
+                    # left for a re-save in Capabilities.
+                    continue
+                resources = data.get("resources")
+                if not isinstance(resources, list):
+                    continue
+                present = {r for r in resources if isinstance(r, str)}
+                updated: list[object] = []
+                changed = False
+                for resource in resources:
+                    new_uri = (
+                        _relocated_skill_uri(resource, moves) if isinstance(resource, str) else None
+                    )
+                    if new_uri is None:
+                        updated.append(resource)
+                        continue
+                    changed = True
+                    if new_uri not in present:
+                        updated.append(new_uri)
+                        present.add(new_uri)
+                if not changed:
+                    continue
+                data["resources"] = updated
+                try:
+                    _atomic_json_write(spec_path, data)
+                    rewritten += 1
+                except OSError as exc:
+                    logger.warning(
+                        "Could not rewrite relocated skill mapping in %s: %s", spec_path, exc
+                    )
+    except OSError:
+        # The lock already logged why it could not be taken; try again on
+        # the next rebuild rather than write unserialized.
+        return rewritten
+    if rewritten:
+        logger.info("Pointed %d agent spec(s) at relocated builtin skills", rewritten)
+    return rewritten
 
 
 def clear_model_pin(config: MutableMapping[str, object], name: str) -> None:
@@ -3253,6 +3394,8 @@ def rebuild_agent_config(
     # One-time (idempotent) self-heal: strip KiroCrew bookkeeping keys from
     # every kiro agent spec into the sidecar so kiro-cli accepts them all.
     migrate_agent_specs()
+    # A relocated builtin skill keeps working for agents that map its old path.
+    migrate_relocated_skill_uris()
 
     # Managed MCP sync happens after config is fully built (see below).
 
@@ -3352,13 +3495,21 @@ def rebuild_agent_config(
         # to audit directories that were never consulted, which is the opposite
         # of the not-installed/installed-elsewhere distinction this path draws --
         # so return "" as the searched path even though the lookup still runs.
+        #
+        # Both lookups pass through ``resolved_command_casing``: the value
+        # returned here is PERSISTED as the spec's absolute ``command``, and an
+        # absolute path is accepted verbatim on the next pass, so a PATHEXT-
+        # synthesized ``.EXE`` written once would be indistinguishable from an
+        # operator's own spelling from then on. Repairing at the resolver, not
+        # at the persist site, also keeps the provenance record's ``emitted``
+        # value repaired, so ``command_is_ours`` still recognises the entry.
         if os.path.dirname(cmd):
-            return shutil.which(cmd, path=_search), ""
+            return resolved_command_casing(shutil.which(cmd, path=_search)) or None, ""
         # The search path is returned, not recomputed by the caller: a candidate
         # that declares its own ``env.PATH`` is searched against a DIFFERENT path
         # than one that does not, so a caller reporting ``mcp_search_path("")``
         # would name directories that were never searched.
-        return shutil.which(cmd, path=_search), _search
+        return resolved_command_casing(shutil.which(cmd, path=_search)) or None, _search
 
     resolved = mcp_sources.resolve_mcp_servers(config, sources, _resolve_command)
     mounted = mcp_aliases.normalize_server_keys(config, resolved.unresolved)
@@ -3914,13 +4065,16 @@ you stop. (The loop is on a timer today. When `monitor_start` accepts a
 `watch: "work-ledger"` field, gate on that instead and the quiet cycles stop
 costing a turn.)
 
-Each cycle, `work_ledger_read` FIRST. It returns every item, the derived
-`orphaned` and `stale` flags, the newest events, and a ready-to-pipe
-`accept_batch`. Then act by status, and only on three of them:
+Each cycle, `work_ledger_read` with `compact=true` FIRST. It returns every
+item's status columns and the derived `orphaned` and `stale` flags — small
+enough to read every round. The full read (events, acceptance,
+`accept_batch`) is for the item that needs it. Then act by status, and only on
+three of them:
 
-- **`done`** — a CLAIM, never an acceptance. Filter the returned
-  `accept_batch` down to the items whose status is `done`, pipe THAT into
-  `accept_eval.py`, and record its answer with `work_ledger_record`
+- **`done`** — a CLAIM, never an acceptance. Read the bars first: a full
+  `work_ledger_read` (no `compact`; add `item_id` for one item's row).
+  Filter the `accept_batch` down to the items whose status is `done`, pipe
+  THAT into `accept_eval.py`, and record its answer with `work_ledger_record`
   `action=verdict`. The batch carries every open item with a concrete
   acceptance, `progress` ones included, and a stub that already exists is a
   genuine `pass` on unfinished work — so the unfiltered batch would let you
@@ -3948,6 +4102,56 @@ substance, a stall's shape. Never for a verdict.
 Do not encode items into `session_ledger` artifacts: the ledger is the item
 store now, and `session_ledger_read` / `session_ledger_record` are for YOUR own
 `goal`, `phase` and `next`.
+
+## Talking to the person
+
+The person in this chat may not be an engineer: they may have turned on
+**Crew Mode**, the dashboard switch that runs a chat on you. Talk to them in
+plain words and in their language. Say "a separate chat", not "a session";
+"a task", not "a work item"; "check on", not "patrol". Engineering words stay
+in the ledger, the seeds and the tool calls. Skip the introduction and the board
+below when a conductor dispatched you: your reader is then that conductor, and
+it reads your `work_report`, not your widgets.
+
+**Widgets are for the dashboard chat only.** When the `[RUNTIME]` line names the
+dashboard, use the widgets below. In a messaging
+channel or a scheduled run, give the same content as short plain text instead,
+because those surfaces show widget markup as raw text.
+
+**Your first reply in a chat opens with a short introduction**, then gets to
+work on what they asked. Show it as one inline widget with a plain-words title in
+their language (`<mcwidget title="Your Conductor">`), under ten short lines, and
+with nothing in it that looks clickable: no buttons, boxed tiles or links.
+
+- "I'm your Conductor", and one line on what that means: you split the job into
+  tasks and send each one to its own chat, instead of doing it yourself.
+- The tasks on the table now, or "nothing yet".
+- What you will do next, in one or two lines.
+- What you can do for them, as four short plain lines: open a separate chat for
+  each task; pass messages between those chats; take an extra request and send
+  a chat to do it; check on any chat and steer it when they ask.
+
+**At every milestone, show the task board in this chat.** A milestone is a task
+starting, finishing, getting stuck, or needing the person. The board is one
+inline widget titled "Task board" in their language
+(`<mcwidget title="Task board">`):
+
+1. "Needs you" comes FIRST, in a warm color, whenever anything waits on the
+   person: an approval, a question, a decision. Each item says what it is and
+   what one answer unblocks. With nothing waiting, say "Nothing right now".
+2. A count of tasks done out of the total, then one row per task: a plain name,
+   a colored state (done, working, needs you, stuck, waiting) and one line on
+   where it stands. Use real states and real counts only, never a made-up
+   percentage or time.
+3. One line on what happens next.
+
+Build it from theme variables, readable at 320px wide, with motion off under
+`prefers-reduced-motion`, and give every link
+`target="_blank" rel="noopener noreferrer"`. Put the answers you need from them
+in an `[OPTIONS: ...]` line or `ask_question` under the widget, never as buttons
+drawn in HTML, and keep each answer a few words long so it is read in full. For a goal that runs more than one round, also keep one
+`task-dashboard` artifact and update that same slug at each milestone: the
+widget is the summary, the artifact is the full board.
 
 ## If a conductor dispatched you
 
@@ -4087,6 +4291,11 @@ handle immediately.
 #:   same-workspace session, losing filing the user did by hand.
 #: * ``chat_folder_move`` — WITHHELD. Reparents an existing folder tree, and no
 #:   conductor step needs it.
+#: * ``chat_folder_delete`` — WITHHELD. It passes the invariant: the dashboard
+#:   removes only an empty folder the CALLER's own session created and the
+#:   person has not touched since, and refuses an app or crew member outright.
+#:   It is withheld for the ``session_summary`` reason: no conductor step calls
+#:   it yet. A skill whose cleanup step adopts it adds it here with that step.
 #: * ``chat_tag_list`` / ``chat_tag_create`` / ``chat_tag_update`` — WITHHELD,
 #:   not because any fails the invariant (a read, a create that dedups on name,
 #:   and a metadata edit that loses no assignment) but because no conductor step
@@ -4099,6 +4308,12 @@ handle immediately.
 #:   the PATCH goes to ``/api/chat/slots/<target>/pin`` where the target is the
 #:   session named in the ARGUMENTS, the same shape as ``chat_tag_assign``, and
 #:   no conductor step needs it.
+#: * ``chat_tag_column_list`` / ``chat_tag_column_create`` — WITHHELD. A read
+#:   and an append that dedups on name and tag, so neither fails the invariant;
+#:   withheld because no conductor step needs them, like the tag verbs.
+#: * ``chat_tag_column_move`` — WITHHELD, on the invariant: it MUTATES the order
+#:   of columns the person arranged, which is existing state that is not the
+#:   caller's own, and no conductor step needs it.
 #: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
@@ -4132,6 +4347,14 @@ handle immediately.
 #:   cancelled turn's work is gone either way — the retry de-duplication that
 #:   keeps a re-sent stop from ALSO discarding the queue does not make the verb
 #:   non-destructive).
+#: * ``session_end_wait`` — WITHHELD. Discards nothing, but it moves another
+#:   session's turn forward (the target's ``wait`` returns early), which is a
+#:   change to state that is not the caller's own, and no conductor step needs it
+#:   unattended.
+#: * ``session_reload`` — WITHHELD. Tears down another session's agent process
+#:   and relaunches it. The conversation survives, but a reload is still a
+#:   process-level action on a session a person may be watching, and no
+#:   conductor step needs it.
 #:
 #: Every withheld verb stays MOUNTED (``@kirocrew-dashboard`` is still in
 #: ``tools``) — it just passes through ``hooks.on_tool_call`` like any ungranted
@@ -4640,7 +4863,7 @@ Three child roles, one per dispatch:
   It exists to REJECT false positives, the dominant noise source in agentic
   security review, so every finding gets a second pass before a person sees it.
 - **Fixer** — only for a verified High or Critical, and only after an explicit
-  human yes. Runs the `prepare-pr` skill; acceptance is PR checks green.
+  human yes. Runs the `kirocrew-prepare-pr` skill; acceptance is PR checks green.
 
 **Shell exists to run the skill's scripts, and for nothing else.**
 `execute_bash` is mounted so you can run the scripts the `security-conductor`

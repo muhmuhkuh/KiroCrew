@@ -117,7 +117,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 61. Deduped from 387 raw records.
 | P1 | `chat-older-sessions` | As a user, I want a searchable history pane of closed sessions with per-session and bulk delete, so that I can revisit or prune past work. | `/chat` | sessions-long-history | smoke | 4 |
 | P1 | `chat-sessions-page` | As a dashboard user, I want a bookmarkable session chooser with search, filter chips and recency groups, so that I can pick a session without one being auto-selected or auto-created. | `/sessions` | sessions-a-few | smoke | 3 |
 | P1 | `sidebar-rail-collapse-expand` | As a user, I want to collapse the rail to icons, so that I have more room for content. | `/chat` | minimal | smoke | 2 |
-| P1 | `sidebar-rail-order-and-active-state` | As a user, I want the rail to list Sessions, Schedule, Artifacts, then Apps/Discover/Library, then Agent Capabilities and Settings, so that navigation is predictable. | `/schedule` | minimal | smoke | 1 |
+| P1 | `sidebar-rail-order-and-active-state` | As a user, I want the rail to list Sessions, Schedule, Artifacts, then Apps/Discover/Library, then Customize and Settings, so that navigation is predictable. | `/schedule` | minimal | smoke | 1 |
 | P2 | `chat-fork-session` | As a user, I want to branch a new slot from an existing transcript, keeping incognito or temporary mode on the child, so that I can explore an alternative without losing the original. | `/chat` | incognito-mix | nightly | 3 |
 | P2 | `chat-session-folders` | As a user with many sessions, I want to group session rows into folders and start mode-pinned ephemeral chats inside them, so that my sidebar stays organised. | `/chat` | sessions-a-few | nightly | 6 |
 | P2 | `chat-session-tags` | As a user, I want to put coloured labels on sessions and filter by them, so that I can find related conversations quickly. | `/chat` | sessions-a-few | nightly | 5 |
@@ -134,7 +134,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 61. Deduped from 387 raw records.
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
 | P2 | `capabilities-pin-tab-to-rail` | As a daily user of one capability tab, I want to pin it as its own rail row (up to NAV_PINNED_LIMIT), so that it is one click away instead of two. | `/capabilities` | minimal | nightly | 3 |
-| P2 | `redirect-agents` | As a user with an old bookmark, I want /agents and /mc-agents to land on Agent Capabilities, so that deep links keep working. | `/agents` | minimal | nightly | 1 |
+| P2 | `redirect-agents` | As a user with an old bookmark, I want /agents and /mc-agents to land on Customize, so that deep links keep working. | `/agents` | minimal | nightly | 1 |
 | P2 | `redirect-artifacts-deploy` | As a user with an old bookmark, I want /artifacts/deploy to land on /deploy, so that deep links keep working. | `/artifacts/deploy` | minimal | nightly | 1 |
 | P2 | `redirect-connections` | As a user with an old bookmark, I want /connections to land on the Connections tab, so that deep links keep working. | `/connections` | minimal | nightly | 1 |
 | P2 | `redirect-instances` | As a user with an old bookmark, I want /instances to land on Settings Instances, so that deep links keep working. | `/instances` | minimal | nightly | 1 |
@@ -379,7 +379,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 61. Deduped from 387 raw records.
 | P2 | `chat-default-memory-mode` | As a privacy-conscious user, I want to choose Persistent, Incognito or Temporary as the default for new dashboard chats, so that new sessions follow my retention preference without a per-chat click. | `/settings/chat` | incognito-mix | nightly | 4 |
 | P2 | `notifications-channel-mute-and-priority-override` | As a user, I want per-channel mute and priority controls, so that noisy channels stay in history without badging while approvals stay critical. | `/settings/notifications` | minimal | nightly | 5 |
 | P2 | `settings-about-report-a-problem` | As a user, I want to click Report a Problem in Settings > About, so that I can file an issue with diagnostics attached. | `/settings/about` | minimal | nightly | 3 |
-| P2 | `settings-about-update-channel-and-notifications` | As a user, I want to choose stable or insider Update channel and toggle Notify when an update is available, so that I control how I receive updates. | `/settings/about` | minimal | nightly | 4 |
+| P2 | `settings-about-update-channel-and-notifications` | As a user, I want to choose stable or insider Update channel and set Update the gateway automatically, which installs updates and restarts where this install can and only notifies where it cannot, so that I control how I receive updates. | `/settings/about` | minimal | nightly | 4 |
 | P2 | `settings-browser-attach-token` | As a dashboard user, I want to paste an extension token in Settings > Browser, so that attaching to my own Chrome skips the per-attach prompt. | `/settings/browser` | minimal | nightly | 3 |
 | P2 | `settings-browser-panel` | As a dashboard user, I want to open Settings > Browser and see whether playwright-cli is installed and toggle the built-in browser, so that the agent can browse. | `/settings/browser` | minimal | nightly | 3 |
 | P2 | `settings-chat-content-width-buttongroup` | As a dashboard user, I want to switch Content Width in Settings > Chat, so that the chat column uses more or less of the screen. | `/settings/chat` | sessions-a-few | nightly | 3 |
@@ -389,7 +389,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 61. Deduped from 387 raw records.
 | P2 | `settings-developer-feature-previews` | As an early adopter, I want to turn on a feature preview in Settings > Developer, so that unfinished surfaces appear in the dashboard. | `/settings/developer` | minimal | nightly | 4 |
 | P2 | `settings-display-language-select` | As a non-English user, I want to change the dashboard Language in Settings > Display, so that the UI is shown in my language. | `/settings/display` | minimal | nightly | 3 |
 | P2 | `settings-display-session-color-palette` | As a dashboard user, I want to set the session colour palette and defaults in Settings > Display, so that sidebar rows are colour-coded. | `/settings/display` | sessions-a-few | nightly | 5 |
-| P2 | `settings-display-terminal-settings` | As a developer, I want to set the terminal shell, font, font size and command completion in Settings > Display, so that the built-in terminal matches my workflow. | `/settings/display` | minimal | nightly | 5 |
+| P2 | `settings-display-terminal-settings` | As a developer, I want to set the terminal shell, font, font size, command completion, and reuse-current-terminal in Settings > Display, so that the built-in terminal matches my workflow. | `/settings/display` | minimal | nightly | 5 |
 | P2 | `settings-display-zoom-level-stepper` | As a dashboard user, I want to step the Zoom Level in Settings > Display, so that the UI is larger or smaller. | `/settings/display` | minimal | nightly | 3 |
 | P2 | `settings-imports-panel` | As a new user, I want to import existing agent setups, so that I do not start from scratch. | `/settings/imports` | minimal | nightly | 3 |
 | P2 | `settings-notifications-category-sound-override` | As a dashboard user, I want to choose a different sound for Approval or Cron notifications, so that I can tell them apart by ear. | `/settings/notifications` | minimal | nightly | 4 |
@@ -431,7 +431,7 @@ Priorities: P0 10 · P1 37 · P2 162 · P3 61. Deduped from 387 raw records.
 
 | Priority | Id | User story | Start URL | Seed | Runnable | Steps |
 |---|---|---|---|---|---|---|
-| P2 | `developer-agent-backend` | As a developer, I want to see which agent harness backend is live, what each harness can and cannot do, and whether Kiro prerequisites are met, so that I know what turns run on before I choose a harness. | `/developer` | minimal | nightly | 3 |
+| P2 | `developer-agent-backend` | As a developer, I want to see which agent harness backend is live, what each harness can and cannot do, and whether Kiro prerequisites are met, so that I know what turns run on before I choose a harness. | `/settings/agent` | minimal | nightly | 3 |
 | P2 | `developer-archive` | As a developer, I want a consolidated session archive browser, so that I can inspect compacted history. | `/developer` | sessions-long-history | nightly | 3 |
 | P2 | `developer-config` | As a developer, I want raw Kiro Crew and agent config editors, so that I can fix a setting no panel exposes. | `/developer` | minimal | nightly | 3 |
 | P2 | `developer-debug-tools` | As a developer, I want diagnostic overlays such as the chat scroll inspector, so that I can debug layout issues. | `/developer` | sessions-a-few | nightly | 3 |

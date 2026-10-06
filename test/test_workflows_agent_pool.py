@@ -56,14 +56,18 @@ class _FakeSessions:
         # extra_env seen on each cold start — index-aligned with
         # created_identities so a test can assert the run-level env pin threads through.
         self.created_extra_env: list = []
+        self.created_backend_overrides: list = []
 
-    async def get_or_create(self, key, *, agent=None, model=None, cwd=None, extra_env=None):
+    async def get_or_create(
+        self, key, *, agent=None, model=None, cwd=None, extra_env=None, **kwargs
+    ):
         # A live key returns instantly (SessionManager's warm per-key fast path).
         if key in self.live:
             return self.live[key], False, False
         self.cold_starts += 1
         self.created_identities.append((agent, model, cwd))
         self.created_extra_env.append(extra_env)
+        self.created_backend_overrides.append(kwargs.get("acp_backend_override"))
         prov = _FakeProvider(tag=key)
         self.live[key] = prov
         self.keys_seen.add(key)
@@ -251,6 +255,21 @@ async def test_per_call_agent_model_override_reaches_get_or_create():
         "claude-opus-4-8",
         None,
     ) in sessions.created_identities, sessions.created_identities
+
+
+@pytest.mark.asyncio
+async def test_backend_override_bypasses_pool_and_reaches_session_factory():
+    sessions = _FakeSessions()
+    agent_fn, pool = build_pooled_agent_fn(sessions, run_id="backend-route")
+    try:
+        result = await agent_fn("review", {"backend": "claude"})
+        assert "review" in result
+    finally:
+        await pool.shutdown()
+
+    assert sessions.cold_starts == 1
+    assert sessions.created_backend_overrides == ["claude"]
+    assert sessions.destroys == 1
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,8 @@ import json
 import logging
 import math
 import re
-from collections.abc import Collection
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import unquote
 
@@ -58,6 +59,7 @@ from kiro_crew.history import SEARCH_MIN_CHARS
 from kiro_crew.instances.constants import (
     PEER_SLOTS_REPLY_MAX_BYTES,
     PROXY_PATH_MAX_DECODE_PASSES,
+    PROXY_REDACT_BUFFER_MAX_BYTES,
     PROXY_REQUEST_BODY_MAX_BYTES,
 )
 from kiro_crew.instances.registry import (
@@ -1959,27 +1961,33 @@ _PEER_SLOT_STR_FIELDS: dict[str, int] = {
 #: for any reader, not only the one frontend that happens to re-check.
 _PEER_SLOT_BOOL_FIELDS = ("running", "pending_approval")
 
-#: The two keys of a peer row's ``parent`` citation (``{slot, key}``, the shape
-#: ``lineage_parents`` puts on every local row), each clamped like ``key``. Both
-#: halves have a reader in the sidebar and they answer different questions:
-#: ``key`` is what the conductor lane NESTS on (resolved against rows of the same
-#: origin only, so the citation stays a bare key in the peer's own key space and
-#: the hub never rewrites it), while ``slot`` is the child's own record of who
-#: opened it -- the "opened by" glyph on a row placed under nothing
-#: (``orphanCitation``, ``citesParent``) and the baseline the lane diffs to tell a
-#: re-parented row from a new one (``citedCreatorRef``). ``lineage_parents``
-#: leaves ``key`` null when the creator is gone and keeps ``slot``, so a
-#: citation with only ``slot`` is the orphan case, not a malformed one. Dropped
-#: from the wire, every session a peer's conductor opened rendered at the top
-#: level of this dashboard as a stray -- the tree existed on the peer and was
-#: stripped one hop from the reader.
+#: The two keys ALLOWLISTED from a peer row's ``parent`` citation (``{slot, key}``,
+#: the shape ``lineage_parents`` puts on every local row), each clamped like
+#: ``key``. The wire carries a third, ``hub_key``, which is never read from the
+#: peer: ``_clean_peer_parent`` stamps it, and only when the cited creator is a
+#: peer slot this hub drives. The three answer different questions in the
+#: sidebar. ``key`` is a bare key in the PEER's key space and is what the
+#: conductor lane nests a peer-to-peer citation on, resolved against rows of the
+#: same origin only. ``hub_key`` is a key in the HUB's key space -- the local slot
+#: driving the creator -- and is what the lane nests on instead when present,
+#: resolved against local rows only (``citedCreatorOf``). ``slot`` is the child's
+#: own record of who opened it -- the "opened by" glyph on a row placed under
+#: nothing (``orphanCitation``, ``citesParent``) and the baseline the lane diffs
+#: to tell a re-parented row from a new one (``citedCreatorRef``).
+#: ``lineage_parents`` leaves ``key`` null when the creator is gone and keeps
+#: ``slot``, so a citation with only ``slot`` is the orphan case, not a malformed
+#: one. Dropped from the wire, every session a peer's conductor opened rendered
+#: at the top level of this dashboard as a stray -- the tree existed on the peer
+#: and was stripped one hop from the reader.
 _PEER_SLOT_PARENT_FIELDS: dict[str, int] = {
     "slot": _PEER_FIELD_MAX_CHARS,
     "key": _PEER_FIELD_MAX_CHARS,
 }
 
 
-def _clean_peer_parent(value: object, driven: Collection[str] = ()) -> dict[str, str] | None:
+def _clean_peer_parent(
+    value: object, driven: Mapping[str, str] = MappingProxyType({})
+) -> dict[str, str] | None:
     """Shape a peer row's ``parent`` citation, or ``None`` when it carries none.
 
     A citation is a dict with a string ``key`` or a string ``slot``; one that has
@@ -1987,14 +1995,19 @@ def _clean_peer_parent(value: object, driven: Collection[str] = ()) -> dict[str,
     rather than forwarded as an empty object. Anything else -- ``None``, a string,
     a list -- is not a citation.
 
-    *driven* is the set of peer slot keys this hub itself drives (see
-    ``read_peer_slots``). A citation naming one of them is dropped whole: that
-    creator's row was filtered out of this listing precisely so its peer slot key
-    never crosses to the browser, and the citation would carry the same key by
-    another route. The child still ships -- it is a real session -- as a root
-    with no citation, which is also the truth of what this listing can show for
-    it: its creator is on screen as the LOCAL row that drives it, not as a peer
-    row the lane could hang it from.
+    *driven* maps each peer slot key this hub itself drives to the LOCAL slot key
+    that drives it (see ``read_peer_slots``). A citation naming a driven key
+    must not carry that key to the
+    browser: the creator's row was filtered out of this listing precisely so its
+    peer slot key never crosses, and the citation would carry the same key by
+    another route. The citation is REWRITTEN rather than dropped: the creator is
+    on screen as the local row that drives it, so the child ships citing that
+    local row through ``hub_key`` (the one field that names a key in the HUB's
+    key space; ``key`` stays the peer's), and ``slot`` -- the half the lane reads
+    for its "opened by" glyph -- names the same local key. The conductor lane
+    then hangs the worker from the local row the user is actually chatting in.
+    Without a local key to redirect to, the citation is dropped whole and the
+    child ships as a root with no citation.
     """
     if not isinstance(value, dict):
         return None
@@ -2002,14 +2015,19 @@ def _clean_peer_parent(value: object, driven: Collection[str] = ()) -> dict[str,
     for field, limit in _PEER_SLOT_PARENT_FIELDS.items():
         raw = value.get(field)
         if isinstance(raw, str) and raw in driven:
-            return None
+            local_key = driven[raw]
+            if not local_key:
+                return None
+            return {"slot": local_key, "hub_key": local_key}
         shaped = _cap_str(raw, limit)
         if shaped:
             out[field] = shaped
     return out or None
 
 
-def _clean_peer_slot(row: object, driven: Collection[str] = ()) -> dict[str, object] | None:
+def _clean_peer_slot(
+    row: object, driven: Mapping[str, str] = MappingProxyType({})
+) -> dict[str, object] | None:
     """Re-shape one untrusted peer slot: allowlist keys, redact, clamp, coerce.
 
     What ``_clean`` does for a peer's SEARCH row, applied to a peer's LIVE row.
@@ -2095,11 +2113,13 @@ class PeerSlots(NamedTuple):
     rows: list[dict[str, object]]
     filtered: int
     over_cap: int
-    #: The peer slot keys this hub drives, as judged for THIS listing. The rows
-    #: carrying them are already out of ``rows``; the chat-slots route needs the
-    #: set again to drop a surviving row's citation of one, so a driven key does
-    #: not reach the browser through ``parent`` after being kept out of ``key``.
-    driven: frozenset[str] = frozenset()
+    #: The peer slot keys this hub drives, as judged for THIS listing, each mapped
+    #: to the LOCAL slot key that drives it. The rows carrying them are already
+    #: out of ``rows``; the chat-slots route needs the map again to rewrite a
+    #: surviving row's citation of one to the local key, so a driven key does not
+    #: reach the browser through ``parent`` after being kept out of ``key``, and
+    #: the child still nests under the row that opened it.
+    driven: Mapping[str, str] = MappingProxyType({})
 
 
 async def read_peer_slots(
@@ -2227,9 +2247,14 @@ async def read_peer_slots(
     # slot and once as the peer row it was adopted from. Read after the await and
     # the set is as current as the rows it judges. ``is_remote`` requires the WHOLE
     # binding, so a half-written slot contributes no empty key.
-    driven: set[str] = {
-        slot.remote_slot
-        for slot in state._slots.values()
+    #
+    # Keyed by the PEER's slot key and valued by the local key that drives it: the
+    # peer key is what the peer's rows cite, the local key is what a surviving
+    # child's citation is rewritten to (``_clean_peer_parent``), so a worker a
+    # driven lead opened on the peer nests under the local row of that lead.
+    driven: dict[str, str] = {
+        slot.remote_slot: key
+        for key, slot in state._slots.items()
         if slot.is_remote and slot.instance_id == instance_id
     }
 
@@ -2279,7 +2304,9 @@ async def read_peer_slots(
         over_cap = max(0, len(rows) - effective_cap)
         if over_cap:
             rows = rows[:effective_cap]
-    return PeerSlots(rows=rows, filtered=filtered, over_cap=over_cap, driven=frozenset(driven))
+    return PeerSlots(
+        rows=rows, filtered=filtered, over_cap=over_cap, driven=MappingProxyType(driven)
+    )
 
 
 async def api_instances_chat_slots(request: web.Request) -> web.Response:
@@ -2306,8 +2333,10 @@ async def api_instances_chat_slots(request: web.Request) -> web.Response:
     the binding already lives, so no peer slot key has to cross to the browser to
     make it possible. The same rule covers the one other field that can carry a
     peer slot key, a surviving row's ``parent`` citation: a citation naming a
-    driven key is dropped by ``_clean_peer_parent``, so the key stays off the
-    wire by every route, not only the row's own ``key``.
+    driven key is rewritten by ``_clean_peer_parent`` to the LOCAL key that
+    drives it (``hub_key``), so the peer key stays off the wire by every route,
+    not only the row's own ``key`` -- and the worker still nests under the local
+    row that opened it.
 
     Surviving rows are then re-shaped by ``_clean_peer_slot`` rather than
     forwarded as the peer sent them. A slot title is MODEL-AUTHORED text from
@@ -2375,6 +2404,84 @@ async def api_instances_chat_slots(request: web.Request) -> web.Response:
     return web.json_response(shaped)
 
 
+class ProxyReplyUnredactable(Exception):
+    """A peer reply the redactor cannot walk (nested past the recursion limit)."""
+
+
+def _redact_peer_value(value: object) -> object:
+    """Redact every string in a decoded peer JSON value, keys included."""
+    from kiro_crew.dashboard.remote_relay import redact_peer_text
+
+    if isinstance(value, str):
+        return redact_peer_text(value)
+    if isinstance(value, list):
+        return [_redact_peer_value(v) for v in value]
+    if isinstance(value, dict):
+        return {redact_peer_text(str(k)): _redact_peer_value(v) for k, v in value.items()}
+    return value
+
+
+def _redact_peer_payload(text: str) -> str:
+    """Redact one peer JSON document, or the raw text when it is not JSON.
+
+    Redacting the decoded strings rather than the serialized text keeps a
+    credential split by a JSON escape (``\\u0041KIA…``) visible to the
+    redactor, and keeps the output valid JSON.
+    """
+    # A leading BOM: the browser's JSON parser skips it, Python's refuses it,
+    # and a raw-text fallback would miss an escaped credential behind it.
+    text = text.removeprefix("\ufeff")
+    try:
+        decoded = json.loads(text)
+        return json.dumps(_redact_peer_value(decoded))
+    except RecursionError:
+        # Too deeply nested to walk: refuse rather than forward it unredacted.
+        raise ProxyReplyUnredactable() from None
+    except json.JSONDecodeError:
+        # Not JSON at all (a plain SSE data line): redact it as text.
+        from kiro_crew.dashboard.remote_relay import redact_peer_text
+
+        return redact_peer_text(text)
+    except ValueError:
+        # Valid JSON Python will not decode (an integer past the digit limit):
+        # the browser parses it, so a raw-text pass could miss an escaped
+        # credential. Refuse it.
+        raise ProxyReplyUnredactable() from None
+
+
+def _redact_sse_event(event: bytes) -> bytes:
+    """Redact one SSE event block (no trailing blank line, ``\\n`` line ends).
+
+    The browser joins an event's ``data:`` lines into ONE payload before it
+    parses it, so the payload is joined and redacted the same way here: a
+    credential split across two lines, or behind a JSON escape, is caught. It
+    is re-emitted as one ``data:`` line (a JSON re-serialization has no raw
+    newline). Every other line (``event:``, ``id:``, comments) is peer text
+    as well and runs the same chain as plain text.
+    """
+    from kiro_crew.dashboard.remote_relay import redact_peer_text
+
+    out: list[str] = []
+    data: list[str] = []
+    for line in event.decode("utf-8", "replace").split("\n"):
+        if line.startswith("data:"):
+            data.append(line[5:].removeprefix(" "))
+        else:
+            out.append(redact_peer_text(line))
+    if data:
+        clean = _redact_peer_payload("\n".join(data))
+        out.extend("data: " + part for part in clean.split("\n"))
+    return "\n".join(out).encode()
+
+
+async def _redact_sse_event_async(event: bytes) -> bytes:
+    """`_redact_sse_event`, off the loop for a large event (a peer `slots`
+    broadcast can run to megabytes)."""
+    if len(event) > 65536:
+        return await asyncio.to_thread(_redact_sse_event, event)
+    return _redact_sse_event(event)
+
+
 async def api_instances_proxy(request: web.Request) -> web.StreamResponse:
     """ANY /api/instances/{id}/proxy/{path} — forward to a connected peer.
 
@@ -2385,6 +2492,10 @@ async def api_instances_proxy(request: web.Request) -> web.StreamResponse:
     token never reaches the browser, no browser Origin or cookies are forwarded
     to the peer (the hub presents as a same-origin loopback client), and the
     peer's Set-Cookie never reaches the hub origin.
+
+    Every reply is redacted with the relay's peer-text chain before the
+    browser sees it, because the window renders peer text directly: a JSON
+    body as one document, an SSE stream one event at a time.
     """
     denied = _guard(request, "proxy")
     if denied is not None:
@@ -2480,6 +2591,38 @@ async def api_instances_proxy(request: web.Request) -> web.StreamResponse:
                     },
                     status=502,
                 )
+            if upstream_ct.lower() == "application/json":
+                # Buffered whole: a JSON body redacts as one document, and it
+                # must not reach the browser before it is redacted.
+                raw = bytearray()
+                async for chunk in upstream.content.iter_any():
+                    raw += chunk
+                    if len(raw) > PROXY_REDACT_BUFFER_MAX_BYTES:
+                        _audit("proxy", "denied", request_id=instance_id, error="reply too large")
+                        return web.json_response(
+                            {"error": "peer reply too large", "code": "proxy_reply_too_large"},
+                            status=502,
+                        )
+                try:
+                    text = await asyncio.to_thread(
+                        _redact_peer_payload, raw.decode("utf-8", "replace")
+                    )
+                except ProxyReplyUnredactable:
+                    _audit("proxy", "denied", request_id=instance_id, error="reply unredactable")
+                    return web.json_response(
+                        {
+                            "error": "peer reply could not be redacted",
+                            "code": "proxy_reply_unredactable",
+                        },
+                        status=502,
+                    )
+                _audit("proxy", "success", request_id=instance_id)
+                return web.Response(
+                    status=upstream.status,
+                    body=text.encode(),
+                    content_type="application/json",
+                    headers={"X-Content-Type-Options": "nosniff"},
+                )
             resp = web.StreamResponse(status=upstream.status)
             for key, value in upstream.headers.items():
                 if key.lower() in _PROXY_RESP_ALLOW_HEADERS:
@@ -2487,8 +2630,56 @@ async def api_instances_proxy(request: web.Request) -> web.StreamResponse:
             resp.headers["X-Content-Type-Options"] = "nosniff"
             await resp.prepare(request)
             try:
+                pending = b""
+                first = True
                 async for chunk in upstream.content.iter_any():
-                    await resp.write(chunk)
+                    # SSE allows CR and CRLF line ends; the browser honours
+                    # them, so framing is normalised before events are cut.
+                    # A CR at a chunk edge waits one chunk for its LF.
+                    pending += chunk
+                    if first:
+                        # The stream's BOM, likewise, before fields are read;
+                        # a BOM split across chunks waits for its last byte.
+                        if len(pending) < 3 and b"\xef\xbb\xbf".startswith(pending):
+                            continue
+                        pending = pending.removeprefix(b"\xef\xbb\xbf")
+                        first = False
+                    hold = pending.endswith(b"\r")
+                    if hold:
+                        pending = pending[:-1]
+                    pending = pending.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                    *events, pending = pending.split(b"\n\n")
+                    if hold:
+                        pending += b"\r"
+                    for event in events:
+                        if len(event) > PROXY_REDACT_BUFFER_MAX_BYTES:
+                            pending = event
+                            break
+                        try:
+                            clean = await _redact_sse_event_async(event)
+                        except ProxyReplyUnredactable:
+                            _audit(
+                                "proxy",
+                                "partial",
+                                request_id=instance_id,
+                                error="event unredactable",
+                            )
+                            return resp
+                        await resp.write(clean + b"\n\n")
+                    if len(pending) > PROXY_REDACT_BUFFER_MAX_BYTES:
+                        # Fail closed: an event too large to redact is dropped
+                        # with the rest of the stream, never forwarded raw.
+                        _audit("proxy", "partial", request_id=instance_id, error="event too large")
+                        return resp
+                if pending:
+                    tail = pending.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+                    try:
+                        await resp.write(await _redact_sse_event_async(tail))
+                    except ProxyReplyUnredactable:
+                        _audit(
+                            "proxy", "partial", request_id=instance_id, error="event unredactable"
+                        )
+                        return resp
             except ConnectionResetError:
                 # Browser went away mid-stream; the peer finishes its turn on
                 # its own (its transcript is authoritative — see design doc).

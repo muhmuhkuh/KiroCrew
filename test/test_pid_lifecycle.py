@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -17,6 +18,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from non_utf8_comm import BAD_COMM, write_stat
 
 from kiro_crew import platform_compat
 
@@ -920,14 +922,16 @@ class TestMarkedGroupMembers:
     """The vouching read: which live members of a group are ours."""
 
     @staticmethod
-    def _fake_proc(tmp_path: Path, rows: dict[int, tuple[str, int, str]]) -> Path:
-        """rows: pid -> (state, pgrp, spawn instance). Minimal /proc/<pid>/{stat,environ}."""
+    def _fake_proc(
+        tmp_path: Path, rows: dict[int, tuple[str, int, str]], *, comm: bytes = b"x"
+    ) -> Path:
+        """rows: pid -> (state, pgrp, spawn instance). Minimal /proc/<pid>/{stat,environ}.
+
+        Each member's start ticks are ``pid * 10``, so its start id is ``f"{pid}0"``.
+        """
         for pid, (state, pgrp, inst) in rows.items():
-            d = tmp_path / str(pid)
-            d.mkdir()
-            # pid (comm) state ppid pgrp ...
-            (d / "stat").write_text(f"{pid} (x) {state} 1 {pgrp} 0 0 0 0 0", encoding="utf-8")
-            (d / "environ").write_bytes(
+            write_stat(tmp_path, pid, comm=comm, state=state, pgrp=pgrp, start_ticks=pid * 10)
+            (tmp_path / str(pid) / "environ").write_bytes(
                 b"KIROCREW_SPAWNED=1\x00KIROCREW_SPAWN_INSTANCE="
                 + inst.encode()
                 + b"\x00PATH=/bin\x00"
@@ -935,7 +939,10 @@ class TestMarkedGroupMembers:
         (tmp_path / "self").mkdir()  # a non-digit entry, skipped
         return tmp_path
 
-    def test_only_live_marked_members_of_the_group_count(self, tmp_path, monkeypatch) -> None:
+    @pytest.mark.parametrize("comm", [b"x", BAD_COMM], ids=["ascii", "not-utf8"])
+    def test_only_live_marked_members_of_the_group_count(
+        self, tmp_path, monkeypatch, comm: bytes
+    ) -> None:
         from kiro_crew import session_pid as sp
 
         # The reader is Linux-gated, and the fixture supplies the /proc shape it
@@ -951,18 +958,34 @@ class TestMarkedGroupMembers:
                 104: ("S", 200, "ours"),  # another group
                 105: ("S", 100, "theirs"),  # a fresh runtime that took the number
             },
+            comm=comm,
         )
-        monkeypatch.setattr(sp, "Path", lambda p="/proc": root if p == "/proc" else Path(p))
-        real_reader = sp._env_spawn_instance
-        monkeypatch.setattr(sp, "_env_spawn_instance", lambda pid: real_reader(pid, root))
-        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid: pid in (101, 102, 105))
+        monkeypatch.setattr(
+            sp, "_env_has_kirocrew_marker", lambda pid, proc_root=None: pid in (101, 102, 105)
+        )
         monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: True)
-        monkeypatch.setattr(sp, "_pid_start_token", lambda pid: f"s{pid}")
 
-        assert sp._marked_group_members(100, "ours") == {101: "s101"}
+        assert sp._marked_group_members(100, "ours", proc_root=root) == {101: "1010"}
         # The instance is the pin: the same group read as a different spawn is empty.
-        assert sp._marked_group_members(100, "theirs") == {105: "s105"}
-        assert sp._marked_group_members(100, "") == {}
+        assert sp._marked_group_members(100, "theirs", proc_root=root) == {105: "1050"}
+        assert sp._marked_group_members(100, "", proc_root=root) == {}
+
+    def test_the_start_id_comes_from_the_read_that_admitted_the_member(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A second read may already name another process, so it is never taken."""
+        from kiro_crew import session_pid as sp
+
+        monkeypatch.setattr(sp.sys, "platform", "linux")
+        root = self._fake_proc(tmp_path, {101: ("S", 100, "ours"), 102: ("S", 100, "ours")})
+        stat = (root / "102" / "stat").read_bytes()
+        (root / "102" / "stat").write_bytes(stat.replace(b" 1020 ", b" notticks "))
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid, proc_root=None: True)
+        monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: True)
+        monkeypatch.setattr(sp, "_pid_start_token", lambda pid: "a stranger's start")
+
+        # 102's start cannot be read from that read, so it is not vouched for.
+        assert sp._marked_group_members(100, "ours", proc_root=root) == {101: "1010"}
 
     def test_a_marked_member_without_runtime_identity_does_not_vouch(
         self, tmp_path, monkeypatch
@@ -972,13 +995,10 @@ class TestMarkedGroupMembers:
 
         monkeypatch.setattr(sp.sys, "platform", "linux")
         root = self._fake_proc(tmp_path, {101: ("S", 100, "ours")})
-        monkeypatch.setattr(sp, "Path", lambda p="/proc": root if p == "/proc" else Path(p))
-        real_reader = sp._env_spawn_instance
-        monkeypatch.setattr(sp, "_env_spawn_instance", lambda pid: real_reader(pid, root))
-        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid: True)
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid, proc_root=None: True)
         monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: False)
 
-        assert sp._marked_group_members(100, "ours") == {}
+        assert sp._marked_group_members(100, "ours", proc_root=root) == {}
 
     def test_env_spawn_instance_reads_the_value_and_fails_closed(self, tmp_path) -> None:
         from kiro_crew import session_pid as sp
@@ -1001,21 +1021,20 @@ class TestMarkedGroupMembers:
 
         monkeypatch.setattr(sp.sys, "platform", "linux")
         root = self._fake_proc(tmp_path, {101: ("S", 100, "ours"), 104: ("S", 200, "ours")})
-        monkeypatch.setattr(sp, "Path", lambda p="/proc": root if p == "/proc" else Path(p))
-        real_reader = sp._env_spawn_instance
-        monkeypatch.setattr(sp, "_env_spawn_instance", lambda pid: real_reader(pid, root))
-        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid: True)
-        monkeypatch.setattr(sp, "_pid_start_token", lambda pid: f"s{pid}")
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid, proc_root=None: True)
         # The default gate is what an app backend's tree fails.
         monkeypatch.setattr(sp, "_tracked_child_has_runtime_identity", lambda pid: False)
 
-        assert sp._marked_group_members(100, "ours") == {}
-        assert sp._marked_group_members(100, "ours", require_runtime_identity=False) == {
-            101: "s101"
-        }
+        assert sp._marked_group_members(100, "ours", proc_root=root) == {}
+        assert sp._marked_group_members(
+            100, "ours", require_runtime_identity=False, proc_root=root
+        ) == {101: "1010"}
         # Turning the gate off relaxes ONLY that gate: a member of another group,
         # or one carrying a different instance, is still refused.
-        assert sp._marked_group_members(200, "theirs", require_runtime_identity=False) == {}
+        assert (
+            sp._marked_group_members(200, "theirs", require_runtime_identity=False, proc_root=root)
+            == {}
+        )
 
     def test_the_public_non_runtime_entry_point_turns_the_gate_off(self, monkeypatch) -> None:
         """signal_orphaned_spawn_group differs from the ACP path in exactly one way."""
@@ -2205,57 +2224,58 @@ class TestParseEtime:
 class TestOurOrphanPids:
     """Direct tests for _our_orphan_pids (Linux /proc and macOS ps branches)."""
 
-    def test_linux_proc_scan_finds_init_and_subreaper_children(self) -> None:
+    def test_linux_proc_scan_finds_init_and_subreaper_children(self, tmp_path: Path) -> None:
         """Linux /proc two-pass scan: includes ppid==1 and ppid==systemd subreaper.
 
         Exercises the real Linux branch (systemd --user subreaper detection in
-        pass 1 + PPid parsing in pass 2), not the macOS ps path.
+        pass 1 + the parent read in pass 2), not the macOS ps path, over a
+        fixture table whose stat and comm files are real. Pid 600's name is a
+        multibyte one cut at the kernel's 15 bytes, so it is not UTF-8; its
+        parent is read from stat bytes, so that orphan is listed like the rest.
         """
         from kiro_crew.session_pid import _our_orphan_pids
 
-        class _FakeProcEntry:
-            def __init__(self, name: str, uid: int, comm: str, ppid: str) -> None:
+        my_uid = 1000
+        rows = {  # pid -> (uid, comm, ppid)
+            100: (my_uid, b"python3", 1),  # init-reparented
+            200: (my_uid, b"bash", 50),  # live child, excluded
+            300: (my_uid, b"systemd", 1),  # --user subreaper
+            400: (my_uid, b"worker", 300),  # child of subreaper
+            500: (9999, b"python3", 1),  # other uid, excluded
+            600: (my_uid, "run_データ処理.py".encode()[:15], 1),  # name not UTF-8
+        }
+        for pid, (_uid, comm, ppid) in rows.items():
+            (tmp_path / str(pid)).mkdir()
+            (tmp_path / str(pid) / "comm").write_bytes(comm + b"\n")
+            (tmp_path / str(pid) / "stat").write_bytes(b"%d (%s) S %d 0 0" % (pid, comm, ppid))
+        (tmp_path / "self").mkdir()  # non-numeric, skipped
+
+        class _Entry:
+            def __init__(self, name: str) -> None:
                 self.name = name
-                self._uid = uid
-                self._comm = comm
-                self._ppid = ppid
 
             def stat(self) -> MagicMock:
-                return MagicMock(st_uid=self._uid)
+                return MagicMock(st_uid=rows[int(self.name)][0] if self.name.isdigit() else my_uid)
 
-            def __truediv__(self, child: str) -> MagicMock:
-                node = MagicMock()
-                if child == "comm":
-                    node.read_text.return_value = self._comm + "\n"
-                else:  # "status"
-                    node.read_text.return_value = f"Name:\t{self._comm}\nPPid:\t{self._ppid}\n"
-                return node
+            def __truediv__(self, child: str) -> Path:
+                return tmp_path / self.name / child
 
-        my_uid = 1000
-        entries = [
-            _FakeProcEntry("100", my_uid, "python3", "1"),  # init-reparented
-            _FakeProcEntry("200", my_uid, "bash", "50"),  # live child, excluded
-            _FakeProcEntry("300", my_uid, "systemd", "1"),  # --user subreaper
-            _FakeProcEntry("400", my_uid, "worker", "300"),  # child of subreaper
-            _FakeProcEntry("500", 9999, "python3", "1"),  # other uid, excluded
-            _FakeProcEntry("self", my_uid, "x", "1"),  # non-numeric, skipped
-        ]
-        proc_root = MagicMock()
-        proc_root.iterdir.return_value = entries
+        class _Proc:
+            def iterdir(self) -> list[_Entry]:
+                return [_Entry(p.name) for p in sorted(tmp_path.iterdir())]
+
+            def __truediv__(self, child: str) -> Path:
+                return tmp_path / child
 
         with (
             patch("kiro_crew.session_pid.sys") as mock_sys,
-            patch("kiro_crew.session_pid.Path", return_value=proc_root),
+            patch("kiro_crew.session_pid.Path", return_value=_Proc()),
             patch("os.getuid", return_value=my_uid),
         ):
             mock_sys.platform = "linux"
             result = _our_orphan_pids()
 
-        assert 100 in result  # ppid == init
-        assert 300 in result  # subreaper itself is ppid == init
-        assert 400 in result  # ppid == detected systemd subreaper
-        assert 200 not in result  # ppid is a live process, not orphaned
-        assert 500 not in result  # different uid
+        assert sorted(result) == [100, 300, 400, 600]
 
     def test_macos_excludes_launcher_children(self) -> None:
         """ppid==launcher must NOT be reaped (regression guard).
@@ -2301,43 +2321,34 @@ class TestLinuxPidAge:
     """Direct tests for _linux_pid_age /proc/<pid>/stat starttime parsing."""
 
     @staticmethod
-    def _patch_proc(stat_line: str, uptime: str = "10000.0 9000.0"):
-        def fake_path(p: object) -> MagicMock:
-            node = MagicMock()
-            if str(p).endswith("/stat"):
-                node.read_text.return_value = stat_line
-            elif str(p) == "/proc/uptime":
-                node.read_text.return_value = uptime
-            return node
+    def _proc(tmp_path: Path, pid: int, comm: bytes, start_ticks: int) -> Path:
+        write_stat(tmp_path, pid, comm=comm, start_ticks=start_ticks)
+        (tmp_path / "uptime").write_text("10000.0 9000.0")
+        return tmp_path
 
-        return patch("kiro_crew.session_pid.Path", side_effect=fake_path)
-
-    def test_age_with_spaces_and_parens_in_comm(self) -> None:
-        """starttime is read from field 22 even when comm contains spaces/parens.
-
-        rfind(')') must land on the comm's closing paren so field-index math
-        starts at the state field. starttime_ticks=500000, clk_tck=100 →
-        5000s offset; uptime=10000s → age=5000s.
+    @pytest.mark.parametrize("comm", [b"my (weird) proc", BAD_COMM], ids=["parens", "not-utf8"])
+    def test_age_past_any_comm(self, tmp_path: Path, monkeypatch, comm: bytes) -> None:
+        """starttime is field 22 whatever the comm holds: spaces, parens, or bytes
+        that are not UTF-8. starttime_ticks=500000, clk_tck=100 → 5000s offset;
+        uptime=10000s → age=5000s.
         """
-        from kiro_crew.session_pid import _linux_pid_age
+        from kiro_crew import session_pid as sp
 
-        # pid (comm) state ppid ... starttime(field 22 == index 19 after state)
-        post_comm = "S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 0 20 0 1 500000 0 0"
-        stat_line = f"1234 (my (weird) proc) {post_comm}\n"
+        monkeypatch.setattr(sp.sys, "platform", "linux")
+        root = self._proc(tmp_path, 1234, comm, 500000)
+        with patch("os.sysconf", return_value=100):
+            assert sp._linux_pid_age(1234, root) == 5000.0
 
-        with self._patch_proc(stat_line), patch("os.sysconf", return_value=100):
-            age = _linux_pid_age(1234, now=123456.0)
+    def test_malformed_stat_returns_zero(self, tmp_path: Path, monkeypatch) -> None:
+        """Too-few fields → 0.0 fail-safe (min-age guard skips)."""
+        from kiro_crew import session_pid as sp
 
-        assert age == 5000.0
-
-    def test_malformed_stat_returns_zero(self) -> None:
-        """Too-few fields → IndexError → 0.0 fail-safe (min-age guard skips)."""
-        from kiro_crew.session_pid import _linux_pid_age
-
-        with self._patch_proc("999 (proc) S 1 1\n"), patch("os.sysconf", return_value=100):
-            age = _linux_pid_age(999, now=123456.0)
-
-        assert age == 0.0
+        monkeypatch.setattr(sp.sys, "platform", "linux")
+        (tmp_path / "999").mkdir()
+        (tmp_path / "999" / "stat").write_bytes(b"999 (proc) S 1 1\n")
+        (tmp_path / "uptime").write_text("10000.0 9000.0")
+        with patch("os.sysconf", return_value=100):
+            assert sp._linux_pid_age(999, tmp_path) == 0.0
 
 
 class TestIsManagedAgentProcess:
@@ -4359,15 +4370,22 @@ class TestIsSweepableOrphanWork:
         with patch("kiro_crew.session_pid._linux_pid_sid", return_value=1234):
             assert _work_orphan_session_leader_alive(1234) is True
 
-    def test_dead_leader_means_session_ended(self) -> None:
+    def test_dead_leader_means_session_ended(self, tmp_path: Path) -> None:
         """Leader gone (or PID recycled into a non-leader) -> session ended."""
         from kiro_crew.session_pid import _work_orphan_session_leader_alive
 
-        def fake_sid(pid: int) -> int:
-            return 500 if pid == 1234 else -1  # leader 500 unreadable = gone
+        write_stat(tmp_path, 1234, session=500)
+        assert _work_orphan_session_leader_alive(1234, tmp_path) is False  # 500 gone
+        write_stat(tmp_path, 500, session=7)
+        assert _work_orphan_session_leader_alive(1234, tmp_path) is False  # leads another
 
-        with patch("kiro_crew.session_pid._linux_pid_sid", side_effect=fake_sid):
-            assert _work_orphan_session_leader_alive(1234) is False
+    def test_a_present_leader_whose_stat_cannot_be_read_is_alive(self, tmp_path: Path) -> None:
+        """Only a pid whose /proc entry is absent counts as a gone leader."""
+        from kiro_crew.session_pid import _work_orphan_session_leader_alive
+
+        write_stat(tmp_path, 1234, session=500)
+        (tmp_path / "500").mkdir()
+        assert _work_orphan_session_leader_alive(1234, tmp_path) is True
 
     def test_marked_detached_daemon_is_not_sweepable(self) -> None:
         """A marked process WITHOUT a test-runner shape is never swept.
@@ -5527,6 +5545,47 @@ class TestReclaimOwnsEveryHarnessItTracked:
         )
         assert tokenless not in remaining
 
+    def test_a_launcher_rooted_orphan_is_killed_through_the_real_gate(
+        self, session_pid_file: Path
+    ) -> None:
+        """The retain-vs-kill arm, driven by the gate's own answer on a launcher argv.
+
+        ``test_an_unrecognised_argv_orphan_is_never_killed`` patches the gate out, so it
+        proves the arm and not the gate. This drives the REAL
+        ``_is_managed_agent_process`` off a faked ``/proc`` read, so the startup reclaim
+        is covered for the sandboxed shape as well as the periodic sweep -- an entry that
+        takes the retain branch here survives a gateway restart too.
+        """
+        from kiro_crew.session_pid import cleanup_orphaned_session_roots
+
+        entry = "999999:99998:sometoken"
+        session_pid_file.write_text(entry + "\n")
+        cmdline = _launcher_cmdline("/usr/local/bin/kiro-cli", "acp")
+        kills: list[tuple[int, int]] = []
+
+        with (
+            patch("kiro_crew.session_pid._pid_cmdline", return_value=cmdline),
+            patch("kiro_crew.session_pid._pid_start_token", return_value="sometoken"),
+            patch(
+                "kiro_crew.session_pid.platform_compat.pid_liveness",
+                side_effect=self._dead_gateway_liveness(999999),
+            ),
+            patch("kiro_crew.session_pid.platform_compat.get_ppid", return_value=1),
+            patch("kiro_crew.session_pid.platform_compat.pid_exists", return_value=True),
+            patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
+            patch(
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append((p, s)),
+            ),
+        ):
+            cleanup_orphaned_session_roots()
+
+        assert (99998, platform_compat.SIGKILL) in kills, (
+            "the startup reclaim retained the sandboxed agent root, so its runtime "
+            "survives a gateway restart as well as every periodic pass"
+        )
+        assert entry not in session_pid_file.read_text(encoding="utf-8")
+
     def test_a_recognised_orphan_is_killed(self, session_pid_file: Path) -> None:
         """The whole point: a harness the marker set now covers gets reaped."""
         from kiro_crew.session_pid import cleanup_orphaned_session_roots
@@ -5697,6 +5756,432 @@ class TestReclaimOwnsEveryHarnessItTracked:
         assert kills == []
         assert killed == 0
         assert entry not in session_pid_file.read_text(encoding="utf-8")
+
+
+def _launcher_shape() -> "tuple[tuple[str, ...], str, str, str]":
+    """``(flags, run dir, prefix, suffix)`` as ``sandbox.namespace_argv`` uses them.
+
+    Read off the sandbox module itself, never from literals, so these fixtures cannot
+    become the place the builder and the recogniser drift apart.
+    """
+    import kiro_crew.sandbox as sandbox_mod
+
+    return (
+        sandbox_mod._LAUNCHER_INTERPRETER_FLAGS,
+        sandbox_mod.namespace_launcher_script_dir(),
+        sandbox_mod._SANDBOX_ARTIFACT_PREFIX,
+        sandbox_mod._LAUNCHER_SCRIPT_SUFFIX,
+    )
+
+
+def _launcher_script_path() -> str:
+    """A path in the exact shape ``sandbox.namespace_argv``'s ``mkstemp`` produces."""
+    _flags, run_dir, prefix, suffix = _launcher_shape()
+    return os.path.join(run_dir, f"{prefix}4242_ab12cd{suffix}")
+
+
+def _launcher_cmdline(*wrapped: str, interpreter: str = "/usr/bin/python3") -> bytes:
+    """A command line in the exact shape ``sandbox.namespace_argv`` builds."""
+    flags, _run_dir, _prefix, _suffix = _launcher_shape()
+    script = _launcher_script_path()
+    return b"\x00".join(token.encode() for token in (interpreter, *flags, script, *wrapped))
+
+
+class TestSandboxedAgentRootIsRecognised:
+    """The tracked root of a sandboxed agent is the LAUNCHER, not the harness.
+
+    On Linux with the namespace backend -- ``detect_backend() == "namespace"``, the
+    default on most distributions -- ``sandbox.namespace_argv`` wraps the spawn as
+    ``<interpreter> -I -S <run dir>/kirocrew_sandbox_*.py <harness argv…>`` and the
+    launcher's PARENT never execs: it writes the child's uid/gid maps and then blocks
+    in ``waitpid`` for the life of the session. That parent is the pid the gateway
+    records, so the gate's ``argv[0]`` was the interpreter and every sandboxed agent
+    root answered "not managed".
+
+    An unrecognised agent root is UNRECLAIMABLE, not spared: ``_sweep_pid_entries``
+    RETAINS a settled-token entry the argv gate does not recognise (dropping the record
+    would leave the process unfindable by every sweep) and the scope reaper refuses a
+    scope holding a tracked pid, so nothing reaches the kiro-cli runtime under it until
+    the gateway restarts.
+
+    Recognition is positive and names that one shape only; the inner positional rules
+    are unchanged, so nothing about which token may name a harness is relaxed to pay
+    for stepping over the wrapper. Full contract:
+    ``docs/system-specs/modules/session.md`` §Reclaim identity.
+    """
+
+    @pytest.mark.parametrize(
+        "wrapped",
+        [
+            ("/usr/local/bin/kiro-cli", "acp"),
+            ("/opt/kiro/bin/kiro-cli-chat", "acp", "--agent", "x"),
+            ("/usr/bin/node", "/opt/n/bin/codex-acp"),
+            (
+                "/usr/bin/node",
+                "/opt/n/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js",
+            ),
+        ],
+    )
+    def test_a_launcher_wrapped_harness_is_managed(self, wrapped: tuple[str, ...]) -> None:
+        """Both inner slots answer: argv0, and a Node interpreter's script slot.
+
+        The Node cases matter as much as the direct one -- a bespoke adapter inside the
+        sandbox must be recognised the same way an unsandboxed one is, under BOTH
+        spellings the resolver produces (the bin shim, whose basename is the name, and
+        the package entry, matched against the published relative path).
+        """
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        assert _cmdline_names_a_harness(_launcher_cmdline(*wrapped)) is True
+
+    @pytest.mark.parametrize(
+        "wrapped",
+        [
+            # Something the gateway wraps that is not an agent runtime at all.
+            ("/usr/bin/make", "-j4"),
+            # The harness name as an inner ARGUMENT, which says nothing about what the
+            # inner process IS -- exactly the rule the unwrapped gate already applies.
+            ("/usr/bin/vim", "/home/u/notes/kiro-cli"),
+            ("/usr/bin/node", "build.js", "--agent", "goose"),
+        ],
+    )
+    def test_a_launcher_wrapped_non_harness_is_not_managed(self, wrapped: tuple[str, ...]) -> None:
+        """Stepping over the wrapper does not widen what the inner argv may claim.
+
+        The launcher is Crew's, so the process under it is one Crew started -- but this
+        gate authorizes a SIGKILL of a whole tree, and the sandbox wraps MCP probes and
+        app backends too. Only the inner positions that would have named a harness
+        unwrapped may name one here.
+        """
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        assert _cmdline_names_a_harness(_launcher_cmdline(*wrapped)) is False
+
+    def test_an_arbitrary_python_process_is_never_managed(self) -> None:
+        """``python foo.py kiro-cli`` is not a launcher, whatever it mentions.
+
+        The whole risk of reading past argv0 on a kill path is that a python process is
+        the most ordinary thing on a host. Nothing about this one is Crew's: no launcher
+        flags, and a script that is neither in Crew's run directory nor named the way
+        ``sandbox.py`` names the launcher it writes.
+        """
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        assert _cmdline_names_a_harness(b"/usr/bin/python3\x00foo.py\x00kiro-cli\x00acp") is False
+
+    @staticmethod
+    def _near_misses() -> "dict[str, tuple[str, ...]]":
+        """One argv per BROKEN condition, every other condition intact.
+
+        Built off the live shape so each case isolates exactly the condition it names --
+        a hand-written path would fail several at once and stop proving that any single
+        one of them is load-bearing.
+        """
+        from kiro_crew.sandbox import _SEATBELT_PROFILE_SUFFIX
+
+        flags, run_dir, prefix, suffix = _launcher_shape()
+        script = _launcher_script_path()
+        name = os.path.basename(script)
+        return {
+            "no flags": ("/usr/bin/python3", script, "kiro-cli"),
+            "flags reversed": ("/usr/bin/python3", *reversed(flags), script, "kiro-cli"),
+            "not the interpreter": ("/usr/bin/perl", *flags, script, "kiro-cli"),
+            "script outside the run dir": (
+                "/usr/bin/python3",
+                *flags,
+                os.path.join("/opt/elsewhere", name),
+                "kiro-cli",
+            ),
+            # The tmpdir _ensure_run_dir degrades to is NOT an accepted launcher
+            # directory: it is shared with every other user of the host, so a path
+            # anyone can write must not decide which trees are reclaimable.
+            "the shared tmpdir": (
+                "/usr/bin/python3",
+                *flags,
+                os.path.join(tempfile.gettempdir(), name),
+                "kiro-cli",
+            ),
+            "not the generated prefix": (
+                "/usr/bin/python3",
+                *flags,
+                os.path.join(run_dir, f"payload{suffix}"),
+                "kiro-cli",
+            ),
+            "the seatbelt profile, not the launcher": (
+                "/usr/bin/python3",
+                *flags,
+                os.path.join(run_dir, f"{prefix}1_a{_SEATBELT_PROFILE_SUFFIX}"),
+                "kiro-cli",
+            ),
+            "nothing wrapped": ("/usr/bin/python3", *flags, script),
+        }
+
+    def test_a_near_miss_of_the_launcher_shape_opens_no_slot(self) -> None:
+        """Every condition is load-bearing on its own.
+
+        Dropping any one of them turns "is this Crew's launcher" into "does this command
+        line resemble it", and the answer authorizes a SIGKILL of a process tree. A miss
+        here costs a retained tracking entry re-examined next pass, which is the
+        direction this module fails in everywhere. Asserted as one test over a named map
+        so a failure says WHICH condition stopped holding.
+        """
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        admitted = [
+            broken
+            for broken, argv in self._near_misses().items()
+            if _cmdline_names_a_harness(b"\x00".join(t.encode() for t in argv))
+        ]
+        assert not admitted, (
+            "these command lines are NOT Crew's sandbox launcher yet opened its wrapped "
+            f"slot, which authorizes a SIGKILL of a tree Crew never spawned: {admitted}"
+        )
+
+    def test_a_default_home_under_a_dot_dot_HOME_still_matches(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The writer collapses the run directory, so the token comparison can be exact.
+
+        ``config_dir()`` returns ``<HOME>/.kiro/crew`` verbatim for the DEFAULT home, so a
+        ``HOME`` containing ``..`` yields ``<...>/x/../.kiro/crew/run`` -- which
+        ``mkstemp`` then collapses, putting a different spelling in ``/proc`` from the one
+        a raw ``config_dir() / "run"`` would produce. ``namespace_launcher_script_dir``
+        normalizes it instead, so both sides agree.
+
+        The DEFAULT home specifically: an explicit ``KIROCREW_HOME`` is ``.resolve()``d by
+        ``config.paths._valid_override_home``, so it can never present this spelling and a
+        test driven through it would pass with the normalization removed.
+        """
+        import kiro_crew.sandbox as sandbox_mod
+        from kiro_crew.sandbox import namespace_launcher_script_dir
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        home = tmp_path / "x" / ".." / ".kiro" / "crew"
+        # ``sandbox`` binds ``config_dir`` at import, so the repoint goes on that module.
+        monkeypatch.setattr(sandbox_mod, "config_dir", lambda: home)
+        collapsed = tmp_path / ".kiro" / "crew" / "run"
+        assert str(home / "run") != str(collapsed), "the fixture no longer carries a '..'"
+        assert namespace_launcher_script_dir() == str(collapsed)
+
+        flags, _run_dir, prefix, suffix = _launcher_shape()
+        # The spelling ``mkstemp`` produces for this home.
+        script = os.path.join(str(collapsed), f"{prefix}1_a{suffix}")
+        argv = ("/usr/bin/python3", *flags, script, "kiro-cli", "acp")
+
+        assert _cmdline_names_a_harness(b"\x00".join(t.encode() for t in argv)) is True
+
+    def test_a_relative_or_oddly_split_script_token_is_refused(self) -> None:
+        r"""The token is compared as the writer spelled it: absolute, and ``/``-split.
+
+        ``mkstemp`` produces an absolute, collapsed path, so anything else is not ours.
+        Two spellings in particular must not match, and neither would if the comparison
+        normalized the token or split its two halves differently:
+
+        * a RELATIVE path, which ``abspath`` would resolve against the SWEEPING gateway's
+          cwd -- a path the target process never named;
+        * a name whose ``\`` segment makes ``os.path.dirname`` and a backslash-aware
+          basename disagree about where the file name starts.
+        """
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        flags, run_dir, prefix, suffix = _launcher_shape()
+        name = f"{prefix}1_a{suffix}"
+        for script in (
+            os.path.join("run", name),
+            os.path.join(run_dir, "..", os.path.basename(run_dir), name),
+            os.path.join(run_dir, "") + name.replace(prefix, f"zz\\{prefix}"),
+        ):
+            argv = ("/usr/bin/python3", *flags, script, "kiro-cli")
+            cmdline = b"\x00".join(token.encode() for token in argv)
+            assert _cmdline_names_a_harness(cmdline) is False, script
+
+    def test_an_unreadable_shape_declines_rather_than_raising(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate must never raise: one bad home would stop the whole sweep.
+
+        ``namespace_launcher_script_dir`` goes through ``config_dir()``, which creates the
+        data home and can fail. ``cleanup_orphaned_session_roots``'s caller swallows an
+        exception with no per-entry guard, so a propagated error silently stops reclaiming
+        EVERY remaining entry. Declining costs one missed reclaim instead.
+        """
+        import kiro_crew.sandbox as sandbox_mod
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        # Built BEFORE the break: the fixture resolves the same directory the gate does.
+        cmdline = _launcher_cmdline("kiro-cli", "acp")
+
+        def _boom() -> str:
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(sandbox_mod, "namespace_launcher_script_dir", _boom)
+
+        assert _cmdline_names_a_harness(cmdline) is False
+        # An ordinary harness argv is unaffected: it never reaches the shape lookup.
+        assert _cmdline_names_a_harness(b"kiro-cli\x00acp") is True
+
+    def test_an_ordinary_harness_argv_never_resolves_the_run_directory(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cost: the filesystem-touching part of the shape runs LAST, or not at all.
+
+        This gate is called once per tracked entry by every sweep, and the common case is
+        an unwrapped harness. Resolving the launcher directory there would mean a
+        ``config_dir()`` call -- which creates the data home -- per entry per pass, for an
+        answer the free tests already have.
+        """
+        import kiro_crew.sandbox as sandbox_mod
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        def _unexpected() -> str:
+            raise AssertionError("the gate resolved the run directory for a plain argv")
+
+        monkeypatch.setattr(sandbox_mod, "namespace_launcher_script_dir", _unexpected)
+
+        assert _cmdline_names_a_harness(b"kiro-cli\x00acp") is True
+        assert _cmdline_names_a_harness(b"/usr/bin/node\x00/opt/n/bin/codex-acp") is True
+        assert _cmdline_names_a_harness(b"/usr/bin/vim\x00/home/u/dsh") is False
+
+    def test_a_launcher_inside_a_launcher_is_rejected(self) -> None:
+        """Exactly ONE unwrap, pinned.
+
+        A launcher inside a launcher is impossible on the host -- the outer launcher's
+        seccomp filter denies ``unshare`` for its whole tree -- so accepting the shape
+        would be authority granted for one nothing can produce. A loop here would also
+        let a crafted argv bury the harness name arbitrarily deep.
+        """
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        flags, _run_dir, _prefix, _suffix = _launcher_shape()
+        script = _launcher_script_path()
+        nested = (
+            "/usr/bin/python3",
+            *flags,
+            script,
+            "/usr/bin/python3",
+            *flags,
+            script,
+            "kiro-cli",
+        )
+
+        assert _cmdline_names_a_harness(b"\x00".join(t.encode() for t in nested)) is False
+
+    def test_the_report_only_predicate_leaves_the_launcher_to_the_mcp_sweep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_is_untracked_managed_agent_orphan`` stays argv0-only, and that is correct.
+
+        It answers "is this a runtime NO REAPER CAN REACH", not "is this a runtime". An
+        orphaned launcher IS reached: its command line carries the sandbox artifact
+        prefix, so ``_is_orphan_mcp`` accepts it and the orphan-MCP sweep kills it on the
+        same pass. Teaching this predicate the launcher shape would make the report log
+        "leaked agent runtime, not terminated" about a pid that is already a kill
+        candidate, and inflate ``leaked_untracked`` with it.
+
+        So the asymmetry against :func:`_is_managed_agent_process` is deliberate, and this
+        asserts both sides of it, because the two predicates reading the same command line
+        and answering differently is the kind of thing a later change quietly "fixes".
+        """
+        import kiro_crew.session_pid as sp
+
+        monkeypatch.setattr(sp, "_env_has_kirocrew_marker", lambda pid, **kw: True)
+        cmdline = _launcher_cmdline("/usr/local/bin/kiro-cli", "acp")
+
+        # The kill gate DOES recognise it; this predicate deliberately does not.
+        assert sp._cmdline_names_a_harness(cmdline) is True
+        assert sp._is_untracked_managed_agent_orphan(4242, cmdline, set()) is False
+        assert sp._is_orphan_mcp(cmdline) is True, (
+            "the orphan-MCP sweep no longer reaches a launcher, so leaving it out of the "
+            "untracked-runtime report makes it invisible to everything"
+        )
+        # An UNWRAPPED harness orphan is still reported, which is what the predicate is for.
+        assert sp._is_untracked_managed_agent_orphan(4242, b"kiro-cli\x00acp", set()) is True
+
+    def test_the_mcp_marker_tracks_the_sandbox_artifact_prefix(self) -> None:
+        """``_SANDBOX_LAUNCHER_MARKER`` duplicates the sandbox constant deliberately.
+
+        The orphan-MCP sweep's marker tuple is a module constant, so reading it through
+        the accessor would put a ``sandbox`` import back at ``session_pid`` import time --
+        the one thing the lazy lookup exists to avoid. The copy is pinned here instead, the
+        same way ``_BROWSER_SESSION_ENV`` is.
+        """
+        from kiro_crew.sandbox import _SANDBOX_ARTIFACT_PREFIX
+        from kiro_crew.session_pid import _MCP_ENTRYPOINT_MARKERS, _SANDBOX_LAUNCHER_MARKER
+
+        assert _SANDBOX_LAUNCHER_MARKER == _SANDBOX_ARTIFACT_PREFIX.encode()
+        assert _SANDBOX_LAUNCHER_MARKER in _MCP_ENTRYPOINT_MARKERS
+
+    @_POSIX_ONLY
+    @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
+    def test_the_argv_the_wrap_really_builds_is_recognised(self, _resolve: Mock) -> None:
+        """End-to-end against ``namespace_argv`` itself, not a hand-written shape.
+
+        This is the pin that matters: the builder and the recogniser read the same shape
+        off the ``sandbox`` module's own constants, and this proves the agreement
+        on a real result rather than on the accessor. A flag added to the launcher, a
+        moved run directory or a renamed artifact fails here rather than silently costing
+        every sandboxed root its reclaim.
+        """
+        import kiro_crew.sandbox as sandbox_mod
+        from kiro_crew.sandbox import namespace_argv
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        argv = namespace_argv(["kiro-cli", "acp"], "strict")
+        try:
+            cmdline = b"\x00".join(token.encode() for token in argv)
+            assert _cmdline_names_a_harness(cmdline) is True
+        finally:
+            # The module's own accessor, not index 3: that index is the flag COUNT plus
+            # one, so a hardcoded 3 unlinks a flag token and leaks the tempfile as soon as
+            # a flag is added -- the same reason ``_launcher_script_of`` exists.
+            os.unlink(sandbox_mod._launcher_script_of(argv))
+
+    def test_the_shape_is_read_from_the_sandbox_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No copied literal: repointing the launcher's flags moves the script slot.
+
+        The gate reads the sandbox module's globals through the accessor at call time, so
+        a launcher carrying one more flag is recognised without an edit here, and the
+        two-flag spelling stops being recognised. Both halves are asserted: either one
+        alone also passes against a copy of the value kept in this module.
+        """
+        import kiro_crew.sandbox as sandbox_mod
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        stock = sandbox_mod._LAUNCHER_INTERPRETER_FLAGS
+        script = _launcher_script_path()
+        stale = b"\x00".join(t.encode() for t in ("/usr/bin/python3", *stock, script, "kiro-cli"))
+        monkeypatch.setattr(sandbox_mod, "_LAUNCHER_INTERPRETER_FLAGS", (*stock, "-X", "y"))
+        grown = b"\x00".join(
+            t.encode() for t in ("/usr/bin/python3", *stock, "-X", "y", script, "kiro-cli")
+        )
+
+        assert _cmdline_names_a_harness(grown) is True
+        assert _cmdline_names_a_harness(stale) is False
+
+    def test_the_artifact_prefix_is_read_from_the_sandbox_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same for the generated name: renaming the artifact moves the match.
+
+        ``_SANDBOX_ARTIFACT_PREFIX`` is what the run-dir sweep reclaims this family by
+        and what ``namespace_argv``'s ``mkstemp`` writes, so a recogniser holding its own
+        copy goes quiet on a rename while every other test stays green.
+        """
+        import kiro_crew.sandbox as sandbox_mod
+        from kiro_crew.session_pid import _cmdline_names_a_harness
+
+        monkeypatch.setattr(sandbox_mod, "_SANDBOX_ARTIFACT_PREFIX", "kirocrew_boxed_")
+        flags = sandbox_mod._LAUNCHER_INTERPRETER_FLAGS
+        run_dir = sandbox_mod.namespace_launcher_script_dir()
+
+        def _line(name: str) -> bytes:
+            argv = ("/usr/bin/python3", *flags, os.path.join(run_dir, name), "kiro-cli")
+            return b"\x00".join(token.encode() for token in argv)
+
+        assert _cmdline_names_a_harness(_line("kirocrew_boxed_1_a.py")) is True
+        assert _cmdline_names_a_harness(_line("kirocrew_sandbox_1_a.py")) is False
 
 
 class TestSpawnGraceCrossPlatform:
@@ -6074,6 +6559,18 @@ class TestTrackedAgentPids:
 
         with patch.object(Path, "read_text", side_effect=OSError(errno.EACCES, "denied")):
             assert _read_tracked_agent_pids() == (set(), False)
+
+    def test_undecodable_file_marks_snapshot_incomplete(
+        self, pid_file: Path, session_pid_file: Path
+    ) -> None:
+        """A stray non-UTF-8 byte is damage, not an exception out of every reaper."""
+        from kiro_crew.session_pid import _read_tracked_agent_pids
+
+        session_pid_file.write_bytes(b"10:11\n\xff\xfe\n")
+        pid_file.write_text("31:32\n", encoding="utf-8")
+        # Like a malformed entry: the damaged line marks the snapshot incomplete
+        # and every readable line is still counted.
+        assert _read_tracked_agent_pids() == ({11, 31}, False)
 
     def test_malformed_entry_marks_snapshot_incomplete_but_keeps_valid_pids(
         self, pid_file: Path, session_pid_file: Path

@@ -127,6 +127,34 @@ def test_pi_permission_is_correlated_to_original_tool_call(tmp_path):
         client._build_permission_event(permission)
 
 
+def test_pi_correlated_permission_redacts_before_title_cap(tmp_path):
+    client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_PI)
+    token = "AKIA" + "STRADDLE0123456A"
+    title = "x" * 111 + token + " tail"
+    client._observed_tool_calls["call-1"] = (title, "execute")
+    permission = JsonRpcMessage.from_dict(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": {
+                    "toolCallId": "pi-confirm",
+                    "rawInput": {"message": "kirocrew-tool-call:call-1"},
+                },
+                "options": [{"optionId": "yes", "kind": "allow_once"}],
+            },
+        }
+    )
+
+    event = client._build_permission_event(permission)
+
+    assert event is not None
+    assert len(event.title) <= 120
+    assert token[:9] not in event.title
+    assert "[REDACTED" in event.title
+
+
 def test_pi_permission_without_known_correlation_is_rejected(tmp_path):
     client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_PI)
     permission = JsonRpcMessage.from_dict(
@@ -506,6 +534,79 @@ def test_pi_provider_and_qualified_models_are_editable():
     assert _EDITABLE_CONFIG["agent.provider"]["values"] == ["acp"]
     for key in ("agent.model", "agent.role_models.background", "agent.role_models.subagent"):
         assert re.fullmatch(_EDITABLE_CONFIG[key]["pattern"], "provider/model")
+
+
+@pytest.mark.parametrize("verified_spec", [{"prompt": "verified instructions"}, None])
+def test_pi_worker_load_uses_verified_snapshot_only(tmp_path, verified_spec):
+    from kiro_crew import pi_support
+    from kiro_crew.agent_materialization.worker_agent import DerivedSpecSnapshot
+
+    snapshot = DerivedSpecSnapshot("identity", "fingerprint", verified_spec)
+    with (
+        patch("kiro_crew.agent.ensure_agent_materialized") as materialize,
+        patch("kiro_crew.agent.require_fresh_derived_spec", return_value=snapshot) as fresh,
+        patch("kiro_crew.pi_support.kiro_agents_dir", side_effect=AssertionError("second read")),
+    ):
+        if verified_spec is None:
+            with pytest.raises(RuntimeError, match="Verified agent configuration unavailable"):
+                pi_support._load_agent_spec("kirocrew-worker", tmp_path)
+        else:
+            assert pi_support._load_agent_spec("kirocrew-worker", tmp_path) == verified_spec
+
+    materialize.assert_called_once_with("kirocrew-worker")
+    fresh.assert_called_once_with("kirocrew-worker", tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "approval_sent", "outcome"),
+    [
+        ("policy denied", True, "rejected_hook_deny"),
+        (None, False, "rejected_transport_floor"),
+        (None, True, "auto_approved"),
+    ],
+)
+async def test_pi_review_permission_gate_and_audit(tmp_path, reason, approval_sent, outcome):
+    from kiro_crew.apps.builtins.code_review_sage.sage_lib import review_pool as rp
+
+    permission = SimpleNamespace(kind=rp.EVENT_PERMISSION_REQUEST, request_id="req-1")
+
+    async def events(task, timeout):
+        yield permission
+        yield SimpleNamespace(kind=rp.EVENT_COMPLETE, stop_reason="end_turn")
+
+    client = SimpleNamespace(
+        _session_id="review-1",
+        stream_events=events,
+        approve_tool=AsyncMock(return_value=approval_sent),
+        reject_tool=AsyncMock(),
+        shutdown=AsyncMock(),
+    )
+    with (
+        patch.object(rp, "_configured_provider", return_value="pi"),
+        patch.object(rp, "_get_review_settings", return_value={"model": None, "effort": ""}),
+        patch.object(rp, "AcpClient", return_value=client),
+        patch.object(rp, "refusal_for", return_value=reason) as gate,
+    ):
+        pool = rp.ReviewPool(agent="kirocrew", max_workers=1, work_dir=str(tmp_path))
+        with patch.object(pool, "_audit_tool", new_callable=AsyncMock) as audit:
+            assert await pool.send("review", timeout=1) == ""
+        gate.assert_called_once_with(
+            permission,
+            session_key="review-1",
+            agent=pool._agent,
+            app="code-review-sage",
+            security_only=False,
+        )
+        audit.assert_awaited_once_with(client, permission, request_id="req-1", outcome=outcome)
+        if reason is not None:
+            client.approve_tool.assert_not_awaited()
+            client.reject_tool.assert_awaited_once_with("req-1")
+        else:
+            client.approve_tool.assert_awaited_once_with("req-1")
+            client.reject_tool.assert_not_awaited()
+        client.shutdown.assert_awaited_once()
+        await pool.shutdown()
 
 
 @patch("kiro_crew.agent.ensure_agent_materialized")

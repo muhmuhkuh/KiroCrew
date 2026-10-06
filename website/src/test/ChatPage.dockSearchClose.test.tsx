@@ -16,21 +16,21 @@
  * props) with the find pane open and asserts the find input disappears and the
  * target panel appears.
  *
- * The one-time Dashboard card (CommandCenterDock) is the third such opener:
- * it persists its dismissal and unmounts itself BEFORE calling ChatPage's
- * `onOpen`, so an `onOpen` that left the find pane up would lose the hint for
- * good while the panel it promised stayed hidden behind the pane.
+ * The Dashboard dock (CommandCenterDock) is the third such opener: its
+ * open-panel action must land on a visible panel, not one mounted and hidden
+ * behind the find pane.
  *
  * Uses the REAL useMessageSearch hook so the
  * single-dock precedence + close-on-open wiring is exercised end to end.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
+import { PREVIEW_DASHBOARD, setPreviewFlag } from '../utils/previewFlags'
 import { ThemeProvider } from '../hooks/useTheme'
 
 // --- Stub the chat message components: AssistantMessage exposes the real
@@ -173,7 +173,7 @@ const ASSISTANT_MSG = {
 
 const renderChatPage = ({ withWorker = false } = {}) => {
   const slot = { key: 'chat-1', title: 'chat-1', messages: 1, running: false, mode: '', created: '', last_ts: '' }
-  // A subagent slot the active chat spawned makes the one-time Dashboard card
+  // A subagent slot the active chat spawned makes the Dashboard dock
   // `relevant` (useCommandCenter scopes more than one slot to this root).
   const worker = { key: 'worker-1', title: 'worker', messages: 0, running: true, mode: '', created: '', last_ts: '', created_by: 'chat-1' }
   const slots = withWorker ? [slot, worker] : [slot]
@@ -280,25 +280,39 @@ describe('ChatPage – opening a dock panel closes the find pane', () => {
     })
   })
 
-  it('clicking the one-time Dashboard card closes the find pane and shows the command-center panel', async () => {
+  it('the dock\'s open-panel action closes the find pane and shows the command-center panel', async () => {
     localStorage.clear()
+    // The dock is a Feature Preview: on, so there is a dock to open from.
+    localStorage.setItem(PREVIEW_DASHBOARD, '1')
     renderChatPage({ withWorker: true })
     const card = await screen.findByTestId('command-center-dock')
     openFind()
     expect(await screen.findByPlaceholderText(FIND_PLACEHOLDER)).toBeTruthy()
 
     act(() => {
-      fireEvent.click(card.querySelector('button')!)
+      fireEvent.click(within(card).getByRole('button', { name: 'Open Dashboard' }))
     })
 
-    // The card is a one-time hint: it is gone either way, so the panel it
-    // opened must be visible, not mounted-and-hidden behind the find pane.
+    // The panel must be visible, not mounted-and-hidden behind the find pane.
     await waitFor(() => {
       expect(screen.queryByPlaceholderText(FIND_PLACEHOLDER)).toBeNull()
       const heading = document.querySelector<HTMLElement>('[data-command-center-heading]')
       expect(heading).toBeTruthy()
       expect(heading!.closest('[hidden]')).toBeNull()
     })
+  })
+
+  it('mounts no dock while the Dynamic Dashboard preview is off, and the dock in the same tick it turns on', async () => {
+    localStorage.clear()
+    renderChatPage({ withWorker: true })
+    // The worker makes a team, which is what would show the dock: with the flag
+    // off the dock is not offered at all, not merely empty.
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    expect(screen.queryByTestId('command-center-dock')).toBeNull()
+    act(() => { setPreviewFlag(PREVIEW_DASHBOARD, true) })
+    expect(await screen.findByTestId('command-center-dock')).toBeTruthy()
+    act(() => { setPreviewFlag(PREVIEW_DASHBOARD, false) })
+    await waitFor(() => expect(screen.queryByTestId('command-center-dock')).toBeNull())
   })
 })
 

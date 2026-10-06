@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '../types'
 import type { DisplayItem } from '../pages/chat/types'
-import { usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
+import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
+import { DEFAULT_PINNED_CARD_H } from '../utils/pinnedPrompt'
 
 /**
  * chat-core P5-d: the pinned-prompt geometry extracted from the main chat's
@@ -370,8 +371,8 @@ function mountUserRow(row: HTMLElement) {
   return { root, bubble, strip }
 }
 
-describe('usePinnedPrompt folds the card to the bubble, leaving the action strip clear', () => {
-  it('reports a live height whose bottom is the bubble bottom, with the strip below it uncovered', () => {
+describe('usePinnedPrompt leaves a tall bubble in place, then pins it at rest', () => {
+  it('does not pin a tall prompt while its bubble still shows below the card', () => {
     const h = renderPin()
     const g = mountGeometry(5)
     // The pinned row (index 2) is a tall prompt whose top has crossed the fold
@@ -381,14 +382,22 @@ describe('usePinnedPrompt folds the card to the bubble, leaving the action strip
     const { bubble, strip } = mountUserRow(g.rows[2])
     setRect(bubble, 64, 366)
     setRect(strip, 434, 26)
-    // Push the incoming prompt far down so the card is not being pushed out.
     setRect(g.rows[3], 460, 40)
     setRect(g.rows[4], 900, 40)
+    setRect(g.scroller, 0, 600)
     wire(h, g)
-    // Card top is fold + ROW_PAD_Y = 104; bubble bottom is 430 → 326px tall.
-    // The row's bottom (460) would have given 356px and buried the strip. The
-    // strip, wholly below the folding card's bottom, is uncovered.
-    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 326, stripUncovered: true })
+    // Pinning here would hide the real bubble behind a card that shows only the
+    // prompt's first lines, so the reader could not scroll through its middle.
+    expect(h.result.current.pinned).toBeNull()
+    // Scrolled on until the bubble's bottom (140) is above the card's resting
+    // bottom (fold + 4 + 60 = 164): now the one-line card takes over.
+    setRect(g.rows[2], -230, 400)
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned?.liveH, 'the card never folds').toBeUndefined()
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
   })
 
   it('keeps the strip uncovered once the card rests, while any of it is still below the card', () => {
@@ -412,6 +421,47 @@ describe('usePinnedPrompt folds the card to the bubble, leaving the action strip
     wire(h, g)
     expect(h.result.current.pinned?.liveH, 'the fold is over').toBeUndefined()
     expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+  })
+
+  // Prompt 2 is pinned first, and its card reports a two-line height — the
+  // image-only card shape. Then the reader scrolls on to prompt 4, whose card
+  // must be gated on the seed height, not on the 90px the previous card
+  // measured. Shared by the timestamped and the timestamp-less transcript below.
+  function expectSeedHeightGate(items: DisplayItem[]) {
+    const h = renderPin()
+    const g = mountGeometry(6)
+    wire(h, g, items)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+    act(() => { h.result.current.onPinCollapsedHeight(90) })
+    // Scroll on: prompt 4 is now the candidate. Its bubble's bottom sits at
+    // 174, so 70px of it is left above the reply (174 - fold 100 - ROW_PAD_Y 4):
+    // more than a fresh one-line card, less than the previous card's 90.
+    setRect(g.rows[2], -400, 40)
+    setRect(g.rows[3], -300, 40)
+    setRect(g.rows[4], 60, 140)
+    const { bubble } = mountUserRow(g.rows[4])
+    setRect(bubble, 64, 110)
+    setRect(g.rows[5], 800, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toBeNull()
+    // Once only one line of it is left, its card takes over at the seed height.
+    setRect(g.rows[4], 20, 140)
+    setRect(bubble, 24, 110)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toMatchObject({ idx: 4, bannerH: DEFAULT_PINNED_CARD_H })
+  }
+
+  it('gates a new prompt on the seed height, not the previous card\'s measured height', () => {
+    expectSeedHeightGate([...ITEMS, single(5, 'assistant', 'next reply')])
+  })
+
+  it('gates a new prompt on the seed height across a hand-off between prompts that carry no `ts`', () => {
+    // An import or a legacy log reads `ts` as '' on every message. The reset
+    // keys the candidate on its index as well, so the hand-off from prompt 2 to
+    // prompt 4 still brings the seed height back.
+    const noTs = [...ITEMS, single(5, 'assistant', 'next reply')]
+      .map(item => ({ ...item, msg: { ...item.msg, ts: '' } }))
+    expectSeedHeightGate(noTs)
   })
 
   it('drops the mark on a later frame of the same pin, once the strip has slid under the card', () => {
@@ -479,29 +529,15 @@ describe('usePinnedPrompt folds the card to the bubble, leaving the action strip
     setRect(g.rows[3], 460, 40)
     setRect(g.rows[4], 900, 40)
     wire(h, g)
-    // 388 − 104 = 284, under the stand-in's 324px ceiling (row top 60 to bubble
-    // bottom 388, less the row padding) — the fold is still in progress.
-    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 284 })
-  })
-
-  it('caps the fold at the stand-in\'s natural height, so a steer\'s card reaches its bubble bottom', () => {
-    const h = renderPin()
-    const g = mountGeometry(5)
-    // The hand-off frame: row 2's top is ON the fold (100). A steer's accent
-    // bubble starts under its badge, 28px below the row top instead of the 4px
-    // of row padding a plain bubble has, so the box the card stands in for runs
-    // from the card's top (104) to the bubble's bottom (428): 324px.
-    setRect(g.rows[2], 100, 400)
-    const bubble = document.createElement('div')
-    bubble.className = 'message-bubble'
-    g.rows[2].append(bubble)
-    setRect(bubble, 128, 300)
-    setRect(g.rows[3], 500, 40)
-    setRect(g.rows[4], 900, 40)
-    wire(h, g)
-    // A ceiling of the bubble's own 300px would stop the card 24px short of the
-    // bubble's bottom — a blank band above the strip re-shown under it.
-    expect(h.result.current.pinned).toMatchObject({ idx: 2, liveH: 324 })
+    // Its bottom (388) is far below the card: the real bubble stays readable.
+    expect(h.result.current.pinned).toBeNull()
+    // Scrolled until its bottom (150) is inside the card's resting box.
+    setRect(g.rows[2], -178, 400)
+    setRect(bubble, -150, 300)
+    setRect(g.rows[3], 222, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+    expect(h.result.current.pinned?.liveH).toBeUndefined()
   })
 
   it('never takes a row that is being edited as the stand-in', () => {
@@ -572,7 +608,9 @@ describe('usePinnedPrompt folds the card to the bubble, leaving the action strip
       setRect(g.card, 104, 60)
       wire(h, g)
       expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
-      expect(observed, 'the pinned card is what the hook observes').toEqual([g.card])
+      // The scroller too: the card's ceiling is read off its box and padding,
+      // which move on a resize no scroll reports (see the floor tests below).
+      expect(observed, 'the pinned card and the scroller are what the hook observes').toEqual([g.card, g.scroller])
       // The pointer rests on the card: the peek grows it to three lines, over
       // the strip, and the observer's report is the only recompute there is.
       setRect(g.card, 104, 105)
@@ -581,6 +619,127 @@ describe('usePinnedPrompt folds the card to the bubble, leaving the action strip
     } finally {
       scope.ResizeObserver = original
     }
+  })
+})
+
+/**
+ * The card lives in an overlay that is a sibling of the scroller and paints above
+ * everything after it — the composer dock the main chat floats over the scroller's
+ * bottom, a pane's in-flow composer — so nothing bounds it but this geometry. The
+ * fold held a 30-line prompt's card at its full height and the expansion grew it
+ * to 40vh plus an image strip; on a short pane both ran past the scroller and over
+ * the input box (the reported bug: "the bubble is in the composer"). The ceiling is
+ * the transcript FLOOR — the scroller's bottom less its bottom padding, which is
+ * each host's own statement of where readable rows stop (the main chat pads by the
+ * dock's height plus a clearance) — measured from the scroller rather than passed,
+ * so the two can never be set apart.
+ */
+describe('usePinnedPrompt caps the card at the transcript floor', () => {
+  /** A tall prompt scrolled until its bubble's bottom (140) sits inside the
+   *  card's resting box (fold + 4 + 60 = 164), so it is pinned at rest. */
+  function mountTallFold(g: ReturnType<typeof mountGeometry>) {
+    setRect(g.rows[2], -230, 400)
+    const { bubble, strip } = mountUserRow(g.rows[2])
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    return { bubble, strip }
+  }
+
+  it('reports the ceiling: scroller bottom, less its bottom padding, less the card top', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    wire(h, g)
+    // Card top is fold + ROW_PAD_Y = 104; the scroller ends at 400 with no
+    // padding → the card may be 296px at most.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 296 })
+  })
+
+  it('never reports a fold height for a tall prompt', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+    expect(h.result.current.pinned?.liveH).toBeUndefined()
+  })
+
+  it('takes the host\'s bottom padding off the floor — the dock the main chat pads for', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    // ChatPage writes `paddingBottom: dockH + DOCK_CLEARANCE_PX` on the scroller;
+    // here a 120px dock plus 16px clearance.
+    g.scroller.style.paddingBottom = '136px'
+    wire(h, g)
+    // 400 − 136 = 264 floor, less the card top 104 → 160.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 160 })
+  })
+
+  it('reports a taller ceiling on a taller pane', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    setRect(g.scroller, 0, 600)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 496 })
+  })
+
+  it('re-attaches the observers across a hand-off between prompts that carry no `ts`', () => {
+    // An import or a legacy log reads `ts` as '' on every message. Keyed on `ts`
+    // alone, a hand-off from one such prompt to the next changed nothing the
+    // observer effect was keyed on: the observer stayed on the previous card and
+    // the new one was never watched, so a pane shrink left it over the composer
+    // until the next scroll.
+    const observed: Element[] = []
+    class RecordingResizeObserver {
+      constructor(_cb: ResizeObserverCallback) {}
+      observe(el: Element) { observed.push(el) }
+      unobserve() {}
+      disconnect() {}
+    }
+    const scope = globalThis as unknown as { ResizeObserver: unknown }
+    const original = scope.ResizeObserver
+    scope.ResizeObserver = RecordingResizeObserver
+    try {
+      const h = renderPin()
+      const g = mountGeometry(7)
+      mountTallFold(g)
+      const noTs = [...ITEMS, single(5, 'assistant', 'next reply'), single(6, 'user', 'last prompt')]
+        .map(item => ({ ...item, msg: { ...item.msg, ts: '' } }))
+      wire(h, g, noTs)
+      expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+      expect(observed).toEqual([g.card, g.scroller])
+      // The reader scrolls on: prompt 4 crosses the fold and row 5 is the first
+      // row below it, so the pin hands over from prompt 2 to prompt 4.
+      setRect(g.rows[2], -600, 400)
+      setRect(g.rows[3], -200, 40)
+      setRect(g.rows[4], 20, 40)
+      setRect(g.rows[5], 160, 40)
+      setRect(g.rows[6], 900, 40)
+      act(() => { h.result.current.updatePinnedPrompt() })
+      expect(h.result.current.pinned).toMatchObject({ idx: 4 })
+      expect(observed, 'the effect re-ran for the new pin').toEqual([g.card, g.scroller, g.card, g.scroller])
+    } finally {
+      scope.ResizeObserver = original
+    }
+  })
+
+  it('moves the ceiling with the scroller on the same message, with no scroll in between', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    setRect(g.scroller, 0, 600)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 496 })
+    // The pane shrinks (a window resize, a dock growing a status bar). The
+    // same-message path of nextPinnedPromptState must carry the new ceiling, or
+    // the card keeps the old one until a different prompt pins.
+    setRect(g.scroller, 0, 400)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 296 })
   })
 })
 
@@ -647,5 +806,17 @@ describe('usePinnedPrompt in-place jump under reduced motion', () => {
     expect(frames).toHaveLength(1)
     flushFrame(2000)
     expect(frames).toHaveLength(0)
+  })
+})
+
+describe('pinCandidateKey (the identity the reset and the card\'s promptKey share)', () => {
+  it('changes with the index alone, so prompts with no ts and the same text are told apart', () => {
+    expect(pinCandidateKey(4, undefined)).not.toBe(pinCandidateKey(6, undefined))
+    expect(pinCandidateKey(4, undefined)).toBe(pinCandidateKey(4, ''))
+  })
+
+  it('changes with the ts alone, so a prompt replaced in place at one index is a new identity', () => {
+    expect(pinCandidateKey(4, 'a')).not.toBe(pinCandidateKey(4, 'b'))
+    expect(pinCandidateKey(4, 'a')).toBe(pinCandidateKey(4, 'a'))
   })
 })

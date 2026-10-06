@@ -5,6 +5,7 @@ import { useMemo, useRef } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
 import { store, type AppDispatch } from '../../store'
 import { sseSlots, sseYolo, setChannelTrusted, sseSlotPatch, fetchSlots, type SlotPatchFrame } from '../../store/dashboardSlice'
+import { reconcileSubagentQueuedFromSlots } from '../../store/chatSlice'
 import type { ChatSlot, ChatFolder } from '../../types'
 import type { FrameData } from './frames'
 
@@ -13,6 +14,13 @@ export interface SlotListSync {
   resetForConnection(): void
   onSlots(msg: FrameData, data: ChatSlot[], raw: string): void
   onSlotPatch(frame: SlotPatchFrame): void
+}
+
+/** Tell AppHost apps (`useAppEvents('slots')`) the session list changed.
+ *  No payload: an app re-reads through its own scoped API client, so the
+ *  owner's full slot list never crosses into app code. */
+function notifyAppsSlotsChanged(): void {
+  window.dispatchEvent(new CustomEvent('mc:app:slots', { detail: null }))
 }
 
 export function useSlotListSync(dispatch: AppDispatch, queryClient: QueryClient): SlotListSync {
@@ -37,6 +45,13 @@ export function useSlotListSync(dispatch: AppDispatch, queryClient: QueryClient)
       lastSlotsRawRef.current = null
     },
     onSlots(msg, data, raw) {
+      // The queued-depth reconcile rides this frame only, never `fetchSlots`: a
+      // pushed frame is ordered with the `subagent_queued` frames on this one
+      // socket, while a GET answer can land after a newer frame and undo it.
+      // It runs ahead of the repeat check below: a push identical to the last
+      // one still corrects a count a `subagent_queued` frame moved in between,
+      // which is the very case the reconcile exists for.
+      if (Array.isArray(data)) dispatch(reconcileSubagentQueuedFromSlots(data))
       // An identical repeat carries identical values for every arm below, but
       // only while no other writer (fetchSlots) has since replaced the list.
       if (raw === lastSlotsRawRef.current
@@ -152,6 +167,7 @@ export function useSlotListSync(dispatch: AppDispatch, queryClient: QueryClient)
       // and issues another, so separate calls put two identical GETs on the
       // wire where one answers them all.
       for (const key of staleKeys) queryClient.invalidateQueries({ queryKey: [key] })
+      notifyAppsSlotsChanged()
     },
     onSlotPatch(frame) {
       const dashboard = store.getState().dashboard
@@ -166,6 +182,7 @@ export function useSlotListSync(dispatch: AppDispatch, queryClient: QueryClient)
       // restore that row, so the authoritative list repairs the omission.
       if (hasUnknownRow) dispatch(fetchSlots())
       dispatch(sseSlotPatch(frame))
+      notifyAppsSlotsChanged()
     },
   }), [dispatch, queryClient])
 }

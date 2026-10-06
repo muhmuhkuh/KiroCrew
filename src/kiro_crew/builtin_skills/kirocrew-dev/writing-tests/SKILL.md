@@ -1,8 +1,7 @@
 ---
 name: writing-tests
-description: "How to write a Kiro Crew backend pytest test with NO side effects that does not flake. Use when adding, editing, reviewing or debugging a test in the Kiro Crew repo: which conftest applies, what leaks (temp dirs, data home, ~/.kiro, cron, threads), the six flake classes, cross-platform traps."
+description: "Kiro Crew repo only: how to write a backend pytest test with NO side effects that does not flake. Use when adding, editing, reviewing or debugging a test there: which conftest applies, what leaks (temp dirs, data home, ~/.kiro, cron, threads), the six flake classes, cross-platform traps."
 triggers: write a test, add a test, fix a flaky test, test is flaky, test side effect, temp dir residue, tmp residue, kirocrew test, pytest kirocrew, test isolation, conftest, xdist, test leaked
-repo_scope: src/kiro_crew
 ---
 
 # Writing a Kiro Crew test that does not leak and does not flake
@@ -27,7 +26,7 @@ neighbouring steps, and none of them restates what is here:
 |---|---|
 | Writing, fixing, or speeding up a test | **this skill** |
 | Running the build gate in a worktree, and deciding whether a red is yours | **kirocrew-worktree-dev** |
-| Driving a branch to a review-ready PR and through CI | **prepare-pr** |
+| Driving a branch to a review-ready PR and through CI | **kirocrew-prepare-pr** |
 | Polling that PR until it is green | **babysit** |
 
 The line that matters most in practice: **kirocrew-worktree-dev** tells you whether a
@@ -291,7 +290,10 @@ package re-export when the caller reads its own defining module, or patching
 `pkg.mod.fn` when the caller did `from pkg.mod import fn` and holds its own binding.
 Either way the real function runs, the assertion passes for the wrong reason, and the
 test pays real time. **Treat an unexpectedly slow "mocked" test as evidence the mock
-missed.**
+missed.** The opposite trap is a patch that is too WIDE: a side effect on a module global
+also fires for every background worker that calls it (the `eventlog-io` legacy fold calls
+`members.read_dm_binding`). Patch the function awaited in the window you mean, and pin
+the order of the calls the test relies on.
 
 Another: **the host is an input, and a "surely-unused" number is not a constant.**
 `999999` reads as an impossible PID and is not — `pid_max` is 4194304, so on a
@@ -301,17 +303,17 @@ of executing when it had not. If the code *probes* the PID, pin the probe; if th
 must never appear in real output, pick one no OS can allocate (`99999999999`).
 
 The host's free MEMORY is an input too, and the most-used probe of it is
-`SubagentManager.spawn`, which refuses — registering nothing in `_tasks` — on a
-pressured machine. A refusal is still a `SubagentInfo`, so the test dies a line
+`SubagentManager.spawn`, which queues — registering nothing in `_tasks` — on a
+pressured machine. A queued spawn is still a `SubagentInfo`, so the test dies a line
 later on a bare `KeyError`, not on the assert that would have named the cause. Any
 file driving `spawn` takes `pytestmark = pytest.mark.usefixtures("healthy_host_memory")`,
-and `test_subagent_spawn_host_pin.py` fails when a new one does not. The two guards it
+and `test_subagent_spawn_host_pin.py` fails when a new one does not. The guard it
 pins, and why it stays transparent for the parser's own tests, are in
 testing-conventions § Determinism 1. Both the fixture and its ratchet are
 `test/`-only — `healthy_host_memory` lives in `test/conftest.py`, and
 `test_subagent_spawn_host_pin.py` scans `test/*.py` non-recursively. An in-package
 app suite cannot request the fixture and is not swept, so a test there that drives
-`SubagentManager.spawn` must pin the two guards itself.
+`SubagentManager.spawn` must pin the floor reading itself.
 
 One more, for tests of a **single-flight or coalescing** path ("N concurrent readers
 share ONE scan"): the property only holds for readers that arrive WHILE the shared
@@ -382,8 +384,9 @@ spawned without `cwd=`.
 
 At ~56.5k tests, **per-test setup cost dominates any single slow test** — an autouse
 fixture is paid ~56,500 times. Profile, never guess; compare candidates back to back on
-the same host (`git stash`, run, pop, run), because a loaded host makes an absolute
-number meaningless.
+the same host (run the change, then the base in `git worktree add --detach <dir> <base>`;
+never `git stash`: every worktree shares one stash list), because a loaded host makes an
+absolute number meaningless.
 
 The recurring wins, in order of leverage:
 
@@ -735,3 +738,32 @@ The consequence for how you write a test:
       which is a loosened ratchet (`a-ratchet-may-only-tighten`); probe the host through
       the bash the script will run under, not `shutil.which`, and prefer the real binary
       where that bash has one
+- [ ] A leaked child whose spawning thread is a NAMED pool reaper (`mc-*-reaper`) is the
+      shared `executors` pool warming, not the test's child: the fix is at the pool (a
+      `shutdown` that joins its reaper BEFORE the kill loop, so a tick past its stop check
+      cannot refill the slot it just emptied) and at session end
+      (`shutdown_maintenance_executor()` in a `test/conftest.py` fixture), never a reap in
+      the first test that happened to trigger it
+- [ ] Two writers creating one sidecar on a fresh directory open it `O_CREAT | O_EXCL` first
+      and reopen without `O_CREAT` on `FileExistsError`: a nonexclusive `O_CREAT` can lose
+      the create race on Darwin with a bare `ENOENT` for the leaf, and a `prune` or flush
+      that swallows it silently skips its work (`_open_lock_sidecar`)
+- [ ] A test double's pid (`4242`) is a shared name across hundreds of files, so any
+      process-wide table keyed by pid (`runtime_ownership`'s leases and tenancy) is reset on
+      BOTH sides of every test by a `test/conftest.py` autouse fixture; a kill-gate assertion
+      that reads `refused` where it expects the failed-kill wording is a neighbour's lease,
+      not the gate
+- [ ] A race detector never parks on a `threading.Barrier(..., timeout=)` a correct
+      interleaving cannot reach: the correct code then pays the whole timeout every run and
+      pass is told from fail by elapsed time. Park on an `Event`, signal the arrival you are
+      waiting for through the seam under test, and assert the event count while parked
+- [ ] `monkeypatch.chdir` does not put a `cwd` on the spawn: the descriptor still says
+      `cwd=None`, indistinguishable to a per-spawn audit from a spawn in the checkout. Pin the
+      helper's seam instead -- `runner=partial(subprocess.run, cwd=...)`, or the script
+      module's `subprocess` binding replaced with a namespace whose `run` carries `cwd`
+- [ ] An object whose constructor opens SQLite (`SubagentManager` -> `tasks.db`,
+      `KnowledgeStore` per thread, `SkillsLoader` -> the skill index) is closed through its
+      production close path at teardown -- `test/conftest.py`'s `close_subagent_managers` /
+      `close_skills_loaders` opt-in fixtures, `opened(...)`, or `_close_all_for_tests()` when
+      ANOTHER thread held a connection (`close()` is per-thread) -- never left to the cyclic
+      collector, whose timing is what makes the descriptor count flap between runs

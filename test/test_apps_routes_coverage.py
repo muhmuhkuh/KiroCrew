@@ -19,17 +19,20 @@ from __future__ import annotations
 import asyncio
 import json
 import platform as platform_mod
+import shutil
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from dashboard_owner_helpers import as_owner
+from test_update_provider import _UNALLOCATABLE_PID
 
 import kiro_crew.apps.routes as routes_mod
 from conftest import requires_symlinks
@@ -2374,7 +2377,7 @@ class TestOpenApp:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post("/api/apps/ghost/open")
             assert resp.status == 404
 
@@ -2384,7 +2387,7 @@ class TestOpenApp:
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path, openCommand="true")
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 409
             assert (await resp.json())["code"] == "app_disabled"
@@ -2396,7 +2399,7 @@ class TestOpenApp:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
         enable_app(APP)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 400
             assert "openCommand" in (await resp.json())["error"]
@@ -2413,7 +2416,7 @@ class TestOpenApp:
             "app_execution_denied",
             lambda name, **kwargs: "third-party app execution is not admitted",
         )
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 403
             body = await resp.json()
@@ -2433,7 +2436,7 @@ class TestOpenApp:
         monkeypatch.setattr(platform_mod, "system", lambda: "Linux")
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 200
             body = await resp.json()
@@ -2463,7 +2466,7 @@ class TestOpenApp:
         monkeypatch.setattr(routes_mod, "wrap_argv", _wrap)
         monkeypatch.setattr(routes_mod, "cgroup_scope_argv", lambda argv: argv)
         monkeypatch.setattr(routes_mod, "create_subprocess_limited", _spawn)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 200
             body = await resp.json()
@@ -2490,10 +2493,48 @@ class TestOpenApp:
             raise OSError("no such executable")
 
         monkeypatch.setattr(routes_mod, "create_subprocess_limited", _boom)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.post(f"/api/apps/{APP}/open")
             assert resp.status == 500
             assert "failed to launch" in (await resp.json())["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("app_identity", "dashboard_user"),
+        [(None, "channel-user"), (APP, "owner")],
+        ids=["non_owner_dashboard_subject", "app_token"],
+    )
+    async def test_non_owner_cannot_open(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        app_identity: str | None,
+        dashboard_user: str,
+    ) -> None:
+        # Opening spawns the manifest's openCommand on the host, so it is an
+        # owner action like enable and disable.
+        _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, openCommand="open-my-app")
+        enable_app(APP)
+        monkeypatch.setattr(routes_mod, "app_execution_denied", lambda n, **k: None)
+        monkeypatch.setattr(platform_mod, "system", lambda: "Darwin")
+        monkeypatch.setattr(
+            routes_mod, "wrap_argv", lambda argv, mode="standard": (argv, None)
+        )
+        monkeypatch.setattr(routes_mod, "cgroup_scope_argv", lambda argv: argv)
+        spawned: list[tuple[str, ...]] = []
+
+        async def _spawn(*argv: str, **kwargs: Any) -> Any:
+            spawned.append(argv)
+            return SimpleNamespace(pid=_UNALLOCATABLE_PID)
+
+        monkeypatch.setattr(routes_mod, "create_subprocess_limited", _spawn)
+        app = _make_app(app_identity=app_identity, dashboard_user=dashboard_user)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(f"/api/apps/{APP}/open")
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "owner_only"
+        assert spawned == []
 
 
 # ---------------------------------------------------------------------------
@@ -3020,7 +3061,7 @@ class TestAppConfig:
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.put(
                 f"/api/apps/{APP}/config",
                 data="{",
@@ -3034,7 +3075,7 @@ class TestAppConfig:
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.put(f"/api/apps/{APP}/config", json=[1, 2, 3])
             assert resp.status == 400
             assert "JSON object" in (await resp.json())["error"]
@@ -3045,7 +3086,7 @@ class TestAppConfig:
     ) -> None:
         _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
-        async with TestClient(TestServer(_make_app())) as client:
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
             resp = await client.put(
                 f"/api/apps/{APP}/config", json={"theme": "dark"}
             )
@@ -3321,6 +3362,140 @@ class TestBlobProxy:
             assert resp.headers["Content-Type"] == "image/png"
             assert resp.headers["Cache-Control"] == "public, max-age=86400"
             assert await resp.read() == b"\x89PNG\r\n"
+
+    @pytest.mark.asyncio
+    async def test_serving_a_cached_blob_refreshes_its_mtime(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``_gc_blob_cache_dir`` reclaims a blob-cache file whose mtime has aged past
+        # the grace, and only the owner-tier prewarm re-dates a live row's art. An
+        # index-tier blob the proxy wrote once is never re-published, so without a
+        # touch on serve a file still being served every day would age out and be
+        # reclaimed, then re-cloned. Serving must bump the mtime so "being served"
+        # keeps a file young exactly as a rewrite does.
+        import os as _os
+        import time as _time
+
+        _setup_env(tmp_path, monkeypatch)
+        monkeypatch.setattr(routes_mod, "known_registry_repos", lambda: {"acme"})
+
+        async def _must_not_fetch(*args: Any, **kwargs: Any) -> bool:
+            raise AssertionError("cache hit must not trigger a clone")
+
+        clone_url = "ssh://forge.example/org/acme.git"
+        monkeypatch.setattr(
+            routes_mod,
+            "get_registry_app_by_repo",
+            lambda repo: {"repo": repo, "gitUrl": clone_url, "branch": "main"},
+        )
+        monkeypatch.setattr(routes_mod, "_fetch_git_blob", _must_not_fetch)
+        cache = (
+            routes_mod._blob_cache_dir()
+            / routes_mod._blob_cache_key("acme", clone_url)
+            / "main"
+            / "assets"
+        )
+        cache.mkdir(parents=True)
+        blob = cache / "logo.png"
+        blob.write_bytes(b"\x89PNG\r\n")
+        # Backdate the file well into the past, as an aging blob would be.
+        old = _time.time() - 10 * 86400
+        _os.utime(blob, (old, old))
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(
+                "/api/apps/blob",
+                params={"repo": "acme", "path": "assets/logo.png", "ref": "main"},
+            )
+            assert resp.status == 200
+            assert await resp.read() == b"\x89PNG\r\n"
+
+        # The serve bumped the mtime back to ~now, so it is young enough to survive GC.
+        assert blob.stat().st_mtime > old + 86400
+
+    @pytest.mark.asyncio
+    async def test_a_touch_failure_does_not_fail_the_serve(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Negative control / robustness: the mtime refresh is best-effort. If the
+        # touch raises (a read-only mount, a racing GC unlink), the blob is served
+        # regardless rather than 500-ing. Without the ``try/except`` around the
+        # ``os.utime`` this serve would raise.
+        import os as _os
+
+        _setup_env(tmp_path, monkeypatch)
+        monkeypatch.setattr(routes_mod, "known_registry_repos", lambda: {"acme"})
+
+        async def _must_not_fetch(*args: Any, **kwargs: Any) -> bool:
+            raise AssertionError("cache hit must not trigger a clone")
+
+        clone_url = "ssh://forge.example/org/acme.git"
+        monkeypatch.setattr(
+            routes_mod,
+            "get_registry_app_by_repo",
+            lambda repo: {"repo": repo, "gitUrl": clone_url, "branch": "main"},
+        )
+        monkeypatch.setattr(routes_mod, "_fetch_git_blob", _must_not_fetch)
+        cache = (
+            routes_mod._blob_cache_dir()
+            / routes_mod._blob_cache_key("acme", clone_url)
+            / "main"
+            / "assets"
+        )
+        cache.mkdir(parents=True)
+        (cache / "logo.png").write_bytes(b"\x89PNG\r\n")
+
+        real_utime = _os.utime
+
+        def _boom(path: Any, *args: Any, **kwargs: Any) -> None:
+            # Fail the serve's refresh touch, but leave the FileResponse's own
+            # stat/open untouched so the rest of the handler behaves normally.
+            if str(path).endswith("logo.png"):
+                raise OSError("read-only cache")
+            return real_utime(path, *args, **kwargs)
+
+        monkeypatch.setattr(routes_mod.os, "utime", _boom)
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(
+                "/api/apps/blob",
+                params={"repo": "acme", "path": "assets/logo.png", "ref": "main"},
+            )
+            assert resp.status == 200, "a failed mtime refresh must not fail the serve"
+            assert await resp.read() == b"\x89PNG\r\n"
+
+    def test_touch_without_nofollow_utime_still_refreshes_a_regular_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Windows has no ``os.utime(follow_symlinks=False)``; the touch must still
+        # land there instead of raising NotImplementedError and being skipped.
+        import os as _os
+        import time as _time
+
+        monkeypatch.setattr(routes_mod.os, "supports_follow_symlinks", set())
+        blob = tmp_path / "logo.png"
+        blob.write_bytes(b"x")
+        old = _time.time() - 10 * 86400
+        _os.utime(blob, (old, old))
+        routes_mod._touch_served_blob(blob)
+        assert blob.stat().st_mtime > old + 86400
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privilege")
+    def test_touch_without_nofollow_utime_leaves_a_link_target_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import os as _os
+        import time as _time
+
+        monkeypatch.setattr(routes_mod.os, "supports_follow_symlinks", set())
+        target = tmp_path / "outside.png"
+        target.write_bytes(b"x")
+        old = _time.time() - 10 * 86400
+        _os.utime(target, (old, old))
+        link = tmp_path / "logo.png"
+        link.symlink_to(target)
+        routes_mod._touch_served_blob(link)
+        assert target.stat().st_mtime == pytest.approx(old)
 
     @pytest.mark.asyncio
     async def test_repo_key_reuse_across_registries_does_not_serve_stale_bytes(
@@ -4622,54 +4797,188 @@ async def test_api_proxy_signs_and_forwards_to_backend(
 
 
 class TestMigrateCleanup:
-    @pytest.mark.asyncio
-    async def test_non_migrated_app_is_400(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.delete(f"/api/apps/{APP}/migrate-cleanup")
-            assert resp.status == 400
-            assert (await resp.json())["ok"] is False
+
+    def _retired(self, tmp_path, monkeypatch):
+        from kiro_crew.apps.manager import InstalledApp, _write_installed, app_dir
+
+        home = _setup_env(tmp_path, monkeypatch)
+        _install(tmp_path, setup={"onUninstall": "remove-data.sh"})
+        _write_installed(APP, InstalledApp(name=APP, origin="builtin", lifecycle="locked"))
+        dest = app_dir(APP)
+        (dest / "data" / "keep.txt").write_text("keep me", encoding="utf-8")
+        for leaf in (".kirocrew-deps", ".kirocrew-deps-prior", ".kirocrew-deps-staging-1-12345678"):
+            (dest / "data" / leaf).mkdir()
+        (home / "config.json").write_text(
+            json.dumps({"agent": {"apps_trusted": [APP], "apps_trusted_local": [APP]}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            routes_mod, "_stop_backend_and_observe", AsyncMock(return_value=(None, True))
+        )
+        monkeypatch.setattr(routes_mod, "_run_lifecycle_script", AsyncMock())
+        monkeypatch.setattr(
+            routes_mod,
+            "_deregister_app_off_loop",
+            AsyncMock(return_value=routes_mod.RegistrationResult()),
+        )
+        return home, dest
 
     @pytest.mark.asyncio
-    async def test_idempotent_when_already_clean(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _setup_env(tmp_path, monkeypatch)
-        async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.delete("/api/apps/deploy-web/migrate-cleanup")
-            assert resp.status == 200
-            assert (await resp.json())["ok"] is True
+    async def test_dependency_classification_runs_off_the_event_loop(self, tmp_path, monkeypatch):
+        """The ledger classify-and-clean takes a blocking file lock; it must not run on the loop."""
+        _, dest = self._retired(tmp_path, monkeypatch)
+        seen: list[tuple[threading.Thread, str, tuple[str, ...]]] = []
+
+        def record(name, declared, *, keep_specific):
+            seen.append((threading.current_thread(), name, tuple(keep_specific)))
+            return {"removable": [], "shared": [], "userInstalled": []}
+
+        monkeypatch.setattr(routes_mod, "classify_and_clean_for_uninstall", record)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            loop_thread = threading.current_thread()
+            resp = await client.delete(f"/api/apps/{APP}/migrate-cleanup")
+            assert resp.status == 200, await resp.text()
+        assert [(n, k) for _, n, k in seen] == [(APP, ())]
+        assert seen[0][0] is not loop_thread, "classification must be offloaded from the loop"
+        assert {p.name for p in dest.iterdir()} == {"data"}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "error_code,status",
-        [
-            ("not_orphaned", 400),
-            ("replacement_missing", 409),
-            ("io_error", 500),
-            ("unknown_code", 400),
-        ],
+        "warning", ["none", "flush", "discard-and-flush", "backend", "deregister"]
     )
-    async def test_error_code_maps_to_http_status(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        error_code: str,
-        status: int,
-    ) -> None:
-        _setup_env(tmp_path, monkeypatch)
-        monkeypatch.setattr(
-            routes_mod,
-            "cleanup_migrated_builtin",
-            lambda name: AppResult(
-                ok=False, name=name, error="nope", error_code=error_code
+    async def test_delegates_to_uninstall_preserving_only_user_data(
+        self, tmp_path, monkeypatch, warning
+    ):
+        home, dest = self._retired(tmp_path, monkeypatch)
+        app = _make_app(dashboard_user="owner")
+        audit = MagicMock()
+        monkeypatch.setattr(routes_mod, "sel", lambda: audit)
+        sessions = SimpleNamespace(
+            mapped_session_keys=lambda: {"owned"},
+            session_keys=lambda: set(),
+            discard_conversation=AsyncMock(
+                side_effect=OSError("discard") if warning == "discard-and-flush" else None
             ),
+            suppress_replay_persistently=MagicMock(),
+            aflush=AsyncMock(side_effect=OSError("flush") if "flush" in warning else None),
         )
-        async with TestClient(TestServer(_make_app())) as client:
-            resp = await client.delete("/api/apps/deploy-web/migrate-cleanup")
-            assert resp.status == status
+        app["state"].sessions = sessions
+        monkeypatch.setattr(routes_mod, "app_conversation_keys", lambda *a, **k: ["owned"])
+        if warning == "backend":
+            routes_mod._stop_backend_and_observe.return_value = (12345, True)
+        if warning == "deregister":
+            routes_mod._deregister_app_off_loop.return_value.errors = [
+                "cleanup failed: https://user:secret@example.test/path"
+            ]
+        from kiro_crew.apps import manager
+
+        monkeypatch.setattr(manager, "_orphaned_builtins_cache", {APP})
+        async with TestClient(TestServer(app)) as client:
+            assert (await client.post(f"/api/apps/{APP}/uninstall")).status == 400
+            resp = await client.delete(f"/api/apps/{APP}/migrate-cleanup")
+            body = await resp.json()
+        assert resp.status == 200, body
+        assert body["ok"] and bool(body.get("notice")) == (warning != "none")
+        assert "user:secret" not in body.get("notice", "")
+        assert {p.name for p in dest.iterdir()} == {"data"}
+        assert (dest / "data" / "keep.txt").read_text(encoding="utf-8") == "keep me"
+        assert {p.name for p in (dest / "data").iterdir()} == {"keep.txt", ".kirocrew-deps.lock"}
+        assert manager._orphaned_builtins_cache is None
+        agent = json.loads((home / "config.json").read_text(encoding="utf-8"))["agent"]
+        assert APP not in agent["apps_trusted"] and APP not in agent["apps_trusted_local"]
+        routes_mod._run_lifecycle_script.assert_not_awaited()
+        routes_mod._stop_backend_and_observe.assert_awaited_once_with(APP)
+        sessions.discard_conversation.assert_awaited_once_with("owned", replay=False)
+        sessions.aflush.assert_awaited_once()
+        audit.log_api_access.assert_any_call(
+            caller="dashboard", operation="app_migrate_cleanup", outcome="completed", resources=APP
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("refusal", ["changed", "link", "data-link", "data-file", "shipped"])
+    async def test_ineligible_builtin_is_untouched(self, tmp_path, monkeypatch, refusal):
+        from contextlib import asynccontextmanager
+
+        from kiro_crew.apps import manager
+        from kiro_crew.testing.links import make_dir_link
+
+        home, dest = self._retired(tmp_path, monkeypatch)
+        before = (dest / "installed.json").read_bytes()
+        config_before = (home / "config.json").read_bytes()
+        target = None
+        if refusal == "link":
+            target = dest.rename(tmp_path / "linked-app")
+            make_dir_link(dest, target)
+        elif refusal == "data-link":
+            target = (dest / "data").rename(tmp_path / "linked-data")
+            make_dir_link(dest / "data", target)
+            target_before = sorted(p.name for p in target.iterdir())
+        elif refusal == "data-file":
+            shutil.rmtree(dest / "data")
+            (dest / "data").write_text("not a directory", encoding="utf-8")
+        elif refusal == "shipped":
+            monkeypatch.setattr(manager, "detect_orphaned_builtins", lambda **k: set())
+        else:
+            held = False
+
+            @asynccontextmanager
+            async def lock(name):
+                nonlocal held
+                held = True
+                yield
+
+            def predicate(name):
+                with pytest.raises(RuntimeError):
+                    asyncio.get_running_loop()
+                return not held
+
+            monkeypatch.setattr(routes_mod, "app_lifecycle_lock", lock)
+            monkeypatch.setattr(manager, "migrated_builtin_cleanup_applies", predicate)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.delete(f"/api/apps/{APP}/migrate-cleanup")
+            body = await resp.json()
+        assert resp.status == 400 and body["code"] == "not_orphaned" and not body["ok"]
+        assert (dest / "installed.json").read_bytes() == before
+        assert (home / "config.json").read_bytes() == config_before
+        routes_mod._stop_backend_and_observe.assert_not_awaited()
+        routes_mod._run_lifecycle_script.assert_not_awaited()
+        routes_mod._deregister_app_off_loop.assert_not_awaited()
+        if refusal == "data-link":
+            assert (dest / "data").is_symlink() or manager.is_link_or_junction(dest / "data")
+            assert sorted(p.name for p in target.iterdir()) == target_before
+            assert (target / "keep.txt").read_text(encoding="utf-8") == "keep me"
+        if refusal == "data-file":
+            assert (dest / "data").read_text(encoding="utf-8") == "not a directory"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("installed", [False, True])
+    async def test_idempotent_without_touching_the_successor(
+        self, tmp_path, monkeypatch, installed
+    ):
+        home = _setup_env(tmp_path, monkeypatch)
+        if installed:
+            _install(tmp_path)
+        before = {p: p.read_bytes() for p in home.rglob("*") if p.is_file()}
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.delete(f"/api/apps/{APP}/migrate-cleanup")
+            body = await resp.json()
+        assert resp.status == 200 and body["ok"]
+        assert ("already migrated" if installed else "nothing to clean up") in body["message"]
+        assert {p: p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("actor", ["app", "non-owner"])
+    async def test_requires_owner_not_app_token(self, tmp_path, monkeypatch, actor):
+        _, dest = self._retired(tmp_path, monkeypatch)
+        app = _make_app(app_identity=APP if actor == "app" else None, dashboard_user="other")
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.delete(f"/api/apps/{APP}/migrate-cleanup")
+            body = await resp.json()
+        assert resp.status == 403
+        if actor == "app":
+            assert body["code"] == "app_token_forbidden"
+        assert (dest / "installed.json").is_file()
+        routes_mod._stop_backend_and_observe.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

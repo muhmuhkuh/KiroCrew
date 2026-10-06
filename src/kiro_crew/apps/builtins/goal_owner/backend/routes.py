@@ -228,9 +228,10 @@ async def _handle_create(request: web.Request, ctx: AppContext) -> web.Response:
     if not report.ok:
         return web.json_response(
             {
+                "goal": payload["goal"],
+                "scheduler": payload["scheduler"],
                 "error": "goal saved but scheduler reconciliation was incomplete",
                 "code": "scheduler_reconcile_failed",
-                **payload,
             },
             status=503,
         )
@@ -260,9 +261,10 @@ async def _handle_status_transition(
     if not report.ok:
         return web.json_response(
             {
+                "goal": payload["goal"],
+                "scheduler": payload["scheduler"],
                 "error": "goal status saved but scheduler reconciliation was incomplete",
                 "code": "scheduler_reconcile_failed",
-                **payload,
             },
             status=503,
         )

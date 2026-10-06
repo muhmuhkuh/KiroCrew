@@ -21,7 +21,7 @@ consumer                                      projection it reads
 ``agent_sdk.tool_gate`` own-leaf exclusion    :data:`AGENT_AUTH_DECLARATIONS`
 ``agent_sdk.backends`` logout-recycle set     :func:`backends_retired_by_host_logout`
 ``acp`` auth-required message                 :func:`signed_out_message`
-``cli_doctor`` sign-in row                    :func:`declaration_for`
+``doctor_checks.agents`` sign-in row          :func:`declaration_for`
 ``GET /api/acp-backends`` auth object         :func:`declaration_for`
 ============================================  ================================
 
@@ -397,11 +397,11 @@ _KIRO_SIGNED_OUT = (
 # process had, so its messages name both remedies. Plain prose (no backticks, no
 # "--") in the remedy: the panel renders it as text.
 _KAS_REMEDY = (
-    "Sign in from Developer → Agent Backend → Kiro sign-in, or run kiro-cli login "
+    "Sign in from Settings → Agent Harness → Kiro sign-in, or run kiro-cli login "
     "in your terminal if kiro-cli owns the sign-in, then start a new chat."
 )
 _KAS_SIGNED_OUT = (
-    "Not signed in to Kiro. Sign in again from Developer → Agent Backend → Kiro sign-in, "
+    "Not signed in to Kiro. Sign in again from Settings → Agent Harness → Kiro sign-in, "
     "or run `kiro-cli login` in your terminal if kiro-cli owns the sign-in, then start a "
     "new chat."
 )

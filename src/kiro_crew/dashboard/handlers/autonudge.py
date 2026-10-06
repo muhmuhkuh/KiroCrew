@@ -516,11 +516,14 @@ def _monitor_config(
                 1,
                 runtime_ceiling,
             ),
+            # Floor 0, not 1: zero is this budget's unlimited sentinel, and
+            # ``_bounded_int`` reads the body by key rather than by truthiness, so
+            # an explicit 0 survives instead of collapsing to the default.
             max_agent_turns=_bounded_int(
                 body,
                 "max_agent_turns",
                 DEFAULT_MONITOR_AGENT_TURNS,
-                1,
+                0,
                 MAX_MONITOR_AGENT_TURNS,
             ),
             max_tokens=_bounded_int(
@@ -1083,6 +1086,14 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         idle_secs=body.get("idle_secs"),
         max_cycles=body.get("max_cycles"),
         active=body.get("active"),
+        # This route is the user's own press (the goal popover's Play), so a
+        # revival through it is a resume: the service resets only the counter
+        # behind a spent bound (a spent cycle cap zeroes the count, a spent time
+        # budget re-anchors the clock, read from the stored stop reason and the
+        # bounds at the press) and keeps the rest, so the loop resumes from its
+        # breakpoint; a save on a running loop carries ``active: true`` too and
+        # the flag is inert there.
+        fresh_run=True,
         max_runtime_secs=body.get("max_runtime_secs"),
         banner=body.get("banner"),
         source="dashboard",
@@ -1212,12 +1223,10 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
       product decision — the fire path this route arms already made it, with its
       reason written down at the site: queueing "would stack identical 3KB+
       nudges and blow up the context window" (``_fire_dashboard_nudge``). The
-      predicate is the repository's canonical one, ``slot.running or
-      slot._in_stage_execution``, read here exactly as the cron-injection
-      handler reads it (``handlers/messaging.py``) — ``slot.running`` alone is
-      False between the stages of a multi-stage plan, so it would let this land
-      a concurrent turn on top of the plan. Note the two consumers of that
-      predicate diverge deliberately: the cron path QUEUES, this one REFUSES,
+      predicate is the repository's canonical one, ``slot.running``, read here
+      exactly as the cron-injection handler reads it
+      (``handlers/messaging.py``). Note the two consumers of that predicate
+      diverge deliberately: the cron path QUEUES, this one REFUSES,
       and the nudge path's stated reason is the one that applies here.
 
       This check is an AFFORDANCE, not a guarantee: a turn that starts between
@@ -1348,7 +1357,7 @@ async def api_autonudge_fire(request: web.Request) -> web.Response:
         )
     state: DashboardState = request.app["state"]
     slot = state.get_slot(existing.slot_key)
-    if slot is not None and (slot.running or slot._in_stage_execution):
+    if slot is not None and slot.running:
         # Names the OUTCOME and the NEXT STEP, not just the condition. "a turn is
         # in flight" leaves a reader unable to tell a refusal from a delay, and
         # the distinction is the whole point here: the press was refused, not

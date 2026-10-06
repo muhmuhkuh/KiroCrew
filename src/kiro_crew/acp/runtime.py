@@ -78,7 +78,12 @@ from kiro_crew.acp.mcp_session_report import (
     roster_names,
     sanitize_sink_text,
 )
-from kiro_crew.acp.runtime_process_tree import ChildRecord, _capture_child_records, _get_child_pids
+from kiro_crew.acp.runtime_process_tree import (
+    ChildRecord,
+    _capture_child_records,
+    _get_child_pids,
+    _kill_escaped_children,
+)
 from kiro_crew.acp.runtime_start import (
     _INIT_NOTIFICATION_BUFFER_LIMIT,
     _SESSION_NEW_TIMEOUT,
@@ -93,6 +98,7 @@ from kiro_crew.acp.runtime_start import (
 from kiro_crew.acp.session_handle import (
     NATIVE_CHILD_ROSTER_CAP,
     AcpFrameTooLarge,
+    AcpModeNotFound,
     AcpRequestTimeout,
     AcpRuntimeDead,
     AcpRuntimeError,
@@ -112,19 +118,29 @@ from kiro_crew.acp.transport_errors import (
     is_sandbox_init_failure_output,
     registration_throttle_line,
 )
-from kiro_crew.acp.transport_framing import (
+
+# The block-wide noqa covers _RESPONSE_WRITE_MIN_PROGRESS_BYTES, which is bound
+# for re-export rather than used here: the refactor-facade tests pin runtime and
+# client to one shared copy of this floor (test_acp_refactor_transport_framing /
+# test_acp_refactor_facade), while _stall_window_phrase owns the floor's only read.
+from kiro_crew.acp.transport_framing import (  # noqa: F401
     _RESPONSE_WRITE_BOUND_SECS,
     _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
     OversizeLineUnrecoverable,
+    RequestWriteResult,
     _drain_oversize_line,
+    _stall_window_phrase,
     response_write_window_secs,
+    settle_drain,
     write_notification_best_effort,
+    write_request_frame_bounded,
     write_response_frame_bounded,
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_MARKDOWN_AGENT_SPECS,
+    ACP_BACKENDS_SERIAL_SESSION_STARTS,
     MCP_ROSTER_COMPLETE_NOTE,
     METHOD_KAS_MCP_RESET_SERVER,
     METHOD_KAS_OPEN_EXTERNAL_URL,
@@ -150,8 +166,10 @@ from kiro_crew.agent_sdk.tool_search import (
 from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 from kiro_crew.browser_cli.launch import browser_session_env, browser_socket_env
 from kiro_crew.config import live
-from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.constants import (
+    INITIALIZE_TIMEOUT_SECS,
+    KIROCREW_SPAWN_HOME_ENV,
     KIROCREW_SPAWN_INSTANCE_ENV,
     KIROCREW_SPAWNED_ENV,
     KIROCREW_SPAWNED_VALUE,
@@ -169,6 +187,7 @@ from kiro_crew.metrics.events import (
     CHILD_PERMISSION_DENIED,
     CHILD_PERMISSION_ROUTED,
     DROPPED_FRAMES,
+    SKILL_VIEW_FALLBACKS,
     emit_counter,
 )
 from kiro_crew.providers.mirrors.registry import has_mirror, mirror_for
@@ -211,6 +230,12 @@ from kiro_crew.session_pid import (
     unregister_protected_pid,
 )
 from kiro_crew.session_token_sig import publish_session_token
+from kiro_crew.start_priority import (
+    START_QUEUE_ADMISSION,
+    START_QUEUE_SESSION_NEW,
+    StartPriority,
+    notify_start_queue,
+)
 from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN, MODEL_ID_RE
 
 logger = logging.getLogger(__name__)
@@ -430,12 +455,13 @@ _REQUEST_TIMEOUT = 30.0
 _MCP_SIGN_IN_TIMEOUT = 630.0
 # JSON-RPC server-error code for a consent URL Crew did not show anyone.
 _MCP_URL_NOT_OPENED = -32000
-# ``initialize`` budget while the kernel is throttling the agents slice. A
-# throttled kiro-cli is alive and making progress, only slowly, so the fixed
-# budget above kills work that would have finished; each retry then pays the
-# same startup into the same throttle and deepens it. Three times the plain
-# budget, not unbounded: the cold-start semaphore (``runtime_start``) is held for
-# the whole wait. The value MUST stay strictly below the subagent startup watchdog
+# ``initialize`` budget: a cold start, not a control-plane round trip. kiro-cli
+# answers ``initialize`` only after it has started up, so a slow disk, a large
+# skill tree or a throttled agents slice can push the first answer past the plain
+# budget above while the process is alive and making progress. Killing it there
+# discards that startup, and every retry pays the same startup again. Three times
+# the plain budget, not unbounded: the cold-start semaphore (``runtime_start``) is
+# held for the whole wait. The value MUST stay strictly below the subagent startup watchdog
 # (``subagent._STARTUP_TIMEOUT_SECS``, 120s from ``_exec_started``): a
 # subagent's ``info._pid`` is recorded only after ``provider.start()`` returns,
 # i.e. after this handshake, so the watchdog sees "no runtime yet" for the
@@ -443,7 +469,7 @@ _MCP_URL_NOT_OPENED = -32000
 # The budget therefore has to expire first, with room for the spawn that
 # precedes the handshake, so ``AcpRuntimeOverloaded`` is what the caller sees
 # rather than a reaper kill. ``test_agents_slice_admission`` pins the ordering.
-_INIT_TIMEOUT_UNDER_THROTTLE = 90.0
+_INITIALIZE_TIMEOUT = INITIALIZE_TIMEOUT_SECS
 
 
 class _PendingRequests(dict):
@@ -547,6 +573,35 @@ def _capped_names(names: list[str]) -> str:
     return f"{joined} (+{rest} more)" if rest > 0 else joined
 
 
+# Requests a backend in ACP_BACKENDS_SERIAL_SESSION_STARTS answers one at a time.
+# kiro-cli (2.26 and earlier) awaits each of these inside its ACP connection's
+# dispatch loop, so while one waits on a slow MCP server or the model list, every
+# message behind it waits too, including the next session start. A start sent
+# behind one therefore spends its own budget on the earlier request.
+_ONE_AT_A_TIME_METHODS = frozenset({METHOD_SESSION_NEW, METHOD_SESSION_LOAD, METHOD_SET_MODE})
+
+
+def _queued_behind_note(ahead: list[tuple[str, float]]) -> str:
+    """Describe the requests a timed-out session start was queued behind.
+
+    ``ahead`` holds ``(method, seconds sent before this start)`` for each request
+    in :data:`_ONE_AT_A_TIME_METHODS` that was outstanding when the start went out
+    and was STILL unanswered at its deadline. An empty list says nothing.
+    """
+    if not ahead:
+        return ""
+    counts: dict[str, int] = {}
+    for method, _age in ahead:
+        counts[method] = counts.get(method, 0) + 1
+    kinds = ", ".join(f"{n} {m}" for m, n in sorted(counts.items()))
+    oldest = max(age for _m, age in ahead)
+    return (
+        f"queued behind {len(ahead)} earlier request(s) this agent process had not "
+        f"answered by the deadline ({kinds}; oldest sent {oldest:.0f}s earlier), "
+        "and it answers those one at a time"
+    )
+
+
 # Teardown must be snappy: a session is usually terminated on a hot path
 # (background task done, subagent reaped). kiro-cli's terminate handler responds
 # as soon as it enqueues the eviction (the actual shutdown runs in its actor
@@ -634,6 +689,56 @@ def _format_runtime_rpc_error(error: object) -> str:
                 f"then restart the gateway."
             )
     return f"RPC error: {error}"
+
+
+def _runtime_rpc_exception(error: object) -> AcpRuntimeError:
+    """The exception an awaited request fails with; :func:`_format_runtime_rpc_error`'s text.
+
+    A missing mode is an :class:`AcpModeNotFound` carrying the name, so the
+    ``set_mode`` path can recover from a skill-view alias the host has not
+    loaded yet without parsing the sentence it would show a user.
+    """
+    message = _format_runtime_rpc_error(error)
+    if isinstance(error, dict):
+        match = _MODE_NOT_FOUND_RE.search(str(error.get("data", "") or ""))
+        if match:
+            return AcpModeNotFound(message, match.group("name"))
+    return AcpRuntimeError(message)
+
+
+# After a skill-view alias is published, how long ``session/set_mode`` waits
+# before each retry of a "not found" answer. kiro-cli reloads its agents
+# directory 500 ms after the last data write to it (a trailing debounce, then a
+# full rescan; measured selectable 0.7-1.5 s after publication) and never on a
+# rename, and a miss does not trigger a reload itself. Short even steps land
+# soon after a reload; the total (3 s) stays well inside the set_mode budget, and
+# after it the session start fails with the restart remedy rather than activate
+# any older copy of the agent.
+_PROJECTED_MODE_RETRY_DELAYS_SECS: tuple[float, ...] = (0.5, 0.5, 0.5, 0.5, 1.0)
+
+
+async def _prepare_projection_to_completion(
+    prepare: Callable[..., Any], *args: Any, **kwargs: Any
+) -> tuple[Any, bool]:
+    """Run *prepare* in a worker thread and wait for it even through cancellation.
+
+    Returns ``(result, cancelled)``. A cancelled start must not leave the
+    projection lock while its worker is still running: the worker may already
+    have read an edit, and the caller adopts that view before re-raising. The
+    wait is bounded by the preparation itself (its alias lock times out)."""
+    worker = asyncio.ensure_future(asyncio.to_thread(prepare, *args, **kwargs))
+    cancelled = False
+    while not worker.done():
+        try:
+            # ``wait`` never cancels the worker when this task is cancelled.
+            await asyncio.wait({worker})
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled and worker.exception() is not None:
+        # The worker's own failure must not replace the cancellation the caller
+        # asked for; an unadopted preparation is recorded by the caller either way.
+        raise asyncio.CancelledError
+    return worker.result(), cancelled
 
 
 # ── Unroutable-frame drop accounting ──
@@ -845,6 +950,33 @@ class _MirroredSessionMcp(NamedTuple):
     """
 
 
+def _point_private_state_at_scratch(
+    env: dict[str, str], env_var: str | None, scratch: Path | None
+) -> None:
+    """Point the host's private-state variable at this process's scratch dir.
+
+    *env_var* is :attr:`SpawnPlan.private_state_env`: ``None`` for a host whose
+    state tolerates concurrent processes, so nothing is set. A non-empty value
+    already in *env* is the caller's (the operator's environment, or a cron or
+    workflow ``extra_env``): they chose that location, and it reaches the child
+    as set. Otherwise the variable names the per-process scratch directory: no
+    other process uses it, and it is reclaimed once this one is dead
+    (``agent_scratch.sweep_dead_scratch``). Without scratch the child gets the
+    host's shared default and a warning says so: a shared database home is
+    better than a refused spawn.
+    """
+    if env_var is None or env.get(env_var):
+        return
+    if scratch is None:
+        logger.warning(
+            "AcpRuntime: no per-process scratch to point %s at; the child shares the "
+            "host's default, so concurrent processes may lock each other out",
+            env_var,
+        )
+        return
+    env[env_var] = str(scratch)
+
+
 async def _retrying_spawn_factory(
     factory: "Callable[..., Awaitable[asyncio.subprocess.Process]]", **kwargs: Any
 ) -> asyncio.subprocess.Process:
@@ -1051,9 +1183,19 @@ class AcpRuntime:
         # Single reader task — the ONLY coroutine that reads stdout
         self._reader_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._stderr_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        # Watches the root process's OWN exit, independent of the stdout stream.
+        # The reader loop observes a death only as EOF on stdout, which does not
+        # arrive while a descendant holds the root's inherited write end, so a
+        # dead-but-unreaped root is invisible to its waiters for the life of the
+        # survivor. This task fails them on the exit itself.
+        self._exit_watch_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
         # Demux routing
         self._pending_requests: _PendingRequests = _PendingRequests()
+        # Method and send time of each awaited request in _ONE_AT_A_TIME_METHODS.
+        # An id stays listed only while _pending_requests still holds it, so a
+        # timed-out start that a collector adopted still counts.
+        self._one_at_a_time_sent: dict[int, tuple[str, float]] = {}
         # session/new requests whose caller timed out but whose answer is still
         # owned (RFC §4.4); keyed by request id, settled by the collector.
         self._start_collectors: dict[int, StartCollector] = {}
@@ -1134,6 +1276,15 @@ class AcpRuntime:
         # operator filtering on WARNING never sees the death without the
         # exit code that followed it.
         self._death_expected = False
+        # Set by ``_mark_dead(stdin_stalled=True)``: the runtime was condemned
+        # because the child stopped reading stdin, with the child still alive.
+        # Any prompt frame already in that pipe may yet be read, so every
+        # session with an unanswered prompt reports its death as an ambiguous
+        # delivery (``AcpSessionHandle.prompt_outstanding_on_stall``).
+        self._stdin_stall_death = False
+        # The sessions whose turn was active when that stall condemned the
+        # runtime, frozen at ``_mark_dead`` before any turn's teardown runs.
+        self._stall_turn_sessions: frozenset[str] = frozenset()
         self._last_activity: float = 0.0
         self._stderr_lines: list[str] = []
         # Latched auth-failure observation. ``_stderr_lines`` is a 20-line ring,
@@ -1357,6 +1508,38 @@ class AcpRuntime:
     def is_alive(self) -> bool:
         """True if the underlying process exists and has not exited."""
         return self._process is not None and self._process.returncode is None and not self._dead
+
+    @property
+    def stdin_stall_death(self) -> bool:
+        """Whether this runtime died of a stdin stall, its child left alive."""
+        return self._stdin_stall_death
+
+    def stdin_reader_may_live(self) -> bool:
+        """Whether a process that can still read this runtime's stdin may run.
+
+        Blocking (a process-group scan), so call it off the loop. The pipe is
+        inherited inside the root's process group -- the root may be a sandbox
+        launcher whose child reads it -- while stdio MCP servers lead their own
+        groups, so the answer is the root (proven by identity, which holds
+        whether or not this handle still references it) or any live member of
+        its group. Conservative on an unreadable group: True.
+        """
+        pid = self._pid  # pid-owner-ok: the runtime reads its own root
+        if pid is None:
+            return False
+        if self._root_identity() == "holds":
+            return True
+        if platform_compat.IS_WINDOWS:
+            return False
+        return _pgroup_has_member_besides(pid, pid)
+
+    def turn_active_at_stall(self, session_id: str) -> bool:
+        """Whether *session_id* had a turn running when a stdin stall killed this runtime.
+
+        Frozen at the death, so a reader that runs after the turn's own teardown
+        (the provider's exception translation) still gets the answer.
+        """
+        return session_id in self._stall_turn_sessions
 
     @property
     def process_tree_confirmed_dead(self) -> bool:
@@ -1630,34 +1813,27 @@ class AcpRuntime:
         return plan
 
     async def _initialize_handshake(self, client_capabilities: dict[str, Any]) -> dict[str, Any]:
-        """Send ``initialize`` with a budget sized to the host's throttle state.
+        """Send ``initialize`` with the cold-start budget.
 
         ``client_capabilities`` is the declaration :meth:`spawn` resolved before
         the process existed (the harness constant, or the wire-filled variant a
         ``client_meta_settings`` host gets); this helper only owns the budget.
 
-        The plain budget assumes an unthrottled process. When the agents slice
-        is being throttled at spawn time the budget is
-        :data:`_INIT_TIMEOUT_UNDER_THROTTLE` instead, because a throttled
-        kiro-cli is alive and answering slowly, not hung -- killing it at the
-        plain deadline discards its startup and the retry pays the same
-        startup into the same throttle. When the throttle is first seen at the
-        plain deadline with the process still ALIVE, the same ``initialize``
-        request stays pending for the remainder of the extended budget (a
-        fresh gateway's first probe can only baseline the counter, so the
-        spawn-time read can miss a throttle already under way). A timeout that
-        lands while the process is still ALIVE and the slice is throttling is
-        re-raised as :class:`AcpRuntimeOverloaded`, so the failure names
-        overload instead of a killed process. Any other timeout, and an exited
-        process, propagate unchanged.
+        The budget is :data:`_INITIALIZE_TIMEOUT` whatever the host's state:
+        ``initialize`` is answered only once kiro-cli has started, so a slow
+        start is a live process answering late, not a hung one. A timeout that
+        lands while the process is still ALIVE and the agents slice is
+        throttling is re-raised as :class:`AcpRuntimeOverloaded`, so the failure
+        names overload instead of a killed process. Any other timeout, and an
+        exited process, propagate unchanged.
         """
         throttled_at_spawn = agents_slice_throttling()
-        timeout = _INIT_TIMEOUT_UNDER_THROTTLE if throttled_at_spawn else _REQUEST_TIMEOUT
+        timeout = _INITIALIZE_TIMEOUT
         if throttled_at_spawn:
             logger.warning(
-                "acp_startup_stage stage=initialize outcome=throttled_budget "
+                "acp_startup_stage stage=initialize outcome=throttled_at_spawn "
                 "timeout_budget_s=%g pid=%s: the agents slice is being throttled, "
-                "so this handshake gets the extended budget",
+                "so this cold start may be slow",
                 timeout,
                 self._pid,
             )
@@ -1688,28 +1864,6 @@ class AcpRuntime:
             alive = self._process is not None and self._process.returncode is None
             if not alive or not (throttled_at_spawn or agents_slice_throttling()):
                 raise
-            pending = getattr(exc, "adopted_future", None)
-            if not throttled_at_spawn and pending is not None:
-                # The throttle surfaced only at the plain deadline (a fresh
-                # gateway's first probe can only baseline the counter, and
-                # reclaim can hold usage just under the line at spawn). The
-                # process is alive and the request is still registered, so
-                # give it the rest of the extended budget instead of reaping
-                # a startup that is merely slow.
-                extension = _INIT_TIMEOUT_UNDER_THROTTLE - timeout
-                logger.warning(
-                    "acp_startup_stage stage=initialize outcome=late_throttle_extension "
-                    "timeout_budget_s=%g extension_s=%g pid=%s: the agents slice began "
-                    "throttling during the handshake; keeping the request pending",
-                    timeout,
-                    extension,
-                    self._pid,
-                )
-                try:
-                    return await asyncio.wait_for(pending, timeout=extension)
-                except asyncio.TimeoutError:
-                    self._pending_requests.pop(getattr(exc, "req_id", None), None)
-                    timeout = _INIT_TIMEOUT_UNDER_THROTTLE
             raise AcpRuntimeOverloaded(
                 f"initialize went unanswered for {timeout:g}s while the agents slice is "
                 "being throttled at its memory ceiling; the process was alive, not hung. "
@@ -1717,24 +1871,42 @@ class AcpRuntime:
                 "and retry."
             ) from exc
 
-    async def spawn(self) -> None:
-        """Start the ACP runtime behind the gateway-wide cold-start admission gate."""
+    async def spawn(
+        self,
+        *,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
+        on_gate_queued: Callable[..., None] | None = None,
+        on_gate_acquired: Callable[..., None] | None = None,
+    ) -> None:
+        """Start the ACP runtime behind the gateway-wide cold-start admission gate.
+
+        ``start_priority`` orders this spawn in the admission queue (rule:
+        ``kiro_crew.start_priority``). ``on_gate_queued(queue)`` /
+        ``on_gate_acquired(queue_wait_ms, queue)`` bracket the admission wait, with
+        ``queue`` = :data:`START_QUEUE_ADMISSION`, as they bracket the
+        ``session/new`` gate in :meth:`create_session`.
+        """
         if self._process is not None:
             raise AcpRuntimeError("Runtime already spawned")
         self._process_tree_confirmed_dead = False
 
         admission = runtime_start._cold_start_admission()
-        wait_ms = await admission.acquire()
-        logger.info(
-            "acp_cold_start stage=queue_wait outcome=admitted wait_ms=%.1f "
-            "active_starts=%d queued_starts=%d",
-            wait_ms,
-            admission.active,
-            admission.queued,
-        )
+        notify_start_queue(logger, on_gate_queued, START_QUEUE_ADMISSION)
+        wait_ms = await admission.acquire(start_priority)
         started = time.monotonic()
         outcome = "error"
         try:
+            # Inside the try: the permit is released below whatever the callback does.
+            notify_start_queue(logger, on_gate_acquired, wait_ms, START_QUEUE_ADMISSION)
+            logger.info(
+                "acp_cold_start stage=queue_wait outcome=admitted priority=%s wait_ms=%.1f "
+                "active_starts=%d queued_starts=%d %s",
+                start_priority.value,
+                wait_ms,
+                admission.active,
+                admission.queued,
+                admission.semaphore.describe(),
+            )
             await self._spawn_admitted_rederiving_once()
             outcome = "ready"
         except asyncio.CancelledError:
@@ -1758,7 +1930,7 @@ class AcpRuntime:
                 admission.queued,
                 process_state,
             )
-            admission.release()
+            admission.release(start_priority)
 
     async def _spawn_admitted_rederiving_once(self) -> None:
         """``_spawn_admitted``, retried ONCE when the post-handshake bracket fires.
@@ -1834,14 +2006,43 @@ class AcpRuntime:
             if self.acp_backend == ACP_BACKEND_KIRO:
                 from kiro_crew.acp.skill_projection import prepare_native_skill_projection
 
-                self._native_skill_projection = await asyncio.to_thread(
-                    prepare_native_skill_projection, self._work_dir
-                )
+                async with self._skill_projection_lock():
+                    generation = self._issue_skill_projection_generation()
+                    spawned = await asyncio.to_thread(
+                        prepare_native_skill_projection, self._work_dir
+                    )
+                    # Issued and adopted under the lock, so nothing newer exists.
+                    self._native_skill_projection = spawned
+                    self._skill_projection_generation = generation
+                # Held for the process's life: the aliases kiro-cli listed at
+                # startup are ones it is guaranteed to have loaded, so later
+                # projections keep translating them in inbound frames
+                # (_activate_mode_bracketed), and holding the object keeps its
+                # lease -- and them -- out of the prune.
+                self._spawn_skill_projection = self._native_skill_projection
                 if self._native_skill_projection is not None:
+                    # Deliberately do NOT set spawn_agent_name here. The shared
+                    # runtime activates the launched agent through
+                    # _activate_mode_bracketed, which allows self._agent at every
+                    # session start explicitly (keyed on self._agent, translate
+                    # bypassing request()). Setting spawn_agent_name would ALSO make
+                    # request() -- the general outbound path a mid-session set_mode
+                    # takes -- tolerate the launch agent indefinitely, so a switch
+                    # back to it after its view vanished would reactivate a cached
+                    # unprojected spec the strict resolver exists to refuse. The
+                    # field stays empty on the shared runtime; only the direct
+                    # client (one session, no mid-session re-entry) sets it. The
+                    # launch mode must still be ADVERTISED so the session open finds
+                    # an activatable mode (frame reads advertised_launch_name, which
+                    # the shared runtime DOES set -- advertising is safe for both
+                    # runtimes; only request()'s mid-session tolerance is withheld).
+                    self._native_skill_projection.advertised_launch_name = self._agent
                     argv = list(argv)
                     agent_position = argv.index("--agent") + 1
                     try:
-                        argv[agent_position] = self._native_skill_projection.agent(self._agent)
+                        argv[agent_position] = self._native_skill_projection.spawn_agent(
+                            self._agent
+                        )
                     except ValueError as exc:
                         # The projection refused this agent's view -- a
                         # ``kirocrew-core`` restriction authored in its spec, a
@@ -1851,7 +2052,11 @@ class AcpRuntime:
                         # paths translate (``providers/acp.py`` handles
                         # ``AcpRuntimeError`` around ``spawn()``); a bare
                         # ``ValueError`` would leave ``spawn()`` as an internal
-                        # failure with the actionable text unread.
+                        # failure with the actionable text unread. ``spawn_agent``
+                        # raises for that authored refusal (a spec that projected
+                        # but excludes the search tool its view needs); an agent
+                        # with no prepared view keeps its authored name and never
+                        # lands here.
                         raise AcpRuntimeError(str(exc)) from exc
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc
@@ -1889,6 +2094,7 @@ class AcpRuntime:
         argv, delegate_internal_sandbox = await asyncio.to_thread(
             apply_pod_bundle_spawn, argv, backend=self._acp_backend
         )
+        spawned_kiro_bin = argv[0] if argv else None
         # The host's credential mask, resolved with its argv and applied here.
         # Empty for a host whose privileged tools ask by construction; for one this
         # core's tool gate ENFORCES it is the compensating control, so a spawn that
@@ -2001,17 +2207,20 @@ class AcpRuntime:
             resolve_krb5_ccname(env)
             # KIRO_API_KEY is one host's own MODEL credential and another
             # host's active hazard, so which way it goes is the harness's answer.
-            # kiro-cli is handed it for its v2 agent loop. The KAS relay has it
-            # REMOVED even though its process is now a kiro-cli: the v3 engine
-            # authenticates either from kiro-cli's OIDC store
-            # (--auth-method cli) or from Crew's vault over the
-            # _kiro/auth/getAccessToken callback, and in BOTH shapes the
-            # variable must be absent — the engine gives an API key in its
-            # environment precedence over the callback, so leaving it set would
-            # silently override the credential the operator signed in with.
+            # kiro-cli is handed it for its v2 agent loop. The KAS relay is a
+            # kiro-cli too, so the answer follows the spawn plan's auth owner:
+            # a cli-owned relay (--auth-method cli) authenticates itself and an
+            # API key is one of its sign-ins, so it is handed the key; a
+            # Crew-owned relay answers _kiro/auth/getAccessToken from Crew's
+            # vault and has the key REMOVED -- the engine gives an API key in
+            # its environment precedence over the callback, so leaving it set
+            # would silently override the credential the operator signed in
+            # with.
             # Called here, before the scrub below, so a host can both add its own
             # variables and remove one this generic path would pass through.
-            self._harness.apply_spawn_env(env)
+            self._harness.apply_spawn_env(
+                env, spawned_binary=spawned_kiro_bin, cli_owned_auth=not plan.host_auth
+            )
 
         await self._to_thread_guarding_sandbox(_resolve_env_off_loop)
         # Parent-side equivalent of the launcher scrub. This is required on
@@ -2046,6 +2255,10 @@ class AcpRuntime:
         # /proc/<pid>/environ to prove a process is THIS spawn's descendant once
         # the root itself is gone.
         env[KIROCREW_SPAWN_INSTANCE_ENV] = spawn_instance
+        # Which install spawned it: the leaked-runtime reclaim refuses a runtime
+        # whose home is absent or differs, since the marker above is shared by
+        # every install on this uid.
+        env[KIROCREW_SPAWN_HOME_ENV] = str(data_home())
         # Own browser session per agent process, matching AcpClient._spawn (see
         # browser_session_env). Per PROCESS, not per agent: with session sharing
         # on (the default) an eligible subagent's session is created on the
@@ -2071,6 +2284,9 @@ class AcpRuntime:
             # Own allocation failed (inherited temp) but the tree's work
             # directory is mounted: the prompt-visible name still points there.
             env["KIROCREW_SCRATCH"] = str(self._shared_scratch)
+        # A host whose state cannot be shared between processes (codex's SQLite
+        # databases) keeps its own copy under this process's scratch directory.
+        _point_private_state_at_scratch(env, plan.private_state_env, self._scratch_dir)
         # Memory-aware cap for pytest-xdist's ``-n auto`` (subagent spawn path —
         # mirrors acp/client.py): xdist sizes auto to the CPU count, ignoring
         # memory; PYTEST_XDIST_AUTO_NUM_WORKERS bounds ONLY auto resolution.
@@ -2359,7 +2575,7 @@ class AcpRuntime:
         # the process, its reader/stderr tasks, its PID-file entries AND its
         # _PROTECTED_PIDS shield would all leak. kill() reaps them (and
         # unregisters the protected PID via _mark_dead) before we re-raise.
-        # BaseException so CancelledError during the 30s handshake also cleans up.
+        # BaseException so CancelledError during the handshake also cleans up.
         try:
             # Start stderr drain
             if self._process.stderr:
@@ -2368,8 +2584,12 @@ class AcpRuntime:
             # Start the single reader task — owns stdout exclusively
             self._reader_task = asyncio.ensure_future(self._reader_loop())
 
-            # Protocol handshake ("initialize"); the budget follows the host's
-            # throttle state -- see _initialize_handshake. The capabilities
+            # Start the process-exit watcher — fails the runtime on the root's
+            # own exit even when stdout stays open behind a surviving descendant.
+            self._exit_watch_task = asyncio.ensure_future(self._exit_watch_loop())
+
+            # Protocol handshake ("initialize"); the cold-start budget is
+            # _INITIALIZE_TIMEOUT -- see _initialize_handshake. The capabilities
             # were resolved above, before the process existed.
             init_resp = await self._initialize_handshake(client_capabilities)
             _agent_caps = init_resp.get("agentCapabilities", {})
@@ -2419,25 +2639,133 @@ class AcpRuntime:
             # cancellation reaches this arm.
             await self._snapshot_descendants(retry_when_empty=True)
         except BaseException:
-            # BEFORE the kill, which is the whole point of the ordering. The
-            # cleanup below cancels the stderr drain, and a line still in the pipe
-            # when it does is a line nobody will ever read -- so the caller's own
-            # settle finds the task already done and learns nothing. Draining here
-            # is the last moment the child's own account of why it could not start
-            # is still reachable, and a sandbox refusal is exactly the failure that
-            # arrives this way: the child writes its signature and closes stdout
-            # together. Bounded and swallowing (see ``settle_stderr``); this is
-            # already the failure path.
-            await self.settle_stderr()
-            try:
-                # This death IS abnormal (failed spawn/handshake): kill()'s
-                # expected=False default keeps its log at WARNING.
-                await self.kill(reason="failed init handshake cleanup")
-            except Exception:
-                logger.debug(
-                    "AcpRuntime: cleanup kill after failed spawn/handshake failed", exc_info=True
+            # One task this frame only WAITS on, so a cancellation cannot cut the
+            # cleanup short. Two ordinary dashboard paths (a newer slot signal, a
+            # slot deletion) cancel this same eager-spawn task, and a cancel that
+            # landed inside the descendant scan below would drop the only record
+            # of the MCP servers the group kill cannot reach. A cancel delivered
+            # while the cleanup runs is absorbed until it settles, then propagated
+            # in place of the original failure. Same shape as the tracking reap
+            # guard above.
+            cleanup = asyncio.ensure_future(self._failed_start_cleanup())
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+            if not cleanup.cancelled() and cleanup.exception() is not None:
+                logger.warning(
+                    "AcpRuntime: failed-start cleanup raised",
+                    exc_info=cleanup.exception(),
                 )
+            if cancelled:
+                raise asyncio.CancelledError()
             raise
+
+    async def _failed_start_cleanup(self) -> None:
+        """Settle stderr, record the tree, kill it, and reap what left the group.
+
+        Runs as its own task under ``_spawn_admitted``'s failed-start guard, which
+        shields it, so every step completes even when the spawning task is
+        cancelled mid-cleanup.
+        """
+        # BEFORE the kill, which is the whole point of the ordering. The
+        # cleanup below cancels the stderr drain, and a line still in the pipe
+        # when it does is a line nobody will ever read -- so the caller's own
+        # settle finds the task already done and learns nothing. Draining here
+        # is the last moment the child's own account of why it could not start
+        # is still reachable, and a sandbox refusal is exactly the failure that
+        # arrives this way: the child writes its signature and closes stdout
+        # together. Bounded (see ``settle_stderr``); this is already the failure
+        # path. A cancel of THIS task (loop shutdown) is absorbed here as it is
+        # in the tree scan below, so the kill that follows still runs.
+        try:
+            await self.settle_stderr()
+        except asyncio.CancelledError:
+            pass
+        # The group kill below reaches only kiro-cli's own process group, and
+        # every stdio MCP server it launches leads a group of its own. A
+        # runtime that served a session has those recorded by the descendant
+        # scan at the end of a successful start; one that failed before it has
+        # none, so its MCP servers outlive it unrecorded. Record the tree now,
+        # while the root still links it, and kill whatever of it survives the
+        # group kill.
+        escapees = await self._record_tree_before_failed_start_kill()
+        # Withheld from the kill's own teardown, which would otherwise report
+        # every recorded MCP server as a survivor it leaves to the orphan sweep,
+        # milliseconds before the reap below kills it. The reap prunes their
+        # tracking entries itself, and owns the verdict on whether any survived.
+        self._child_pids = {}
+        try:
+            # This death IS abnormal (failed spawn/handshake): kill()'s
+            # expected=False default keeps its log at WARNING.
+            await self.kill(reason="failed init handshake cleanup")
+        except Exception:
+            logger.debug(
+                "AcpRuntime: cleanup kill after failed spawn/handshake failed", exc_info=True
+            )
+        if escapees:
+            await self._kill_failed_start_escapees(escapees)
+
+    async def _record_tree_before_failed_start_kill(self) -> dict[int, ChildRecord]:
+        """The descendants of a runtime whose start failed, read before its kill.
+
+        Best-effort and bounded: the scan swallows its own failures. The caller
+        runs it inside a shielded cleanup task, so the spawning task's
+        cancellation never reaches it; a cancellation of the cleanup task itself
+        (loop shutdown) is absorbed so the kill that follows still runs, leaving
+        the tree to the group kill alone.
+        """
+        if platform_compat.IS_WINDOWS:
+            return {}
+        try:
+            await self._snapshot_descendants()
+        except asyncio.CancelledError:
+            return {}
+        return dict(self._child_pids)
+
+    #: How long the failed-start reap waits for SIGKILLed descendants to be
+    #: reaped by their new parent before reporting them as survivors.
+    _FAILED_START_REAP_WAIT = 1.0
+
+    async def _kill_failed_start_escapees(self, escapees: dict[int, ChildRecord]) -> None:
+        """SIGKILL the recorded descendants of a failed start that are still ours.
+
+        Each is checked against the identity recorded at the scan, so a number
+        reused since then is skipped. Entries of the ones confirmed gone are
+        pruned from the tracking file; a survivor keeps its entry for the sweep.
+        A just-killed process is not gone at once (it is a zombie until its new
+        parent reaps it), so the verdict waits a bounded moment for the exits
+        before calling anything a survivor.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._FAILED_START_REAP_WAIT
+        try:
+            await asyncio.to_thread(_kill_escaped_children, escapees)
+            pending = escapees
+            while True:
+                survivors = await asyncio.to_thread(_prune_dead_descendants, pending)
+                if not survivors or loop.time() >= deadline:
+                    break
+                pending = {pid: escapees[pid] for pid in survivors}
+                await asyncio.sleep(0.05)
+        except Exception:
+            self._process_tree_confirmed_dead = False
+            logger.warning(
+                "AcpRuntime: could not reap the descendants of a failed start", exc_info=True
+            )
+            return
+        if survivors:
+            self._process_tree_confirmed_dead = False
+            logger.warning(
+                "AcpRuntime: %d descendant PID(s) of a failed start survived SIGKILL; "
+                "left tracked for the orphan sweep: %s",
+                len(survivors),
+                survivors,
+            )
 
     #: One retry for a descendant scan that came back empty. The spawned root
     #: is a launcher that forks the agent, which forks again, so a scan racing a
@@ -2779,6 +3107,24 @@ class AcpRuntime:
     # window. Class attributes so tests can shrink them.
     _KILL_TERM_TIMEOUT = 5.0
     _KILL_REAP_TIMEOUT = 2.0
+    # Cadence at which the exit watcher polls process.returncode. returncode is
+    # set by _process_exited (the SIGCHLD/waitpid path) the instant the root is
+    # reaped, independent of pipe disconnection, so a short poll notices the
+    # exit even while a surviving descendant holds stdout open and no EOF or
+    # broken-pipe wakes process.wait(). Small enough to keep the fail-fast
+    # promise, large enough not to busy-spin the loop.
+    _EXIT_WATCH_POLL_INTERVAL = 0.25
+
+    # After the exit is confirmed, give the reader a bounded window to drain any
+    # final frame the backend wrote just before exiting -- a completed turn's
+    # response sitting in the pipe the reader has not pulled yet. The reader
+    # stamps ``_last_activity`` on every frame, so progress is observable: keep
+    # yielding while it keeps draining, stop once it has been quiet for one grace
+    # slice (nothing left to pull) or the total cap is reached. The cap bounds
+    # the fail-fast delay a genuinely-empty pipe adds; the per-slice yield lets
+    # the reader run between checks.
+    _EXIT_DRAIN_GRACE = 0.05
+    _EXIT_DRAIN_MAX = 1.0
 
     async def kill(self, *, expected: bool = False, reason: str = "") -> None:
         """Kill the subprocess and release spawn resources even when cancelled.
@@ -2836,6 +3182,13 @@ class AcpRuntime:
             except (asyncio.CancelledError, Exception):
                 pass
 
+        if self._exit_watch_task and not self._exit_watch_task.done():
+            self._exit_watch_task.cancel()
+            try:
+                await self._exit_watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         if self._stderr_task and not self._stderr_task.done():
             self._stderr_task.cancel()
             try:
@@ -2864,6 +3217,19 @@ class AcpRuntime:
             pid = process.pid
             try:
                 await platform_compat.terminate_windows_asyncio_tree(process)
+            except platform_compat.WindowsTreeDrainPending as exc:
+                # Pending, not lost: every pin is in the pending registry and the
+                # cleanup sweep resumes this drain. One line, because a traceback
+                # here reads as the crash and buries the failure that asked for
+                # this kill. Still raised, so the caller retains.
+                logger.warning(
+                    "AcpRuntime Windows tree for PID %s did not finish one bounded drain "
+                    "pass (%d member(s) pending cleanup); its handles stay pinned and the "
+                    "cleanup sweep keeps reaping it",
+                    pid,
+                    exc.pending,
+                )
+                raise
             except (OSError, asyncio.TimeoutError):
                 logger.warning(
                     "AcpRuntime Windows tree cleanup incomplete for PID %s; retaining process",
@@ -3249,7 +3615,9 @@ class AcpRuntime:
         # Audit before condemning the runtime, so the record for this decision
         # cannot race the wait-resolution _mark_dead triggers.
         refusal = _deny()
-        self._mark_dead(f"{request_kind}-answer task cap reached (backend not reading)")
+        self._mark_dead(
+            f"{request_kind}-answer task cap reached (backend not reading)", stdin_stalled=True
+        )
         return refusal
 
     async def _spawn_answer_task(
@@ -3350,7 +3718,9 @@ class AcpRuntime:
             self._audit_denied_off_loop(
                 msg, session_id, f"{reason}:send_stalled_runtime_dead", title=title
             )
-            self._mark_dead("permission-answer write stalled (backend not reading)")
+            self._mark_dead(
+                "permission-answer write stalled (backend not reading)", stdin_stalled=True
+            )
             return
         except AcpRuntimeStdinStalled:
             # send_response's own no-progress bound fired ahead of the outer
@@ -3681,9 +4051,7 @@ class AcpRuntime:
                     future = self._pending_requests.pop(req_id, None)
                     if future and not future.done():
                         if msg.error:
-                            future.set_exception(
-                                AcpRuntimeError(_format_runtime_rpc_error(msg.error))
-                            )
+                            future.set_exception(_runtime_rpc_exception(msg.error))
                         else:
                             future.set_result(msg.result or {})
                         continue
@@ -4194,16 +4562,12 @@ class AcpRuntime:
 
         Bounded and swallowing, because the caller is already on a failure path:
         the worst case of not settling is the generic error it would have produced
-        anyway, and no failure here may become a second failure. The same shape
-        and the same budget as ``AcpClient._read_message``'s own EOF drain.
+        anyway, and no failure here may become a second failure. The same budget
+        as ``AcpClient._read_message``'s own EOF drain, but shielded: this child
+        may still be alive and the drain is still the latches' only writer. A
+        cancel of the caller propagates; see :func:`settle_drain`.
         """
-        task = self._stderr_task
-        if task is None or task.done():
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except (Exception, asyncio.CancelledError):
-            pass
+        await settle_drain(self._stderr_task, timeout)
 
     def saw_sandbox_init_failure(self) -> bool:
         """True if an OS sandbox told this runtime's child it could not initialize.
@@ -4259,6 +4623,118 @@ class AcpRuntime:
         rebuild the profile this spawn was actually refused under.
         """
         return self._sandbox_hidden_dirs
+
+    async def _exit_watch_loop(self) -> None:
+        """Fail the runtime on the root process's OWN exit, not on stdout EOF.
+
+        The reader loop observes a death only as EOF on stdout. A descendant
+        that inherited the root's write end holds that pipe open after the root
+        is gone, so EOF does not arrive and the reader -- parked on ``readuntil``
+        while nothing is being written -- cannot notice the broken pipe either.
+        The death is then invisible until the survivor exits (the pipe finally
+        closing) or idle expiry force-reaps the session, on the order of an hour.
+
+        This watcher keys on the exit itself, by polling ``process.returncode``.
+        ``returncode`` is set by the event loop's ``_process_exited`` -- the
+        SIGCHLD/waitpid path -- the instant the root is reaped, independent of
+        whether the pipes have disconnected. ``process.wait()`` cannot serve
+        here: its waiters are woken only from ``_call_connection_lost``, after
+        ALL pipe transports disconnect, so a descendant holding stdout open
+        parks ``wait()`` exactly as long as it parks the reader -- the watcher
+        would never fire for the very case it exists to catch. The poll sees a
+        non-``None`` returncode as soon as the root is gone, whatever the pipes
+        are doing. A still-``None`` returncode is NOT an exit (a closed pipe the
+        module deliberately refuses to treat as death), so the watcher keeps
+        looping rather than marking dead.
+
+        On the confirmed exit it first gives the reader a bounded window to
+        drain any final frame still readable on stdout -- a completed turn's
+        response the backend wrote just before exiting -- then marks the runtime
+        dead, which fails every pending request and poisons every session queue,
+        so a waiting turn surfaces ``AcpProcessDied`` in seconds instead of
+        waiting for a backstop timer. The drain yields in short slices while the
+        reader keeps routing frames (it stamps ``_last_activity`` per frame) and
+        ends the moment the reader goes quiet with an empty buffer, so it costs
+        the fail-fast path at most one idle slice on a pipe with nothing left.
+
+        The reader keeps priority: the drain window lets an EOF that arrives in
+        the same breath (the ordinary same-second close) run the reader's own
+        death+retire path first, and ``_mark_dead`` is idempotent, so the loser
+        of that race is a no-op. The exit reason is read AFTER the returncode is
+        observed, so it carries the real code rather than ``<not reaped>``.
+        """
+        process = self._process
+        if process is None:
+            return
+        try:
+            while process.returncode is None:
+                await asyncio.sleep(self._EXIT_WATCH_POLL_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A returncode read that cannot complete (a mock without the
+            # attribute, an OS reap race) leaves death detection to the reader's
+            # EOF path. It must never crash the runtime.
+            logger.debug(
+                "AcpRuntime: exit watcher could not poll the runtime process", exc_info=True
+            )
+            return
+        # Let the reader drain whatever is already readable before the mark.
+        # The backend can write a final response and exit; those bytes sit in
+        # the pipe the reader has not pulled yet. _mark_dead clears pending
+        # routes and poisons the session queues, so marking before that frame is
+        # routed loses a completed turn's response. Yield in short slices while
+        # the reader keeps making progress (it stamps _last_activity per frame),
+        # and stop as soon as it goes quiet for one slice -- nothing left to pull
+        # -- or the total cap is reached. This drains readable frames WITHOUT
+        # waiting for EOF, which the surviving descendant holding stdout open may
+        # never deliver. An EOF observed in the same breath still wins: the
+        # reader's own death+retire path runs during the grace, and _mark_dead is
+        # idempotent so the slower observer here is a no-op.
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._EXIT_DRAIN_MAX
+        while not self._dead and loop.time() < deadline:
+            before = self._last_activity
+            await asyncio.sleep(self._EXIT_DRAIN_GRACE)
+            if self._dead:
+                break
+            if self._last_activity == before and not self._reader_has_buffered_input():
+                # The reader processed nothing this slice and nothing is waiting
+                # in its buffer: the pipe is drained, stop waiting.
+                break
+        # Mark dead only once -- a reader-crash, broken-pipe or write-stall path
+        # may already have set it before the root exited. But those paths mark
+        # dead WITHOUT retiring the registry, so the confirmed exit still owes
+        # the retirement: run it whether or not this watcher is the one that
+        # marked. _retire_tracking_after_exit is identity-guarded and idempotent,
+        # so a second call once the reader's EOF branch has already retired is a
+        # no-op, and a stale PID-ledger line a non-retiring death mark left
+        # standing is cleared the moment the exit is confirmed.
+        if not self._dead:
+            rc = process.returncode
+            self._mark_dead(self._exit_reason(rc))
+        # The reader is still parked on a stdout that never reaches EOF, so it
+        # will not run the retire path the EOF branch owns; run it here instead.
+        await self._retire_tracking_after_exit()
+
+    def _reader_has_buffered_input(self) -> bool:
+        """Whether stdout still holds bytes the reader has not consumed.
+
+        ``StreamReader`` keeps already-read bytes in a private ``_buffer`` until
+        a ``readuntil``/``read`` consumes them. A non-empty buffer means a frame
+        (or part of one) is still waiting to be routed, so the exit-drain window
+        must keep yielding to the reader rather than mark the runtime dead. The
+        private attribute is read defensively: any failure reports "nothing
+        buffered" so the drain ends on its cap rather than crashing.
+        """
+        process = self._process
+        stdout = process.stdout if process is not None else None
+        if stdout is None:
+            return False
+        try:
+            return bool(stdout._buffer)  # type: ignore[attr-defined]
+        except Exception:
+            return False
 
     def _exit_reason(self, rc: object) -> str:
         """The death reason for a process that exited: its exit status, and a CAUSE only if proven.
@@ -4386,8 +4862,14 @@ class AcpRuntime:
         else:
             log("AcpRuntime reaped after an observed exit (PID %s): returncode=%s", self._pid, rc)
 
-    def _mark_dead(self, reason: str, *, expected: bool = False) -> None:
+    def _mark_dead(
+        self, reason: str, *, expected: bool = False, stdin_stalled: bool = False
+    ) -> None:
         """Mark runtime dead, fail all pending requests, poison all session queues.
+
+        ``stdin_stalled`` records that the death is a stdin stall with the child
+        still alive (see ``stdin_stall_death``), BEFORE the queues are poisoned,
+        so every session woken by the poison reads it.
 
         ``expected`` selects only the log severity: a deliberate teardown (a
         warm-pool TTL recycle, a session shutdown) logs at INFO, while every
@@ -4399,6 +4881,9 @@ class AcpRuntime:
         """
         if self._dead:
             return
+        self._stdin_stall_death = stdin_stalled
+        if stdin_stalled:
+            self._stall_turn_sessions = frozenset(self._turn_active_sessions)
         # Read co-tenancy BEFORE the flag flips. Both readings go through
         # liveness -- ``outstanding_leases`` excludes a dead runtime's leases by
         # design, and ``is_alive()`` consults ``_dead`` -- so a count taken after
@@ -4511,8 +4996,10 @@ class AcpRuntime:
     async def _retire_tracking_after_exit(self) -> None:
         """Drop this root's registry entries once its exit is CONFIRMED, not inferred.
 
-        Called from the reader loop's EOF branch, which is the only death path that
-        observes an exit instead of causing one. ``_kill_inner`` untracks after it
+        Called from the two death paths that observe an exit instead of causing
+        one: the reader loop's EOF branch, and the ``_exit_watch_loop`` that
+        polls ``process.returncode`` so a death with stdout held open by a
+        survivor is still seen. ``_kill_inner`` untracks after it
         reaps; a root killed from outside (an OOM kill, a ``pkill``, an operator)
         reached no such step, so its ``kiro_session_pids.txt`` / ``kiro_pids.txt``
         lines survived until the periodic sweep's next tick, bounded only by
@@ -4595,12 +5082,22 @@ class AcpRuntime:
 
     # ── Protocol Interface (used by AcpSessionHandle) ──
 
-    async def send_request(self, method: str, params: dict[str, Any]) -> int:
+    async def send_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        on_reserved: "Callable[[int], None] | None" = None,
+    ) -> int:
         """Send a JSON-RPC request and return the request id.
 
         The response will be routed to the session's queue (via _routed_requests)
         so AcpSessionHandle can detect turn completion. For requests that need
         an immediate response (init, session/new), use _send_and_await instead.
+
+        ``on_reserved`` is called with the id BEFORE the write, whose ``drain()``
+        can suspend: the response can reach the session queue during that
+        suspension, so a caller that must claim it registers the id by then.
         """
         if not self._process or not self._process.stdin:
             raise AcpRuntimeDead("process not running")
@@ -4617,18 +5114,20 @@ class AcpRuntime:
         session_id = params.get("sessionId")
         if session_id and session_id in self._session_queues:
             self._routed_requests[req_id] = session_id
+        if on_reserved is not None:
+            on_reserved(req_id)
 
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
 
         try:
-            # Under the write lock so a response frame waiting behind this
-            # (caller-sized, deliberately unbounded) frame measures the
-            # reader's progress exactly; see await_under_no_progress_bound.
-            async with self._stdin_write_lock():
-                self._refuse_write_if_dead()
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded on the reader's PROGRESS, not held across a raw drain: on
+            # the shared stdin a request write that parks while kiro-cli is
+            # flow-control-paused must not hold the write lock and wedge every
+            # other session. On a stall _write_request_bounded marks the runtime
+            # dead and raises AcpRuntimeStdinStalled (an AcpRuntimeDead) -- caught
+            # below so the routing registration is dropped like any other death.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except AcpRuntimeDead:
             self._routed_requests.pop(req_id, None)
             raise
@@ -4709,6 +5208,89 @@ class AcpRuntime:
             self._stdin_lock = lock
         return lock
 
+    # ── Skill-view projection: one preparation at a time, newest view wins ──
+    #
+    # Every session start re-prepares the native skill projection and sends the
+    # alias it published, and starts on one runtime overlap. A preparation reads
+    # the agent specs BEFORE it waits on the cross-process alias lock, so without
+    # ordering a start that read the spec before an edit revoked a grant could
+    # return last, become ``_native_skill_projection`` and activate that alias.
+    #
+    # Two mechanisms close it, and each needs the other:
+    #
+    # * ``_skill_projection_lock`` serializes preparation AND adoption per runtime,
+    #   so preparations read the specs in the order they are adopted. It is held
+    #   only across the ``to_thread`` preparation and the in-memory adoption,
+    #   never across ``session/set_mode`` (which can take a whole handshake budget
+    #   while a switched-to MCP server boots), and never across blocking I/O on
+    #   the loop: the file I/O runs in the worker thread.
+    # * a generation, issued under the lock before the read, stamps each adopted
+    #   projection. Adoption refuses one older than the adopted generation, and a
+    #   start whose ``set_mode`` is still pending re-checks it before every attempt
+    #   and after the answer: a newer view adopted meanwhile is the one it uses, or,
+    #   once the host has already answered for the older alias, the start fails.
+    #   The after-answer check first takes the lock itself, so a preparation that
+    #   was still running when the answer arrived is adopted before it is judged.
+    #   A preparation runs to completion even when its start is cancelled, and its
+    #   view is adopted before the cancellation propagates; one that yields no
+    #   view (or raises) is recorded as unadopted, and until a later view is
+    #   adopted a pending start cannot prove its view current and fails.
+    #   The lock is what makes the counter mean "read later": issued outside it, a
+    #   later generation could belong to a thread that read the spec first.
+    #
+    # Lock order (outermost first): ``_skill_projection_lock`` (asyncio, this
+    # runtime) -> the alias file lock ``_projection_alias_lock`` (flock, taken in
+    # the worker thread) -> the workspace ``cli.json`` settings lock -> the
+    # projection lease. Nothing that holds a file lock ever awaits the asyncio
+    # lock: the file locks are taken and released inside one synchronous call on a
+    # worker thread, so the thread cannot wait on the loop, and the loop never
+    # blocks on a file lock. ``_stdin_write_lock`` is never taken while this lock
+    # is held, because the send happens after adoption releases it, and the
+    # after-answer check takes this lock with no other lock held.
+
+    def _skill_projection_lock(self) -> asyncio.Lock:
+        """The per-runtime lock around skill-view preparation and adoption.
+
+        Created on first use, like :meth:`_stdin_write_lock`, so a runtime built
+        without ``__init__`` (test doubles) has one."""
+        lock = getattr(self, "_skill_projection_lock_obj", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._skill_projection_lock_obj = lock
+        return lock
+
+    def _issue_skill_projection_generation(self) -> int:
+        """The next preparation generation. Call with the projection lock held."""
+        generation = int(getattr(self, "_skill_projection_issued", 0)) + 1
+        self._skill_projection_issued = generation
+        return generation
+
+    def _adopted_skill_projection_generation(self) -> int:
+        return int(getattr(self, "_skill_projection_generation", 0))
+
+    def _note_unadopted_skill_projection(self, generation: int) -> None:
+        """Record that preparation *generation* ended without being adopted.
+
+        It may have read an edit no adopted view reflects (it returned no view, or
+        raised), so until a later preparation is adopted a pending start cannot
+        prove its view is current. Call with the projection lock held."""
+        if generation > self._unadopted_skill_projection_generation():
+            self._skill_projection_unadopted = generation
+
+    def _unadopted_skill_projection_generation(self) -> int:
+        return int(getattr(self, "_skill_projection_unadopted", 0))
+
+    def _adopt_skill_projection(self, prepared: Any, generation: int) -> bool:
+        """Make *prepared* this runtime's projection unless a newer one was adopted.
+
+        Call with the projection lock held. Returns ``False`` -- and changes
+        nothing -- for a preparation older than (or as old as) the adopted one."""
+        if generation <= self._adopted_skill_projection_generation():
+            return False
+        self._native_skill_projection = prepared
+        self._skill_projection_generation = generation
+        return True
+
     async def _write_response_bounded(self, data: bytes, request_id: str | int) -> None:
         """Write a response/error frame under the write lock and a no-progress bound.
 
@@ -4737,16 +5319,105 @@ class AcpRuntime:
         safe_id = _loggable_request_id(request_id)
         window = response_write_window_secs(self._process.stdin, _RESPONSE_WRITE_BOUND_SECS)
         logger.warning(
-            "ACP runtime stdin stalled: no write progress for %gs (floor %d bytes/window) "
+            "ACP runtime stdin stalled: %s "
             "while delivering response to req=%s; marking runtime dead",
-            window,
-            _RESPONSE_WRITE_MIN_PROGRESS_BYTES,
+            _stall_window_phrase(self._process.stdin, window),
             safe_id,
         )
-        self._mark_dead("response write stalled (backend not reading stdin)")
+        self._mark_dead("response write stalled (backend not reading stdin)", stdin_stalled=True)
         raise AcpRuntimeStdinStalled(
             f"stdin stalled: no write progress for {window:g}s while "
             f"delivering response to req={safe_id}"
+        )
+
+    async def _write_request_bounded(self, data: bytes, request_id: int, method: str) -> None:
+        """Write a REQUEST frame under the write lock and the same no-progress bound.
+
+        The request twin of :meth:`_write_response_bounded`, for the same
+        shared-runtime hazard: one stdin serves every multiplexed session, so a
+        request write (``session/prompt``, ``session/new``, ``set_mode``,
+        ``_session/steering``) that holds the lock across an unbounded ``drain()``
+        parks forever WITH the lock held whenever kiro-cli is flow-control-paused
+        -- busy generating on one lane and not reading stdin, the state right
+        after ``spawn_run`` fans several session prompts onto the one pipe. Every
+        other session's stdin write then queues behind that lock at 0 CPU while
+        the busy lane keeps streaming stdout and looks healthy. The bound is on
+        PROGRESS, not elapsed time, so a caller-sized frame (a prompt may carry
+        any number of image blocks) stays legal: a reader still consuming keeps
+        the wait alive, and only a writer whose buffer has not shrunk for
+        ``_RESPONSE_WRITE_BOUND_SECS`` is the reader-gone stall.
+
+        Both phases mark the runtime dead and raise
+        :class:`AcpRuntimeStdinStalled`, which the session provider translates to
+        ``AcpProcessDied`` so the caller takes the ownership-authorized session-
+        reset recovery the broken-pipe case uses. This path does NOT kill the
+        child: a ``DRAIN_STALL`` can leave the frame buffered in a kiro-cli that
+        resumes, but killing cannot be guaranteed (a close/EOF keeps flushing the
+        buffered bytes and the wedged child is the one that will not exit in a kill
+        grace, so death is unconfirmed before the raise) and, on this shared
+        runtime, signalling the child from a write path bypasses the
+        ``authorize_runtime_kill`` ownership gate and teardown barrier the only
+        sanctioned teardown takes, terminating sibling sessions' work unauthorized.
+        Instead a ``DRAIN_STALL`` raises with ``ambiguous_delivery`` set, which
+        rides through ``_translate_dead`` into ``build_recovery_requeue`` and makes
+        the recovery resume from restored state rather than replay the prompt the
+        paused backend may have consumed; a ``LOCK_STALL`` wrote no byte, so it is
+        not ambiguous and its replay is safe. The method name and request id appear
+        only through ``_loggable_request_id``.
+        """
+        assert self._process is not None and self._process.stdin is not None
+        result = await write_request_frame_bounded(
+            self._process.stdin,
+            self._stdin_write_lock(),
+            data,
+            bound_secs=_RESPONSE_WRITE_BOUND_SECS,
+            before_write=self._refuse_write_if_dead,
+        )
+        if result is RequestWriteResult.OK:
+            return
+        safe_id = _loggable_request_id(request_id)
+        window = response_write_window_secs(self._process.stdin, _RESPONSE_WRITE_BOUND_SECS)
+        logger.warning(
+            "ACP runtime stdin stalled: %s while sending request method=%s req=%s; "
+            "marking runtime dead (%s)",
+            _stall_window_phrase(self._process.stdin, window),
+            _loggable_request_id(method),
+            safe_id,
+            # Which phase stalled, for the log only -- recovery is the same either
+            # way (see below).
+            (
+                "frame never written"
+                if result is RequestWriteResult.LOCK_STALL
+                else "frame already buffered"
+            ),
+        )
+        # Both phases mark the runtime dead and raise -- no direct child kill from
+        # here. On the shared runtime the child serves every multiplexed session,
+        # and signalling it from a write path bypasses the ownership
+        # authorization + teardown barrier (authorize_runtime_kill) that the only
+        # sanctioned teardown takes, so it would terminate sibling sessions' work
+        # unauthorized. Instead the two phases differ ONLY in the recovery hint
+        # they carry: a LOCK_STALL wrote no byte, so the recovery's prompt replay
+        # is the frame's first and only delivery (replay safe); a DRAIN_STALL left
+        # the frame in the transport, which a kiro-cli that merely paused reading
+        # could still consume -- so it is flagged ambiguous_delivery, and the
+        # recovery resumes from restored state rather than replaying the prompt
+        # verbatim (which would run its tools twice). The flag rides the stall
+        # through _translate_dead onto AcpProcessDied; the authorized teardown
+        # reaps the old child through the ownership path.
+        drain_stall = result is RequestWriteResult.DRAIN_STALL
+        self._mark_dead(
+            (
+                "request write stalled after the frame was buffered"
+                if drain_stall
+                else "request write stalled waiting for stdin lock"
+            ),
+            stdin_stalled=True,
+        )
+        raise AcpRuntimeStdinStalled(
+            f"stdin stalled: no write progress for {window:g}s while "
+            f"sending request req={safe_id}",
+            ambiguous_delivery=drain_stall,
         )
 
     async def send_request_for_answer(
@@ -4795,16 +5466,19 @@ class AcpRuntime:
         if on_registered is not None:
             on_registered(future)
         try:
-            # Through the transport's write lock like every other stdin writer:
-            # a response write measuring the buffer level for its no-progress bound
-            # must be the only writer in flight (see await_under_no_progress_bound).
-            async with self._stdin_write_lock():
-                self._refuse_write_if_dead()
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded like send_request: a raw drain here would hold the
+            # shared write lock against a flow-control-paused kiro-cli. A
+            # stall marks the runtime dead and raises AcpRuntimeStdinStalled (an
+            # AcpRuntimeDead), caught below so the pending future is retrieved or
+            # cancelled rather than left unretrieved.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except AcpRuntimeDead:
-            # From _refuse_write_if_dead: _mark_dead already failed or dropped the
-            # future; retrieve or cancel it so asyncio logs nothing unhandled.
+            # Reached two ways, both of which have already resolved the future
+            # before the raise, so retrieve or cancel it here only to stop
+            # asyncio logging a handled error as unhandled: _refuse_write_if_dead
+            # (a sibling stall marked the runtime dead while this caller held the
+            # lock wait), or _write_request_bounded's own stall paths -- both of
+            # which call _mark_dead and fail this pending future first.
             self._pending_requests.pop(req_id, None)
             if future.done():
                 if not future.cancelled():
@@ -4981,7 +5655,7 @@ class AcpRuntime:
 
     # ── Session Management ──
 
-    def _mcp_init_progress(self, expected: Any) -> str:
+    def _mcp_init_progress(self, expected: Any, *, queued_behind: bool = False) -> str:
         """Describe MCP registration progress for a session start that stalled.
 
         Reads the frames the reader loop already staged in
@@ -5066,12 +5740,14 @@ class AcpRuntime:
             silent = [n for n in roster if n not in reported]
             if silent:
                 parts.append(f"no report from {_capped_names(silent)}")
-            elif not set(failed) & set(roster):
+            elif not set(failed) & set(roster) and not queued_behind:
                 # Every roster member reported READY. A member that reported an
                 # init failure counts as reported (so it is never chased as
                 # silent) but is named under ``failed:`` below, and the stall
                 # may be in it -- so the "not in those servers" verdict is
-                # withheld then.
+                # withheld then. It is withheld too when the start was sent
+                # behind unanswered requests: the budget may have gone to those
+                # before this start ran at all, which is not "later in startup".
                 parts.append(MCP_ROSTER_COMPLETE_NOTE)
         else:
             # No roster to attribute against: these reports belong to the agent
@@ -5104,7 +5780,12 @@ class AcpRuntime:
         answer. Returns a replacement to raise rather than raising here, so the
         caller keeps the ``from exc`` chain.
         """
-        progress = self._mcp_init_progress(expected)
+        queued = _queued_behind_note(getattr(exc, "queued_behind", None) or [])
+        progress = "; ".join(
+            part
+            for part in (queued, self._mcp_init_progress(expected, queued_behind=bool(queued)))
+            if part
+        )
         logger.warning("%s stalled: %s", method, progress or "no MCP reports staged")
         # Tag the exception the caller will raise as a SESSION-START failure,
         # whichever of the two it is: both reach a self-driving caller as "the
@@ -5299,6 +5980,105 @@ class AcpRuntime:
             f"--agent-only` to rewrite the agent config."
         )
 
+    def _resolve_start_alias(self, projection: Any, mode_agent: str) -> str:
+        """Resolve *mode_agent*'s alias for a session START, launch-agent-aware.
+
+        The launched agent's own activation is allowed at EVERY start even with
+        no prepared view (the process is already running as it, and a shared
+        runtime starts many sessions as self._agent over its life), so it takes
+        ``spawn_agent`` (which keeps the authored name) rather than the strict
+        ``agent``. Every OTHER mode_agent takes the strict resolver, so a switch
+        to a mode this view never prepared is still rejected. Used at the initial
+        resolution AND at both supersession re-checks, so a newer EMPTY projection
+        adopted by a concurrent start does not reject the unchanged launch agent
+        the strict resolver has no entry for."""
+        if mode_agent and mode_agent == self._agent:
+            return str(projection.spawn_agent(mode_agent))
+        return str(projection.agent(mode_agent))
+
+    def _superseding_alias(self, projection: Any, mode_agent: str) -> str:
+        """*mode_agent*'s alias in a newer view adopted while its start was pending.
+
+        The start's own preparation is older than that view, so its alias is never
+        sent again; when the newer view does not offer the agent at all, the
+        start fails rather than fall back to the older one."""
+        try:
+            return self._resolve_start_alias(projection, mode_agent)
+        except ValueError as exc:
+            emit_counter(SKILL_VIEW_FALLBACKS, {"outcome": "refused_superseded"})
+            raise AcpRuntimeError(
+                f"Agent {mode_agent!r} changed while this session was starting, and its "
+                f"new skill view cannot be used ({exc}). The session was not started on "
+                "the copy from before the change, which could carry permissions the change "
+                "removed. Fix the agent and start the session again; if it keeps failing, "
+                "restart the gateway."
+            ) from exc
+
+    def _refuse_if_view_unverified(self, mode_agent: str, used_generation: int) -> None:
+        """Fail a start while the newest preparation of this runtime was not adopted.
+
+        A preparation that began after this start's own and ended without a view
+        (no view could be prepared, or it raised) may have read an edit to
+        *mode_agent*'s spec that no adopted view reflects, so nothing proves the
+        alias this start sends, or the host activated, is current. A view adopted
+        after that preparation read the specs later still, and clears it."""
+        unadopted = self._unadopted_skill_projection_generation()
+        if unadopted <= max(used_generation, self._adopted_skill_projection_generation()):
+            return
+        emit_counter(SKILL_VIEW_FALLBACKS, {"outcome": "refused_superseded"})
+        logger.warning(
+            "AcpRuntime set_mode: a newer skill-view preparation did not complete while "
+            "agent=%s was starting; refusing to start the session on a view it cannot "
+            "verify",
+            mode_agent,
+        )
+        raise AcpRuntimeError(
+            f"Agent {mode_agent!r}: a newer preparation of its skill view did not "
+            "complete while this session was starting, so nothing proves the view "
+            "kiro-cli would run still matches the agent's spec. The session was not "
+            "started. Start it again; if it keeps failing, restart the gateway."
+        )
+
+    def _refuse_if_view_superseded(
+        self, mode_agent: str, sent_alias: str, used_generation: int
+    ) -> None:
+        """Fail a start the host answered after a newer view changed its agent.
+
+        A concurrent start may adopt a newer projection while this start's
+        ``set_mode`` is pending. Nothing says whether the host activated the older
+        alias before or after that newer preparation read the spec, so when the
+        newer view gives *mode_agent* a different alias the session may be running
+        a view an edit has since revoked grants from, and it is not started. A
+        newer view that leaves this agent's alias unchanged refuses nothing. Call
+        with the projection lock held, so no preparation is mid-flight."""
+        self._refuse_if_view_unverified(mode_agent, used_generation)
+        if self._adopted_skill_projection_generation() == used_generation:
+            return
+        projection = getattr(self, "_native_skill_projection", None)
+        try:
+            newest = (
+                self._resolve_start_alias(projection, mode_agent)
+                if projection is not None
+                else None
+            )
+        except ValueError:
+            newest = None
+        if newest == sent_alias:
+            return
+        emit_counter(SKILL_VIEW_FALLBACKS, {"outcome": "refused_superseded"})
+        logger.warning(
+            "AcpRuntime set_mode: skill view %s for agent=%s was replaced by a newer "
+            "preparation while the request was pending; refusing to start the session",
+            sent_alias,
+            mode_agent,
+        )
+        raise AcpRuntimeError(
+            f"Agent {mode_agent!r} changed while this session was starting, and kiro-cli "
+            f"may have activated the skill view prepared before the change ({sent_alias}), "
+            "which could carry permissions the change removed. The session was not "
+            "started. Start it again; if it keeps failing, restart the gateway."
+        )
+
     async def _activate_mode_bracketed(
         self,
         session_id: str,
@@ -5361,23 +6141,188 @@ class AcpRuntime:
                 await self.terminate_session(session_id)
                 raise AcpRuntimeError(str(exc)) from exc
         try:
+            projection_now: Any = None
+            used_generation = 0
             if getattr(self, "_native_skill_projection", None) is not None:
                 from kiro_crew.acp.skill_projection import prepare_native_skill_projection
 
-                # Keep the transport mode selected at spawn for this process.
-                # The rollback environment switch takes effect after restart.
-                self._native_skill_projection = await asyncio.to_thread(
-                    prepare_native_skill_projection, self._work_dir, enabled=True
-                )
+                # Preparation and adoption run under the per-runtime projection
+                # lock, so overlapping starts read the specs in the order their
+                # views are adopted (see _skill_projection_lock for the lock order).
+                async with self._skill_projection_lock():
+                    previous = getattr(self, "_native_skill_projection", None)
+                    generation = self._issue_skill_projection_generation()
+                    adopted = False
+                    try:
+                        # Keep the transport mode selected at spawn for this process.
+                        # The rollback environment switch takes effect after restart.
+                        prepared, cancelled = await _prepare_projection_to_completion(
+                            prepare_native_skill_projection, self._work_dir, enabled=True
+                        )
+                        if prepared is not None:
+                            # set_mode always names the FRESH alias, never an older
+                            # one: an alias the host loaded earlier (the spawn one
+                            # included) may hold a generation of the spec an edit has
+                            # since revoked grants from. Inbound frames keep
+                            # translating every alias this process published before
+                            # (``recognise``), so an agent the host still lists under
+                            # an older alias stays selectable. Holding
+                            # ``_spawn_skill_projection`` keeps those aliases -- and so
+                            # the host's view of them -- out of the prune.
+                            spawn = getattr(self, "_spawn_skill_projection", None)
+                            if spawn is not None:
+                                prepared.recognise(spawn)
+                            if previous is not None:
+                                prepared.recognise(previous)
+                            # Under the lock a fresh generation is always the
+                            # newest; the refusal keeps an older preparation from
+                            # ever replacing a newer one should adoption be reached
+                            # any other way.
+                            adopted = self._adopt_skill_projection(prepared, generation)
+                        if cancelled:
+                            # Adopted first: a view this preparation read must not
+                            # vanish with the start that asked for it.
+                            raise asyncio.CancelledError
+                        if prepared is None:
+                            # No view could be prepared (the alias lock is busy), so
+                            # nothing proves any alias this process holds still says
+                            # what the agent's spec says now. Fail the start rather
+                            # than activate one.
+                            emit_counter(SKILL_VIEW_FALLBACKS, {"outcome": "refused_unprepared"})
+                            logger.warning(
+                                "skill projection: re-preparation unavailable at set_mode; "
+                                "refusing to start agent %r on a view it cannot verify",
+                                mode_agent,
+                            )
+                            raise AcpRuntimeError(
+                                f"Agent {mode_agent!r}: its skill view could not be "
+                                "prepared (the skill-view lock is held by another Kiro "
+                                "Crew process), so this session was not started. Try "
+                                "again in a moment; if it keeps failing, restart the "
+                                "gateway."
+                            )
+                    finally:
+                        if not adopted:
+                            self._note_unadopted_skill_projection(generation)
+                    projection_now = self._native_skill_projection
+                    used_generation = self._adopted_skill_projection_generation()
             # set_mode is a handshake request: switching to an agent boots THAT
             # agent's MCP servers, the same server (re-)initialization that gives
             # session/new and session/load their 90s budget. A switched-to server
             # pending OAuth holds the response for its full 30s wait, so the generic
             # _REQUEST_TIMEOUT would turn set_mode into the SAME race the
             # session-start floor exists to prevent (see _SESSION_NEW_TIMEOUT).
-            await self._send_and_await(
-                METHOD_SET_MODE, set_mode_params(session_id, mode_agent), timeout=budget
-            )
+            #
+            # kiro-cli 2.25/2.26 does not reload its agents directory on the rename
+            # that publishes an alias, so a fresh one can answer ``Mode '<alias>' not
+            # found`` while the file is on disk. A miss for the alias this projection
+            # translated *mode_agent* to -- and for nothing else -- forces a rescan and
+            # is retried after _PROJECTED_MODE_RETRY_DELAYS_SECS. When the host still
+            # has not loaded it, the start FAILS with the remedy: no other copy of the
+            # agent (an older alias, or the authored spec kiro-cli cached) is proven
+            # to match the spec on disk, so none is activated in its place. Every other
+            # error propagates as before.
+            params = set_mode_params(session_id, mode_agent)
+            # Translated from the projection this bracket adopted and sent as
+            # fixed wire params -- past the send's own translation, which reads
+            # ``_native_skill_projection`` at send time. The projection lock is
+            # NOT held across the send, so a concurrent start may adopt a newer
+            # view while this request is pending or between retries: before each
+            # attempt the alias is re-derived from the newest adopted view (never
+            # an older one), and an answer that arrives after a newer view
+            # changed this agent fails the start (``_refuse_if_view_superseded``).
+            # ``translate`` is passed only when a projection exists, so the send
+            # is the same call as before for every caller without one.
+            wire = params
+            sent_alias: str | None = None
+            untranslated: dict[str, Any] = {}
+            if projection_now is not None:
+                # The launched agent's own activation is allowed at EVERY session
+                # start, even with no prepared view: the process is already running
+                # as it, and a shared runtime starts many sessions as self._agent
+                # over its life, so this is not a one-shot token to consume -- doing
+                # so would break the second shared session that legitimately starts
+                # as the same agent. _resolve_start_alias keeps the authored name
+                # for self._agent; every OTHER mode_agent takes the strict agent(),
+                # so a switch to a mode this projection never prepared is still
+                # rejected and an agent cannot escape its scope. The SAME resolver
+                # runs at both supersession re-checks below, so a newer empty
+                # projection adopted by a concurrent start does not reject the
+                # unchanged launch agent. The general (mid-session) set_mode path
+                # stays strict as before -- this allowance is scoped to the start
+                # bracket and keyed on self._agent, not on a mutable token.
+                sent_alias = self._resolve_start_alias(projection_now, mode_agent)
+                wire = {**params, "modeId": sent_alias}
+                untranslated = {"translate": False}
+            retries = iter(_PROJECTED_MODE_RETRY_DELAYS_SECS)
+            missed: str | None = None
+            while True:
+                if (
+                    sent_alias is not None
+                    and self._adopted_skill_projection_generation() != used_generation
+                ):
+                    projection_now = self._native_skill_projection
+                    used_generation = self._adopted_skill_projection_generation()
+                    newest = self._superseding_alias(projection_now, mode_agent)
+                    if newest != sent_alias:
+                        # The retry schedule and the miss record belong to the
+                        # alias being replaced; the newer one starts its own.
+                        sent_alias = newest
+                        wire = {**params, "modeId": sent_alias}
+                        retries = iter(_PROJECTED_MODE_RETRY_DELAYS_SECS)
+                        missed = None
+                if sent_alias is not None:
+                    self._refuse_if_view_unverified(mode_agent, used_generation)
+                try:
+                    await self._send_and_await(
+                        METHOD_SET_MODE, wire, timeout=budget, **untranslated
+                    )
+                except AcpModeNotFound as exc:
+                    if sent_alias is None or exc.mode_id != sent_alias:
+                        raise
+                    missed = exc.mode_id
+                    delay = next(retries, None)
+                    if delay is None:
+                        emit_counter(SKILL_VIEW_FALLBACKS, {"outcome": "refused_unloaded"})
+                        logger.warning(
+                            "AcpRuntime set_mode: kiro-cli has not loaded skill view %s for "
+                            "agent=%s after a forced reload and %d attempt(s); refusing to "
+                            "start the session on any other copy of the agent",
+                            missed,
+                            mode_agent,
+                            1 + len(_PROJECTED_MODE_RETRY_DELAYS_SECS),
+                        )
+                        raise AcpRuntimeError(
+                            f"Agent {mode_agent!r} changed since this kiro-cli process "
+                            f"started, and kiro-cli has not loaded its new skill view "
+                            f"({missed}) after a forced reload. The session was not started "
+                            "on an older copy of the agent, which could carry permissions "
+                            "the change removed. Restart the gateway to apply the change."
+                        ) from exc
+                    # kiro-cli reloads on a data write, never on the rename that
+                    # published the alias, and a miss triggers no reload: rewrite
+                    # the alias's own bytes in place so it rescans, then retry.
+                    from kiro_crew.acp.skill_projection import announce_alias
+
+                    await asyncio.to_thread(announce_alias, exc.mode_id)
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            if sent_alias is not None:
+                # Wait out any preparation already running: one that began before
+                # this answer may have read an edit the host's activation predates,
+                # and it is adopted only when it finishes. Nothing else is held
+                # here, so this cannot invert the lock order.
+                async with self._skill_projection_lock():
+                    self._refuse_if_view_superseded(mode_agent, sent_alias, used_generation)
+            if missed is not None:
+                emit_counter(SKILL_VIEW_FALLBACKS, {"outcome": "loaded_after_retry"})
+                logger.info(
+                    "AcpRuntime set_mode: kiro-cli loaded skill view %s for agent=%s "
+                    "after a reload",
+                    missed,
+                    mode_agent,
+                )
         except Exception:
             await self.terminate_session(session_id)
             raise
@@ -5977,9 +6922,10 @@ class AcpRuntime:
         session_key: str = "",
         channel_id: str = "",
         memory_mode: str = "persistent",
-        on_gate_acquired: Callable[[float], None] | None = None,
+        on_gate_acquired: Callable[..., None] | None = None,
         late_adopter: "Callable[[AcpSessionHandle], Awaitable[bool]] | None" = None,
-        on_gate_queued: Callable[[], None] | None = None,
+        on_gate_queued: Callable[..., None] | None = None,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> AcpSessionHandle:
         """Create a new ACP session on this runtime. Returns a session handle.
 
@@ -6005,11 +6951,13 @@ class AcpRuntime:
         element. Empty — and unread — for a host with no mirror.
 
         ``session/new`` runs under the loop's :class:`SessionStartGate`
-        (``agent.session_start_concurrency``). ``on_gate_queued()`` fires
+        (``agent.session_start_concurrency``). ``on_gate_queued(queue)`` fires
         immediately before the wait for a permit begins and
-        ``on_gate_acquired(queue_wait_ms)`` at gate EXIT, so the caller can
-        stop its own clocks for exactly the span spent queued and restart them
-        at acquisition: the queue wait is not start time. On a ``session/new`` timeout the request
+        ``on_gate_acquired(queue_wait_ms, queue)`` at gate EXIT, so the caller can
+        PAUSE its own clock for exactly the span spent queued and resume it at
+        acquisition: the queue wait is not start time. ``start_priority``
+        orders this start in the gate's queue (rule: ``kiro_crew.start_priority``);
+        the callbacks receive ``queue`` = :data:`START_QUEUE_SESSION_NEW`. On a ``session/new`` timeout the request
         is NOT abandoned: a :class:`StartCollector` keeps it for
         ``agent.start_collect_timeout_secs`` and either hands the late session
         to ``late_adopter`` (which returns True to keep it) or tears it down;
@@ -6217,17 +7165,15 @@ class AcpRuntime:
             # gate protects), on a timeout by the collector that now owns the
             # request, on any other failure here.
             gate = await runtime_start.session_start_gate()
-            if on_gate_queued is not None:
-                try:
-                    on_gate_queued()
-                except Exception:
-                    logger.debug("on_gate_queued callback raised", exc_info=True)
-            permit = await gate.acquire()
-            if on_gate_acquired is not None:
-                try:
-                    on_gate_acquired(permit.queue_wait_ms)
-                except Exception:
-                    logger.debug("on_gate_acquired callback raised", exc_info=True)
+            notify_start_queue(logger, on_gate_queued, START_QUEUE_SESSION_NEW)
+            permit = await gate.acquire(start_priority)
+            try:
+                notify_start_queue(
+                    logger, on_gate_acquired, permit.queue_wait_ms, START_QUEUE_SESSION_NEW
+                )
+            except BaseException:
+                permit.release()
+                raise
         except BaseException:
             self._finish_session_init("")
             raise
@@ -6422,10 +7368,12 @@ class AcpRuntime:
         self._start_collectors[int(req_id)] = collector
         logger.warning(
             "acp_startup_stage stage=session_new outcome=collecting req_id=%d "
-            "collect_budget_s=%g gate_active=%d gate_queued=%d",
+            "collect_budget_s=%g priority=%s gate_active=%d gate_queued=%d %s",
             int(req_id),
             timeout,
+            permit.priority.value,
             *session_start_gate_counts(),
+            permit.gate_state(),
         )
         return collector.start()
 
@@ -6536,6 +7484,7 @@ class AcpRuntime:
             watchdog=_wd,
             crew_agent=_crew,
             session_key=session_key,
+            bound_cwd=str(session_work_dir),
         )
         handle.memory_mode = memory_mode
         # The token this session's stubs carry, so a later claim (warm-pool
@@ -7125,6 +8074,7 @@ class AcpRuntime:
             watchdog=_wd,
             crew_agent=_crew,
             session_key=session_key,
+            bound_cwd=str(load_params["cwd"]),
         )
         # Mirrors create_session: the resumed session's own stub token.
         handle.stub_session_token = stub_token
@@ -7294,8 +8244,41 @@ class AcpRuntime:
                 await self.terminate_session(handle.session_id)
             raise
 
+    def _one_at_a_time_ahead(self, method: str, req_id: int) -> list[tuple[int, str, float]]:
+        """Record *req_id* if the backend serializes it; return what it was sent behind.
+
+        Returns ``(id, method, seconds since sent)`` for every request in
+        :data:`_ONE_AT_A_TIME_METHODS` still awaiting an answer, but only when
+        *method* is a session start, the one caller that reports it, and only on a
+        backend in ``ACP_BACKENDS_SERIAL_SESSION_STARTS``. Answered or abandoned
+        ids are dropped here, so the map never outgrows ``_pending_requests``.
+        """
+        sent = self._one_at_a_time_sent
+        for stale in [rid for rid in sent if rid not in self._pending_requests]:
+            del sent[stale]
+        # H6: only a backend measured to serialize these is described as having
+        # made this start wait; an overlap on any other harness says nothing.
+        if (
+            method not in _ONE_AT_A_TIME_METHODS
+            or self._acp_backend not in ACP_BACKENDS_SERIAL_SESSION_STARTS
+        ):
+            return []
+        now = time.monotonic()
+        ahead = (
+            [(rid, m, now - t) for rid, (m, t) in sent.items()]
+            if method in (METHOD_SESSION_NEW, METHOD_SESSION_LOAD)
+            else []
+        )
+        sent[req_id] = (method, now)
+        return ahead
+
     async def _send_and_await(
-        self, method: str, params: dict[str, Any], timeout: float = _REQUEST_TIMEOUT
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float = _REQUEST_TIMEOUT,
+        *,
+        translate: bool = True,
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and await the response via _pending_requests.
 
@@ -7303,7 +8286,11 @@ class AcpRuntime:
         where we need the response immediately rather than routing it to a
         session queue. ``timeout`` bounds the wait — teardown paths pass a
         tighter value than the default so an unresponsive runtime can't stall
-        session eviction.
+        session eviction. ``translate=False`` sends *params* as given, past the
+        skill projection's name translation: the one caller is the ``set_mode``
+        bracket, which passes params it translated itself and, between attempts,
+        re-derives them only from the newest adopted projection
+        (:meth:`_activate_mode_bracketed`).
         """
         if not self._process or not self._process.stdin:
             raise AcpRuntimeDead("process not running")
@@ -7312,9 +8299,10 @@ class AcpRuntime:
 
         req_id = self._next_id
         self._next_id += 1
+        ahead = self._one_at_a_time_ahead(method, req_id)
 
         projection = getattr(self, "_native_skill_projection", None)
-        if projection is not None:
+        if projection is not None and translate:
             params = projection.request(method, params)
         req = JsonRpcRequest(method=method, params=params, id=req_id)
         data = json.dumps(req.to_dict()) + "\n"
@@ -7324,15 +8312,20 @@ class AcpRuntime:
         self._pending_requests[req_id] = future
 
         try:
-            async with self._stdin_write_lock():
-                self._refuse_write_if_dead()
-                self._process.stdin.write(data.encode())
-                await self._process.stdin.drain()
+            # Bounded like send_request: the control-plane
+            # requests (initialize, session/new, set_mode) share the same
+            # drain under the shared write lock and must not park it against
+            # a flow-control-paused kiro-cli. A stall raises AcpRuntimeStdinStalled
+            # (an AcpRuntimeDead), caught below to retrieve/cancel the future.
+            await self._write_request_bounded(data.encode(), req_id, method)
         except AcpRuntimeDead:
-            # Reached only through _refuse_write_if_dead: _mark_dead has already
-            # failed this future and cleared the map, so retrieve its exception
-            # (or cancel a still-pending one) rather than drop the last reference
-            # unretrieved and have asyncio log a handled error as unhandled.
+            # Reached through _refuse_write_if_dead (a sibling stall marked the
+            # runtime dead while this caller held the lock wait) OR through
+            # _write_request_bounded's own stall paths -- both of which call
+            # _mark_dead. They all fail this future before the raise, so retrieve
+            # its exception (or cancel a still-pending one) rather than drop the
+            # last reference unretrieved and have asyncio log a handled error as
+            # unhandled.
             self._pending_requests.pop(req_id, None)
             if future.done():
                 if not future.cancelled():
@@ -7357,25 +8350,19 @@ class AcpRuntime:
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            if method == METHOD_SESSION_NEW or method == "initialize":
-                # The answer may still come. For ``session/new`` it names a
-                # session the runtime has CREATED, so keep the future registered
-                # for the reader loop and hand ownership to the caller's
-                # StartCollector via ``adopt`` (RFC §4.4) instead of leaving an
-                # unowned session in the shared process. For ``initialize`` the
-                # caller (:meth:`_initialize_handshake`) may decide the deadline
-                # was too short -- the slice started throttling after the
-                # budget was chosen -- and keep waiting on the SAME request
-                # rather than reap a process that is alive and answering
-                # slowly. ``wait_for`` cancelled the future; register a fresh
-                # one bound to the same id either way.
+            if method == METHOD_SESSION_NEW:
+                # The answer may still come, and it names a session the runtime
+                # has CREATED, so keep the future registered for the reader loop
+                # and hand ownership to the caller's StartCollector via ``adopt``
+                # (RFC §4.4) instead of leaving an unowned session in the shared
+                # process. ``wait_for`` cancelled the future; register a fresh one
+                # bound to the same id. Every other method is popped: a future
+                # left registered with no reader is failed by the cleanup kill's
+                # ``_mark_dead`` and logged as an exception nobody retrieved.
                 fresh: asyncio.Future[dict[str, Any]] = loop.create_future()
                 self._pending_requests[req_id] = fresh
-                if method == METHOD_SESSION_NEW:
-                    adopt = getattr(self._pending_requests, "adopt", None)
-                    adopted = adopt(req_id) if adopt is not None else fresh
-                else:
-                    adopted = fresh
+                adopt = getattr(self._pending_requests, "adopt", None)
+                adopted = adopt(req_id) if adopt is not None else fresh
             else:
                 self._pending_requests.pop(req_id, None)
                 adopted = None
@@ -7402,6 +8389,14 @@ class AcpRuntime:
             # Name the budget: a session-start timeout (90s) must be
             # distinguishable from a generic control-plane one (30s).
             timeout_exc = AcpRequestTimeout(f"Request {method} timed out after {timeout:g}s")
+            # Only a request the process had still not answered at this deadline
+            # is reported: on a backend that answers them one at a time, this
+            # start had not begun while that one was outstanding. One answered
+            # earlier may have cost a few seconds or nothing, so it is left out
+            # rather than blamed for the whole budget.
+            unanswered = [(m, age) for rid, m, age in ahead if rid in self._pending_requests]
+            if unanswered:
+                setattr(timeout_exc, "queued_behind", unanswered)
             if adopted is not None:
                 # What create_session needs to build the collector.
                 setattr(timeout_exc, "req_id", req_id)

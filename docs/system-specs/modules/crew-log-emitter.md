@@ -171,7 +171,7 @@ unset here -- see "Reconnect is not resume" below for what it is for.
 | `session/opened` | after `get_or_create`, on create or re-attach only -- the dashboard runner on every turn, and the Discord and Telegram dispatchers for their OWN sessions (`messaging.dispatch.open_turn_crew_log`, before `TurnDriver.run`; a dashboard session resumed into a chat is left to the runner that holds its lineage) | agent, slot key, model, `model_requested` when a tier resolved one, cwd, `resumed`; `previous {sid}` on a CREATE whose slot already wrote a different crew log, resolved in three tiers -- the store the slot last handed to a `session/opened` (recorded on the slot as that edge is spent, and the only source that can name a crew log whose create is still queued to the writer thread), then the slot's own newest unit IN THE STORE (the unit no other unit of that slot cites as `previous`, read off the event loop and keyed by the slot rather than the session key, which is the DURABLE answer a restart has), then `mapped_sid` (in-memory, non-pruning) for a slot with no unit at all; the mapping cannot be higher because a replay-pending allocation holds the prior resumable id there on purpose, which would name a generation behind and leave the crew log between cited by nobody, and inside that window it is not cited -- the log records `previous_undecided` instead, and a store the read proves is the slot's first records `previous_none`, because a silence the announce carries and a silence that is merely the absence of every key demand opposite treatment from a later fold. The window is asked about where a SESSION EXISTS to answer, as the edge is taken, not where the id is read: the marker is an attribute of a live session and the read runs before this turn's session is allocated, so asking there answers "no replay owed" both when none is owed and when there is nobody to ask -- and the second is a cold start, the restart this whole read exists to survive. So the mapped id is latched PROVISIONAL and downgraded to a break at the take; the slot's own record is never provisional, and a latch whose record wins over a mapped id drops the flag with it. `previous_none` is the LOOKER's statement, written only for a caller that passed a determination, and only when the store's answer is COMPLETE -- no unit of the slot at all. A store holding units it could not rank hands the question on WITHOUT a determination, so an empty mapping there is no finding about the slot and the create writes no key; the channel dispatchers hand over one captured id and determine nothing, so their units carry no predecessor key either. Both read as the legacy silence they are, rather than declaring a slot with units to be its own first store; latched on the slot by whichever allocation observes it FIRST -- the eager prefetch maps its own session over the key before the first turn runs, so a turn reading the mapping for itself would answer the successor and write no edge; the latch is write-once and is spent on one entry; the channel dispatchers, which hold no slot record, consume the ALLOCATION's own capture instead (`SessionManager.allocation_predecessor`, read by `SessionAllocationService` inside the registration's critical section from `mapped_sid` -- live id or the `discarded_sid` stash a recycle leaves -- and handed over through `messaging.dispatch.predecessor_sid` after the claim), so no read of the mapping around `get_or_create` remains to be staled by a concurrent turn's allocate-and-recycle; recorded only when the named crew log's own header names this slot, read at emit time, so a stale or recycled mapping entry yields no edge; `parent {slot, sid?}` when `session_create` made the session IN THIS GATEWAY PROCESS (`_lineage_minted`) -- the creator's key from the slot's `_created_by`, and the creator's ACP session id FROZEN at mint (`_created_by_sid`) from the live caller handle, present when the caller had a session at that moment; a slot restored from transcript metadata writes no `parent` |
 | `turn/started` | after every dispatch gate, immediately before the stream opens | turn ordinal, actor, prompt depth |
 | `turn/refused` | each gate that refuses the dispatch | turn ordinal, actor, `reason`, prompt depth |
-| `turn/completed` | the `EVENT_COMPLETE` arm, beside `_emit_turn_metric`; the turn's `finally` when no terminal event arrived | the four `TurnUsage` token counts, credits, `duration_ms`, `stop_reason`, model, provider -- or `stop_reason: "failed"` with `error` and no usage |
+| `turn/completed` | the `EVENT_COMPLETE` arm, beside `_emit_turn_metric`; the turn's `finally` when no terminal event arrived | the four `TurnUsage` token counts (only when some count is above zero, then all four), credits (only when positive and finite), `duration_ms`, `stop_reason`, model, provider -- or `stop_reason: "failed"` with `error` and no usage |
 | `tool/called` | `EVENT_TOOL_CALL` | `call_id`, trusted `name`, `server`, and `kind`; optional `step`, `call_index`, and argument digest/size |
 | `tool/completed` | `EVENT_TOOL_RESULT` when `tool_final` | `call_id`, remembered `name` and `server`, `status`; optional `elapsed_ms`, `is_error`, `step`, `call_index`, and result digest/size |
 | `model/selected` | the fallback swap in `_run_chat`, after the pick lock is released | model id, source, turn |
@@ -189,10 +189,11 @@ unset here -- see "Reconnect is not resume" below for what it is for.
 | `approval/decided` | the same prompt's `finally`, where every exit converges | turn, request id, decision, `by: host` and the host's `cause` for an auto-decline |
 | `plan/updated` | `EVENT_TODO_UPDATE`, inside `slot.set_todo`'s own change gate | turn, the whole task list as `{id, text, state}` |
 | `background/completed` | `run_bg_oneliner` and `background_turn`, at the point they record usage, against an owner pinned BEFORE the call | kind, served model, provider, the billed token dimensions, credits, ms -- no turn |
-| `subagent/spawned` | `_log_spawned`, the one site every started run passes and no rejection does | the turn that ASKED, read from the pin taken at acceptance; child id, agent, model, the three context-scope flags |
+| `subagent/spawned` | `_log_spawned`, the one site every started run passes and no rejection does | the turn that ASKED, read from the pin taken at acceptance; child id, agent, model, the task text redacted and clipped, the three context-scope flags |
 | `subagent/steered` | `steer_run` after the provider accepted, `follow_up_run` after the queue accepted | child id, `interrupt` or `follow_up` |
 | `subagent/completed` | the exclusive terminal report, for outcome `completed` | child id, elapsed ms, credits when billed |
 | `subagent/failed` | the same report, for outcome `failed` or `stopped` | child id, reason, which outcome it was, elapsed ms, credits when billed |
+| `subagent/dismissed` | the dismiss route, for a run the live manager no longer holds | child id |
 | `write/dropped` | writer recovery, before that session's next ordinary append | dropped count and bytes |
 | `object/observed` | `monitoring.controller.MonitorController.tick`, after the service has published a probe's observation whose fingerprint differs from the one it held; into the log of the monitor's OWNER session, named by the host's resolver | `producer` (closed: `probe`), the monitored `kind`, the subject's full `target` URL, the probe's `fingerprint`, the canonical `facts` snapshot verbatim (short by named members in `facts_omitted` only when the line would not fit), `observed_at` -- no turn |
 
@@ -982,8 +983,8 @@ measurement but an OWNER: both helpers knew what the call cost and neither knew 
 for. Both now take a kind and an owning session key, and write nothing unless given both -- because
 a background call is shared infrastructure by default. Titling is charged to the session it titles;
 a tip, a folder icon or a cron label is charged to nobody, and picking a session for one of those
-would put someone else's cost in a user's log. Three kinds are emitted today: `title`, `summary`,
-`memory_consolidation`.
+would put someone else's cost in a user's log. Four kinds are emitted today: `title`, `summary`,
+`memory_consolidation`, and `dynamic_card` for an automatic Dynamic Dashboard card.
 
 `background/completed` names no turn. The call runs after a turn ends, on a separate session, and
 naming the turn that happened to be last would attribute the cost to work that did not cause it.
@@ -1094,7 +1095,6 @@ the finding: an unnamed site records `user`.
 | `chat_runner` synthesis dispatch | the sub-agent synthesis prompt | `subagent` |
 | `issue_radar.crew_runtime` | a crew-composed prompt | `crew` |
 | `handlers/taskrunner` (plan, result) | a task-runner summary | `gateway` |
-| `chat_orchestrator` stage loop | orchestrator stage context | `gateway` |
 
 One shared helper passes no actor on purpose: `spec_builder.runtime.enqueue_or_run_prompt`
 takes both the message and its origin as parameters, so its actor is its CALLER's fact and
@@ -1135,9 +1135,11 @@ turn's `finally` through `on_turn_failed`: `turn/completed` with `stop_reason:
 "failed"` and, when an exception was caught, `error` naming its CLASS -- never its
 message, which can carry a path or a credential. `tokens` and `credits` are ABSENT
 rather than zeroed, because no usage event arrived and a turn that streamed real
-text must not carry a durable line claiming it cost nothing; that absence is also
-what tells a synthesized closer from a provider-reported one. `duration_ms` is
-measured from the turn's own start.
+text must not carry a durable line claiming it cost nothing. The measured closer
+takes the same posture one field at a time -- it omits a token block the provider
+left at four zeros and a charge that is not positive -- so absence alone does not
+tell a synthesized closer from a provider-reported one; `stop_reason: "failed"`
+does. `duration_ms` is measured from the turn's own start.
 
 Leaving the `turn/started` open instead would be the wrong record, not the honest
 one. This process OBSERVED the end -- the stream raised, or a recovery path

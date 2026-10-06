@@ -90,13 +90,23 @@ from kiro_crew.messaging.queue_drain import (
     drain_until_quiet,
     entries_queued_by,
     entry_channel,
+    entry_person_origin,
     owner_token,
+    person_tag,
     register_drain,
     tag_entry,
 )
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface, receipt_address_key
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.sel import sel
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    decline_stop,
+    force_stop_keeping_others,
+)
+from kiro_crew.start_priority import person_priority
 from kiro_crew.webex import cards
 from kiro_crew.webex.attachments import process_webex_attachments
 from kiro_crew.webex.cards import LiveChoices, read_press
@@ -253,8 +263,14 @@ def _queued_place(kwargs: dict) -> _QueuedPlace | None:
     return place
 
 
-def _reply_envelope(inbound: "WebexInbound | None", place: _QueuedPlace) -> "WebexInbound":
+def _reply_envelope(
+    inbound: "WebexInbound | None", place: _QueuedPlace, *, person_origin: bool
+) -> "WebexInbound":
     """The envelope a drained turn answers under: the QUEUED entry's, never the opener's.
+
+    *person_origin* is the queued entries' own flag, never the opener's: the finished
+    turn can have been opened by a gateway-built wake, and a wake can itself have been
+    queued (kiro_crew.start_priority).
 
     Built on *inbound* when the finished turn had one, so a field this replay does not
     address (the spool's ``message_id``, card inputs) keeps whatever that turn carried.
@@ -270,6 +286,7 @@ def _reply_envelope(inbound: "WebexInbound | None", place: _QueuedPlace) -> "Web
         parent_id=place.parent_id,
         person_email=place.person_email,
         room_type=place.room_type,
+        person_origin=person_origin,
     )
 
 
@@ -684,6 +701,7 @@ class WebexDispatcher:
         try:
             await drive_turn(
                 ChannelTurn(
+                    start_priority=person_priority(inbound.person_origin),
                     channel_type="webex",
                     session_key=session_key,
                     inbound_route=inbound_route,
@@ -1308,6 +1326,8 @@ class WebexDispatcher:
                 # carry it could only be replayed onto the opener's routing, which is
                 # a different session key whenever the two differ.
                 webex_room_type=inbound.room_type,
+                # Whether a PERSON sent it: the drained replay's start priority.
+                **person_tag(inbound.person_origin),
                 # Which CHANNEL recorded this entry, and WHOSE it is. Both neutral, and
                 # splatted from the shared helper rather than written as literal
                 # keywords, because the fields above cannot be read until ownership is
@@ -1384,6 +1404,8 @@ class WebexDispatcher:
             # another person (a shared unified key puts two humans on one queue), in
             # another thread, or on another transport entirely.
             place: _QueuedPlace | None = None
+            # Whether a person sent any entry this turn collapses.
+            person = False
             # Latched the moment one owned entry does not fit, so everything behind it
             # defers too and the queue keeps exact arrival order. Mirrors the other three
             # drains; see the collapse test below for what its absence costs.
@@ -1437,6 +1459,7 @@ class WebexDispatcher:
                         and item_sender == place.sender_key
                     ):
                         texts.append(item[1])
+                        person = person or entry_person_origin(item[2])
                         # Collapsed messages contribute their attachments too, in
                         # order, so a burst of "here, and here" screenshots all
                         # reach the one turn that answers them.
@@ -1470,7 +1493,7 @@ class WebexDispatcher:
                     # and ``edit_receipt`` carries the room id, so editing it under the
                     # opener's address reaches a different room where that message id
                     # does not exist.
-                    envelope = _reply_envelope(inbound, place)
+                    envelope = _reply_envelope(inbound, place, person_origin=person)
                     await self._queue.flip_answering_locked(
                         session_key,
                         self._receipt_surface(envelope),
@@ -1508,7 +1531,7 @@ class WebexDispatcher:
             # different room. Falls back to *inbound* only when an entry predates
             # this field (a queue persisted by an older build).
             drained = replace(
-                _reply_envelope(inbound, place),
+                _reply_envelope(inbound, place, person_origin=person),
                 text="\n\n".join(texts),
                 file_urls=tuple(files),
             )
@@ -1535,12 +1558,43 @@ class WebexDispatcher:
         answer to, and flips their receipt to a cancellation they never asked for.
         """
         session_key = self._session_key(_route_of(inbound))
+        owner = _entry_owner(inbound)
+        # Before the Stop record and the queue clear: a Stop the session's own
+        # automatic compaction declines ends nothing and must destroy nothing.
+        force = False
+        if compaction_in_flight(self.sessions, session_key):
+            # A repeat within the window is the second press and forces. Keyed
+            # by the presser too: a group space shares one session key, and
+            # another member's declined Stop must not arm this member's first.
+            if not consume_stop_declined(session_key, owner):
+                # Sent before the marker is armed: an undelivered warning plus an
+                # armed escalation is a retry that hard-resets the session with
+                # this member never told that it would.
+                async def _say_declined() -> bool:
+                    # ``_reply`` returns the id of the message it posted, so a
+                    # ``None`` is a warning this member never saw.
+                    return await self._reply(inbound, STOP_DECLINED_COMPACTING_TEXT) is not None
+
+                await decline_stop(session_key, owner, _say_declined)
+                return
+            force = True
         # Recorded before the busy check, so a Stop landing while the session is
         # between an abandoned attempt and its replay still counts (see
         # ``note_user_stop``).
         note_user_stop(self.sessions, session_key)
         cancelled_turn = False
-        if self.sessions.is_busy(session_key):
+        if force:
+            try:
+                # The reset is this member's, the queue is the whole space's: the
+                # hard stop pops the session and its queue, so the other members'
+                # entries are carried to the successor and only this member's are
+                # dropped (``force_stop_keeping_others``).
+                cancelled_turn = await force_stop_keeping_others(
+                    self.sessions, session_key, entries_queued_by(owner)
+                )
+            except Exception:
+                logger.warning("Webex /stop: force stop failed for %s", session_key, exc_info=True)
+        elif self.sessions.is_busy(session_key):
             provider = self.sessions.get_provider(session_key)
             # ``cancel`` is declared on the LLMProvider ABC, so the guard is for
             # a session with no live provider, not for a provider missing it.
@@ -1551,8 +1605,11 @@ class WebexDispatcher:
                 except Exception:
                     logger.warning("Webex /stop: cancel failed for %s", session_key, exc_info=True)
         async with self._queue.lock:
-            owner = _entry_owner(inbound)
-            self.sessions.clear_queue(session_key, entries_queued_by(owner))
+            # On the forced repeat the helper already dropped this member's
+            # press-time entries and carried the rest; a second clear here would
+            # take a message the same member sent during the stop's awaits.
+            if not force:
+                self.sessions.clear_queue(session_key, entries_queued_by(owner))
             await self._queue.finish_cancelled_locked(
                 session_key, self._receipt_surface(inbound), owner
             )
@@ -1928,7 +1985,9 @@ class WebexDispatcher:
         """
         try:
             await asyncio.wait_for(provider.compact(), timeout=_COMPACT_TIMEOUT_S)
-            result = await provider.wait_for_compaction()
+            result = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
         except asyncio.TimeoutError:
             logger.warning("Webex: compaction timed out after %.0fs", _COMPACT_TIMEOUT_S)
             return False, "timed out"

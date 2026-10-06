@@ -33,7 +33,9 @@ from kiro_crew.agent_sdk.host_auth import signed_out_message
 from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_bindings
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.request_priority import owner_start_priority
 from kiro_crew.dashboard.side_readonly_spec import ReadOnlySpecError, publish_readonly_spec
+from kiro_crew.dashboard.slot_ownership import deny_app_slot_access
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 from kiro_crew.dashboard.ws import broadcast_thread_reply
 from kiro_crew.history import (
@@ -54,6 +56,7 @@ from kiro_crew.llm_helpers import (
 from kiro_crew.members import DM_SLOT_MODE
 from kiro_crew.security import StreamRedactor, redact
 from kiro_crew.sel import sel
+from kiro_crew.start_priority import StartPriority
 
 logger = logging.getLogger(__name__)
 
@@ -355,23 +358,7 @@ def build_thread_message(
 def _deny_foreign_app(request: web.Request, slot: _ChatSlot, operation: str) -> web.Response | None:
     """App tokens see only their own slots (App Kit §5.2); a crewmate chat is
     never app-owned, so an app caller gets the anti-enumeration 404."""
-    request_app = request.get("app", "")
-    if not request_app:
-        return None
-    if slot._app and request_app == slot._app:
-        return None
-    try:
-        sel().log_api_access(
-            caller=request_app,
-            operation=operation,
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot",
-        )
-    except Exception:  # noqa: BLE001 -- the refusal must reach the caller regardless
-        logger.debug("SEL audit unavailable for thread refusal", exc_info=True)
-    return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    return deny_app_slot_access(request.get("app", ""), slot, slot.key, operation)
 
 
 async def threads_enabled() -> bool:
@@ -713,7 +700,16 @@ async def api_chat_thread_reply(request: web.Request) -> web.Response:
         )
         task = asyncio.create_task(
             _run_thread_turn(
-                state, slot, mid, run_id, text, parent, context_before, flight_key, identity
+                state,
+                slot,
+                mid,
+                run_id,
+                text,
+                parent,
+                context_before,
+                flight_key,
+                identity,
+                start_priority=owner_start_priority(request),
             )
         )
         state._background_tasks.add(task)
@@ -839,6 +835,7 @@ async def _run_thread_turn(
     context_before: list[dict[str, Any]],
     flight_key: str,
     identity: str | None,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
 ) -> None:
     """Background task: one crewmate reply into the thread on *mid*.
 
@@ -947,7 +944,10 @@ async def _run_thread_turn(
         # envelope. A retained session would stay bound to the agent and cwd of
         # the turn that created it after the slot's project or agent changed.
         provider, _is_new, _resumed = await state.sessions.get_or_create(
-            session_key, agent=agent, cwd=project
+            session_key,
+            agent=agent,
+            cwd=project,
+            start_priority=start_priority,
         )
         acquired_key = session_key
         threads = await asyncio.to_thread(log.read_threads, history_key)

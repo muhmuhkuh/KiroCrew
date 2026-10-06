@@ -125,7 +125,14 @@ def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
         # mid-turn burst would have left one.
         async with queue.lock:
             await queue.create_or_grow_locked("s", surface, "what time is it", _CALLER)
-        return await stop_running_turn(sessions, "s", queue=queue, surface=surface, owner=_CALLER)
+        return await stop_running_turn(
+            sessions,
+            "s",
+            queue=queue,
+            surface=surface,
+            owner=_CALLER,
+            deliver=AsyncMock(),
+        )
 
     return asyncio.run(go())
 
@@ -671,6 +678,23 @@ class TestSpawn:
         assert "a9" in (await spawn_task_reply("do it", manager, "slack:C1:1") or "")
         manager.spawn.assert_not_called()
         assert manager.spawn_async.await_args.kwargs["parent_session_key"] == "slack:C1:1"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_spawn_is_reported_as_refused_not_spawned(self) -> None:
+        """A refusal comes back as a terminal record, not None; a non-batch one is
+        announced nowhere else, so the reply must say it never started."""
+        manager = MagicMock(max_concurrent=2)
+        manager.spawn.return_value = SimpleNamespace(
+            id="r1", done=True, error="spawn refused: gateway admission is closed"
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply.startswith("⚠️ Subagent `r1` was not started: gateway admission is closed")
+        assert "spawn refused" not in reply and "Spawned" not in reply
+        manager.spawn.return_value = SimpleNamespace(
+            id="r2", done=True, error="never started: waiting for memory (pressure)"
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply.startswith("⚠️ Subagent `r2` was not started: waiting for memory")
 
     @pytest.mark.asyncio
     async def test_an_empty_argument_declines(self) -> None:

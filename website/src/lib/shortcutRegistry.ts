@@ -205,11 +205,20 @@ export const SHORTCUT_REGISTRY: readonly ShortcutEntry[] = [
   { id: 'toggle-focus-mode', group: 'actions', dispatch: 'registry', defaults: both({ key: 'm', alt: true, shift: true }) },
   // Dispatched by ChatInput, not the global handler; listed for the reference.
   { id: 'optimize-prompt', group: 'actions', dispatch: 'code', defaults: both({ key: 'Enter', mod: true, shift: true }) },
+  // ⌘↑ on macOS / Ctrl+↑ elsewhere — edit the last user message.
+  // Dispatched by the composer (both the Lexical editor and the textarea
+  // fallback), not the global handler; listed for the reference so the
+  // shortcuts modal advertises it alongside the other composer bindings.
+  { id: 'edit-last-message', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowUp', mod: true }) },
   // Literal Ctrl on every platform — see isAgentMonitorChord for why this one
   // does NOT follow the ⌘-on-Mac convention (`ctrl`, not `mod`, on both).
   { id: 'agent-monitor', group: 'actions', dispatch: 'code', defaults: both({ key: 'g', ctrl: true }) },
   // Bare Escape, handled by a capture-phase listener; listed for the reference.
   { id: 'stop-speaking', group: 'actions', dispatch: 'code', defaults: both({ key: 'Escape' }) },
+  // Bare Up/Down, handled by NotificationFeed while one of its rows has focus
+  // (inbox page and bell sheet); listed for the reference.
+  { id: 'notification-prev', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowUp' }) },
+  { id: 'notification-next', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowDown' }) },
   // ---- Remote instances (useInstanceShortcuts, Electron only) ---------------
   // 1 = Local, 2..6 = the 1st..5th remote instance, matching the InstanceTabBar
   // left-to-right order.

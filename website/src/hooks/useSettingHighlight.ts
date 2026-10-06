@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useLocation, useSearchParams } from 'react-router-dom'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
+import { setSettingsDeepLinkTarget } from '../components/settings'
 import { i18nT } from '../i18n/t'
 
 /**
@@ -30,8 +31,10 @@ export const SETTINGS_CREW_MEMBERS_PREVIEW_ID = 'developer.crewmates'
  *   again when the qualifier was corrected to the service's real name,
  *   Amazon Polly — so BOTH the positional id and the short-form id have to
  *   land on the current one.
- * - `chat.fallback-model` — the row was relabeled from "Fallback Model" to
- *   "Default Model", the tier it actually is.
+ *
+ * No key may be an id a row has now (an older label can produce an id a later
+ * row takes, as `chat.fallback-model` did): that row's links would land on
+ * another one. `settingHighlightAliases.test.ts` pins it over every key.
  */
 const LEGACY_ID_EXACT: Record<string, string> = {
   'voice.aws-profile': 'voice.aws-profile-transcribe',
@@ -40,10 +43,6 @@ const LEGACY_ID_EXACT: Record<string, string> = {
   'voice.aws-region-2': 'voice.aws-region-amazon-polly',
   'voice.aws-profile-polly': 'voice.aws-profile-amazon-polly',
   'voice.aws-region-polly': 'voice.aws-region-amazon-polly',
-  // The "Default Model" row was labeled "Fallback Model", and registry ids
-  // derive from the label — without this, links saved or bookmarked against
-  // the old id silently lose their highlight.
-  'chat.fallback-model': 'chat.default-model',
   // The pin toggle's label moved from "prompt" to "turn" vocabulary, shifting
   // the derived id with it.
   'chat.pin-the-latest-prompt': 'chat.pin-the-latest-turn',
@@ -58,7 +57,15 @@ const LEGACY_ID_EXACT: Record<string, string> = {
   // "Remote crew sessions" when the remote-crew vocabulary was restored. Same
   // flag, same card — only the label, and so the derived id, moved.
   'developer.remote-instance-sessions': 'developer.remote-crew-sessions',
+  // The two About update switches shared one "Auto-update on restart" label,
+  // and the gateway's row was registered under its notify wording; each is now
+  // labelled by what it does.
+  'about.auto-update-on-restart': 'about.install-app-updates-automatically',
+  'about.update-notifications': 'about.update-the-gateway-automatically',
 }
+
+/** The ids `LEGACY_ID_EXACT` rewrites, for the test that none is live. */
+export const LEGACY_EXACT_HIGHLIGHT_IDS: readonly string[] = Object.keys(LEGACY_ID_EXACT)
 
 /** Current registry ids, for fail-safe legacy rewrites below. */
 const REGISTRY_IDS = new Set(SETTINGS_REGISTRY.map(e => e.id))
@@ -90,24 +97,30 @@ export function resolveLegacyHighlightId(id: string): string {
 export const SETTINGS_DEFAULT_MODEL_ID = 'chat.default-model'
 
 /**
- * `data-setting-key` anchor of the Kiro sign-in card on Developer → Agent
- * Backend, the target of the chat error row's "Sign in to Kiro" link
+ * `data-setting-key` anchor of the Kiro sign-in card on Settings → Coding
+ * Agent, the target of the chat error row's "Sign in to Kiro" link
  * (`KIRO_SIGN_IN_PATH` in `pages/developer/kiroSignInLink.ts`). A pseudo key,
  * not a config path: nothing reads it as a setting. Declared HERE, beside the
  * other deep-link ids, because the hook has to know it: the card mounts LATE
- * (its pane renders it only after the Agent Backend tab's config read), so
+ * (its pane renders it only after the Agent Harness tab's config read), so
  * the probe waits for this anchor the way it waits for a declared UI identity
  * instead of stripping it as unknown on the first tick. Every other `key:`
  * value with no registry entry and no element is still stripped at once, so
  * a typo cannot leave a dangling `?highlight=` in the URL.
  */
 export const KIRO_SIGN_IN_HIGHLIGHT_ANCHOR = 'kiro-sign-in'
+/** `data-setting-key` of the Default crewmate row on Developer → Config
+ *  (`KiroCrewCfgTab`), the one control that changes which crewmate a new
+ *  session starts as. The Crewmates roster's `default` badge links here. */
+export const DEFAULT_CREWMATE_HIGHLIGHT_ANCHOR = 'default-crewmate'
+/** Anchors whose card mounts AFTER its page: the sign-in card waits on the
+ *  backend probe, the Default crewmate row on the config query. A `key:` link
+ *  to one of these waits for the element instead of stripping the param. */
+const LATE_MOUNT_ANCHORS: ReadonlySet<string> = new Set([KIRO_SIGN_IN_HIGHLIGHT_ANCHOR, DEFAULT_CREWMATE_HIGHLIGHT_ANCHOR])
 
 
 /**
- * useSettingHighlight — deep-link + highlight hook for Settings, also mounted by
- * the Developer page so `/developer?tab=…&highlight=key:<anchor>` rings a card
- * there (the Kiro sign-in card under the Agent Backend switch).
+ * useSettingHighlight — deep-link + highlight hook for Settings.
  *
  * Reads `?highlight=<id>` from the URL, resolves the id to the label rendered
  * in the active locale via SETTINGS_REGISTRY, finds the element by
@@ -123,14 +136,29 @@ export const KIRO_SIGN_IN_HIGHLIGHT_ANCHOR = 'kiro-sign-in'
  * then proceeds with the standard label-based DOM highlight.
  */
 /**
+ * Build a `[data-setting-*="…"]` attribute selector from a settings DOM anchor
+ * attribute and its value. `attr` is one of the three machine anchor names the
+ * rows carry (`data-setting-id` / `data-setting-key` / `data-setting-label`) and
+ * `value` is a resolved id/key/label; neither is user-visible copy — the result
+ * is fed to `querySelector`/`matches`, never rendered — so this is where the
+ * selector literals live, exempted by callee in `eslint.i18n.config.js`.
+ */
+function settingAnchorSelector(
+  attr: 'data-setting-id' | 'data-setting-key' | 'data-setting-label',
+  value: string,
+): string {
+  return `[${attr}="${CSS.escape(value)}"]`
+}
+
+/**
  * @param owns Whether the mounting page currently owns the URL's `highlight`.
  *   Default `true` (Settings, which is the only element under its route). A
- *   page that also REDIRECTS legacy links to another page passes a route check
- *   here: DeveloperPage replace-navigates `/developer?tab=feature-previews` onto
- *   `/settings/developer?highlight=key:…`, and while it is still the rendered
- *   element for that tick this hook would read the Settings-bound highlight,
- *   find no anchor, and strip it before SettingsPage ever mounts. With `owns`
- *   false the hook leaves the param untouched for the page that will own it.
+ *   page that also mounts this hook while REDIRECTING legacy links to Settings
+ *   passes a route check here, so it does not read the Settings-bound
+ *   highlight, find no anchor, and strip it before SettingsPage ever mounts.
+ *   (DeveloperPage mounts this hook for the default-crewmate deep link on its
+ *   Config tab, and gates it off so that its legacy `agent-backend` redirect
+ *   forwards `highlight` to Settings untouched.)
  */
 export function useSettingHighlight(owns: boolean = true): void {
   const [params, setParams] = useSearchParams()
@@ -154,10 +182,31 @@ export function useSettingHighlight(owns: boolean = true): void {
   }
 
   useEffect(() => {
-    if (!owns || !highlightId) return
+    /* Announce the pending link BEFORE the probe, and withdraw it as soon as
+     * there is none. A collapsed `SettingsSection` renders no rows, so without
+     * this the probe below searches a document its target was never put into --
+     * see the signal's own comment in `components/settings`. Keyed off
+     * `highlightId` alone, so the withdrawal rides the re-run that the strip
+     * already causes: resolved, unknown and not-ours all arrive here as "no
+     * highlight", which is the one condition that means nothing is pending. */
+    if (!owns || !highlightId) { setSettingsDeepLinkTarget(null); return }
 
     const entry = SETTINGS_REGISTRY.find(e => e.id === highlightId)
     const settingId = entry?.settingId
+    /* The selector a collapsed group answers "is that row inside me?" with. Built
+     * from the SAME three identities the probe resolves by, in the same precedence,
+     * so a group can never reveal itself for something the probe would not accept.
+     * Deliberately coarser than `findTarget`: the `occurrence` tiebreak disambiguates
+     * a repeated label, which is a question only the probe can answer and which no
+     * group needs to in order to know whether it holds the row. */
+    const containmentSelector = settingId
+      ? settingAnchorSelector('data-setting-id', settingId)
+      : directConfigKey
+        ? settingAnchorSelector('data-setting-key', directConfigKey)
+        : entry
+          ? settingAnchorSelector('data-setting-label', entry.labelKey ? i18nT(entry.labelKey) : entry.label)
+          : null
+    setSettingsDeepLinkTarget(containmentSelector)
     // Explicit UI identities and schema keys both survive an async panel load.
     if (settingId || directConfigKey) {
       const findDirectTarget = (): HTMLElement | null => {
@@ -177,11 +226,11 @@ export function useSettingHighlight(owns: boolean = true): void {
         const candidate = matches[entry.occurrence - 1] ?? matches[0]
         return candidate && !candidate.hasAttribute('data-setting-key') && !candidate.hasAttribute('data-setting-id') ? candidate : null
       }
-      // A declared identity -- a registry entry, or the late-mounting sign-in
-      // anchor -- is authoritative even before it mounts, so the probe waits
+      // A declared identity -- a registry entry, or a late-mounting anchor
+      // (LATE_MOUNT_ANCHORS) -- is authoritative even before it mounts, so the probe waits
       // for it. An anchor already in the DOM is highlighted at once. Any other
       // `key:` value with no entry and no element is unknown enough to strip.
-      if (entry || directConfigKey === KIRO_SIGN_IN_HIGHLIGHT_ANCHOR || findDirectTarget()) {
+      if (entry || (directConfigKey && LATE_MOUNT_ANCHORS.has(directConfigKey)) || findDirectTarget()) {
         let observer: MutationObserver | null = null
         const highlightTarget = (): boolean => {
           const el = findTarget()
@@ -220,6 +269,9 @@ export function useSettingHighlight(owns: boolean = true): void {
         return () => {
           clearTimeout(timer)
           observer?.disconnect()
+          // A page torn down mid-probe leaves nothing to resolve the link, so the
+          // signal must not outlive it into the next tree.
+          setSettingsDeepLinkTarget(null)
         }
       }
       // Unknown keys retain the legacy parameter-cleanup behavior below.
@@ -271,7 +323,7 @@ export function useSettingHighlight(owns: boolean = true): void {
       }, { replace: true })
     }, 100)
 
-    return () => clearTimeout(timer)
+    return () => { clearTimeout(timer); setSettingsDeepLinkTarget(null) }
     // location.key: every navigation re-arms the probe. Without it, the
     // legacy-URL translation (SettingsPage replace-navigates ?tab=X onto the
     // path form, mounting the target panel one commit LATER) would race this

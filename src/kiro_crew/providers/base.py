@@ -36,6 +36,7 @@ from kiro_crew.essential_delivery import EssentialDelivery
 # import-light rule: ``abort`` imports only ``mcp_gateway.transport`` outside the
 # standard library, and that module is already loaded by the time this one is.
 from kiro_crew.mcp_gateway.abort import RuntimeAbortTarget
+from kiro_crew.start_priority import StartPriority
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Type-only: this module's runtime imports are deliberately narrow, and
@@ -99,6 +100,11 @@ class SessionMcpReport(Protocol):
 class LLMProvider(ABC):
     """Abstract LLM backend."""
 
+    #: The priority of this provider's next ``start()``, set by ``SessionManager``
+    #: just before it starts the provider (rule: ``kiro_crew.start_priority``); a
+    #: provider started anywhere else starts BACKGROUND.
+    start_priority: StartPriority = StartPriority.BACKGROUND
+
     @cached_property
     def essential_delivery(self) -> EssentialDelivery:
         """Private prompt receipts belong to this provider, never the builder."""
@@ -133,8 +139,12 @@ class LLMProvider(ABC):
         """Gracefully shut down."""
 
     @abstractmethod
-    async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
-        """Send a message and yield events."""
+    async def stream(self, message: str, *, allow_image: bool = True) -> AsyncIterator[LLMEvent]:
+        """Send a message and yield events.
+
+        ``allow_image=False`` sends *message* as text only: no image path in it
+        is read or inlined as an image block.
+        """
         yield LLMEvent(kind=EVENT_COMPLETE)  # pragma: no cover
 
     @abstractmethod
@@ -513,6 +523,13 @@ class LLMProvider(ABC):
         """True if a native turn has not reached its done boundary, independent
         of cancel state (drives the shutdown drain). Default False."""
         return False
+
+    def background_launch(self) -> tuple[float, str] | None:
+        """``(seconds since, description)`` of the newest work this session's
+        harness launched to run on after the prompt returned (a backgrounded
+        command, a Workflow), or ``None``. Read by the session watchdog, which
+        cannot otherwise see that work. Default ``None``: nothing launched."""
+        return None
 
     async def wait_turn_done(self, timeout: float) -> str:
         """Wait for the current native turn's done boundary and return its stop

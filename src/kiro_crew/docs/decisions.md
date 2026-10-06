@@ -76,6 +76,38 @@ This setting alone changes nothing: a chat is only routed while its model is set
 
 After setting the provider and sampling values, enable the switch only if the data transfer below is acceptable. Turn it off to return to normal trigger matching. Old `preview` and per-point mode values do not enable this new behavior.
 
+## Running a model on this machine
+
+Instead of Jev, decisions can be answered by an open-weight model running on your own machine. It speaks the same request format as Jev, so every feature on this page works with it, and **nothing a decision point collects leaves the machine**. Pick it under **Decision model** on the Decisions card. The card offers three models and marks the one your machine's memory suits:
+
+| Model | Accuracy vs Jev | Hard decisions vs Jev | Memory it uses | Recommended from | Time per decision (CPU) |
+|---|---|---|---|---|---|
+| Plumb-4B | about 103% | about 109% | about 15 GB | 60 GB total | about 2.4 s, up to 32 s |
+| Strands Decider 2B | about 84% | about 69% | about 12 GB | 48 GB total | about 0.6 s, up to 12 s |
+| Laya | about 67% | about 47% | about 6 GB | 24 GB total | about 0.2 s, up to 0.5 s |
+
+"Accuracy vs Jev" is how many of Jev's correct answers the model also got right on the 231 public items of [JevBench](https://github.com/fstandhartinger/jevbench), measured on a 10-core CPU with no GPU. The card recommends a model only on a machine with at least four times its memory, so running it leaves the rest for your other sessions; below 24 GB it recommends hosted Jev.
+
+A running local model keeps its memory the whole time, not only while it answers, and the card says how much. That memory is gone for everything else on the machine: when free memory runs low Kiro Crew runs fewer subagents at once, and other software you have open can slow down. Pick **No model** to give it back.
+
+A local model is slower than Jev, and each decision point waits only a few seconds for an answer. A slower answer is skipped and the point does what it does without Jev, so a slow model makes fewer decisions, not worse ones. Two points do wait in front of you: picking the model for a turn, and placing a message you send mid-turn. With Plumb-4B or Strands Decider 2B each can add up to 5 seconds, and up to 2 seconds with Laya. The accuracy figures on the card were measured with no time limit, and the answers that take longest are mostly the hard ones, so treat them as an upper bound: with its 5-second limit, Plumb-4B skips many of the long, hard decisions its "hard" figure counts. To stop a local model, pick **No model** and press **Use this model**: nothing is sent, the server stops, and every decision uses the built-in rules. Turning the Decisions switch off does not stop it: the server keeps its memory and starts again with the gateway, it just receives nothing. Only **No model** stops it. Plumb-4B is the better choice for the background points (risky tool calls, recalled memories, compaction scoring); Strands Decider 2B is the middle ground: most of Plumb-4B's accuracy at a quarter of its typical time and less memory. Laya is fast enough for everything but misses more of the hard judgements.
+
+You do not install or start anything yourself. When you press **Use this model**, Kiro Crew does it and the card shows each step:
+
+1. **Download.** The model files come from Kiro Crew's own model CDN: about 8.4 GB for Plumb-4B, about 0.85 GB for Laya, which keeps only its English checkpoint. Each file is checked against a SHA-256 fixed in Kiro Crew before it is used, so a changed file is refused rather than run. An interrupted download resumes where it stopped.
+2. **Install.** A Python 3.12 environment of about 1 GB is built for the model with `uv`, from a lock that pins every package to the version the card's figures were measured with. On Linux, PyTorch comes from its CPU-only index. This happens once per model and takes a few minutes.
+3. **Start.** The model's server starts in the background, sandboxed, and listens on `127.0.0.1` only. The card says **Running on this machine** once it answers.
+
+The weights, with their license and notice files, live under `~/.kiro/crew/decisions/models/<model>/`; the model's software and its log live under `~/.kiro/crew/models/decisions/<model>/`. The server runs for as long as Kiro Crew does: it stops when you switch to another model and when the gateway exits, and starts again when the gateway does. If it exits on its own it is restarted a few times; if it keeps failing, the card shows why, with the end of the server's log, and a **Try again** button. **Remove download** under a model you are not using deletes its files and environment to give the disk space back.
+
+What changes when you switch:
+
+- The card writes `provider.endpoint` as `http://127.0.0.1:<port>/v1/systemone`, together with the model and a longer `timeout_ms`. Kiro Crew picks the port: the model's usual one, or a free one when something else holds it. The card never takes an address or a port from you, so the dashboard cannot be used to send decisions somewhere else.
+- **Your Jev API key is not sent** to a local address. Only a literal loopback address counts as local: an address written with the name `localhost` is treated like any other server and gets the key.
+- If the Decisions switch was on, it stays on for the local address. Switching back to Jev does the opposite: nothing is sent until you turn the switch off and on again, because that is the direction that starts sending to TypeSafe.
+
+Your other settings, including the recorded scopes, are unchanged.
+
 ## Letting Jev pick the model
 
 Open the model picker under the chat box and choose **Auto (Jev)**. The entry appears only when the Decisions switch is on and your organisation allows the feature, so if you do not see it, turn the switch on first.

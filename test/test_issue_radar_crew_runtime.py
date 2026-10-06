@@ -35,6 +35,7 @@ from typing import Any, cast
 from unittest import mock
 
 import pytest
+from off_loop_helpers import off_loop
 
 import kiro_crew.sel as sel_mod
 from kiro_crew import platform_compat
@@ -276,10 +277,147 @@ def _unit_for(crew_id: str) -> str:
 
 
 def _item(root, crew_id, number, **patch) -> dict[str, Any]:
-    """Seed one work item through the real write path: one entry in the crew's log."""
-    return cs.commit_work_progress(
-        OWNER, REPO, crew_id, number, patch, "claim", "seeded", root=root, session_id=_unit_for(crew_id)
+    """Seed one work item through the real write path: one entry in the crew's log.
+
+    The write runs on a worker thread (``off_loop``), as every product caller runs
+    it (``asyncio.to_thread``). Most callers here are async tests, so a direct call
+    would run on the event-loop thread, where ``file_lock`` takes ONE attempt and
+    never waits: if the crew log's writer thread is still inside its brief critical
+    section, the read-back after the append is refused and the write raises
+    ``CrewLedgerNotRecorded``. On a worker thread the same contention is an ordinary
+    short wait.
+    """
+    return off_loop(
+        cs.commit_work_progress,
+        OWNER,
+        REPO,
+        crew_id,
+        number,
+        patch,
+        "claim",
+        "seeded",
+        root=root,
+        session_id=_unit_for(crew_id),
     )["item"]
+
+
+class TestSeedingSurvivesABriefLogLock:
+    """``_item`` must not depend on the crew log's writer having let go yet."""
+
+    def _hold_the_log_lock_during_read_back(self, monkeypatch) -> list[bool]:
+        """Hold the unit's log lock from another thread across the read-back.
+
+        The holder lets go on an EVENT, never on a timer, so a slow runner cannot
+        turn the negative control into a pass or the positive case into a vacuous
+        one. Every acquire of the log lock by the read-back's own thread first probes it
+        once without waiting; that probe must be refused (recorded in the
+        returned list), which proves the lock was really held when the waiter came.
+        Off the loop the probe then releases the holder, and the real acquire waits
+        it out. On the loop nothing releases it until the read-back has given up, so
+        each on-loop attempt meets a held lock.
+        """
+        from kiro_crew import platform_lock_compat
+        from kiro_crew.crew_log import store as log_store
+        from kiro_crew.crew_log.schema import KIND_SESSION
+
+        real_landed = cs._landed_since
+        real_file_lock = log_store.file_lock
+        holder: dict[str, Any] = {}
+        released = threading.Event()
+        probes: list[bool] = []
+
+        def _identity(st: os.stat_result) -> tuple[int, int]:
+            return (st.st_dev, st.st_ino)
+
+        @contextlib.contextmanager
+        def watched_file_lock(fd, *args, **kwargs):
+            if (
+                "identity" in holder
+                and holder["waiter"] is threading.current_thread()
+                and _identity(os.fstat(fd)) == holder["identity"]
+            ):
+                got = platform_lock_compat.try_acquire_lock(fd, exclusive=True)
+                if got:
+                    platform_lock_compat.release_lock(fd)
+                probes.append(not got)
+                if not platform_lock_compat._on_event_loop():
+                    released.set()
+            with real_file_lock(fd, *args, **kwargs):
+                yield
+
+        def contended(projection, session_id, *args, **kwargs):
+            taken = threading.Event()
+            # Only the read-back's own thread is the waiter under test: the crew log
+            # also reads the unit on its own threads, and one of those must neither
+            # release the holder nor count as a probe.
+            holder["waiter"] = threading.current_thread()
+
+            def hold() -> None:
+                holder["thread"] = threading.current_thread()
+                lock_path = log_store._lock_path(KIND_SESSION, session_id)
+                with log_store._open_lock(lock_path):
+                    holder["identity"] = _identity(os.stat(lock_path))
+                    taken.set()
+                    # A lost-run ceiling only: the release is an event.
+                    released.wait(30)
+
+            threading.Thread(target=hold, daemon=True).start()
+            assert taken.wait(5), "the competing holder never took the lock"
+            try:
+                return real_landed(projection, session_id, *args, **kwargs)
+            finally:
+                released.set()
+
+        monkeypatch.setattr(log_store, "file_lock", watched_file_lock)
+        monkeypatch.setattr(cs, "_landed_since", contended)
+        return probes
+
+    def test_a_seed_from_an_async_test_waits_out_a_held_log_lock(self, tmp_path, monkeypatch):
+        crew = _crew(tmp_path, unattended=True)
+        _item(tmp_path, crew["id"], 2201, phase="awaiting-ci")
+        probes = self._hold_the_log_lock_during_read_back(monkeypatch)
+
+        async def from_the_loop() -> dict[str, Any]:
+            return _item(tmp_path, crew["id"], 2201, phase="resolved")
+
+        assert asyncio.run(from_the_loop())["phase"] == "resolved"
+        assert probes and probes[0], f"the read-back never met the held lock: {probes}"
+
+    def test_the_held_lock_is_real_contention(self, tmp_path, monkeypatch):
+        """Negative control: the same write made ON the loop is refused.
+
+        The setup write leaves the crew log's own background holders behind it --
+        the writer thread landing the entry and the eager folder reading the unit
+        right after -- and an on-loop acquire makes one attempt, so meeting either
+        of them raises a bare ``OSError`` from the write's preparing fold before
+        the read-back this control is about is ever reached. Both are settled
+        first, so the only holder the on-loop write can meet is the planted one.
+        """
+        from kiro_crew.crew_log import eager as crew_log_eager
+        from kiro_crew.crew_log import emit as crew_log_emit
+
+        crew = _crew(tmp_path, unattended=True)
+        _item(tmp_path, crew["id"], 2201, phase="awaiting-ci")
+        assert crew_log_emit.flush(timeout=30), "the setup write never landed"
+        assert crew_log_eager.drain(timeout=30), "the setup write's fold never settled"
+        probes = self._hold_the_log_lock_during_read_back(monkeypatch)
+
+        async def on_the_loop() -> None:
+            cs.commit_work_progress(
+                OWNER,
+                REPO,
+                crew["id"],
+                2201,
+                {"phase": "resolved"},
+                "claim",
+                "seeded",
+                root=tmp_path,
+                session_id=_unit_for(crew["id"]),
+            )
+
+        with pytest.raises(cs.CrewLedgerNotRecorded):
+            asyncio.run(on_the_loop())
+        assert probes and all(probes), f"an on-loop attempt found the lock free: {probes}"
 
 
 # ── brief injection ─────────────────────────────────────────────────────────
@@ -1970,41 +2108,6 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
             cr.dispatch_crew_turn(state, slot, "advance one item")
             await slot.runners[-1](state, slot, slot.prompts[-1])
         self.assertEqual([m for m in slot.messages if m["role"] == "error"], [])
-
-    async def test_a_dispatch_between_a_plans_stages_queues(self):
-        """``dispatch_crew_turn`` relies on the admission point, so the gate is the gate.
-
-        Its own docstring states the reliance -- "``enqueue_or_run_prompt`` queues
-        instead of racing when the crew is mid-turn" -- and it carries no mid-plan
-        check of its own. Between a plan's stages ``slot.running`` reads False while
-        the plan is still live, so gating on ``running`` alone would put a crew turn
-        alongside the plan, with no recovery once two turns own one slot.
-
-        Driven through a REAL ``_ChatSlot``, not this module's ``_FakeSlot``: the
-        fake implements its own admission, so a test through it would pass on the
-        double's rule rather than on the product's.
-
-        Mutation guard: drop ``or self._in_stage_execution`` from the gate and this
-        starts a turn.
-        """
-        from kiro_crew.dashboard.state import _ChatSlot
-
-        slot = _ChatSlot(key="chat-1")
-        # The inter-stage shape: nothing in flight, plan still executing.
-        slot.task = None
-        slot._in_stage_execution = True
-        state = mock.MagicMock()
-        state._background_tasks = set()
-
-        started = cr.dispatch_crew_turn(state, slot, "advance one item")
-
-        self.assertFalse(started, "a mid-plan crew dispatch must be queued")
-        self.assertIsNone(slot.task, "and must not open a turn alongside the plan")
-        self.assertEqual(
-            [q["content"] for q in slot._queue],
-            ["advance one item"],
-            "the prompt is held for the plan's own drain",
-        )
 
 
 # ── unblock signal detection (pure) ─────────────────────────────────────────

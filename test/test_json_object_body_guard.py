@@ -201,21 +201,21 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     # need 12 JSON bytes each; 512 KiB covers those keys plus the control envelope.
     "handlers/prompts.py::api_skills": ("512 * 1024", _BOUNDED_EXPLICIT),
     # agents.py tranche.
-    "handlers/agents.py::api_agent_config": ("None", _UNBOUNDED_USER_CONTENT),
-    "handlers/agents.py::api_default_agent": ("None", _CONTROL_FIELDS_CAP_PENDING),
-    "handlers/agents.py::api_capability_mcp_install": (
+    "agent_admin/agent_config.py::api_agent_config": ("None", _UNBOUNDED_USER_CONTENT),
+    "agent_admin/default_agent.py::api_default_agent": ("None", _CONTROL_FIELDS_CAP_PENDING),
+    "agent_admin/capabilities.py::api_capability_mcp_install": (
         "None",
         _CONTROL_FIELDS_CAP_PENDING,
     ),
-    "handlers/agents.py::api_capability_mcp_uninstall": (
+    "agent_admin/capabilities.py::api_capability_mcp_uninstall": (
         "None",
         _CONTROL_FIELDS_CAP_PENDING,
     ),
-    "handlers/agents.py::api_capability_skills_install": (
+    "agent_admin/capabilities.py::api_capability_skills_install": (
         "None",
         _CONTROL_FIELDS_CAP_PENDING,
     ),
-    "handlers/agents.py::api_capability_skills_uninstall": (
+    "agent_admin/capabilities.py::api_capability_skills_uninstall": (
         "None",
         _CONTROL_FIELDS_CAP_PENDING,
     ),
@@ -299,20 +299,21 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
         _BOUNDED_EXPLICIT,
     ),
     # ---- tranche 3 ----
-    # chat_handlers.py: control-field slot mutations take the cap; the sites
-    # that carry a chat message, queued-edit text, follow-up prompts, or
-    # injected context/note content stay uncapped.
+    # chat_handlers.py and its chat_api owners: control-field slot mutations take
+    # the cap; the sites that carry a chat message, queued-edit text, follow-up
+    # prompts, or injected context/note content stay uncapped.
     "chat_handlers.py::api_chat": ("None", _UNBOUNDED_USER_CONTENT),
     "chat_handlers.py::api_chat_slot_create": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_end_wait": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_interrupt": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_queue_edit": ("None", _UNBOUNDED_USER_CONTENT),
     "chat_handlers.py::api_chat_slot_queue_reorder": ("<default>", _BOUNDED_CONTROL_FIELDS),
-    "chat_handlers.py::api_chat_slot_reset_conversation": (
+    "chat_api/slot_lifecycle.py::api_chat_slot_reset_conversation": (
         "<default>",
         _BOUNDED_CONTROL_FIELDS,
     ),
-    "chat_handlers.py::api_chat_slots_cleanup": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "chat_api/slot_lifecycle.py::api_chat_slots_cleanup": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "chat_folder_cleanup.py::api_chat_folders_cleanup": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_agent": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_backend": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_model": ("<default>", _BOUNDED_CONTROL_FIELDS),
@@ -324,7 +325,7 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "chat_handlers.py::api_chat_slot_workspace": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_project": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_followup": ("None", _UNBOUNDED_USER_CONTENT),
-    "chat_handlers.py::api_chat_slot_resume": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "chat_api/resume.py::api_chat_slot_resume": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_mode": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_approve": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "chat_handlers.py::api_chat_slot_color": ("<default>", _BOUNDED_CONTROL_FIELDS),
@@ -371,18 +372,19 @@ _CAP_REGISTER: dict[str, tuple[str, str]] = {
     "handlers/workflows.py::api_workflow_run_intent": ("None", _UNBOUNDED_USER_CONTENT),
     "handlers/workflows.py::api_workflow_run_promote": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/workflows.py::api_workflow_run_rerun": ("None", _UNBOUNDED_USER_CONTENT),
-    # handlers/files.py: bodies name paths and routing fields -- the file
-    # bytes travel in api_file_write's body, which is the one uncapped site.
+    # handlers/files.py and its file_api owners: bodies name paths and routing
+    # fields -- the file bytes travel in api_file_write's body, which is the one
+    # uncapped site.
     "handlers/files.py::api_reveal_path": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/files.py::api_outbox_notify": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/files.py::api_slack_upload_file": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/files.py::api_channel_upload_file": ("<default>", _BOUNDED_CONTROL_FIELDS),
-    "handlers/files.py::api_workspaces_create": ("<default>", _BOUNDED_CONTROL_FIELDS),
-    "handlers/files.py::api_workspaces_update": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "file_api/workspaces.py::api_workspaces_create": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "file_api/workspaces.py::api_workspaces_update": ("<default>", _BOUNDED_CONTROL_FIELDS),
     "handlers/files.py::api_file_write": ("None", _UNBOUNDED_USER_CONTENT),
     # a root path and a query the handler caps at 200 characters
     "handlers/files.py::api_file_grep": ("<default>", _BOUNDED_CONTROL_FIELDS),
-    "handlers/files.py::api_dashboard_config": ("<default>", _BOUNDED_CONTROL_FIELDS),
+    "file_api/dashboard_config.py::api_dashboard_config": ("<default>", _BOUNDED_CONTROL_FIELDS),
 }
 
 _DASHBOARD_DIR = Path(shared.__file__).resolve().parent.parent
@@ -437,6 +439,8 @@ class TestCapRegister:
         # A refactor that moved or renamed the helper would otherwise empty the
         # scan and make every assertion below pass by finding nothing.
         assert len(_call_sites()) >= 25
+        # The chat_api owners composed into chat_handlers hold call sites too.
+        assert sum(key.startswith("chat_api/") for key in _call_sites()) >= 3
 
     def test_every_call_site_records_a_cap_decision(self) -> None:
         unregistered = sorted(set(_call_sites()) - set(_CAP_REGISTER))

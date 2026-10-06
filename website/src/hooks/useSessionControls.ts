@@ -18,6 +18,7 @@
  */
 import { useRef } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
+import { shallowEqual } from 'react-redux'
 import { api } from '../api/client'
 import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
 
@@ -67,6 +68,8 @@ export interface SessionControlStatus {
   state: SessionControlState
   /** Replaces the chip tooltip when present, so the state can explain itself. */
   tooltip: string
+  /** Short per-session text shown after the manifest label, or ''. */
+  detail: string
 }
 
 /**
@@ -255,11 +258,20 @@ export function normalizeStatus(raw: unknown): SessionControlStatus {
   // `unknown` rather than `any`: this is a third party's payload, so the
   // narrowing below is the contract and the compiler should enforce that every
   // field is checked before use.
-  const r = (raw ?? {}) as { state?: unknown; tooltip?: unknown }
+  const r = (raw ?? {}) as { state?: unknown; tooltip?: unknown; detail?: unknown }
   const state =
     typeof r.state === 'string' && KNOWN_STATES.has(r.state) ? (r.state as SessionControlState) : 'none'
   const tooltip = typeof r.tooltip === 'string' ? r.tooltip.slice(0, 200) : ''
-  return { state, tooltip }
+  // `detail` is drawn on the chip itself, so the whole Unicode C category
+  // (control, format incl. bidi and zero-width, surrogate, private-use,
+  // unassigned) and the line/paragraph separators are removed: none of them can
+  // reorder or hide the label. The cap counts code points, so it never splits
+  // a surrogate pair.
+  const detail =
+    typeof r.detail === 'string'
+      ? Array.from(r.detail.replace(/[\p{C}\p{Zl}\p{Zp}]/gu, '').trim()).slice(0, 40).join('')
+      : ''
+  return { state, tooltip, detail }
 }
 
 /** What {@link useSessionControlStatuses} returns. */
@@ -350,9 +362,10 @@ export function useSessionControlStatuses(
   const statuses: Record<string, SessionControlStatus> = {}
   for (const r of results) {
     const d = r.data
-    // `none` is dropped rather than stored, so the map reads as "has state"
-    // and a caller never has to check the value as well as the key.
-    if (d && d.status.state !== 'none') statuses[d.key] = d.status
+    // A status with neither a state nor a detail is dropped rather than
+    // stored, so the map reads as "has something to show" and a caller never
+    // has to check the values as well as the key.
+    if (d && (d.status.state !== 'none' || d.status.detail)) statuses[d.key] = d.status
   }
   // One error stands for all of them: the chips are a group, and a per-chip
   // banner would be noise on a surface that competes with the message input for
@@ -364,12 +377,6 @@ export function useSessionControlStatuses(
   // chip list) from ever holding. Each entry is react-query data, which keeps
   // its identity until the probe's answer changes.
   const stableRef = useRef(statuses)
-  if (!sameEntries(stableRef.current, statuses)) stableRef.current = statuses
+  if (!shallowEqual(stableRef.current, statuses)) stableRef.current = statuses
   return { statuses: stableRef.current, error: (failed?.error as Error | undefined) ?? null }
-}
-
-function sameEntries(a: Record<string, SessionControlStatus>, b: Record<string, SessionControlStatus>): boolean {
-  const ka = Object.keys(a)
-  if (ka.length !== Object.keys(b).length) return false
-  return ka.every(k => Object.prototype.hasOwnProperty.call(b, k) && a[k] === b[k])
 }
